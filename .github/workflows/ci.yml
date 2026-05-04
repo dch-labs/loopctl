@@ -44,6 +44,14 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  doctest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --doc --all-features
+
   docs:
     runs-on: ubuntu-latest
     steps:

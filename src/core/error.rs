@@ -1,6 +1,6 @@
 //! Error types for the agent framework.
 //!
-//! Every agent operation returns `Result<T, [`AgentError`]>`, and this
+//! Every agent operation returns `Result<T, [AgentError]>`, and this
 //! module defines the single unified error enum that carries structured
 //! context for each failure mode. The variants are fine-grained enough
 //! for callers to match on and recover programmatically
@@ -300,14 +300,19 @@ impl AgentError {
     pub fn tool_not_found(tool: impl Into<String>, available: &[&str]) -> Self {
         let tool = tool.into();
         let available_str = if available.is_empty() {
-            "none registered".to_string()
+            String::from("none registered")
         } else if available.len() <= 10 {
             available.join(", ")
         } else {
+            let count = available.len().saturating_sub(10);
             format!(
-                "{}... (and {} more)",
-                available[..10].join(", "),
-                available.len() - 10
+                "{}... (and {count} more)",
+                available
+                    .iter()
+                    .take(10)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", "),
             )
         };
         Self::ToolNotFound {
@@ -334,7 +339,8 @@ impl AgentError {
     /// Returns `false` for all other variants (e.g. invalid input,
     /// cancel, configuration errors) where retrying is unlikely to
     /// help.
-    pub fn is_recoverable(&self) -> bool {
+    #[must_use]
+    pub const fn is_recoverable(&self) -> bool {
         matches!(
             self,
             Self::ToolExecution { .. }
@@ -359,7 +365,8 @@ impl AgentError {
     /// let err = AgentError::Cancelled;
     /// assert!(err.is_cancelled());
     /// ```
-    pub fn is_cancelled(&self) -> bool {
+    #[must_use]
+    pub const fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
     }
 }

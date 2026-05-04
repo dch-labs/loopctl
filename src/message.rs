@@ -194,7 +194,8 @@ impl Message {
     ///     MessagePart::tool_call("t1", "search", serde_json::json!({"q": "weather"})),
     /// ]);
     /// ```
-    pub fn new(role: Role, parts: Vec<MessagePart>) -> Self {
+    #[must_use]
+    pub const fn new(role: Role, parts: Vec<MessagePart>) -> Self {
         Self { role, parts }
     }
 }
@@ -254,7 +255,7 @@ impl fmt::Display for Message {
 ///
 /// # Serialization
 ///
-/// Serialized as lowercase snake_case strings (`"user"`, `"assistant"`)
+/// Serialized as lowercase `snake_case` strings (`"user"`, `"assistant"`)
 /// to match the API convention.
 ///
 /// # Example
@@ -296,8 +297,8 @@ pub enum Role {
 impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Role::User => write!(f, "user"),
-            Role::Assistant => write!(f, "assistant"),
+            Self::User => write!(f, "user"),
+            Self::Assistant => write!(f, "assistant"),
         }
     }
 }
@@ -548,7 +549,8 @@ impl MessagePart {
     /// let part = MessagePart::text("hello");
     /// assert!(part.is_text());
     /// ```
-    pub fn is_text(&self) -> bool {
+    #[must_use]
+    pub const fn is_text(&self) -> bool {
         matches!(self, Self::Text { .. })
     }
 
@@ -565,7 +567,8 @@ impl MessagePart {
     /// let part = MessagePart::tool_call("id", "tool", Value::Null);
     /// assert!(part.is_tool_call());
     /// ```
-    pub fn is_tool_call(&self) -> bool {
+    #[must_use]
+    pub const fn is_tool_call(&self) -> bool {
         matches!(self, Self::ToolCall { .. })
     }
 
@@ -580,7 +583,8 @@ impl MessagePart {
     /// let part = MessagePart::tool_result("id", "output", false);
     /// assert!(part.is_tool_result());
     /// ```
-    pub fn is_tool_result(&self) -> bool {
+    #[must_use]
+    pub const fn is_tool_result(&self) -> bool {
         matches!(self, Self::ToolResult { .. })
     }
 
@@ -604,6 +608,7 @@ impl MessagePart {
     /// let tool = MessagePart::tool_call("id", "tool", Value::Null);
     /// assert_eq!(tool.as_text(), None);
     /// ```
+    #[must_use]
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text { text } => Some(text),
@@ -687,7 +692,7 @@ impl ImageSource {
     #[must_use]
     pub fn new_base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
         Self {
-            encoding: "base64".to_string(),
+            encoding: "base64".into(),
             media_type: media_type.into(),
             data: data.into(),
         }
@@ -797,7 +802,7 @@ impl ToolResult {
     /// ]);
     /// ```
     #[must_use]
-    pub fn from_multipart(parts: Vec<ToolResultPart>) -> Self {
+    pub const fn from_multipart(parts: Vec<ToolResultPart>) -> Self {
         Self::Multipart(parts)
     }
 
@@ -812,7 +817,8 @@ impl ToolResult {
     /// let content = ToolResult::from_string("ok");
     /// assert!(content.is_string());
     /// ```
-    pub fn is_string(&self) -> bool {
+    #[must_use]
+    pub const fn is_string(&self) -> bool {
         matches!(self, Self::Text(_))
     }
 }
@@ -871,7 +877,7 @@ impl From<String> for ToolResult {
 /// ```
 impl From<&str> for ToolResult {
     fn from(s: &str) -> Self {
-        Self::Text(s.to_string())
+        Self::Text(s.to_owned())
     }
 }
 
@@ -1020,7 +1026,8 @@ impl ToolResultPart {
     /// use loopctl::message::{ImageSource, ToolResultPart};
     /// let part = ToolResultPart::image(ImageSource::new_base64("image/png", "..."));
     /// ```
-    pub fn image(source: ImageSource) -> Self {
+    #[must_use]
+    pub const fn image(source: ImageSource) -> Self {
         Self::Image { source }
     }
 }

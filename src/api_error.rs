@@ -41,7 +41,8 @@
 //!         │
 //!         ├──→ code()         → ErrorCode (u32)
 //!         ├──→ is_retryable() → bool
-//!         ├──→ is_auth_error() / is_config_error() / …
+//!         ├──→ is_auth_error() / is_config_error() / is_context_overflow()
+//!         ├──→ is_io_error() / is_tool_error()
 //!         │
 //!         ▼
 //!    Result<T>  (= std::result::Result<T, ApiError>)
@@ -64,7 +65,7 @@
 //! }
 //! ```
 
-use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use thiserror::Error;
 
 // ==================================================
@@ -94,7 +95,8 @@ use thiserror::Error;
 /// assert_eq!(err.code(), ErrorCode::ApiRateLimited);
 /// assert_eq!(err.code() as u32, 1002);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
+#[repr(u16)]
 pub enum ErrorCode {
     // ==================================================
     // API errors (1000-1005)
@@ -114,7 +116,6 @@ pub enum ErrorCode {
     /// Use [`ApiError::api`] to construct errors that map to this code.
     /// The framework's retry loop treats this code as retryable via
     /// [`ApiError::is_retryable`].
-    ///
     ApiRequestFailed = 1000,
 
     /// The API response could not be parsed.
@@ -125,7 +126,6 @@ pub enum ErrorCode {
     /// This error is **not** retryable; the response format is unlikely
     /// to change on subsequent attempts. Investigate version
     /// compatibility or schema changes.
-    ///
     ApiResponseInvalid = 1001,
 
     /// The API rate limit was exceeded.
@@ -133,21 +133,18 @@ pub enum ErrorCode {
     /// The caller should back off and retry after the period indicated by
     /// the provider's headers. [`ApiError::is_retryable`] returns `true`.
     /// Maps to **1002**.
-    ///
     ApiRateLimited = 1002,
 
     /// The API request timed out.
     ///
     /// The request took longer than the configured timeout. Safe to retry
     /// (possibly with a longer timeout). Maps to **1003**.
-    ///
     ApiTimeout = 1003,
 
     /// An error occurred while reading the SSE stream.
     ///
     /// The connection was established but the stream was interrupted or
     /// produced malformed events. Maps to **1004**.
-    ///
     ApiStreamError = 1004,
 
     /// The request exceeded the model's context window.
@@ -155,7 +152,6 @@ pub enum ErrorCode {
     /// The combined prompt `max_tokens` exceeds the model's limit. The
     /// agent should reduce the context (e.g. via summarisation or
     /// truncation) before retrying. Maps to **1005**.
-    ///
     ApiContextOverflow = 1005,
 
     // ==================================================
@@ -165,7 +161,6 @@ pub enum ErrorCode {
     ///
     /// The key may be expired, revoked, or not yet set. Check
     /// environment variables and configuration files. Maps to **1100**.
-    ///
     AuthInvalidKey = 1100,
 
     /// Authentication failed for a non-key-related reason.
@@ -173,7 +168,6 @@ pub enum ErrorCode {
     /// Covers token-expiry, account-suspension, or other auth-layer
     /// rejections that are not specifically about an invalid key.
     /// Maps to **1101**.
-    ///
     AuthFailed = 1101,
 
     // ==================================================
@@ -187,7 +181,6 @@ pub enum ErrorCode {
     /// Constructed via [`ApiError::http`] or [`ApiError::from_hyper`].
     /// This code is considered retryable by [`ApiError::is_retryable`]
     /// because connection issues are often transient.
-    ///
     HttpConnectionError = 1200,
 
     /// An HTTP request construction or send error.
@@ -197,7 +190,6 @@ pub enum ErrorCode {
     ///
     /// This code is retryable — a resend may succeed if the root cause
     /// was a transient serialisation glitch.
-    ///
     HttpRequestError = 1201,
 
     /// An HTTP response error (non-success status).
@@ -207,7 +199,6 @@ pub enum ErrorCode {
     ///
     /// Use [`ApiError::http_with_status`] to embed the status code in
     /// the message for downstream log aggregation.
-    ///
     HttpResponseError = 1202,
 
     // ==================================================
@@ -220,7 +211,6 @@ pub enum ErrorCode {
     ///
     /// Constructed via [`ApiError::tool_not_found`]. Not retryable —
     /// the tool must be registered before use.
-    ///
     ToolNotFound = 1300,
 
     /// Tool execution failed.
@@ -230,7 +220,6 @@ pub enum ErrorCode {
     ///
     /// Constructed via [`ApiError::tool`] when the message does not
     /// match a more specific tool-error pattern.
-    ///
     ToolExecutionFailed = 1301,
 
     /// Permission denied for tool execution.
@@ -240,7 +229,6 @@ pub enum ErrorCode {
     ///
     /// Constructed via [`ApiError::tool_permission`]. Not retryable —
     /// permissions must be updated before the operation can succeed.
-    ///
     ToolPermissionDenied = 1302,
 
     /// Tool input validation failed.
@@ -250,7 +238,6 @@ pub enum ErrorCode {
     ///
     /// Constructed via [`ApiError::tool_input_invalid`]. Not retryable —
     /// the caller must fix the arguments.
-    ///
     ToolInputInvalid = 1303,
 
     /// Tool execution timed out.
@@ -259,7 +246,6 @@ pub enum ErrorCode {
     ///
     /// May be retryable if the timeout was caused by a transient slowdown,
     /// but the caller should consider increasing the timeout first.
-    ///
     ToolTimeout = 1304,
 
     // ==================================================
@@ -269,27 +255,23 @@ pub enum ErrorCode {
     ///
     /// The path pointed to by the config setting does not exist or is
     /// not readable. Maps to **1400**.
-    ///
     ConfigFileNotFound = 1400,
 
     /// The configuration file could not be parsed.
     ///
     /// The file exists but contains invalid TOML / JSON / YAML. Maps
     /// to **1401**.
-    ///
     ConfigParseError = 1401,
 
     /// Configuration values failed semantic validation.
     ///
     /// The file parsed correctly but a value is out of range or
     /// semantically invalid (e.g. negative timeout). Maps to **1402**.
-    ///
     ConfigValidationError = 1402,
 
     /// A required configuration value is missing entirely.
     ///
     /// No value was provided and no default is available. Maps to **1403**.
-    ///
     ConfigMissing = 1403,
 
     // ==================================================
@@ -301,19 +283,16 @@ pub enum ErrorCode {
     /// Maps to **1500**.
     ///
     /// [`ConfigFileNotFound`]: ErrorCode::ConfigFileNotFound
-    ///
     IoFileNotFound = 1500,
 
     /// A file read operation failed.
     ///
     /// Permission denied, I/O error, or unexpected EOF. Maps to **1501**.
-    ///
     IoReadError = 1501,
 
     /// A file write operation failed.
     ///
     /// Disk full, permission denied, or path invalid. Maps to **1502**.
-    ///
     IoWriteError = 1502,
 
     // ==================================================
@@ -323,7 +302,6 @@ pub enum ErrorCode {
     ///
     /// The response body or request payload contained malformed JSON.
     /// Maps to **1600**.
-    ///
     JsonParseError = 1600,
 
     // ==================================================
@@ -333,7 +311,6 @@ pub enum ErrorCode {
     ///
     /// Catch-all for bugs or unclassifiable failures. If you see this
     /// code in production please file a bug report. Maps to **1700**.
-    ///
     InternalError = 1700,
 
     // ==================================================
@@ -343,7 +320,6 @@ pub enum ErrorCode {
     ///
     /// Not an error per se — the agent loop checks for this code to
     /// perform graceful shutdown. Maps to **1999**.
-    ///
     Interrupted = 1999,
 }
 
@@ -404,7 +380,6 @@ pub enum ApiError {
     /// Covers request failures, rate limits, timeouts, streaming errors,
     /// and context-overflow conditions. The message is inspected by
     /// [`ApiError::code`] to select the most specific [`ErrorCode`].
-    ///
     #[error("API error: {0}")]
     Api(String),
 
@@ -413,7 +388,6 @@ pub enum ApiError {
     /// Invalid API keys, expired tokens, or account-level restrictions.
     /// The message text determines whether [`ErrorCode::AuthInvalidKey`]
     /// or [`ErrorCode::AuthFailed`] is returned by [`ApiError::code`].
-    ///
     #[error("Authentication error: {0}")]
     Auth(String),
 
@@ -422,7 +396,6 @@ pub enum ApiError {
     /// Connection failures, DNS errors, TLS handshake problems, or
     /// non-success status codes. Created via [`ApiError::http`] or
     /// [`ApiError::http_with_status`].
-    ///
     #[error("HTTP error: {0}")]
     Http(String),
 
@@ -430,15 +403,24 @@ pub enum ApiError {
     ///
     /// Automatically converted from [`serde_json::Error`] via the
     /// `#[from]` attribute. Maps to [`ErrorCode::JsonParseError`].
-    ///
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
     /// A general I/O error.
     ///
-    /// Automatically converted from [`std::io::Error`] via the `#[from]`
-    /// attribute. Maps to [`ErrorCode::IoReadError`].
+    /// Automatically converted from [`std::io::Error`] via the `#[from]`attribute.
+    /// The [`ErrorCode`] is determined by inspecting the [`std::io::ErrorKind`]:
     ///
+    /// - [`ErrorKind::NotFound`] → [`ErrorCode::IoFileNotFound`]
+    /// - [`ErrorKind::PermissionDenied`] / [`ErrorKind::WriteZero`] → [`ErrorCode::IoWriteError`]
+    /// - All other kinds → [`ErrorCode::IoReadError`]
+    ///
+    /// For explicit construction, use [`ApiError::io_not_found`], [`ApiError::io_read`],
+    /// or [`ApiError::io_write`].
+    ///
+    /// [`ErrorKind::NotFound`]: std::io::ErrorKind::NotFound
+    /// [`ErrorKind::PermissionDenied`]: std::io::ErrorKind::PermissionDenied
+    /// [`ErrorKind::WriteZero`]: std::io::ErrorKind::WriteZero
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -448,7 +430,6 @@ pub enum ApiError {
     /// invalid inputs, and timeouts. Prefer the specific constructors
     /// ([`ApiError::tool_not_found`], [`ApiError::tool_permission`],
     /// [`ApiError::tool_input_invalid`]) for richer context.
-    ///
     #[error("Tool error: {0}")]
     Tool(String),
 
@@ -458,16 +439,14 @@ pub enum ApiError {
     /// required values. Prefer the specific constructors
     /// ([`ApiError::config_not_found`], [`ApiError::config_validation`])
     /// for structured messages.
-    ///
     #[error("Configuration error: {0}")]
     Config(String),
 
     /// The operation was interrupted by a user signal.
     ///
-    /// Typically triggered by SIGINT (Ctrl-C). The agent loop checks
-    /// for this variant to perform graceful shutdown. Maps to
+    /// Typically triggered by SIGINT. The agent loop checks for
+    /// this variant to perform graceful shutdown. Maps to
     /// [`ErrorCode::Interrupted`].
-    ///
     #[error("Interrupted")]
     Interrupted,
 
@@ -475,7 +454,6 @@ pub enum ApiError {
     ///
     /// Maps to [`ErrorCode::InternalError`]. Prefer a more specific
     /// variant or constructor when possible.
-    ///
     #[error("Other: {0}")]
     Other(String),
 }
@@ -501,34 +479,38 @@ impl ApiError {
     ///
     /// ```text
     /// ApiError::Api(msg)
-    ///   ├─ "timeout"              → ApiTimeout
-    ///   ├─ "rate limit" / "429"   → ApiRateLimited
-    ///   ├─ "stream"               → ApiStreamError
-    ///   ├─ context keywords       → ApiContextOverflow
-    ///   └─ (default)              → ApiRequestFailed
+    ///   ├─ "timeout"                          → ApiTimeout
+    ///   ├─ "rate limit" / "429"               → ApiRateLimited
+    ///   ├─ "stream"                           → ApiStreamError
+    ///   ├─ context keywords                   → ApiContextOverflow
+    ///   └─ (default)                          → ApiRequestFailed
     ///
     /// ApiError::Auth(msg)
-    ///   ├─ "invalid"              → AuthInvalidKey
-    ///   └─ (default)              → AuthFailed
+    ///   ├─ "invalid"                          → AuthInvalidKey
+    ///   └─ (default)                          → AuthFailed
     ///
     /// ApiError::Tool(msg)
-    ///   ├─ "not found"            → ToolNotFound
-    ///   ├─ "permission" / "denied"→ ToolPermissionDenied
-    ///   ├─ "timeout"              → ToolTimeout
-    ///   ├─ "invalid"              → ToolInputInvalid
-    ///   └─ (default)              → ToolExecutionFailed
+    ///   ├─ "not found"                        → ToolNotFound
+    ///   ├─ "permission" / "denied"            → ToolPermissionDenied
+    ///   ├─ "timeout"                          → ToolTimeout
+    ///   ├─ "invalid"                          → ToolInputInvalid
+    ///   └─ (default)                          → ToolExecutionFailed
     ///
     /// ApiError::Config(msg)
-    ///   ├─ "not found"            → ConfigFileNotFound
-    ///   ├─ "validation"           → ConfigValidationError
-    ///   ├─ "missing"              → ConfigMissing
-    ///   └─ (default)              → ConfigParseError
+    ///   ├─ "not found"                        → ConfigFileNotFound
+    ///   ├─ "validation"                       → ConfigValidationError
+    ///   ├─ "missing"                          → ConfigMissing
+    ///   └─ (default)                          → ConfigParseError
     ///
-    /// ApiError::Http(_)  → HttpConnectionError
-    /// ApiError::Json(_)  → JsonParseError
-    /// ApiError::Io(_)    → IoReadError
-    /// ApiError::Interrupted → Interrupted
-    /// ApiError::Other(_) → InternalError
+    /// ApiError::Http(msg)
+    ///   ├─ "HTTP 5xx: ..."                    → HttpResponseError
+    ///   ├─ "HTTP 4xx: ..."                    → HttpRequestError
+    ///   └─ (default)                          → HttpConnectionError
+    ///
+    /// ApiError::Json(_)                       → JsonParseError
+    /// ApiError::Io(_)                         → IoReadError
+    /// ApiError::Interrupted                   → Interrupted
+    /// ApiError::Other(_)                      → InternalError
     /// ```
     ///
     /// # When called
@@ -543,7 +525,6 @@ impl ApiError {
     /// let err = ApiError::api("rate limit exceeded (429)");
     /// assert_eq!(err.code(), ErrorCode::ApiRateLimited);
     /// ```
-    ///
     #[must_use]
     pub fn code(&self) -> ErrorCode {
         match self {
@@ -568,9 +549,29 @@ impl ApiError {
                     ErrorCode::AuthFailed
                 }
             }
-            Self::Http(_) => ErrorCode::HttpConnectionError,
+            Self::Http(msg) => {
+                if let Some(rest) = msg.strip_prefix("HTTP ") {
+                    if let Some(colon) = rest.find(':') {
+                        if let Ok(status) = rest[..colon].parse::<u16>() {
+                            return if status >= 500 {
+                                ErrorCode::HttpResponseError
+                            } else {
+                                ErrorCode::HttpRequestError
+                            };
+                        }
+                    }
+                }
+                ErrorCode::HttpConnectionError
+            }
             Self::Json(_) => ErrorCode::JsonParseError,
-            Self::Io(_) => ErrorCode::IoReadError,
+            Self::Io(err) => {
+                use std::io::ErrorKind;
+                match err.kind() {
+                    ErrorKind::NotFound => ErrorCode::IoFileNotFound,
+                    ErrorKind::PermissionDenied | ErrorKind::WriteZero => ErrorCode::IoWriteError,
+                    _ => ErrorCode::IoReadError,
+                }
+            }
             Self::Tool(msg) => {
                 let msg_lower = msg.to_lowercase();
                 if msg_lower.contains("not found") {
@@ -625,7 +626,6 @@ impl ApiError {
     /// let err = ApiError::api("server error");
     /// assert!(!err.is_context_overflow());
     /// ```
-    ///
     #[must_use]
     pub fn is_context_overflow(&self) -> bool {
         match self {
@@ -647,25 +647,22 @@ impl ApiError {
     /// - `"too many tokens"` — OpenAI-style phrasing
     /// - `"exceeds maximum"` — generic overflow wording
     /// - `"max tokens"` — common provider phrasing
-    /// - `"context length"` — redundant with `"context"` but included
-    ///   for explicit clarity
-    ///
     fn is_context_overflow_internal(msg: &str) -> bool {
         let msg_lower = msg.to_lowercase();
         msg_lower.contains("context")
             || msg_lower.contains("too many tokens")
             || msg_lower.contains("exceeds maximum")
             || msg_lower.contains("max tokens")
-            || msg_lower.contains("context length")
     }
 
     /// Check whether this error is safe to retry.
     ///
     /// Returns `true` for transient failures where a retry (possibly
     /// with back-off) has a reasonable chance of succeeding:
+    ///
     /// [`ErrorCode::ApiRequestFailed`], [`ErrorCode::ApiRateLimited`],
     /// [`ErrorCode::ApiTimeout`], [`ErrorCode::HttpConnectionError`],
-    /// and [`ErrorCode::HttpRequestError`].
+    /// [`ErrorCode::HttpRequestError`], and [`ErrorCode::HttpResponseError`].
     ///
     /// # When called
     ///
@@ -682,7 +679,6 @@ impl ApiError {
     /// let err = ApiError::auth("bad key");
     /// assert!(!err.is_retryable());
     /// ```
-    ///
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         matches!(
@@ -692,6 +688,7 @@ impl ApiError {
                 | ErrorCode::ApiTimeout
                 | ErrorCode::HttpConnectionError
                 | ErrorCode::HttpRequestError
+                | ErrorCode::HttpResponseError
         )
     }
 
@@ -709,7 +706,6 @@ impl ApiError {
     ///     eprintln!("Please check your API key.");
     /// }
     /// ```
-    ///
     #[must_use]
     pub const fn is_auth_error(&self) -> bool {
         matches!(self, Self::Auth(..))
@@ -729,7 +725,6 @@ impl ApiError {
     ///     eprintln!("Configuration problem — check loopctl.toml.");
     /// }
     /// ```
-    ///
     #[must_use]
     pub const fn is_config_error(&self) -> bool {
         matches!(self, Self::Config(..))
@@ -739,7 +734,6 @@ impl ApiError {
     ///
     /// Returns `true` for file-system failures such as missing files,
     /// permission errors, or disk-full conditions.
-    ///
     #[must_use]
     pub const fn is_io_error(&self) -> bool {
         matches!(self, Self::Io(..))
@@ -757,7 +751,6 @@ impl ApiError {
     /// let err = ApiError::tool_not_found("Bash");
     /// assert!(err.is_tool_error());
     /// ```
-    ///
     #[must_use]
     pub const fn is_tool_error(&self) -> bool {
         matches!(self, Self::Tool(..))
@@ -784,7 +777,6 @@ impl ApiError {
     /// use loopctl::api_error::{ApiError, ErrorCode};
     /// let err = ApiError::api("unexpected 502 from upstream");
     /// ```
-    ///
     pub fn api(msg: impl Into<String>) -> Self {
         Self::Api(msg.into())
     }
@@ -802,8 +794,6 @@ impl ApiError {
     /// let err = ApiError::auth("token expired");
     /// assert_eq!(err.code(), ErrorCode::AuthFailed);
     /// ```
-    ///
-    ///
     pub fn auth(msg: impl Into<String>) -> Self {
         Self::Auth(msg.into())
     }
@@ -821,8 +811,6 @@ impl ApiError {
     /// let err = ApiError::auth_invalid_key("key expired");
     /// assert_eq!(err.code(), ErrorCode::AuthInvalidKey);
     /// ```
-    ///
-    ///
     pub fn auth_invalid_key(msg: impl Into<String>) -> Self {
         Self::Auth(format!("Invalid API key: {}", msg.into()))
     }
@@ -839,8 +827,6 @@ impl ApiError {
     /// use loopctl::api_error::{ApiError, ErrorCode};
     /// let err = ApiError::http("DNS resolution failed");
     /// ```
-    ///
-    ///
     pub fn http(msg: impl Into<String>) -> Self {
         Self::Http(msg.into())
     }
@@ -848,8 +834,12 @@ impl ApiError {
     /// Create an [`ApiError::Http`] variant that includes the HTTP status code.
     ///
     /// Formats the message as `"HTTP {status}: {msg}"` so that downstream
-    /// log aggregation can extract the status code. Maps to
-    /// [`ErrorCode::HttpConnectionError`] via [`ApiError::code`].
+    /// log aggregation can extract the status code. [`ApiError::code`]
+    /// inspects the embedded status to select the appropriate [`ErrorCode`]:
+    ///
+    /// - `5xx` → [`ErrorCode::HttpResponseError`] (server error, retryable)
+    /// - `4xx` → [`ErrorCode::HttpRequestError`] (client error, retryable)
+    /// - Other / unparseable → [`ErrorCode::HttpConnectionError`]
     ///
     /// # Example
     ///
@@ -857,9 +847,11 @@ impl ApiError {
     /// use loopctl::api_error::{ApiError, ErrorCode};
     /// let err = ApiError::http_with_status(503, "service unavailable");
     /// assert!(err.to_string().contains("HTTP 503"));
+    /// assert_eq!(err.code(), ErrorCode::HttpResponseError);
+    ///
+    /// let err = ApiError::http_with_status(400, "bad request");
+    /// assert_eq!(err.code(), ErrorCode::HttpRequestError);
     /// ```
-    ///
-    ///
     pub fn http_with_status(status: u16, msg: impl Into<String>) -> Self {
         Self::Http(format!("HTTP {status}: {}", msg.into()))
     }
@@ -877,8 +869,6 @@ impl ApiError {
     /// let err = ApiError::tool("execution failed");
     /// assert_eq!(err.code(), ErrorCode::ToolExecutionFailed);
     /// ```
-    ///
-    ///
     pub fn tool(msg: impl Into<String>) -> Self {
         Self::Tool(msg.into())
     }
@@ -895,8 +885,6 @@ impl ApiError {
     /// let err = ApiError::tool_with_name("Read", "file not found");
     /// assert!(err.to_string().contains("Read"));
     /// ```
-    ///
-    ///
     pub fn tool_with_name(tool: impl Into<String>, msg: impl Into<String>) -> Self {
         Self::Tool(format!("{}: {}", tool.into(), msg.into()))
     }
@@ -913,8 +901,6 @@ impl ApiError {
     /// let err = ApiError::tool_not_found("Bash");
     /// assert_eq!(err.code(), ErrorCode::ToolNotFound);
     /// ```
-    ///
-    ///
     pub fn tool_not_found(tool: impl Into<String>) -> Self {
         Self::Tool(format!("Tool not found: {}", tool.into()))
     }
@@ -931,8 +917,6 @@ impl ApiError {
     /// let err = ApiError::tool_permission("Write", "read-only filesystem");
     /// assert_eq!(err.code(), ErrorCode::ToolPermissionDenied);
     /// ```
-    ///
-    ///
     pub fn tool_permission(tool: impl Into<String>, msg: impl Into<String>) -> Self {
         Self::Tool(format!("{} permission denied: {}", tool.into(), msg.into()))
     }
@@ -949,8 +933,6 @@ impl ApiError {
     /// let err = ApiError::tool_input_invalid("Read", "path contains null bytes");
     /// assert_eq!(err.code(), ErrorCode::ToolInputInvalid);
     /// ```
-    ///
-    ///
     pub fn tool_input_invalid(tool: impl Into<String>, msg: impl Into<String>) -> Self {
         Self::Tool(format!("{} invalid input: {}", tool.into(), msg.into()))
     }
@@ -986,8 +968,6 @@ impl ApiError {
     /// let err = ApiError::config_not_found("/etc/loopctl.toml");
     /// assert_eq!(err.code(), ErrorCode::ConfigFileNotFound);
     /// ```
-    ///
-    ///
     pub fn config_not_found(path: impl Into<String>) -> Self {
         Self::Config(format!("Configuration file not found: {}", path.into()))
     }
@@ -1004,7 +984,6 @@ impl ApiError {
     /// let err = ApiError::config_validation("timeout must be positive");
     /// assert_eq!(err.code(), ErrorCode::ConfigValidationError);
     /// ```
-    ///
     pub fn config_validation(msg: impl Into<String>) -> Self {
         Self::Config(format!("Configuration validation failed: {}", msg.into()))
     }
@@ -1023,7 +1002,6 @@ impl ApiError {
     /// assert!(err.is_retryable());
     /// assert_eq!(err.code(), ErrorCode::ApiTimeout);
     /// ```
-    ///
     pub fn api_timeout(msg: impl Into<String>) -> Self {
         Self::Api(format!("Request timeout: {}", msg.into()))
     }
@@ -1042,7 +1020,6 @@ impl ApiError {
     /// assert!(err.is_retryable());
     /// assert_eq!(err.code(), ErrorCode::ApiRateLimited);
     /// ```
-    ///
     #[must_use]
     pub fn api_rate_limited() -> Self {
         Self::Api("Rate limit exceeded, please retry after a moment".into())
@@ -1060,7 +1037,6 @@ impl ApiError {
     /// let err = ApiError::api_stream("connection reset mid-stream");
     /// assert_eq!(err.code(), ErrorCode::ApiStreamError);
     /// ```
-    ///
     pub fn api_stream(msg: impl Into<String>) -> Self {
         Self::Api(format!("Stream error: {}", msg.into()))
     }
@@ -1077,9 +1053,76 @@ impl ApiError {
     /// let err = ApiError::other("something unexpected happened");
     /// assert_eq!(err.code(), ErrorCode::InternalError);
     /// ```
-    ///
     pub fn other(msg: impl Into<String>) -> Self {
         Self::Other(msg.into())
+    }
+
+    /// Create an I/O error for a missing file.
+    ///
+    /// Convenience constructor for callers that know the operation was
+    /// a file lookup that failed. Maps to [`ErrorCode::IoFileNotFound`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::api_error::{ApiError, ErrorCode};
+    ///
+    /// let err = ApiError::io_not_found(
+    ///     std::io::Error::new(std::io::ErrorKind::NotFound, "config.toml"),
+    /// );
+    /// assert!(matches!(err, ApiError::Io(_)));
+    /// assert_eq!(err.code(), ErrorCode::IoFileNotFound);
+    /// ```
+    #[must_use]
+    pub fn io_not_found(err: std::io::Error) -> Self {
+        debug_assert!(
+            matches!(err.kind(), std::io::ErrorKind::NotFound),
+            "io_not_found called with non-NotFound ErrorKind: {:?}",
+            err.kind()
+        );
+        Self::Io(err)
+    }
+
+    /// Create an I/O error for a read failure.
+    ///
+    /// Maps to [`ErrorCode::IoReadError`] unless the underlying
+    /// [`std::io::ErrorKind`] indicates otherwise (e.g. `NotFound`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::api_error::{ApiError, ErrorCode};
+    ///
+    /// let err = ApiError::io_read(
+    ///     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated"),
+    /// );
+    /// assert!(matches!(err, ApiError::Io(_)));
+    /// assert_eq!(err.code(), ErrorCode::IoReadError);
+    /// ```
+    #[must_use]
+    pub fn io_read(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+
+    /// Create an I/O error for a write failure.
+    ///
+    /// Maps to [`ErrorCode::IoWriteError`] unless the underlying
+    /// [`std::io::ErrorKind`] indicates otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::api_error::{ApiError, ErrorCode};
+    ///
+    /// let err = ApiError::io_write(
+    ///     std::io::Error::new(std::io::ErrorKind::WriteZero, "disk full"),
+    /// );
+    /// assert!(matches!(err, ApiError::Io(_)));
+    /// assert_eq!(err.code(), ErrorCode::IoWriteError);
+    /// ```
+    #[must_use]
+    pub fn io_write(err: std::io::Error) -> Self {
+        Self::Io(err)
     }
 
     /// Convert any [`std::error::Error`] into an [`ApiError::Http`] variant.
@@ -1096,7 +1139,6 @@ impl ApiError {
     /// let api_err = ApiError::from_hyper(io_err);
     /// assert!(matches!(api_err, ApiError::Http(_)));
     /// ```
-    ///
     pub fn from_hyper<E: std::error::Error>(e: E) -> Self {
         Self::Http(e.to_string())
     }
@@ -1143,7 +1185,9 @@ pub type Result<T> = std::result::Result<T, ApiError>;
 /// - Keyword-based classification in [`ApiError::code`] selects the
 ///   most specific code for each message pattern.
 /// - Boolean predicates ([`ApiError::is_retryable`],
-///   [`ApiError::is_auth_error`], etc.) match the expected variants.
+///   [`ApiError::is_auth_error`], [`ApiError::is_config_error`],
+///   [`ApiError::is_context_overflow`], [`ApiError::is_io_error`],
+///   [`ApiError::is_tool_error`]) match the expected variants.
 /// - `From` conversions for [`serde_json::Error`] and [`std::io::Error`]
 ///   produce the correct variant and code.
 /// - [`ErrorCode`] serialisation round-trips through JSON.
@@ -1217,9 +1261,31 @@ mod tests {
     ///
     #[test]
     fn test_http_error_with_status() {
+        // 5xx → HttpResponseError
         let error = ApiError::http_with_status(500, "Server error");
         assert!(error.to_string().contains("HTTP 500"));
         assert!(error.to_string().contains("Server error"));
+        assert_eq!(error.code(), ErrorCode::HttpResponseError);
+
+        // 4xx → HttpRequestError
+        let error = ApiError::http_with_status(429, "Too many requests");
+        assert_eq!(error.code(), ErrorCode::HttpRequestError);
+
+        // Transport-level http() → HttpConnectionError
+        let error = ApiError::http("Connection refused");
+        assert_eq!(error.code(), ErrorCode::HttpConnectionError);
+
+        // Edge: status 399 → still < 500, so HttpRequestError
+        let error = ApiError::http_with_status(399, "redirect-ish");
+        assert_eq!(error.code(), ErrorCode::HttpRequestError);
+
+        // Edge: manual Http message without "HTTP {n}:" prefix → HttpConnectionError
+        let error = ApiError::Http("generic transport failure".into());
+        assert_eq!(error.code(), ErrorCode::HttpConnectionError);
+
+        // Edge: malformed status → HttpConnectionError (fallback)
+        let error = ApiError::Http("HTTP abc: not a number".into());
+        assert_eq!(error.code(), ErrorCode::HttpConnectionError);
     }
 
     #[test]
@@ -1290,6 +1356,9 @@ mod tests {
         assert!(ApiError::api_timeout("timed out").is_retryable());
         assert!(ApiError::api_rate_limited().is_retryable());
         assert!(ApiError::http("connection failed").is_retryable());
+        // HttpResponseError (5xx) and HttpRequestError (4xx) are retryable
+        assert!(ApiError::http_with_status(503, "unavailable").is_retryable());
+        assert!(ApiError::http_with_status(429, "too many requests").is_retryable());
         assert!(!ApiError::auth("invalid key").is_retryable());
         assert!(!ApiError::tool("not found").is_retryable());
     }
@@ -1315,11 +1384,27 @@ mod tests {
 
     #[test]
     fn test_from_io_error() {
+        // #[from] conversion routes NotFound → IoFileNotFound
         let error: ApiError =
             std::io::Error::new(std::io::ErrorKind::NotFound, "file not found").into();
         assert!(matches!(error, ApiError::Io(_)));
-        assert_eq!(error.code(), ErrorCode::IoReadError);
+        assert_eq!(error.code(), ErrorCode::IoFileNotFound);
         assert!(error.is_io_error());
+
+        // PermissionDenied → IoWriteError
+        let error: ApiError =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no access").into();
+        assert_eq!(error.code(), ErrorCode::IoWriteError);
+
+        // Generic I/O error → IoReadError
+        let error: ApiError =
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated").into();
+        assert_eq!(error.code(), ErrorCode::IoReadError);
+
+        // WriteZero → IoWriteError
+        let error: ApiError =
+            std::io::Error::new(std::io::ErrorKind::WriteZero, "disk full").into();
+        assert_eq!(error.code(), ErrorCode::IoWriteError);
     }
 
     #[test]
@@ -1362,6 +1447,24 @@ mod tests {
     fn test_error_code_serialization() {
         let code = ErrorCode::ApiRequestFailed;
         let json = serde_json::to_string(&code).unwrap();
+        assert_eq!(
+            json, "1000",
+            "ErrorCode should serialize as numeric discriminant"
+        );
+        let back: ErrorCode = serde_json::from_str(&json).unwrap();
+        assert_eq!(code, back);
+
+        // Verify round-trip for a code in the middle of the range
+        let code = ErrorCode::ToolPermissionDenied;
+        let json = serde_json::to_string(&code).unwrap();
+        assert_eq!(json, "1302");
+        let back: ErrorCode = serde_json::from_str(&json).unwrap();
+        assert_eq!(code, back);
+
+        // Verify round-trip for the largest code
+        let code = ErrorCode::Interrupted;
+        let json = serde_json::to_string(&code).unwrap();
+        assert_eq!(json, "1999");
         let back: ErrorCode = serde_json::from_str(&json).unwrap();
         assert_eq!(code, back);
     }

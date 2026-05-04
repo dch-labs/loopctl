@@ -6,5 +6,7 @@
 //! # Provided Types
 //!
 //! - **[`convergence`]** — Detects when agent responses become semantically similar.
+//! - **[`loop_detector`]** — Detects repetitive tool-use loops and enforces limits.
 
 pub mod convergence;
+pub mod loop_detector;

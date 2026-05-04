@@ -1,10 +1,14 @@
 //! A trait-based framework for building agent loops with pluggable LLM
 //! clients, tools, and memory.
 //!
-//! See the [`message`] module for the core conversation types,
-//! the [`core`] module for foundational traits and error types,
-//! and the [`api_error`] module for API and infrastructure error types.
+//! # Module Overview
+//!
+//! - **[`message`]** — Core conversation types: messages, parts, tool results.
+//! - **[`api_error`]** — API and infrastructure error types with classification.
+//! - **[`builder`]** — Fluent builder API for constructing configured agents.
+//! - **[`core`]** — Foundational traits (`AgentObserver`) and error types.
 
 pub mod api_error;
+pub mod builder;
 pub mod core;
 pub mod message;

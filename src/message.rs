@@ -29,7 +29,7 @@
 //!                         │
 //!                     API processes
 //!                         │
-//!         ◀── Message::assistant("thinking…")
+//!         ◀── Message::assistant("thinking...")
 //!         ◀── MessagePart::ToolCall { id, name, input }
 //!                         │
 //!              Framework executes tool

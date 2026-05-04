@@ -7,6 +7,7 @@ check:
 
 test:
 	cargo test --all-features
+	cargo test --doc --all-features
 
 clippy:
 	cargo clippy --all-features -- -D warnings

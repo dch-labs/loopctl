@@ -1,0 +1,66 @@
+# loopctl clippy configuration
+# Strict linting for the entire project.
+# Run: cargo clippy --all-features -- -D warnings
+
+# Thresholds
+
+# Maximum cognitive complexity per function before warning.
+cognitive-complexity-threshold = 30
+
+# Maximum number of struct fields before suggesting a builder.
+struct-field-name-threshold = 8
+
+# Type complexity threshold (default is 250).
+type-complexity-threshold = 250
+
+# Maximum lines of code per function body before warning.
+too-many-lines-threshold = 150
+
+# Maximum number of arguments before warning.
+too-many-arguments-threshold = 7
+
+# MSRV from Cargo.toml.
+msrv = "1.85.0"
+
+# Warn when passing types larger than this by value (bytes).
+trivial-copy-size-limit = 32
+
+# Warn on large stack frames.
+stack-size-threshold = 512000
+
+# Warn when a single-char binding name is used more than N times.
+single-char-binding-names-threshold = 4
+
+# Style enforcement
+
+disallowed-names = ["foo", "bar", "baz", "quux"]
+
+doc-valid-idents = [
+    "GraphQL", "WebSocket", "REST", "gRPC",
+    "OpenAI", "Anthropic", "HuggingFace",
+    "OAuth", "JWT", "HMAC", "SHA",
+    "Linux", "macOS", "FreeBSD",
+    "AccessKit", "CoreFoundation", "Direct2D",
+    "Direct3D", "DirectWrite", "OpenSSL",
+    "MinGW", "NaN", "NaNs",
+]
+
+# Lint behavior
+
+avoid-breaking-exported-api = false
+check-private-items = true
+allow-one-hash-in-raw-strings = true
+
+enum-variant-size-threshold = 200
+large-error-threshold = 128
+pass-by-value-size-limit = 256
+vec-box-size-threshold = 128
+unnecessary-box-size = 128
+literal-representation-threshold = 4
+verbose-bit-mask-threshold = 1
+
+max-struct-bools = 3
+max-fn-params-bools = 2
+max-trait-bounds = 4
+
+standard-macro-braces = []

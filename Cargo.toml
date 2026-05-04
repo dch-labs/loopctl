@@ -20,6 +20,7 @@ path = "src/lib.rs"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_repr = "0.1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
@@ -31,3 +32,18 @@ proptest = "1"
 [features]
 default = []
 testing = []
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+arithmetic_side_effects = "deny"
+indexing_slicing = "deny"
+match_same_arms = "deny"
+redundant_clone = "deny"
+clone_on_ref_ptr = "deny"
+let_underscore_must_use = "deny"

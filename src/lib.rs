@@ -7,8 +7,10 @@
 //! - **[`api_error`]** — API and infrastructure error types with classification.
 //! - **[`builder`]** — Fluent builder API for constructing configured agents.
 //! - **[`core`]** — Foundational traits (`AgentObserver`) and error types.
+//! - **[`loop_control`]** — Detection and intervention modules for agent loops.
 
 pub mod api_error;
 pub mod builder;
 pub mod core;
+pub mod loop_control;
 pub mod message;

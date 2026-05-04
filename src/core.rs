@@ -6,9 +6,9 @@
 //!
 //! # Traits
 //!
-//! | Trait             | Purpose                                               |
-//! |-------------------|-------------------------------------------------------|
-// TODO: to be added
+//! | Trait              | Purpose                                               |
+//! |--------------------|-------------------------------------------------------|
+//! | [`AgentObserver`]  | Lifecycle event hooks for monitoring agents            |
 //!
 //! # Supporting Types
 //!
@@ -16,16 +16,16 @@
 //! |-------------------|-------------------------------------------------------|
 //! | [`AgentError`]    | Unified error type for all framework operations       |
 
+pub mod agent_observer;
 pub mod error;
 // TODO: add remaining modules
 // pub mod agent_core;
 // pub mod agent_memory;
-// pub mod agent_observer;
 // pub mod types;
 
+pub use agent_observer::*;
 pub use error::*;
-// TODO: add remaining modules
+// TODO: add remaining pub use re-exports as modules are migrated
 // pub use agent_core::*;
 // pub use agent_memory::*;
-// pub use agent_observer::*;
 // pub use types::*;

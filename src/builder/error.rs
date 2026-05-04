@@ -83,13 +83,13 @@ pub enum BuildError {
     /// variant carries the dependency name and a hint about how to provide it.
     ///
     /// **Fix:** Add the missing dependency before calling `.build()`.
-    #[error("Missing dependency: {0}. {1}")]
-    MissingDependency(
+    #[error("Missing dependency: {name}. {hint}")]
+    MissingDependency {
         /// Name of the missing dependency (e.g. `"ApiClient"`, `"ToolRegistry"`).
-        &'static str,
+        name: String,
         /// Human-readable hint describing how to supply the dependency.
-        &'static str,
-    ),
+        hint: String,
+    },
 
     /// Feature conflict — two mutually exclusive features enabled.
     ///
@@ -151,10 +151,13 @@ impl BuildError {
     ///
     /// # Arguments
     ///
-    /// - `name` — Static string identifying the missing dependency
+    /// - `name` — Name of the missing dependency
     ///   (e.g. `"ApiClient"`).
-    /// - `hint` — Static string describing how to supply the dependency
+    /// - `hint` — Description of how to supply the dependency
     ///   (e.g. `"Call .with_api_client() before building."`).
+    ///
+    /// Accepts any `Into<String>` so callers can pass `&str`, `String`,
+    /// or string literals interchangeably.
     ///
     /// # Example
     ///
@@ -165,11 +168,14 @@ impl BuildError {
     ///     "ToolRegistry",
     ///     "Call .with_tool_registry() with a configured registry.",
     /// );
-    /// assert!(matches!(err, BuildError::MissingDependency("ToolRegistry", _)));
+    /// assert!(matches!(err, BuildError::MissingDependency { .. }));
     /// ```
     #[must_use]
-    pub fn missing_dependency(name: &'static str, hint: &'static str) -> Self {
-        Self::MissingDependency(name, hint)
+    pub fn missing_dependency(name: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self::MissingDependency {
+            name: name.into(),
+            hint: hint.into(),
+        }
     }
 
     /// Create a feature-conflict error naming two incompatible features.
@@ -223,10 +229,17 @@ mod tests {
     #[test]
     fn test_missing_dependency_constructor() {
         let err = BuildError::missing_dependency("ApiClient", "Call .with_api_client()");
-        assert!(matches!(err, BuildError::MissingDependency("ApiClient", _)));
+        assert!(matches!(err, BuildError::MissingDependency { .. }));
         let msg = err.to_string();
         assert!(msg.contains("ApiClient"));
         assert!(msg.contains(".with_api_client()"));
+
+        // Also accepts String
+        let err = BuildError::missing_dependency(
+            String::from("ToolRegistry"),
+            format!("Call .with_tool_registry()"),
+        );
+        assert!(matches!(err, BuildError::MissingDependency { .. }));
     }
 
     #[test]

@@ -1,0 +1,41 @@
+# loopctl formatting rules
+# Derived from the project's existing style (edition 2024, rustfmt 1.8.0).
+# Run: cargo fmt --all -- --check
+
+# Line width
+max_width = 100
+
+# Indentation
+hard_tabs = false
+tab_spaces = 4
+
+# Newlines
+newline_style = "Unix"
+
+# Functions & calls
+fn_params_layout = "Tall"
+fn_call_width = 60
+attr_fn_like_width = 70
+struct_lit_width = 18
+struct_variant_width = 35
+array_width = 60
+chain_width = 60
+single_line_if_else_max_width = 50
+single_line_let_else_max_width = 50
+
+# Heuristics & expressions
+use_small_heuristics = "Default"
+short_array_element_width_threshold = 10
+remove_nested_parens = true
+match_arm_leading_pipes = "Never"
+match_block_trailing_comma = false
+
+# Imports
+reorder_imports = true
+reorder_modules = true
+
+# Miscellaneous
+merge_derives = true
+use_field_init_shorthand = true
+force_explicit_abi = true
+

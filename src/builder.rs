@@ -8,7 +8,11 @@
 //! # Provided Types
 //!
 //! - **[`BuildError`]** — Errors that can occur during builder validation.
+//! - **[`Feature`]** — Named feature flag enum.
+//! - **[`FeatureSet`]** — Compact set of enabled features.
 
 pub mod error;
+pub mod features;
 
 pub use error::BuildError;
+pub use features::{Feature, FeatureSet};

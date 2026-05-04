@@ -341,7 +341,7 @@ pub enum ErrorCode {
 ///
 /// ```rust
 /// use loopctl::api_error::{ApiError, ErrorCode};
-/// // Instead of ApiError::Api("…".into())
+/// // Instead of ApiError::Api("...".into())
 /// let err = ApiError::api("request failed");
 ///
 /// // Contextual constructors embed structured messages

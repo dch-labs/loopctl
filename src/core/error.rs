@@ -83,6 +83,7 @@
 /// - [`Internal`](AgentError::Internal) — A catch-all for unexpected
 ///   or infrastructure-level errors.
 #[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
 pub enum AgentError {
     /// A tool was not found in the registry.
     ///
@@ -360,5 +361,104 @@ impl AgentError {
     /// ```
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn tool_not_found_empty_available_says_none_registered() {
+        let err = AgentError::tool_not_found("my_tool", &[]);
+        assert_eq!(
+            err.to_string(),
+            "Tool not found: my_tool. Available: none registered"
+        );
+    }
+
+    #[test]
+    fn tool_not_found_up_to_10_entries_comma_joined() {
+        let names: Vec<&str> = (1..=10)
+            .map(|i| {
+                static TOOLS: [&str; 10] = [
+                    "tool_1", "tool_2", "tool_3", "tool_4", "tool_5", "tool_6", "tool_7", "tool_8",
+                    "tool_9", "tool_10",
+                ];
+                TOOLS[i - 1]
+            })
+            .collect();
+        let err = AgentError::tool_not_found("missing", &names);
+        assert_eq!(
+            err.to_string(),
+            "Tool not found: missing. Available: tool_1, tool_2, tool_3, tool_4, tool_5, tool_6, tool_7, tool_8, tool_9, tool_10"
+        );
+    }
+
+    #[test]
+    fn tool_not_found_more_than_10_truncates_with_and_n_more() {
+        let names: Vec<&str> = vec![
+            "tool_1", "tool_2", "tool_3", "tool_4", "tool_5", "tool_6", "tool_7", "tool_8",
+            "tool_9", "tool_10", "tool_11", "tool_12", "tool_13",
+        ];
+        let err = AgentError::tool_not_found("missing", &names);
+        assert_eq!(
+            err.to_string(),
+            "Tool not found: missing. Available: tool_1, tool_2, tool_3, tool_4, tool_5, tool_6, tool_7, tool_8, tool_9, tool_10... (and 3 more)"
+        );
+    }
+
+    #[test]
+    fn tool_not_found_exactly_11_shows_one_more() {
+        let names: Vec<&str> = vec![
+            "tool_1", "tool_2", "tool_3", "tool_4", "tool_5", "tool_6", "tool_7", "tool_8",
+            "tool_9", "tool_10", "tool_11",
+        ];
+        let err = AgentError::tool_not_found("missing", &names);
+        assert_eq!(
+            err.to_string(),
+            "Tool not found: missing. Available: tool_1, tool_2, tool_3, tool_4, tool_5, tool_6, tool_7, tool_8, tool_9, tool_10... (and 1 more)"
+        );
+    }
+
+    #[test]
+    fn is_recoverable_true_for_tool_execution() {
+        let err = AgentError::ToolExecution {
+            tool: "cat".into(),
+            message: "something went wrong".into(),
+        };
+        assert!(err.is_recoverable());
+    }
+
+    #[test]
+    fn is_recoverable_true_for_api() {
+        let err = AgentError::Api("rate limited".into());
+        assert!(err.is_recoverable());
+    }
+
+    #[test]
+    fn is_recoverable_true_for_context_exceeded() {
+        let err = AgentError::ContextExceeded {
+            used: 200_000,
+            limit: 128_000,
+        };
+        assert!(err.is_recoverable());
+    }
+
+    #[test]
+    fn is_recoverable_true_for_reflection() {
+        let err = AgentError::Reflection("need to rethink".into());
+        assert!(err.is_recoverable());
+    }
+
+    #[test]
+    fn is_recoverable_false_for_tool_not_found() {
+        let err = AgentError::tool_not_found("nope", &["a", "b"]);
+        assert!(!err.is_recoverable());
+    }
+
+    #[test]
+    fn is_recoverable_false_for_cancelled() {
+        let err = AgentError::Cancelled;
+        assert!(!err.is_recoverable());
     }
 }

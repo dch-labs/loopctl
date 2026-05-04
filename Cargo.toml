@@ -13,7 +13,7 @@ readme = "README.md"
 rust-version = "1.85"
 
 [lib]
-name = "agentloop"
+name = "loopctl"
 path = "src/lib.rs"
 
 [dependencies]

@@ -7,6 +7,8 @@
 //!
 //! - **[`convergence`]** — Detects when agent responses become semantically similar.
 //! - **[`loop_detector`]** — Detects repetitive tool-use loops and enforces limits.
+//! - **[`fallback`]** — Circuit breaker pattern for automatic API model fallback.
 
 pub mod convergence;
+pub mod fallback;
 pub mod loop_detector;

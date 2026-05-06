@@ -172,7 +172,7 @@ impl Default for AgentConfig {
 /// enum to drive the agent loop and report status to observers.
 ///
 /// ```text
-/// Idle → Processing → WaitingForTool → Processing → … → Completed/Failed
+/// Idle → Processing → WaitingForTool → Processing → ... → Completed/Failed
 ///                  ↘ Compacting ↗
 ///                  ↘ Reflecting ↗
 /// ```

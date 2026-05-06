@@ -95,8 +95,6 @@ use tracing::{debug, info, warn};
 /// assert_eq!(state as u8, 0);
 /// assert_eq!(FallbackState::from(1), FallbackState::Fallback);
 /// ```
-///
-/// See the surrounding documentation and cross-references for details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackState {
     /// Circuit is **closed** — using the primary model.
@@ -104,8 +102,6 @@ pub enum FallbackState {
     /// All requests route to the primary LLM. Consecutive failures are
     /// counted; once they reach the configured threshold the circuit
     /// trips open and transitions to [`Fallback`](FallbackState::Fallback).
-    ///
-    /// See the surrounding documentation and cross-references for details.
     Primary = 0,
 
     /// Circuit is **open** — using the fallback model.
@@ -114,8 +110,6 @@ pub enum FallbackState {
     /// stays in this state until [`FallbackManager::should_try_resume_primary`]
     /// returns `true`, at which point it transitions to
     /// [`Recovering`](FallbackState::Recovering) to probe the primary.
-    ///
-    /// See the surrounding documentation and cross-references for details.
     Fallback = 1,
 
     /// Circuit is **half-open** — probing whether the primary has recovered.
@@ -125,8 +119,6 @@ pub enum FallbackState {
     /// [`FallbackConfig::recovery_successes_needed`]), the circuit closes
     /// back to [`Primary`](FallbackState::Primary). A single failure
     /// immediately reopens the circuit to [`Fallback`](FallbackState::Fallback).
-    ///
-    /// See the surrounding documentation and cross-references for details.
     Recovering = 2,
 }
 
@@ -152,8 +144,6 @@ pub enum FallbackState {
 /// assert_eq!(FallbackState::from(2u8), FallbackState::Recovering);
 /// assert_eq!(FallbackState::from(255u8), FallbackState::Primary); // unknown → safe default
 /// ```
-///
-/// See the surrounding documentation and cross-references for details.
 impl From<u8> for FallbackState {
     #[allow(clippy::match_same_arms)]
     fn from(value: u8) -> Self {
@@ -182,8 +172,6 @@ impl From<u8> for FallbackState {
 /// let record = AttemptRecord::new("rate_limit");
 /// assert_eq!(record.reason(), Some("rate_limit"));
 /// ```
-///
-/// See the surrounding documentation and cross-references for details.
 #[derive(Debug, Clone)]
 pub struct AttemptRecord {
     /// When this failure was recorded.
@@ -299,8 +287,6 @@ impl AttemptRecord {
 /// assert_eq!(entry.attempt_count(), 2);
 /// assert!(entry.failed()); // max_fail_count defaults to 2
 /// ```
-///
-/// See the surrounding documentation and cross-references for details.
 #[derive(Debug, Clone)]
 pub struct FallbackEntry {
     /// Model identifier (e.g. `"llm-70b"`).
@@ -605,8 +591,6 @@ impl FallbackEntry {
 ///     max_fail_count: 2,
 /// };
 /// ```
-///
-/// See the surrounding documentation and cross-references for details.
 #[derive(Debug, Clone)]
 pub struct FallbackConfig {
     /// Number of consecutive API failures before the circuit trips open.
@@ -614,10 +598,6 @@ pub struct FallbackConfig {
     /// Once this many failures have been recorded in a row (without an
     /// intervening success), the manager transitions from [`FallbackState::Primary`]
     /// to [`FallbackState::Fallback`]. Defaults to `3`.
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     pub trip_threshold: usize,
 
     /// Minimum time to remain in [`FallbackState::Fallback`] before probing
@@ -626,10 +606,6 @@ pub struct FallbackConfig {
     /// Checked by [`FallbackManager::should_try_resume_primary`]. Defaults
     /// to 60 seconds. Set this higher to give a degraded API more time to
     /// recover before retrying.
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     pub recovery_timeout: Duration,
 
     /// Number of consecutive successful requests on the primary model during
@@ -638,10 +614,6 @@ pub struct FallbackConfig {
     /// Each success is recorded via [`FallbackManager::record_model_success`];
     /// once the count reaches this threshold, the manager transitions back
     /// to [`FallbackState::Primary`]. Defaults to `2`.
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     pub recovery_successes_needed: usize,
 
     /// Per-model failure threshold: how many recorded failures before a
@@ -651,10 +623,6 @@ pub struct FallbackConfig {
     /// When [`FallbackEntry::attempt_count`] reaches this value, the entry
     /// is considered [`failed`](FallbackEntry::failed) and is skipped by
     /// [`FallbackManager::fallback_model`]. Defaults to `2`.
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     pub max_fail_count: usize,
 }
 
@@ -672,8 +640,6 @@ pub struct FallbackConfig {
 /// assert_eq!(config.trip_threshold, 3);
 /// assert_eq!(config.max_fail_count, 2);
 /// ```
-///
-/// See the surrounding documentation and cross-references for details.
 impl Default for FallbackConfig {
     fn default() -> Self {
         Self {
@@ -733,8 +699,6 @@ impl Default for FallbackConfig {
 ///     mgr.record_model_success(); // → back to Primary
 /// }
 /// ```
-///
-/// See the surrounding documentation and cross-references for details.
 pub struct FallbackManager {
     // ==================================================
     // Config
@@ -745,10 +709,6 @@ pub struct FallbackManager {
     /// this value, the circuit trips from [`FallbackState::Primary`] to
     /// [`FallbackState::Fallback`]. Set at construction time via
     /// [`FallbackManager::new`] or [`FallbackManager::with_config`].
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     fallback_threshold: usize,
 
     /// Successes needed on primary before resuming.
@@ -756,10 +716,6 @@ pub struct FallbackManager {
     /// During [`FallbackState::Recovering`], this many consecutive
     /// successes must be recorded via [`record_model_success`](Self::record_model_success)
     /// before the circuit closes back to [`FallbackState::Primary`].
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     primary_resume_threshold: usize,
 
     /// Per-model max failure count, passed to new [`FallbackEntry`] instances.
@@ -769,10 +725,6 @@ pub struct FallbackManager {
     /// they use [`FallbackEntry::with_max_fail_count`] with this value.
     /// Defaults to `2`. Override via
     /// [`FallbackConfig::max_fail_count`].
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     default_max_fail_count: usize,
 
     // ==================================================
@@ -784,9 +736,6 @@ pub struct FallbackManager {
     /// or [`record_api_failure`](Self::record_api_failure). Reset to `0`
     /// on success ([`record_model_success`](Self::record_model_success))
     /// or by calling [`reset`](Self::reset). Starts at `0`.
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     consecutive_failures: AtomicUsize,
 
     /// Whether fallback has been activated (sticky flag).
@@ -796,20 +745,12 @@ pub struct FallbackManager {
     /// the circuit on every subsequent failure. Cleared by
     /// [`transition_to_primary`](Self::transition_to_primary) or
     /// [`reset`](Self::reset).
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     fallback_activated: AtomicBool,
 
     /// Circuit breaker state (0=Primary, 1=Fallback, 2=Recovering).
     ///
     /// Stored as a [`FallbackState`] discriminant for lock-free reads.
     /// Use [`state()`](Self::state) to access the typed value.
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     fallback_state: AtomicU8,
 
     /// Consecutive successes on primary during recovery.
@@ -819,10 +760,6 @@ pub struct FallbackManager {
     /// Once it reaches [`primary_resume_threshold`](Self::primary_resume_threshold),
     /// the circuit closes to [`FallbackState::Primary`]. Reset to `0`
     /// on any state transition.
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     primary_success_count: AtomicUsize,
 
     // ==================================================
@@ -836,9 +773,6 @@ pub struct FallbackManager {
     /// [`original_model`](Self::original_model) and used by
     /// [`active_model`](Self::active_model) to decide which model to use.
     /// `None` until explicitly set.
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     original_model: Mutex<Option<String>>,
 
     /// Ordered list of fallback models with their failure status.
@@ -865,10 +799,6 @@ pub struct FallbackManager {
     ///
     /// `None` when no fallback model is configured or when all fallbacks
     /// have failed.
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     active_fallback: Mutex<Option<String>>,
 
     /// Time when fallback was activated.
@@ -880,10 +810,6 @@ pub struct FallbackManager {
     /// [`reset`](Self::reset). Checked by
     /// [`should_try_resume_primary`](Self::should_try_resume_primary)
     /// to enforce the cooldown period.
-    ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     fallback_switched_at: Mutex<Option<Instant>>,
 }
 
@@ -911,8 +837,6 @@ impl FallbackManager {
     /// let mgr = FallbackManager::new(5, 3);
     /// // Trip after 5 failures, resume after 3 consecutive successes
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     #[must_use]
     pub fn new(fallback_threshold: usize, primary_resume_threshold: usize) -> Self {
         Self {
@@ -951,8 +875,6 @@ impl FallbackManager {
     /// };
     /// let mgr = FallbackManager::with_config(&config);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     #[must_use]
     pub fn with_config(config: &FallbackConfig) -> Self {
         let mut mgr = Self::new(config.trip_threshold, config.recovery_successes_needed);
@@ -988,8 +910,6 @@ impl FallbackManager {
     /// assert!(mgr.is_using_fallback());
     /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     #[must_use]
     pub fn new_with_fallback(original_model: String, fallback_threshold: usize) -> Self {
         let mgr = Self::new(fallback_threshold, 2);
@@ -1022,8 +942,6 @@ impl FallbackManager {
     /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
     /// assert!(!mgr.is_using_fallback());
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn for_model(primary_model: impl Into<String>) -> Self {
         let mgr = Self::new(3, 2);
         if let Ok(mut m) = mgr.original_model.lock() {
@@ -1078,8 +996,6 @@ impl FallbackManager {
     /// let mgr = FallbackManager::new(3, 2);
     /// assert_eq!(mgr.state(), FallbackState::Primary);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn state(&self) -> FallbackState {
         FallbackState::from(self.fallback_state.load(Ordering::Relaxed))
     }
@@ -1099,8 +1015,6 @@ impl FallbackManager {
     /// let mgr = FallbackManager::new(3, 2);
     /// assert!(!mgr.is_using_fallback());
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn is_using_fallback(&self) -> bool {
         matches!(self.state(), FallbackState::Fallback)
     }
@@ -1120,8 +1034,6 @@ impl FallbackManager {
     /// let mgr = FallbackManager::new(3, 2);
     /// assert!(!mgr.is_fallback_active());
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn is_fallback_active(&self) -> bool {
         self.fallback_activated.load(Ordering::Relaxed)
     }
@@ -1141,8 +1053,6 @@ impl FallbackManager {
     /// mgr.record_model_failure();
     /// assert_eq!(mgr.consecutive_failures(), 1);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn consecutive_failures(&self) -> usize {
         self.consecutive_failures.load(Ordering::Relaxed)
     }
@@ -1162,8 +1072,6 @@ impl FallbackManager {
     /// let mgr = FallbackManager::for_model("llm-70b");
     /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn original_model(&self) -> Option<String> {
         self.original_model.lock().ok().and_then(|m| m.clone())
     }
@@ -1183,8 +1091,6 @@ impl FallbackManager {
     /// mgr.set_original_model("llm-70b".into());
     /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn set_original_model(&self, model: String) {
         if let Ok(mut m) = self.original_model.lock() {
             *m = Some(model);
@@ -1209,8 +1115,6 @@ impl FallbackManager {
     /// let mgr = FallbackManager::new(3, 2);
     /// assert!(mgr.fallback_switched_at().is_none());
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn fallback_switched_at(&self) -> Option<Instant> {
         self.fallback_switched_at.lock().ok().and_then(|t| *t)
     }
@@ -1240,8 +1144,6 @@ impl FallbackManager {
     /// let mgr = FallbackManager::for_model("llm-70b");
     /// assert_eq!(mgr.active_model(), Some("llm-70b".to_string()));
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn active_model(&self) -> Option<String> {
         match self.state() {
             FallbackState::Primary | FallbackState::Recovering => self.original_model(),
@@ -1282,8 +1184,6 @@ impl FallbackManager {
     /// assert_eq!(mgr.state(), FallbackState::Fallback);
     /// assert_eq!(mgr.active_model(), Some("llm-4".to_string()));
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn set_fallback_model(&self, model: impl Into<String>) {
         if let Ok(mut m) = self.fallback_models.lock() {
             m.clear();
@@ -1313,8 +1213,6 @@ impl FallbackManager {
     /// mgr.add_fallback_model("llm-120b");
     /// assert_eq!(mgr.fallback_model(), Some("llm-70b".to_string())); // first in chain
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn fallback_model(&self) -> Option<String> {
         self.active_fallback.lock().ok().and_then(|m| m.clone())
     }
@@ -1337,8 +1235,6 @@ impl FallbackManager {
     /// let chain = mgr.fallback_models();
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b", "llm-32b"]);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn fallback_models(&self) -> Vec<String> {
         self.fallback_models
             .lock()
@@ -1369,8 +1265,6 @@ impl FallbackManager {
     /// let chain = mgr.fallback_models();
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b"]);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn add_fallback_model(&self, model: impl Into<String>) {
         if let Ok(mut m) = self.fallback_models.lock() {
             m.push(FallbackEntry::with_max_fail_count(
@@ -1404,8 +1298,6 @@ impl FallbackManager {
     /// let chain = mgr.fallback_models();
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b", "llm-32b"]);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn insert_fallback_model(&self, index: usize, model: impl Into<String>) {
         if let Ok(mut m) = self.fallback_models.lock() {
             let entry = FallbackEntry::with_max_fail_count(model, self.default_max_fail_count);
@@ -1439,8 +1331,6 @@ impl FallbackManager {
     /// let chain = mgr.fallback_models();
     /// assert_eq!(chain, vec!["llm-120b"]);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn remove_fallback_model(&self, model: &str) -> bool {
         let removed = if let Ok(mut m) = self.fallback_models.lock() {
             if let Some(pos) = m.iter().position(|x| x.name == model) {
@@ -1478,8 +1368,6 @@ impl FallbackManager {
     /// let chain = mgr.fallback_models();
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b", "llm-32b"]);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn set_fallback_models(&self, models: Vec<String>) {
         let max_fc = self.default_max_fail_count;
         if let Ok(mut m) = self.fallback_models.lock() {
@@ -1521,8 +1409,6 @@ impl FallbackManager {
     /// // active_model skips failed, returns next available
     /// assert_eq!(mgr.fallback_model(), Some("llm-3".to_string()));
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn mark_fallback_failed(&self, model: &str) -> bool {
         let found = if let Ok(mut m) = self.fallback_models.lock() {
             if let Some(entry) = m.iter_mut().find(|e| e.name == model) {
@@ -1560,8 +1446,6 @@ impl FallbackManager {
     /// mgr.clear_fallback_failed("llm-2");
     /// assert!(mgr.failed_fallbacks().is_empty());
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn clear_fallback_failed(&self, model: &str) -> bool {
         let found = if let Ok(mut m) = self.fallback_models.lock() {
             if let Some(entry) = m.iter_mut().find(|e| e.name == model) {
@@ -1601,8 +1485,6 @@ impl FallbackManager {
     /// mgr.clear_all_fallback_failed();
     /// assert!(mgr.failed_fallbacks().is_empty());
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn clear_all_fallback_failed(&self) {
         if let Ok(mut m) = self.fallback_models.lock() {
             for entry in m.iter_mut() {
@@ -1631,8 +1513,6 @@ impl FallbackManager {
     /// let failed = mgr.failed_fallbacks();
     /// assert_eq!(failed, vec!["llm-3"]);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn failed_fallbacks(&self) -> Vec<String> {
         self.fallback_models
             .lock()
@@ -1665,8 +1545,6 @@ impl FallbackManager {
     /// let available = mgr.available_fallbacks();
     /// assert_eq!(available, vec!["llm-2"]);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn available_fallbacks(&self) -> Vec<String> {
         self.fallback_models
             .lock()
@@ -1704,8 +1582,6 @@ impl FallbackManager {
     ///
     /// assert!(mgr.fallback_entry("nonexistent").is_none());
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn fallback_entry(&self, name: &str) -> Option<FallbackEntry> {
         self.fallback_models
             .lock()
@@ -1742,8 +1618,6 @@ impl FallbackManager {
     /// mgr.set_fallback_available("llm-2", true);
     /// assert_eq!(mgr.fallback_model(), Some("llm-2".to_string()));
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn set_fallback_available(&self, model: &str, available: bool) -> bool {
         let found = if let Ok(mut m) = self.fallback_models.lock() {
             if let Some(entry) = m.iter_mut().find(|e| e.name == model) {
@@ -1792,8 +1666,6 @@ impl FallbackManager {
     /// assert!(mgr.record_api_failure());  // 3 — threshold reached
     /// assert!(mgr.record_api_failure());  // 4 — still not activated
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn record_api_failure(&self) -> bool {
         let failures = self
             .consecutive_failures
@@ -1815,8 +1687,6 @@ impl FallbackManager {
     ///
     /// Provided for callers that prefer the shorter `record_failure` name.
     /// Delegates directly to [`record_api_failure`](Self::record_api_failure).
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn record_failure(&self) -> bool {
         self.record_api_failure()
     }
@@ -1839,8 +1709,6 @@ impl FallbackManager {
     /// mgr.reset_failure_counter();
     /// assert_eq!(mgr.consecutive_failures(), 0);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn reset_failure_counter(&self) {
         self.consecutive_failures.store(0, Ordering::Relaxed);
     }
@@ -1869,8 +1737,6 @@ impl FallbackManager {
     /// mgr.record_model_success(); // resets failures to 0
     /// assert_eq!(mgr.consecutive_failures(), 0);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn record_model_success(&self) {
         match self.state() {
             FallbackState::Primary => {
@@ -1900,8 +1766,6 @@ impl FallbackManager {
     ///
     /// Provided for callers that prefer the shorter `record_success` name.
     /// Delegates directly to [`record_model_success`](Self::record_model_success).
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn record_success(&self) {
         self.record_model_success();
     }
@@ -1938,8 +1802,6 @@ impl FallbackManager {
     /// assert!(mgr.record_model_failure());  // 3 → trips to Fallback
     /// assert_eq!(mgr.state(), FallbackState::Fallback);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn record_model_failure(&self) -> bool {
         match self.state() {
             FallbackState::Primary => {
@@ -2003,8 +1865,6 @@ impl FallbackManager {
     /// // Not in fallback state → false
     /// assert!(!mgr.should_try_resume_primary(Duration::from_secs(10)));
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn should_try_resume_primary(&self, min_fallback_duration: Duration) -> bool {
         if self.state() != FallbackState::Fallback {
             return false;
@@ -2037,8 +1897,6 @@ impl FallbackManager {
     /// mgr.transition_to_fallback();
     /// assert_eq!(mgr.state(), FallbackState::Fallback);
     /// ```
-    ///
-    /// Called internally by the framework during the agent loop.
     pub fn transition_to_fallback(&self) {
         self.fallback_state
             .store(FallbackState::Fallback as u8, Ordering::Relaxed);
@@ -2070,7 +1928,6 @@ impl FallbackManager {
     /// mgr.transition_to_recovering();
     /// assert_eq!(mgr.state(), FallbackState::Recovering);
     /// ```
-    ///
     pub fn transition_to_recovering(&self) {
         self.fallback_state
             .store(FallbackState::Recovering as u8, Ordering::Relaxed);

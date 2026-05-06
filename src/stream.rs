@@ -111,7 +111,7 @@ impl std::error::Error for StreamError {
 ///   → PartStart
 ///     → IndexedDelta (repeated)
 ///   → PartStop
-///   → … more parts …
+///   → ... more parts ...
 /// → MessageDelta
 /// → MessageStop
 /// ```

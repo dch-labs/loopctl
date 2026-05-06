@@ -395,7 +395,7 @@ impl Default for ConvergenceConfig {
 /// consecutive_count ─── how many similar responses in a row
 /// similarity_score ──── highest Jaccard score among compared pairs
 /// similar_responses ─── the response texts that triggered detection
-/// action ────────────── what the caller should do (stop, warn, …)
+/// action ────────────── what the caller should do (stop, warn, ...)
 /// ```
 ///
 /// # Example

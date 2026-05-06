@@ -33,18 +33,18 @@
 //!
 //! # Quick Start
 //!
-//! ```rust,ignore
+//! ```rust
 //! use loopctl::stream::{StreamAccumulator, StreamEvent, StreamStopReason};
 //!
 //! let mut acc = StreamAccumulator::new();
 //!
 //! // Feed events as they arrive from the SSE connection
-//! for event in sse_events {
-//!     acc.process(&event)?;
+//! for event in std::iter::empty::<StreamEvent>() {
+//!     acc.process(&event).unwrap();
 //! }
 //!
 //! // Get usage before building (build consumes the accumulator)
-//! let usage = acc.usage();
+//! let _usage = acc.usage();
 //! let message = acc.build();
 //! ```
 
@@ -126,17 +126,20 @@ impl std::error::Error for StreamError {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use loopctl::stream::{StreamEvent, DeltaPart, IndexedDelta};
+///
+/// let event = StreamEvent::MessageStop; // placeholder
 /// match event {
-///     StreamEvent::MessageStart(start) => {
-///         println!("Model: {}", start.message.model);
+///     StreamEvent::MessageStart(_start) => {
+///         // println!("Model: {}", start.message.model);
 ///     }
 ///     StreamEvent::IndexedDelta(delta) => {
 ///         if let DeltaPart::Text { text } = &delta.delta {
-///             print!("{text}");
+///             let _text: &str = text;
 ///         }
 ///     }
-///     StreamEvent::MessageStop => println!("\n[done]"),
+///     StreamEvent::MessageStop => { /* println!("[done]") */ }
 ///     _ => {}
 /// }
 /// ```
@@ -217,7 +220,9 @@ pub enum StreamEvent {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use loopctl::stream::{MessageStart, MessageMetadata};
+///
 /// let start = MessageStart {
 ///     message: MessageMetadata {
 ///         id: "msg_abc123".to_string(),
@@ -254,7 +259,9 @@ pub struct MessageStart {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use loopctl::stream::MessageMetadata;
+///
 /// let meta = MessageMetadata {
 ///     id: "msg_abc123".to_string(),
 ///     role: "assistant".to_string(),
@@ -300,7 +307,11 @@ pub struct MessageMetadata {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use loopctl::stream::PartStart;
+/// use loopctl::message::MessagePart;
+/// use serde_json::Value;
+///
 /// // Text part start — type is implicit
 /// let text_start = PartStart { index: 0, part: None };
 ///
@@ -343,7 +354,9 @@ pub struct PartStart {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use loopctl::stream::{IndexedDelta, DeltaPart};
+///
 /// let delta = IndexedDelta {
 ///     index: 0,
 ///     delta: DeltaPart::Text { text: "Hello".to_string() },
@@ -385,7 +398,12 @@ pub struct IndexedDelta {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use loopctl::stream::DeltaPart;
+///
+/// let delta_content = DeltaPart::Text { text: "hello".to_string() };
+/// let mut buffer = String::new();
+/// let mut json_buf = String::new();
 /// match &delta_content {
 ///     DeltaPart::Text { text } => buffer.push_str(text),
 ///     DeltaPart::InputJson { partial_json } => json_buf.push_str(partial_json),
@@ -474,7 +492,9 @@ pub enum DeltaPart {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use loopctl::stream::StreamStopReason;
+///
 /// let reason = StreamStopReason::from_api_str("tool_call").unwrap();
 /// assert!(reason.should_continue_tool_loop());
 ///
@@ -529,7 +549,9 @@ impl StreamStopReason {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use loopctl::stream::StreamStopReason;
+    ///
     /// assert_eq!(StreamStopReason::from_api_str("tool_call"), Some(StreamStopReason::ToolCall));
     /// assert_eq!(StreamStopReason::from_api_str("unknown"), None);
     /// ```
@@ -557,7 +579,9 @@ impl StreamStopReason {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use loopctl::stream::StreamStopReason;
+    ///
     /// assert_eq!(StreamStopReason::ToolCall.to_api_str(), "tool_call");
     /// assert_eq!(StreamStopReason::EndTurn.to_api_str(), "end_turn");
     /// ```
@@ -586,11 +610,12 @@ impl StreamStopReason {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use loopctl::stream::StreamStopReason;
+    ///
+    /// let reason = StreamStopReason::ToolCall;
     /// if reason.should_continue_tool_loop() {
     ///     // Execute tools and continue the conversation
-    ///     let tool_results = execute_tools(&message);
-    ///     // ... send next request with tool results
     /// }
     /// ```
     #[must_use]
@@ -611,7 +636,9 @@ impl StreamStopReason {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use loopctl::stream::{MessageDelta, MessageDeltaPayload, Usage};
+///
 /// let delta = MessageDelta {
 ///     delta: MessageDeltaPayload { stop_reason: Some("end_turn".to_string()) },
 ///     usage: Some(Usage::new(100, 50)),
@@ -653,7 +680,9 @@ pub struct MessageDelta {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use loopctl::stream::{MessageDeltaPayload, StreamStopReason};
+///
 /// let delta = MessageDeltaPayload { stop_reason: Some("tool_call".to_string()) };
 /// if let Some(s) = &delta.stop_reason {
 ///     let reason = StreamStopReason::from_api_str(s);
@@ -695,7 +724,9 @@ pub struct MessageDeltaPayload {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
+/// use loopctl::stream::Usage;
+///
 /// let usage = Usage::new(150, 75);
 /// assert_eq!(usage.input_tokens, 150);
 /// assert_eq!(usage.output_tokens, 75);
@@ -736,7 +767,9 @@ impl Usage {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use loopctl::stream::Usage;
+    ///
     /// let usage = Usage::new(100, 50);
     /// assert_eq!(usage.total_tokens(), 150);
     /// ```
@@ -760,7 +793,9 @@ impl Usage {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use loopctl::stream::Usage;
+    ///
     /// let usage = Usage::new(100, 50);
     /// assert_eq!(usage.total_tokens(), 150);
     /// ```
@@ -808,16 +843,16 @@ impl Usage {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
 /// use loopctl::stream::{StreamAccumulator, StreamEvent};
 ///
 /// let mut acc = StreamAccumulator::new();
 ///
-/// for event in sse_events {
-///     acc.process(&event)?;
+/// for event in std::iter::empty::<StreamEvent>() {
+///     acc.process(&event).unwrap();
 /// }
 ///
-/// let usage = acc.usage();
+/// let _usage = acc.usage();
 /// let message = acc.build();
 /// ```
 ///
@@ -899,9 +934,11 @@ impl StreamAccumulator {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use loopctl::stream::StreamAccumulator;
+    ///
     /// let mut acc = StreamAccumulator::new();
-    /// acc.process(&event)?;
+    /// // acc.process(&event).unwrap();
     /// let message = acc.build();
     /// ```
     #[must_use]
@@ -935,11 +972,26 @@ impl StreamAccumulator {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use loopctl::stream::{StreamAccumulator, StreamEvent, MessageStart, MessageMetadata,
+    ///     PartStart, IndexedDelta, DeltaPart};
+    ///
     /// let mut acc = StreamAccumulator::new();
-    /// acc.process(&StreamEvent::MessageStart(start))?;
-    /// acc.process(&StreamEvent::IndexedDelta(delta))?;
-    /// acc.process(&StreamEvent::MessageStop)?;
+    /// let start = MessageStart {
+    ///     message: MessageMetadata {
+    ///         id: "msg_1".to_string(),
+    ///         role: "assistant".to_string(),
+    ///         model: "test".to_string(),
+    ///     },
+    /// };
+    /// acc.process(&StreamEvent::MessageStart(start)).unwrap();
+    /// acc.process(&StreamEvent::PartStart(PartStart { index: 0, part: None })).unwrap();
+    /// let delta = IndexedDelta {
+    ///     index: 0,
+    ///     delta: DeltaPart::Text { text: "hi".to_string() },
+    /// };
+    /// acc.process(&StreamEvent::IndexedDelta(delta)).unwrap();
+    /// acc.process(&StreamEvent::MessageStop).unwrap();
     /// ```
     ///
     /// # Errors
@@ -1035,7 +1087,11 @@ impl StreamAccumulator {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use loopctl::stream::StreamAccumulator;
+    /// use loopctl::message::Role;
+    ///
+    /// let acc = StreamAccumulator::new();
     /// let message = acc.build();
     /// assert_eq!(message.role, Role::Assistant);
     /// ```
@@ -1060,9 +1116,12 @@ impl StreamAccumulator {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use loopctl::stream::{StreamAccumulator, Usage};
+    ///
+    /// let mut acc = StreamAccumulator::new();
     /// if let Some(usage) = acc.usage() {
-    ///     println!("Total tokens: {}", usage.total_tokens());
+    ///     let _total = usage.total_tokens();
     /// }
     /// ```
     #[must_use]

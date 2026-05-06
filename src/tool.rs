@@ -11,8 +11,7 @@
 //! - **[`Tool`]** — The trait every tool implements. Downstream crates
 //!   provide concrete implementations.
 //! - **[`FnTool`]** — An adapter that wraps a plain function pointer as a
-//!   [`Tool`] trait object, bridging the legacy function-pointer API to the
-//!   new trait system.
+//!   [`Tool`] trait object, wrapping plain functions as trait implementations.
 //! - **[`ToolRegistry`]** — A name → tool map used by the agent loop for
 //!   dynamic dispatch.
 //! - **[`ToolSchema`]** — JSON Schema descriptor sent to the LLM for
@@ -36,7 +35,7 @@
 //!     fn description(&self) -> &str { "Echoes back the input" }
 //!     fn schema(&self) -> ToolSchema {
 //!         ToolSchema {
-//!             name: "echo".into(),
+//!             tool: "echo".into(),
 //!             description: "Echoes back the input".into(),
 //!             input_schema: json!({
 //!                 "type": "object",
@@ -73,7 +72,7 @@ use crate::message::ToolResult as MessageToolResult;
 ///
 /// When the agent loop sends a list of available tools to the LLM, each
 /// tool is represented by a [`ToolSchema`] instance. The LLM uses the
-/// schema's `name`, `description`, and `input_schema` to decide which
+/// schema's `tool`, `description`, and `input_schema` to decide which
 /// tool to call and how to format its arguments.
 ///
 /// # Construction
@@ -83,7 +82,7 @@ use crate::message::ToolResult as MessageToolResult;
 /// ```rust,ignore
 /// fn schema(&self) -> ToolSchema {
 ///     ToolSchema {
-///         name: "read_file".into(),
+///         tool: "read_file".into(),
 ///         description: "Read a file from disk".into(),
 ///         input_schema: json!({
 ///             "type": "object",
@@ -1124,7 +1123,7 @@ impl PermissionCheck {
 ///     fn description(&self) -> &str { "Read a file from disk" }
 ///     fn schema(&self) -> ToolSchema {
 ///         ToolSchema {
-///             name: "read_file".into(),
+///             tool: "read_file".into(),
 ///             description: "Read a file from disk".into(),
 ///             input_schema: json!({
 ///                 "type": "object",
@@ -1564,7 +1563,7 @@ impl Default for ToolRegistry {
 /// Matches the signature used by concrete tools in downstream crates:
 /// `fn(Value, &ToolContext) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'static>>`.
 ///
-/// Used as the `f` field in [`FnTool`] to bridge function-pointer-based
+/// Stored in the `f` field of [`FnTool`] to adapt function-pointer-based
 /// tool definitions to the [`Tool`] trait.
 pub type ToolFn =
     fn(
@@ -1661,7 +1660,7 @@ pub struct FnTool {
     /// Called by [`Tool::call`] with the LLM-supplied input and the
     /// session's [`ToolContext`]. Must return a pinned, `Send` future
     /// producing a `Result<ToolOutput, ToolError>`.
-    pub f: ToolFn,
+    pub tool_fn: ToolFn,
 
     /// Whether this tool is safe to run concurrently with itself.
     ///
@@ -1721,12 +1720,12 @@ impl FnTool {
     ///     my_grep_fn as ToolFn,
     /// );
     /// ```
-    pub fn new(name: String, description: String, input_schema: Value, f: ToolFn) -> Self {
+    pub fn new(name: String, description: String, input_schema: Value, tool_fn: ToolFn) -> Self {
         Self {
             name,
             description,
             input_schema,
-            f,
+            tool_fn,
             is_concurrency_safe: false,
             concurrency_check_fn: None,
             is_read_only: false,
@@ -1838,16 +1837,16 @@ impl FnTool {
 ///
 /// # Delegation map
 ///
-/// | Trait method                     | Delegates to                       |
-/// |----------------------------------|------------------------------------|
-/// | [`Tool::name`]                   | [`FnTool::name`] field accessor    |
-/// | [`Tool::description`]            | [`FnTool::description`] accessor   |
-/// | [`Tool::schema`]                 | Clones fields into [`ToolSchema`]  |
-/// | [`Tool::call`]                   | [`FnTool::f`] function pointer     |
-/// | [`Tool::is_concurrency_safe`]    | [`FnTool::is_concurrency_safe`]    |
+/// | Trait method                               | Delegates to                                 |
+/// |--------------------------------------------|----------------------------------------------|
+/// | [`Tool::name`]                             | [`FnTool::name`] field accessor              |
+/// | [`Tool::description`]                      | [`FnTool::description`] accessor             |
+/// | [`Tool::schema`]                           | Clones fields into [`ToolSchema`]            |
+/// | [`Tool::call`]                             | internal function pointer                    |
+/// | [`Tool::is_concurrency_safe`]              | [`FnTool::is_concurrency_safe`]              |
 /// | [`Tool::is_safe_for_concurrent_execution`] | [`FnTool::concurrency_check_fn`] or fallback |
-/// | [`Tool::is_read_only`]           | [`FnTool::is_read_only`]           |
-/// | [`Tool::system_prompt`]          | [`FnTool::system_prompt`] clone    |
+/// | [`Tool::is_read_only`]                     | [`FnTool::is_read_only`]                     |
+/// | [`Tool::system_prompt`]                    | [`FnTool::system_prompt`] clone              |
 impl Tool for FnTool {
     /// Return the tool name from the [`FnTool::name`] field.
     ///
@@ -1889,7 +1888,7 @@ impl Tool for FnTool {
 
     /// Delegate execution to the stored function pointer.
     ///
-    /// Invokes [`FnTool::f`] with the provided `input` and `context`,
+    /// Invokes the stored function pointer with the provided `input` and `context`,
     /// returning the pinned future directly. The function pointer owns
     /// the full future lifecycle — the `'static` bound on [`ToolFn`]
     /// ensures the future does not borrow from the tool adapter itself.
@@ -1904,7 +1903,7 @@ impl Tool for FnTool {
         input: Value,
         context: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        (self.f)(input, context)
+        (self.tool_fn)(input, context)
     }
 
     /// Return the static concurrency-safety flag.
@@ -1955,14 +1954,15 @@ impl Tool for FnTool {
     }
 }
 
+// ===================================================
 // Tests
+// ===================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    // Test tool implementation
     struct EchoTool;
 
     impl Tool for EchoTool {

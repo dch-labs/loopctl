@@ -186,8 +186,6 @@ use std::sync::{Arc, Mutex};
 /// stored in an [`Arc`] inside [`LoopDetector`]. All methods take `&self`,
 /// so the implementation should be stateless or use interior mutability.
 ///
-/// This value is consulted during normal operation and may be
-/// updated by the framework as the agent loop progresses.
 pub trait ToolSignature: Send + Sync {
     /// Extract a primary parameter from tool input for loop comparison.
     ///
@@ -206,8 +204,6 @@ pub trait ToolSignature: Send + Sync {
     ///
     /// Returns an empty string — no differentiation between invocations.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     fn extract_primary_param(&self, tool: &str, input: &serde_json::Value) -> String {
         let _ = (tool, input);
         String::new()
@@ -250,8 +246,6 @@ pub trait ToolSignature: Send + Sync {
     /// }
     /// ```
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     fn is_recoverable_error(&self, tool: &str, error: &str) -> bool {
         let _ = (tool, error);
         false
@@ -273,8 +267,6 @@ pub trait ToolSignature: Send + Sync {
     ///
     /// Returns `None`.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     fn get_suggestion(&self, tool: &str) -> Option<String> {
         let _ = tool;
         None
@@ -319,8 +311,6 @@ pub trait ToolSignature: Send + Sync {
     /// }
     /// ```
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     fn file_path_for_reset(&self, tool: &str, input: &serde_json::Value) -> Option<String> {
         let _ = (tool, input);
         None
@@ -341,8 +331,6 @@ pub trait ToolSignature: Send + Sync {
     ///
     /// Returns `false`.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     fn is_file_read_tool(&self, tool: &str) -> bool {
         let _ = tool;
         false
@@ -364,8 +352,6 @@ pub trait ToolSignature: Send + Sync {
     ///
     /// Returns `false`.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     fn is_file_edit_tool(&self, tool: &str) -> bool {
         let _ = tool;
         false
@@ -387,8 +373,6 @@ pub trait ToolSignature: Send + Sync {
     ///
     /// Returns an empty `HashMap` — no tool-specific overrides.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     fn tool_thresholds(&self) -> HashMap<String, usize> {
         HashMap::new()
     }
@@ -481,7 +465,6 @@ pub trait ToolSignature: Send + Sync {
 /// );
 /// ```
 ///
-/// See the surrounding documentation and cross-references for details.
 pub struct NoOpToolSignature;
 
 /// Blanket [`ToolSignature`] implementation for [`NoOpToolSignature`].
@@ -495,8 +478,6 @@ pub struct NoOpToolSignature;
 /// This implementation is intentionally empty — it relies entirely on the
 /// default method bodies defined in the [`ToolSignature`] trait. See the
 /// trait-level documentation for the semantics of each default.
-///
-/// See the surrounding documentation and cross-references for details.
 ///
 impl ToolSignature for NoOpToolSignature {}
 
@@ -553,7 +534,6 @@ impl ToolSignature for NoOpToolSignature {}
 ///   repetition (e.g. `"Edit" → 2`) or particularly noisy (e.g.
 ///   `"Grep" → 5`).
 ///
-/// See the surrounding documentation and cross-references for details.
 #[derive(Debug, Clone)]
 pub struct LoopDetectorConfig {
     /// Maximum number of operations kept in the sliding window.
@@ -566,8 +546,6 @@ pub struct LoopDetectorConfig {
     ///
     /// **Default:** `50`.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub window_size: usize,
 
     /// Number of identical repetitions required to flag a loop.
@@ -579,8 +557,6 @@ pub struct LoopDetectorConfig {
     ///
     /// **Default:** `3`.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub repetition_threshold: usize,
 
     /// Maximum number of tool calls allowed in a single turn.
@@ -592,8 +568,6 @@ pub struct LoopDetectorConfig {
     ///
     /// **Default:** `9999` (effectively unlimited).
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub max_tools_per_turn: usize,
 
     /// Maximum number of identical file reads before a warning is raised.
@@ -604,8 +578,6 @@ pub struct LoopDetectorConfig {
     ///
     /// **Default:** `5`.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub max_same_file_reads: usize,
 
     /// Number of repetitions required to force-stop the agent.
@@ -618,8 +590,6 @@ pub struct LoopDetectorConfig {
     ///
     /// **Default:** `10`.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub stop_threshold: usize,
 
     /// Tool-specific repetition thresholds that override
@@ -633,8 +603,6 @@ pub struct LoopDetectorConfig {
     ///
     /// **Default:** empty `HashMap`.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub tool_thresholds: HashMap<String, usize>,
 }
 
@@ -676,7 +644,6 @@ pub struct LoopDetectorConfig {
 /// - [`LoopDetector::new`] — constructs a detector from a config.
 /// - [`LoopDetectorConfig::threshold_for_tool`] — per-tool threshold lookup.
 ///
-/// See the surrounding documentation and cross-references for details.
 impl Default for LoopDetectorConfig {
     /// Build a config with the default values described in the trait-level docs.
     ///
@@ -684,8 +651,6 @@ impl Default for LoopDetectorConfig {
     /// is pre-allocated with capacity matching
     /// [`window_size`](LoopDetectorConfig::window_size).
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     fn default() -> Self {
         Self {
             window_size: 50,
@@ -711,7 +676,6 @@ impl Default for LoopDetectorConfig {
 ///   overrides first and falling back to the generic
 ///   [`repetition_threshold`](LoopDetectorConfig::repetition_threshold).
 ///
-/// See the surrounding documentation and cross-references for details.
 impl LoopDetectorConfig {
     /// Get the effective repetition threshold for a specific tool.
     ///
@@ -736,8 +700,6 @@ impl LoopDetectorConfig {
     /// assert_eq!(config.threshold_for_tool("Read"), 3);   // generic default
     /// ```
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     #[must_use]
     pub fn threshold_for_tool(&self, tool_name: &str) -> usize {
         self.tool_thresholds
@@ -792,7 +754,6 @@ impl LoopDetectorConfig {
 /// threshold, a loop is reported. The optional `result_hash` ensures that
 /// operations producing *different* outputs are not counted as repetitions.
 ///
-/// See the surrounding documentation and cross-references for details.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Operation {
     /// Name of the tool that was invoked (e.g. `"Read"`, `"Edit"`, `"Bash"`).
@@ -802,8 +763,6 @@ pub struct Operation {
     /// [`result_hash`](Operation::result_hash) it uniquely identifies a
     /// repeated invocation pattern.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub tool: String,
 
     /// Primary parameter that identifies the operation's target.
@@ -813,8 +772,6 @@ pub struct Operation {
     /// operations with the same `tool` but different `primary_param` are
     /// *not* considered a loop (they target different resources).
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub primary_param: String,
 
     /// Hash of the tool result content, for result-aware loop detection.
@@ -827,8 +784,6 @@ pub struct Operation {
     ///
     /// Generated by the free function [`hash_result`].
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub result_hash: Option<u64>,
 }
 
@@ -856,7 +811,6 @@ pub struct Operation {
 ///            or Operation::new(tool, param).with_result_hash(hash)
 /// ```
 ///
-/// See the surrounding documentation and cross-references for details.
 impl Operation {
     /// Create a new operation with the given tool name and primary parameter.
     ///
@@ -883,8 +837,6 @@ impl Operation {
     /// - [`Operation::from_input_with_signature`] — when you have raw JSON input.
     /// - [`Operation::with_result_hash`] — to attach a result hash after creation.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn new(tool: impl Into<String>, primary_param: impl Into<String>) -> Self {
         Self {
             tool: tool.into(),
@@ -935,8 +887,6 @@ impl Operation {
     /// - [`Operation::from_input_with_result_and_signature`] — full construction with hash.
     /// - [`ToolSignature::extract_primary_param`] — the parsing logic.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn from_input_with_signature(
         tool: &str,
         input: &serde_json::Value,
@@ -987,8 +937,6 @@ impl Operation {
     /// - [`Operation::from_input_with_signature`] — same but without result hash.
     /// - [`LoopDetector::record_from_input`] — the primary caller.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn from_input_with_result_and_signature(
         tool: &str,
         input: &serde_json::Value,
@@ -1033,8 +981,6 @@ impl Operation {
     /// - [`hash_result`] — computes the hash from tool output.
     /// - [`Operation::result_hash`] — the field this sets.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     #[must_use]
     pub fn with_result_hash(mut self, hash: Option<u64>) -> Self {
         self.result_hash = hash;
@@ -1095,8 +1041,6 @@ impl Operation {
 /// - [`Operation::with_result_hash`] — attaches the hash to an operation.
 /// - [`Operation::result_hash`] — the field that stores the hash.
 ///
-/// Called internally by the framework during the agent loop.
-/// See the module-level documentation for the overall flow.
 #[must_use]
 pub fn hash_result(content: &str) -> Option<u64> {
     use std::collections::hash_map::DefaultHasher;
@@ -1191,7 +1135,6 @@ pub fn hash_result(content: &str) -> Option<u64> {
 /// Does *not* derive [`PartialEq`] because [`Option<String>`] comparison
 /// is rarely useful for status objects.
 ///
-/// See the surrounding documentation and cross-references for details.
 #[derive(Debug, Clone, Default)]
 pub struct LoopStatus {
     /// Whether a loop was detected.
@@ -1202,9 +1145,6 @@ pub struct LoopStatus {
     /// or a per-tool override from
     /// [`tool_thresholds`](LoopDetectorConfig::tool_thresholds)).
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     pub is_looping: bool,
 
     /// Operations that triggered the loop detection.
@@ -1214,8 +1154,6 @@ pub struct LoopStatus {
     /// tie for the highest repetition count, all of them are included.
     /// Empty when [`is_looping`](LoopStatus::is_looping) is `false`.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub repeated_operations: Vec<Operation>,
 
     /// Number of repetitions of the most-repeated operation.
@@ -1224,8 +1162,6 @@ pub struct LoopStatus {
     /// [`repeated_operations`](LoopStatus::repeated_operations). Zero when
     /// no loop was detected.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub repetition_count: usize,
 
     /// Human-readable warning message describing the detected loop.
@@ -1237,8 +1173,6 @@ pub struct LoopStatus {
     /// detected, or when the loop has already been warned about (to avoid
     /// spamming the agent with duplicate warnings).
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub warning: Option<String>,
 
     /// Whether the agent should be force-stopped due to severe looping.
@@ -1248,8 +1182,6 @@ pub struct LoopStatus {
     /// stop threshold is non-zero). The framework should halt the agent's
     /// event loop when this is `true`.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     pub should_stop: bool,
 }
 
@@ -1335,7 +1267,6 @@ pub struct LoopStatus {
 /// | `warned_operations`  | `Mutex<HashSet<Op>>`      | Already-warned dedup set       |
 /// | `signature`          | `Arc<dyn ToolSignature>`  | Tool-specific parsing logic    |
 ///
-/// See the surrounding documentation and cross-references for details.
 pub struct LoopDetector {
     /// Sliding window of recent [`Operation`] records.
     ///
@@ -1344,9 +1275,6 @@ pub struct LoopDetector {
     /// window is scanned by [`LoopDetector::check_loop`] to find repeated
     /// operations.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
-    ///
     operations: Mutex<VecDeque<Operation>>,
 
     /// Configuration controlling thresholds and limits.
@@ -1354,8 +1282,6 @@ pub struct LoopDetector {
     /// Set at construction time via [`LoopDetector::new`]. Immutable for
     /// the lifetime of the detector.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     config: LoopDetectorConfig,
 
     /// Count of tool invocations in the current turn.
@@ -1365,8 +1291,6 @@ pub struct LoopDetector {
     /// [`LoopDetectorConfig::max_tools_per_turn`] by
     /// [`LoopDetector::check_turn_limit`].
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     turn_count: Mutex<usize>,
 
     /// Set of operations that have already triggered a warning.
@@ -1378,8 +1302,6 @@ pub struct LoopDetector {
     /// progress) or when [`LoopDetector::clear`] / [`LoopDetector::reset`]
     /// is called.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     warned_operations: Mutex<std::collections::HashSet<Operation>>,
 
     /// Tool signature for extracting tool-specific parameters.
@@ -1389,8 +1311,6 @@ pub struct LoopDetector {
     /// [`LoopDetector::signature`]. The trait object is `Send + Sync` so
     /// it can be used from any thread.
     ///
-    /// This value is consulted during normal operation and may be
-    /// updated by the framework as the agent loop progresses.
     signature: Arc<dyn ToolSignature>,
 }
 
@@ -1408,7 +1328,6 @@ pub struct LoopDetector {
 /// (empty status, `false`, zero count) rather than propagulating the panic.
 /// This ensures the detector never crashes the agent loop.
 ///
-/// See the surrounding documentation and cross-references for details.
 impl LoopDetector {
     /// Create a new loop detector with the given configuration and tool signature.
     ///
@@ -1428,8 +1347,6 @@ impl LoopDetector {
     /// let detector = LoopDetector::new(config, Arc::new(NoOpToolSignature));
     /// ```
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn new(config: LoopDetectorConfig, signature: Arc<dyn ToolSignature>) -> Self {
         Self {
             operations: Mutex::new(VecDeque::with_capacity(config.window_size)),
@@ -1452,8 +1369,6 @@ impl LoopDetector {
     /// LoopDetector::new(LoopDetectorConfig::default(), Arc::new(NoOpToolSignature));
     /// ```
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     #[must_use]
     pub fn default_detector() -> Self {
         Self::new(LoopDetectorConfig::default(), Arc::new(NoOpToolSignature))
@@ -1473,8 +1388,6 @@ impl LoopDetector {
     /// // let detector = LoopDetector::with_signature(Arc::new(MyToolSignature));
     /// ```
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn with_signature(signature: Arc<dyn ToolSignature>) -> Self {
         Self::new(LoopDetectorConfig::default(), signature)
     }
@@ -1485,8 +1398,6 @@ impl LoopDetector {
     /// Useful when external code needs to query the same tool-specific
     /// logic (e.g. to extract parameters for logging).
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn signature(&self) -> &dyn ToolSignature {
         self.signature.as_ref()
     }
@@ -1511,8 +1422,6 @@ impl LoopDetector {
     /// - `result_hash` — Optional hash of the tool result, typically
     ///   generated by [`hash_result`].
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn record_from_input(
         &self,
         tool: &str,
@@ -1572,8 +1481,6 @@ impl LoopDetector {
     /// );
     /// ```
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn record_from_input_with_error(
         &self,
         tool: &str,
@@ -1621,8 +1528,6 @@ impl LoopDetector {
     /// directly, via [`LoopDetector::record_from_input`], or via
     /// [`LoopDetector::record_from_input_with_error`].
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn record(&self, operation: Operation) {
         // Check if this operation was previously warned with a different result
         if let Ok(mut warned) = self.warned_operations.lock() {
@@ -1720,8 +1625,6 @@ impl LoopDetector {
     /// Called by the framework after each tool invocation, typically
     /// immediately after [`record`](LoopDetector::record).
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn check_loop(&self) -> LoopStatus {
         let Ok(ops) = self.operations.lock() else {
             return LoopStatus::default();
@@ -1823,8 +1726,6 @@ impl LoopDetector {
     /// Called by the framework before dispatching each tool call within a
     /// turn. If `true`, the framework should stop the turn.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn check_turn_limit(&self) -> bool {
         match self.turn_count.lock() {
             Ok(count) => *count >= self.config.max_tools_per_turn,
@@ -1842,8 +1743,6 @@ impl LoopDetector {
     ///
     /// The turn-local call count, or `0` if the lock is poisoned.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn turn_count(&self) -> usize {
         self.turn_count.lock().map_or(0, |c| *c)
     }
@@ -1858,8 +1757,6 @@ impl LoopDetector {
     /// At the beginning of every new turn, before any tool calls are
     /// dispatched.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn reset_turn(&self) {
         if let Ok(mut count) = self.turn_count.lock() {
             *count = 0;
@@ -1888,8 +1785,6 @@ impl LoopDetector {
     /// `true` if the file has been read ≥ `max_same_file_reads` times,
     /// `false` otherwise (including if the lock is poisoned).
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn check_file_reads(&self, file_path: &str) -> bool {
         let Ok(ops) = self.operations.lock() else {
             return false;
@@ -1926,8 +1821,6 @@ impl LoopDetector {
     /// - `tool` — Name of the tool being dispatched.
     /// - `file_path` — The file being read.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn check_and_reset_on_file_read(&self, tool: &str, file_path: &str) {
         if !self.signature.is_file_read_tool(tool) {
             return;
@@ -1970,8 +1863,6 @@ impl LoopDetector {
     /// Called when the agent wants to clear loop history without resetting
     /// turn state — for example, after a successful corrective action.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn clear(&self) {
         if let Ok(mut ops) = self.operations.lock() {
             ops.clear();
@@ -1993,8 +1884,6 @@ impl LoopDetector {
     /// starts another — so that loop state from the previous task doesn't
     /// bleed into the next one.
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     pub fn reset(&self) {
         if let Ok(mut ops) = self.operations.lock() {
             ops.clear();
@@ -2034,15 +1923,12 @@ impl LoopDetector {
 /// - [`LoopDetector::with_signature`] — for custom tool signatures.
 /// - [`LoopDetector::default_detector`] — the method this delegates to.
 ///
-/// See the surrounding documentation and cross-references for details.
 impl Default for LoopDetector {
     /// Build a detector with [`LoopDetectorConfig::default`] and [`NoOpToolSignature`].
     ///
     /// Equivalent to `LoopDetector::default_detector()`. The internal state
     /// is empty (no operations recorded, zero turn count, no warnings).
     ///
-    /// Called internally by the framework during the agent loop.
-    /// See the module-level documentation for the overall flow.
     fn default() -> Self {
         Self::default_detector()
     }
@@ -2065,8 +1951,6 @@ impl Default for LoopDetector {
 /// [`OnceLock`] guarantees safe concurrent access from multiple threads
 /// without additional synchronisation.
 ///
-/// This value is consulted during normal operation and may be
-/// updated by the framework as the agent loop progresses.
 static GLOBAL_DETECTOR: std::sync::OnceLock<Arc<LoopDetector>> = std::sync::OnceLock::new();
 
 /// Get a reference-counted handle to the global [`LoopDetector`] singleton.
@@ -2097,8 +1981,6 @@ static GLOBAL_DETECTOR: std::sync::OnceLock<Arc<LoopDetector>> = std::sync::Once
 /// - [`LoopDetector::new`] — for custom configuration.
 /// - [`LoopDetector::with_signature`] — for custom tool signatures.
 ///
-/// Called internally by the framework during the agent loop.
-/// See the module-level documentation for the overall flow.
 pub fn global_detector() -> Arc<LoopDetector> {
     Arc::clone(GLOBAL_DETECTOR.get_or_init(|| Arc::new(LoopDetector::default_detector())))
 }
@@ -2114,7 +1996,6 @@ mod tests {
     /// the `file_path` parameter for `Read` calls and the `command` parameter
     /// for `Bash` calls, falling back to an empty string for unknown tools.
     ///
-    /// See the surrounding documentation and cross-references for details.
     struct TestToolSignature;
 
     impl ToolSignature for TestToolSignature {

@@ -171,8 +171,6 @@ pub enum DetectedPattern {
     ///     assert!(repetitions >= 3);
     /// }
     /// ```
-    ///
-    /// See the surrounding documentation and cross-references for details.
     LoopDetected {
         /// Number of times the pattern has repeated.
         ///
@@ -213,8 +211,6 @@ pub enum DetectedPattern {
     ///   pair of responses (0.0–1.0).
     /// - `consecutive_count` — how many consecutive response pairs exceeded
     ///   the threshold.
-    ///
-    /// See the surrounding documentation and cross-references for details.
     ConvergenceDetected {
         /// Jaccard similarity score (0.0–1.0) of the most recent pair of
         /// responses.
@@ -248,8 +244,6 @@ pub enum DetectedPattern {
     ///
     /// Callers should simply continue the turn loop when they receive
     /// this variant.
-    ///
-    /// See the surrounding documentation and cross-references for details.
     NoPattern,
 }
 
@@ -351,7 +345,6 @@ pub struct DetectionConfig {
     /// sufficient — typical loops repeat within 3–10 operations.
     ///
     /// Default: **100**.
-    ///
     pub max_history: usize,
 
     // ==================================================
@@ -657,7 +650,7 @@ pub struct DetectionStats {
 /// }
 ///
 /// // Record responses
-/// dm.record_response("Working on step 1…");
+/// dm.record_response("Working on step 1...");
 ///
 /// // Query at any time
 /// let stats = dm.stats();
@@ -1436,7 +1429,7 @@ impl DetectionManager {
     ///
     /// ```rust,ignore
     /// dm.record_tool_call("Read", 42);
-    /// dm.record_response("Working on step 1…");
+    /// dm.record_response("Working on step 1...");
     /// dm.reset();
     /// assert!(matches!(dm.check_current_pattern(), DetectedPattern::NoPattern));
     /// assert_eq!(dm.stats().turns_analyzed, 0);

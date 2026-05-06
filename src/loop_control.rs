@@ -9,6 +9,8 @@
 //! - **[`loop_detector`]** — Detects repetitive tool-use loops and enforces limits.
 //! - **[`fallback`]** — Circuit breaker pattern for automatic API model fallback.
 
+pub mod bundle;
 pub mod convergence;
+pub mod detection;
 pub mod fallback;
 pub mod loop_detector;

@@ -9,6 +9,7 @@
 //! - **[`core`]** — Foundational traits (`AgentObserver`) and error types.
 //! - **[`loop_control`]** — Detection and intervention modules for agent loops.
 //! - **[`stream`]** — Streaming event types for LLM API responses.
+//! - **[`tool`]** — Tool trait, registry, and supporting types.
 
 pub mod api_error;
 pub mod builder;
@@ -16,3 +17,4 @@ pub mod core;
 pub mod loop_control;
 pub mod message;
 pub mod stream;
+pub mod tool;

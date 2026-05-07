@@ -8,6 +8,7 @@
 //! - **[`api_error`]** — API and infrastructure error types with classification.
 //! - **[`builder`]** — Fluent builder API for constructing configured agents.
 //! - **[`core`]** — Foundational traits (`AgentObserver`) and error types.
+//! - **[`builtin`]** — Reference implementations of core traits ([`builtin::memory::InMemoryStore`], [`builtin::observer::LoggingObserver`], etc.).
 //! - **[`loop_control`]** — Detection and intervention modules for agent loops.
 //! - **[`stream`]** — Streaming event types for LLM API responses.
 //! - **[`tool`]** — Tool trait, registry, and supporting types.
@@ -15,6 +16,7 @@
 pub mod api_client;
 pub mod api_error;
 pub mod builder;
+pub mod builtin;
 pub mod core;
 pub mod loop_control;
 pub mod message;

@@ -21,4 +21,6 @@ pub mod core;
 pub mod loop_control;
 pub mod message;
 pub mod stream;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod tool;

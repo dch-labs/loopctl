@@ -123,16 +123,16 @@ let result = agent.run("test input").await?;
 
 ## Feature Flags
 
-| Feature | Default | Description |
-|---------|---------|-------------|
-| `testing` | No | Mock clients, tools, and test fixtures |
+| Feature   | Default | Description                            |
+|-----------|---------|----------------------------------------|
+| `testing` | No      | Mock clients, tools, and test fixtures |
 
 ## Architecture
 
 ```text
-                 ┌──────────────┐
-                 │   ApiClient  │  ← you implement this
-                 └──────┬───────┘
+                ┌──────────────┐
+                │   ApiClient  │  ← you implement this
+                └───────┬──────┘
                         │
           ┌─────────────▼─────────────┐
           │         BareLoop          │

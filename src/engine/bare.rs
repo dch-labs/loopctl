@@ -434,7 +434,8 @@ impl<C: ApiClient> BareLoop<C> {
     /// - **Max turns exceeded** — [`config.max_turns`](AgentConfig::max_turns)
     ///   is reached, producing [`AgentError::MaxTurnsExceeded`].
     /// - **Cancellation** — [`cancel()`](BareLoop::cancel) was called,
-    ///   producing `Ok(SessionResult::failed(...))`.
+    ///   producing [`AgentError::Cancelled`]; the caller should handle this
+    ///   variant to distinguish user-initiated cancellation from other errors.
     /// - **API error** — the streaming request fails, producing
     ///   [`AgentError::Api`].
     ///
@@ -515,11 +516,25 @@ impl<C: ApiClient> BareLoop<C> {
                     turn_count += 1;
 
                     if has_tool_calls {
-                        let tool_results = self.dispatch_tools(&tool_calls).await?;
-                        total_tool_calls += tool_results.len();
-                        let tool_result_msg = Self::build_tool_result_message(tool_results);
-                        self.conversation.push(tool_result_msg);
-                        self.notify_turn_end(true, None);
+                        let tool_result = self.dispatch_tools(&tool_calls).await;
+                        match tool_result {
+                            Ok(results) => {
+                                total_tool_calls += results.len();
+                                let tool_result_msg = Self::build_tool_result_message(results);
+                                self.conversation.push(tool_result_msg);
+                                self.notify_turn_end(true, None);
+                            }
+                            Err(AgentError::Cancelled) => {
+                                self.notify_turn_end(false, Some("Cancelled"));
+                                self.notify_session_end(false, Some("Cancelled"));
+                                return Err(AgentError::Cancelled);
+                            }
+                            Err(e) => {
+                                self.notify_turn_end(false, Some(&e.to_string()));
+                                self.notify_session_end(false, Some(&e.to_string()));
+                                return Err(e);
+                            }
+                        }
                     } else {
                         // No tool calls — done
                         self.notify_turn_end(true, None);

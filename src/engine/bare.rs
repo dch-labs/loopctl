@@ -503,7 +503,7 @@ impl<C: ApiClient> BareLoop<C> {
             let stream_result = self.stream_turn().await;
 
             match stream_result {
-                Ok((assistant_msg, usage, _stop_reason)) => {
+                Ok((assistant_msg, usage, stop_reason)) => {
                     if let Some(u) = usage {
                         input_tokens += u.input_tokens as u64;
                         output_tokens += u.output_tokens as u64;
@@ -536,9 +536,15 @@ impl<C: ApiClient> BareLoop<C> {
                             }
                         }
                     } else {
-                        // No tool calls — done
-                        self.notify_turn_end(true, None);
-                        self.notify_session_end(true, None);
+                        // No tool calls — session is done
+                        let success = stop_reason == StreamStopReason::EndTurn;
+                        let error = if success {
+                            None
+                        } else {
+                            Some(format!("Stream stopped with reason: {stop_reason:?}"))
+                        };
+                        self.notify_turn_end(success, error.as_deref());
+                        self.notify_session_end(success, error.as_deref());
                         let duration = start.elapsed();
                         return Ok(SessionResult {
                             session_id,
@@ -547,9 +553,9 @@ impl<C: ApiClient> BareLoop<C> {
                             output_tokens,
                             total_duration: duration,
                             tool_calls: total_tool_calls,
-                            success: true,
+                            success,
                             final_output: Some(text),
-                            error: None,
+                            error,
                         });
                     }
                 }

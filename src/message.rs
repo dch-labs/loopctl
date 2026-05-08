@@ -19,8 +19,8 @@
 //! - **[`Role`]** — Who sent the message (`User` or `Assistant`).
 //! - **[`MessagePart`]** — A polymorphic part (text, image, tool-call, or tool-result).
 //! - **[`ImageSource`]** — Base64-encoded image data in loopctl API format.
-//! - **[`ToolResult`]** — Content returned by a tool (string or multipart).
-//! - **[`ToolResultPart`]** — A single part of a multipart tool result.
+//! - **[`ToolContent`]** — Content returned by a tool (string or multipart).
+//! - **[`ToolContentPart`]** — A single part of a multipart tool result.
 //!
 //! # Message Flow
 //!
@@ -43,7 +43,7 @@
 //! # Quick Start
 //!
 //! ```rust
-//! use loopctl::message::{Message, MessagePart, Role, ToolResult};
+//! use loopctl::message::{Message, MessagePart, Role, ToolContent};
 //!
 //! // Create a simple user message
 //! let user_msg = Message::user("What files are in /tmp?");
@@ -61,7 +61,7 @@
 //! let tool_result_msg = Message {
 //!     role: Role::User, // tool results are sent back as "user" role
 //!     parts: vec![
-//!         MessagePart::tool_result("tool_1", ToolResult::from_string("file1.txt\nfile2.txt"), false),
+//!         MessagePart::tool_result("tool_1", ToolContent::from_string("file1.txt\nfile2.txt"), false),
 //!     ],
 //! };
 //! ```
@@ -421,8 +421,8 @@ pub enum MessagePart {
         /// The output returned by the tool.
         ///
         /// Can be a simple string or a multipart response with
-        /// multiple parts. See [`ToolResult`].
-        output: ToolResult,
+        /// multiple parts. See [`ToolContent`].
+        output: ToolContent,
 
         /// Whether this result represents an error.
         ///
@@ -521,7 +521,7 @@ impl MessagePart {
     /// ```
     pub fn tool_result(
         call_id: impl Into<String>,
-        output: impl Into<ToolResult>,
+        output: impl Into<ToolContent>,
         is_error: bool,
     ) -> Self {
         Self::ToolResult {
@@ -694,7 +694,7 @@ impl ImageSource {
 }
 
 // ==================================================
-// ToolResult
+// ToolContent
 // ==================================================
 
 /// Content that can be returned from a tool invocation.
@@ -704,36 +704,36 @@ impl ImageSource {
 ///
 /// Serialized using `#[serde(untagged)]` so that a plain string
 /// is represented directly in JSON, while a multipart result
-/// is serialized as an array of [`ToolResultPart`] objects.
+/// is serialized as an array of [`ToolContentPart`] objects.
 ///
 /// # Construction
 ///
-/// Use [`from_string`](ToolResult::from_string) for simple
-/// text results or [`from_multipart`](ToolResult::from_multipart)
+/// Use [`from_string`](ToolContent::from_string) for simple
+/// text results or [`from_multipart`](ToolContent::from_multipart)
 /// for multi-part results. Both `String` and `&str` implement
-/// `Into<ToolResult>` for ergonomic conversion.
+/// `Into<ToolContent>` for ergonomic conversion.
 ///
 /// # Default
 ///
 /// The [`Default`] implementation produces an empty string result,
-/// equivalent to `ToolResult::from_string("")`.
+/// equivalent to `ToolContent::from_string("")`.
 ///
 /// # Example
 ///
 /// ```rust
-/// use loopctl::message::{ToolResult, ToolResultPart};
+/// use loopctl::message::{ToolContent, ToolContentPart};
 /// // Simple string result
-/// let simple = ToolResult::from_string("File found: test.txt");
+/// let simple = ToolContent::from_string("File found: test.txt");
 ///
 /// // Multipart result with multiple parts
-/// let multipart = ToolResult::from_multipart(vec![
-///     ToolResultPart::text("Line 1"),
-///     ToolResultPart::text("Line 2"),
+/// let multipart = ToolContent::from_multipart(vec![
+///     ToolContentPart::text("Line 1"),
+///     ToolContentPart::text("Line 2"),
 /// ]);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum ToolResult {
+pub enum ToolContent {
     /// A simple string result.
     ///
     /// The most common case — tools that return plain text output.
@@ -743,10 +743,10 @@ pub enum ToolResult {
     ///
     /// Used when a tool needs to return mixed content (text + images)
     /// or multiple text segments.
-    Multipart(Vec<ToolResultPart>),
+    Multipart(Vec<ToolContentPart>),
 }
 
-impl ToolResult {
+impl ToolContent {
     /// Create a simple string result.
     ///
     /// Wraps the given text in the [`Text`](Self::Text) variant.
@@ -757,13 +757,13 @@ impl ToolResult {
     ///
     /// # Returns
     ///
-    /// A [`ToolResult::Text`] variant.
+    /// A [`ToolContent::Text`] variant.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::message::{ToolResult};
-    /// let content = ToolResult::from_string("Done!");
+    /// use loopctl::message::{ToolContent};
+    /// let content = ToolContent::from_string("Done!");
     /// assert!(content.is_string());
     /// ```
     #[must_use]
@@ -778,23 +778,23 @@ impl ToolResult {
     ///
     /// # Arguments
     ///
-    /// - `parts` — The [`ToolResultPart`]s that make up the result.
+    /// - `parts` — The [`ToolContentPart`]s that make up the result.
     ///
     /// # Returns
     ///
-    /// A [`ToolResult::Multipart`] variant.
+    /// A [`ToolContent::Multipart`] variant.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::message::{ToolResult, ToolResultPart};
-    /// let content = ToolResult::from_multipart(vec![
-    ///     ToolResultPart::text("file1.txt"),
-    ///     ToolResultPart::text("file2.txt"),
+    /// use loopctl::message::{ToolContent, ToolContentPart};
+    /// let content = ToolContent::from_multipart(vec![
+    ///     ToolContentPart::text("file1.txt"),
+    ///     ToolContentPart::text("file2.txt"),
     /// ]);
     /// ```
     #[must_use]
-    pub const fn from_multipart(parts: Vec<ToolResultPart>) -> Self {
+    pub const fn from_multipart(parts: Vec<ToolContentPart>) -> Self {
         Self::Multipart(parts)
     }
 
@@ -805,8 +805,8 @@ impl ToolResult {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::message::{ToolResult};
-    /// let content = ToolResult::from_string("ok");
+    /// use loopctl::message::{ToolContent};
+    /// let content = ToolContent::from_string("ok");
     /// assert!(content.is_string());
     /// ```
     #[must_use]
@@ -815,9 +815,9 @@ impl ToolResult {
     }
 }
 
-/// Produces a [`Default`] value for [`ToolResult`].
+/// Produces a [`Default`] value for [`ToolContent`].
 ///
-/// Returns an empty [`String`](ToolResult::Text) variant,
+/// Returns an empty [`String`](ToolContent::Text) variant,
 /// which is the neutral starting point for tool results. This is
 /// useful when building responses incrementally or initializing
 /// result storage.
@@ -825,37 +825,37 @@ impl ToolResult {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::message::{ToolResult};
-/// let content = ToolResult::default();
+/// use loopctl::message::{ToolContent};
+/// let content = ToolContent::default();
 /// assert!(content.is_string());
 /// assert_eq!(content.to_string(), "");
 /// ```
-impl Default for ToolResult {
+impl Default for ToolContent {
     fn default() -> Self {
         Self::Text(String::new())
     }
 }
 
-/// Converts a [`String`] into a [`ToolResult::Text`].
+/// Converts a [`String`] into a [`ToolContent::Text`].
 ///
 /// This blanket conversion allows passing owned strings directly
-/// into APIs that accept [`Into<ToolResult>`], for example
+/// into APIs that accept [`Into<ToolContent>`], for example
 /// [`MessagePart::tool_result`].
 ///
 /// # Example
 ///
 /// ```rust
-/// use loopctl::message::{ToolResult};
-/// let content: ToolResult = "File found".to_string().into();
+/// use loopctl::message::{ToolContent};
+/// let content: ToolContent = "File found".to_string().into();
 /// assert!(content.is_string());
 /// ```
-impl From<String> for ToolResult {
+impl From<String> for ToolContent {
     fn from(s: String) -> Self {
         Self::Text(s)
     }
 }
 
-/// Converts a `&str` into a [`ToolResult::Text`].
+/// Converts a `&str` into a [`ToolContent::Text`].
 ///
 /// This conversion allocates a new [`String`] from the borrowed slice.
 /// It enables ergonomic usage with string literals:
@@ -863,21 +863,21 @@ impl From<String> for ToolResult {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::message::{ToolResult};
-/// let content: ToolResult = "ok".into();
+/// use loopctl::message::{ToolContent};
+/// let content: ToolContent = "ok".into();
 /// assert!(content.is_string());
 /// ```
-impl From<&str> for ToolResult {
+impl From<&str> for ToolContent {
     fn from(s: &str) -> Self {
         Self::Text(s.to_owned())
     }
 }
 
-/// Formats a [`ToolResult`] for display.
+/// Formats a [`ToolContent`] for display.
 ///
-/// For the [`String`](ToolResult::Text) variant, writes the
-/// text directly. For the [`Multipart`](ToolResult::Multipart)
-/// variant, concatenates all [`ToolResultPart::Text`] parts with
+/// For the [`String`](ToolContent::Text) variant, writes the
+/// text directly. For the [`Multipart`](ToolContent::Multipart)
+/// variant, concatenates all [`ToolContentPart::Text`] parts with
 /// newlines, silently skipping any non-text parts (e.g. images).
 ///
 /// This is useful for quick debugging and logging. For full
@@ -886,17 +886,17 @@ impl From<&str> for ToolResult {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::message::{ToolResult, ToolResultPart};
-/// let content = ToolResult::from_string("Done!");
+/// use loopctl::message::{ToolContent, ToolContentPart};
+/// let content = ToolContent::from_string("Done!");
 /// assert_eq!(content.to_string(), "Done!");
 ///
-/// let multipart = ToolResult::from_multipart(vec![
-///     ToolResultPart::text("line 1"),
-///     ToolResultPart::text("line 2"),
+/// let multipart = ToolContent::from_multipart(vec![
+///     ToolContentPart::text("line 1"),
+///     ToolContentPart::text("line 2"),
 /// ]);
 /// assert_eq!(multipart.to_string(), "line 1\nline 2");
 /// ```
-impl fmt::Display for ToolResult {
+impl fmt::Display for ToolContent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Text(s) => write!(f, "{s}"),
@@ -904,7 +904,7 @@ impl fmt::Display for ToolResult {
                 let texts: Vec<&str> = parts
                     .iter()
                     .filter_map(|part| {
-                        if let ToolResultPart::Text { text } = part {
+                        if let ToolContentPart::Text { text } = part {
                             Some(text.as_str())
                         } else {
                             None
@@ -918,30 +918,30 @@ impl fmt::Display for ToolResult {
 }
 
 // ==================================================
-// ToolResultPart
+// ToolContentPart
 // ==================================================
 
-/// A part of a Multipart [`ToolResult`].
+/// A part of a Multipart [`ToolContent`].
 ///
 /// Represents a single piece of content within a multi-part tool result.
 /// Currently supports images (via [`ImageSource`]) and text.
 ///
 /// # Construction
 ///
-/// Use [`text`](ToolResultPart::text) or [`image`](ToolResultPart::image)
+/// Use [`text`](ToolContentPart::text) or [`image`](ToolContentPart::image)
 /// constructors rather than building variants directly.
 ///
 /// # Example
 ///
 /// ```rust
-/// use loopctl::message::{ImageSource, ToolResult, ToolResultPart};
-/// let text_part = ToolResultPart::text("Screenshot analysis:");
-/// let img_part = ToolResultPart::image(ImageSource::new_base64("image/png", "..."));
-/// let content = ToolResult::from_multipart(vec![text_part, img_part]);
+/// use loopctl::message::{ImageSource, ToolContent, ToolContentPart};
+/// let text_part = ToolContentPart::text("Screenshot analysis:");
+/// let img_part = ToolContentPart::image(ImageSource::new_base64("image/png", "..."));
+/// let content = ToolContent::from_multipart(vec![text_part, img_part]);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ToolResultPart {
+pub enum ToolContentPart {
     /// An image part within a Multipart tool result.
     ///
     /// Contains the base64-encoded image data. Useful for tools
@@ -961,17 +961,17 @@ pub enum ToolResultPart {
         /// The text content of this part.
         ///
         /// May contain multiple lines. Joined with other text parts
-        /// by [`ToolResult`]'s [`Display`](fmt::Display) impl.
+        /// by [`ToolContent`]'s [`Display`](fmt::Display) impl.
         text: String,
     },
 }
 
-impl ToolResultPart {
+impl ToolContentPart {
     /// Create a text part.
     ///
     /// Convenience constructor for the most common part type.
     /// Use this to build individual text segments within a
-    /// [`ToolResult::Multipart`] result.
+    /// [`ToolContent::Multipart`] result.
     ///
     /// # Arguments
     ///
@@ -980,13 +980,13 @@ impl ToolResultPart {
     ///
     /// # Returns
     ///
-    /// A [`ToolResultPart::Text`] variant.
+    /// A [`ToolContentPart::Text`] variant.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::message::{ToolResultPart};
-    /// let part = ToolResultPart::text("result: 42");
+    /// use loopctl::message::{ToolContentPart};
+    /// let part = ToolContentPart::text("result: 42");
     /// ```
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text { text: text.into() }
@@ -995,8 +995,8 @@ impl ToolResultPart {
     /// Create an image part.
     ///
     /// Use when a tool result includes image data alongside text.
-    /// Combine with [`ToolResultPart::text`] parts via
-    /// [`ToolResult::from_multipart`] to produce a multi-part
+    /// Combine with [`ToolContentPart::text`] parts via
+    /// [`ToolContent::from_multipart`] to produce a multi-part
     /// result containing both text and images.
     ///
     /// # Arguments
@@ -1006,13 +1006,13 @@ impl ToolResultPart {
     ///
     /// # Returns
     ///
-    /// A [`ToolResultPart::Image`] variant.
+    /// A [`ToolContentPart::Image`] variant.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::message::{ImageSource, ToolResultPart};
-    /// let part = ToolResultPart::image(ImageSource::new_base64("image/png", "..."));
+    /// use loopctl::message::{ImageSource, ToolContentPart};
+    /// let part = ToolContentPart::image(ImageSource::new_base64("image/png", "..."));
     /// ```
     #[must_use]
     pub const fn image(source: ImageSource) -> Self {
@@ -1120,36 +1120,36 @@ mod tests {
         assert_eq!(src.media_type, "image/png");
     }
 
-    /// Verify `From<&str>` for [`ToolResult`] produces a string variant.
+    /// Verify `From<&str>` for [`ToolContent`] produces a string variant.
     ///
     /// The conversion should wrap the provided text in
-    /// [`ToolResult::Text`] and [`Display`](std::fmt::Display) should
+    /// [`ToolContent::Text`] and [`Display`](std::fmt::Display) should
     /// yield the original text.
     #[test]
     fn test_tool_result_from_string() {
-        let result: ToolResult = "hello".into();
+        let result: ToolContent = "hello".into();
         assert!(result.is_string());
         assert_eq!(result.to_string(), "hello");
     }
 
-    /// Verify that [`ToolResult::default`] produces an empty-string variant.
+    /// Verify that [`ToolContent::default`] produces an empty-string variant.
     ///
-    /// Equivalent to `ToolResult::from_string("")`.
+    /// Equivalent to `ToolContent::from_string("")`.
     #[test]
     fn test_tool_result_default() {
-        let result = ToolResult::default();
+        let result = ToolContent::default();
         assert!(result.is_string());
     }
 
-    /// Verify [`ToolResultPart::text`] produces the [`Text`](ToolResultPart::Text) variant.
+    /// Verify [`ToolContentPart::text`] produces the [`Text`](ToolContentPart::Text) variant.
     ///
-    /// The constructor should create a [`ToolResultPart::Text`] containing the
+    /// The constructor should create a [`ToolContentPart::Text`] containing the
     /// provided string, accessible via pattern matching on the variant.
     #[test]
     fn test_tool_result_part_text() {
-        let part = ToolResultPart::text("output");
+        let part = ToolContentPart::text("output");
         match &part {
-            ToolResultPart::Text { text } => assert_eq!(text, "output"),
+            ToolContentPart::Text { text } => assert_eq!(text, "output"),
             _ => panic!("expected text part"),
         }
     }
@@ -1181,16 +1181,16 @@ mod tests {
         assert_eq!(parts.len(), back.len());
     }
 
-    /// Verify [`ToolResult`]'s [`Display`](fmt::Display) joins text parts.
+    /// Verify [`ToolContent`]'s [`Display`](fmt::Display) joins text parts.
     ///
-    /// When a Multipart [`ToolResult`] contains multiple
-    /// [`ToolResultPart::Text`] entries, the [`Display`](fmt::Display) impl
+    /// When a Multipart [`ToolContent`] contains multiple
+    /// [`ToolContentPart::Text`] entries, the [`Display`](fmt::Display) impl
     /// should join them with newlines.
     #[test]
     fn test_tool_result_multipart_display() {
-        let result = ToolResult::from_multipart(vec![
-            ToolResultPart::text("line 1"),
-            ToolResultPart::text("line 2"),
+        let result = ToolContent::from_multipart(vec![
+            ToolContentPart::text("line 1"),
+            ToolContentPart::text("line 2"),
         ]);
         assert_eq!(result.to_string(), "line 1\nline 2");
     }

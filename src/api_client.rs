@@ -170,7 +170,6 @@ pub trait ApiClient: Send + Sync {
     /// # Returns
     ///
     /// A pinned, boxed stream of [`Result<StreamEvent, ApiError>`].
-    ///
     fn stream_messages(
         &self,
         messages: Vec<Message>,
@@ -198,7 +197,6 @@ pub trait ApiClient: Send + Sync {
     ///
     /// A pinned, boxed future resolving to the raw JSON response value
     /// from the provider, or an [`ApiError`] if the request fails.
-    ///
     fn create_message(
         &self,
         messages: Vec<Message>,
@@ -228,7 +226,6 @@ pub trait ApiClient: Send + Sync {
 /// let client: BoxedApiClient = Box::new(MyProviderClient::new(api_key));
 /// assert_eq!(client.model(), "llm-1");
 /// ```
-///
 pub type BoxedApiClient = Box<dyn ApiClient>;
 
 /// Type alias for a shared API client with reference-counted ownership.
@@ -248,7 +245,6 @@ pub type BoxedApiClient = Box<dyn ApiClient>;
 /// let agent_client = client.clone();
 /// let metrics_client = client.clone();
 /// ```
-///
 pub type SharedApiClient = Arc<dyn ApiClient>;
 
 #[cfg(test)]

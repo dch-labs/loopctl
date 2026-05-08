@@ -237,7 +237,6 @@ pub struct MessageStart {
     ///
     /// Contains the server-assigned message ID, the role (always
     /// `"assistant"` for streaming responses), and the model name.
-    /// This field is always present.
     pub message: MessageMetadata,
 }
 
@@ -328,7 +327,6 @@ pub struct PartStart {
     /// Sequentially assigned by the API. Used to correlate
     /// [`IndexedDelta`] events with the correct part.
     /// Indices are monotonically increasing within a single stream.
-    ///
     pub index: usize,
 
     /// The part, if known at start time.
@@ -338,7 +336,6 @@ pub struct PartStart {
     /// the type is inferred from subsequent [`DeltaPart::Text`]
     /// deltas. The [`StreamAccumulator`] uses this to seed the
     /// tool ID and name before deltas arrive.
-    ///
     pub part: Option<MessagePart>,
 }
 

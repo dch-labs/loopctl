@@ -950,8 +950,6 @@ impl ApiError {
     /// let err = ApiError::config("invalid TOML syntax at line 42");
     /// assert_eq!(err.code(), ErrorCode::ConfigParseError);
     /// ```
-    ///
-    ///
     pub fn config(msg: impl Into<String>) -> Self {
         Self::Config(msg.into())
     }
@@ -1166,9 +1164,6 @@ impl ApiError {
 ///     Ok(parse(&text))
 /// }
 /// ```
-///
-/// The framework selects the appropriate variant based on runtime
-/// conditions and the agent's current state.
 pub type Result<T> = std::result::Result<T, ApiError>;
 
 // ==================================================
@@ -1191,14 +1186,12 @@ pub type Result<T> = std::result::Result<T, ApiError>;
 /// - `From` conversions for [`serde_json::Error`] and [`std::io::Error`]
 ///   produce the correct variant and code.
 /// - [`ErrorCode`] serialisation round-trips through JSON.
-///
 mod tests {
     use super::*;
 
     /// Verify that a generic [`ApiError::api`] message maps to
     /// [`ErrorCode::ApiRequestFailed`] and the Display output
     /// contains the expected text.
-    ///
     #[test]
     fn test_api_error_code() {
         let error = ApiError::api("API failed");
@@ -1210,7 +1203,6 @@ mod tests {
     /// Verify that [`ApiError::auth`] with "Invalid" in the message
     /// maps to [`ErrorCode::AuthInvalidKey`] and is recognised by
     /// [`ApiError::is_auth_error`].
-    ///
     #[test]
     fn test_auth_error() {
         let error = ApiError::auth("Invalid key");
@@ -1224,7 +1216,6 @@ mod tests {
     /// Asserts that the error carries [`ErrorCode::AuthInvalidKey`] and that
     /// the prefix "invalid" in the message triggers the specialized variant
     /// rather than the generic [`ErrorCode::AuthFailed`].
-    ///
     #[test]
     fn test_auth_invalid_key() {
         let error = ApiError::auth_invalid_key("expired");
@@ -1235,7 +1226,6 @@ mod tests {
     ///
     /// When the message does not contain the word "invalid", the classifier
     /// should fall through to the generic [`ErrorCode::AuthFailed`] variant.
-    ///
     #[test]
     fn test_auth_failed_generic() {
         let error = ApiError::auth("token expired");
@@ -1246,7 +1236,6 @@ mod tests {
     ///
     /// Asserts that the [`Display`](std::fmt::Display) output contains
     /// "HTTP error" and that [`ApiError::code`] returns the correct variant.
-    ///
     #[test]
     fn test_http_error() {
         let error = ApiError::http("Connection failed");
@@ -1258,7 +1247,6 @@ mod tests {
     ///
     /// Checks that the [`Display`](std::fmt::Display) output includes both
     /// the HTTP status code (e.g., "HTTP 500") and the original error message.
-    ///
     #[test]
     fn test_http_error_with_status() {
         // 5xx → HttpResponseError

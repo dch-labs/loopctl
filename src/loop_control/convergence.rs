@@ -856,7 +856,6 @@ impl ConvergenceDetector {
     ///
     /// let mut detector = ConvergenceDetector::default_detector()?;
     /// detector.add_response("task in progress");
-    /// detector.add_response("task in progress");
     /// detector.clear();
     /// assert!(detector.window().is_empty());
     /// assert_eq!(detector.consecutive_count(), 0);

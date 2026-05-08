@@ -62,7 +62,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::message::ToolResult as MessageToolResult;
+use crate::message::ToolContent as MessageToolContent;
 
 // ===================================================
 // ToolSchema
@@ -150,8 +150,8 @@ pub struct ToolSchema {
 /// # Content types
 ///
 /// The [`payload`](ToolOutput::payload) field holds a
-/// [`MessageToolResult`] which is either a simple [`String`] or a
-/// structured list of [`ToolResultPart`](crate::message::ToolResultPart)
+/// [`MessageToolContent`] which is either a simple [`String`] or a
+/// structured list of [`ToolContentPart`](crate::message::ToolContentPart)
 /// elements. Use [`text_content`](ToolOutput::text_content) to extract
 /// plain text regardless of which variant is stored.
 ///
@@ -172,7 +172,7 @@ pub struct ToolSchema {
 /// Tool::call(input, ctx)
 ///   → Ok(ToolOutput { content, is_error: false })
 ///   → Ok(ToolOutput { content, is_error: true  })   [soft failure]
-///   → Err(ToolError)                                 [hard failure]
+///   → Err(ToolError)                                [hard failure]
 /// ```
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
@@ -181,7 +181,7 @@ pub struct ToolOutput {
     /// Holds either a plain-text string or structured multi-part content.
     /// Use [`ToolOutput::text_content`] to extract text regardless of the
     /// variant.
-    pub payload: MessageToolResult,
+    pub payload: MessageToolContent,
 
     /// Whether this result represents an error.
     ///
@@ -196,23 +196,23 @@ impl ToolOutput {
     /// Create a successful result with the given content.
     ///
     /// Called by tool implementations when the invocation succeeds and
-    /// the output is a structured [`MessageToolResult`] value.
+    /// the output is a structured [`MessageToolContent`] value.
     /// Sets [`is_error`](ToolOutput::is_error) to `false`.
     ///
     /// This is the most general success constructor — it accepts any type
-    /// that converts into [`MessageToolResult`]. For simple text results,
+    /// that converts into [`MessageToolContent`]. For simple text results,
     /// prefer the more concise [`ToolOutput::text`] helper.
     ///
     /// # Example
     ///
     /// ```rust
     /// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
-    /// use loopctl::message::ToolResult as MessageToolResult;
+    /// use loopctl::message::ToolContent as MessageToolContent;
     ///
-    /// let result = ToolOutput::success(MessageToolResult::Text("done".into()));
+    /// let result = ToolOutput::success(MessageToolContent::Text("done".into()));
     /// assert!(!result.is_error);
     /// ```
-    pub fn success(payload: impl Into<MessageToolResult>) -> Self {
+    pub fn success(payload: impl Into<MessageToolContent>) -> Self {
         Self {
             payload: payload.into(),
             is_error: false,
@@ -238,7 +238,7 @@ impl ToolOutput {
     /// let result = ToolOutput::error("permission denied");
     /// assert!(result.is_error);
     /// ```
-    pub fn error(payload: impl Into<MessageToolResult>) -> Self {
+    pub fn error(payload: impl Into<MessageToolContent>) -> Self {
         Self {
             payload: payload.into(),
             is_error: true,
@@ -248,7 +248,7 @@ impl ToolOutput {
     /// Create a successful plain-text result.
     ///
     /// Convenience wrapper around [`ToolOutput::success`] that converts
-    /// the input string into a [`MessageToolResult::Text`] variant.
+    /// the input string into a [`MessageToolContent::Text`] variant.
     /// This is the most common constructor for simple tool outputs.
     ///
     /// # When to use
@@ -256,7 +256,7 @@ impl ToolOutput {
     /// Use this when the tool produces a simple string response — for
     /// example, file contents, a computed value, or a status message.
     /// For structured multi-part responses, use [`ToolOutput::success`]
-    /// directly with a [`MessageToolResult::Multipart`] value.
+    /// directly with a [`MessageToolContent::Multipart`] value.
     ///
     /// # Example
     ///
@@ -273,7 +273,7 @@ impl ToolOutput {
     /// Create an error plain-text result.
     ///
     /// Convenience wrapper around [`ToolOutput::error`] that converts
-    /// the input string into a [`MessageToolResult::Text`] variant.
+    /// the input string into a [`MessageToolContent::Text`] variant.
     ///
     /// Use this for simple error messages like "file not found" or
     /// "permission denied". For structured error content, use
@@ -296,9 +296,9 @@ impl ToolOutput {
     ///
     /// Inspects the [`payload`](ToolOutput::payload) field and returns a
     /// flat [`String`]:
-    /// - For [`MessageToolResult::Text`], returns the string directly.
-    /// - For [`MessageToolResult::Multipart`], joins all
-    ///   [`ToolResultPart::Text`](crate::message::ToolResultPart::Text)
+    /// - For [`MessageToolContent::Text`], returns the string directly.
+    /// - For [`MessageToolContent::Multipart`], joins all
+    ///   [`ToolContentPart::Text`](crate::message::ToolContentPart::Text)
     ///   parts with newlines, discarding non-text parts.
     ///
     /// Useful when the consumer only cares about the textual payload and
@@ -308,16 +308,16 @@ impl ToolOutput {
     ///
     /// ```rust
     /// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
-    /// use loopctl::message::ToolResult as MessageToolResult;
-    /// use loopctl::message::ToolResultPart;
+    /// use loopctl::message::ToolContent as MessageToolContent;
+    /// use loopctl::message::ToolContentPart;
     ///
     /// let result = ToolOutput::text("hello world");
     /// assert_eq!(result.text_content(), "hello world");
     ///
     /// // Works with structured content too:
-    /// let structured = ToolOutput::success(MessageToolResult::Multipart(vec![
-    ///     ToolResultPart::Text { text: "line 1".into() },
-    ///     ToolResultPart::Text { text: "line 2".into() },
+    /// let structured = ToolOutput::success(MessageToolContent::Multipart(vec![
+    ///     ToolContentPart::Text { text: "line 1".into() },
+    ///     ToolContentPart::Text { text: "line 2".into() },
     /// ]));
     /// assert_eq!(structured.text_content(), "line 1\nline 2");
     /// ```
@@ -328,14 +328,14 @@ impl ToolOutput {
     #[must_use]
     pub fn text_content(&self) -> String {
         match &self.payload {
-            MessageToolResult::Text(s) => s.clone(),
-            MessageToolResult::Multipart(parts) => {
-                use crate::message::ToolResultPart;
+            MessageToolContent::Text(s) => s.clone(),
+            MessageToolContent::Multipart(parts) => {
+                use crate::message::ToolContentPart;
                 parts
                     .iter()
                     .filter_map(|p| match p {
-                        ToolResultPart::Text { text } => Some(text.clone()),
-                        ToolResultPart::Image { .. } => None,
+                        ToolContentPart::Text { text } => Some(text.clone()),
+                        ToolContentPart::Image { .. } => None,
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -433,9 +433,6 @@ impl From<&str> for ToolOutput {
 /// let err = ToolError::not_found("grep", &["read_file", "bash"]);
 /// assert!(err.to_string().contains("grep"));
 /// ```
-///
-/// The framework selects the appropriate variant based on runtime
-/// conditions and the agent's current state.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     /// The requested tool was not found in the registry.
@@ -620,7 +617,6 @@ impl ToolError {
 ///     println!("verbose={}", cfg.verbose);
 /// }
 /// ```
-///
 #[derive(Clone)]
 pub struct ToolContext {
     /// Current working directory for the agent session.
@@ -846,7 +842,6 @@ pub enum PermissionCheck {
     /// In interactive sessions the agent loop should present `prompt` to
     /// the user and then treat the response as either [`Allow`](PermissionCheck::Allow)
     /// or [`Deny`](PermissionCheck::Deny).
-    ///
     Ask {
         /// The question to present to the user.
         ///
@@ -1145,7 +1140,6 @@ impl PermissionCheck {
 ///     fn is_read_only(&self) -> bool { true }
 /// }
 /// ```
-///
 pub trait Tool: Send + Sync {
     /// The tool's unique name (e.g., `"read_file"`, `"bash"`).
     ///

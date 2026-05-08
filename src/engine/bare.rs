@@ -72,7 +72,7 @@ use crate::api_client::ApiClient;
 use crate::cancel::CancelSignal;
 use crate::core::{AgentConfig, AgentError, AgentObserver, SessionResult};
 use crate::loop_control::bundle::ManagerBundle;
-use crate::message::{Message, MessagePart, Role};
+use crate::message::{Message, MessagePart, Role, ToolContent};
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
 use crate::tool::{ToolContext, ToolRegistry, ToolSchema};
 use futures::StreamExt;
@@ -490,7 +490,7 @@ impl<C: ApiClient> BareLoop<C> {
         loop {
             if self.is_cancelled() {
                 self.notify_session_end(false, Some("Cancelled"));
-                return Ok(SessionResult::failed(session_id, "Agent cancelled"));
+                return Err(AgentError::Cancelled);
             }
             if turn_count >= max_turns {
                 self.notify_session_end(false, Some("Max turns exceeded"));
@@ -652,18 +652,19 @@ impl<C: ApiClient> BareLoop<C> {
                 Some(tool) => match tool.call(tc.input.clone(), &tool_context).await {
                     Ok(result) => {
                         let duration = start.elapsed();
-                        let output = result.text_content();
+                        let output_text = result.text_content();
+                        let success = !result.is_error;
                         self.notify_tool_complete(
                             &tc.name,
                             &tc.input.to_string(),
-                            &output,
+                            &output_text,
                             duration,
-                            true,
+                            success,
                             None,
                         );
                         ToolCallResult {
                             tool_call_id: tc.id.clone(),
-                            output,
+                            output: result.payload,
                             is_error: result.is_error,
                             duration,
                         }
@@ -681,7 +682,7 @@ impl<C: ApiClient> BareLoop<C> {
                         );
                         ToolCallResult {
                             tool_call_id: tc.id.clone(),
-                            output: error_msg,
+                            output: ToolContent::Text(error_msg),
                             is_error: true,
                             duration,
                         }
@@ -702,7 +703,7 @@ impl<C: ApiClient> BareLoop<C> {
                     );
                     ToolCallResult {
                         tool_call_id: tc.id.clone(),
-                        output: error_msg,
+                        output: ToolContent::Text(error_msg),
                         is_error: true,
                         duration: Duration::ZERO,
                     }
@@ -762,7 +763,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Per API convention, tool results are sent as a **user** message
     /// containing `tool_result` content parts. Each part pairs the
     /// `tool_call_id` with the tool's output (wrapped in a
-    /// [`ToolContent`](crate::message::ToolContent)) and an `is_error`
+    /// [`ToolContent`](ToolContent)) and an `is_error`
     /// flag so the model can distinguish successes from failures.
     /// the model can distinguish success from failure.
     ///
@@ -776,16 +777,9 @@ impl<C: ApiClient> BareLoop<C> {
     /// A [`Message`] with [`Role::User`] and one `tool_result`
     /// [`MessagePart`] per result.
     fn build_tool_result_message(results: Vec<ToolCallResult>) -> Message {
-        use crate::message::ToolContent;
         let parts: Vec<MessagePart> = results
             .into_iter()
-            .map(|r| {
-                MessagePart::tool_result(
-                    r.tool_call_id,
-                    ToolContent::from(r.output.clone()),
-                    r.is_error,
-                )
-            })
+            .map(|r| MessagePart::tool_result(r.tool_call_id, r.output, r.is_error))
             .collect();
         Message::new(Role::User, parts)
     }
@@ -963,7 +957,7 @@ struct ToolCallInfo {
 /// This is the internal version used during dispatch. Each executed tool
 /// produces one `ToolCallResult`, which is then converted into a
 /// `tool_result` [`MessagePart`] (with the output wrapped as
-/// [`ToolContent`](crate::message::ToolContent)) by
+/// [`ToolContent`](ToolContent)) by
 /// [`build_tool_result_message()`](BareLoop::build_tool_result_message)
 /// and appended to the conversation.
 ///
@@ -990,15 +984,16 @@ struct ToolCallResult {
     /// the result to the original request.
     tool_call_id: String,
 
-    /// The tool's output text or error message.
+    /// The tool's output content or error message.
     ///
-    /// On success this is whatever the tool's
-    /// [`call()`](crate::tool::Tool::call) returned via
-    /// [`ToolOutput::text_content()`](crate::tool::ToolOutput::text_content).
-    /// On failure it contains the error message string.
-    /// This text is later wrapped in [`ToolContent::Text`](crate::message::ToolContent)
-    /// when building the `tool_result` message part.
-    output: String,
+    /// On success this holds the full [`ToolOutput::payload`] returned by
+    /// [`Tool::call()`](crate::tool::Tool::call) — preserving multipart and
+    /// image content instead of flattening to text.
+    /// On failure it contains an error message wrapped in
+    /// [`ToolContent::Text`](ToolContent).
+    /// This content is passed directly to [`MessagePart::tool_result`] when
+    /// building the `tool_result` message part.
+    output: ToolContent,
 
     /// Whether the execution resulted in an error.
     ///
@@ -1622,9 +1617,12 @@ mod tests {
         agent.cancel();
         assert!(agent.is_cancelled());
 
-        let result = agent.run("Hi").await.unwrap();
-        assert!(!result.success);
-        assert_eq!(result.error.as_deref(), Some("Agent cancelled"));
+        let result = agent.run("Hi").await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AgentError::Cancelled => {}
+            other => panic!("Expected Cancelled error, got: {other}"),
+        }
     }
 
     /// Verify that an API error (no mock responses) propagates as
@@ -1801,7 +1799,7 @@ mod tests {
     async fn test_tool_result_message_format() {
         let results = vec![super::ToolCallResult {
             tool_call_id: "tool_123".to_string(),
-            output: "Echo: hello".to_string(),
+            output: ToolContent::Text("Echo: hello".to_string()),
             is_error: false,
             duration: Duration::from_millis(100),
         }];

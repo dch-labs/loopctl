@@ -87,10 +87,11 @@ impl CancelSignal {
     /// }
     /// ```
     pub async fn notified(&self) {
+        let notified = self.notify.notified();
         if self.flag.load(Ordering::Acquire) {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
     }
 }
 

@@ -675,6 +675,14 @@ impl<C: ApiClient> BareLoop<C> {
                     let call_result = tokio::select! {
                         r = tool.call(tc.input.clone(), &tool_context) => r,
                         () = cancel.notified() => {
+                            self.notify_tool_complete(
+                                &tc.name,
+                                &tc.input.to_string(),
+                                "",
+                                start.elapsed(),
+                                false,
+                                Some("cancelled"),
+                            );
                             return Err(AgentError::Cancelled);
                         }
                     };

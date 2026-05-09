@@ -8,6 +8,7 @@
 //! - **[`api_error`]** — API and infrastructure error types with classification.
 //! - **[`builder`]** — Fluent builder API for constructing configured agents.
 //! - **[`cancel`]** — Cooperative cancellation signal (`CancelSignal`).
+//! - **[`compact`]** — Context management and compaction (threshold detection, pluggable strategies).
 //! - **[`core`]** — Foundational traits (`AgentObserver`) and error types.
 //! - **[`builtin`]** — Reference implementations of core traits ([`builtin::memory::InMemoryStore`], [`builtin::observer::LoggingObserver`], etc.).
 //! - **[`loop_control`]** — Detection and intervention modules for agent loops.
@@ -20,6 +21,7 @@ pub mod api_error;
 pub mod builder;
 pub mod builtin;
 pub mod cancel;
+pub mod compact;
 pub mod core;
 pub mod engine;
 pub mod loop_control;

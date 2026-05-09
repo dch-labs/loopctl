@@ -56,7 +56,7 @@
 //!
 //! # Quick Start
 //!
-//! ```rust,ignore
+//! ```rust
 //! use loopctl::testing::{MockApiClient, MockTool, test_config};
 //! use loopctl::tool::ToolRegistry;
 //!
@@ -313,9 +313,9 @@ pub struct MockToolCall {
     pub input: Value,
 }
 
-// --------------------------------------------------
+// ===================================================
 // MockApiClient — construction & builder methods
-// --------------------------------------------------
+// ===================================================
 
 /// Construction and builder methods for [`MockApiClient`].
 ///
@@ -481,7 +481,7 @@ impl MockApiClient {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use loopctl::testing::{MockApiClient, MockResponse};
     ///
     /// let client = MockApiClient::new("test-model").with_responses(vec![
@@ -566,9 +566,9 @@ impl MockApiClient {
     }
 }
 
-// --------------------------------------------------
+// ===================================================
 // MockApiClient — ApiClient trait implementation
-// --------------------------------------------------
+// ===================================================
 
 /// Trait implementation that turns canned [`MockResponse`] values into
 /// real [`StreamEvent`] sequences and JSON payloads.
@@ -644,11 +644,16 @@ impl ApiClient for MockApiClient {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// use loopctl::api_client::ApiClient;
+    /// use loopctl::testing::MockApiClient;
+    ///
     /// let client = MockApiClient::new("test-model").with_text_response("Hi!");
     /// let stream = client.stream_messages(vec![], None, None);
-    /// let events: Vec<_> = stream.collect().await;
-    /// assert!(events.len() >= 4); // Start + TextBlock + Delta + Stop
+    /// let events: Vec<_> = futures::StreamExt::collect(stream).await;
+    /// assert!(events.len() >= 4);
+    /// # });
     /// ```
     fn stream_messages(
         &self,
@@ -715,9 +720,7 @@ impl ApiClient for MockApiClient {
     ///
     /// Called by code paths that use the non-streaming API. The mock
     /// returns a JSON object with a `content` array containing a single
-    /// text block drawn from the current [`MockResponse`]. This mirrors
-    /// the shape of the real Anthropic API response so that consumers
-    /// parsing the JSON see the expected structure.
+    /// text block drawn from the current [`MockResponse`].
     ///
     /// If [`with_error`](MockApiClient::with_error) was called the
     /// future resolves to an [`ApiError`] instead, bypassing the
@@ -728,10 +731,15 @@ impl ApiClient for MockApiClient {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// use loopctl::api_client::ApiClient;
+    /// use loopctl::testing::MockApiClient;
+    ///
     /// let client = MockApiClient::new("test-model").with_text_response("Hi!");
     /// let result = client.create_message(vec![], None, None).await;
     /// assert_eq!(result.unwrap()["content"][0]["text"], "Hi!");
+    /// # });
     /// ```
     fn create_message(
         &self,
@@ -878,9 +886,9 @@ pub struct MockTool {
     system_prompt: Option<String>,
 }
 
-// --------------------------------------------------
+// ===================================================
 // MockTool — construction & builder methods
-// --------------------------------------------------
+// ===================================================
 
 /// Construction and builder methods for [`MockTool`].
 ///
@@ -1083,9 +1091,9 @@ impl MockTool {
     }
 }
 
-// --------------------------------------------------
+// ===================================================
 // MockTool — Tool trait implementation
-// --------------------------------------------------
+// ===================================================
 
 /// Trait implementation that returns canned tool metadata and results.
 ///
@@ -1161,11 +1169,17 @@ impl Tool for MockTool {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// use loopctl::testing::MockTool;
+    /// use loopctl::tool::{Tool, ToolContext};
+    /// use serde_json::json;
+    ///
     /// let tool = MockTool::new("echo", "Echoes").with_result("pong");
     /// let ctx = ToolContext::default();
     /// let result = tool.call(json!({"msg": "ping"}), &ctx).await;
     /// assert_eq!(result.unwrap().text_content(), "pong");
+    /// # });
     /// ```
     fn call(
         &self,

@@ -23,5 +23,6 @@
 //! ```
 
 mod bare;
+pub mod middleware;
 
 pub use bare::*;

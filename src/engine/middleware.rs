@@ -440,12 +440,10 @@ impl ToolPipeline {
                 return Err(AgentError::Cancelled);
             }
             let cancel = Arc::clone(&ctx.cancel);
-            let result = tokio::select! {
-                r = self.invoke(ctx) => r,
-                () = cancel.notified() => {
-                    return Err(AgentError::Cancelled);
-                }
-            };
+            let result = self.invoke(ctx).await;
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
             results.push(result);
         }
         Ok(results)
@@ -788,8 +786,8 @@ impl Default for TimeoutConfig {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(120),
-            retry_on_timeout: true,
-            max_retries: 1,
+            retry_on_timeout: false,
+            max_retries: 0,
         }
     }
 }

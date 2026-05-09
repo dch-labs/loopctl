@@ -670,45 +670,54 @@ impl<C: ApiClient> BareLoop<C> {
             self.notify_tool_call(&tc.name, &tc.input.to_string());
             let start = Instant::now();
             let tool_result = match self.tools.get(&tc.name) {
-                Some(tool) => match tool.call(tc.input.clone(), &tool_context).await {
-                    Ok(result) => {
-                        let duration = start.elapsed();
-                        let output_text = result.text_content();
-                        let success = !result.is_error;
-                        self.notify_tool_complete(
-                            &tc.name,
-                            &tc.input.to_string(),
-                            &output_text,
-                            duration,
-                            success,
-                            None,
-                        );
-                        ToolCallResult {
-                            tool_call_id: tc.id.clone(),
-                            output: result.payload,
-                            is_error: result.is_error,
-                            duration,
+                Some(tool) => {
+                    let cancel = Arc::clone(&self.cancelled);
+                    let call_result = tokio::select! {
+                        r = tool.call(tc.input.clone(), &tool_context) => r,
+                        () = cancel.notified() => {
+                            return Err(AgentError::Cancelled);
+                        }
+                    };
+                    match call_result {
+                        Ok(result) => {
+                            let duration = start.elapsed();
+                            let output_text = result.text_content();
+                            let success = !result.is_error;
+                            self.notify_tool_complete(
+                                &tc.name,
+                                &tc.input.to_string(),
+                                &output_text,
+                                duration,
+                                success,
+                                None,
+                            );
+                            ToolCallResult {
+                                tool_call_id: tc.id.clone(),
+                                output: result.payload,
+                                is_error: result.is_error,
+                                duration,
+                            }
+                        }
+                        Err(e) => {
+                            let duration = start.elapsed();
+                            let error_msg = e.to_string();
+                            self.notify_tool_complete(
+                                &tc.name,
+                                &tc.input.to_string(),
+                                &error_msg,
+                                duration,
+                                false,
+                                Some(&error_msg),
+                            );
+                            ToolCallResult {
+                                tool_call_id: tc.id.clone(),
+                                output: ToolContent::Text(error_msg),
+                                is_error: true,
+                                duration,
+                            }
                         }
                     }
-                    Err(e) => {
-                        let duration = start.elapsed();
-                        let error_msg = e.to_string();
-                        self.notify_tool_complete(
-                            &tc.name,
-                            &tc.input.to_string(),
-                            &error_msg,
-                            duration,
-                            false,
-                            Some(&error_msg),
-                        );
-                        ToolCallResult {
-                            tool_call_id: tc.id.clone(),
-                            output: ToolContent::Text(error_msg),
-                            is_error: true,
-                            duration,
-                        }
-                    }
-                },
+                }
                 None => {
                     let available: Vec<String> = self.tools.tool_names().clone();
                     let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();

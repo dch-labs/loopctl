@@ -31,6 +31,11 @@
 //! - **[`IndexedDelta`]** — An indexed [`DeltaPart`] carrying the part position.
 //! - **[`MessageStart`]** / **[`MessageDelta`]** — Boundary events with metadata.
 //!
+//! # Sub-modules
+//!
+//! - **[`handler`]** — [`handler::StreamHandler`] with retry, timeout,
+//!   and fallback for resilient streaming.
+//!
 //! # Quick Start
 //!
 //! ```rust
@@ -52,6 +57,8 @@ use crate::message::{Message, MessagePart};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
+
+pub mod handler;
 
 // ==================================================
 // StreamError

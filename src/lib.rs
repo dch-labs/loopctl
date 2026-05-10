@@ -13,6 +13,7 @@
 //! - **[`builtin`]** — Reference implementations of core traits ([`builtin::memory::InMemoryStore`], [`builtin::observer::LoggingObserver`], etc.).
 //! - **[`loop_control`]** — Detection and intervention modules for agent loops.
 //! - **[`engine`]** — The core agentic loop that orchestrates the full agent lifecycle.
+//! - **[`observability`]** — Structured event streaming (`EventSink`, `ObserveEvent`, metrics).
 //! - **[`stream`]** — Streaming event types for LLM API responses.
 //! - **[`tool`]** — Tool trait, registry, and supporting types.
 
@@ -26,6 +27,7 @@ pub mod core;
 pub mod engine;
 pub mod loop_control;
 pub mod message;
+pub mod observability;
 pub mod stream;
 #[cfg(feature = "testing")]
 pub mod testing;

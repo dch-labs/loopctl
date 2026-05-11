@@ -35,6 +35,8 @@
 //!
 //! - **[`handler`]** — [`handler::StreamHandler`] with retry, timeout,
 //!   and fallback for resilient streaming.
+//! - **[`heartbeat`]** — [`heartbeat::HeartbeatStream`] composable heartbeat
+//!   and timeout wrapper for any stream.
 //!
 //! # Quick Start
 //!
@@ -59,6 +61,7 @@ use serde_json::Value;
 use std::fmt;
 
 pub mod handler;
+pub mod heartbeat;
 
 // ==================================================
 // StreamError

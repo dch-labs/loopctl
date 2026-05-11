@@ -1,29 +1,30 @@
-//! Streaming robustness: retry, timeout, and fallback for LLM stream processing.
+//! Configuration, result types, and error types for resilient LLM stream handling.
 //!
-//! [`StreamHandler`] wraps the raw [`ApiClient::stream_messages`](crate::api_client::ApiClient::stream_messages)
-//! call with production-grade resilience:
+//! This module defines the types that underpin [`StreamHandler`] — the framework's
+//! production-grade streaming resilience layer. The handler will wrap
+//! [`ApiClient::stream_messages`](crate::api_client::ApiClient::stream_messages)
+//! with retry, timeout, and fallback behaviour.
 //!
-//! - **Retry** — Exponential backoff on stream initialization failure.
-//! - **Timeouts** — Per-event, total-stream, and initial-event timeouts.
-//! - **Fallback** — Falls back to [`ApiClient::create_message`](crate::api_client::ApiClient::create_message)
-//!   when streaming fails.
-//! - **Cancellation** — Respects [`CancelSignal`](crate::cancel::CancelSignal) throughout.
+//! **Current state:** config structs, result types, error types, and constructors
+//! are implemented here. The runtime lifecycle methods (`stream_turn`,
+//! `init_with_retry`, `process_events`, `fallback_non_streaming`) will be wired
+//! into `BareLoop` in a future phase, using these types.
 //!
 //! # Architecture
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────┐
-//! │                StreamHandler                    │
-//! │                                                 │
-//! │  Phase 1: init_with_retry()                     │
+//! │        StreamHandler (config + types)           │
+//! |                                                 │
+//! |   Phase 1: init_with_retry()          (planned) │
 //! │    └─ stream_messages() → first event timeout   │
 //! │    └─ retry with backoff on failure             │
 //! │                                                 │
-//! │  Phase 2: process_events()                      │
+//! |    Phase 2: process_events()          (planned) │
 //! │    └─ per-event timeout + total timeout         │
 //! │    └─ progress callbacks at intervals           │
 //! │                                                 │
-//! │  Phase 3: fallback_non_streaming()              │
+//! |   Phase 3: fallback_non_streaming()   (planned) │
 //! │    └─ create_message() if streaming exhausted   │
 //! └─────────────────────────────────────────────────┘
 //! ```
@@ -141,6 +142,57 @@ impl Default for StreamTimeoutConfig {
     }
 }
 
+impl StreamTimeoutConfig {
+    /// Validates the configuration, returning an error message if invalid.
+    ///
+    /// Checks that all timeout durations are non-zero and that
+    /// `total_stream_timeout` ≥ `initial_event_timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a string describing the first validation failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::stream::handler::StreamTimeoutConfig;
+    /// use std::time::Duration;
+    ///
+    /// assert!(StreamTimeoutConfig::default().validate().is_ok());
+    ///
+    /// let bad = StreamTimeoutConfig {
+    ///     initial_event_timeout: Duration::ZERO,
+    ///     ..Default::default()
+    /// };
+    /// assert!(bad.validate().is_err());
+    /// ```
+    pub fn validate(&self) -> Result<(), String> {
+        if self.initial_event_timeout.is_zero() {
+            return Err("initial_event_timeout must be non-zero".to_string());
+        }
+        if self.per_event_timeout.is_zero() {
+            return Err("per_event_timeout must be non-zero".to_string());
+        }
+        if self.total_stream_timeout.is_zero() {
+            return Err("total_stream_timeout must be non-zero".to_string());
+        }
+        if self.total_stream_timeout < self.initial_event_timeout {
+            return Err(format!(
+                "total_stream_timeout ({:?}) must be >= initial_event_timeout ({:?})",
+                self.total_stream_timeout, self.initial_event_timeout
+            ));
+        }
+        if self.progress_interval.is_zero() {
+            return Err("progress_interval must be non-zero".to_string());
+        }
+
+        if self.max_consecutive_timeouts == 0 {
+            return Err("max_consecutive_timeouts must be >= 1".to_string());
+        }
+        Ok(())
+    }
+}
+
 // ===================================================
 // StreamRetryConfig
 // ===================================================
@@ -229,6 +281,53 @@ impl StreamRetryConfig {
             .base_delay_ms
             .saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX));
         Duration::from_millis(delay_ms.min(self.max_delay_ms))
+    }
+
+    /// Validates the configuration, returning an error message if invalid.
+    ///
+    /// Checks that `jitter_factor` is finite and within `0.0..=1.0`,
+    /// and that all delay values are non-zero with `max_delay_ms` ≥ `base_delay_ms`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a string describing the first validation failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::stream::handler::StreamRetryConfig;
+    ///
+    /// assert!(StreamRetryConfig::default().validate().is_ok());
+    ///
+    /// let bad = StreamRetryConfig { jitter_factor: 1.5, ..Default::default() };
+    /// assert!(bad.validate().is_err());
+    /// ```
+    pub fn validate(&self) -> Result<(), String> {
+        if self.base_delay_ms == 0 {
+            return Err("base_delay_ms must be non-zero".to_string());
+        }
+        if self.max_delay_ms == 0 {
+            return Err("max_delay_ms must be non-zero".to_string());
+        }
+        if self.max_delay_ms < self.base_delay_ms {
+            return Err(format!(
+                "max_delay_ms ({}) must be >= base_delay_ms ({})",
+                self.max_delay_ms, self.base_delay_ms
+            ));
+        }
+        if !self.jitter_factor.is_finite() {
+            return Err(format!(
+                "jitter_factor must be finite, got {}",
+                self.jitter_factor
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.jitter_factor) {
+            return Err(format!(
+                "jitter_factor must be in 0.0..=1.0, got {}",
+                self.jitter_factor
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -465,26 +564,24 @@ pub struct StreamProgress {
 // StreamHandler
 // ===================================================
 
-/// Handles streaming API responses with retry, timeout, and fallback.
+/// Holds configuration for the streaming resilience layer.
 ///
-/// Wraps [`ApiClient::stream_messages`](crate::api_client::ApiClient::stream_messages)
-/// with a three-phase lifecycle:
+/// `StreamHandler` stores [`StreamTimeoutConfig`] and [`StreamRetryConfig`]
+/// for use by the planned three-phase streaming lifecycle:
 ///
-/// 1. **Initialize** — Opens a stream, waits for the first event with
-///    a timeout, retries with exponential backoff on failure.
+/// 1. **Initialize** *(planned)* — Opens a stream, waits for the first
+///    event with a timeout, retries with exponential backoff on failure.
 ///
-/// 2. **Process** — Consumes events with per-event and total timeouts.
-///    Emits progress callbacks at regular intervals.
+/// 2. **Process** *(planned)* — Consumes events with per-event and total
+///    timeouts. Emits progress callbacks at regular intervals.
 ///
-/// 3. **Recover** — If streaming fails, falls back to
+/// 3. **Recover** *(planned)* — If streaming fails, falls back to
 ///    [`ApiClient::create_message`](crate::api_client::ApiClient::create_message)
 ///    for a non-streaming response.
 ///
-/// # Cancellation
-///
-/// The handler checks [`CancelSignal`](crate::cancel::CancelSignal)
-/// throughout all phases. Cancellation is immediate — no pending events
-/// are processed after cancellation.
+/// **Current state:** only config accessors are implemented. Runtime methods
+/// (`stream_turn`, `init_with_retry`, `process_events`, `fallback_non_streaming`)
+/// will be added in a future phase.
 ///
 /// # Example
 ///
@@ -803,5 +900,163 @@ mod tests {
         let debug = format!("{handler:?}");
         assert!(debug.contains("StreamHandler"));
         assert!(debug.contains("timeout_config"));
+    }
+
+    // ===================================================
+    // StreamTimeoutConfig::validate tests
+    // ===================================================
+
+    #[test]
+    fn timeout_config_validate_default_ok() {
+        assert!(StreamTimeoutConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn timeout_config_validate_zero_initial() {
+        let config = StreamTimeoutConfig {
+            initial_event_timeout: Duration::ZERO,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("initial_event_timeout"));
+    }
+
+    #[test]
+    fn timeout_config_validate_zero_per_event() {
+        let config = StreamTimeoutConfig {
+            per_event_timeout: Duration::ZERO,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("per_event_timeout"));
+    }
+
+    #[test]
+    fn timeout_config_validate_zero_total() {
+        let config = StreamTimeoutConfig {
+            total_stream_timeout: Duration::ZERO,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("total_stream_timeout"));
+    }
+
+    #[test]
+    fn timeout_config_validate_total_less_than_initial() {
+        let config = StreamTimeoutConfig {
+            initial_event_timeout: Duration::from_secs(120),
+            total_stream_timeout: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("total_stream_timeout"));
+        assert!(err.contains("initial_event_timeout"));
+    }
+
+    #[test]
+    fn timeout_config_validate_zero_progress() {
+        let config = StreamTimeoutConfig {
+            progress_interval: Duration::ZERO,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("progress_interval"));
+    }
+
+    // ===================================================
+    // StreamRetryConfig::validate tests
+    // ===================================================
+
+    #[test]
+    fn retry_config_validate_default_ok() {
+        assert!(StreamRetryConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn retry_config_validate_zero_base_delay() {
+        let config = StreamRetryConfig {
+            base_delay_ms: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("base_delay_ms"));
+    }
+
+    #[test]
+    fn retry_config_validate_zero_max_delay() {
+        let config = StreamRetryConfig {
+            max_delay_ms: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("max_delay_ms"));
+    }
+
+    #[test]
+    fn retry_config_validate_max_less_than_base() {
+        let config = StreamRetryConfig {
+            base_delay_ms: 1000,
+            max_delay_ms: 500,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("max_delay_ms"));
+        assert!(err.contains("base_delay_ms"));
+    }
+
+    #[test]
+    fn retry_config_validate_jitter_nan() {
+        let config = StreamRetryConfig {
+            jitter_factor: f64::NAN,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("finite"));
+    }
+
+    #[test]
+    fn retry_config_validate_jitter_infinity() {
+        let config = StreamRetryConfig {
+            jitter_factor: f64::INFINITY,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("finite"));
+    }
+
+    #[test]
+    fn retry_config_validate_jitter_above_one() {
+        let config = StreamRetryConfig {
+            jitter_factor: 1.5,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("0.0..=1.0"));
+    }
+
+    #[test]
+    fn retry_config_validate_jitter_negative() {
+        let config = StreamRetryConfig {
+            jitter_factor: -0.1,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("0.0..=1.0"));
+    }
+
+    #[test]
+    fn retry_config_validate_jitter_boundaries() {
+        // 0.0 and 1.0 are valid boundaries.
+        let config = StreamRetryConfig {
+            jitter_factor: 0.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        let config = StreamRetryConfig {
+            jitter_factor: 1.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 }

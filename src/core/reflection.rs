@@ -59,6 +59,8 @@
 
 use crate::core::types::Correction;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 // ===================================================
@@ -331,34 +333,40 @@ impl fmt::Display for RecoveryAction {
 /// use loopctl::core::reflection::{
 ///     Reflector, ReflectionContext, FailureAnalysis, FailureSeverity, ReflectionError,
 /// };
+/// use std::future::Future;
+/// use std::pin::Pin;
 ///
 /// struct PatternReflector;
 ///
 /// impl Reflector for PatternReflector {
-///     async fn analyze(
+///     fn analyze(
 ///         &self,
 ///         error: &str,
 ///         tool_name: &str,
-///         tool_input: &serde_json::Value,
-///         context: &ReflectionContext,
-///     ) -> Result<FailureAnalysis, ReflectionError> {
-///         if error.contains("not found") {
-///             Ok(FailureAnalysis {
-///                 is_recoverable: true,
-///                 root_cause: error.to_string(),
-///                 severity: FailureSeverity::Medium,
-///                 correction: None,
-///                 context: format!("tool: {tool_name}"),
-///             })
-///         } else {
-///             Ok(FailureAnalysis {
-///                 is_recoverable: false,
-///                 root_cause: error.to_string(),
-///                 severity: FailureSeverity::High,
-///                 correction: None,
-///                 context: String::new(),
-///             })
-///         }
+///         _tool_input: &serde_json::Value,
+///         _context: &ReflectionContext,
+///     ) -> Pin<Box<dyn Future<Output = Result<FailureAnalysis, ReflectionError>> + Send + '_>> {
+///         let error = error.to_string();
+///         let tool_name = tool_name.to_string();
+///         Box::pin(async move {
+///             if error.contains("not found") {
+///                 Ok(FailureAnalysis {
+///                     is_recoverable: true,
+///                     root_cause: error,
+///                     severity: FailureSeverity::Medium,
+///                     correction: None,
+///                     context: format!("tool: {tool_name}"),
+///                 })
+///             } else {
+///                 Ok(FailureAnalysis {
+///                     is_recoverable: false,
+///                     root_cause: error,
+///                     severity: FailureSeverity::High,
+///                     correction: None,
+///                     context: String::new(),
+///                 })
+///             }
+///         })
 ///     }
 /// }
 /// ```
@@ -382,7 +390,7 @@ pub trait Reflector: Send + Sync {
         tool_name: &str,
         tool_input: &serde_json::Value,
         context: &ReflectionContext,
-    ) -> impl std::future::Future<Output = Result<FailureAnalysis, ReflectionError>> + Send;
+    ) -> Pin<Box<dyn Future<Output = Result<FailureAnalysis, ReflectionError>> + Send + '_>>;
 }
 
 // ===================================================
@@ -405,23 +413,26 @@ pub trait Reflector: Send + Sync {
 /// use loopctl::core::reflection::{
 ///     RecoveryStrategy, FailureAnalysis, FailureSeverity, RecoveryAction,
 /// };
+/// use std::future::Future;
+/// use std::pin::Pin;
 ///
 /// struct AlwaysRetryStrategy;
 ///
 /// impl RecoveryStrategy for AlwaysRetryStrategy {
-///     async fn decide(
+///     fn decide(
 ///         &self,
-///         analysis: &FailureAnalysis,
+///         _analysis: &FailureAnalysis,
 ///         attempt: u32,
 ///         max_attempts: u32,
-///     ) -> RecoveryAction {
-///         if attempt >= max_attempts {
+///     ) -> Pin<Box<dyn Future<Output = RecoveryAction> + Send + '_>> {
+///         let action = if attempt >= max_attempts {
 ///             RecoveryAction::Fail("max retries exceeded".to_string())
 ///         } else {
 ///             RecoveryAction::Retry {
 ///                 delay: std::time::Duration::from_secs(1),
 ///             }
-///         }
+///         };
+///         Box::pin(async move { action })
 ///     }
 /// }
 /// ```
@@ -442,7 +453,7 @@ pub trait RecoveryStrategy: Send + Sync {
         analysis: &FailureAnalysis,
         attempt: u32,
         max_attempts: u32,
-    ) -> impl std::future::Future<Output = RecoveryAction> + Send;
+    ) -> Pin<Box<dyn Future<Output = RecoveryAction> + Send + '_>>;
 }
 
 // ===================================================
@@ -472,19 +483,22 @@ pub trait RecoveryStrategy: Send + Sync {
 pub struct NoopReflector;
 
 impl Reflector for NoopReflector {
-    async fn analyze(
+    fn analyze(
         &self,
         error: &str,
         _tool_name: &str,
         _tool_input: &serde_json::Value,
         _context: &ReflectionContext,
-    ) -> Result<FailureAnalysis, ReflectionError> {
-        Ok(FailureAnalysis {
-            is_recoverable: false,
-            root_cause: error.to_string(),
-            severity: FailureSeverity::Medium,
-            correction: None,
-            context: String::new(),
+    ) -> Pin<Box<dyn Future<Output = Result<FailureAnalysis, ReflectionError>> + Send + '_>> {
+        let root_cause = error.to_string();
+        Box::pin(async move {
+            Ok(FailureAnalysis {
+                is_recoverable: false,
+                root_cause,
+                severity: FailureSeverity::Medium,
+                correction: None,
+                context: String::new(),
+            })
         })
     }
 }
@@ -613,30 +627,27 @@ impl ExponentialBackoffRecovery {
 }
 
 impl RecoveryStrategy for ExponentialBackoffRecovery {
-    async fn decide(
+    fn decide(
         &self,
         analysis: &FailureAnalysis,
         attempt: u32,
         _max_attempts: u32,
-    ) -> RecoveryAction {
-        if !analysis.is_recoverable {
-            return RecoveryAction::Fail(analysis.root_cause.clone());
-        }
-
-        if attempt >= self.max_retries {
-            return RecoveryAction::Fail(format!("max retries ({}) exceeded", self.max_retries));
-        }
-
-        if analysis.severity >= FailureSeverity::High && analysis.correction.is_some() {
-            return RecoveryAction::AskUser(format!(
+    ) -> Pin<Box<dyn Future<Output = RecoveryAction> + Send + '_>> {
+        let action = if !analysis.is_recoverable {
+            RecoveryAction::Fail(analysis.root_cause.clone())
+        } else if attempt >= self.max_retries {
+            RecoveryAction::Fail(format!("max retries ({}) exceeded", self.max_retries))
+        } else if analysis.severity >= FailureSeverity::High && analysis.correction.is_some() {
+            RecoveryAction::AskUser(format!(
                 "high-severity failure with correction available: {}",
                 analysis.root_cause
-            ));
-        }
-
-        RecoveryAction::Retry {
-            delay: self.delay_for_attempt(attempt),
-        }
+            ))
+        } else {
+            RecoveryAction::Retry {
+                delay: self.delay_for_attempt(attempt),
+            }
+        };
+        Box::pin(async move { action })
     }
 }
 

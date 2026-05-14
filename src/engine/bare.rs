@@ -276,7 +276,22 @@ struct TurnContext {
     tokens: TurnTokens,
 }
 
+/// Reason the session was aborted before normal completion.
+///
+/// Used by [`abort_session`](BareLoop::abort_session) to select the
+/// correct [`AgentError`] variant without string matching.
+#[derive(Clone, Copy)]
+enum AbortReason {
+    /// User or external signal requested cancellation.
+    Cancelled,
+    /// The turn budget was exhausted.
+    MaxTurnsExceeded,
+}
+
 impl<C: ApiClient> BareLoop<C> {
+    /// Maximum retry attempts for tool recovery before giving up.
+    const MAX_RECOVERY_ATTEMPTS: u32 = 5;
+
     /// Create a new `BareLoop` with the given components.
     ///
     /// Initializes an empty conversation history, no observers, and a
@@ -640,13 +655,17 @@ impl<C: ApiClient> BareLoop<C> {
         // Main agent loop
         loop {
             if self.is_cancelled() {
-                return self.abort_session(budget.turn_count, start.elapsed(), "Cancelled");
+                return self.abort_session(
+                    budget.turn_count,
+                    start.elapsed(),
+                    AbortReason::Cancelled,
+                );
             }
             if budget.turn_count >= max_turns {
                 return self.abort_session(
                     budget.turn_count,
                     start.elapsed(),
-                    "Max turns exceeded",
+                    AbortReason::MaxTurnsExceeded,
                 );
             }
 
@@ -853,13 +872,17 @@ impl<C: ApiClient> BareLoop<C> {
         &self,
         turn_count: usize,
         session_duration: Duration,
-        reason: &str,
+        reason: AbortReason,
     ) -> Result<SessionResult, AgentError> {
-        self.emit_session_stop(turn_count, session_duration, false, reason);
-        self.notify_session_end(false, Some(reason));
+        let reason_str = match &reason {
+            AbortReason::Cancelled => "Cancelled",
+            AbortReason::MaxTurnsExceeded => "Max turns exceeded",
+        };
+        self.emit_session_stop(turn_count, session_duration, false, reason_str);
+        self.notify_session_end(false, Some(reason_str));
         match reason {
-            "Cancelled" => Err(AgentError::Cancelled),
-            _ => Err(AgentError::MaxTurnsExceeded {
+            AbortReason::Cancelled => Err(AgentError::Cancelled),
+            AbortReason::MaxTurnsExceeded => Err(AgentError::MaxTurnsExceeded {
                 max: self.config.max_turns,
             }),
         }
@@ -998,7 +1021,6 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Result<ToolCallResult, AgentError> {
         let tool_context = self.build_tool_context();
         let mut attempt: u32 = 0;
-        let max_recovery_attempts: u32 = 5;
 
         loop {
             if self.is_cancelled() {
@@ -1101,7 +1123,7 @@ impl<C: ApiClient> BareLoop<C> {
             match recovery_action {
                 RecoveryAction::Retry { delay } => {
                     attempt = attempt.saturating_add(1);
-                    if attempt >= max_recovery_attempts {
+                    if attempt >= Self::MAX_RECOVERY_ATTEMPTS {
                         return Ok(tool_result);
                     }
                     tokio::select! {
@@ -1139,7 +1161,7 @@ impl<C: ApiClient> BareLoop<C> {
         let context = ReflectionContext {
             task: String::new(),
             attempt,
-            max_attempts: 5,
+            max_attempts: Self::MAX_RECOVERY_ATTEMPTS,
         };
 
         let Ok(analysis) = self
@@ -1151,7 +1173,9 @@ impl<C: ApiClient> BareLoop<C> {
             return RecoveryAction::Fail(error_msg);
         };
 
-        self.recovery.decide(&analysis, attempt, 5).await
+        self.recovery
+            .decide(&analysis, attempt, Self::MAX_RECOVERY_ATTEMPTS)
+            .await
     }
 
     // ==================================================

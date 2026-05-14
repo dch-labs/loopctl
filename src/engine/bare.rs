@@ -70,14 +70,20 @@
 
 use crate::api_client::ApiClient;
 use crate::cancel::CancelSignal;
+use crate::core::reflection::{
+    ExponentialBackoffRecovery, NoopReflector, RecoveryAction, RecoveryStrategy, ReflectionContext,
+    Reflector,
+};
 use crate::core::{AgentConfig, AgentError, AgentObserver, SessionResult};
 use crate::loop_control::bundle::ManagerBundle;
 use crate::message::{Message, MessagePart, Role, ToolContent};
+use crate::observability::{EventSink, NullSink, ObserveEvent};
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
 use crate::tool::{ToolContext, ToolRegistry, ToolSchema};
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 // ==================================================
 // BareLoop
@@ -113,7 +119,7 @@ use std::time::{Duration, Instant};
 /// ```text
 /// new() / with_observers() / from_parts()
 ///   → run(user_input)
-///       → stream_turn() ─→ dispatch_tools() ─→ stream_turn()
+///       → stream_turn() → dispatch_tools() → stream_turn()
 ///       → … (repeat until end_turn or max_turns)
 ///   → SessionResult
 /// ```
@@ -171,9 +177,31 @@ pub struct BareLoop<C: ApiClient> {
 
     /// Manager bundle (fallback, loop detection, convergence).
     ///
-    /// Currently marked `dead_code` until those features are wired in.
-    #[allow(dead_code)]
+    /// Reserved for future wiring (loop detection, circuit-breaker
+    /// policies). Uses `#[expect]` so that wiring the field will
+    /// produce a reminder to remove this attribute.
+    #[expect(dead_code)]
     managers: ManagerBundle,
+
+    /// Structured event sink for observability.
+    ///
+    /// Emits [`ObserveEvent`] variants at each lifecycle point alongside
+    /// the legacy [`AgentObserver`] callbacks (dual-track migration).
+    event_sink: Arc<dyn EventSink>,
+
+    /// Failure analyser for tool errors.
+    ///
+    /// When a tool call returns an error, the reflector analyses the
+    /// failure and produces a [`FailureAnalysis`] describing
+    /// recoverability, severity, and optional corrections.
+    reflector: Arc<dyn Reflector>,
+
+    /// Recovery policy for tool errors.
+    ///
+    /// Takes the [`FailureAnalysis`] and decides on a [`RecoveryAction`]
+    /// (retry, skip, ask user, or fail). Defaults to
+    /// [`ExponentialBackoffRecovery`] with 3 retries.
+    recovery: Arc<dyn RecoveryStrategy>,
 
     /// Shared cancellation signal.
     ///
@@ -184,7 +212,86 @@ pub struct BareLoop<C: ApiClient> {
     cancelled: Arc<CancelSignal>,
 }
 
+// ==================================================
+// Run-loop bookkeeping types
+// ==================================================
+
+/// Accumulated token counts, tool-call count, and turn count for a session.
+///
+/// Mutable state that flows through the [`run()`](BareLoop::run) loop.
+/// Using a struct avoids scattering loose counters across the method.
+#[derive(Default)]
+struct SessionBudget {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tool_calls: usize,
+    turn_count: usize,
+}
+
+impl SessionBudget {
+    /// Accumulate token usage from a single turn into the running totals.
+    fn accumulate_usage(&mut self, usage: Option<&Usage>) {
+        if let Some(u) = usage {
+            self.input_tokens = self.input_tokens.saturating_add(u64::from(u.input_tokens));
+            self.output_tokens = self
+                .output_tokens
+                .saturating_add(u64::from(u.output_tokens));
+        }
+    }
+}
+
+/// Token counts for a single turn, captured before tool dispatch.
+///
+/// Needed because [`SessionBudget::accumulate_usage`] mutates the running
+/// totals, but the per-turn values must be reported separately in
+/// [`emit_turn_complete`](BareLoop::emit_turn_complete).
+#[derive(Clone, Copy)]
+struct TurnTokens {
+    input: u64,
+    output: u64,
+}
+
+impl TurnTokens {
+    fn from_usage(usage: Option<&Usage>) -> Self {
+        match usage {
+            Some(u) => Self {
+                input: u64::from(u.input_tokens),
+                output: u64::from(u.output_tokens),
+            },
+            None => Self {
+                input: 0,
+                output: 0,
+            },
+        }
+    }
+}
+
+/// Per-turn context passed to helper methods during the [`run()`](BareLoop::run) loop.
+///
+/// Bundles the zero-based turn index, wall-clock duration, and token
+/// counts so that extracted methods don't need long parameter lists.
+struct TurnContext {
+    idx: usize,
+    duration: Duration,
+    tokens: TurnTokens,
+}
+
+/// Reason the session was aborted before normal completion.
+///
+/// Used by [`abort_session`](BareLoop::abort_session) to select the
+/// correct [`AgentError`] variant without string matching.
+#[derive(Clone, Copy)]
+enum AbortReason {
+    /// User or external signal requested cancellation.
+    Cancelled,
+    /// The turn budget was exhausted.
+    MaxTurnsExceeded,
+}
+
 impl<C: ApiClient> BareLoop<C> {
+    /// Maximum retry attempts for tool recovery before giving up.
+    const MAX_RECOVERY_ATTEMPTS: u32 = 5;
+
     /// Create a new `BareLoop` with the given components.
     ///
     /// Initializes an empty conversation history, no observers, and a
@@ -213,6 +320,9 @@ impl<C: ApiClient> BareLoop<C> {
             conversation: Vec::new(),
             observers: Vec::new(),
             managers: ManagerBundle::new(),
+            event_sink: Arc::new(NullSink),
+            reflector: Arc::new(NoopReflector),
+            recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
         }
     }
@@ -253,6 +363,9 @@ impl<C: ApiClient> BareLoop<C> {
             conversation: Vec::new(),
             observers,
             managers: ManagerBundle::new(),
+            event_sink: Arc::new(NullSink),
+            reflector: Arc::new(NoopReflector),
+            recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
         }
     }
@@ -300,6 +413,9 @@ impl<C: ApiClient> BareLoop<C> {
             conversation: Vec::new(),
             observers,
             managers,
+            event_sink: Arc::new(NullSink),
+            reflector: Arc::new(NoopReflector),
+            recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
         }
     }
@@ -338,6 +454,9 @@ impl<C: ApiClient> BareLoop<C> {
             conversation: Vec::new(),
             observers,
             managers,
+            event_sink: Arc::new(NullSink),
+            reflector: Arc::new(NoopReflector),
+            recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
         }
     }
@@ -418,6 +537,56 @@ impl<C: ApiClient> BareLoop<C> {
     }
 
     // ==================================================
+    // Dependency setters
+    // ==================================================
+
+    /// Set the [`EventSink`] for structured observability events.
+    ///
+    /// Replaces the default [`NullSink`] with a caller-supplied
+    /// implementation. Must be called before [`run()`](BareLoop::run).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_event_sink(Arc::new(MySink));
+    /// ```
+    pub fn set_event_sink(&mut self, sink: Arc<dyn EventSink>) {
+        self.event_sink = sink;
+    }
+
+    /// Set the [`Reflector`] for tool-error analysis.
+    ///
+    /// Replaces the default [`NoopReflector`] with a caller-supplied
+    /// implementation. Must be called before [`run()`](BareLoop::run).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_reflector(Arc::new(MyReflector));
+    /// ```
+    pub fn set_reflector(&mut self, reflector: Arc<dyn Reflector>) {
+        self.reflector = reflector;
+    }
+
+    /// Set the [`RecoveryStrategy`] for tool-error recovery.
+    ///
+    /// Replaces the default [`ExponentialBackoffRecovery`] with a
+    /// caller-supplied implementation. Must be called before
+    /// [`run()`](BareLoop::run).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_recovery_strategy(Arc::new(MyStrategy));
+    /// ```
+    pub fn set_recovery_strategy(&mut self, strategy: Arc<dyn RecoveryStrategy>) {
+        self.recovery = strategy;
+    }
+
+    // ==================================================
     // Main run loop
     // ==================================================
 
@@ -474,15 +643,11 @@ impl<C: ApiClient> BareLoop<C> {
     ///     println!("Output tokens: {}", result.output_tokens);
     /// }
     /// ```
-    #[allow(clippy::arithmetic_side_effects, clippy::cast_lossless)]
     pub async fn run(mut self, user_input: &str) -> Result<SessionResult, AgentError> {
         let session_id = self.config.session_id;
         let max_turns = self.config.max_turns;
         let start = Instant::now();
-        let mut input_tokens: u64 = 0;
-        let mut output_tokens: u64 = 0;
-        let mut total_tool_calls: usize = 0;
-        let mut turn_count: usize = 0;
+        let mut budget = SessionBudget::default();
 
         self.notify_session_start();
         self.conversation.push(Message::user(user_input));
@@ -490,81 +655,236 @@ impl<C: ApiClient> BareLoop<C> {
         // Main agent loop
         loop {
             if self.is_cancelled() {
-                self.notify_session_end(false, Some("Cancelled"));
-                return Err(AgentError::Cancelled);
+                return self.abort_session(
+                    budget.turn_count,
+                    start.elapsed(),
+                    AbortReason::Cancelled,
+                );
             }
-            if turn_count >= max_turns {
-                self.notify_session_end(false, Some("Max turns exceeded"));
-                return Err(AgentError::MaxTurnsExceeded { max: max_turns });
+            if budget.turn_count >= max_turns {
+                return self.abort_session(
+                    budget.turn_count,
+                    start.elapsed(),
+                    AbortReason::MaxTurnsExceeded,
+                );
             }
 
+            self.emit_turn_start(budget.turn_count, user_input);
             self.notify_turn_start(user_input);
-            let _turn_start = Instant::now();
-            let stream_result = self.stream_turn().await;
+            let turn_start = Instant::now();
 
-            match stream_result {
+            match self.stream_turn().await {
                 Ok((assistant_msg, usage, stop_reason)) => {
-                    if let Some(u) = usage {
-                        input_tokens += u.input_tokens as u64;
-                        output_tokens += u.output_tokens as u64;
-                    }
+                    budget.accumulate_usage(usage.as_ref());
                     let text = Self::extract_text(&assistant_msg);
                     let tool_calls = Self::extract_tool_calls(&assistant_msg);
-                    let has_tool_calls = !tool_calls.is_empty();
-
                     self.conversation.push(assistant_msg);
-                    turn_count += 1;
+                    budget.turn_count = budget.turn_count.saturating_add(1);
 
-                    if has_tool_calls {
-                        let tool_result = self.dispatch_tools(&tool_calls).await;
-                        match tool_result {
-                            Ok(results) => {
-                                total_tool_calls += results.len();
-                                let tool_result_msg = Self::build_tool_result_message(results);
-                                self.conversation.push(tool_result_msg);
-                                self.notify_turn_end(true, None);
-                            }
-                            Err(AgentError::Cancelled) => {
-                                self.notify_turn_end(false, Some("Cancelled"));
-                                self.notify_session_end(false, Some("Cancelled"));
-                                return Err(AgentError::Cancelled);
-                            }
-                            Err(e) => {
-                                self.notify_turn_end(false, Some(&e.to_string()));
-                                self.notify_session_end(false, Some(&e.to_string()));
-                                return Err(e);
-                            }
-                        }
-                    } else {
-                        // No tool calls — session is done
-                        let success = stop_reason == StreamStopReason::EndTurn;
-                        let error = if success {
-                            None
-                        } else {
-                            Some(format!("Stream stopped with reason: {stop_reason:?}"))
-                        };
-                        self.notify_turn_end(success, error.as_deref());
-                        self.notify_session_end(success, error.as_deref());
-                        let duration = start.elapsed();
-                        return Ok(SessionResult {
+                    let turn = TurnContext {
+                        idx: budget.turn_count.saturating_sub(1),
+                        duration: turn_start.elapsed(),
+                        tokens: TurnTokens::from_usage(usage.as_ref()),
+                    };
+
+                    if tool_calls.is_empty() {
+                        return Ok(self.finalise_session(
                             session_id,
-                            total_turns: turn_count,
-                            input_tokens,
-                            output_tokens,
-                            total_duration: duration,
-                            tool_calls: total_tool_calls,
-                            success,
-                            final_output: Some(text),
-                            error,
-                        });
+                            text,
+                            stop_reason,
+                            &turn,
+                            start.elapsed(),
+                            &budget,
+                        ));
+                    }
+
+                    if let Err(e) = self
+                        .dispatch_and_record(&tool_calls, &turn, &mut budget)
+                        .await
+                    {
+                        return self.abort_session_from_error(e, start.elapsed(), &budget);
                     }
                 }
                 Err(e) => {
-                    self.notify_turn_end(false, Some(&e.to_string()));
-                    self.notify_session_end(false, Some(&e.to_string()));
-                    return Err(e);
+                    let err_str = e.to_string();
+                    return self.abort_turn_and_session(
+                        budget.turn_count,
+                        turn_start.elapsed(),
+                        start.elapsed(),
+                        &err_str,
+                        e,
+                    );
                 }
             }
+        }
+    }
+
+    // ==================================================
+    // Run helpers
+    // ==================================================
+
+    /// Dispatch tool calls, push the result message, and record the count.
+    ///
+    /// Emits turn-complete on success, turn-failed on error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Cancelled`] or a tool-dispatch error
+    /// propagated from [`dispatch_tools`](BareLoop::dispatch_tools).
+    async fn dispatch_and_record(
+        &mut self,
+        tool_calls: &[ToolCallInfo],
+        turn: &TurnContext,
+        budget: &mut SessionBudget,
+    ) -> Result<(), AgentError> {
+        match self.dispatch_tools(tool_calls).await {
+            Ok(results) => {
+                budget.total_tool_calls = budget.total_tool_calls.saturating_add(results.len());
+                let tool_result_msg = Self::build_tool_result_message(results);
+                self.conversation.push(tool_result_msg);
+                self.emit_turn_complete(
+                    turn.idx,
+                    turn.duration,
+                    turn.tokens.input,
+                    turn.tokens.output,
+                );
+                self.notify_turn_end(true, None);
+                Ok(())
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                self.emit_turn_failed(turn.idx, turn.duration, &err_str);
+                self.notify_turn_end(false, Some(&err_str));
+                Err(e)
+            }
+        }
+    }
+
+    /// Build the final [`SessionResult`] when the model ends its turn.
+    ///
+    /// Called when streaming completes with no tool calls. Emits
+    /// turn-complete/failed and session-stop events, notifies observers,
+    /// and returns the assembled result.
+    fn finalise_session(
+        &self,
+        session_id: Uuid,
+        text: String,
+        stop_reason: StreamStopReason,
+        turn: &TurnContext,
+        session_duration: Duration,
+        budget: &SessionBudget,
+    ) -> SessionResult {
+        let success = stop_reason == StreamStopReason::EndTurn;
+        let error = if success {
+            None
+        } else {
+            Some(format!("Stream stopped with reason: {stop_reason:?}"))
+        };
+
+        if success {
+            self.emit_turn_complete(
+                turn.idx,
+                turn.duration,
+                turn.tokens.input,
+                turn.tokens.output,
+            );
+        } else {
+            self.emit_turn_failed(
+                turn.idx,
+                turn.duration,
+                error.as_deref().unwrap_or("unknown"),
+            );
+        }
+        self.notify_turn_end(success, error.as_deref());
+
+        self.emit_session_stop(
+            budget.turn_count,
+            session_duration,
+            success,
+            error.as_deref().unwrap_or("completed"),
+        );
+        self.notify_session_end(success, error.as_deref());
+
+        SessionResult {
+            session_id,
+            total_turns: budget.turn_count,
+            input_tokens: budget.input_tokens,
+            output_tokens: budget.output_tokens,
+            total_duration: session_duration,
+            tool_calls: budget.total_tool_calls,
+            success,
+            final_output: Some(text),
+            error,
+        }
+    }
+
+    /// Abort the session with an error — emits turn-failed + session-stop.
+    ///
+    /// Used when the streaming call itself fails (API error, timeout, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Always returns `Err(error)`, passing through the original [`AgentError`].
+    fn abort_turn_and_session(
+        &self,
+        turn_count: usize,
+        turn_duration: Duration,
+        session_duration: Duration,
+        reason: &str,
+        error: AgentError,
+    ) -> Result<SessionResult, AgentError> {
+        self.emit_turn_failed(turn_count, turn_duration, reason);
+        self.notify_turn_end(false, Some(reason));
+        self.emit_session_stop(turn_count, session_duration, false, reason);
+        self.notify_session_end(false, Some(reason));
+        Err(error)
+    }
+
+    /// Abort the session after a tool-dispatch error.
+    ///
+    /// Handles both [`AgentError::Cancelled`] and other errors uniformly.
+    /// Turn-level events were already emitted inside [`dispatch_and_record`].
+    ///
+    /// # Errors
+    ///
+    /// Always returns `Err(error)`, passing through the original [`AgentError`].
+    fn abort_session_from_error(
+        &self,
+        error: AgentError,
+        session_duration: Duration,
+        budget: &SessionBudget,
+    ) -> Result<SessionResult, AgentError> {
+        let reason = error.to_string();
+        self.emit_session_stop(budget.turn_count, session_duration, false, &reason);
+        self.notify_session_end(false, Some(&reason));
+        Err(error)
+    }
+
+    /// Abort the session with a known reason string (cancel / max-turns).
+    ///
+    /// Does not emit turn-level events since no turn was started.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Cancelled`] or [`AgentError::MaxTurnsExceeded`]
+    /// depending on the `reason` string.
+    fn abort_session(
+        &self,
+        turn_count: usize,
+        session_duration: Duration,
+        reason: AbortReason,
+    ) -> Result<SessionResult, AgentError> {
+        let reason_str = match &reason {
+            AbortReason::Cancelled => "Cancelled",
+            AbortReason::MaxTurnsExceeded => "Max turns exceeded",
+        };
+        self.emit_session_stop(turn_count, session_duration, false, reason_str);
+        self.notify_session_end(false, Some(reason_str));
+        match reason {
+            AbortReason::Cancelled => Err(AgentError::Cancelled),
+            AbortReason::MaxTurnsExceeded => Err(AgentError::MaxTurnsExceeded {
+                max: self.config.max_turns,
+            }),
         }
     }
 
@@ -648,6 +968,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// registry produces a soft error result (not a hard [`AgentError`]),
     /// allowing the model to recover.
     ///
+    /// When a tool returns an error (execution failure or not-found),
+    /// the framework consults the [`Reflector`] and [`RecoveryStrategy`]
+    /// to decide whether to retry, skip, ask user, or fail. Retry
+    /// attempts use the delay specified by the [`RecoveryAction`].
+    ///
     /// Observers are notified before and after each tool invocation via
     /// [`on_tool_call`](AgentObserver::on_tool_call) and
     /// [`on_tool_complete`](AgentObserver::on_tool_complete).
@@ -656,102 +981,201 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Returns [`AgentError::Cancelled`] if the cancellation flag is set
     /// between tool invocations.
-    #[allow(clippy::single_match_else)]
     async fn dispatch_tools(
         &self,
         tool_calls: &[ToolCallInfo],
     ) -> Result<Vec<ToolCallResult>, AgentError> {
         let mut results = Vec::with_capacity(tool_calls.len());
-        let tool_context = self.build_tool_context();
         for tc in tool_calls {
             if self.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
+            let result = self.dispatch_tool_with_recovery(tc).await?;
+            results.push(result);
+        }
+        Ok(results)
+    }
+
+    /// Dispatch a single tool call, using reflector + recovery on errors.
+    ///
+    /// If the tool call succeeds, returns the result immediately. If it
+    /// fails, calls [`Reflector::analyze()`] and [`RecoveryStrategy::decide()`]
+    /// to determine the next action:
+    ///
+    /// - [`Retry`](RecoveryAction::Retry) — re-dispatch the tool after the
+    ///   specified delay, up to the recovery strategy's retry limit.
+    /// - [`Skip`](RecoveryAction::Skip) — produce a soft error result and
+    ///   continue to the next tool.
+    /// - [`Fail`](RecoveryAction::Fail) — produce a soft error result (the
+    ///   model sees the failure and can decide how to respond).
+    /// - [`AskUser`](RecoveryAction::AskUser) — treated as `Skip` (interactive
+    ///   recovery not yet supported in `BareLoop`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Cancelled`] if the cancellation signal fires
+    /// during tool execution or between retry attempts.
+    async fn dispatch_tool_with_recovery(
+        &self,
+        tc: &ToolCallInfo,
+    ) -> Result<ToolCallResult, AgentError> {
+        let tool_context = self.build_tool_context();
+        let mut attempt: u32 = 0;
+
+        loop {
+            if self.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+
             self.notify_tool_call(&tc.name, &tc.input.to_string());
+            self.emit_tool_start(&tc.name, &tc.input.to_string());
             let start = Instant::now();
-            let tool_result = match self.tools.get(&tc.name) {
-                Some(tool) => {
-                    let cancel = Arc::clone(&self.cancelled);
-                    let call_result = tokio::select! {
-                        r = tool.call(tc.input.clone(), &tool_context) => r,
-                        () = cancel.notified() => {
-                            self.notify_tool_complete(
-                                &tc.name,
-                                &tc.input.to_string(),
-                                "",
-                                start.elapsed(),
-                                false,
-                                Some("cancelled"),
-                            );
-                            return Err(AgentError::Cancelled);
+
+            let tool_result = if let Some(tool) = self.tools.get(&tc.name) {
+                let cancel = Arc::clone(&self.cancelled);
+                let call_result = tokio::select! {
+                    r = tool.call(tc.input.clone(), &tool_context) => r,
+                    () = cancel.notified() => {
+                        let dur = start.elapsed();
+                        self.notify_tool_complete(
+                            &tc.name,
+                            &tc.input.to_string(),
+                            "",
+                            dur,
+                            false,
+                            Some("cancelled"),
+                        );
+                        self.emit_tool_complete(&tc.name, "", true, dur);
+                        return Err(AgentError::Cancelled);
+                    }
+                };
+                match call_result {
+                    Ok(result) => {
+                        let duration = start.elapsed();
+                        let output_text = result.text_content();
+                        let success = !result.is_error;
+                        self.notify_tool_complete(
+                            &tc.name,
+                            &tc.input.to_string(),
+                            &output_text,
+                            duration,
+                            success,
+                            None,
+                        );
+                        self.emit_tool_complete(&tc.name, &output_text, !success, duration);
+                        ToolCallResult {
+                            tool_call_id: tc.id.clone(),
+                            output: result.payload,
+                            is_error: result.is_error,
+                            duration,
                         }
-                    };
-                    match call_result {
-                        Ok(result) => {
-                            let duration = start.elapsed();
-                            let output_text = result.text_content();
-                            let success = !result.is_error;
-                            self.notify_tool_complete(
-                                &tc.name,
-                                &tc.input.to_string(),
-                                &output_text,
-                                duration,
-                                success,
-                                None,
-                            );
-                            ToolCallResult {
-                                tool_call_id: tc.id.clone(),
-                                output: result.payload,
-                                is_error: result.is_error,
-                                duration,
-                            }
-                        }
-                        Err(e) => {
-                            let duration = start.elapsed();
-                            let error_msg = e.to_string();
-                            self.notify_tool_complete(
-                                &tc.name,
-                                &tc.input.to_string(),
-                                &error_msg,
-                                duration,
-                                false,
-                                Some(&error_msg),
-                            );
-                            ToolCallResult {
-                                tool_call_id: tc.id.clone(),
-                                output: ToolContent::Text(error_msg),
-                                is_error: true,
-                                duration,
-                            }
+                    }
+                    Err(e) => {
+                        let duration = start.elapsed();
+                        let error_msg = e.to_string();
+                        self.notify_tool_complete(
+                            &tc.name,
+                            &tc.input.to_string(),
+                            &error_msg,
+                            duration,
+                            false,
+                            Some(&error_msg),
+                        );
+                        self.emit_tool_complete(&tc.name, &error_msg, true, duration);
+                        ToolCallResult {
+                            tool_call_id: tc.id.clone(),
+                            output: ToolContent::Text(error_msg.clone()),
+                            is_error: true,
+                            duration,
                         }
                     }
                 }
-                None => {
-                    let available: Vec<String> = self.tools.tool_names().clone();
-                    let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();
-                    let error = AgentError::tool_not_found(&tc.name, &available_refs);
-                    let error_msg = error.to_string();
-                    self.notify_tool_complete(
-                        &tc.name,
-                        &tc.input.to_string(),
-                        &error_msg,
-                        Duration::ZERO,
-                        false,
-                        Some(&error_msg),
-                    );
-                    ToolCallResult {
-                        tool_call_id: tc.id.clone(),
-                        output: ToolContent::Text(error_msg),
-                        is_error: true,
-                        duration: Duration::ZERO,
-                    }
+            } else {
+                let available: Vec<String> = self.tools.tool_names().clone();
+                let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();
+                let error = AgentError::tool_not_found(&tc.name, &available_refs);
+                let error_msg = error.to_string();
+                self.notify_tool_complete(
+                    &tc.name,
+                    &tc.input.to_string(),
+                    &error_msg,
+                    Duration::ZERO,
+                    false,
+                    Some(&error_msg),
+                );
+                self.emit_tool_complete(&tc.name, &error_msg, true, Duration::ZERO);
+                ToolCallResult {
+                    tool_call_id: tc.id.clone(),
+                    output: ToolContent::Text(error_msg.clone()),
+                    is_error: true,
+                    duration: Duration::ZERO,
                 }
             };
 
-            results.push(tool_result);
-        }
+            // If the tool succeeded, return immediately.
+            if !tool_result.is_error {
+                return Ok(tool_result);
+            }
 
-        Ok(results)
+            // Tool failed — consult reflector + recovery strategy.
+            let recovery_action = self.recover_tool_error(tc, &tool_result, attempt).await;
+
+            match recovery_action {
+                RecoveryAction::Retry { delay } => {
+                    attempt = attempt.saturating_add(1);
+                    if attempt >= Self::MAX_RECOVERY_ATTEMPTS {
+                        return Ok(tool_result);
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {},
+                        () = self.cancelled.notified() => {
+                            return Err(AgentError::Cancelled);
+                        }
+                    }
+                    // Loop to retry the tool call.
+                }
+                RecoveryAction::Skip(_) | RecoveryAction::AskUser(_) | RecoveryAction::Fail(_) => {
+                    // All non-retry actions: return the error result as a
+                    // soft error so the model can see it and respond.
+                    return Ok(tool_result);
+                }
+            }
+        }
+    }
+
+    /// Analyse a tool error and decide on a recovery action.
+    ///
+    /// Calls [`Reflector::analyze()`] and then [`RecoveryStrategy::decide()`].
+    /// If the reflector itself fails, logs the error and returns
+    /// [`RecoveryAction::Fail`] (conservative default).
+    async fn recover_tool_error(
+        &self,
+        tc: &ToolCallInfo,
+        result: &ToolCallResult,
+        attempt: u32,
+    ) -> RecoveryAction {
+        let error_msg = match &result.output {
+            ToolContent::Text(msg) => msg.clone(),
+            ToolContent::Multipart(_) => result.output.to_string(),
+        };
+        let context = ReflectionContext {
+            task: String::new(),
+            attempt,
+            max_attempts: Self::MAX_RECOVERY_ATTEMPTS,
+        };
+
+        let Ok(analysis) = self
+            .reflector
+            .analyze(&error_msg, &tc.name, &tc.input, &context)
+            .await
+        else {
+            // Reflector failed — conservatively fail.
+            return RecoveryAction::Fail(error_msg);
+        };
+
+        self.recovery
+            .decide(&analysis, attempt, Self::MAX_RECOVERY_ATTEMPTS)
+            .await
     }
 
     // ==================================================
@@ -865,6 +1289,9 @@ impl<C: ApiClient> BareLoop<C> {
         for obs in &self.observers {
             obs.on_session_start(self.config.session_id);
         }
+        self.event_sink.on_event(&ObserveEvent::SessionStart {
+            session_id: self.config.session_id,
+        });
     }
 
     /// Notify all observers that the session has ended.
@@ -921,10 +1348,8 @@ impl<C: ApiClient> BareLoop<C> {
     /// Includes the tool's output, execution `duration`, a `success`
     /// flag, and an optional `error` message.
     ///
-    /// The `#[allow(clippy::too_many_arguments)]` annotation suppresses
-    /// the lint for this notification method because all parameters are
-    /// required by the [`AgentObserver::on_tool_complete`] trait method.
-    #[allow(clippy::too_many_arguments)]
+    /// Parameter count is dictated by the [`AgentObserver::on_tool_complete`]
+    /// trait method.
     fn notify_tool_complete(
         &self,
         tool: &str,
@@ -937,6 +1362,86 @@ impl<C: ApiClient> BareLoop<C> {
         for obs in &self.observers {
             obs.on_tool_complete(tool, input, output, duration, success, error);
         }
+    }
+
+    // ==================================================
+    // EventSink emissions
+    // ==================================================
+
+    /// Convert a [`Duration`] to milliseconds as `u64`.
+    ///
+    /// Clamps at `u64::MAX` if the duration exceeds ~584 million years,
+    /// which is safe for any practical agent session.
+    fn millis_u64(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Emit a [`TurnStart`](ObserveEvent::TurnStart) event.
+    fn emit_turn_start(&self, turn: usize, query: &str) {
+        self.event_sink.on_event(&ObserveEvent::TurnStart {
+            turn,
+            query: query.to_string(),
+        });
+    }
+
+    /// Emit a [`TurnComplete`](ObserveEvent::TurnComplete) event.
+    fn emit_turn_complete(
+        &self,
+        turn: usize,
+        duration: Duration,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) {
+        self.event_sink.on_event(&ObserveEvent::TurnComplete {
+            turn,
+            duration_ms: Self::millis_u64(duration),
+            input_tokens,
+            output_tokens,
+        });
+    }
+
+    /// Emit a [`TurnFailed`](ObserveEvent::TurnFailed) event.
+    fn emit_turn_failed(&self, turn: usize, duration: Duration, error: &str) {
+        self.event_sink.on_event(&ObserveEvent::TurnFailed {
+            turn,
+            duration_ms: Self::millis_u64(duration),
+            error: error.to_string(),
+        });
+    }
+
+    /// Emit a [`ToolStart`](ObserveEvent::ToolStart) event.
+    fn emit_tool_start(&self, name: &str, input: &str) {
+        self.event_sink.on_event(&ObserveEvent::ToolStart {
+            name: name.to_string(),
+            input: input.to_string(),
+        });
+    }
+
+    /// Emit a [`ToolComplete`](ObserveEvent::ToolComplete) event.
+    fn emit_tool_complete(&self, name: &str, output: &str, is_error: bool, duration: Duration) {
+        self.event_sink.on_event(&ObserveEvent::ToolComplete {
+            name: name.to_string(),
+            output: output.to_string(),
+            is_error,
+            duration_ms: Self::millis_u64(duration),
+        });
+    }
+
+    /// Emit a [`SessionStop`](ObserveEvent::SessionStop) event.
+    fn emit_session_stop(
+        &self,
+        total_turns: usize,
+        duration: Duration,
+        success: bool,
+        reason: &str,
+    ) {
+        self.event_sink.on_event(&ObserveEvent::SessionStop {
+            session_id: self.config.session_id,
+            success,
+            reason: reason.to_string(),
+            total_turns,
+            duration_ms: Self::millis_u64(duration),
+        });
     }
 }
 
@@ -1043,10 +1548,10 @@ struct ToolCallResult {
     /// Wall-clock duration of the tool execution.
     ///
     /// Measured with [`Instant::now()`] around the
-    /// [`Tool::call()`](crate::tool::Tool::call) invocation. Currently
-    /// marked `dead_code` because it is not yet surfaced in the public
-    /// [`SessionResult`], but it is passed to observer callbacks.
-    #[allow(dead_code)]
+    /// [`Tool::call()`](crate::tool::Tool::call) invocation. Reserved
+    /// for future surfacing in [`SessionResult`]; currently passed to
+    /// observer callbacks inline during dispatch.
+    #[expect(dead_code)]
     duration: Duration,
 }
 
@@ -1064,8 +1569,6 @@ mod tests {
     };
     use crate::tool::ToolRegistry;
     use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
-    #[allow(unused_imports)]
-    use futures::stream;
     use serde_json::{Value, json};
     use std::future::Future;
     use std::pin::Pin;
@@ -1275,7 +1778,7 @@ mod tests {
         /// which does not trigger an error on its own. Reserved for
         /// testing streaming-error scenarios once the accumulator
         /// handles partial messages.
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         fn add_error_response(&self) {
             // Return an empty response that will cause the stream to error
             // We'll handle this by having the stream return an error event
@@ -1565,8 +2068,8 @@ mod tests {
     // Tests: Basic lifecycle
     // ==================================================
 
-    /// Verify that a single-turn conversation (no tools) completes
-    /// successfully and returns the model's text as `final_output`.
+    /// Verify that a single-turn session (text response, no tool calls)
+    /// completes successfully and returns the model's text output.
     #[tokio::test]
     async fn test_bare_loop_single_turn() {
         let client = MockClient::new("test-model");
@@ -1574,7 +2077,6 @@ mod tests {
 
         let config = make_config();
         let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
-
         let result = agent.run("Hi").await.unwrap();
 
         assert!(result.success);
@@ -1582,8 +2084,8 @@ mod tests {
         assert_eq!(result.final_output.as_deref(), Some("Hello! I'm done."));
     }
 
-    /// Verify that a two-turn conversation (tool_call then end_turn)
-    /// records one tool call and two total turns.
+    /// Verify that a two-turn session (tool call → tool result → end turn)
+    /// completes successfully and records the tool invocation.
     #[tokio::test]
     async fn test_bare_loop_with_tool_call() {
         let client = MockClient::new("test-model");
@@ -1599,7 +2101,6 @@ mod tests {
 
         let config = make_config();
         let agent = BareLoop::new(Arc::new(client), registry, config);
-
         let result = agent.run("Echo hello").await.unwrap();
 
         assert!(result.success);
@@ -1607,12 +2108,8 @@ mod tests {
         assert_eq!(result.tool_calls, 1);
     }
 
-    /// Verify that exceeding `max_turns` produces
-    /// [`AgentError::MaxTurnsExceeded`].
-    ///
-    /// The mock returns only `tool_call` responses so the loop never
-    /// receives an `end_turn`. After 3 turns the loop should abort
-    /// with the correct error variant.
+    /// Verify that exceeding `max_turns` returns
+    /// [`AgentError::MaxTurnsExceeded`] and reports `success = false`.
     #[tokio::test]
     async fn test_bare_loop_max_turns_exceeded() {
         let client = MockClient::new("test-model");
@@ -1632,7 +2129,6 @@ mod tests {
         registry.register(EchoTool);
 
         let agent = BareLoop::new(Arc::new(client), registry, config);
-
         let result = agent.run("Keep going").await;
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1641,8 +2137,8 @@ mod tests {
         }
     }
 
-    /// Verify that cancelling the loop before it starts returns a
-    /// failed [`SessionResult`] (not an error).
+    /// Verify that calling [`cancel()`](BareLoop::cancel) mid-session
+    /// returns [`AgentError::Cancelled`].
     #[tokio::test]
     async fn test_bare_loop_cancellation() {
         let client = MockClient::new("test-model");
@@ -1663,16 +2159,14 @@ mod tests {
         }
     }
 
-    /// Verify that an API error (no mock responses) propagates as
-    /// [`AgentError::Api`].
+    /// Verify that an API error during streaming propagates as
+    /// [`AgentError::Api`] and marks the session as failed.
     #[tokio::test]
     async fn test_bare_loop_api_error() {
+        // The mock will return an error
         let client = MockClient::new("test-model");
-        // Don't add any responses — the mock will return an error
-
         let config = make_config();
         let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
-
         let result = agent.run("Hi").await;
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1685,32 +2179,27 @@ mod tests {
     // Tests: Tool dispatch
     // ==================================================
 
-    /// Verify that requesting a nonexistent tool produces a soft error
-    /// result (the loop continues), not a hard error.
-    ///
-    /// The model asks for a tool that isn't in the registry. The loop
-    /// should create an error tool result, feed it back, and then the
-    /// model's second response (end_turn) should complete the session
-    /// successfully.
+    /// Verify that requesting a tool not present in the registry produces
+    /// a soft error result (not a hard [`AgentError`]), allowing the model
+    /// to see the failure and adapt.
     #[tokio::test]
     async fn test_tool_not_found_returns_error_result() {
         let client = MockClient::new("test-model");
         client.add_tool_then_text("tool_1", "nonexistent", json!({}), "I see the tool failed.");
 
-        let config = make_config();
         // Empty registry — tool won't be found
+        let config = make_config();
         let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
-
         let result = agent.run("Use nonexistent tool").await.unwrap();
 
-        assert!(result.success);
         // The tool-not-found should be returned as an error result in the conversation,
         // not as a hard error. The loop should continue and eventually get the end_turn.
+        assert!(result.success);
         assert_eq!(result.total_turns, 2);
     }
 
-    /// Verify that a tool that returns an execution error is handled
-    /// as a soft error result, allowing the session to continue.
+    /// Verify that a tool returning an execution error produces a soft
+    /// error result and the session continues to completion.
     #[tokio::test]
     async fn test_tool_execution_failure() {
         let client = MockClient::new("test-model");
@@ -1721,7 +2210,6 @@ mod tests {
 
         let config = make_config();
         let agent = BareLoop::new(Arc::new(client), registry, config);
-
         let result = agent.run("Use failing tool").await.unwrap();
 
         assert!(result.success);
@@ -1732,9 +2220,8 @@ mod tests {
     // Tests: Observers
     // ==================================================
 
-    /// Verify that a single-turn session fires the expected observer
-    /// callbacks: one session start, one session end, one turn start,
-    /// and one turn end.
+    /// Verify that a single-turn session fires `session_start`,
+    /// `turn_start`, `turn_end`, and `session_end` on the observer.
     #[tokio::test]
     async fn test_observer_lifecycle_events() {
         let client = MockClient::new("test-model");
@@ -1742,7 +2229,6 @@ mod tests {
 
         let observer = Arc::new(CountingObserver::new());
         let config = make_config();
-
         let agent = BareLoop::with_observers(
             Arc::new(client),
             ToolRegistry::new(),
@@ -1751,8 +2237,8 @@ mod tests {
         );
 
         let result = agent.run("Hi").await.unwrap();
-        assert!(result.success);
 
+        assert!(result.success);
         assert_eq!(observer.session_starts.load(Ordering::SeqCst), 1);
         assert_eq!(observer.session_ends.load(Ordering::SeqCst), 1);
         assert_eq!(observer.turn_starts.load(Ordering::SeqCst), 1);
@@ -1761,6 +2247,8 @@ mod tests {
 
     /// Verify that a tool-using session fires tool call/complete
     /// callbacks in addition to the turn callbacks.
+    /// Verify that a tool-using session fires `tool_call` and
+    /// `tool_complete` callbacks in addition to the turn callbacks.
     ///
     /// A two-turn session (tool_call + end_turn) should produce:
     /// - 2 turn starts, 2 turn ends
@@ -1867,10 +2355,12 @@ mod tests {
 
     /// Verify that multiple tool_call parts in a single assistant
     /// message are all dispatched and counted.
+    /// Verify that multiple tool_call parts in a single assistant message
+    /// are all dispatched and counted.
     ///
-    /// The mock emits two `tool_call` parts in one response, followed
-    /// by an `end_turn` response. The session should report 2 turns
-    /// and 2 tool calls.
+    /// The mock emits two `tool_call` parts in one response, followed by
+    /// an `end_turn` response. The session should report 2 turns and 2
+    /// tool calls.
     #[tokio::test]
     async fn test_multiple_tool_calls_in_one_turn() {
         let client = MockClient::new("test-model");
@@ -1939,7 +2429,6 @@ mod tests {
         let client = MockClient::new("test-model");
         let config = make_config();
         let session_id = config.session_id;
-
         let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
 
         assert_eq!(agent.config().session_id, session_id);
@@ -1954,7 +2443,6 @@ mod tests {
         let client = MockClient::new("test-model");
         let config = make_config();
         let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
-
         let signal = agent.cancel_signal();
         assert!(!signal.is_cancelled());
 
@@ -1975,7 +2463,6 @@ mod tests {
         let config = make_config();
         let managers = ManagerBundle::new();
         let observers: Vec<Arc<dyn AgentObserver>> = vec![];
-
         let agent = BareLoop::from_parts(
             Arc::new(client),
             ToolRegistry::new(),
@@ -2000,9 +2487,7 @@ mod tests {
 
         let config = make_config();
         let session_id = config.session_id;
-
         let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
-
         let result = agent.run("Hi").await.unwrap();
 
         assert_eq!(result.session_id, session_id);
@@ -2043,7 +2528,6 @@ mod tests {
 
         let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
         let result = agent.run("Hi").await;
-
         assert!(result.is_err());
         match result.unwrap_err() {
             AgentError::MaxTurnsExceeded { max } => assert_eq!(max, 0),
@@ -2091,8 +2575,403 @@ mod tests {
 
         let config = make_config();
         let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
-
         let result = agent.run("Use missing tool").await.unwrap();
         assert!(result.success);
+    }
+
+    // ==================================================
+    // EventSink + Recovery wiring tests
+    // ==================================================
+
+    /// A recording [`EventSink`] that captures all emitted events.
+    ///
+    /// Uses `Mutex<Vec<ObserveEvent>>` so it's `Send + Sync`.
+    struct RecordingSink {
+        events: std::sync::Mutex<Vec<ObserveEvent>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Return a snapshot of all captured events.
+        fn events(&self) -> Vec<ObserveEvent> {
+            self.events.lock().expect("lock").clone()
+        }
+
+        fn count_matching(&self, pred: impl Fn(&ObserveEvent) -> bool) -> usize {
+            self.events
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|e| pred(e))
+                .count()
+        }
+
+        /// Return true if any event matches the predicate.
+        fn any(&self, pred: impl Fn(&ObserveEvent) -> bool) -> bool {
+            self.events.lock().expect("lock").iter().any(|e| pred(e))
+        }
+
+        /// Return the first event matching the predicate, if any.
+        fn find(&self, pred: impl Fn(&ObserveEvent) -> bool) -> Option<ObserveEvent> {
+            self.events
+                .lock()
+                .expect("lock")
+                .iter()
+                .find(|e| pred(e))
+                .cloned()
+        }
+    }
+
+    impl EventSink for RecordingSink {
+        fn on_event(&self, event: &ObserveEvent) {
+            self.events.lock().expect("lock").push(event.clone());
+        }
+    }
+
+    /// Helpers for matching [`ObserveEvent`] variants in assertions.
+    mod event_match {
+        use crate::observability::ObserveEvent;
+
+        pub fn is_session_start(e: &ObserveEvent) -> bool {
+            matches!(e, ObserveEvent::SessionStart { .. })
+        }
+        pub fn is_session_stop(e: &ObserveEvent) -> bool {
+            matches!(e, ObserveEvent::SessionStop { .. })
+        }
+        pub fn is_turn_start(e: &ObserveEvent) -> bool {
+            matches!(e, ObserveEvent::TurnStart { .. })
+        }
+        pub fn is_turn_complete(e: &ObserveEvent) -> bool {
+            matches!(e, ObserveEvent::TurnComplete { .. })
+        }
+        pub fn is_tool_start(e: &ObserveEvent) -> bool {
+            matches!(e, ObserveEvent::ToolStart { .. })
+        }
+        pub fn is_tool_complete(e: &ObserveEvent) -> bool {
+            matches!(e, ObserveEvent::ToolComplete { .. })
+        }
+    }
+
+    /// Build a [`BareLoop`] with a [`RecordingSink`] wired in.
+    ///
+    /// Returns the loop and an `Arc<RecordingSink>` for asserting events.
+    fn agent_with_recording_sink(
+        client: MockClient,
+        registry: ToolRegistry,
+        config: AgentConfig,
+    ) -> (BareLoop<MockClient>, Arc<RecordingSink>) {
+        let sink = Arc::new(RecordingSink::new());
+        let mut agent = BareLoop::new(Arc::new(client), registry, config);
+        agent.event_sink = Arc::clone(&sink) as Arc<dyn EventSink>;
+        (agent, sink)
+    }
+
+    // ==================================================
+    // EventSink emission tests
+    // ==================================================
+
+    /// Verify that a successful single-turn session emits
+    /// [`SessionStart`](ObserveEvent::SessionStart) and
+    /// [`SessionStop`](ObserveEvent::SessionStop) events.
+    #[tokio::test]
+    async fn test_sink_emits_session_start_stop_on_success() {
+        let client = MockClient::new("test");
+        client.add_text_response("Hello!");
+
+        let (agent, sink) = agent_with_recording_sink(client, ToolRegistry::new(), make_config());
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+        assert!(
+            sink.any(event_match::is_session_start),
+            "missing session_start"
+        );
+        assert!(
+            sink.any(event_match::is_session_stop),
+            "missing session_stop"
+        );
+        assert!(sink.any(event_match::is_turn_start), "missing turn_start");
+        assert!(
+            sink.any(event_match::is_turn_complete),
+            "missing turn_complete"
+        );
+    }
+
+    /// Verify that exceeding `max_turns` emits a
+    /// [`SessionStop`](ObserveEvent::SessionStop) with `success = false`.
+    #[tokio::test]
+    async fn test_sink_emits_session_stop_on_max_turns_error() {
+        let client = MockClient::new("test");
+        // Queue a response so the mock has something to return, but
+        // max_turns=0 means the loop aborts before streaming.
+        client.add_text_response("turn 1");
+
+        let mut config = make_config();
+        config.max_turns = 0;
+
+        let (agent, sink) = agent_with_recording_sink(client, ToolRegistry::new(), config);
+
+        // max_turns=0 → immediate abort, no turn executes.
+        let err = agent.run("Hi").await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::MaxTurnsExceeded { .. }),
+            "expected MaxTurnsExceeded, got {err:?}"
+        );
+        assert!(
+            sink.any(event_match::is_session_start),
+            "missing session_start"
+        );
+        let stop_evt = sink
+            .find(event_match::is_session_stop)
+            .expect("missing session_stop");
+        assert!(
+            matches!(stop_evt, ObserveEvent::SessionStop { success: false, .. }),
+            "expected SessionStop with success=false, got {stop_evt:?}"
+        );
+    }
+
+    /// Verify that a tool-using session emits
+    /// [`ToolStart`](ObserveEvent::ToolStart) and
+    /// [`ToolComplete`](ObserveEvent::ToolComplete) events.
+    #[tokio::test]
+    async fn test_sink_emits_tool_events_on_tool_call() {
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+
+        let client = MockClient::new("test");
+        client.add_tool_then_text("tool_1", "echo", json!({"message": "hi"}), "Done");
+
+        let (agent, sink) = agent_with_recording_sink(client, registry, make_config());
+        let result = agent.run("Test").await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.tool_calls, 1);
+        assert!(sink.any(event_match::is_tool_start), "missing tool_start");
+        assert!(
+            sink.any(event_match::is_tool_complete),
+            "missing tool_complete"
+        );
+    }
+
+    /// Verify that dispatching a missing tool emits
+    /// [`ToolComplete`](ObserveEvent::ToolComplete) with `is_error = true`.
+    #[tokio::test]
+    async fn test_sink_emits_tool_complete_with_error_on_missing_tool() {
+        let client = MockClient::new("test");
+        client.add_tool_then_text("tool_1", "missing_tool", json!({}), "OK");
+
+        let (agent, sink) = agent_with_recording_sink(client, ToolRegistry::new(), make_config());
+        let result = agent.run("Test").await.unwrap();
+
+        assert!(result.success);
+        assert!(sink.any(event_match::is_tool_start), "missing tool_start");
+        assert!(
+            sink.any(event_match::is_tool_complete),
+            "missing tool_complete"
+        );
+
+        // The tool_complete should have is_error=true
+        let error_completes = sink.events().iter().any(|e| {
+            if let ObserveEvent::ToolComplete { is_error, .. } = e {
+                *is_error
+            } else {
+                false
+            }
+        });
+        assert!(
+            error_completes,
+            "expected at least one tool_complete with is_error=true"
+        );
+    }
+
+    /// Verify that a single-turn session emits the full event sequence:
+    /// `SessionStart → TurnStart → TurnComplete → SessionStop`.
+    #[tokio::test]
+    async fn test_event_sequence_single_turn() {
+        let client = MockClient::new("test");
+        client.add_text_response("Hello!");
+
+        let (agent, sink) = agent_with_recording_sink(client, ToolRegistry::new(), make_config());
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        let events = sink.events();
+        // Sequence: SessionStart, TurnStart, TurnComplete, SessionStop
+        assert!(
+            event_match::is_session_start(&events[0]),
+            "expected SessionStart, got {:?}",
+            events[0]
+        );
+        assert!(
+            event_match::is_turn_start(&events[1]),
+            "expected TurnStart, got {:?}",
+            events[1]
+        );
+        assert!(
+            event_match::is_turn_complete(&events[2]),
+            "expected TurnComplete, got {:?}",
+            events[2]
+        );
+        assert!(
+            event_match::is_session_stop(&events[3]),
+            "expected SessionStop, got {:?}",
+            events[3]
+        );
+        assert_eq!(events.len(), 4, "expected exactly 4 events, got {events:?}");
+    }
+
+    /// Verify that a tool-using session emits the full event sequence:
+    /// `SessionStart → TurnStart → ToolStart → ToolComplete → TurnComplete
+    /// → TurnStart → TurnComplete → SessionStop`.
+    #[tokio::test]
+    async fn test_event_sequence_with_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+
+        let client = MockClient::new("test");
+        client.add_tool_then_text("tool_1", "echo", json!({"message": "x"}), "Done");
+
+        let (agent, sink) = agent_with_recording_sink(client, registry, make_config());
+        let result = agent.run("Test").await.unwrap();
+        assert!(result.success);
+
+        let events = sink.events();
+        // Sequence: SessionStart, TurnStart, ToolStart, ToolComplete,
+        // TurnComplete, TurnStart, TurnComplete, SessionStop
+        assert!(
+            event_match::is_session_start(&events[0]),
+            "event[0] not SessionStart"
+        );
+        assert!(
+            event_match::is_turn_start(&events[1]),
+            "event[1] not TurnStart"
+        );
+        assert!(
+            event_match::is_tool_start(&events[2]),
+            "event[2] not ToolStart"
+        );
+        assert!(
+            event_match::is_tool_complete(&events[3]),
+            "event[3] not ToolComplete"
+        );
+        assert!(
+            event_match::is_turn_complete(&events[4]),
+            "event[4] not TurnComplete"
+        );
+        assert!(
+            event_match::is_turn_start(&events[5]),
+            "event[5] not TurnStart"
+        );
+        assert!(
+            event_match::is_turn_complete(&events[6]),
+            "event[6] not TurnComplete"
+        );
+        assert!(
+            event_match::is_session_stop(&events[7]),
+            "event[7] not SessionStop"
+        );
+        assert_eq!(
+            events.len(),
+            8,
+            "expected exactly 8 events, got {}",
+            events.len()
+        );
+    }
+
+    // ==================================================
+    // Recovery wiring tests
+    // ==================================================
+
+    /// Verify the default `NoopReflector` + `ExponentialBackoffRecovery`
+    /// wiring returns soft errors (no infinite loop, no panic).
+    #[tokio::test]
+    async fn test_default_recovery_on_tool_error_returns_soft_result() {
+        let mut registry = ToolRegistry::new();
+        registry.register(FailingTool);
+
+        let client = MockClient::new("test");
+        client.add_tool_then_text("tool_1", "fail", json!({}), "Moving on");
+
+        let (agent, sink) = agent_with_recording_sink(client, registry, make_config());
+        let result = agent.run("Test").await.unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.tool_calls, 1);
+        assert!(sink.any(event_match::is_tool_start), "missing tool_start");
+        assert!(
+            sink.any(event_match::is_tool_complete),
+            "missing tool_complete"
+        );
+    }
+
+    /// Verify that when a tool is not found, the recovery wiring still
+    /// produces a soft error result (no hard error propagated).
+    #[tokio::test]
+    async fn test_recovery_on_missing_tool_returns_soft_result() {
+        let client = MockClient::new("test");
+        client.add_tool_then_text("tool_1", "nonexistent", json!({}), "OK");
+
+        let (agent, sink) = agent_with_recording_sink(client, ToolRegistry::new(), make_config());
+        let result = agent.run("Test").await.unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.tool_calls, 1);
+        // Should still emit tool_start and tool_complete (even for missing tools)
+        assert!(sink.any(event_match::is_tool_start), "missing tool_start");
+        assert!(
+            sink.any(event_match::is_tool_complete),
+            "missing tool_complete"
+        );
+    }
+
+    /// Verify that a failing tool with the default recovery produces
+    /// exactly one tool_start and one tool_complete event (NoopReflector
+    /// marks everything as non-recoverable, so no retries).
+    #[tokio::test]
+    async fn test_recovery_noop_reflector_no_retries() {
+        let mut registry = ToolRegistry::new();
+        registry.register(FailingTool);
+
+        let client = MockClient::new("test");
+        client.add_tool_then_text("tool_1", "fail", json!({}), "OK");
+
+        let (agent, sink) = agent_with_recording_sink(client, registry, make_config());
+        let result = agent.run("Test").await.unwrap();
+
+        assert!(result.success);
+        // NoopReflector marks everything non-recoverable → Fail → no retry
+        assert_eq!(
+            sink.count_matching(event_match::is_tool_start),
+            1,
+            "expected exactly 1 tool_start (no retries)"
+        );
+        assert_eq!(
+            sink.count_matching(event_match::is_tool_complete),
+            1,
+            "expected exactly 1 tool_complete (no retries)"
+        );
+    }
+
+    /// Verify cancellation is still respected during tool recovery.
+    #[tokio::test]
+    async fn test_recovery_respects_cancellation() {
+        let mut registry = ToolRegistry::new();
+        registry.register(FailingTool);
+
+        let client = MockClient::new("test");
+        client.add_tool_only_response("tc-1", "fail", json!({}));
+
+        let sink = Arc::new(RecordingSink::new());
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+        agent.event_sink = Arc::clone(&sink) as Arc<dyn EventSink>;
+
+        // Cancel before running
+        agent.cancel();
+
+        let result = agent.run("Test").await;
+        assert!(result.is_err());
     }
 }

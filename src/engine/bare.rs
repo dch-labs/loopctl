@@ -522,6 +522,56 @@ impl<C: ApiClient> BareLoop<C> {
     }
 
     // ==================================================
+    // Dependency setters
+    // ==================================================
+
+    /// Set the [`EventSink`] for structured observability events.
+    ///
+    /// Replaces the default [`NullSink`] with a caller-supplied
+    /// implementation. Must be called before [`run()`](BareLoop::run).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_event_sink(Arc::new(MySink));
+    /// ```
+    pub fn set_event_sink(&mut self, sink: Arc<dyn EventSink>) {
+        self.event_sink = sink;
+    }
+
+    /// Set the [`Reflector`] for tool-error analysis.
+    ///
+    /// Replaces the default [`NoopReflector`] with a caller-supplied
+    /// implementation. Must be called before [`run()`](BareLoop::run).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_reflector(Arc::new(MyReflector));
+    /// ```
+    pub fn set_reflector(&mut self, reflector: Arc<dyn Reflector>) {
+        self.reflector = reflector;
+    }
+
+    /// Set the [`RecoveryStrategy`] for tool-error recovery.
+    ///
+    /// Replaces the default [`ExponentialBackoffRecovery`] with a
+    /// caller-supplied implementation. Must be called before
+    /// [`run()`](BareLoop::run).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_recovery_strategy(Arc::new(MyStrategy));
+    /// ```
+    pub fn set_recovery_strategy(&mut self, strategy: Arc<dyn RecoveryStrategy>) {
+        self.recovery = strategy;
+    }
+
+    // ==================================================
     // Main run loop
     // ==================================================
 
@@ -973,7 +1023,7 @@ impl<C: ApiClient> BareLoop<C> {
                             false,
                             Some("cancelled"),
                         );
-                        self.emit_tool_complete(&tc.name, "", false, dur);
+                        self.emit_tool_complete(&tc.name, "", true, dur);
                         return Err(AgentError::Cancelled);
                     }
                 };
@@ -1054,7 +1104,12 @@ impl<C: ApiClient> BareLoop<C> {
                     if attempt >= max_recovery_attempts {
                         return Ok(tool_result);
                     }
-                    tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {},
+                        () = self.cancelled.notified() => {
+                            return Err(AgentError::Cancelled);
+                        }
+                    }
                     // Loop to retry the tool call.
                 }
                 RecoveryAction::Skip(_) | RecoveryAction::AskUser(_) | RecoveryAction::Fail(_) => {
@@ -2536,6 +2591,16 @@ mod tests {
         fn any(&self, pred: impl Fn(&ObserveEvent) -> bool) -> bool {
             self.events.lock().expect("lock").iter().any(|e| pred(e))
         }
+
+        /// Return the first event matching the predicate, if any.
+        fn find(&self, pred: impl Fn(&ObserveEvent) -> bool) -> Option<ObserveEvent> {
+            self.events
+                .lock()
+                .expect("lock")
+                .iter()
+                .find(|e| pred(e))
+                .cloned()
+        }
     }
 
     impl EventSink for RecordingSink {
@@ -2617,24 +2682,31 @@ mod tests {
     #[tokio::test]
     async fn test_sink_emits_session_stop_on_max_turns_error() {
         let client = MockClient::new("test");
+        // Queue a response so the mock has something to return, but
+        // max_turns=0 means the loop aborts before streaming.
         client.add_text_response("turn 1");
-        client.add_text_response("turn 2");
 
         let mut config = make_config();
-        config.max_turns = 1;
+        config.max_turns = 0;
 
         let (agent, sink) = agent_with_recording_sink(client, ToolRegistry::new(), config);
 
-        // max_turns=1 → first turn succeeds, session completes normally
-        let result = agent.run("Hi").await.unwrap();
-        assert!(result.success);
+        // max_turns=0 → immediate abort, no turn executes.
+        let err = agent.run("Hi").await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::MaxTurnsExceeded { .. }),
+            "expected MaxTurnsExceeded, got {err:?}"
+        );
         assert!(
             sink.any(event_match::is_session_start),
             "missing session_start"
         );
+        let stop_evt = sink
+            .find(event_match::is_session_stop)
+            .expect("missing session_stop");
         assert!(
-            sink.any(event_match::is_session_stop),
-            "missing session_stop"
+            matches!(stop_evt, ObserveEvent::SessionStop { success: false, .. }),
+            "expected SessionStop with success=false, got {stop_evt:?}"
         );
     }
 

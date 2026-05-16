@@ -1197,8 +1197,8 @@ impl ToolMiddleware for OutputLimitMiddleware {
             let mut result = next.dispatch(ctx).await;
 
             if let ToolContent::Text(ref text) = result.output {
-                let len = text.len();
-                if len > max_chars {
+                let char_count = text.chars().count();
+                if char_count > max_chars {
                     let truncated: String = text.chars().take(max_chars).collect();
                     result.output = ToolContent::Text(format!("{truncated}\n[truncated]"));
                 }
@@ -2016,5 +2016,33 @@ mod tests {
             result.output,
             ToolContent::Text("\n[truncated]".to_string())
         );
+    }
+
+    /// Multi-byte UTF-8 text whose byte count exceeds `max_chars` but whose
+    /// character count does **not** must pass through un-truncated.
+    #[tokio::test]
+    async fn test_output_limit_multibyte_under_char_limit_not_truncated() {
+        // "日" is 3 bytes. 5 repetitions = 5 chars, 15 bytes.
+        // Set max_chars = 8: 5 chars < 8, but 15 bytes > 8.
+        let registry = long_output_registry();
+        let pipeline = ToolPipeline::builder()
+            .with(OutputLimitMiddleware::new(8))
+            .core(Arc::clone(&registry))
+            .build()
+            .expect("valid");
+        let ctx = ToolDispatchContext {
+            tool_name: "long_output".to_string(),
+            input: json!({"count": 5, "char": "日"}),
+            call_id: "mb-1".to_string(),
+            turn_number: 1,
+            cancel: Arc::new(CancelSignal::new()),
+            permission: PermissionCheck::Allow,
+            tool_context: ToolContext::default(),
+        };
+
+        let result = pipeline.invoke(ctx).await;
+        assert!(!result.is_error);
+        // Must NOT be truncated: 5 chars <= 8 max_chars, even though 15 bytes > 8.
+        assert_eq!(result.output, ToolContent::Text("日日日日日".to_string()));
     }
 }

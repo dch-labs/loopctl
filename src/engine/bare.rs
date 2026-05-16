@@ -75,11 +75,12 @@ use crate::core::reflection::{
     Reflector,
 };
 use crate::core::{AgentConfig, AgentError, AgentObserver, SessionResult};
+use crate::engine::middleware::{ToolDispatchContext, ToolPipeline};
 use crate::loop_control::bundle::ManagerBundle;
-use crate::message::{Message, MessagePart, Role, ToolContent};
+use crate::message::{Message, MessagePart, Role, ToolContent, ToolContentPart};
 use crate::observability::{EventSink, NullSink, ObserveEvent};
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
-use crate::tool::{ToolContext, ToolRegistry, ToolSchema};
+use crate::tool::{PermissionCheck, ToolContext, ToolRegistry, ToolSchema};
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -155,8 +156,17 @@ pub struct BareLoop<C: ApiClient> {
     ///
     /// When the model emits a tool-call part, the loop looks up the tool
     /// by name in this registry and invokes it.
-    tools: ToolRegistry,
+    tools: Arc<ToolRegistry>,
 
+    /// Optional middleware pipeline wrapping tool dispatch.
+    ///
+    /// When `Some`, tool calls flow through the pipeline's middleware
+    /// chain (timeouts, output limiting, etc.) before reaching the
+    /// registry. When `None`, dispatches go directly to the registry
+    /// (backward-compatible default).
+    pipeline: Option<ToolPipeline>,
+
+    /// Accumulated middleware layers pending pipeline construction.
     /// Session parameters (max turns, model, system prompt).
     ///
     /// See [`AgentConfig`] for the full set of options.
@@ -315,7 +325,8 @@ impl<C: ApiClient> BareLoop<C> {
     pub fn new(client: Arc<C>, tools: ToolRegistry, config: AgentConfig) -> Self {
         Self {
             client,
-            tools,
+            tools: Arc::new(tools),
+            pipeline: None,
             config,
             conversation: Vec::new(),
             observers: Vec::new(),
@@ -358,7 +369,8 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Self {
         Self {
             client,
-            tools,
+            tools: Arc::new(tools),
+            pipeline: None,
             config,
             conversation: Vec::new(),
             observers,
@@ -408,7 +420,8 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Self {
         Self {
             client,
-            tools,
+            tools: Arc::new(tools),
+            pipeline: None,
             config,
             conversation: Vec::new(),
             observers,
@@ -449,7 +462,8 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Self {
         Self {
             client,
-            tools,
+            tools: Arc::new(tools),
+            pipeline: None,
             config,
             conversation: Vec::new(),
             observers,
@@ -584,6 +598,33 @@ impl<C: ApiClient> BareLoop<C> {
     /// ```
     pub fn set_recovery_strategy(&mut self, strategy: Arc<dyn RecoveryStrategy>) {
         self.recovery = strategy;
+    }
+
+    /// Set the middleware pipeline for tool dispatch.
+    ///
+    /// Replaces the default (no pipeline) with a caller-supplied
+    /// [`ToolPipeline`]. When set, tool calls flow through the
+    /// pipeline's middleware chain before reaching the registry.
+    /// Must be called before [`run()`](BareLoop::run).
+    ///
+    /// Build the pipeline using [`ToolPipeline::builder()`]:
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::engine::middleware::{ToolPipeline, TimeoutMiddleware};
+    ///
+    /// let pipeline = ToolPipeline::builder()
+    ///     .with(TimeoutMiddleware::from_secs(30))
+    ///     .core(Arc::clone(&registry))
+    ///     .build()
+    ///     .expect("pipeline configuration is valid");
+    ///
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_pipeline(pipeline);
+    /// ```
+    pub fn set_pipeline(&mut self, pipeline: ToolPipeline) {
+        self.pipeline = Some(pipeline);
     }
 
     // ==================================================
@@ -1031,7 +1072,10 @@ impl<C: ApiClient> BareLoop<C> {
             self.emit_tool_start(&tc.name, &tc.input.to_string());
             let start = Instant::now();
 
-            let tool_result = if let Some(tool) = self.tools.get(&tc.name) {
+            let tool_result = if let Some(ref pipeline) = self.pipeline {
+                self.dispatch_via_pipeline(pipeline, tc, &tool_context, start)
+                    .await?
+            } else if let Some(tool) = self.tools.get(&tc.name) {
                 let cancel = Arc::clone(&self.cancelled);
                 let call_result = tokio::select! {
                     r = tool.call(tc.input.clone(), &tool_context) => r,
@@ -1141,6 +1185,87 @@ impl<C: ApiClient> BareLoop<C> {
                 }
             }
         }
+    }
+
+    /// Dispatch a tool call through the middleware pipeline.
+    ///
+    /// Builds a [`ToolDispatchContext`] from the tool call info, delegates
+    /// to the pipeline's middleware chain, and converts the
+    /// [`ToolDispatchResult`] back to a [`ToolCallResult`] with proper
+    /// event emission. Handles cancellation via `tokio::select!`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Cancelled`] if the cancel signal fires
+    /// during pipeline dispatch.
+    async fn dispatch_via_pipeline(
+        &self,
+        pipeline: &ToolPipeline,
+        tc: &ToolCallInfo,
+        tool_context: &ToolContext,
+        start: Instant,
+    ) -> Result<ToolCallResult, AgentError> {
+        let ctx = ToolDispatchContext {
+            tool_name: tc.name.clone(),
+            input: tc.input.clone(),
+            call_id: tc.id.clone(),
+            turn_number: self.config.max_turns,
+            cancel: Arc::clone(&self.cancelled),
+            permission: PermissionCheck::Allow,
+            tool_context: tool_context.clone(),
+        };
+        let cancel = Arc::clone(&self.cancelled);
+        let dispatch_result = tokio::select! {
+            r = pipeline.invoke(ctx) => r,
+            () = cancel.notified() => {
+                let dur = start.elapsed();
+                self.notify_tool_complete(
+                    &tc.name,
+                    &tc.input.to_string(),
+                    "",
+                    dur,
+                    false,
+                    Some("cancelled"),
+                );
+                self.emit_tool_complete(&tc.name, "", true, dur);
+                return Err(AgentError::Cancelled);
+            }
+        };
+        let output_text = match &dispatch_result.output {
+            ToolContent::Text(t) => t.clone(),
+            ToolContent::Multipart(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ToolContentPart::Text { text } => Some(text.as_str()),
+                    ToolContentPart::Image { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        };
+        self.notify_tool_complete(
+            &tc.name,
+            &tc.input.to_string(),
+            &output_text,
+            dispatch_result.duration,
+            !dispatch_result.is_error,
+            if dispatch_result.is_error {
+                Some(&output_text)
+            } else {
+                None
+            },
+        );
+        self.emit_tool_complete(
+            &tc.name,
+            &output_text,
+            dispatch_result.is_error,
+            dispatch_result.duration,
+        );
+        Ok(ToolCallResult {
+            tool_call_id: tc.id.clone(),
+            output: dispatch_result.output,
+            is_error: dispatch_result.is_error,
+            duration: dispatch_result.duration,
+        })
     }
 
     /// Analyse a tool error and decide on a recovery action.

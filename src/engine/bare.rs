@@ -75,11 +75,12 @@ use crate::core::reflection::{
     Reflector,
 };
 use crate::core::{AgentConfig, AgentError, AgentObserver, SessionResult};
+use crate::engine::middleware::{ToolDispatchContext, ToolPipeline, ToolPipelineBuilder};
 use crate::loop_control::bundle::ManagerBundle;
-use crate::message::{Message, MessagePart, Role, ToolContent};
+use crate::message::{Message, MessagePart, Role, ToolContent, ToolContentPart};
 use crate::observability::{EventSink, NullSink, ObserveEvent};
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
-use crate::tool::{ToolContext, ToolRegistry, ToolSchema};
+use crate::tool::{PermissionCheck, ToolContext, ToolRegistry, ToolSchema};
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -155,8 +156,17 @@ pub struct BareLoop<C: ApiClient> {
     ///
     /// When the model emits a tool-call part, the loop looks up the tool
     /// by name in this registry and invokes it.
-    tools: ToolRegistry,
+    tools: Arc<ToolRegistry>,
 
+    /// Optional middleware pipeline wrapping tool dispatch.
+    ///
+    /// When `Some`, tool calls flow through the pipeline's middleware
+    /// chain (timeouts, output limiting, etc.) before reaching the
+    /// registry. When `None`, dispatches go directly to the registry
+    /// (backward-compatible default).
+    pipeline: Option<ToolPipeline>,
+
+    /// Accumulated middleware layers pending pipeline construction.
     /// Session parameters (max turns, model, system prompt).
     ///
     /// See [`AgentConfig`] for the full set of options.
@@ -315,7 +325,8 @@ impl<C: ApiClient> BareLoop<C> {
     pub fn new(client: Arc<C>, tools: ToolRegistry, config: AgentConfig) -> Self {
         Self {
             client,
-            tools,
+            tools: Arc::new(tools),
+            pipeline: None,
             config,
             conversation: Vec::new(),
             observers: Vec::new(),
@@ -358,7 +369,8 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Self {
         Self {
             client,
-            tools,
+            tools: Arc::new(tools),
+            pipeline: None,
             config,
             conversation: Vec::new(),
             observers,
@@ -408,7 +420,8 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Self {
         Self {
             client,
-            tools,
+            tools: Arc::new(tools),
+            pipeline: None,
             config,
             conversation: Vec::new(),
             observers,
@@ -449,7 +462,8 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Self {
         Self {
             client,
-            tools,
+            tools: Arc::new(tools),
+            pipeline: None,
             config,
             conversation: Vec::new(),
             observers,
@@ -584,6 +598,43 @@ impl<C: ApiClient> BareLoop<C> {
     /// ```
     pub fn set_recovery_strategy(&mut self, strategy: Arc<dyn RecoveryStrategy>) {
         self.recovery = strategy;
+    }
+
+    /// Set the middleware pipeline for tool dispatch.
+    ///
+    /// Replaces the default (no pipeline) with a caller-supplied
+    /// [`ToolPipeline`]. When set, tool calls flow through the
+    /// pipeline's middleware chain before reaching the registry.
+    /// Must be called before [`run()`](BareLoop::run).
+    ///
+    /// Build the pipeline using [`ToolPipeline::builder()`], adding middleware
+    /// layers **without** calling `.core()` — the registry is injected
+    /// automatically from `self.tools` so that schema generation and dispatch
+    /// always share the same underlying registry:
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::engine::middleware::{ToolPipeline, TimeoutMiddleware};
+    ///
+    /// let builder = ToolPipeline::builder()
+    ///     .with(TimeoutMiddleware::from_secs(30));
+    ///
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_pipeline(builder)?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Config`] if the builder fails to produce a valid
+    /// pipeline (e.g. internal invariant violated).
+    pub fn set_pipeline(&mut self, builder: ToolPipelineBuilder) -> Result<(), AgentError> {
+        let pipeline = builder
+            .core(Arc::clone(&self.tools))
+            .build()
+            .map_err(|e| AgentError::Config(e.to_string()))?;
+        self.pipeline = Some(pipeline);
+        Ok(())
     }
 
     // ==================================================
@@ -737,7 +788,7 @@ impl<C: ApiClient> BareLoop<C> {
         turn: &TurnContext,
         budget: &mut SessionBudget,
     ) -> Result<(), AgentError> {
-        match self.dispatch_tools(tool_calls).await {
+        match self.dispatch_tools(tool_calls, turn.idx).await {
             Ok(results) => {
                 budget.total_tool_calls = budget.total_tool_calls.saturating_add(results.len());
                 let tool_result_msg = Self::build_tool_result_message(results);
@@ -984,13 +1035,14 @@ impl<C: ApiClient> BareLoop<C> {
     async fn dispatch_tools(
         &self,
         tool_calls: &[ToolCallInfo],
+        turn_idx: usize,
     ) -> Result<Vec<ToolCallResult>, AgentError> {
         let mut results = Vec::with_capacity(tool_calls.len());
         for tc in tool_calls {
             if self.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
-            let result = self.dispatch_tool_with_recovery(tc).await?;
+            let result = self.dispatch_tool_with_recovery(tc, turn_idx).await?;
             results.push(result);
         }
         Ok(results)
@@ -1018,6 +1070,7 @@ impl<C: ApiClient> BareLoop<C> {
     async fn dispatch_tool_with_recovery(
         &self,
         tc: &ToolCallInfo,
+        turn_idx: usize,
     ) -> Result<ToolCallResult, AgentError> {
         let tool_context = self.build_tool_context();
         let mut attempt: u32 = 0;
@@ -1031,7 +1084,10 @@ impl<C: ApiClient> BareLoop<C> {
             self.emit_tool_start(&tc.name, &tc.input.to_string());
             let start = Instant::now();
 
-            let tool_result = if let Some(tool) = self.tools.get(&tc.name) {
+            let tool_result = if let Some(ref pipeline) = self.pipeline {
+                self.dispatch_via_pipeline(pipeline, tc, &tool_context, start, turn_idx)
+                    .await?
+            } else if let Some(tool) = self.tools.get(&tc.name) {
                 let cancel = Arc::clone(&self.cancelled);
                 let call_result = tokio::select! {
                     r = tool.call(tc.input.clone(), &tool_context) => r,
@@ -1141,6 +1197,88 @@ impl<C: ApiClient> BareLoop<C> {
                 }
             }
         }
+    }
+
+    /// Dispatch a tool call through the middleware pipeline.
+    ///
+    /// Builds a [`ToolDispatchContext`] from the tool call info, delegates
+    /// to the pipeline's middleware chain, and converts the
+    /// [`ToolDispatchResult`] back to a [`ToolCallResult`] with proper
+    /// event emission. Handles cancellation via `tokio::select!`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Cancelled`] if the cancel signal fires
+    /// during pipeline dispatch.
+    async fn dispatch_via_pipeline(
+        &self,
+        pipeline: &ToolPipeline,
+        tc: &ToolCallInfo,
+        tool_context: &ToolContext,
+        start: Instant,
+        turn_idx: usize,
+    ) -> Result<ToolCallResult, AgentError> {
+        let ctx = ToolDispatchContext {
+            tool_name: tc.name.clone(),
+            input: tc.input.clone(),
+            call_id: tc.id.clone(),
+            turn_number: turn_idx,
+            cancel: Arc::clone(&self.cancelled),
+            permission: PermissionCheck::Allow,
+            tool_context: tool_context.clone(),
+        };
+        let cancel = Arc::clone(&self.cancelled);
+        let dispatch_result = tokio::select! {
+            r = pipeline.invoke(ctx) => r,
+            () = cancel.notified() => {
+                let dur = start.elapsed();
+                self.notify_tool_complete(
+                    &tc.name,
+                    &tc.input.to_string(),
+                    "",
+                    dur,
+                    false,
+                    Some("cancelled"),
+                );
+                self.emit_tool_complete(&tc.name, "", true, dur);
+                return Err(AgentError::Cancelled);
+            }
+        };
+        let output_text = match &dispatch_result.output {
+            ToolContent::Text(t) => t.clone(),
+            ToolContent::Multipart(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ToolContentPart::Text { text } => Some(text.as_str()),
+                    ToolContentPart::Image { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        };
+        self.notify_tool_complete(
+            &tc.name,
+            &tc.input.to_string(),
+            &output_text,
+            dispatch_result.duration,
+            !dispatch_result.is_error,
+            if dispatch_result.is_error {
+                Some(&output_text)
+            } else {
+                None
+            },
+        );
+        self.emit_tool_complete(
+            &tc.name,
+            &output_text,
+            dispatch_result.is_error,
+            dispatch_result.duration,
+        );
+        Ok(ToolCallResult {
+            tool_call_id: tc.id.clone(),
+            output: dispatch_result.output,
+            is_error: dispatch_result.is_error,
+            duration: dispatch_result.duration,
+        })
     }
 
     /// Analyse a tool error and decide on a recovery action.
@@ -2973,5 +3111,103 @@ mod tests {
 
         let result = agent.run("Test").await;
         assert!(result.is_err());
+    }
+
+    // ==================================================
+    // Tests: set_pipeline uses self.tools registry
+    // ==================================================
+
+    /// Verify that `set_pipeline` automatically injects `self.tools` as the
+    /// pipeline's core registry, so dispatch never diverges from schema
+    /// generation.
+    #[tokio::test]
+    async fn test_set_pipeline_injects_self_tools_registry() {
+        let client = MockClient::new("test-model");
+        client.add_tool_then_text("tool_1", "echo", json!({"message": "hello"}), "done");
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let config = make_config();
+        let mut agent = BareLoop::new(Arc::new(client), registry, config);
+        // Build a builder WITHOUT calling .core() — set_pipeline must inject it.
+        let builder = ToolPipeline::builder();
+        agent.set_pipeline(builder).unwrap();
+
+        let result = agent.run("Echo hello").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().success);
+    }
+
+    // ==================================================
+    // Tests: turn_number is actual turn index
+    // ==================================================
+
+    /// A middleware that records the `turn_number` from each dispatch context.
+    struct TurnNumberCapture {
+        turns: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl TurnNumberCapture {
+        fn new(shared: Arc<std::sync::Mutex<Vec<usize>>>) -> Self {
+            Self { turns: shared }
+        }
+    }
+
+    impl crate::engine::middleware::ToolMiddleware for TurnNumberCapture {
+        fn name(&self) -> &str {
+            "turn_capture"
+        }
+
+        fn dispatch<'a>(
+            &'a self,
+            ctx: &'a mut ToolDispatchContext,
+            next: &'a ToolPipeline,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = crate::engine::middleware::ToolDispatchResult>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.turns.lock().unwrap().push(ctx.turn_number);
+            next.dispatch(ctx)
+        }
+    }
+
+    /// Verify that `turn_number` reflects the actual turn index, not
+    /// `config.max_turns`.
+    #[tokio::test]
+    async fn test_turn_number_is_actual_turn_index() {
+        let client = MockClient::new("test-model");
+        // Turn 0: model requests tool call, then turn 1: model requests another
+        client.add_tool_only_response("tool_0", "echo", json!({"message": "a"}));
+        client.add_tool_only_response("tool_1", "echo", json!({"message": "b"}));
+        client.add_text_response("done");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let mut config = make_config();
+        config.max_turns = 10;
+
+        let capture = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let mut agent = BareLoop::new(Arc::new(client), registry, config);
+        let builder = ToolPipeline::builder().with(TurnNumberCapture::new(Arc::clone(&capture)));
+        agent.set_pipeline(builder).unwrap();
+
+        let result = agent.run("test").await;
+        assert!(result.is_ok());
+
+        let turns = capture.lock().unwrap().clone();
+        // Tool was called on turn 0 (first turn) and turn 1 (second turn).
+        assert_eq!(
+            turns.len(),
+            2,
+            "expected tool calls on 2 turns: got {turns:?}"
+        );
+        assert_eq!(turns[0], 0, "first tool call should be on turn 0");
+        assert_eq!(turns[1], 1, "second tool call should be on turn 1");
+        assert!(
+            turns.iter().all(|&t| t < 10),
+            "turn_number must be actual index, not max_turns (10): got {turns:?}"
+        );
     }
 }

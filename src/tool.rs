@@ -20,6 +20,12 @@
 //! - **[`ToolContext`]** — Session-level context passed to every invocation.
 //! - **[`PermissionCheck`]** — Pre-execution permission gate.
 //!
+//! # Middleware Pipeline
+//!
+//! The [`engine::middleware`](crate::engine::middleware) module provides a composable
+//! middleware chain for tool dispatch with cross-cutting concerns
+//! (timeouts, output limiting, etc.).
+//!
 //! # Quick Start
 //!
 //! ```rust,ignore

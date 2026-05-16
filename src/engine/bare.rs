@@ -75,7 +75,7 @@ use crate::core::reflection::{
     Reflector,
 };
 use crate::core::{AgentConfig, AgentError, AgentObserver, SessionResult};
-use crate::engine::middleware::{ToolDispatchContext, ToolPipeline};
+use crate::engine::middleware::{ToolDispatchContext, ToolPipeline, ToolPipelineBuilder};
 use crate::loop_control::bundle::ManagerBundle;
 use crate::message::{Message, MessagePart, Role, ToolContent, ToolContentPart};
 use crate::observability::{EventSink, NullSink, ObserveEvent};
@@ -607,24 +607,34 @@ impl<C: ApiClient> BareLoop<C> {
     /// pipeline's middleware chain before reaching the registry.
     /// Must be called before [`run()`](BareLoop::run).
     ///
-    /// Build the pipeline using [`ToolPipeline::builder()`]:
+    /// Build the pipeline using [`ToolPipeline::builder()`], adding middleware
+    /// layers **without** calling `.core()` — the registry is injected
+    /// automatically from `self.tools` so that schema generation and dispatch
+    /// always share the same underlying registry:
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// use loopctl::engine::middleware::{ToolPipeline, TimeoutMiddleware};
     ///
-    /// let pipeline = ToolPipeline::builder()
-    ///     .with(TimeoutMiddleware::from_secs(30))
-    ///     .core(Arc::clone(&registry))
-    ///     .build()
-    ///     .expect("pipeline configuration is valid");
+    /// let builder = ToolPipeline::builder()
+    ///     .with(TimeoutMiddleware::from_secs(30));
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
-    /// agent.set_pipeline(pipeline);
+    /// agent.set_pipeline(builder)?;
     /// ```
-    pub fn set_pipeline(&mut self, pipeline: ToolPipeline) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Config`] if the builder fails to produce a valid
+    /// pipeline (e.g. internal invariant violated).
+    pub fn set_pipeline(&mut self, builder: ToolPipelineBuilder) -> Result<(), AgentError> {
+        let pipeline = builder
+            .core(Arc::clone(&self.tools))
+            .build()
+            .map_err(|e| AgentError::Config(e.to_string()))?;
         self.pipeline = Some(pipeline);
+        Ok(())
     }
 
     // ==================================================
@@ -778,7 +788,7 @@ impl<C: ApiClient> BareLoop<C> {
         turn: &TurnContext,
         budget: &mut SessionBudget,
     ) -> Result<(), AgentError> {
-        match self.dispatch_tools(tool_calls).await {
+        match self.dispatch_tools(tool_calls, turn.idx).await {
             Ok(results) => {
                 budget.total_tool_calls = budget.total_tool_calls.saturating_add(results.len());
                 let tool_result_msg = Self::build_tool_result_message(results);
@@ -1025,13 +1035,14 @@ impl<C: ApiClient> BareLoop<C> {
     async fn dispatch_tools(
         &self,
         tool_calls: &[ToolCallInfo],
+        turn_idx: usize,
     ) -> Result<Vec<ToolCallResult>, AgentError> {
         let mut results = Vec::with_capacity(tool_calls.len());
         for tc in tool_calls {
             if self.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
-            let result = self.dispatch_tool_with_recovery(tc).await?;
+            let result = self.dispatch_tool_with_recovery(tc, turn_idx).await?;
             results.push(result);
         }
         Ok(results)
@@ -1059,6 +1070,7 @@ impl<C: ApiClient> BareLoop<C> {
     async fn dispatch_tool_with_recovery(
         &self,
         tc: &ToolCallInfo,
+        turn_idx: usize,
     ) -> Result<ToolCallResult, AgentError> {
         let tool_context = self.build_tool_context();
         let mut attempt: u32 = 0;
@@ -1073,7 +1085,7 @@ impl<C: ApiClient> BareLoop<C> {
             let start = Instant::now();
 
             let tool_result = if let Some(ref pipeline) = self.pipeline {
-                self.dispatch_via_pipeline(pipeline, tc, &tool_context, start)
+                self.dispatch_via_pipeline(pipeline, tc, &tool_context, start, turn_idx)
                     .await?
             } else if let Some(tool) = self.tools.get(&tc.name) {
                 let cancel = Arc::clone(&self.cancelled);
@@ -1204,12 +1216,13 @@ impl<C: ApiClient> BareLoop<C> {
         tc: &ToolCallInfo,
         tool_context: &ToolContext,
         start: Instant,
+        turn_idx: usize,
     ) -> Result<ToolCallResult, AgentError> {
         let ctx = ToolDispatchContext {
             tool_name: tc.name.clone(),
             input: tc.input.clone(),
             call_id: tc.id.clone(),
-            turn_number: self.config.max_turns,
+            turn_number: turn_idx,
             cancel: Arc::clone(&self.cancelled),
             permission: PermissionCheck::Allow,
             tool_context: tool_context.clone(),
@@ -3098,5 +3111,103 @@ mod tests {
 
         let result = agent.run("Test").await;
         assert!(result.is_err());
+    }
+
+    // ==================================================
+    // Tests: set_pipeline uses self.tools registry
+    // ==================================================
+
+    /// Verify that `set_pipeline` automatically injects `self.tools` as the
+    /// pipeline's core registry, so dispatch never diverges from schema
+    /// generation.
+    #[tokio::test]
+    async fn test_set_pipeline_injects_self_tools_registry() {
+        let client = MockClient::new("test-model");
+        client.add_tool_then_text("tool_1", "echo", json!({"message": "hello"}), "done");
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let config = make_config();
+        let mut agent = BareLoop::new(Arc::new(client), registry, config);
+        // Build a builder WITHOUT calling .core() — set_pipeline must inject it.
+        let builder = ToolPipeline::builder();
+        agent.set_pipeline(builder).unwrap();
+
+        let result = agent.run("Echo hello").await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().success);
+    }
+
+    // ==================================================
+    // Tests: turn_number is actual turn index
+    // ==================================================
+
+    /// A middleware that records the `turn_number` from each dispatch context.
+    struct TurnNumberCapture {
+        turns: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl TurnNumberCapture {
+        fn new(shared: Arc<std::sync::Mutex<Vec<usize>>>) -> Self {
+            Self { turns: shared }
+        }
+    }
+
+    impl crate::engine::middleware::ToolMiddleware for TurnNumberCapture {
+        fn name(&self) -> &str {
+            "turn_capture"
+        }
+
+        fn dispatch<'a>(
+            &'a self,
+            ctx: &'a mut ToolDispatchContext,
+            next: &'a ToolPipeline,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = crate::engine::middleware::ToolDispatchResult>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.turns.lock().unwrap().push(ctx.turn_number);
+            next.dispatch(ctx)
+        }
+    }
+
+    /// Verify that `turn_number` reflects the actual turn index, not
+    /// `config.max_turns`.
+    #[tokio::test]
+    async fn test_turn_number_is_actual_turn_index() {
+        let client = MockClient::new("test-model");
+        // Turn 0: model requests tool call, then turn 1: model requests another
+        client.add_tool_only_response("tool_0", "echo", json!({"message": "a"}));
+        client.add_tool_only_response("tool_1", "echo", json!({"message": "b"}));
+        client.add_text_response("done");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let mut config = make_config();
+        config.max_turns = 10;
+
+        let capture = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let mut agent = BareLoop::new(Arc::new(client), registry, config);
+        let builder = ToolPipeline::builder().with(TurnNumberCapture::new(Arc::clone(&capture)));
+        agent.set_pipeline(builder).unwrap();
+
+        let result = agent.run("test").await;
+        assert!(result.is_ok());
+
+        let turns = capture.lock().unwrap().clone();
+        // Tool was called on turn 0 (first turn) and turn 1 (second turn).
+        assert_eq!(
+            turns.len(),
+            2,
+            "expected tool calls on 2 turns: got {turns:?}"
+        );
+        assert_eq!(turns[0], 0, "first tool call should be on turn 0");
+        assert_eq!(turns[1], 1, "second tool call should be on turn 1");
+        assert!(
+            turns.iter().all(|&t| t < 10),
+            "turn_number must be actual index, not max_turns (10): got {turns:?}"
+        );
     }
 }

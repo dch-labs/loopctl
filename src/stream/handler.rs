@@ -847,14 +847,16 @@ impl StreamHandler {
         let mut accumulator = StreamAccumulator::new();
         let mut stop_reason = StreamStopReason::EndTurn;
         let mut consecutive_timeouts: usize = 0;
+        let mut events_processed: u64 = 0;
         let stream_start = Instant::now();
         loop {
             if let Some(deadline) = total_deadline {
                 if Instant::now() >= deadline {
+                    let has_partial_data = !accumulator.peek_parts().is_empty();
                     return Err(StreamHandlerError::StreamFailed(
                         StreamOutcome::TotalTimeout {
-                            has_partial_data: false,
-                            events_processed: 0,
+                            has_partial_data,
+                            events_processed,
                             duration: stream_start.elapsed(),
                         },
                     ));
@@ -873,9 +875,10 @@ impl StreamHandler {
                     consecutive_timeouts = consecutive_timeouts.saturating_add(1);
                     let max_consecutive = self.timeout_config.max_consecutive_timeouts as usize;
                     if consecutive_timeouts >= max_consecutive {
+                        let has_partial_data = !accumulator.peek_parts().is_empty();
                         return Err(StreamHandlerError::StreamFailed(
                             StreamOutcome::EventTimeout {
-                                has_partial_data: false,
+                                has_partial_data,
                                 consecutive_timeouts: u32::try_from(consecutive_timeouts).unwrap_or(u32::MAX),
                             },
                         ));
@@ -887,6 +890,7 @@ impl StreamHandler {
             match event_result {
                 Some(Ok(event)) => {
                     consecutive_timeouts = 0;
+                    events_processed = events_processed.saturating_add(1);
                     if let StreamEvent::MessageDelta(delta) = &event {
                         if let Some(ref reason_str) = delta.delta.stop_reason {
                             stop_reason =

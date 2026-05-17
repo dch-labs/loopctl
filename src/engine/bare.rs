@@ -70,6 +70,7 @@
 
 use crate::api_client::ApiClient;
 use crate::cancel::CancelSignal;
+use crate::compact::{ContextManager, EnsureContextResult};
 use crate::core::reflection::{
     ExponentialBackoffRecovery, NoopReflector, RecoveryAction, RecoveryStrategy, ReflectionContext,
     Reflector,
@@ -79,6 +80,7 @@ use crate::engine::middleware::{ToolDispatchContext, ToolPipeline, ToolPipelineB
 use crate::loop_control::bundle::ManagerBundle;
 use crate::message::{Message, MessagePart, Role, ToolContent, ToolContentPart};
 use crate::observability::{EventSink, NullSink, ObserveEvent};
+use crate::stream::handler::{StreamHandler, StreamHandlerError};
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
 use crate::tool::{PermissionCheck, ToolContext, ToolRegistry, ToolSchema};
 use futures::StreamExt;
@@ -162,11 +164,9 @@ pub struct BareLoop<C: ApiClient> {
     ///
     /// When `Some`, tool calls flow through the pipeline's middleware
     /// chain (timeouts, output limiting, etc.) before reaching the
-    /// registry. When `None`, dispatches go directly to the registry
-    /// (backward-compatible default).
+    /// registry. When `None`, dispatches go directly to the registry.
     pipeline: Option<ToolPipeline>,
 
-    /// Accumulated middleware layers pending pipeline construction.
     /// Session parameters (max turns, model, system prompt).
     ///
     /// See [`AgentConfig`] for the full set of options.
@@ -186,17 +186,12 @@ pub struct BareLoop<C: ApiClient> {
     observers: Vec<Arc<dyn AgentObserver>>,
 
     /// Manager bundle (fallback, loop detection, convergence).
-    ///
-    /// Reserved for future wiring (loop detection, circuit-breaker
-    /// policies). Uses `#[expect]` so that wiring the field will
-    /// produce a reminder to remove this attribute.
     #[expect(dead_code)]
     managers: ManagerBundle,
 
     /// Structured event sink for observability.
     ///
-    /// Emits [`ObserveEvent`] variants at each lifecycle point alongside
-    /// the legacy [`AgentObserver`] callbacks (dual-track migration).
+    /// Emits [`ObserveEvent`] variants at each lifecycle point.
     event_sink: Arc<dyn EventSink>,
 
     /// Failure analyser for tool errors.
@@ -220,6 +215,22 @@ pub struct BareLoop<C: ApiClient> {
     /// Streaming is also cancel-aware via `tokio::select!` — the loop
     /// will wake up mid-stream when cancelled.
     cancelled: Arc<CancelSignal>,
+
+    /// Optional context manager for automatic compaction.
+    ///
+    /// When `Some`, the loop checks token usage after each turn and
+    /// triggers compaction when usage exceeds the configured threshold.
+    /// Compaction replaces the conversation messages and emits
+    /// [`on_compaction()`](AgentObserver::on_compaction) to observers
+    /// and [`ObserveEvent::ContextCompacted`] to the event sink.
+    context_manager: Option<Arc<ContextManager>>,
+
+    /// Optional stream handler for resilient streaming.
+    ///
+    /// When `Some`, replaces the inline [`stream_turn()`](BareLoop::stream_turn)
+    /// logic with the handler's retry, timeout, and fallback capabilities.
+    /// When `None`, streaming uses the basic inline logic with no retries.
+    stream_handler: Option<StreamHandler>,
 }
 
 // ==================================================
@@ -335,6 +346,8 @@ impl<C: ApiClient> BareLoop<C> {
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
+            context_manager: None,
+            stream_handler: None,
         }
     }
 
@@ -379,6 +392,8 @@ impl<C: ApiClient> BareLoop<C> {
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
+            context_manager: None,
+            stream_handler: None,
         }
     }
 
@@ -430,6 +445,8 @@ impl<C: ApiClient> BareLoop<C> {
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
+            context_manager: None,
+            stream_handler: None,
         }
     }
 
@@ -472,6 +489,8 @@ impl<C: ApiClient> BareLoop<C> {
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
+            context_manager: None,
+            stream_handler: None,
         }
     }
 
@@ -598,6 +617,59 @@ impl<C: ApiClient> BareLoop<C> {
     /// ```
     pub fn set_recovery_strategy(&mut self, strategy: Arc<dyn RecoveryStrategy>) {
         self.recovery = strategy;
+    }
+
+    /// Set the [`ContextManager`] for automatic context compaction.
+    ///
+    /// When set, the loop checks token usage after each turn and
+    /// triggers compaction when usage exceeds the configured threshold.
+    /// Must be called before [`run()`](BareLoop::run).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::compact::{ContextManager, TruncatingCompactor};
+    /// use std::sync::Arc;
+    ///
+    /// let compactor = TruncatingCompactor::new()
+    ///     .with_preserve_recent(4)
+    ///     .with_min_messages(6);
+    /// let manager = ContextManager::new(Arc::new(compactor))
+    ///     .with_context_window(200_000)
+    ///     .with_threshold(0.80);
+    ///
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_context_manager(Arc::new(manager));
+    /// ```
+    pub fn set_context_manager(&mut self, manager: Arc<ContextManager>) {
+        self.context_manager = Some(manager);
+    }
+
+    /// Set the [`StreamHandler`] for resilient streaming with retries,
+    /// timeouts, and fallback to non-streaming.
+    ///
+    /// When set, the loop delegates streaming to the handler instead of
+    /// using the inline streaming logic. Must be called before
+    /// [`run()`](BareLoop::run).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::stream::handler::{StreamHandler, StreamTimeoutConfig};
+    ///
+    /// let handler = StreamHandler::with_config(
+    ///     StreamTimeoutConfig {
+    ///         initial_event_timeout: Duration::from_secs(60),
+    ///         ..Default::default()
+    ///     },
+    ///     Default::default(),
+    /// );
+    ///
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_stream_handler(handler);
+    /// ```
+    pub fn set_stream_handler(&mut self, handler: StreamHandler) {
+        self.stream_handler = Some(handler);
     }
 
     /// Set the middleware pipeline for tool dispatch.
@@ -754,6 +826,17 @@ impl<C: ApiClient> BareLoop<C> {
                         .await
                     {
                         return self.abort_session_from_error(e, start.elapsed(), &budget);
+                    }
+
+                    // After tool dispatch, check if context compaction is needed.
+                    if let Err(e) = self.maybe_compact_context(budget.turn_count).await {
+                        return self.abort_turn_and_session(
+                            budget.turn_count,
+                            turn_start.elapsed(),
+                            start.elapsed(),
+                            &e.to_string(),
+                            e,
+                        );
                     }
                 }
                 Err(e) => {
@@ -940,10 +1023,69 @@ impl<C: ApiClient> BareLoop<C> {
     }
 
     // ==================================================
+    // Context compaction
+    // ==================================================
+
+    /// Check if context compaction is needed and perform it if so.
+    ///
+    /// When a [`ContextManager`] is configured, this method:
+    /// 1. Calls [`ContextManager::ensure_context_fits()`] to check token usage.
+    /// 2. If compaction occurred, replaces `self.conversation` with the compacted messages.
+    /// 3. Notifies observers via [`on_compaction`](AgentObserver::on_compaction).
+    /// 4. Emits [`ObserveEvent::ContextCompacted`] to the event sink.
+    ///
+    /// When no `ContextManager` is set, this is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Context`] if compaction was needed but failed
+    /// (i.e. the conversation exceeds the context window and the compactor
+    /// could not reduce it sufficiently).
+    async fn maybe_compact_context(&mut self, turn: usize) -> Result<(), AgentError> {
+        let Some(ref ctx_manager) = self.context_manager else {
+            return Ok(());
+        };
+
+        let messages_before = self.conversation.len();
+        let result = ctx_manager
+            .ensure_context_fits(std::mem::take(&mut self.conversation), turn)
+            .await;
+        match result {
+            Ok(EnsureContextResult::Compacted(outcome)) => {
+                self.conversation = outcome.messages;
+                let messages_after = self.conversation.len();
+                for obs in &self.observers {
+                    obs.on_compaction(messages_before, messages_after);
+                }
+                self.event_sink.on_event(&ObserveEvent::ContextCompacted {
+                    messages_before,
+                    messages_after,
+                    tokens_saved: outcome.tokens_saved,
+                });
+                Ok(())
+            }
+            Ok(EnsureContextResult::NoAction(messages)) => {
+                self.conversation = messages;
+                Ok(())
+            }
+            Err(overflow) => Err(AgentError::ContextExceeded {
+                used: overflow.tokens_used,
+                limit: overflow.context_window,
+            }),
+        }
+    }
+
+    // ==================================================
     // Streaming
     // ==================================================
 
     /// Stream one turn from the API, accumulating the response.
+    ///
+    /// When a [`StreamHandler`] is configured (via
+    /// [`set_stream_handler()`](BareLoop::set_stream_handler)), delegates
+    /// to the handler for resilient streaming with retry, timeout, and
+    /// fallback capabilities. Otherwise, uses the basic inline logic
+    /// with no retries.
     ///
     /// Sends the current conversation history to the LLM API via
     /// [`ApiClient::stream_messages`] and uses a [`StreamAccumulator`]
@@ -966,6 +1108,12 @@ impl<C: ApiClient> BareLoop<C> {
     /// Returns [`AgentError::Api`] if any stream event is an error.
     /// Returns [`AgentError::Cancelled`] if the cancellation signal fires mid-stream.
     async fn stream_turn(&self) -> Result<(Message, Option<Usage>, StreamStopReason), AgentError> {
+        // Delegate to StreamHandler if configured.
+        if let Some(ref handler) = self.stream_handler {
+            return self.stream_turn_via_handler(handler).await;
+        }
+
+        // Inline streaming (no handler).
         let system = self.config.system_prompt.clone();
         let tool_schemas = self.build_tool_schemas();
         let mut stream =
@@ -1002,6 +1150,64 @@ impl<C: ApiClient> BareLoop<C> {
         let message = accumulator.build();
 
         Ok((message, usage, stop_reason))
+    }
+
+    /// Stream one turn via the [`StreamHandler`].
+    ///
+    /// Delegates streaming to the handler, which manages retries,
+    /// timeouts, and fallback to non-streaming. Maps the handler's
+    /// result/error types back to the `(Message, Option<Usage>,
+    /// StreamStopReason)` tuple expected by the run loop.
+    ///
+    /// # Errors
+    ///
+    /// Maps [`StreamHandlerError`] variants to the appropriate
+    /// [`AgentError`] variants:
+    /// - [`Cancelled`](StreamHandlerError::Cancelled) → [`AgentError::Cancelled`]
+    /// - [`InitFailed`](StreamHandlerError::InitFailed) → [`AgentError::Api`]
+    /// - [`StreamFailed`](StreamHandlerError::StreamFailed) → [`AgentError::Api`]
+    /// - [`FallbackFailed`](StreamHandlerError::FallbackFailed) → [`AgentError::Api`]
+    async fn stream_turn_via_handler(
+        &self,
+        handler: &StreamHandler,
+    ) -> Result<(Message, Option<Usage>, StreamStopReason), AgentError> {
+        let system = self.config.system_prompt.clone();
+        let tool_schemas = self.build_tool_schemas();
+        let result = handler
+            .stream_turn(
+                &*self.client,
+                self.conversation.clone(),
+                system,
+                tool_schemas,
+                &self.cancelled,
+            )
+            .await
+            .map_err(Self::map_handler_error)?;
+        Ok((result.message, result.usage, result.stop_reason))
+    }
+
+    /// Map a [`StreamHandlerError`] to an [`AgentError`].
+    ///
+    /// Preserves cancellation semantics —
+    /// [`StreamHandlerError::Cancelled`] maps to [`AgentError::Cancelled`].
+    /// All other variants map to [`AgentError::Api`] with a descriptive
+    /// message.
+    fn map_handler_error(error: StreamHandlerError) -> AgentError {
+        match error {
+            StreamHandlerError::Cancelled => AgentError::Cancelled,
+            StreamHandlerError::InitFailed(outcome) => {
+                AgentError::Api(format!("stream init failed: {outcome}"))
+            }
+            StreamHandlerError::StreamFailed(outcome) => {
+                AgentError::Api(format!("stream failed: {outcome}"))
+            }
+            StreamHandlerError::FallbackFailed {
+                stream_outcome,
+                fallback_error,
+            } => AgentError::Api(format!(
+                "stream ({stream_outcome}) and fallback failed: {fallback_error}"
+            )),
+        }
     }
 
     // ==================================================
@@ -1365,7 +1571,6 @@ impl<C: ApiClient> BareLoop<C> {
     /// `tool_call_id` with the tool's output (wrapped in a
     /// [`ToolContent`](ToolContent)) and an `is_error`
     /// flag so the model can distinguish successes from failures.
-    /// the model can distinguish success from failure.
     ///
     /// # Parameters
     ///
@@ -2383,8 +2588,6 @@ mod tests {
         assert_eq!(observer.turn_ends.load(Ordering::SeqCst), 1);
     }
 
-    /// Verify that a tool-using session fires tool call/complete
-    /// callbacks in addition to the turn callbacks.
     /// Verify that a tool-using session fires `tool_call` and
     /// `tool_complete` callbacks in addition to the turn callbacks.
     ///
@@ -2491,8 +2694,6 @@ mod tests {
     // Tests: Multiple tools in one turn
     // ==================================================
 
-    /// Verify that multiple tool_call parts in a single assistant
-    /// message are all dispatched and counted.
     /// Verify that multiple tool_call parts in a single assistant message
     /// are all dispatched and counted.
     ///

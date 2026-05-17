@@ -1079,6 +1079,16 @@ impl StreamAccumulator {
         }
     }
 
+    /// Returns a slice of the accumulated [`MessagePart`]s so far.
+    ///
+    /// Unlike [`build`](Self::build), this does not consume the
+    /// accumulator. Useful for checking whether any content has been
+    /// received before the stream times out.
+    #[must_use]
+    pub fn peek_parts(&self) -> &[MessagePart] {
+        &self.parts
+    }
+
     /// Consume the accumulator and produce the final [`Message`].
     ///
     /// Called after all [`StreamEvent`]s have been processed via

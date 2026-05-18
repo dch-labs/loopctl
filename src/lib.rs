@@ -11,6 +11,7 @@
 //! - **[`compact`]** — Context management and compaction (threshold detection, pluggable strategies).
 //! - **[`core`]** — Foundational traits (`AgentObserver`) and error types.
 //! - **[`builtin`]** — Reference implementations of core traits ([`builtin::memory::InMemoryStore`], [`builtin::observer::LoggingObserver`], etc.).
+//! - **[`hooks`]** — Bidirectional lifecycle control (allow/block/ask before tool use, compaction). *Requires `hooks` feature.*
 //! - **[`loop_control`]** — Detection and intervention modules for agent loops.
 //! - **[`engine`]** — The core agentic loop that orchestrates the full agent lifecycle.
 //! - **[`observability`]** — Structured event streaming (`EventSink`, `ObserveEvent`, metrics).
@@ -25,6 +26,8 @@ pub mod cancel;
 pub mod compact;
 pub mod core;
 pub mod engine;
+#[cfg(feature = "hooks")]
+pub mod hooks;
 pub mod loop_control;
 pub mod message;
 pub mod observability;

@@ -34,6 +34,8 @@ proptest = "1"
 default = []
 hooks = []
 testing = []
+tool_health = []
+tool_shield = ["tool_health"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

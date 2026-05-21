@@ -192,9 +192,11 @@ impl ToolStats {
         let ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         self.total_duration_ns.fetch_add(ns, Ordering::Relaxed);
         self.max_duration_ns.fetch_max(ns, Ordering::Relaxed);
-        let prev = self.ewma_success.load(Ordering::Relaxed);
-        let next = update_ewma(prev, true);
-        self.ewma_success.store(next, Ordering::Relaxed);
+        self.ewma_success
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                Some(update_ewma(prev, true))
+            })
+            .ok();
     }
 
     /// Record a failed tool execution.
@@ -206,9 +208,11 @@ impl ToolStats {
         self.failure_count.fetch_add(1, Ordering::Relaxed);
         let ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         self.total_duration_ns.fetch_add(ns, Ordering::Relaxed);
-        let prev = self.ewma_success.load(Ordering::Relaxed);
-        let next = update_ewma(prev, false);
-        self.ewma_success.store(next, Ordering::Relaxed);
+        self.ewma_success
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                Some(update_ewma(prev, false))
+            })
+            .ok();
     }
 
     /// Total number of calls recorded (successes + failures).
@@ -240,8 +244,7 @@ impl ToolStats {
             return 1.0;
         }
         let successes = self.success_count.load(Ordering::Relaxed);
-        f64::from(u32::try_from(successes).unwrap_or(u32::MAX))
-            / f64::from(u32::try_from(total).unwrap_or(u32::MAX))
+        f64::from(successes as u32) / f64::from(total as u32)
     }
 
     /// Composite health score (0.0–1.0) blending success rate with EWMA.
@@ -255,9 +258,9 @@ impl ToolStats {
     /// ```
     #[must_use]
     pub fn health_score(&self) -> f64 {
-        let raw_ewma = self.ewma_success.load(Ordering::Relaxed);
-        let ewma = f64::from(u32::try_from(raw_ewma.min(EWMA_SCALE)).unwrap_or(0))
-            / f64::from(u32::try_from(EWMA_SCALE).unwrap_or(1));
+        let ewma =
+            f64::from(self.ewma_success.load(Ordering::Relaxed).min(EWMA_SCALE) as u32)
+                / f64::from(EWMA_SCALE as u32);
         0.3 * self.success_rate() + 0.7 * ewma
     }
 
@@ -440,12 +443,15 @@ impl ToolCircuitBreaker {
     ///
     /// - **Closed**: always allowed.
     /// - **Open**: allowed only if `recovery_duration` has elapsed since
-    ///   the last failure (transitions to `HalfOpen`).
-    /// - **`HalfOpen`**: allowed (one probe call).
+    ///   the last failure, in which case the calling thread atomically
+    ///   transitions to `HalfOpen` and becomes the sole probe.
+    /// - **`HalfOpen`**: already probing — no additional probes allowed
+    ///   (returns `false` to prevent thundering-herd).
     #[must_use]
     pub fn allow_request(&self) -> bool {
         match self.state.load(Ordering::Acquire).into() {
-            CircuitState::Closed | CircuitState::HalfOpen => true,
+            CircuitState::Closed => true,
+            CircuitState::HalfOpen => false,
             CircuitState::Open => {
                 let recovered = self
                     .last_failure_time
@@ -455,8 +461,13 @@ impl ToolCircuitBreaker {
                     .unwrap_or(false);
                 if recovered {
                     self.state
-                        .store(CircuitState::HalfOpen as u32, Ordering::Release);
-                    true
+                        .compare_exchange(
+                            CircuitState::Open as u32,
+                            CircuitState::HalfOpen as u32,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
                 } else {
                     false
                 }
@@ -539,6 +550,15 @@ impl ToolCircuitBreaker {
         matches!(
             self.state.load(Ordering::Acquire).into(),
             CircuitState::Open
+        )
+    }
+
+    /// Whether the breaker is currently in the `HalfOpen` (probing) state.
+    #[must_use]
+    pub fn is_half_open(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire).into(),
+            CircuitState::HalfOpen
         )
     }
 }
@@ -678,13 +698,18 @@ impl ToolHealthRegistry {
     /// Quick health check: is this tool available for use?
     ///
     /// Combines the circuit-breaker state (Open = unavailable) with the
-    /// health score (Unhealthy = unavailable). Returns `true` only when
-    /// the breaker is not Open and the health score is not Unhealthy.
+    /// health score (Unhealthy = unavailable). Returns `true` when:
+    /// - the breaker is not Open and the health score is not Unhealthy, or
+    /// - the breaker has transitioned to `HalfOpen` (allowing a recovery probe
+    ///   even if the health score is still Unhealthy).
     #[must_use]
     pub fn is_tool_available(&self, tool_name: &str) -> bool {
         let breaker = self.get_circuit_breaker(tool_name);
         if !breaker.allow_request() {
             return false;
+        }
+        if breaker.is_half_open() {
+            return true;
         }
         self.get_health_status(tool_name) != HealthStatus::Unhealthy
     }
@@ -815,15 +840,14 @@ impl HealthRouter {
 
     /// Choose the best available tool from a primary name and its fallbacks.
     ///
-    /// Returns the primary name if it is [`Healthy`](HealthStatus::Healthy)
-    /// or [`Degraded`](HealthStatus::Degraded). Otherwise iterates through
-    /// the fallbacks and returns the first one that is available. If no
-    /// alternative is available, returns the primary name (letting the
-    /// caller decide how to handle the failure).
+    /// Returns the primary name if [`is_tool_available`](ToolHealthRegistry::is_tool_available)
+    /// reports it as available. Otherwise iterates through the fallbacks and
+    /// returns the first one that is available. If no alternative is available,
+    /// returns the primary name (letting the caller decide how to handle the
+    /// failure).
     #[must_use]
     pub fn resolve_tool(&self, tool_name: &str, registry: &ToolHealthRegistry) -> String {
-        let status = registry.get_health_status(tool_name);
-        if status == HealthStatus::Healthy || status == HealthStatus::Degraded {
+        if registry.is_tool_available(tool_name) {
             return tool_name.to_string();
         }
 

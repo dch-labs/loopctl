@@ -17,6 +17,7 @@
 //! - **[`observability`]** — Structured event streaming (`EventSink`, `ObserveEvent`, metrics).
 //! - **[`stream`]** — Streaming event types for LLM API responses.
 //! - **[`tool`]** — Tool trait, registry, and supporting types.
+//! - **[`tool::health`]** — Per-tool health monitoring, circuit breakers, and self-healing routing. *Requires `tool_health` feature.*
 
 pub mod api_client;
 pub mod api_error;

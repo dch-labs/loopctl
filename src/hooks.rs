@@ -168,6 +168,30 @@ pub trait Hook: Send + Sync {
 }
 
 // ===================================================
+// Interactivity
+// ===================================================
+
+/// Whether the session can interact with a human operator.
+///
+/// This controls how [`HookAction::Ask`] is handled by the
+/// [`HookExecutor`]:
+///
+/// - [`Interactivity::Headless`] — there is no human in the loop, so
+///   `Ask` is automatically downgraded to `Block` with a descriptive
+///   reason. This is the default and the correct mode for autonomous
+///   / headless agents (e.g. `BareLoop`).
+/// - [`Interactivity::Interactive`] — a human is available to respond
+///   to prompts, so `Ask` passes through unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Interactivity {
+    /// No human in the loop — `Ask` is downgraded to `Block`.
+    #[default]
+    Headless,
+    /// Human is available — `Ask` passes through unchanged.
+    Interactive,
+}
+
+// ===================================================
 // HookAction
 // ===================================================
 
@@ -249,6 +273,12 @@ impl HookAction {
     #[must_use]
     pub fn is_block(&self) -> bool {
         matches!(self, Self::Block { .. })
+    }
+
+    /// Returns `true` if this action requests interactive confirmation.
+    #[must_use]
+    pub fn is_ask(&self) -> bool {
+        matches!(self, Self::Ask { .. })
     }
 
     /// Returns the block reason, if this is a [`HookAction::Block`].
@@ -350,5 +380,34 @@ mod tests {
             }
             .is_block()
         );
+    }
+
+    #[test]
+    fn is_ask_true_for_ask() {
+        let action = HookAction::ask("proceed?");
+        assert!(action.is_ask());
+    }
+
+    #[test]
+    fn is_ask_false_for_block() {
+        let action = HookAction::block("nope");
+        assert!(!action.is_ask());
+    }
+
+    #[test]
+    fn is_ask_false_for_allow() {
+        assert!(!HookAction::Allow.is_ask());
+    }
+
+    #[test]
+    fn interactivity_default_is_headless() {
+        assert_eq!(Interactivity::default(), Interactivity::Headless);
+    }
+
+    #[test]
+    fn interactivity_eq_semantics() {
+        assert_eq!(Interactivity::Headless, Interactivity::Headless);
+        assert_eq!(Interactivity::Interactive, Interactivity::Interactive);
+        assert_ne!(Interactivity::Headless, Interactivity::Interactive);
     }
 }

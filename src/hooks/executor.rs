@@ -37,14 +37,26 @@ use std::sync::Arc;
 
 use crate::hooks::Hook;
 use crate::hooks::HookAction;
+use crate::hooks::Interactivity;
 use crate::hooks::context::{
     CompactResult, PostCompactContext, PostToolUseContext, PreCompactContext, PreToolUseContext,
     SessionEndContext, SessionStartContext,
 };
 
 /// Executes hooks in registration order with short-circuit semantics.
+///
+/// # Interactivity
+///
+/// The executor carries an [`Interactivity`] mode that controls how
+/// [`HookAction::Ask`] is handled:
+///
+/// - [`Interactivity::Headless`] (the default) — `Ask` is automatically
+///   downgraded to `Block`, because there is no user to interact with.
+/// - [`Interactivity::Interactive`] — `Ask` passes through unchanged,
+///   allowing the agent to present a prompt to the user.
 pub struct HookExecutor {
     hooks: Vec<Arc<dyn Hook>>,
+    interactivity: Interactivity,
 }
 
 impl Default for HookExecutor {
@@ -54,13 +66,40 @@ impl Default for HookExecutor {
 }
 
 impl HookExecutor {
-    /// Create an executor with no hooks.
+    /// Create an executor in [`Interactivity::Headless`] mode with no hooks.
     ///
     /// Use [`with_hook`](Self::with_hook) to add hooks via builder pattern,
     /// or [`register`](Self::register) for mutable registration.
     #[must_use]
     pub fn new() -> Self {
-        Self { hooks: Vec::new() }
+        Self {
+            hooks: Vec::new(),
+            interactivity: Interactivity::Headless,
+        }
+    }
+
+    /// Create an executor with the given interactivity mode and no hooks.
+    ///
+    /// Use [`interactivity`](Self::interactivity) to change the mode after
+    /// construction, or [`with_hook`](Self::with_hook) to add hooks via
+    /// builder pattern.
+    #[must_use]
+    pub fn with_interactivity(interactivity: Interactivity) -> Self {
+        Self {
+            hooks: Vec::new(),
+            interactivity,
+        }
+    }
+
+    /// Set the interactivity mode (builder style).
+    ///
+    /// Overrides the current [`Interactivity`] mode and returns `self`
+    /// for chaining:
+    /// `HookExecutor::new().interactivity(Interactivity::Interactive).with_hook(h)`.
+    #[must_use]
+    pub fn interactivity(mut self, mode: Interactivity) -> Self {
+        self.interactivity = mode;
+        self
     }
 
     /// Register a hook (builder pattern).
@@ -81,6 +120,20 @@ impl HookExecutor {
         self.hooks.push(hook);
     }
 
+    /// Downgrade [`HookAction::Ask`] to [`HookAction::Block`] in headless mode.
+    ///
+    /// In [`Interactivity::Headless`] mode, `Ask` is converted to `Block`
+    /// with a reason that includes the original message. All other actions
+    /// (including `Allow` and `Block`) pass through unchanged.
+    fn apply_interactivity(&self, action: HookAction) -> HookAction {
+        match (&self.interactivity, action) {
+            (Interactivity::Headless, HookAction::Ask { message }) => HookAction::block(format!(
+                "Hook requested confirmation ({message}) but the session is not interactive"
+            )),
+            (_, action) => action,
+        }
+    }
+
     /// Number of registered hooks.
     ///
     /// Returns 0 for a freshly constructed executor.
@@ -99,13 +152,16 @@ impl HookExecutor {
     /// past explicit `Allow` results so that later safety-critical hooks are
     /// still evaluated. Returns [`HookAction::Allow`] if no hook produced a
     /// non-Allow action.
+    ///
+    /// In [`Interactivity::Headless`] mode, [`HookAction::Ask`] is
+    /// automatically downgraded to [`HookAction::Block`].
     #[must_use]
     pub fn check_pre_tool_use(&self, ctx: &PreToolUseContext) -> HookAction {
         for hook in &self.hooks {
             if let Some(action) = hook.on_pre_tool_use(ctx) {
                 match action {
                     HookAction::Allow => {}
-                    other => return other,
+                    other => return self.apply_interactivity(other),
                 }
             }
         }
@@ -581,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn check_pre_tool_use_ask_returns_ask() {
+    fn check_pre_tool_use_headless_downgrades_ask_to_block() {
         struct AskHook;
         impl Hook for AskHook {
             fn name(&self) -> &str {
@@ -591,7 +647,32 @@ mod tests {
                 Some(HookAction::ask("confirm?"))
             }
         }
+
+        // Default (Headless) executor downgrades Ask → Block.
         let executor = HookExecutor::new().with_hook(Arc::new(AskHook));
+        let ctx = dummy_pre_ctx();
+        let action = executor.check_pre_tool_use(&ctx);
+        assert!(
+            action.is_block(),
+            "expected Block in Headless mode, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn check_pre_tool_use_interactive_passes_ask_through() {
+        struct AskHook;
+        impl Hook for AskHook {
+            fn name(&self) -> &str {
+                "ask"
+            }
+            fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
+                Some(HookAction::ask("confirm?"))
+            }
+        }
+
+        // Interactive executor passes Ask through unchanged.
+        let executor = HookExecutor::with_interactivity(Interactivity::Interactive)
+            .with_hook(Arc::new(AskHook));
         let ctx = dummy_pre_ctx();
         let action = executor.check_pre_tool_use(&ctx);
         match action {
@@ -601,11 +682,139 @@ mod tests {
     }
 
     #[test]
+    fn check_pre_tool_use_interactivity_builder() {
+        struct AskHook;
+        impl Hook for AskHook {
+            fn name(&self) -> &str {
+                "ask"
+            }
+            fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
+                Some(HookAction::ask("ok?"))
+            }
+        }
+
+        // Builder style: start Headless, switch to Interactive.
+        let executor = HookExecutor::new()
+            .interactivity(Interactivity::Interactive)
+            .with_hook(Arc::new(AskHook));
+        let ctx = dummy_pre_ctx();
+        let action = executor.check_pre_tool_use(&ctx);
+        assert!(
+            action.is_ask(),
+            "expected Ask in Interactive mode, got {action:?}"
+        );
+    }
+
+    #[test]
     fn default_is_same_as_new() {
         let default_exec = HookExecutor::default();
         let new_exec = HookExecutor::new();
         assert_eq!(default_exec.hook_count(), 0);
         assert_eq!(new_exec.hook_count(), 0);
         assert_eq!(default_exec.hook_count(), new_exec.hook_count());
+    }
+
+    #[test]
+    fn headless_block_passes_through_unchanged() {
+        struct BlockOnlyHook;
+        impl Hook for BlockOnlyHook {
+            fn name(&self) -> &str {
+                "block_only"
+            }
+            fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
+                Some(HookAction::block("forbidden"))
+            }
+        }
+
+        // Headless mode does NOT alter Block actions.
+        let executor = HookExecutor::new().with_hook(Arc::new(BlockOnlyHook));
+        let ctx = dummy_pre_ctx();
+        let action = executor.check_pre_tool_use(&ctx);
+        assert!(action.is_block());
+        assert_eq!(action.block_reason(), Some("forbidden"));
+    }
+
+    #[test]
+    fn headless_downgrade_preserves_original_message() {
+        struct AskHook;
+        impl Hook for AskHook {
+            fn name(&self) -> &str {
+                "ask"
+            }
+            fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
+                Some(HookAction::ask("please confirm deployment"))
+            }
+        }
+
+        let executor = HookExecutor::new().with_hook(Arc::new(AskHook));
+        let ctx = dummy_pre_ctx();
+        let action = executor.check_pre_tool_use(&ctx);
+        let reason = action
+            .block_reason()
+            .expect("downgraded action should be a Block with a reason");
+        assert!(
+            reason.contains("please confirm deployment"),
+            "Block reason should contain the original Ask message, got: {reason}"
+        );
+        assert!(
+            reason.contains("not interactive"),
+            "Block reason should explain the downgrade, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn with_interactivity_constructor_sets_mode() {
+        struct AskHook;
+        impl Hook for AskHook {
+            fn name(&self) -> &str {
+                "ask"
+            }
+            fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
+                Some(HookAction::ask("ok?"))
+            }
+        }
+
+        // with_interactivity(Headless) should downgrade.
+        let headless =
+            HookExecutor::with_interactivity(Interactivity::Headless).with_hook(Arc::new(AskHook));
+        assert!(
+            headless.check_pre_tool_use(&dummy_pre_ctx()).is_block(),
+            "Headless via with_interactivity should downgrade Ask"
+        );
+    }
+
+    #[test]
+    fn interactive_block_passes_through_unchanged() {
+        struct BlockOnlyHook;
+        impl Hook for BlockOnlyHook {
+            fn name(&self) -> &str {
+                "block_only"
+            }
+            fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
+                Some(HookAction::block("forbidden"))
+            }
+        }
+
+        // Interactive mode does NOT alter Block actions.
+        let executor = HookExecutor::with_interactivity(Interactivity::Interactive)
+            .with_hook(Arc::new(BlockOnlyHook));
+        let ctx = dummy_pre_ctx();
+        let action = executor.check_pre_tool_use(&ctx);
+        assert!(action.is_block());
+        assert_eq!(action.block_reason(), Some("forbidden"));
+    }
+
+    #[test]
+    fn no_hooks_returns_allow_in_headless() {
+        let executor = HookExecutor::new();
+        let ctx = dummy_pre_ctx();
+        assert!(executor.check_pre_tool_use(&ctx).is_allow());
+    }
+
+    #[test]
+    fn no_hooks_returns_allow_in_interactive() {
+        let executor = HookExecutor::with_interactivity(Interactivity::Interactive);
+        let ctx = dummy_pre_ctx();
+        assert!(executor.check_pre_tool_use(&ctx).is_allow());
     }
 }

@@ -77,11 +77,22 @@ use crate::core::reflection::{
 };
 use crate::core::{AgentConfig, AgentError, AgentObserver, SessionResult};
 use crate::engine::middleware::{ToolDispatchContext, ToolPipeline, ToolPipelineBuilder};
+#[cfg(feature = "hooks")]
+use crate::hooks::HookAction;
+#[cfg(feature = "hooks")]
+use crate::hooks::HookExecutor;
+#[cfg(feature = "hooks")]
+use crate::hooks::context::{
+    CompactTrigger, PostCompactContext, PostToolUseContext, PreCompactContext, PreToolUseContext,
+    SessionEndContext, SessionEndReason, SessionStartContext,
+};
 use crate::loop_control::bundle::ManagerBundle;
 use crate::message::{Message, MessagePart, Role, ToolContent, ToolContentPart};
 use crate::observability::{EventSink, NullSink, ObserveEvent};
 use crate::stream::handler::{StreamHandler, StreamHandlerError};
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
+#[cfg(feature = "tool_health")]
+use crate::tool::health::ToolHealthRegistry;
 use crate::tool::{PermissionCheck, ToolContext, ToolRegistry, ToolSchema};
 use futures::StreamExt;
 use std::sync::Arc;
@@ -231,6 +242,29 @@ pub struct BareLoop<C: ApiClient> {
     /// logic with the handler's retry, timeout, and fallback capabilities.
     /// When `None`, streaming uses the basic inline logic with no retries.
     stream_handler: Option<StreamHandler>,
+
+    /// Ordered hook executor for lifecycle interception.
+    ///
+    /// When `Some`, the executor runs registered hooks before and after
+    /// tool dispatch, compaction, and session start/end. Hooks can
+    /// short-circuit with [`HookAction::Block`].
+    /// [`HookAction::Ask`] is automatically downgraded to `Block` by the
+    /// executor in [`crate::hooks::Interactivity::Headless`] mode (the default).
+    /// When `None`, no lifecycle interception occurs.
+    ///
+    /// *Requires `hooks` feature.*
+    #[cfg(feature = "hooks")]
+    hook_executor: Option<Arc<HookExecutor>>,
+
+    /// Per-tool health tracker with circuit breakers.
+    ///
+    /// When `Some`, records success/failure and latency for every tool
+    /// dispatch. Tools that exceed the failure threshold have their circuit
+    /// breaker opened, blocking subsequent calls until recovery.
+    ///
+    /// *Requires `tool_health` feature.*
+    #[cfg(feature = "tool_health")]
+    health_registry: Option<Arc<ToolHealthRegistry>>,
 }
 
 // ==================================================
@@ -309,6 +343,36 @@ enum AbortReason {
     MaxTurnsExceeded,
 }
 
+/// Aggregated session metrics passed to [`notify_session_end`](BareLoop::notify_session_end).
+///
+/// Captures completion status, an [`EndReason`] discriminant, turn/token
+/// counters, and wall-clock duration — everything a hook needs to log or
+/// react to session termination without pulling data from other sources.
+#[allow(dead_code)]
+struct SessionEndInfo {
+    /// Whether the session completed normally.
+    success: bool,
+    /// Structured reason for the session end.
+    reason: EndReason,
+    /// Total turns executed.
+    total_turns: usize,
+    /// Total tokens consumed (input + output).
+    total_tokens: u64,
+    /// Wall-clock session duration in seconds.
+    duration_secs: u64,
+}
+
+/// Discriminant for how a session terminated.
+///
+/// Mapped to [`SessionEndReason`] inside the `#[cfg(feature = "hooks")]`
+/// path so the enum itself remains feature-independent.
+enum EndReason {
+    Complete,
+    Cancelled,
+    Error,
+    MaxTurns,
+}
+
 impl<C: ApiClient> BareLoop<C> {
     /// Maximum retry attempts for tool recovery before giving up.
     const MAX_RECOVERY_ATTEMPTS: u32 = 5;
@@ -348,6 +412,10 @@ impl<C: ApiClient> BareLoop<C> {
             cancelled: Arc::new(CancelSignal::new()),
             context_manager: None,
             stream_handler: None,
+            #[cfg(feature = "hooks")]
+            hook_executor: None,
+            #[cfg(feature = "tool_health")]
+            health_registry: None,
         }
     }
 
@@ -394,6 +462,10 @@ impl<C: ApiClient> BareLoop<C> {
             cancelled: Arc::new(CancelSignal::new()),
             context_manager: None,
             stream_handler: None,
+            #[cfg(feature = "hooks")]
+            hook_executor: None,
+            #[cfg(feature = "tool_health")]
+            health_registry: None,
         }
     }
 
@@ -447,6 +519,10 @@ impl<C: ApiClient> BareLoop<C> {
             cancelled: Arc::new(CancelSignal::new()),
             context_manager: None,
             stream_handler: None,
+            #[cfg(feature = "hooks")]
+            hook_executor: None,
+            #[cfg(feature = "tool_health")]
+            health_registry: None,
         }
     }
 
@@ -491,6 +567,10 @@ impl<C: ApiClient> BareLoop<C> {
             cancelled: Arc::new(CancelSignal::new()),
             context_manager: None,
             stream_handler: None,
+            #[cfg(feature = "hooks")]
+            hook_executor: None,
+            #[cfg(feature = "tool_health")]
+            health_registry: None,
         }
     }
 
@@ -672,6 +752,56 @@ impl<C: ApiClient> BareLoop<C> {
         self.stream_handler = Some(handler);
     }
 
+    /// Set the [`HookExecutor`] for lifecycle interception.
+    ///
+    /// When set, the executor runs registered hooks before and after
+    /// tool dispatch, compaction, and session start/end. Hooks can
+    /// short-circuit with [`HookAction::Block`].
+    /// [`HookAction::Ask`] is automatically downgraded to `Block` by the
+    /// executor in [`crate::hooks::Interactivity::Headless`] mode (the default).
+    /// Must be called before [`run()`](BareLoop::run).
+    ///
+    /// *Requires `hooks` feature.*
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::hooks::HookExecutor;
+    /// use std::sync::Arc;
+    ///
+    /// let executor = HookExecutor::new();
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_hook_executor(Arc::new(executor));
+    /// ```
+    #[cfg(feature = "hooks")]
+    pub fn set_hook_executor(&mut self, executor: Arc<HookExecutor>) {
+        self.hook_executor = Some(executor);
+    }
+
+    /// Set the [`ToolHealthRegistry`] for per-tool health tracking.
+    ///
+    /// When set, records success/failure and latency for every tool
+    /// dispatch. Tools that exceed the failure threshold have their
+    /// circuit breaker opened, blocking subsequent calls until recovery.
+    /// Must be called before [`run()`](BareLoop::run).
+    ///
+    /// *Requires `tool_health` feature.*
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::tool::health::ToolHealthRegistry;
+    /// use std::sync::Arc;
+    ///
+    /// let registry = ToolHealthRegistry::new();
+    /// let mut agent = BareLoop::new(client, tools, config);
+    /// agent.set_health_registry(Arc::new(registry));
+    /// ```
+    #[cfg(feature = "tool_health")]
+    pub fn set_health_registry(&mut self, registry: Arc<ToolHealthRegistry>) {
+        self.health_registry = Some(registry);
+    }
+
     /// Set the middleware pipeline for tool dispatch.
     ///
     /// Replaces the default (no pipeline) with a caller-supplied
@@ -778,18 +908,10 @@ impl<C: ApiClient> BareLoop<C> {
         // Main agent loop
         loop {
             if self.is_cancelled() {
-                return self.abort_session(
-                    budget.turn_count,
-                    start.elapsed(),
-                    AbortReason::Cancelled,
-                );
+                return self.abort_session(&budget, start.elapsed(), AbortReason::Cancelled);
             }
             if budget.turn_count >= max_turns {
-                return self.abort_session(
-                    budget.turn_count,
-                    start.elapsed(),
-                    AbortReason::MaxTurnsExceeded,
-                );
+                return self.abort_session(&budget, start.elapsed(), AbortReason::MaxTurnsExceeded);
             }
 
             self.emit_turn_start(budget.turn_count, user_input);
@@ -831,7 +953,7 @@ impl<C: ApiClient> BareLoop<C> {
                     // After tool dispatch, check if context compaction is needed.
                     if let Err(e) = self.maybe_compact_context(budget.turn_count).await {
                         return self.abort_turn_and_session(
-                            budget.turn_count,
+                            &budget,
                             turn_start.elapsed(),
                             start.elapsed(),
                             &e.to_string(),
@@ -842,7 +964,7 @@ impl<C: ApiClient> BareLoop<C> {
                 Err(e) => {
                     let err_str = e.to_string();
                     return self.abort_turn_and_session(
-                        budget.turn_count,
+                        &budget,
                         turn_start.elapsed(),
                         start.elapsed(),
                         &err_str,
@@ -937,7 +1059,18 @@ impl<C: ApiClient> BareLoop<C> {
             success,
             error.as_deref().unwrap_or("completed"),
         );
-        self.notify_session_end(success, error.as_deref());
+        let end_reason = if success {
+            EndReason::Complete
+        } else {
+            EndReason::Error
+        };
+        self.notify_session_end(&SessionEndInfo {
+            success,
+            reason: end_reason,
+            total_turns: budget.turn_count,
+            total_tokens: budget.input_tokens.saturating_add(budget.output_tokens),
+            duration_secs: session_duration.as_secs(),
+        });
 
         SessionResult {
             session_id,
@@ -961,16 +1094,27 @@ impl<C: ApiClient> BareLoop<C> {
     /// Always returns `Err(error)`, passing through the original [`AgentError`].
     fn abort_turn_and_session(
         &self,
-        turn_count: usize,
+        budget: &SessionBudget,
         turn_duration: Duration,
         session_duration: Duration,
         reason: &str,
         error: AgentError,
     ) -> Result<SessionResult, AgentError> {
-        self.emit_turn_failed(turn_count, turn_duration, reason);
+        self.emit_turn_failed(budget.turn_count, turn_duration, reason);
         self.notify_turn_end(false, Some(reason));
-        self.emit_session_stop(turn_count, session_duration, false, reason);
-        self.notify_session_end(false, Some(reason));
+        self.emit_session_stop(budget.turn_count, session_duration, false, reason);
+        let end_reason = if matches!(error, AgentError::Cancelled) {
+            EndReason::Cancelled
+        } else {
+            EndReason::Error
+        };
+        self.notify_session_end(&SessionEndInfo {
+            success: false,
+            reason: end_reason,
+            total_turns: budget.turn_count,
+            total_tokens: budget.input_tokens.saturating_add(budget.output_tokens),
+            duration_secs: session_duration.as_secs(),
+        });
         Err(error)
     }
 
@@ -990,7 +1134,18 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Result<SessionResult, AgentError> {
         let reason = error.to_string();
         self.emit_session_stop(budget.turn_count, session_duration, false, &reason);
-        self.notify_session_end(false, Some(&reason));
+        let end_reason = if matches!(error, AgentError::Cancelled) {
+            EndReason::Cancelled
+        } else {
+            EndReason::Error
+        };
+        self.notify_session_end(&SessionEndInfo {
+            success: false,
+            reason: end_reason,
+            total_turns: budget.turn_count,
+            total_tokens: budget.input_tokens.saturating_add(budget.output_tokens),
+            duration_secs: session_duration.as_secs(),
+        });
         Err(error)
     }
 
@@ -1004,7 +1159,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// depending on the `reason` string.
     fn abort_session(
         &self,
-        turn_count: usize,
+        budget: &SessionBudget,
         session_duration: Duration,
         reason: AbortReason,
     ) -> Result<SessionResult, AgentError> {
@@ -1012,8 +1167,18 @@ impl<C: ApiClient> BareLoop<C> {
             AbortReason::Cancelled => "Cancelled",
             AbortReason::MaxTurnsExceeded => "Max turns exceeded",
         };
-        self.emit_session_stop(turn_count, session_duration, false, reason_str);
-        self.notify_session_end(false, Some(reason_str));
+        self.emit_session_stop(budget.turn_count, session_duration, false, reason_str);
+        let end_reason = match &reason {
+            AbortReason::Cancelled => EndReason::Cancelled,
+            AbortReason::MaxTurnsExceeded => EndReason::MaxTurns,
+        };
+        self.notify_session_end(&SessionEndInfo {
+            success: false,
+            reason: end_reason,
+            total_turns: budget.turn_count,
+            total_tokens: budget.input_tokens.saturating_add(budget.output_tokens),
+            duration_secs: session_duration.as_secs(),
+        });
         match reason {
             AbortReason::Cancelled => Err(AgentError::Cancelled),
             AbortReason::MaxTurnsExceeded => Err(AgentError::MaxTurnsExceeded {
@@ -1047,9 +1212,37 @@ impl<C: ApiClient> BareLoop<C> {
         };
 
         let messages_before = self.conversation.len();
+
+        // Pre-compact hook check
+        #[cfg(feature = "hooks")]
+        if let Some(ref executor) = self.hook_executor {
+            let tokens_before =
+                crate::compact::CompactionOutcome::estimate_tokens(&self.conversation);
+            let ctx = PreCompactContext {
+                trigger: CompactTrigger::Auto,
+                custom_instructions: None,
+                message_count: messages_before,
+                tokens_before,
+                context_window: self.config.context_window,
+                session_id: self.config.session_id,
+            };
+            let hook_result = executor.check_pre_compact(&ctx);
+            if hook_result.abort {
+                // Hook aborted compaction — return Ok, conversation unchanged.
+                return Ok(());
+            }
+            // Note: hook_result.new_instructions and hook_result.additional_context
+            // are available for future use with a hook-aware compactor.
+        }
+
+        let compact_start = Instant::now();
         let result = ctx_manager
             .ensure_context_fits(std::mem::take(&mut self.conversation), turn)
             .await;
+        #[cfg(feature = "hooks")]
+        let compact_duration_ms = u64::try_from(compact_start.elapsed().as_millis()).unwrap_or(0);
+        #[cfg(not(feature = "hooks"))]
+        let _ = compact_start;
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
                 self.conversation = outcome.messages;
@@ -1062,6 +1255,22 @@ impl<C: ApiClient> BareLoop<C> {
                     messages_after,
                     tokens_saved: outcome.tokens_saved,
                 });
+
+                // Post-compact hook notification
+                #[cfg(feature = "hooks")]
+                if let Some(ref executor) = self.hook_executor {
+                    let messages_compacted = messages_before.saturating_sub(messages_after);
+                    let ctx = PostCompactContext {
+                        trigger: CompactTrigger::Auto,
+                        messages_compacted,
+                        tokens_saved: outcome.tokens_saved,
+                        tokens_after: outcome.tokens_after,
+                        duration_ms: compact_duration_ms,
+                        session_id: self.config.session_id,
+                    };
+                    executor.notify_post_compact(&ctx);
+                }
+
                 Ok(())
             }
             Ok(EnsureContextResult::NoAction(messages)) => {
@@ -1286,6 +1495,10 @@ impl<C: ApiClient> BareLoop<C> {
                 return Err(AgentError::Cancelled);
             }
 
+            if let Some(blocked) = self.check_pre_tool_use_hooks(tc, turn_idx) {
+                return Ok(blocked);
+            }
+
             self.notify_tool_call(&tc.name, &tc.input.to_string());
             self.emit_tool_start(&tc.name, &tc.input.to_string());
             let start = Instant::now();
@@ -1374,6 +1587,9 @@ impl<C: ApiClient> BareLoop<C> {
                 }
             };
 
+            self.notify_post_tool_use_hooks(tc, &tool_result, turn_idx);
+            self.record_tool_health(tc.name.as_str(), &tool_result);
+
             // If the tool succeeded, return immediately.
             if !tool_result.is_error {
                 return Ok(tool_result);
@@ -1402,6 +1618,115 @@ impl<C: ApiClient> BareLoop<C> {
                     return Ok(tool_result);
                 }
             }
+        }
+    }
+
+    /// Check pre-tool-use hooks and return a blocked result if any hook
+    /// blocks or asks.
+    ///
+    /// Returns `Some(ToolCallResult)` with an error result if a hook
+    /// blocked the call, or `None` if the call should proceed.
+    ///
+    /// *Requires `hooks` feature; returns `None` otherwise.*
+    fn check_pre_tool_use_hooks(
+        &self,
+        tc: &ToolCallInfo,
+        turn_idx: usize,
+    ) -> Option<ToolCallResult> {
+        #[cfg(feature = "hooks")]
+        if let Some(ref executor) = self.hook_executor {
+            let ctx = PreToolUseContext {
+                tool_name: tc.name.clone(),
+                input: tc.input.clone(),
+                session_id: self.config.session_id,
+                turn_number: turn_idx,
+            };
+            match executor.check_pre_tool_use(&ctx) {
+                HookAction::Allow => None,
+                HookAction::Block { reason } => {
+                    self.emit_tool_complete(&tc.name, &reason, true, Duration::ZERO);
+                    Some(ToolCallResult {
+                        tool_call_id: tc.id.clone(),
+                        output: ToolContent::Text(reason),
+                        is_error: true,
+                        duration: Duration::ZERO,
+                    })
+                }
+                HookAction::Ask { message } => {
+                    // In Headless mode (the default) the executor already
+                    // downgrades Ask → Block. If we reach this arm the
+                    // executor is Interactive, but BareLoop has no UI to
+                    // show a prompt, so we still treat it as Block.
+                    self.emit_tool_complete(&tc.name, &message, true, Duration::ZERO);
+                    Some(ToolCallResult {
+                        tool_call_id: tc.id.clone(),
+                        output: ToolContent::Text(message),
+                        is_error: true,
+                        duration: Duration::ZERO,
+                    })
+                }
+            }
+        } else {
+            None
+        }
+        #[cfg(not(feature = "hooks"))]
+        {
+            let _ = (tc, turn_idx);
+            None
+        }
+    }
+
+    /// Notify post-tool-use hooks with the execution result.
+    ///
+    /// *Requires `hooks` feature; no-op otherwise.*
+    fn notify_post_tool_use_hooks(
+        &self,
+        tc: &ToolCallInfo,
+        tool_result: &ToolCallResult,
+        turn_idx: usize,
+    ) {
+        #[cfg(feature = "hooks")]
+        if let Some(ref executor) = self.hook_executor {
+            let output_text = match &tool_result.output {
+                ToolContent::Text(t) => t.clone(),
+                ToolContent::Multipart(_) => String::new(),
+            };
+            let ctx = PostToolUseContext {
+                tool_name: tc.name.clone(),
+                input: tc.input.clone(),
+                output: output_text,
+                is_error: tool_result.is_error,
+                duration_ms: tool_result
+                    .duration
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                session_id: self.config.session_id,
+                turn_number: turn_idx,
+            };
+            executor.notify_post_tool_use(&ctx);
+        }
+        #[cfg(not(feature = "hooks"))]
+        {
+            let _ = (tc, tool_result, turn_idx);
+        }
+    }
+
+    /// Record tool health (success or failure) in the health registry.
+    ///
+    /// *Requires `tool_health` feature; no-op otherwise.*
+    fn record_tool_health(&self, tool_name: &str, tool_result: &ToolCallResult) {
+        #[cfg(feature = "tool_health")]
+        if let Some(ref health) = self.health_registry {
+            if tool_result.is_error {
+                health.record_failure(tool_name, tool_result.duration);
+            } else {
+                health.record_success(tool_name, tool_result.duration);
+            }
+        }
+        #[cfg(not(feature = "tool_health"))]
+        {
+            let _ = (tool_name, tool_result);
         }
     }
 
@@ -1635,17 +1960,51 @@ impl<C: ApiClient> BareLoop<C> {
         self.event_sink.on_event(&ObserveEvent::SessionStart {
             session_id: self.config.session_id,
         });
+
+        #[cfg(feature = "hooks")]
+        if let Some(ref executor) = self.hook_executor {
+            let ctx = SessionStartContext {
+                session_id: self.config.session_id,
+                model: self.config.model.clone(),
+                working_directory: std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            };
+            executor.notify_session_start(&ctx);
+        }
     }
 
     /// Notify all observers that the session has ended.
     ///
     /// Called once when [`run()`](BareLoop::run) returns — whether
     /// successfully, due to an error, or because of cancellation.
-    /// The `success` flag and optional `error` message let observers
-    /// distinguish normal termination from failures.
-    fn notify_session_end(&self, success: bool, error: Option<&str>) {
+    fn notify_session_end(&self, info: &SessionEndInfo) {
+        let reason_str = match &info.reason {
+            EndReason::Complete => None,
+            EndReason::Cancelled => Some("cancelled"),
+            EndReason::MaxTurns => Some("max turns exceeded"),
+            EndReason::Error => Some("session ended with error"),
+        };
         for obs in &self.observers {
-            obs.on_session_end(success, error);
+            obs.on_session_end(info.success, reason_str);
+        }
+
+        #[cfg(feature = "hooks")]
+        if let Some(ref executor) = self.hook_executor {
+            let reason = match &info.reason {
+                EndReason::Complete => SessionEndReason::Complete,
+                EndReason::Cancelled => SessionEndReason::Cancelled,
+                EndReason::Error => SessionEndReason::Error,
+                EndReason::MaxTurns => SessionEndReason::MaxTurns,
+            };
+            let ctx = SessionEndContext {
+                session_id: self.config.session_id,
+                reason,
+                total_turns: info.total_turns,
+                total_tokens: info.total_tokens,
+                duration_secs: info.duration_secs,
+            };
+            executor.notify_session_end(&ctx);
         }
     }
 
@@ -1894,7 +2253,11 @@ struct ToolCallResult {
     /// [`Tool::call()`](crate::tool::Tool::call) invocation. Reserved
     /// for future surfacing in [`SessionResult`]; currently passed to
     /// observer callbacks inline during dispatch.
-    #[expect(dead_code)]
+    ///
+    /// Used by [`ToolHealthRegistry::record_success`] and
+    /// [`ToolHealthRegistry::record_failure`] when the `tool_health`
+    /// feature is enabled.
+    #[cfg_attr(not(feature = "tool_health"), expect(dead_code))]
     duration: Duration,
 }
 

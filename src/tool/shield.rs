@@ -280,7 +280,10 @@ pub trait ToolSafetyShield: Send + Sync {
 
     /// Called after the tool executes. Allows the shield to update
     /// internal state (e.g. call history for multi-turn analysis).
-    fn record_invocation(&self, tool_name: &str, success: bool);
+    ///
+    /// The `input` is the same [`Value`] passed to [`evaluate`](ToolSafetyShield::evaluate),
+    /// so the shield can store it for later combination-rule matching.
+    fn record_invocation(&self, tool_name: &str, input: &Value, success: bool);
 
     /// Return the set of tool names this shield wants to inspect.
     ///
@@ -329,8 +332,8 @@ pub struct UnixShield {
     warn_threshold: f32,
     /// Score at which [`SafetyAction::Block`] is returned.
     block_threshold: f32,
-    /// Per-turn invocation history: `(tool_name, turn)`.
-    turn_history: Mutex<Vec<(String, usize)>>,
+    /// Per-turn invocation history: `(tool_name, input_string)`.
+    turn_history: Mutex<Vec<(String, String)>>,
     /// Per-tool single-turn risk patterns.
     patterns: HashMap<&'static str, Vec<RiskPattern>>,
     /// Combination rules for dangerous sequences.
@@ -434,11 +437,11 @@ impl UnixShield {
         for rule in &self.combination_rules {
             let mut all_matched = true;
             for &(tool, pat) in rule.triggers {
-                let found_in_history = history.iter().any(|(name, _)| {
+                let found_in_history = history.iter().any(|(name, historical_input)| {
                     if name != tool {
                         return false;
                     }
-                    pat.is_none_or(|p| ctx.input.to_string().contains(p))
+                    pat.is_none_or(|p| historical_input.contains(p))
                 });
                 if !found_in_history {
                     let current_matches = ctx.tool_name == tool
@@ -612,12 +615,12 @@ impl ToolSafetyShield for UnixShield {
         }
     }
 
-    fn record_invocation(&self, tool_name: &str, _success: bool) {
+    fn record_invocation(&self, tool_name: &str, input: &Value, _success: bool) {
         let mut history = self
             .turn_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        history.push((tool_name.to_string(), 0));
+        history.push((tool_name.to_string(), input.to_string()));
         // Trim to last 20 entries.
         if history.len() > 20 {
             let drain_until = history.len().saturating_sub(20);
@@ -769,7 +772,7 @@ impl ToolSafetyShield for NullShield {
         SafetyDecision::allow()
     }
 
-    fn record_invocation(&self, _tool_name: &str, _success: bool) {
+    fn record_invocation(&self, _tool_name: &str, _input: &Value, _success: bool) {
         // No-op — no state to update.
     }
 
@@ -852,7 +855,7 @@ mod tests {
     fn unix_shield_records_and_trims_history() {
         let shield = UnixShield::new();
         for i in 0..25 {
-            shield.record_invocation("Bash", true);
+            shield.record_invocation("Bash", &json!({ "command": "ls" }), true);
             let history = shield.turn_history.lock().unwrap();
             assert!(history.len() <= 20, "iteration {i}: history too long");
         }

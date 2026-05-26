@@ -343,6 +343,36 @@ enum AbortReason {
     MaxTurnsExceeded,
 }
 
+/// Aggregated session metrics passed to [`notify_session_end`](BareLoop::notify_session_end).
+///
+/// Captures completion status, an [`EndReason`] discriminant, turn/token
+/// counters, and wall-clock duration — everything a hook needs to log or
+/// react to session termination without pulling data from other sources.
+#[allow(dead_code)]
+struct SessionEndInfo {
+    /// Whether the session completed normally.
+    success: bool,
+    /// Structured reason for the session end.
+    reason: EndReason,
+    /// Total turns executed.
+    total_turns: usize,
+    /// Total tokens consumed (input + output).
+    total_tokens: u64,
+    /// Wall-clock session duration in seconds.
+    duration_secs: u64,
+}
+
+/// Discriminant for how a session terminated.
+///
+/// Mapped to [`SessionEndReason`] inside the `#[cfg(feature = "hooks")]`
+/// path so the enum itself remains feature-independent.
+enum EndReason {
+    Complete,
+    Cancelled,
+    Error,
+    MaxTurns,
+}
+
 impl<C: ApiClient> BareLoop<C> {
     /// Maximum retry attempts for tool recovery before giving up.
     const MAX_RECOVERY_ATTEMPTS: u32 = 5;
@@ -1037,7 +1067,18 @@ impl<C: ApiClient> BareLoop<C> {
             success,
             error.as_deref().unwrap_or("completed"),
         );
-        self.notify_session_end(success, error.as_deref());
+        let end_reason = if success {
+            EndReason::Complete
+        } else {
+            EndReason::Error
+        };
+        self.notify_session_end(&SessionEndInfo {
+            success,
+            reason: end_reason,
+            total_turns: budget.turn_count,
+            total_tokens: budget.input_tokens.saturating_add(budget.output_tokens),
+            duration_secs: session_duration.as_secs(),
+        });
 
         SessionResult {
             session_id,
@@ -1070,7 +1111,18 @@ impl<C: ApiClient> BareLoop<C> {
         self.emit_turn_failed(turn_count, turn_duration, reason);
         self.notify_turn_end(false, Some(reason));
         self.emit_session_stop(turn_count, session_duration, false, reason);
-        self.notify_session_end(false, Some(reason));
+        let end_reason = if matches!(error, AgentError::Cancelled) {
+            EndReason::Cancelled
+        } else {
+            EndReason::Error
+        };
+        self.notify_session_end(&SessionEndInfo {
+            success: false,
+            reason: end_reason,
+            total_turns: turn_count,
+            total_tokens: 0,
+            duration_secs: session_duration.as_secs(),
+        });
         Err(error)
     }
 
@@ -1090,7 +1142,18 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Result<SessionResult, AgentError> {
         let reason = error.to_string();
         self.emit_session_stop(budget.turn_count, session_duration, false, &reason);
-        self.notify_session_end(false, Some(&reason));
+        let end_reason = if matches!(error, AgentError::Cancelled) {
+            EndReason::Cancelled
+        } else {
+            EndReason::Error
+        };
+        self.notify_session_end(&SessionEndInfo {
+            success: false,
+            reason: end_reason,
+            total_turns: budget.turn_count,
+            total_tokens: budget.input_tokens.saturating_add(budget.output_tokens),
+            duration_secs: session_duration.as_secs(),
+        });
         Err(error)
     }
 
@@ -1113,7 +1176,17 @@ impl<C: ApiClient> BareLoop<C> {
             AbortReason::MaxTurnsExceeded => "Max turns exceeded",
         };
         self.emit_session_stop(turn_count, session_duration, false, reason_str);
-        self.notify_session_end(false, Some(reason_str));
+        let end_reason = match &reason {
+            AbortReason::Cancelled => EndReason::Cancelled,
+            AbortReason::MaxTurnsExceeded => EndReason::MaxTurns,
+        };
+        self.notify_session_end(&SessionEndInfo {
+            success: false,
+            reason: end_reason,
+            total_turns: turn_count,
+            total_tokens: 0,
+            duration_secs: session_duration.as_secs(),
+        });
         match reason {
             AbortReason::Cancelled => Err(AgentError::Cancelled),
             AbortReason::MaxTurnsExceeded => Err(AgentError::MaxTurnsExceeded {
@@ -1151,11 +1224,13 @@ impl<C: ApiClient> BareLoop<C> {
         // Pre-compact hook check
         #[cfg(feature = "hooks")]
         if let Some(ref executor) = self.hook_executor {
+            let tokens_before =
+                crate::compact::CompactionOutcome::estimate_tokens(&self.conversation);
             let ctx = PreCompactContext {
                 trigger: CompactTrigger::Auto,
                 custom_instructions: None,
                 message_count: messages_before,
-                tokens_before: 0,
+                tokens_before,
                 context_window: self.config.context_window,
                 session_id: self.config.session_id,
             };
@@ -1168,9 +1243,14 @@ impl<C: ApiClient> BareLoop<C> {
             // are available for future use with a hook-aware compactor.
         }
 
+        let compact_start = Instant::now();
         let result = ctx_manager
             .ensure_context_fits(std::mem::take(&mut self.conversation), turn)
             .await;
+        #[cfg(feature = "hooks")]
+        let compact_duration_ms = u64::try_from(compact_start.elapsed().as_millis()).unwrap_or(0);
+        #[cfg(not(feature = "hooks"))]
+        let _ = compact_start;
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
                 self.conversation = outcome.messages;
@@ -1192,8 +1272,8 @@ impl<C: ApiClient> BareLoop<C> {
                         trigger: CompactTrigger::Auto,
                         messages_compacted,
                         tokens_saved: outcome.tokens_saved,
-                        tokens_after: 0,
-                        duration_ms: 0,
+                        tokens_after: outcome.tokens_after,
+                        duration_ms: compact_duration_ms,
                         session_id: self.config.session_id,
                     };
                     executor.notify_post_compact(&ctx);
@@ -1906,30 +1986,31 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Called once when [`run()`](BareLoop::run) returns — whether
     /// successfully, due to an error, or because of cancellation.
-    /// The `success` flag and optional `error` message let observers
-    /// distinguish normal termination from failures.
-    fn notify_session_end(&self, success: bool, error: Option<&str>) {
+    fn notify_session_end(&self, info: &SessionEndInfo) {
+        let reason_str = match &info.reason {
+            EndReason::Complete => None,
+            EndReason::Cancelled => Some("cancelled"),
+            EndReason::MaxTurns => Some("max turns exceeded"),
+            EndReason::Error => Some("session ended with error"),
+        };
         for obs in &self.observers {
-            obs.on_session_end(success, error);
+            obs.on_session_end(info.success, reason_str);
         }
 
         #[cfg(feature = "hooks")]
         if let Some(ref executor) = self.hook_executor {
-            let reason = if success {
-                SessionEndReason::Complete
-            } else if error.is_some_and(|e| e.contains("cancel") || e.contains("Cancel")) {
-                SessionEndReason::Cancelled
-            } else if error.is_some_and(|e| e.contains("Max turns")) {
-                SessionEndReason::MaxTurns
-            } else {
-                SessionEndReason::Error
+            let reason = match &info.reason {
+                EndReason::Complete => SessionEndReason::Complete,
+                EndReason::Cancelled => SessionEndReason::Cancelled,
+                EndReason::Error => SessionEndReason::Error,
+                EndReason::MaxTurns => SessionEndReason::MaxTurns,
             };
             let ctx = SessionEndContext {
                 session_id: self.config.session_id,
                 reason,
-                total_turns: 0,
-                total_tokens: 0,
-                duration_secs: 0,
+                total_turns: info.total_turns,
+                total_tokens: info.total_tokens,
+                duration_secs: info.duration_secs,
             };
             executor.notify_session_end(&ctx);
         }

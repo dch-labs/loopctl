@@ -425,34 +425,42 @@ impl UnixShield {
     /// Assess combination risk: detect dangerous tool sequences in
     /// recent history.
     ///
-    /// Each [`CombinationRule`] specifies a set of triggers that must
-    /// all appear (either in history or the current call) for the rule
-    /// to fire. Returns the highest score among all matched rules.
+    /// Each [`CombinationRule`] specifies an ordered sequence of triggers.
+    /// The match is chronological — triggers must appear in the order
+    /// specified, either in recorded history or the current call.
+    /// Returns the highest score among all matched rules.
     pub fn assess_combination(&self, ctx: &ShieldContext) -> f32 {
         let history = self
             .turn_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut max_risk = 0.0_f32;
+
+        // Build a chronological candidate sequence: history entries in
+        // recorded order, followed by the current call.
+        let current_event = (ctx.tool_name.as_str(), ctx.input.to_string());
+        let candidates: Vec<(&str, String)> = history
+            .iter()
+            .map(|(name, input)| (name.as_str(), input.clone()))
+            .chain(std::iter::once((current_event.0, current_event.1.clone())))
+            .collect();
+
         for rule in &self.combination_rules {
-            let mut all_matched = true;
-            for &(tool, pat) in rule.triggers {
-                let found_in_history = history.iter().any(|(name, historical_input)| {
-                    if name != tool {
-                        return false;
-                    }
-                    pat.is_none_or(|p| historical_input.contains(p))
-                });
-                if !found_in_history {
-                    let current_matches = ctx.tool_name == tool
-                        && pat.is_none_or(|p| ctx.input.to_string().contains(p));
-                    if !current_matches {
-                        all_matched = false;
+            // Walk the candidate sequence, advancing a trigger pointer
+            // only when the current trigger matches in order.
+            let mut trigger_idx: usize = 0;
+            for (name, input) in &candidates {
+                let Some(&(tool, pattern)) = rule.triggers.get(trigger_idx) else {
+                    break;
+                };
+                if *name == tool && pattern.is_none_or(|p| input.contains(p)) {
+                    trigger_idx = trigger_idx.saturating_add(1);
+                    if trigger_idx == rule.triggers.len() {
                         break;
                     }
                 }
             }
-            if all_matched {
+            if trigger_idx == rule.triggers.len() {
                 max_risk = max_risk.max(rule.score);
             }
         }
@@ -873,6 +881,42 @@ mod tests {
     #[test]
     fn unix_shield_default_trait() {
         let _shield = UnixShield::default();
+    }
+
+    #[test]
+    fn combination_rule_requires_chronological_order() {
+        // Use a blank shield with a single rule to avoid false matches
+        // from other built-in rules (e.g. "modify permissions then write").
+        let shield = UnixShieldBuilder::blank()
+            .combination_rule(CombinationRule {
+                description: "write then execute",
+                score: 0.75,
+                triggers: &[("Write", None), ("Bash", Some("chmod +x"))],
+            })
+            .build();
+
+        // Record in REVERSE order: Bash(chmod +x) first, then Write.
+        // The rule requires Write → Bash, so this should NOT match.
+        shield.record_invocation("Bash", &json!({ "command": "chmod +x /tmp/payload" }), true);
+        shield.record_invocation("Write", &json!({ "path": "/tmp/payload" }), true);
+
+        let eval_ctx = ctx("Read", json!({ "path": "/tmp/data" }), 2);
+        let combo = shield.assess_combination(&eval_ctx);
+        assert_eq!(combo, 0.0, "reversed order should not match");
+
+        // Now test correct order: Write first, then Bash(chmod +x) as the
+        // current call.
+        let shield2 = UnixShieldBuilder::blank()
+            .combination_rule(CombinationRule {
+                description: "write then execute",
+                score: 0.75,
+                triggers: &[("Write", None), ("Bash", Some("chmod +x"))],
+            })
+            .build();
+        shield2.record_invocation("Write", &json!({ "path": "/tmp/payload" }), true);
+        let eval_ctx2 = ctx("Bash", json!({ "command": "chmod +x /tmp/payload" }), 1);
+        let combo2 = shield2.assess_combination(&eval_ctx2);
+        assert!(combo2 > 0.0, "correct order should match");
     }
 
     // ===================================================

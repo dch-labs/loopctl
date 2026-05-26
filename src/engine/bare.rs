@@ -908,18 +908,10 @@ impl<C: ApiClient> BareLoop<C> {
         // Main agent loop
         loop {
             if self.is_cancelled() {
-                return self.abort_session(
-                    budget.turn_count,
-                    start.elapsed(),
-                    AbortReason::Cancelled,
-                );
+                return self.abort_session(&budget, start.elapsed(), AbortReason::Cancelled);
             }
             if budget.turn_count >= max_turns {
-                return self.abort_session(
-                    budget.turn_count,
-                    start.elapsed(),
-                    AbortReason::MaxTurnsExceeded,
-                );
+                return self.abort_session(&budget, start.elapsed(), AbortReason::MaxTurnsExceeded);
             }
 
             self.emit_turn_start(budget.turn_count, user_input);
@@ -961,7 +953,7 @@ impl<C: ApiClient> BareLoop<C> {
                     // After tool dispatch, check if context compaction is needed.
                     if let Err(e) = self.maybe_compact_context(budget.turn_count).await {
                         return self.abort_turn_and_session(
-                            budget.turn_count,
+                            &budget,
                             turn_start.elapsed(),
                             start.elapsed(),
                             &e.to_string(),
@@ -972,7 +964,7 @@ impl<C: ApiClient> BareLoop<C> {
                 Err(e) => {
                     let err_str = e.to_string();
                     return self.abort_turn_and_session(
-                        budget.turn_count,
+                        &budget,
                         turn_start.elapsed(),
                         start.elapsed(),
                         &err_str,
@@ -1102,15 +1094,15 @@ impl<C: ApiClient> BareLoop<C> {
     /// Always returns `Err(error)`, passing through the original [`AgentError`].
     fn abort_turn_and_session(
         &self,
-        turn_count: usize,
+        budget: &SessionBudget,
         turn_duration: Duration,
         session_duration: Duration,
         reason: &str,
         error: AgentError,
     ) -> Result<SessionResult, AgentError> {
-        self.emit_turn_failed(turn_count, turn_duration, reason);
+        self.emit_turn_failed(budget.turn_count, turn_duration, reason);
         self.notify_turn_end(false, Some(reason));
-        self.emit_session_stop(turn_count, session_duration, false, reason);
+        self.emit_session_stop(budget.turn_count, session_duration, false, reason);
         let end_reason = if matches!(error, AgentError::Cancelled) {
             EndReason::Cancelled
         } else {
@@ -1119,8 +1111,8 @@ impl<C: ApiClient> BareLoop<C> {
         self.notify_session_end(&SessionEndInfo {
             success: false,
             reason: end_reason,
-            total_turns: turn_count,
-            total_tokens: 0,
+            total_turns: budget.turn_count,
+            total_tokens: budget.input_tokens.saturating_add(budget.output_tokens),
             duration_secs: session_duration.as_secs(),
         });
         Err(error)
@@ -1167,7 +1159,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// depending on the `reason` string.
     fn abort_session(
         &self,
-        turn_count: usize,
+        budget: &SessionBudget,
         session_duration: Duration,
         reason: AbortReason,
     ) -> Result<SessionResult, AgentError> {
@@ -1175,7 +1167,7 @@ impl<C: ApiClient> BareLoop<C> {
             AbortReason::Cancelled => "Cancelled",
             AbortReason::MaxTurnsExceeded => "Max turns exceeded",
         };
-        self.emit_session_stop(turn_count, session_duration, false, reason_str);
+        self.emit_session_stop(budget.turn_count, session_duration, false, reason_str);
         let end_reason = match &reason {
             AbortReason::Cancelled => EndReason::Cancelled,
             AbortReason::MaxTurnsExceeded => EndReason::MaxTurns,
@@ -1183,8 +1175,8 @@ impl<C: ApiClient> BareLoop<C> {
         self.notify_session_end(&SessionEndInfo {
             success: false,
             reason: end_reason,
-            total_turns: turn_count,
-            total_tokens: 0,
+            total_turns: budget.turn_count,
+            total_tokens: budget.input_tokens.saturating_add(budget.output_tokens),
             duration_secs: session_duration.as_secs(),
         });
         match reason {

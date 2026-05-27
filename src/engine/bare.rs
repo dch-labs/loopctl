@@ -75,7 +75,7 @@ use crate::core::reflection::{
     ExponentialBackoffRecovery, NoopReflector, RecoveryAction, RecoveryStrategy, ReflectionContext,
     Reflector,
 };
-use crate::core::{AgentConfig, AgentError, AgentObserver, SessionResult};
+use crate::core::{AgentConfig, AgentError, AgentObserver, SessionResult, ToolDispatchResult};
 use crate::engine::middleware::{ToolDispatchContext, ToolPipeline, ToolPipelineBuilder};
 #[cfg(feature = "hooks")]
 use crate::hooks::HookAction;
@@ -1427,7 +1427,7 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Iterates over each [`ToolCallInfo`] extracted from the assistant
     /// message, looks up the corresponding tool in the [`ToolRegistry`],
-    /// and invokes it. Each result is wrapped in a [`ToolCallResult`].
+    /// and invokes it. Each result is wrapped in a [`ToolDispatchResult`].
     ///
     /// Tool execution is **sequential** so that cancellation can be
     /// checked between invocations. A tool that is not found in the
@@ -1451,7 +1451,7 @@ impl<C: ApiClient> BareLoop<C> {
         &self,
         tool_calls: &[ToolCallInfo],
         turn_idx: usize,
-    ) -> Result<Vec<ToolCallResult>, AgentError> {
+    ) -> Result<Vec<ToolDispatchResult>, AgentError> {
         let mut results = Vec::with_capacity(tool_calls.len());
         for tc in tool_calls {
             if self.is_cancelled() {
@@ -1486,7 +1486,7 @@ impl<C: ApiClient> BareLoop<C> {
         &self,
         tc: &ToolCallInfo,
         turn_idx: usize,
-    ) -> Result<ToolCallResult, AgentError> {
+    ) -> Result<ToolDispatchResult, AgentError> {
         let tool_context = self.build_tool_context();
         let mut attempt: u32 = 0;
 
@@ -1538,11 +1538,12 @@ impl<C: ApiClient> BareLoop<C> {
                             None,
                         );
                         self.emit_tool_complete(&tc.name, &output_text, !success, duration);
-                        ToolCallResult {
-                            tool_call_id: tc.id.clone(),
+                        ToolDispatchResult {
+                            tool_call_id: Some(tc.id.clone()),
                             output: result.payload,
                             is_error: result.is_error,
                             duration,
+                            resolved_tool_name: tc.name.clone(),
                         }
                     }
                     Err(e) => {
@@ -1557,11 +1558,12 @@ impl<C: ApiClient> BareLoop<C> {
                             Some(&error_msg),
                         );
                         self.emit_tool_complete(&tc.name, &error_msg, true, duration);
-                        ToolCallResult {
-                            tool_call_id: tc.id.clone(),
+                        ToolDispatchResult {
+                            tool_call_id: Some(tc.id.clone()),
                             output: ToolContent::Text(error_msg.clone()),
                             is_error: true,
                             duration,
+                            resolved_tool_name: tc.name.clone(),
                         }
                     }
                 }
@@ -1579,11 +1581,12 @@ impl<C: ApiClient> BareLoop<C> {
                     Some(&error_msg),
                 );
                 self.emit_tool_complete(&tc.name, &error_msg, true, Duration::ZERO);
-                ToolCallResult {
-                    tool_call_id: tc.id.clone(),
+                ToolDispatchResult {
+                    tool_call_id: Some(tc.id.clone()),
                     output: ToolContent::Text(error_msg.clone()),
                     is_error: true,
                     duration: Duration::ZERO,
+                    resolved_tool_name: tc.name.clone(),
                 }
             };
 
@@ -1624,7 +1627,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Check pre-tool-use hooks and return a blocked result if any hook
     /// blocks or asks.
     ///
-    /// Returns `Some(ToolCallResult)` with an error result if a hook
+    /// Returns `Some(ToolDispatchResult)` with an error result if a hook
     /// blocked the call, or `None` if the call should proceed.
     ///
     /// *Requires `hooks` feature; returns `None` otherwise.*
@@ -1632,7 +1635,7 @@ impl<C: ApiClient> BareLoop<C> {
         &self,
         tc: &ToolCallInfo,
         turn_idx: usize,
-    ) -> Option<ToolCallResult> {
+    ) -> Option<ToolDispatchResult> {
         #[cfg(feature = "hooks")]
         if let Some(ref executor) = self.hook_executor {
             let ctx = PreToolUseContext {
@@ -1645,11 +1648,12 @@ impl<C: ApiClient> BareLoop<C> {
                 HookAction::Allow => None,
                 HookAction::Block { reason } => {
                     self.emit_tool_complete(&tc.name, &reason, true, Duration::ZERO);
-                    Some(ToolCallResult {
-                        tool_call_id: tc.id.clone(),
+                    Some(ToolDispatchResult {
+                        tool_call_id: Some(tc.id.clone()),
                         output: ToolContent::Text(reason),
                         is_error: true,
                         duration: Duration::ZERO,
+                        resolved_tool_name: tc.name.clone(),
                     })
                 }
                 HookAction::Ask { message } => {
@@ -1658,11 +1662,12 @@ impl<C: ApiClient> BareLoop<C> {
                     // executor is Interactive, but BareLoop has no UI to
                     // show a prompt, so we still treat it as Block.
                     self.emit_tool_complete(&tc.name, &message, true, Duration::ZERO);
-                    Some(ToolCallResult {
-                        tool_call_id: tc.id.clone(),
+                    Some(ToolDispatchResult {
+                        tool_call_id: Some(tc.id.clone()),
                         output: ToolContent::Text(message),
                         is_error: true,
                         duration: Duration::ZERO,
+                        resolved_tool_name: tc.name.clone(),
                     })
                 }
             }
@@ -1682,7 +1687,7 @@ impl<C: ApiClient> BareLoop<C> {
     fn notify_post_tool_use_hooks(
         &self,
         tc: &ToolCallInfo,
-        tool_result: &ToolCallResult,
+        tool_result: &ToolDispatchResult,
         turn_idx: usize,
     ) {
         #[cfg(feature = "hooks")]
@@ -1715,7 +1720,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Record tool health (success or failure) in the health registry.
     ///
     /// *Requires `tool_health` feature; no-op otherwise.*
-    fn record_tool_health(&self, tool_name: &str, tool_result: &ToolCallResult) {
+    fn record_tool_health(&self, tool_name: &str, tool_result: &ToolDispatchResult) {
         #[cfg(feature = "tool_health")]
         if let Some(ref health) = self.health_registry {
             if tool_result.is_error {
@@ -1734,7 +1739,7 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Builds a [`ToolDispatchContext`] from the tool call info, delegates
     /// to the pipeline's middleware chain, and converts the
-    /// [`ToolDispatchResult`] back to a [`ToolCallResult`] with proper
+    /// [`ToolDispatchResult`] back to a [`ToolDispatchResult`] with proper
     /// event emission. Handles cancellation via `tokio::select!`.
     ///
     /// # Errors
@@ -1748,7 +1753,7 @@ impl<C: ApiClient> BareLoop<C> {
         tool_context: &ToolContext,
         start: Instant,
         turn_idx: usize,
-    ) -> Result<ToolCallResult, AgentError> {
+    ) -> Result<ToolDispatchResult, AgentError> {
         let ctx = ToolDispatchContext {
             tool_name: tc.name.clone(),
             input: tc.input.clone(),
@@ -1804,11 +1809,12 @@ impl<C: ApiClient> BareLoop<C> {
             dispatch_result.is_error,
             dispatch_result.duration,
         );
-        Ok(ToolCallResult {
-            tool_call_id: tc.id.clone(),
+        Ok(ToolDispatchResult {
+            tool_call_id: Some(tc.id.clone()),
             output: dispatch_result.output,
             is_error: dispatch_result.is_error,
             duration: dispatch_result.duration,
+            resolved_tool_name: dispatch_result.resolved_tool_name,
         })
     }
 
@@ -1820,7 +1826,7 @@ impl<C: ApiClient> BareLoop<C> {
     async fn recover_tool_error(
         &self,
         tc: &ToolCallInfo,
-        result: &ToolCallResult,
+        result: &ToolDispatchResult,
         attempt: u32,
     ) -> RecoveryAction {
         let error_msg = match &result.output {
@@ -1899,17 +1905,19 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Parameters
     ///
-    /// - `results` — The [`ToolCallResult`]s produced by
+    /// - `results` — The [`ToolDispatchResult`]s produced by
     ///   [`dispatch_tools()`](BareLoop::dispatch_tools).
     ///
     /// # Returns
     ///
     /// A [`Message`] with [`Role::User`] and one `tool_result`
     /// [`MessagePart`] per result.
-    fn build_tool_result_message(results: Vec<ToolCallResult>) -> Message {
+    fn build_tool_result_message(results: Vec<ToolDispatchResult>) -> Message {
         let parts: Vec<MessagePart> = results
             .into_iter()
-            .map(|r| MessagePart::tool_result(r.tool_call_id, r.output, r.is_error))
+            .map(|r| {
+                MessagePart::tool_result(r.tool_call_id.unwrap_or_default(), r.output, r.is_error)
+            })
             .collect();
         Message::new(Role::User, parts)
     }
@@ -2175,7 +2183,7 @@ struct ToolCallInfo {
     /// The tool call ID assigned by the API.
     ///
     /// Used to correlate the tool result message back to the original
-    /// tool call. Copied into [`ToolCallResult::tool_call_id`] after
+    /// tool call. Copied into [`ToolDispatchResult::tool_call_id`] after
     /// execution.
     id: String,
 
@@ -2191,74 +2199,6 @@ struct ToolCallInfo {
     /// Deserialized from the API's `tool_call` content part. Passed
     /// directly to [`Tool::call()`](crate::tool::Tool::call).
     input: serde_json::Value,
-}
-
-// ==================================================
-// ToolCallResult (re-export)
-// ==================================================
-
-/// Result of executing a single tool call.
-///
-/// This is the internal version used during dispatch. Each executed tool
-/// produces one `ToolCallResult`, which is then converted into a
-/// `tool_result` [`MessagePart`] (with the output wrapped as
-/// [`ToolContent`](ToolContent)) by
-/// [`build_tool_result_message()`](BareLoop::build_tool_result_message)
-/// and appended to the conversation.
-///
-/// This type is distinct from the framework-level
-/// [`ToolCallResult`](crate::ToolCallResult) that appears in the final
-/// [`TurnResult`]. The internal version carries execution metadata
-/// (`duration`, `is_error`) needed for observer notifications.
-///
-/// # Fields
-///
-/// - [`tool_call_id`](ToolCallResult::tool_call_id) — Correlates back to
-///   the original [`ToolCallInfo::id`].
-/// - [`output`](ToolCallResult::output) — The tool's text output or
-///   error message.
-/// - [`is_error`](ToolCallResult::is_error) — `true` when the tool
-///   returned an error or was not found.
-/// - [`duration`](ToolCallResult::duration) — Wall-clock time spent
-///   executing the tool.
-#[derive(Debug, Clone)]
-struct ToolCallResult {
-    /// The tool call ID this result is for.
-    ///
-    /// Copied from [`ToolCallInfo::id`] to ensure the API can match
-    /// the result to the original request.
-    tool_call_id: String,
-
-    /// The tool's output content or error message.
-    ///
-    /// On success this holds the full [`ToolOutput::payload`] returned by
-    /// [`Tool::call()`](crate::tool::Tool::call) — preserving multipart and
-    /// image content instead of flattening to text.
-    /// On failure it contains an error message wrapped in
-    /// [`ToolContent::Text`](ToolContent).
-    /// This content is passed directly to [`MessagePart::tool_result`] when
-    /// building the `tool_result` message part.
-    output: ToolContent,
-
-    /// Whether the execution resulted in an error.
-    ///
-    /// When `true`, the model receives this result with the `is_error`
-    /// flag set, allowing it to decide whether to retry, use a
-    /// different tool, or inform the user.
-    is_error: bool,
-
-    /// Wall-clock duration of the tool execution.
-    ///
-    /// Measured with [`Instant::now()`] around the
-    /// [`Tool::call()`](crate::tool::Tool::call) invocation. Reserved
-    /// for future surfacing in [`SessionResult`]; currently passed to
-    /// observer callbacks inline during dispatch.
-    ///
-    /// Used by [`ToolHealthRegistry::record_success`] and
-    /// [`ToolHealthRegistry::record_failure`] when the `tool_health`
-    /// feature is enabled.
-    #[cfg_attr(not(feature = "tool_health"), expect(dead_code))]
-    duration: Duration,
 }
 
 // ==================================================
@@ -3027,11 +2967,12 @@ mod tests {
     /// tool_call_id, output text, and is_error flag.
     #[tokio::test]
     async fn test_tool_result_message_format() {
-        let results = vec![super::ToolCallResult {
-            tool_call_id: "tool_123".to_string(),
+        let results = vec![super::ToolDispatchResult {
+            tool_call_id: Some("tool_123".to_string()),
             output: ToolContent::Text("Echo: hello".to_string()),
             is_error: false,
             duration: Duration::from_millis(100),
+            resolved_tool_name: String::new(),
         }];
 
         let msg = BareLoop::<MockClient>::build_tool_result_message(results);

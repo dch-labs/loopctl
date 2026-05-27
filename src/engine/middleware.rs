@@ -50,7 +50,7 @@
 use crate::cancel::CancelSignal;
 use crate::core::error::AgentError;
 use crate::message::ToolContent;
-use crate::tool::{PermissionCheck, ToolContext, ToolError, ToolOutput, ToolRegistry};
+use crate::tool::{PermissionCheck, ToolContext, ToolRegistry};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -127,100 +127,11 @@ pub struct ToolDispatchContext {
     /// the innermost [`ToolCallMiddleware`] invokes `Tool::call()`.
     pub tool_context: ToolContext,
 }
-
-/// The outcome of a single tool invocation, produced by the innermost
-/// middleware (or by an outer middleware that short-circuits).
-///
-/// Carries the output text/error, execution duration, and the resolved
-/// tool name (which may differ from the requested name if a router
-/// middleware redirected).
-pub struct ToolDispatchResult {
-    /// The tool's output content or error message.
-    ///
-    /// Contains the text or multipart payload returned by the tool.
-    /// When [`is_error`](ToolDispatchResult::is_error) is `true`, this
-    /// holds a human-readable error description.
-    pub output: ToolContent,
-
-    /// Whether the output represents an error.
-    ///
-    /// `true` when the tool reported failure or a middleware
-    /// short-circuited with an error. The framework uses this to
-    /// set the `is_error` flag on the tool result sent back to
-    /// the model.
-    pub is_error: bool,
-
-    /// Wall-clock duration of the actual tool execution.
-    ///
-    /// Measured by [`ToolCallMiddleware`] from immediately before
-    /// `Tool::call()` to when it returns. For short-circuited
-    /// results from outer middlewares this may be [`Duration::ZERO`].
-    pub duration: Duration,
-
-    /// The name of the tool that actually ran.
-    ///
-    /// May differ from the requested `tool_name` if a routing
-    /// middleware redirected the call to an alternative tool.
-    /// When no redirection occurred, this matches the original
-    /// [`ToolDispatchContext::tool_name`].
-    pub resolved_tool_name: String,
-}
-
-impl ToolDispatchResult {
-    /// Create a successful result with text output.
-    ///
-    /// Convenience constructor for the common case where a tool
-    /// produces a plain-text response.
-    #[must_use]
-    pub fn ok(tool_name: &str, output: String, duration: Duration) -> Self {
-        Self {
-            output: ToolContent::Text(output),
-            is_error: false,
-            duration,
-            resolved_tool_name: tool_name.to_string(),
-        }
-    }
-
-    /// Create an error result with a message.
-    ///
-    /// Used when a middleware short-circuits or the tool reports failure.
-    #[must_use]
-    pub fn err(tool_name: &str, message: String, duration: Duration) -> Self {
-        Self {
-            output: ToolContent::Text(message),
-            is_error: true,
-            duration,
-            resolved_tool_name: tool_name.to_string(),
-        }
-    }
-
-    /// Create a result from a [`ToolOutput`].
-    ///
-    /// Converts the tool's output struct into a dispatch result,
-    /// preserving the error flag and content payload.
-    #[must_use]
-    pub fn from_tool_output(tool_name: &str, output: ToolOutput, duration: Duration) -> Self {
-        Self {
-            output: output.payload,
-            is_error: output.is_error,
-            duration,
-            resolved_tool_name: tool_name.to_string(),
-        }
-    }
-
-    /// Create a result from a [`ToolError`].
-    ///
-    /// Converts the tool's error into a dispatch result with `is_error` set to `true`.
-    #[must_use]
-    pub fn from_tool_error(tool_name: &str, error: &ToolError, duration: Duration) -> Self {
-        Self {
-            output: ToolContent::Text(error.to_string()),
-            is_error: true,
-            duration,
-            resolved_tool_name: tool_name.to_string(),
-        }
-    }
-}
+// Re-export the unified tool dispatch result from core types.
+// Defined in `crate::core::types` so it's available at both
+// `loopctl::core::ToolDispatchResult` and
+// `loopctl::engine::middleware::ToolDispatchResult`.
+pub use crate::core::types::ToolDispatchResult;
 
 // ===================================================
 // Middleware trait
@@ -599,16 +510,8 @@ impl ToolCallMiddleware {
                 }
             };
 
-            match call_result {
-                Ok(output) => {
-                    let duration = start.elapsed();
-                    ToolDispatchResult::from_tool_output(&tool_name, output, duration)
-                }
-                Err(e) => {
-                    let duration = start.elapsed();
-                    ToolDispatchResult::from_tool_error(&tool_name, &e, duration)
-                }
-            }
+            let duration = start.elapsed();
+            ToolDispatchResult::from_result(&tool_name, call_result, duration)
         })
     }
 }
@@ -2044,5 +1947,61 @@ mod tests {
         assert!(!result.is_error);
         // Must NOT be truncated: 5 chars <= 8 max_chars, even though 15 bytes > 8.
         assert_eq!(result.output, ToolContent::Text("日日日日日".to_string()));
+    }
+
+    // ==================================================
+    // ToolDispatchResult::from_result
+    // ==================================================
+
+    #[test]
+    fn from_result_maps_ok_output() {
+        let output = ToolOutput::text("hello");
+        let result = ToolDispatchResult::from_result("echo", Ok(output), Duration::from_millis(50));
+        assert!(!result.is_error);
+        assert_eq!(result.output, ToolContent::Text("hello".to_string()));
+        assert_eq!(result.resolved_tool_name, "echo");
+        assert_eq!(result.duration, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn from_result_maps_err_to_error_result() {
+        let error = ToolError::not_found("missing_tool", &[]);
+        let result =
+            ToolDispatchResult::from_result("missing_tool", Err(error), Duration::from_millis(10));
+        assert!(result.is_error);
+        assert_eq!(result.resolved_tool_name, "missing_tool");
+    }
+
+    // ==================================================
+    // From<ToolOutput> + builder methods
+    // ==================================================
+
+    #[test]
+    fn from_tool_output_defaults() {
+        let output = ToolOutput::text("ok");
+        let result = ToolDispatchResult::from(output);
+        assert!(!result.is_error);
+        assert_eq!(result.output, ToolContent::Text("ok".to_string()));
+        assert_eq!(result.duration, Duration::ZERO);
+        assert_eq!(result.resolved_tool_name, "");
+    }
+
+    #[test]
+    fn from_tool_output_error_preserves_is_error() {
+        let output = ToolOutput::error_text("boom");
+        let result = ToolDispatchResult::from(output);
+        assert!(result.is_error);
+        assert_eq!(result.output, ToolContent::Text("boom".to_string()));
+    }
+
+    #[test]
+    fn builder_methods_chain() {
+        let output = ToolOutput::text("done");
+        let result = ToolDispatchResult::from(output)
+            .with_tool_name("bash")
+            .with_duration(Duration::from_millis(99));
+        assert_eq!(result.resolved_tool_name, "bash");
+        assert_eq!(result.duration, Duration::from_millis(99));
+        assert!(!result.is_error);
     }
 }

@@ -3,7 +3,7 @@
 //! This module defines the foundational data types that every other module in
 //! the framework depends on: configuration ([`AgentConfig`]), lifecycle state
 //! ([`AgentState`]), turn and session results ([`TurnResult`], [`SessionResult`]),
-//! tool call representations ([`ToolCall`], [`ToolCallResult`]), and the
+//! tool call representations ([`ToolCall`], [`ToolDispatchResult`]), and the
 //! reflection/correction system ([`Correction`], [`CorrectionType`],
 //! [`CorrectionResult`]).
 //!
@@ -26,8 +26,11 @@
 //! assert!(session.success);
 //! ```
 
-use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
+
+use crate::message::ToolContent;
+use crate::tool::{ToolError, ToolOutput};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 // ===================================================
@@ -364,9 +367,9 @@ pub struct TurnResult {
     /// Results from tool executions during this turn.
     ///
     /// Populated after tool dispatch. Each result corresponds to a
-    /// [`ToolCall`] by matching [`tool_call_id`](ToolCallResult::tool_call_id)
+    /// [`ToolCall`] by matching [`tool_call_id`](ToolDispatchResult::tool_call_id)
     /// to [`ToolCall::id`].
-    pub tool_results: Vec<ToolCallResult>,
+    pub tool_results: Vec<ToolDispatchResult>,
 
     /// How many tokens were used in the API request.
     ///
@@ -543,7 +546,7 @@ pub enum StopReason {
 ///
 /// Represents a single tool invocation that the LLM has requested during a
 /// turn. The framework matches each `ToolCall` to a registered tool, executes
-/// it, and produces a [`ToolCallResult`] with the output.
+/// it, and produces a [`ToolDispatchResult`] with the output.
 ///
 /// # Serialization
 ///
@@ -554,7 +557,7 @@ pub struct ToolCall {
     /// Unique identifier for this tool call.
     ///
     /// Assigned by the LLM API. Used to correlate the call with its
-    /// [`ToolCallResult`] via [`ToolCallResult::tool_call_id`].
+    /// [`ToolDispatchResult`] via [`ToolDispatchResult::tool_call_id`].
     pub id: String,
 
     /// Name of the tool to invoke.
@@ -572,37 +575,214 @@ pub struct ToolCall {
     pub input: serde_json::Value,
 }
 
-/// The result of a single tool execution.
+/// The outcome of a single tool invocation.
 ///
-/// Produced after the framework dispatches a [`ToolCall`] and collects the
-/// tool's output. Contains the result text (or error message), a flag
-/// indicating success or failure, and the execution duration.
+/// Produced after the framework dispatches a [`ToolCall`] and collects
+/// the tool's output. Used throughout the middleware pipeline, the
+/// engine dispatch layer, and returned to callers via
+/// [`TurnResult::tool_results`].
+///
+/// # Fields
+///
+/// | Field                  | Source                              |
+/// |------------------------|-------------------------------------|
+/// | `tool_call_id`         | Set by the engine after dispatch    |
+/// | `output`               | From [`ToolOutput::payload`]        |
+/// | `is_error`             | From [`ToolOutput::is_error`]       |
+/// | `duration`             | Measured by the dispatch layer      |
+/// | `resolved_tool_name`   | Set by middleware or engine         |
+///
+/// # Construction
+///
+/// Middlewares build results with [`ToolDispatchResult::ok`],
+/// [`ToolDispatchResult::err`], or [`From<ToolOutput>`] combined with
+/// builder methods. The engine layer attaches the `tool_call_id` via
+/// [`ToolDispatchResult::with_call_id`] after the middleware pipeline
+/// returns.
+///
+/// ```
+/// use std::time::Duration;
+/// use loopctl::core::ToolDispatchResult;
+/// use loopctl::tool::ToolOutput;
+///
+/// let output = ToolOutput::text("done");
+/// let result = ToolDispatchResult::from(output)
+///     .with_tool_name("bash")
+///     .with_duration(Duration::from_millis(42))
+///     .with_call_id("call_abc123");
+///
+/// assert_eq!(result.tool_call_id, Some("call_abc123".to_string()));
+/// assert_eq!(result.resolved_tool_name, "bash");
+/// ```
 #[derive(Debug, Clone)]
-pub struct ToolCallResult {
+pub struct ToolDispatchResult {
     /// The tool call this result is for.
     ///
     /// Matches [`ToolCall::id`] to correlate results back to their
-    /// originating requests.
-    pub tool_call_id: String,
+    /// originating requests. Set by the engine after the middleware
+    /// pipeline completes via [`with_call_id`](Self::with_call_id).
+    pub tool_call_id: Option<String>,
 
-    /// The tool's output.
+    /// The tool's output content or error message.
     ///
-    /// On success, contains the tool's return value (e.g., file contents,
-    /// command output). On error, contains a human-readable error message.
-    pub output: String,
+    /// On success, holds the full [`ToolOutput`]
+    /// payload — preserving multipart and image content instead of
+    /// flattening to text. On failure, contains an error message wrapped
+    /// in [`ToolContent::Text`].
+    pub output: ToolContent,
 
     /// Whether the tool execution resulted in an error.
     ///
-    /// When `true`, [`output`](ToolCallResult::output) contains the error
-    /// message and the framework may trigger reflection or retry logic.
+    /// When `true`, [`output`](ToolDispatchResult::output) contains the
+    /// error message and the framework may trigger reflection or retry
+    /// logic.
     pub is_error: bool,
 
     /// Duration of tool execution.
     ///
     /// Measures wall-clock time from tool dispatch start to completion.
-    /// Used by observers for latency tracking and by the detection system
+    /// Used by observers for latency tracking and by the health system
     /// for timeout analysis.
     pub duration: Duration,
+
+    /// The name of the tool that actually ran.
+    ///
+    /// May differ from the requested `tool_name` if a routing
+    /// middleware redirected the call to an alternative tool.
+    pub resolved_tool_name: String,
+}
+
+impl ToolDispatchResult {
+    /// Create a successful result with text output.
+    ///
+    /// Convenience constructor for the common case where a tool
+    /// produces a plain-text response.
+    #[must_use]
+    pub fn ok(tool_name: &str, output: String, duration: Duration) -> Self {
+        Self {
+            tool_call_id: None,
+            output: ToolContent::Text(output),
+            is_error: false,
+            duration,
+            resolved_tool_name: tool_name.to_string(),
+        }
+    }
+
+    /// Create an error result with a message.
+    ///
+    /// Used when a middleware short-circuits or the tool reports failure.
+    #[must_use]
+    pub fn err(tool_name: &str, message: String, duration: Duration) -> Self {
+        Self {
+            tool_call_id: None,
+            output: ToolContent::Text(message),
+            is_error: true,
+            duration,
+            resolved_tool_name: tool_name.to_string(),
+        }
+    }
+
+    /// Create a result from a [`ToolOutput`].
+    ///
+    /// Converts the tool's output struct into a dispatch result,
+    /// preserving the error flag and content payload.
+    #[must_use]
+    pub fn from_tool_output(tool_name: &str, output: ToolOutput, duration: Duration) -> Self {
+        Self::from(output)
+            .with_tool_name(tool_name)
+            .with_duration(duration)
+    }
+
+    /// Builder: attach the [`tool_call_id`](Self::tool_call_id).
+    ///
+    /// Called by the engine layer after the middleware pipeline returns
+    /// to correlate this result with the original [`ToolCall`].
+    #[must_use]
+    pub fn with_call_id(mut self, id: impl Into<String>) -> Self {
+        self.tool_call_id = Some(id.into());
+        self
+    }
+
+    /// Set the [`resolved_tool_name`](Self::resolved_tool_name).
+    ///
+    /// Part of the builder chain when constructing a
+    /// `ToolDispatchResult` from [`From<ToolOutput>`].
+    #[must_use]
+    pub fn with_tool_name(mut self, name: &str) -> Self {
+        name.clone_into(&mut self.resolved_tool_name);
+        self
+    }
+
+    /// Set the [`duration`](Self::duration).
+    ///
+    /// Part of the builder chain when constructing a
+    /// `ToolDispatchResult` from [`From<ToolOutput>`].
+    #[must_use]
+    pub fn with_duration(mut self, dur: Duration) -> Self {
+        self.duration = dur;
+        self
+    }
+
+    /// Create a result from a [`ToolError`].
+    ///
+    /// Converts the tool's error into a dispatch result with `is_error`
+    /// set to `true`.
+    #[must_use]
+    pub fn from_tool_error(tool_name: &str, error: &ToolError, duration: Duration) -> Self {
+        Self {
+            tool_call_id: None,
+            output: ToolContent::Text(error.to_string()),
+            is_error: true,
+            duration,
+            resolved_tool_name: tool_name.to_string(),
+        }
+    }
+
+    /// Create a result from a tool call outcome.
+    ///
+    /// Covers the common `Result<ToolOutput, ToolError>` pattern produced by
+    /// [`Tool::call()`](crate::tool::Tool::call). Maps [`Ok`] through
+    /// [`from_tool_output`](Self::from_tool_output) and [`Err`] through
+    /// [`from_tool_error`](Self::from_tool_error).
+    #[must_use]
+    pub fn from_result(
+        tool_name: &str,
+        result: Result<ToolOutput, ToolError>,
+        duration: Duration,
+    ) -> Self {
+        match result {
+            Ok(output) => Self::from_tool_output(tool_name, output, duration),
+            Err(e) => Self::from_tool_error(tool_name, &e, duration),
+        }
+    }
+}
+
+/// Conversion from a bare [`ToolOutput`].
+///
+/// Produces a `ToolDispatchResult` with no call ID, [`Duration::ZERO`],
+/// and an empty `resolved_tool_name`. Chain builder methods to complete
+/// the fields:
+///
+/// ```
+/// use std::time::Duration;
+/// use loopctl::core::ToolDispatchResult;
+/// use loopctl::tool::ToolOutput;
+///
+/// let result = ToolDispatchResult::from(ToolOutput::text("ok"))
+///     .with_call_id("call_1")
+///     .with_tool_name("echo")
+///     .with_duration(Duration::from_millis(5));
+/// ```
+impl From<ToolOutput> for ToolDispatchResult {
+    fn from(output: ToolOutput) -> Self {
+        Self {
+            tool_call_id: None,
+            output: output.payload,
+            is_error: output.is_error,
+            duration: Duration::ZERO,
+            resolved_tool_name: String::new(),
+        }
+    }
 }
 
 // ===================================================

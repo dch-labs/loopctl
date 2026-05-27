@@ -62,6 +62,8 @@
 
 #[cfg(feature = "tool_health")]
 pub mod health;
+#[cfg(feature = "tool_shield")]
+pub mod shield;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

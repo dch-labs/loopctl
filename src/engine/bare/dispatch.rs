@@ -284,10 +284,7 @@ impl<C: ApiClient> BareLoop<C> {
     ) {
         #[cfg(feature = "hooks")]
         if let Some(ref executor) = self.hook_executor {
-            let output_text = match &tool_result.output {
-                ToolContent::Text(t) => t.clone(),
-                ToolContent::Multipart(_) => String::new(),
-            };
+            let output_text = tool_result.output.to_string();
             let ctx = PostToolUseContext {
                 tool_name: tc.name.clone(),
                 input: tc.input.clone(),

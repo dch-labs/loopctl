@@ -611,7 +611,7 @@ pub struct ToolCall {
 ///     .with_duration(Duration::from_millis(42))
 ///     .with_call_id("call_abc123");
 ///
-/// assert_eq!(result.tool_call_id, Some("call_abc123".to_string()));
+/// assert_eq!(result.tool_call_id, "call_abc123");
 /// assert_eq!(result.resolved_tool_name, "bash");
 /// ```
 #[derive(Debug, Clone)]
@@ -621,7 +621,7 @@ pub struct ToolDispatchResult {
     /// Matches [`ToolCall::id`] to correlate results back to their
     /// originating requests. Set by the engine after the middleware
     /// pipeline completes via [`with_call_id`](Self::with_call_id).
-    pub tool_call_id: Option<String>,
+    pub tool_call_id: String,
 
     /// The tool's output content or error message.
     ///
@@ -660,7 +660,7 @@ impl ToolDispatchResult {
     #[must_use]
     pub fn ok(tool_name: &str, output: String, duration: Duration) -> Self {
         Self {
-            tool_call_id: None,
+            tool_call_id: String::new(),
             output: ToolContent::Text(output),
             is_error: false,
             duration,
@@ -674,7 +674,7 @@ impl ToolDispatchResult {
     #[must_use]
     pub fn err(tool_name: &str, message: String, duration: Duration) -> Self {
         Self {
-            tool_call_id: None,
+            tool_call_id: String::new(),
             output: ToolContent::Text(message),
             is_error: true,
             duration,
@@ -699,7 +699,7 @@ impl ToolDispatchResult {
     /// to correlate this result with the original [`ToolCall`].
     #[must_use]
     pub fn with_call_id(mut self, id: impl Into<String>) -> Self {
-        self.tool_call_id = Some(id.into());
+        self.tool_call_id = id.into();
         self
     }
 
@@ -730,7 +730,7 @@ impl ToolDispatchResult {
     #[must_use]
     pub fn from_tool_error(tool_name: &str, error: &ToolError, duration: Duration) -> Self {
         Self {
-            tool_call_id: None,
+            tool_call_id: String::new(),
             output: ToolContent::Text(error.to_string()),
             is_error: true,
             duration,
@@ -776,7 +776,7 @@ impl ToolDispatchResult {
 impl From<ToolOutput> for ToolDispatchResult {
     fn from(output: ToolOutput) -> Self {
         Self {
-            tool_call_id: None,
+            tool_call_id: String::new(),
             output: output.payload,
             is_error: output.is_error,
             duration: Duration::ZERO,

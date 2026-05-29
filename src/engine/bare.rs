@@ -75,13 +75,15 @@ use crate::core::reflection::{
     ExponentialBackoffRecovery, NoopReflector, RecoveryAction, RecoveryStrategy, ReflectionContext,
     Reflector,
 };
-use crate::core::{AgentConfig, AgentError, AgentObserver, SessionResult};
+use crate::core::{AgentConfig, AgentError, AgentObserver, SessionResult, ToolDispatchResult};
 use crate::engine::middleware::{ToolDispatchContext, ToolPipeline, ToolPipelineBuilder};
 #[cfg(feature = "hooks")]
 use crate::hooks::HookAction;
 #[cfg(feature = "hooks")]
 use crate::hooks::HookExecutor;
+// Hook context types are used by submodules (compact, dispatch, emission) via `use super::*`.
 #[cfg(feature = "hooks")]
+#[allow(unused_imports)]
 use crate::hooks::context::{
     CompactTrigger, PostCompactContext, PostToolUseContext, PreCompactContext, PreToolUseContext,
     SessionEndContext, SessionEndReason, SessionStartContext,
@@ -89,15 +91,21 @@ use crate::hooks::context::{
 use crate::loop_control::bundle::ManagerBundle;
 use crate::message::{Message, MessagePart, Role, ToolContent, ToolContentPart};
 use crate::observability::{EventSink, NullSink, ObserveEvent};
-use crate::stream::handler::{StreamHandler, StreamHandlerError};
+use crate::stream::handler::StreamHandler;
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
 #[cfg(feature = "tool_health")]
 use crate::tool::health::ToolHealthRegistry;
 use crate::tool::{PermissionCheck, ToolContext, ToolRegistry, ToolSchema};
-use futures::StreamExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+// Phase submodules
+mod compact;
+mod dispatch;
+mod emission;
+mod message;
+mod stream;
 
 // ==================================================
 // BareLoop
@@ -197,7 +205,17 @@ pub struct BareLoop<C: ApiClient> {
     observers: Vec<Arc<dyn AgentObserver>>,
 
     /// Manager bundle (fallback, loop detection, convergence).
-    #[expect(dead_code)]
+    ///
+    /// Holds the cross-cutting managers that govern session behaviour:
+    ///
+    /// - [`FallbackManager`] — circuit breaker that trips after repeated
+    ///   API failures, switching to a fallback model and recovering
+    ///   once the primary stabilises.
+    /// - [`DetectionManager`] — orchestrates loop detection (repeated
+    ///   tool operations) and convergence detection (semantically
+    ///   similar responses).
+    ///
+    /// Reset at the start of every session via [`ManagerBundle::reset_all`].
     managers: ManagerBundle,
 
     /// Structured event sink for observability.
@@ -285,6 +303,12 @@ struct SessionBudget {
 
 impl SessionBudget {
     /// Accumulate token usage from a single turn into the running totals.
+    ///
+    /// When the API reports [`Usage`] data (input and output token counts),
+    /// this method adds them to the session-wide accumulators using
+    /// saturating arithmetic to prevent overflow on very long sessions.
+    /// If `usage` is `None` (provider did not report counts), this is a
+    /// no-op.
     fn accumulate_usage(&mut self, usage: Option<&Usage>) {
         if let Some(u) = usage {
             self.input_tokens = self.input_tokens.saturating_add(u64::from(u.input_tokens));
@@ -307,6 +331,15 @@ struct TurnTokens {
 }
 
 impl TurnTokens {
+    /// Extract per-turn token counts from optional [`Usage`].
+    ///
+    /// Returns a [`TurnTokens`] capturing the input and output token
+    /// counts for a single turn. When `usage` is `None` (provider did
+    /// not report counts), both fields default to `0`.
+    ///
+    /// This is needed because [`SessionBudget::accumulate_usage`] mutates
+    /// running totals in place, but the per-turn values must be reported
+    /// separately in [`emit_turn_complete`](BareLoop::emit_turn_complete).
     fn from_usage(usage: Option<&Usage>) -> Self {
         match usage {
             Some(u) => Self {
@@ -371,6 +404,52 @@ enum EndReason {
     Cancelled,
     Error,
     MaxTurns,
+}
+
+// ==================================================
+// ToolCallInfo
+// ==================================================
+
+/// Internal representation of a tool call extracted from a message.
+///
+/// When the LLM emits a `tool_call` content part, the loop extracts
+/// its fields into this struct for convenient passing to
+/// [`dispatch_tools()`](BareLoop::dispatch_tools).
+///
+/// This type is private to the module because external consumers
+/// interact with tool results via [`SessionResult`] or the
+/// [`AgentObserver`] callbacks.
+///
+/// # Fields
+///
+/// - [`id`](ToolCallInfo::id) — The unique identifier assigned by the
+///   API to this tool call. Used to correlate the result back to the
+///   request.
+/// - [`name`](ToolCallInfo::name) — The tool name. Must match a tool
+///   registered in the [`ToolRegistry`].
+/// - [`input`](ToolCallInfo::input) — The JSON input provided by the
+///   model. Deserialized into a `serde_json::Value`.
+#[derive(Debug, Clone)]
+struct ToolCallInfo {
+    /// The tool call ID assigned by the API.
+    ///
+    /// Used to correlate the tool result message back to the original
+    /// tool call. Copied into [`ToolDispatchResult::tool_call_id`] after
+    /// execution.
+    id: String,
+
+    /// The tool name requested by the model.
+    ///
+    /// Must exactly match a name returned by a registered
+    /// [`Tool::name()`](crate::tool::Tool::name). If no match is found,
+    /// a soft error result is produced instead of a hard error.
+    name: String,
+
+    /// The tool input as a JSON value.
+    ///
+    /// Deserialized from the API's `tool_call` content part. Passed
+    /// directly to [`Tool::call()`](crate::tool::Tool::call).
+    input: serde_json::Value,
 }
 
 impl<C: ApiClient> BareLoop<C> {
@@ -903,6 +982,7 @@ impl<C: ApiClient> BareLoop<C> {
         let mut budget = SessionBudget::default();
 
         self.notify_session_start();
+        self.managers.reset_all();
         self.conversation.push(Message::user(user_input));
 
         // Main agent loop
@@ -920,6 +1000,7 @@ impl<C: ApiClient> BareLoop<C> {
 
             match self.stream_turn().await {
                 Ok((assistant_msg, usage, stop_reason)) => {
+                    self.managers.fallback.record_model_success();
                     budget.accumulate_usage(usage.as_ref());
                     let text = Self::extract_text(&assistant_msg);
                     let tool_calls = Self::extract_tool_calls(&assistant_msg);
@@ -962,6 +1043,16 @@ impl<C: ApiClient> BareLoop<C> {
                     }
                 }
                 Err(e) => {
+                    let tripped = self.managers.fallback.record_api_failure();
+                    if tripped {
+                        let from = self.client.model();
+                        if let Some(to) = self.managers.fallback.fallback_model() {
+                            tracing::warn!(from, to, "fallback manager tripped");
+                            for obs in &self.observers {
+                                obs.on_fallback(from, &to);
+                            }
+                        }
+                    }
                     let err_str = e.to_string();
                     return self.abort_turn_and_session(
                         &budget,
@@ -1186,1079 +1277,6 @@ impl<C: ApiClient> BareLoop<C> {
             }),
         }
     }
-
-    // ==================================================
-    // Context compaction
-    // ==================================================
-
-    /// Check if context compaction is needed and perform it if so.
-    ///
-    /// When a [`ContextManager`] is configured, this method:
-    /// 1. Calls [`ContextManager::ensure_context_fits()`] to check token usage.
-    /// 2. If compaction occurred, replaces `self.conversation` with the compacted messages.
-    /// 3. Notifies observers via [`on_compaction`](AgentObserver::on_compaction).
-    /// 4. Emits [`ObserveEvent::ContextCompacted`] to the event sink.
-    ///
-    /// When no `ContextManager` is set, this is a no-op.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AgentError::Context`] if compaction was needed but failed
-    /// (i.e. the conversation exceeds the context window and the compactor
-    /// could not reduce it sufficiently).
-    async fn maybe_compact_context(&mut self, turn: usize) -> Result<(), AgentError> {
-        let Some(ref ctx_manager) = self.context_manager else {
-            return Ok(());
-        };
-
-        let messages_before = self.conversation.len();
-
-        // Pre-compact hook check
-        #[cfg(feature = "hooks")]
-        if let Some(ref executor) = self.hook_executor {
-            let tokens_before =
-                crate::compact::CompactionOutcome::estimate_tokens(&self.conversation);
-            let ctx = PreCompactContext {
-                trigger: CompactTrigger::Auto,
-                custom_instructions: None,
-                message_count: messages_before,
-                tokens_before,
-                context_window: self.config.context_window,
-                session_id: self.config.session_id,
-            };
-            let hook_result = executor.check_pre_compact(&ctx);
-            if hook_result.abort {
-                // Hook aborted compaction — return Ok, conversation unchanged.
-                return Ok(());
-            }
-            // Note: hook_result.new_instructions and hook_result.additional_context
-            // are available for future use with a hook-aware compactor.
-        }
-
-        let compact_start = Instant::now();
-        let result = ctx_manager
-            .ensure_context_fits(std::mem::take(&mut self.conversation), turn)
-            .await;
-        #[cfg(feature = "hooks")]
-        let compact_duration_ms = u64::try_from(compact_start.elapsed().as_millis()).unwrap_or(0);
-        #[cfg(not(feature = "hooks"))]
-        let _ = compact_start;
-        match result {
-            Ok(EnsureContextResult::Compacted(outcome)) => {
-                self.conversation = outcome.messages;
-                let messages_after = self.conversation.len();
-                for obs in &self.observers {
-                    obs.on_compaction(messages_before, messages_after);
-                }
-                self.event_sink.on_event(&ObserveEvent::ContextCompacted {
-                    messages_before,
-                    messages_after,
-                    tokens_saved: outcome.tokens_saved,
-                });
-
-                // Post-compact hook notification
-                #[cfg(feature = "hooks")]
-                if let Some(ref executor) = self.hook_executor {
-                    let messages_compacted = messages_before.saturating_sub(messages_after);
-                    let ctx = PostCompactContext {
-                        trigger: CompactTrigger::Auto,
-                        messages_compacted,
-                        tokens_saved: outcome.tokens_saved,
-                        tokens_after: outcome.tokens_after,
-                        duration_ms: compact_duration_ms,
-                        session_id: self.config.session_id,
-                    };
-                    executor.notify_post_compact(&ctx);
-                }
-
-                Ok(())
-            }
-            Ok(EnsureContextResult::NoAction(messages)) => {
-                self.conversation = messages;
-                Ok(())
-            }
-            Err(overflow) => Err(AgentError::ContextExceeded {
-                used: overflow.tokens_used,
-                limit: overflow.context_window,
-            }),
-        }
-    }
-
-    // ==================================================
-    // Streaming
-    // ==================================================
-
-    /// Stream one turn from the API, accumulating the response.
-    ///
-    /// When a [`StreamHandler`] is configured (via
-    /// [`set_stream_handler()`](BareLoop::set_stream_handler)), delegates
-    /// to the handler for resilient streaming with retry, timeout, and
-    /// fallback capabilities. Otherwise, uses the basic inline logic
-    /// with no retries.
-    ///
-    /// Sends the current conversation history to the LLM API via
-    /// [`ApiClient::stream_messages`] and uses a [`StreamAccumulator`]
-    /// to collect the events into a single [`Message`].
-    ///
-    /// Also captures the stop reason (e.g. `end_turn`, `tool_call`) and
-    /// token [`Usage`] from the stream's final `MessageDelta` event.
-    ///
-    /// # Returns
-    ///
-    /// A tuple of `(Message, Option<Usage>, StreamStopReason)`:
-    ///
-    /// - **[`Message`]** — the fully accumulated assistant message, including
-    ///   any text and `tool_call` content parts.
-    /// - **Option<[`Usage`]>** — token counts for this turn, if reported.
-    /// - **[`StreamStopReason`]** — why the model stopped generating.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AgentError::Api`] if any stream event is an error.
-    /// Returns [`AgentError::Cancelled`] if the cancellation signal fires mid-stream.
-    async fn stream_turn(&self) -> Result<(Message, Option<Usage>, StreamStopReason), AgentError> {
-        // Delegate to StreamHandler if configured.
-        if let Some(ref handler) = self.stream_handler {
-            return self.stream_turn_via_handler(handler).await;
-        }
-
-        // Inline streaming (no handler).
-        let system = self.config.system_prompt.clone();
-        let tool_schemas = self.build_tool_schemas();
-        let mut stream =
-            self.client
-                .stream_messages(self.conversation.clone(), system, tool_schemas);
-        let mut accumulator = StreamAccumulator::new();
-        let mut stop_reason = StreamStopReason::EndTurn;
-        loop {
-            let event_result = tokio::select! {
-                event = stream.next() => event,
-                () = self.cancelled.notified() => {
-                    return Err(AgentError::Cancelled);
-                }
-            };
-
-            match event_result {
-                Some(Ok(event)) => {
-                    if let StreamEvent::MessageDelta(delta) = &event {
-                        if let Some(ref reason_str) = delta.delta.stop_reason {
-                            stop_reason =
-                                StreamStopReason::from_api_str(reason_str).unwrap_or(stop_reason);
-                        }
-                    }
-                    drop(accumulator.process(&event));
-                }
-                Some(Err(api_error)) => {
-                    return Err(AgentError::Api(api_error.to_string()));
-                }
-                None => break,
-            }
-        }
-
-        let usage = accumulator.usage().copied();
-        let message = accumulator.build();
-
-        Ok((message, usage, stop_reason))
-    }
-
-    /// Stream one turn via the [`StreamHandler`].
-    ///
-    /// Delegates streaming to the handler, which manages retries,
-    /// timeouts, and fallback to non-streaming. Maps the handler's
-    /// result/error types back to the `(Message, Option<Usage>,
-    /// StreamStopReason)` tuple expected by the run loop.
-    ///
-    /// # Errors
-    ///
-    /// Maps [`StreamHandlerError`] variants to the appropriate
-    /// [`AgentError`] variants:
-    /// - [`Cancelled`](StreamHandlerError::Cancelled) → [`AgentError::Cancelled`]
-    /// - [`InitFailed`](StreamHandlerError::InitFailed) → [`AgentError::Api`]
-    /// - [`StreamFailed`](StreamHandlerError::StreamFailed) → [`AgentError::Api`]
-    /// - [`FallbackFailed`](StreamHandlerError::FallbackFailed) → [`AgentError::Api`]
-    async fn stream_turn_via_handler(
-        &self,
-        handler: &StreamHandler,
-    ) -> Result<(Message, Option<Usage>, StreamStopReason), AgentError> {
-        let system = self.config.system_prompt.clone();
-        let tool_schemas = self.build_tool_schemas();
-        let result = handler
-            .stream_turn(
-                &*self.client,
-                self.conversation.clone(),
-                system,
-                tool_schemas,
-                &self.cancelled,
-            )
-            .await
-            .map_err(Self::map_handler_error)?;
-        Ok((result.message, result.usage, result.stop_reason))
-    }
-
-    /// Map a [`StreamHandlerError`] to an [`AgentError`].
-    ///
-    /// Preserves cancellation semantics —
-    /// [`StreamHandlerError::Cancelled`] maps to [`AgentError::Cancelled`].
-    /// All other variants map to [`AgentError::Api`] with a descriptive
-    /// message.
-    fn map_handler_error(error: StreamHandlerError) -> AgentError {
-        match error {
-            StreamHandlerError::Cancelled => AgentError::Cancelled,
-            StreamHandlerError::InitFailed(outcome) => {
-                AgentError::Api(format!("stream init failed: {outcome}"))
-            }
-            StreamHandlerError::StreamFailed(outcome) => {
-                AgentError::Api(format!("stream failed: {outcome}"))
-            }
-            StreamHandlerError::FallbackFailed {
-                stream_outcome,
-                fallback_error,
-            } => AgentError::Api(format!(
-                "stream ({stream_outcome}) and fallback failed: {fallback_error}"
-            )),
-        }
-    }
-
-    // ==================================================
-    // Tool dispatch
-    // ==================================================
-
-    /// Execute tool calls and return results.
-    ///
-    /// Iterates over each [`ToolCallInfo`] extracted from the assistant
-    /// message, looks up the corresponding tool in the [`ToolRegistry`],
-    /// and invokes it. Each result is wrapped in a [`ToolCallResult`].
-    ///
-    /// Tool execution is **sequential** so that cancellation can be
-    /// checked between invocations. A tool that is not found in the
-    /// registry produces a soft error result (not a hard [`AgentError`]),
-    /// allowing the model to recover.
-    ///
-    /// When a tool returns an error (execution failure or not-found),
-    /// the framework consults the [`Reflector`] and [`RecoveryStrategy`]
-    /// to decide whether to retry, skip, ask user, or fail. Retry
-    /// attempts use the delay specified by the [`RecoveryAction`].
-    ///
-    /// Observers are notified before and after each tool invocation via
-    /// [`on_tool_call`](AgentObserver::on_tool_call) and
-    /// [`on_tool_complete`](AgentObserver::on_tool_complete).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AgentError::Cancelled`] if the cancellation flag is set
-    /// between tool invocations.
-    async fn dispatch_tools(
-        &self,
-        tool_calls: &[ToolCallInfo],
-        turn_idx: usize,
-    ) -> Result<Vec<ToolCallResult>, AgentError> {
-        let mut results = Vec::with_capacity(tool_calls.len());
-        for tc in tool_calls {
-            if self.is_cancelled() {
-                return Err(AgentError::Cancelled);
-            }
-            let result = self.dispatch_tool_with_recovery(tc, turn_idx).await?;
-            results.push(result);
-        }
-        Ok(results)
-    }
-
-    /// Dispatch a single tool call, using reflector + recovery on errors.
-    ///
-    /// If the tool call succeeds, returns the result immediately. If it
-    /// fails, calls [`Reflector::analyze()`] and [`RecoveryStrategy::decide()`]
-    /// to determine the next action:
-    ///
-    /// - [`Retry`](RecoveryAction::Retry) — re-dispatch the tool after the
-    ///   specified delay, up to the recovery strategy's retry limit.
-    /// - [`Skip`](RecoveryAction::Skip) — produce a soft error result and
-    ///   continue to the next tool.
-    /// - [`Fail`](RecoveryAction::Fail) — produce a soft error result (the
-    ///   model sees the failure and can decide how to respond).
-    /// - [`AskUser`](RecoveryAction::AskUser) — treated as `Skip` (interactive
-    ///   recovery not yet supported in `BareLoop`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AgentError::Cancelled`] if the cancellation signal fires
-    /// during tool execution or between retry attempts.
-    async fn dispatch_tool_with_recovery(
-        &self,
-        tc: &ToolCallInfo,
-        turn_idx: usize,
-    ) -> Result<ToolCallResult, AgentError> {
-        let tool_context = self.build_tool_context();
-        let mut attempt: u32 = 0;
-
-        loop {
-            if self.is_cancelled() {
-                return Err(AgentError::Cancelled);
-            }
-
-            if let Some(blocked) = self.check_pre_tool_use_hooks(tc, turn_idx) {
-                return Ok(blocked);
-            }
-
-            self.notify_tool_call(&tc.name, &tc.input.to_string());
-            self.emit_tool_start(&tc.name, &tc.input.to_string());
-            let start = Instant::now();
-
-            let tool_result = if let Some(ref pipeline) = self.pipeline {
-                self.dispatch_via_pipeline(pipeline, tc, &tool_context, start, turn_idx)
-                    .await?
-            } else if let Some(tool) = self.tools.get(&tc.name) {
-                let cancel = Arc::clone(&self.cancelled);
-                let call_result = tokio::select! {
-                    r = tool.call(tc.input.clone(), &tool_context) => r,
-                    () = cancel.notified() => {
-                        let dur = start.elapsed();
-                        self.notify_tool_complete(
-                            &tc.name,
-                            &tc.input.to_string(),
-                            "",
-                            dur,
-                            false,
-                            Some("cancelled"),
-                        );
-                        self.emit_tool_complete(&tc.name, "", true, dur);
-                        return Err(AgentError::Cancelled);
-                    }
-                };
-                match call_result {
-                    Ok(result) => {
-                        let duration = start.elapsed();
-                        let output_text = result.text_content();
-                        let success = !result.is_error;
-                        self.notify_tool_complete(
-                            &tc.name,
-                            &tc.input.to_string(),
-                            &output_text,
-                            duration,
-                            success,
-                            None,
-                        );
-                        self.emit_tool_complete(&tc.name, &output_text, !success, duration);
-                        ToolCallResult {
-                            tool_call_id: tc.id.clone(),
-                            output: result.payload,
-                            is_error: result.is_error,
-                            duration,
-                        }
-                    }
-                    Err(e) => {
-                        let duration = start.elapsed();
-                        let error_msg = e.to_string();
-                        self.notify_tool_complete(
-                            &tc.name,
-                            &tc.input.to_string(),
-                            &error_msg,
-                            duration,
-                            false,
-                            Some(&error_msg),
-                        );
-                        self.emit_tool_complete(&tc.name, &error_msg, true, duration);
-                        ToolCallResult {
-                            tool_call_id: tc.id.clone(),
-                            output: ToolContent::Text(error_msg.clone()),
-                            is_error: true,
-                            duration,
-                        }
-                    }
-                }
-            } else {
-                let available: Vec<String> = self.tools.tool_names().clone();
-                let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();
-                let error = AgentError::tool_not_found(&tc.name, &available_refs);
-                let error_msg = error.to_string();
-                self.notify_tool_complete(
-                    &tc.name,
-                    &tc.input.to_string(),
-                    &error_msg,
-                    Duration::ZERO,
-                    false,
-                    Some(&error_msg),
-                );
-                self.emit_tool_complete(&tc.name, &error_msg, true, Duration::ZERO);
-                ToolCallResult {
-                    tool_call_id: tc.id.clone(),
-                    output: ToolContent::Text(error_msg.clone()),
-                    is_error: true,
-                    duration: Duration::ZERO,
-                }
-            };
-
-            self.notify_post_tool_use_hooks(tc, &tool_result, turn_idx);
-            self.record_tool_health(tc.name.as_str(), &tool_result);
-
-            // If the tool succeeded, return immediately.
-            if !tool_result.is_error {
-                return Ok(tool_result);
-            }
-
-            // Tool failed — consult reflector + recovery strategy.
-            let recovery_action = self.recover_tool_error(tc, &tool_result, attempt).await;
-
-            match recovery_action {
-                RecoveryAction::Retry { delay } => {
-                    attempt = attempt.saturating_add(1);
-                    if attempt >= Self::MAX_RECOVERY_ATTEMPTS {
-                        return Ok(tool_result);
-                    }
-                    tokio::select! {
-                        () = tokio::time::sleep(delay) => {},
-                        () = self.cancelled.notified() => {
-                            return Err(AgentError::Cancelled);
-                        }
-                    }
-                    // Loop to retry the tool call.
-                }
-                RecoveryAction::Skip(_) | RecoveryAction::AskUser(_) | RecoveryAction::Fail(_) => {
-                    // All non-retry actions: return the error result as a
-                    // soft error so the model can see it and respond.
-                    return Ok(tool_result);
-                }
-            }
-        }
-    }
-
-    /// Check pre-tool-use hooks and return a blocked result if any hook
-    /// blocks or asks.
-    ///
-    /// Returns `Some(ToolCallResult)` with an error result if a hook
-    /// blocked the call, or `None` if the call should proceed.
-    ///
-    /// *Requires `hooks` feature; returns `None` otherwise.*
-    fn check_pre_tool_use_hooks(
-        &self,
-        tc: &ToolCallInfo,
-        turn_idx: usize,
-    ) -> Option<ToolCallResult> {
-        #[cfg(feature = "hooks")]
-        if let Some(ref executor) = self.hook_executor {
-            let ctx = PreToolUseContext {
-                tool_name: tc.name.clone(),
-                input: tc.input.clone(),
-                session_id: self.config.session_id,
-                turn_number: turn_idx,
-            };
-            match executor.check_pre_tool_use(&ctx) {
-                HookAction::Allow => None,
-                HookAction::Block { reason } => {
-                    self.emit_tool_complete(&tc.name, &reason, true, Duration::ZERO);
-                    Some(ToolCallResult {
-                        tool_call_id: tc.id.clone(),
-                        output: ToolContent::Text(reason),
-                        is_error: true,
-                        duration: Duration::ZERO,
-                    })
-                }
-                HookAction::Ask { message } => {
-                    // In Headless mode (the default) the executor already
-                    // downgrades Ask → Block. If we reach this arm the
-                    // executor is Interactive, but BareLoop has no UI to
-                    // show a prompt, so we still treat it as Block.
-                    self.emit_tool_complete(&tc.name, &message, true, Duration::ZERO);
-                    Some(ToolCallResult {
-                        tool_call_id: tc.id.clone(),
-                        output: ToolContent::Text(message),
-                        is_error: true,
-                        duration: Duration::ZERO,
-                    })
-                }
-            }
-        } else {
-            None
-        }
-        #[cfg(not(feature = "hooks"))]
-        {
-            let _ = (tc, turn_idx);
-            None
-        }
-    }
-
-    /// Notify post-tool-use hooks with the execution result.
-    ///
-    /// *Requires `hooks` feature; no-op otherwise.*
-    fn notify_post_tool_use_hooks(
-        &self,
-        tc: &ToolCallInfo,
-        tool_result: &ToolCallResult,
-        turn_idx: usize,
-    ) {
-        #[cfg(feature = "hooks")]
-        if let Some(ref executor) = self.hook_executor {
-            let output_text = match &tool_result.output {
-                ToolContent::Text(t) => t.clone(),
-                ToolContent::Multipart(_) => String::new(),
-            };
-            let ctx = PostToolUseContext {
-                tool_name: tc.name.clone(),
-                input: tc.input.clone(),
-                output: output_text,
-                is_error: tool_result.is_error,
-                duration_ms: tool_result
-                    .duration
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-                session_id: self.config.session_id,
-                turn_number: turn_idx,
-            };
-            executor.notify_post_tool_use(&ctx);
-        }
-        #[cfg(not(feature = "hooks"))]
-        {
-            let _ = (tc, tool_result, turn_idx);
-        }
-    }
-
-    /// Record tool health (success or failure) in the health registry.
-    ///
-    /// *Requires `tool_health` feature; no-op otherwise.*
-    fn record_tool_health(&self, tool_name: &str, tool_result: &ToolCallResult) {
-        #[cfg(feature = "tool_health")]
-        if let Some(ref health) = self.health_registry {
-            if tool_result.is_error {
-                health.record_failure(tool_name, tool_result.duration);
-            } else {
-                health.record_success(tool_name, tool_result.duration);
-            }
-        }
-        #[cfg(not(feature = "tool_health"))]
-        {
-            let _ = (tool_name, tool_result);
-        }
-    }
-
-    /// Dispatch a tool call through the middleware pipeline.
-    ///
-    /// Builds a [`ToolDispatchContext`] from the tool call info, delegates
-    /// to the pipeline's middleware chain, and converts the
-    /// [`ToolDispatchResult`] back to a [`ToolCallResult`] with proper
-    /// event emission. Handles cancellation via `tokio::select!`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AgentError::Cancelled`] if the cancel signal fires
-    /// during pipeline dispatch.
-    async fn dispatch_via_pipeline(
-        &self,
-        pipeline: &ToolPipeline,
-        tc: &ToolCallInfo,
-        tool_context: &ToolContext,
-        start: Instant,
-        turn_idx: usize,
-    ) -> Result<ToolCallResult, AgentError> {
-        let ctx = ToolDispatchContext {
-            tool_name: tc.name.clone(),
-            input: tc.input.clone(),
-            call_id: tc.id.clone(),
-            turn_number: turn_idx,
-            cancel: Arc::clone(&self.cancelled),
-            permission: PermissionCheck::Allow,
-            tool_context: tool_context.clone(),
-        };
-        let cancel = Arc::clone(&self.cancelled);
-        let dispatch_result = tokio::select! {
-            r = pipeline.invoke(ctx) => r,
-            () = cancel.notified() => {
-                let dur = start.elapsed();
-                self.notify_tool_complete(
-                    &tc.name,
-                    &tc.input.to_string(),
-                    "",
-                    dur,
-                    false,
-                    Some("cancelled"),
-                );
-                self.emit_tool_complete(&tc.name, "", true, dur);
-                return Err(AgentError::Cancelled);
-            }
-        };
-        let output_text = match &dispatch_result.output {
-            ToolContent::Text(t) => t.clone(),
-            ToolContent::Multipart(parts) => parts
-                .iter()
-                .filter_map(|p| match p {
-                    ToolContentPart::Text { text } => Some(text.as_str()),
-                    ToolContentPart::Image { .. } => None,
-                })
-                .collect::<Vec<_>>()
-                .join(""),
-        };
-        self.notify_tool_complete(
-            &tc.name,
-            &tc.input.to_string(),
-            &output_text,
-            dispatch_result.duration,
-            !dispatch_result.is_error,
-            if dispatch_result.is_error {
-                Some(&output_text)
-            } else {
-                None
-            },
-        );
-        self.emit_tool_complete(
-            &tc.name,
-            &output_text,
-            dispatch_result.is_error,
-            dispatch_result.duration,
-        );
-        Ok(ToolCallResult {
-            tool_call_id: tc.id.clone(),
-            output: dispatch_result.output,
-            is_error: dispatch_result.is_error,
-            duration: dispatch_result.duration,
-        })
-    }
-
-    /// Analyse a tool error and decide on a recovery action.
-    ///
-    /// Calls [`Reflector::analyze()`] and then [`RecoveryStrategy::decide()`].
-    /// If the reflector itself fails, logs the error and returns
-    /// [`RecoveryAction::Fail`] (conservative default).
-    async fn recover_tool_error(
-        &self,
-        tc: &ToolCallInfo,
-        result: &ToolCallResult,
-        attempt: u32,
-    ) -> RecoveryAction {
-        let error_msg = match &result.output {
-            ToolContent::Text(msg) => msg.clone(),
-            ToolContent::Multipart(_) => result.output.to_string(),
-        };
-        let context = ReflectionContext {
-            task: String::new(),
-            attempt,
-            max_attempts: Self::MAX_RECOVERY_ATTEMPTS,
-        };
-
-        let Ok(analysis) = self
-            .reflector
-            .analyze(&error_msg, &tc.name, &tc.input, &context)
-            .await
-        else {
-            // Reflector failed — conservatively fail.
-            return RecoveryAction::Fail(error_msg);
-        };
-
-        self.recovery
-            .decide(&analysis, attempt, Self::MAX_RECOVERY_ATTEMPTS)
-            .await
-    }
-
-    // ==================================================
-    // Helpers
-    // ==================================================
-
-    /// Extract all text content from a message.
-    ///
-    /// Iterates over the message's [`MessagePart`]s and concatenates
-    /// every text part into a single `String`. Non-text parts (e.g.
-    /// `ToolCall`, `ToolResult`) are silently skipped.
-    ///
-    /// Used to produce the [`SessionResult::final_output`] string when
-    /// the model ends its turn.
-    fn extract_text(msg: &Message) -> String {
-        msg.parts
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    /// Extract tool call information from a message.
-    ///
-    /// Scans the message's [`MessagePart`]s for `ToolCall` variants and
-    /// maps each one to a [`ToolCallInfo`] containing the call ID, tool
-    /// name, and JSON input. Non-`ToolCall` parts are silently skipped.
-    ///
-    /// Returns an empty `Vec` when the message contains no tool calls
-    /// (i.e. the model ended with plain text).
-    fn extract_tool_calls(msg: &Message) -> Vec<ToolCallInfo> {
-        msg.parts
-            .iter()
-            .filter_map(|part| match part {
-                MessagePart::ToolCall { id, name, input } => Some(ToolCallInfo {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                }),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Build the tool result message from executed tool results.
-    ///
-    /// Per API convention, tool results are sent as a **user** message
-    /// containing `tool_result` content parts. Each part pairs the
-    /// `tool_call_id` with the tool's output (wrapped in a
-    /// [`ToolContent`](ToolContent)) and an `is_error`
-    /// flag so the model can distinguish successes from failures.
-    ///
-    /// # Parameters
-    ///
-    /// - `results` — The [`ToolCallResult`]s produced by
-    ///   [`dispatch_tools()`](BareLoop::dispatch_tools).
-    ///
-    /// # Returns
-    ///
-    /// A [`Message`] with [`Role::User`] and one `tool_result`
-    /// [`MessagePart`] per result.
-    fn build_tool_result_message(results: Vec<ToolCallResult>) -> Message {
-        let parts: Vec<MessagePart> = results
-            .into_iter()
-            .map(|r| MessagePart::tool_result(r.tool_call_id, r.output, r.is_error))
-            .collect();
-        Message::new(Role::User, parts)
-    }
-
-    /// Build tool schemas for the API request.
-    ///
-    /// Collects all tool schemas from the [`ToolRegistry`] and returns
-    /// them as `Some(Vec<ToolSchema>)`, or `None` if the registry is
-    /// empty (i.e. the agent has no tools). The API uses these schemas
-    /// to inform the model what tools are available and their expected
-    /// input shapes.
-    fn build_tool_schemas(&self) -> Option<Vec<ToolSchema>> {
-        let schemas = self.tools.all_schemas();
-        if schemas.is_empty() {
-            None
-        } else {
-            Some(schemas)
-        }
-    }
-
-    /// Build a tool context for tool invocations.
-    ///
-    /// Creates a [`ToolContext`] pre-populated with the current session
-    /// ID. Tools can use the context to correlate their work with the
-    /// enclosing session (e.g. for logging, tracing, or storage).
-    fn build_tool_context(&self) -> ToolContext {
-        ToolContext {
-            session_id: self.config.session_id,
-            ..ToolContext::default()
-        }
-    }
-
-    // ==================================================
-    // Observer notifications
-    // ==================================================
-
-    /// Notify all observers that the session has started.
-    ///
-    /// Called once at the beginning of [`run()`](BareLoop::run),
-    /// before the first turn. Iterates over every registered
-    /// [`AgentObserver`] and calls
-    /// [`on_session_start()`](AgentObserver::on_session_start) with the
-    /// session ID from [`AgentConfig`].
-    fn notify_session_start(&self) {
-        for obs in &self.observers {
-            obs.on_session_start(self.config.session_id);
-        }
-        self.event_sink.on_event(&ObserveEvent::SessionStart {
-            session_id: self.config.session_id,
-        });
-
-        #[cfg(feature = "hooks")]
-        if let Some(ref executor) = self.hook_executor {
-            let ctx = SessionStartContext {
-                session_id: self.config.session_id,
-                model: self.config.model.clone(),
-                working_directory: std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            };
-            executor.notify_session_start(&ctx);
-        }
-    }
-
-    /// Notify all observers that the session has ended.
-    ///
-    /// Called once when [`run()`](BareLoop::run) returns — whether
-    /// successfully, due to an error, or because of cancellation.
-    fn notify_session_end(&self, info: &SessionEndInfo) {
-        let reason_str = match &info.reason {
-            EndReason::Complete => None,
-            EndReason::Cancelled => Some("cancelled"),
-            EndReason::MaxTurns => Some("max turns exceeded"),
-            EndReason::Error => Some("session ended with error"),
-        };
-        for obs in &self.observers {
-            obs.on_session_end(info.success, reason_str);
-        }
-
-        #[cfg(feature = "hooks")]
-        if let Some(ref executor) = self.hook_executor {
-            let reason = match &info.reason {
-                EndReason::Complete => SessionEndReason::Complete,
-                EndReason::Cancelled => SessionEndReason::Cancelled,
-                EndReason::Error => SessionEndReason::Error,
-                EndReason::MaxTurns => SessionEndReason::MaxTurns,
-            };
-            let ctx = SessionEndContext {
-                session_id: self.config.session_id,
-                reason,
-                total_turns: info.total_turns,
-                total_tokens: info.total_tokens,
-                duration_secs: info.duration_secs,
-            };
-            executor.notify_session_end(&ctx);
-        }
-    }
-
-    /// Notify all observers that a turn has started.
-    ///
-    /// Called at the top of every iteration of the main loop, before
-    /// the API streaming request. The `query` parameter is the original
-    /// user input (the same for every turn within a single
-    /// [`run()`](BareLoop::run) call).
-    fn notify_turn_start(&self, query: &str) {
-        for obs in &self.observers {
-            obs.on_turn_start(query);
-        }
-    }
-
-    /// Notify all observers that a turn has ended.
-    ///
-    /// Called after each turn completes — whether it produced a tool
-    /// call, ended with text, or encountered an error. The `success`
-    /// flag is `true` for normal turns and `false` when the API stream
-    /// returned an error.
-    fn notify_turn_end(&self, success: bool, error: Option<&str>) {
-        for obs in &self.observers {
-            obs.on_turn_end(success, error);
-        }
-    }
-
-    /// Notify all observers that a tool is about to be invoked.
-    ///
-    /// Called just before the tool's [`call()`](crate::tool::Tool::call)
-    /// method is invoked. The `tool` parameter is the tool name and
-    /// `input` is the JSON input serialized to a string.
-    fn notify_tool_call(&self, tool: &str, input: &str) {
-        for obs in &self.observers {
-            obs.on_tool_call(tool, input);
-        }
-    }
-
-    /// Notify all observers that a tool invocation has completed.
-    ///
-    /// Called after the tool's [`call()`](crate::tool::Tool::call)
-    /// method returns — whether successfully or with an error.
-    /// Includes the tool's output, execution `duration`, a `success`
-    /// flag, and an optional `error` message.
-    ///
-    /// Parameter count is dictated by the [`AgentObserver::on_tool_complete`]
-    /// trait method.
-    fn notify_tool_complete(
-        &self,
-        tool: &str,
-        input: &str,
-        output: &str,
-        duration: Duration,
-        success: bool,
-        error: Option<&str>,
-    ) {
-        for obs in &self.observers {
-            obs.on_tool_complete(tool, input, output, duration, success, error);
-        }
-    }
-
-    // ==================================================
-    // EventSink emissions
-    // ==================================================
-
-    /// Convert a [`Duration`] to milliseconds as `u64`.
-    ///
-    /// Clamps at `u64::MAX` if the duration exceeds ~584 million years,
-    /// which is safe for any practical agent session.
-    fn millis_u64(duration: Duration) -> u64 {
-        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-    }
-
-    /// Emit a [`TurnStart`](ObserveEvent::TurnStart) event.
-    fn emit_turn_start(&self, turn: usize, query: &str) {
-        self.event_sink.on_event(&ObserveEvent::TurnStart {
-            turn,
-            query: query.to_string(),
-        });
-    }
-
-    /// Emit a [`TurnComplete`](ObserveEvent::TurnComplete) event.
-    fn emit_turn_complete(
-        &self,
-        turn: usize,
-        duration: Duration,
-        input_tokens: u64,
-        output_tokens: u64,
-    ) {
-        self.event_sink.on_event(&ObserveEvent::TurnComplete {
-            turn,
-            duration_ms: Self::millis_u64(duration),
-            input_tokens,
-            output_tokens,
-        });
-    }
-
-    /// Emit a [`TurnFailed`](ObserveEvent::TurnFailed) event.
-    fn emit_turn_failed(&self, turn: usize, duration: Duration, error: &str) {
-        self.event_sink.on_event(&ObserveEvent::TurnFailed {
-            turn,
-            duration_ms: Self::millis_u64(duration),
-            error: error.to_string(),
-        });
-    }
-
-    /// Emit a [`ToolStart`](ObserveEvent::ToolStart) event.
-    fn emit_tool_start(&self, name: &str, input: &str) {
-        self.event_sink.on_event(&ObserveEvent::ToolStart {
-            name: name.to_string(),
-            input: input.to_string(),
-        });
-    }
-
-    /// Emit a [`ToolComplete`](ObserveEvent::ToolComplete) event.
-    fn emit_tool_complete(&self, name: &str, output: &str, is_error: bool, duration: Duration) {
-        self.event_sink.on_event(&ObserveEvent::ToolComplete {
-            name: name.to_string(),
-            output: output.to_string(),
-            is_error,
-            duration_ms: Self::millis_u64(duration),
-        });
-    }
-
-    /// Emit a [`SessionStop`](ObserveEvent::SessionStop) event.
-    fn emit_session_stop(
-        &self,
-        total_turns: usize,
-        duration: Duration,
-        success: bool,
-        reason: &str,
-    ) {
-        self.event_sink.on_event(&ObserveEvent::SessionStop {
-            session_id: self.config.session_id,
-            success,
-            reason: reason.to_string(),
-            total_turns,
-            duration_ms: Self::millis_u64(duration),
-        });
-    }
-}
-
-// ==================================================
-// ToolCallInfo
-// ==================================================
-
-/// Internal representation of a tool call extracted from a message.
-///
-/// When the LLM emits a `tool_call` content part, the loop extracts
-/// its fields into this struct for convenient passing to
-/// [`dispatch_tools()`](BareLoop::dispatch_tools).
-///
-/// This type is private to the module because external consumers
-/// interact with tool results via [`SessionResult`] or the
-/// [`AgentObserver`] callbacks.
-///
-/// # Fields
-///
-/// - [`id`](ToolCallInfo::id) — The unique identifier assigned by the
-///   API to this tool call. Used to correlate the result back to the
-///   request.
-/// - [`name`](ToolCallInfo::name) — The tool name. Must match a tool
-///   registered in the [`ToolRegistry`].
-/// - [`input`](ToolCallInfo::input) — The JSON input provided by the
-///   model. Deserialized into a `serde_json::Value`.
-#[derive(Debug, Clone)]
-struct ToolCallInfo {
-    /// The tool call ID assigned by the API.
-    ///
-    /// Used to correlate the tool result message back to the original
-    /// tool call. Copied into [`ToolCallResult::tool_call_id`] after
-    /// execution.
-    id: String,
-
-    /// The tool name requested by the model.
-    ///
-    /// Must exactly match a name returned by a registered
-    /// [`Tool::name()`](crate::tool::Tool::name). If no match is found,
-    /// a soft error result is produced instead of a hard error.
-    name: String,
-
-    /// The tool input as a JSON value.
-    ///
-    /// Deserialized from the API's `tool_call` content part. Passed
-    /// directly to [`Tool::call()`](crate::tool::Tool::call).
-    input: serde_json::Value,
-}
-
-// ==================================================
-// ToolCallResult (re-export)
-// ==================================================
-
-/// Result of executing a single tool call.
-///
-/// This is the internal version used during dispatch. Each executed tool
-/// produces one `ToolCallResult`, which is then converted into a
-/// `tool_result` [`MessagePart`] (with the output wrapped as
-/// [`ToolContent`](ToolContent)) by
-/// [`build_tool_result_message()`](BareLoop::build_tool_result_message)
-/// and appended to the conversation.
-///
-/// This type is distinct from the framework-level
-/// [`ToolCallResult`](crate::ToolCallResult) that appears in the final
-/// [`TurnResult`]. The internal version carries execution metadata
-/// (`duration`, `is_error`) needed for observer notifications.
-///
-/// # Fields
-///
-/// - [`tool_call_id`](ToolCallResult::tool_call_id) — Correlates back to
-///   the original [`ToolCallInfo::id`].
-/// - [`output`](ToolCallResult::output) — The tool's text output or
-///   error message.
-/// - [`is_error`](ToolCallResult::is_error) — `true` when the tool
-///   returned an error or was not found.
-/// - [`duration`](ToolCallResult::duration) — Wall-clock time spent
-///   executing the tool.
-#[derive(Debug, Clone)]
-struct ToolCallResult {
-    /// The tool call ID this result is for.
-    ///
-    /// Copied from [`ToolCallInfo::id`] to ensure the API can match
-    /// the result to the original request.
-    tool_call_id: String,
-
-    /// The tool's output content or error message.
-    ///
-    /// On success this holds the full [`ToolOutput::payload`] returned by
-    /// [`Tool::call()`](crate::tool::Tool::call) — preserving multipart and
-    /// image content instead of flattening to text.
-    /// On failure it contains an error message wrapped in
-    /// [`ToolContent::Text`](ToolContent).
-    /// This content is passed directly to [`MessagePart::tool_result`] when
-    /// building the `tool_result` message part.
-    output: ToolContent,
-
-    /// Whether the execution resulted in an error.
-    ///
-    /// When `true`, the model receives this result with the `is_error`
-    /// flag set, allowing it to decide whether to retry, use a
-    /// different tool, or inform the user.
-    is_error: bool,
-
-    /// Wall-clock duration of the tool execution.
-    ///
-    /// Measured with [`Instant::now()`] around the
-    /// [`Tool::call()`](crate::tool::Tool::call) invocation. Reserved
-    /// for future surfacing in [`SessionResult`]; currently passed to
-    /// observer callbacks inline during dispatch.
-    ///
-    /// Used by [`ToolHealthRegistry::record_success`] and
-    /// [`ToolHealthRegistry::record_failure`] when the `tool_health`
-    /// feature is enabled.
-    #[cfg_attr(not(feature = "tool_health"), expect(dead_code))]
-    duration: Duration,
 }
 
 // ==================================================
@@ -3027,11 +2045,12 @@ mod tests {
     /// tool_call_id, output text, and is_error flag.
     #[tokio::test]
     async fn test_tool_result_message_format() {
-        let results = vec![super::ToolCallResult {
+        let results = vec![super::ToolDispatchResult {
             tool_call_id: "tool_123".to_string(),
             output: ToolContent::Text("Echo: hello".to_string()),
             is_error: false,
             duration: Duration::from_millis(100),
+            resolved_tool_name: String::new(),
         }];
 
         let msg = BareLoop::<MockClient>::build_tool_result_message(results);

@@ -35,7 +35,7 @@
 //! | [`StopReason`]                 | Why the API stopped generating                       |
 //! | [`SessionResult`]              | Summary of a complete agent session                  |
 //! | [`ToolCall`]                   | A tool call requested by the agent                   |
-//! | [`ToolCallResult`]             | Result of a single tool execution                    |
+//! | [`ToolDispatchResult`]         | Result of a single tool execution                    |
 //! | [`TurnResult`]                 | Result of a single agent turn                        |
 
 pub mod agent_core;

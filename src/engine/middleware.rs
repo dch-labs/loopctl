@@ -489,6 +489,7 @@ impl ToolCallMiddleware {
         let tool_ctx = ctx.tool_context.clone();
         let registry = Arc::clone(&self.registry);
         let cancel = Arc::clone(&ctx.cancel);
+        let call_id = ctx.call_id.clone();
 
         Box::pin(async move {
             let start = Instant::now();
@@ -496,7 +497,8 @@ impl ToolCallMiddleware {
                 let available: Vec<String> = registry.tool_names();
                 let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();
                 let error = AgentError::tool_not_found(&tool_name, &available_refs);
-                return ToolDispatchResult::err(&tool_name, error.to_string(), start.elapsed());
+                return ToolDispatchResult::err(&tool_name, error.to_string(), start.elapsed())
+                    .with_call_id(&call_id);
             };
 
             let call_result = tokio::select! {
@@ -506,12 +508,14 @@ impl ToolCallMiddleware {
                         &tool_name,
                         format!("Tool '{tool_name}' cancelled"),
                         start.elapsed(),
-                    );
+                    )
+                    .with_call_id(&call_id);
                 }
             };
 
             let duration = start.elapsed();
             ToolDispatchResult::from_result(&tool_name, call_result, duration)
+                .with_call_id(&call_id)
         })
     }
 }

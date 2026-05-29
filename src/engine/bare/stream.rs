@@ -72,7 +72,9 @@ impl<C: ApiClient> BareLoop<C> {
                                 StreamStopReason::from_api_str(reason_str).unwrap_or(stop_reason);
                         }
                     }
-                    drop(accumulator.process(&event));
+                    accumulator
+                        .process(&event)
+                        .map_err(|e| AgentError::Api(format!("stream accumulation error: {e}")))?;
                 }
                 Some(Err(api_error)) => {
                     return Err(AgentError::Api(api_error.to_string()));

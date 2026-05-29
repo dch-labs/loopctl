@@ -402,7 +402,11 @@ impl<C: ApiClient> BareLoop<C> {
             dispatch_result.duration,
         );
         Ok(ToolDispatchResult {
-            tool_call_id: tc.id.clone(),
+            tool_call_id: if dispatch_result.tool_call_id.is_empty() {
+                tc.id.clone()
+            } else {
+                dispatch_result.tool_call_id
+            },
             output: dispatch_result.output,
             is_error: dispatch_result.is_error,
             duration: dispatch_result.duration,

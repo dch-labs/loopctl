@@ -897,7 +897,14 @@ impl StreamHandler {
                                 StreamStopReason::from_api_str(reason_str).unwrap_or(stop_reason);
                         }
                     }
-                    accumulator.process(&event).ok();
+                    if let Err(e) = accumulator.process(&event) {
+                        return Err(StreamHandlerError::StreamFailed(
+                            StreamOutcome::InitFailed {
+                                attempts: 1,
+                                last_error: e.to_string(),
+                            },
+                        ));
+                    }
                 }
                 Some(Err(api_error)) => {
                     return Err(StreamHandlerError::StreamFailed(

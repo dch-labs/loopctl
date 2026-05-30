@@ -107,6 +107,12 @@ impl EventSink for ConsoleSink {
             ObserveEvent::Error { message, source } => {
                 println!("[error] {source}: {message}");
             }
+            ObserveEvent::LoopDetected { tool, repetitions } => {
+                println!("[detection] loop detected: {tool} repeated {repetitions} times");
+            }
+            ObserveEvent::ConvergenceDetected { action } => {
+                println!("[detection] convergence detected (action: {action})");
+            }
         }
     }
 }

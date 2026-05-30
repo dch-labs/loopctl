@@ -166,6 +166,27 @@ pub enum ObserveEvent {
         /// Error source or category.
         source: String,
     },
+
+    /// A loop was detected in tool operations.
+    ///
+    /// Emitted when the detection manager observes the same tool call
+    /// pattern repeated beyond the configured loop threshold.
+    LoopDetected {
+        /// Tool name that was repeating.
+        tool: String,
+        /// Number of repetitions observed.
+        repetitions: usize,
+    },
+
+    /// Convergence was detected in agent responses.
+    ///
+    /// Emitted when the detection manager observes that recent agent
+    /// responses have become semantically similar beyond the configured
+    /// threshold.
+    ConvergenceDetected {
+        /// Configured action to take (e.g. `"stop"`, `"warn"`, `"compact"`).
+        action: String,
+    },
 }
 
 #[cfg(test)]

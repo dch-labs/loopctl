@@ -211,6 +211,23 @@ impl AgentObserver for LoggingObserver {
     fn on_fallback(&self, from: &str, to: &str) {
         tracing::warn!(from, to, "Fallback triggered");
     }
+
+    /// Log a loop-detection event at `warn` level.
+    ///
+    /// Emits the `tool` name and `repetitions` count so operators can
+    /// identify tools that the agent is calling in a repeated pattern.
+    fn on_loop_detected(&self, tool: &str, repetitions: usize) {
+        warn!(tool, repetitions, "loop detected in tool operations");
+    }
+
+    /// Log a convergence-detection event at `warn` level.
+    ///
+    /// Emits the configured `action` (e.g. `"stop"`, `"warn"`) so
+    /// operators can see when the agent's responses have become
+    /// semantically similar and what the framework intends to do about it.
+    fn on_convergence_detected(&self, action: &str) {
+        warn!(action, "convergence detected in agent responses");
+    }
 }
 
 /// A composite observer that fans out every event to multiple inner observers.
@@ -505,6 +522,26 @@ impl AgentObserver for MultiObserver {
                 obs.on_fallback(from, to);
             })) {
                 warn!("observer panicked in on_fallback: {payload:?}");
+            }
+        }
+    }
+
+    fn on_loop_detected(&self, tool: &str, repetitions: usize) {
+        for obs in &self.observers {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+                obs.on_loop_detected(tool, repetitions);
+            })) {
+                warn!("observer panicked in on_loop_detected: {payload:?}");
+            }
+        }
+    }
+
+    fn on_convergence_detected(&self, action: &str) {
+        for obs in &self.observers {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+                obs.on_convergence_detected(action);
+            })) {
+                warn!("observer panicked in on_convergence_detected: {payload:?}");
             }
         }
     }

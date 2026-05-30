@@ -7,6 +7,7 @@
 //! # Provided Managers
 //!
 //! - **[`FallbackManager`]** — Circuit breaker for automatic API model fallback.
+//! - **[`DetectionManager`]** — Loop and convergence detection orchestrator.
 //!
 //! # Quick Start
 //!
@@ -25,6 +26,7 @@
 //! bundle.reset_all();
 //! ```
 
+use crate::loop_control::detection::DetectionManager;
 use crate::loop_control::fallback::FallbackManager;
 
 /// Bundle of framework-provided manager instances.
@@ -54,6 +56,17 @@ pub struct ManagerBundle {
     ///
     /// See [`FallbackManager`] for the full state-machine documentation.
     pub fallback: FallbackManager,
+
+    /// Loop and convergence detection orchestrator.
+    ///
+    /// Wraps [`LoopDetector`](crate::loop_control::loop_detector::LoopDetector)
+    /// and [`ConvergenceDetector`](crate::loop_control::convergence::ConvergenceDetector)
+    /// behind a single interface. Records tool operations and agent
+    /// responses, then checks for repeated patterns or semantically
+    /// similar outputs.
+    ///
+    /// See [`DetectionManager`] for the full API documentation.
+    pub detection: DetectionManager,
 }
 
 impl ManagerBundle {
@@ -75,6 +88,7 @@ impl ManagerBundle {
     pub fn new() -> Self {
         Self {
             fallback: FallbackManager::default(),
+            detection: DetectionManager::default(),
         }
     }
 
@@ -103,6 +117,32 @@ impl ManagerBundle {
         self
     }
 
+    /// Replace the detection manager with a custom instance.
+    ///
+    /// Consumes the current bundle and returns a new one with the given
+    /// [`DetectionManager`]. Use this when you need custom loop or
+    /// convergence thresholds, e.g. via
+    /// [`DetectionManager::with_config`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use loopctl::loop_control::bundle::ManagerBundle;
+    /// # use loopctl::loop_control::detection::{DetectionManager, DetectionConfig};
+    /// let config = DetectionConfig {
+    ///     loop_threshold: 5,
+    ///     ..Default::default()
+    /// };
+    /// let detection = DetectionManager::with_config(config).unwrap();
+    /// let bundle = ManagerBundle::new().with_detection(detection);
+    /// assert_eq!(bundle.detection.config().loop_threshold, 5);
+    /// ```
+    #[must_use]
+    pub fn with_detection(mut self, detection: DetectionManager) -> Self {
+        self.detection = detection;
+        self
+    }
+
     /// Reset all managers to their initial state.
     ///
     /// Delegates to each manager's `reset()` method. Typically called at the
@@ -120,6 +160,7 @@ impl ManagerBundle {
     /// ```
     pub fn reset_all(&self) {
         self.fallback.reset();
+        self.detection.reset();
     }
 }
 
@@ -145,6 +186,7 @@ impl Default for ManagerBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loop_control::detection::{DetectedPattern, DetectionManager};
 
     #[test]
     fn test_bundle_default() {
@@ -164,5 +206,42 @@ mod tests {
         let bundle = ManagerBundle::new();
         bundle.reset_all();
         // No panic
+    }
+
+    #[test]
+    fn test_bundle_contains_detection_manager() {
+        let bundle = ManagerBundle::new();
+        // Default detection config values
+        assert_eq!(bundle.detection.config().loop_threshold, 3);
+        assert_eq!(bundle.detection.config().stop_threshold, 10);
+    }
+
+    #[test]
+    fn test_bundle_with_custom_detection() {
+        use crate::loop_control::detection::DetectionConfig;
+
+        let config = DetectionConfig {
+            loop_threshold: 7,
+            stop_threshold: 20,
+            ..Default::default()
+        };
+        let detection = DetectionManager::with_config(config).unwrap();
+        let bundle = ManagerBundle::new().with_detection(detection);
+        assert_eq!(bundle.detection.config().loop_threshold, 7);
+        assert_eq!(bundle.detection.config().stop_threshold, 20);
+        // Fallback is still the default
+        assert!(bundle.fallback.active_model().is_none());
+    }
+
+    #[test]
+    fn test_reset_all_clears_detection() {
+        let bundle = ManagerBundle::new();
+        // Record a tool call to populate detection state
+        let _ = bundle.detection.record_tool_call("Read", 12345);
+        // Reset should clear it
+        bundle.reset_all();
+        // After reset, recording the same call should not trigger detection
+        let pattern = bundle.detection.record_tool_call("Read", 12345);
+        assert!(matches!(pattern, DetectedPattern::NoPattern));
     }
 }

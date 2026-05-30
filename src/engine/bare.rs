@@ -89,6 +89,7 @@ use crate::hooks::context::{
     SessionEndContext, SessionEndReason, SessionStartContext,
 };
 use crate::loop_control::bundle::ManagerBundle;
+use crate::loop_control::detection::{ConvergenceAction, DetectedPattern};
 use crate::message::{Message, MessagePart, Role, ToolContent, ToolContentPart};
 use crate::observability::{EventSink, NullSink, ObserveEvent};
 use crate::stream::handler::StreamHandler;
@@ -1003,6 +1004,48 @@ impl<C: ApiClient> BareLoop<C> {
                     self.managers.fallback.record_model_success();
                     budget.accumulate_usage(usage.as_ref());
                     let text = Self::extract_text(&assistant_msg);
+
+                    // Convergence detection
+                    let pattern = self.managers.detection.record_response(&text);
+                    if let Some(result) = self.handle_detected_pattern(&pattern, budget.turn_count)
+                    {
+                        let turn_elapsed = turn_start.elapsed();
+                        return match result {
+                            Ok(session_result) => {
+                                self.emit_turn_complete(
+                                    budget.turn_count,
+                                    turn_elapsed,
+                                    TurnTokens::from_usage(usage.as_ref()).input,
+                                    TurnTokens::from_usage(usage.as_ref()).output,
+                                );
+                                self.notify_turn_end(true, None);
+                                self.emit_session_stop(
+                                    budget.turn_count,
+                                    start.elapsed(),
+                                    true,
+                                    "detection_early_exit",
+                                );
+                                self.notify_session_end(&SessionEndInfo {
+                                    success: true,
+                                    reason: EndReason::Complete,
+                                    total_turns: budget.turn_count,
+                                    total_tokens: budget
+                                        .input_tokens
+                                        .saturating_add(budget.output_tokens),
+                                    duration_secs: start.elapsed().as_secs(),
+                                });
+                                Ok(session_result)
+                            }
+                            Err(e) => self.abort_turn_and_session(
+                                &budget,
+                                turn_elapsed,
+                                start.elapsed(),
+                                &e.to_string(),
+                                e,
+                            ),
+                        };
+                    }
+
                     let tool_calls = Self::extract_tool_calls(&assistant_msg);
                     self.conversation.push(assistant_msg);
                     budget.turn_count = budget.turn_count.saturating_add(1);
@@ -1070,14 +1113,155 @@ impl<C: ApiClient> BareLoop<C> {
     // Run helpers
     // ==================================================
 
+    /// Interpret a detected pattern and decide whether to abort the session.
+    ///
+    /// Called from both the run-loop convergence check (after extracting
+    /// assistant text) and the dispatch path (after recording a tool call).
+    /// Returns `None` to continue the loop, or `Some(result)` to abort
+    /// the session immediately.
+    ///
+    /// # Detection behaviour
+    ///
+    /// - **Loop detection** — only aborts when the repetition count reaches
+    ///   the configured [`DetectionConfig::stop_threshold`]. Below that
+    ///   threshold the pattern is logged as a warning and the loop continues.
+    /// - **Convergence detection** — follows the [`ConvergenceAction`] from
+    ///   the detection config. `Stop` and `AskUser` abort the session;
+    ///   `Warn`, `Compact`, and `SwitchPhase` allow the loop to continue.
+    ///
+    /// # Arguments
+    ///
+    /// - `pattern` — The pattern returned by [`DetectionManager`].
+    /// - `turn` — Zero-based turn index, used in log messages.
+    ///
+    /// [`DetectionConfig::stop_threshold`]: crate::loop_control::detection::DetectionConfig::stop_threshold
+    /// [`DetectionManager`]: crate::loop_control::detection::DetectionManager
+    fn handle_detected_pattern(
+        &self,
+        pattern: &DetectedPattern,
+        turn: usize,
+    ) -> Option<Result<SessionResult, AgentError>> {
+        match pattern {
+            DetectedPattern::NoPattern => None,
+
+            DetectedPattern::LoopDetected {
+                repetitions,
+                pattern_description,
+            } => {
+                tracing::warn!(
+                    repetitions,
+                    pattern = %pattern_description,
+                    turn,
+                    "loop detected"
+                );
+
+                for obs in &self.observers {
+                    obs.on_loop_detected(pattern_description, *repetitions);
+                }
+                self.event_sink.on_event(&ObserveEvent::LoopDetected {
+                    tool: pattern_description.clone(),
+                    repetitions: *repetitions,
+                });
+
+                if *repetitions >= self.managers.detection.config().stop_threshold {
+                    tracing::error!(
+                        repetitions,
+                        pattern = %pattern_description,
+                        turn,
+                        "stopping agent: loop threshold exceeded"
+                    );
+                    Some(Err(AgentError::LoopDetected {
+                        message: format!("{pattern_description} repeated {repetitions} times"),
+                    }))
+                } else {
+                    None // warn but continue
+                }
+            }
+
+            DetectedPattern::ConvergenceDetected {
+                similarity,
+                consecutive_count,
+            } => {
+                tracing::warn!(similarity, consecutive_count, turn, "convergence detected");
+                let action = self.managers.detection.config().on_converge;
+                let action_str = match action {
+                    ConvergenceAction::Stop => "stop",
+                    ConvergenceAction::Warn => "warn",
+                    ConvergenceAction::Compact => "compact",
+                    ConvergenceAction::AskUser => "ask_user",
+                    ConvergenceAction::SwitchPhase => "switch_phase",
+                };
+
+                for obs in &self.observers {
+                    obs.on_convergence_detected(action_str);
+                }
+                self.event_sink
+                    .on_event(&ObserveEvent::ConvergenceDetected {
+                        action: action_str.to_string(),
+                    });
+
+                match action {
+                    ConvergenceAction::Stop => Some(Err(AgentError::LoopDetected {
+                        message: "agent stopped: convergence detected".into(),
+                    })),
+                    ConvergenceAction::Warn => None, // log already happened
+                    ConvergenceAction::Compact => {
+                        // Compact is handled by the existing compaction path,
+                        // so just continue. The compact will happen at the
+                        // end of the turn via maybe_compact_context().
+                        None
+                    }
+                    ConvergenceAction::AskUser => {
+                        // Not supported in BareLoop — treat as Stop
+                        Some(Err(AgentError::LoopDetected {
+                            message: "agent stopped: convergence detected, user input needed"
+                                .into(),
+                        }))
+                    }
+                    ConvergenceAction::SwitchPhase => {
+                        // Not supported in BareLoop — treat as Warn
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Hash tool input for loop-detection deduplication.
+    ///
+    /// Produces a deterministic `u64` hash from a [`serde_json::Value`] by
+    /// serialising it to a canonical JSON string, then feeding the bytes
+    /// through [`DefaultHasher`]. The hash is passed to
+    /// [`DetectionManager::record_tool_call`] so that identical tool inputs
+    /// can be detected without storing the full JSON payload.
+    ///
+    /// # Determinism
+    ///
+    /// `serde_json::to_string` produces a stable ordering for map keys, so
+    /// `{"a":1,"b":2}` and `{"b":2,"a":1}` hash identically. However,
+    /// floating-point values are **not** normalised — `1.0` and `1` produce
+    /// different hashes.
+    ///
+    /// [`DetectionManager::record_tool_call`]: crate::loop_control::detection::DetectionManager::record_tool_call
+    fn hash_tool_input(input: &serde_json::Value) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let serialized = serde_json::to_string(input).unwrap_or_default();
+        let mut hasher = DefaultHasher::new();
+        serialized.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Dispatch tool calls, push the result message, and record the count.
     ///
     /// Emits turn-complete on success, turn-failed on error.
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::Cancelled`] or a tool-dispatch error
-    /// propagated from [`dispatch_tools`](BareLoop::dispatch_tools).
+    /// Returns [`AgentError::Cancelled`] if the cancellation token is set.
+    /// Returns [`AgentError::Api`] if loop or convergence detection forces
+    /// an abort, or if the underlying tool dispatch fails.
     async fn dispatch_and_record(
         &mut self,
         tool_calls: &[ToolCallInfo],

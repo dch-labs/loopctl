@@ -1455,6 +1455,36 @@ impl DetectionManager {
     }
 }
 
+impl Default for DetectionManager {
+    /// Produce a [`DetectionManager`] with the default [`DetectionConfig`].
+    ///
+    /// Constructs the manager directly using struct-literal syntax, bypassing
+    /// the fallible [`DetectionManager::with_config`] constructor. This is
+    /// infallible because:
+    ///
+    /// - [`LoopDetector::new`] is infallible.
+    /// - [`ConvergenceDetector`] is initialised with a default window and
+    ///   threshold that satisfy its validation invariants (`window_size ≥ 2`,
+    ///   `threshold ∈ 0.0..=1.0`).
+    ///
+    /// [`ConvergenceDetector::new`]: crate::loop_control::convergence::ConvergenceDetector::new
+    fn default() -> Self {
+        let config = DetectionConfig::default();
+        let loop_config = config.to_loop_detector_config();
+        let loop_detector = Arc::new(LoopDetector::new(
+            loop_config,
+            Arc::new(super::loop_detector::NoOpToolSignature),
+        ));
+        let convergence_detector = Mutex::new(ConvergenceDetector::default());
+        Self {
+            config,
+            loop_detector,
+            convergence_detector,
+            stats: Mutex::new(DetectionStats::default()),
+        }
+    }
+}
+
 // ==================================================
 // Tests
 // ==================================================

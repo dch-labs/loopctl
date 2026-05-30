@@ -13,6 +13,7 @@ use super::{
 };
 #[cfg(feature = "hooks")]
 use super::{PostToolUseContext, PreToolUseContext};
+use crate::loop_control::loop_detector;
 
 impl<C: ApiClient> BareLoop<C> {
     /// Execute tool calls and return results.
@@ -93,125 +94,231 @@ impl<C: ApiClient> BareLoop<C> {
 
             self.notify_tool_call(&tc.name, &tc.input.to_string());
             self.emit_tool_start(&tc.name, &tc.input.to_string());
+
+            if let Some(blocked) = self.pre_detection(tc, turn_idx) {
+                return Ok(blocked);
+            }
+
             let start = Instant::now();
+            let tool_result = self
+                .dispatch_tool(tc, &tool_context, start, turn_idx)
+                .await?;
 
-            let tool_result = if let Some(ref pipeline) = self.pipeline {
-                self.dispatch_via_pipeline(pipeline, tc, &tool_context, start, turn_idx)
-                    .await?
-            } else if let Some(tool) = self.tools.get(&tc.name) {
-                let cancel = Arc::clone(&self.cancelled);
-                let call_result = tokio::select! {
-                    r = tool.call(tc.input.clone(), &tool_context) => r,
-                    () = cancel.notified() => {
-                        let dur = start.elapsed();
-                        self.notify_tool_complete(
-                            &tc.name,
-                            &tc.input.to_string(),
-                            "",
-                            dur,
-                            false,
-                            Some("cancelled"),
-                        );
-                        self.emit_tool_complete(&tc.name, "", true, dur);
-                        return Err(AgentError::Cancelled);
-                    }
-                };
-                match call_result {
-                    Ok(result) => {
-                        let duration = start.elapsed();
-                        let output_text = result.text_content();
-                        let success = !result.is_error;
-                        self.notify_tool_complete(
-                            &tc.name,
-                            &tc.input.to_string(),
-                            &output_text,
-                            duration,
-                            success,
-                            None,
-                        );
-                        self.emit_tool_complete(&tc.name, &output_text, !success, duration);
-                        ToolDispatchResult {
-                            tool_call_id: tc.id.clone(),
-                            output: result.payload,
-                            is_error: result.is_error,
-                            duration,
-                            resolved_tool_name: tc.name.clone(),
-                        }
-                    }
-                    Err(e) => {
-                        let duration = start.elapsed();
-                        let error_msg = e.to_string();
-                        self.notify_tool_complete(
-                            &tc.name,
-                            &tc.input.to_string(),
-                            &error_msg,
-                            duration,
-                            false,
-                            Some(&error_msg),
-                        );
-                        self.emit_tool_complete(&tc.name, &error_msg, true, duration);
-                        ToolDispatchResult {
-                            tool_call_id: tc.id.clone(),
-                            output: ToolContent::Text(error_msg.clone()),
-                            is_error: true,
-                            duration,
-                            resolved_tool_name: tc.name.clone(),
-                        }
-                    }
-                }
-            } else {
-                let available: Vec<String> = self.tools.tool_names().clone();
-                let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();
-                let error = AgentError::tool_not_found(&tc.name, &available_refs);
-                let error_msg = error.to_string();
-                self.notify_tool_complete(
-                    &tc.name,
-                    &tc.input.to_string(),
-                    &error_msg,
-                    Duration::ZERO,
-                    false,
-                    Some(&error_msg),
-                );
-                self.emit_tool_complete(&tc.name, &error_msg, true, Duration::ZERO);
-                ToolDispatchResult {
-                    tool_call_id: tc.id.clone(),
-                    output: ToolContent::Text(error_msg.clone()),
-                    is_error: true,
-                    duration: Duration::ZERO,
-                    resolved_tool_name: tc.name.clone(),
-                }
-            };
-
+            self.post_detection(tc, &tool_result);
             self.notify_post_tool_use_hooks(tc, &tool_result, turn_idx);
             self.record_tool_health(tc.name.as_str(), &tool_result);
 
-            // If the tool succeeded, return immediately.
             if !tool_result.is_error {
                 return Ok(tool_result);
             }
 
-            // Tool failed — consult reflector + recovery strategy.
-            let recovery_action = self.recover_tool_error(tc, &tool_result, attempt).await;
+            match self
+                .recovery_wait_or_return(tc, &tool_result, attempt)
+                .await
+            {
+                Ok(next_attempt) => attempt = next_attempt,
+                Err(returned_result) => return Ok(returned_result),
+            }
+        }
+    }
 
-            match recovery_action {
-                RecoveryAction::Retry { delay } => {
-                    attempt = attempt.saturating_add(1);
-                    if attempt >= Self::MAX_RECOVERY_ATTEMPTS {
-                        return Ok(tool_result);
-                    }
-                    tokio::select! {
-                        () = tokio::time::sleep(delay) => {},
-                        () = self.cancelled.notified() => {
-                            return Err(AgentError::Cancelled);
-                        }
-                    }
-                    // Loop to retry the tool call.
+    /// Check for a loop pattern before executing the tool.
+    ///
+    /// Hashes the tool input, records the call with the detection manager,
+    /// and returns a soft-error result if the same (tool, input-hash) pair
+    /// has exceeded the loop threshold. Returns `None` when dispatch should
+    /// proceed normally.
+    fn pre_detection(&self, tc: &ToolCallInfo, turn_idx: usize) -> Option<ToolDispatchResult> {
+        let input_hash = Self::hash_tool_input(&tc.input);
+        let pattern = self
+            .managers
+            .detection
+            .record_tool_call(&tc.name, input_hash);
+        self.handle_detected_pattern(&pattern, turn_idx)
+            .map(|_result| ToolDispatchResult {
+                tool_call_id: tc.id.clone(),
+                output: ToolContent::Text("loop detected: aborting tool dispatch".into()),
+                is_error: true,
+                duration: Duration::ZERO,
+                resolved_tool_name: tc.name.clone(),
+            })
+    }
+
+    /// Record the tool result with the detection manager (post-execution).
+    ///
+    /// Hashes the tool's text output and feeds the (tool, input-hash,
+    /// result-hash) triple back to the detection manager. This lets the
+    /// detector distinguish "same input, same output" (stuck) from
+    /// "same input, different output" (progress).
+    fn post_detection(&self, tc: &ToolCallInfo, tool_result: &ToolDispatchResult) {
+        let input_hash = Self::hash_tool_input(&tc.input);
+        let result_hash = match &tool_result.output {
+            ToolContent::Text(t) => loop_detector::hash_result(t),
+            ToolContent::Multipart(_) => None,
+        };
+        if let Some(rh) = result_hash {
+            let _ = self.managers.detection.record_tool_call_with_result(
+                &tc.name,
+                input_hash,
+                Some(rh),
+            );
+        }
+    }
+
+    /// Execute a single tool call through the pipeline or registry.
+    ///
+    /// Tries the middleware pipeline first, then a direct registry lookup,
+    /// then produces a not-found error result. Handles cancellation during
+    /// execution and emits observer/sink events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Cancelled`] if the cancel signal fires
+    /// during tool execution.
+    async fn dispatch_tool(
+        &self,
+        tc: &ToolCallInfo,
+        tool_context: &ToolContext,
+        start: Instant,
+        turn_idx: usize,
+    ) -> Result<ToolDispatchResult, AgentError> {
+        if let Some(ref pipeline) = self.pipeline {
+            return self
+                .dispatch_via_pipeline(pipeline, tc, tool_context, start, turn_idx)
+                .await;
+        }
+
+        let tool_result = if let Some(tool) = self.tools.get(&tc.name) {
+            let cancel = Arc::clone(&self.cancelled);
+            let call_result = tokio::select! {
+                r = tool.call(tc.input.clone(), tool_context) => r,
+                () = cancel.notified() => {
+                    let dur = start.elapsed();
+                    self.notify_tool_complete(
+                        &tc.name,
+                        &tc.input.to_string(),
+                        "",
+                        dur,
+                        false,
+                        Some("cancelled"),
+                    );
+                    self.emit_tool_complete(&tc.name, "", true, dur);
+                    return Err(AgentError::Cancelled);
                 }
-                RecoveryAction::Skip(_) | RecoveryAction::AskUser(_) | RecoveryAction::Fail(_) => {
-                    // All non-retry actions: return the error result as a
-                    // soft error so the model can see it and respond.
-                    return Ok(tool_result);
+            };
+            match call_result {
+                Ok(result) => {
+                    let duration = start.elapsed();
+                    let output_text = result.text_content();
+                    let success = !result.is_error;
+                    self.notify_tool_complete(
+                        &tc.name,
+                        &tc.input.to_string(),
+                        &output_text,
+                        duration,
+                        success,
+                        None,
+                    );
+                    self.emit_tool_complete(&tc.name, &output_text, !success, duration);
+                    ToolDispatchResult {
+                        tool_call_id: tc.id.clone(),
+                        output: result.payload,
+                        is_error: result.is_error,
+                        duration,
+                        resolved_tool_name: tc.name.clone(),
+                    }
                 }
+                Err(e) => {
+                    let duration = start.elapsed();
+                    let error_msg = e.to_string();
+                    self.notify_tool_complete(
+                        &tc.name,
+                        &tc.input.to_string(),
+                        &error_msg,
+                        duration,
+                        false,
+                        Some(&error_msg),
+                    );
+                    self.emit_tool_complete(&tc.name, &error_msg, true, duration);
+                    ToolDispatchResult {
+                        tool_call_id: tc.id.clone(),
+                        output: ToolContent::Text(error_msg),
+                        is_error: true,
+                        duration,
+                        resolved_tool_name: tc.name.clone(),
+                    }
+                }
+            }
+        } else {
+            self.tool_not_found(tc)
+        };
+
+        Ok(tool_result)
+    }
+
+    /// Build a soft-error result for a tool that isn't in the registry.
+    ///
+    /// Notifies observers and emits a sink event with the error message
+    /// that lists available tool names to help the model recover.
+    fn tool_not_found(&self, tc: &ToolCallInfo) -> ToolDispatchResult {
+        let available: Vec<String> = self.tools.tool_names();
+        let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();
+        let error = AgentError::tool_not_found(&tc.name, &available_refs);
+        let error_msg = error.to_string();
+        self.notify_tool_complete(
+            &tc.name,
+            &tc.input.to_string(),
+            &error_msg,
+            Duration::ZERO,
+            false,
+            Some(&error_msg),
+        );
+        self.emit_tool_complete(&tc.name, &error_msg, true, Duration::ZERO);
+        ToolDispatchResult {
+            tool_call_id: tc.id.clone(),
+            output: ToolContent::Text(error_msg),
+            is_error: true,
+            duration: Duration::ZERO,
+            resolved_tool_name: tc.name.clone(),
+        }
+    }
+
+    /// Decide whether to retry a failed tool or return the error result.
+    ///
+    /// Consults the reflector and recovery strategy. On `Retry`, sleeps for
+    /// the prescribed delay (cancellation-aware) and returns the updated
+    /// attempt count via `Ok`. On all other recovery actions, returns the
+    /// original error result via `Err` (which ends the retry loop).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(ToolDispatchResult)` when the recovery strategy decides
+    /// not to retry — the caller should return this as a soft error.
+    async fn recovery_wait_or_return(
+        &self,
+        tc: &ToolCallInfo,
+        tool_result: &ToolDispatchResult,
+        attempt: u32,
+    ) -> Result<u32, ToolDispatchResult> {
+        let recovery_action = self.recover_tool_error(tc, tool_result, attempt).await;
+        match recovery_action {
+            RecoveryAction::Retry { delay } => {
+                let next_attempt = attempt.saturating_add(1);
+                if next_attempt >= Self::MAX_RECOVERY_ATTEMPTS {
+                    return Err(tool_result.clone());
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {},
+                    () = self.cancelled.notified() => {
+                        // Return a placeholder — the caller checks
+                        // cancellation at the top of the retry loop.
+                        return Err(tool_result.clone());
+                    }
+                }
+                Ok(next_attempt)
+            }
+            RecoveryAction::Skip(_) | RecoveryAction::AskUser(_) | RecoveryAction::Fail(_) => {
+                Err(tool_result.clone())
             }
         }
     }

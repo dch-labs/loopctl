@@ -15,6 +15,18 @@ use super::{
 use super::{PostToolUseContext, PreToolUseContext};
 use crate::loop_control::loop_detector;
 
+/// Result of deciding what to do after a tool error during recovery.
+///
+/// Distinguishes between returning a soft-error result (the tool failed,
+/// but the session should continue) and a hard cancellation (the user
+/// cancelled during the backoff sleep).
+enum RecoveryOutcome {
+    /// Return this soft-error result to the caller.
+    SoftError(ToolDispatchResult),
+    /// The session was cancelled during the recovery wait.
+    Cancelled,
+}
+
 impl<C: ApiClient> BareLoop<C> {
     /// Execute tool calls and return results.
     ///
@@ -92,12 +104,12 @@ impl<C: ApiClient> BareLoop<C> {
                 return Ok(blocked);
             }
 
-            self.notify_tool_call(&tc.name, &tc.input.to_string());
-            self.emit_tool_start(&tc.name, &tc.input.to_string());
-
             if let Some(blocked) = self.pre_detection(tc, turn_idx) {
                 return Ok(blocked);
             }
+
+            self.notify_tool_call(&tc.name, &tc.input.to_string());
+            self.emit_tool_start(&tc.name, &tc.input.to_string());
 
             let start = Instant::now();
             let tool_result = self
@@ -117,7 +129,8 @@ impl<C: ApiClient> BareLoop<C> {
                 .await
             {
                 Ok(next_attempt) => attempt = next_attempt,
-                Err(returned_result) => return Ok(returned_result),
+                Err(RecoveryOutcome::SoftError(returned_result)) => return Ok(returned_result),
+                Err(RecoveryOutcome::Cancelled) => return Err(AgentError::Cancelled),
             }
         }
     }
@@ -299,26 +312,24 @@ impl<C: ApiClient> BareLoop<C> {
         tc: &ToolCallInfo,
         tool_result: &ToolDispatchResult,
         attempt: u32,
-    ) -> Result<u32, ToolDispatchResult> {
+    ) -> Result<u32, RecoveryOutcome> {
         let recovery_action = self.recover_tool_error(tc, tool_result, attempt).await;
         match recovery_action {
             RecoveryAction::Retry { delay } => {
                 let next_attempt = attempt.saturating_add(1);
                 if next_attempt >= Self::MAX_RECOVERY_ATTEMPTS {
-                    return Err(tool_result.clone());
+                    return Err(RecoveryOutcome::SoftError(tool_result.clone()));
                 }
                 tokio::select! {
                     () = tokio::time::sleep(delay) => {},
                     () = self.cancelled.notified() => {
-                        // Return a placeholder — the caller checks
-                        // cancellation at the top of the retry loop.
-                        return Err(tool_result.clone());
+                        return Err(RecoveryOutcome::Cancelled);
                     }
                 }
                 Ok(next_attempt)
             }
             RecoveryAction::Skip(_) | RecoveryAction::AskUser(_) | RecoveryAction::Fail(_) => {
-                Err(tool_result.clone())
+                Err(RecoveryOutcome::SoftError(tool_result.clone()))
             }
         }
     }

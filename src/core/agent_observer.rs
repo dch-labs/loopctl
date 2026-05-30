@@ -156,6 +156,20 @@ pub trait AgentObserver: Send + Sync {
     /// and the framework switches to a backup.
     /// `from` is the model that failed; `to` is the replacement.
     fn on_fallback(&self, _from: &str, _to: &str) {}
+
+    /// Called when a loop is detected in tool operations.
+    ///
+    /// Fired by the detection manager when the same tool call pattern
+    /// has been repeated beyond the configured loop threshold.
+    /// `tool` is the repeating tool name; `repetitions` is the count.
+    fn on_loop_detected(&self, _tool: &str, _repetitions: usize) {}
+
+    /// Called when convergence is detected in agent responses.
+    ///
+    /// Fired by the detection manager when recent agent responses
+    /// have become semantically similar beyond the configured threshold.
+    /// `action` describes the configured response (e.g. `"stop"`, `"warn"`).
+    fn on_convergence_detected(&self, _action: &str) {}
 }
 
 #[cfg(test)]

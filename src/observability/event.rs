@@ -166,6 +166,27 @@ pub enum ObserveEvent {
         /// Error source or category.
         source: String,
     },
+
+    /// A loop was detected in tool operations.
+    ///
+    /// Emitted when the detection manager observes the same tool call
+    /// pattern repeated beyond the configured loop threshold.
+    LoopDetected {
+        /// Tool name that was repeating.
+        tool: String,
+        /// Number of repetitions observed.
+        repetitions: usize,
+    },
+
+    /// Convergence was detected in agent responses.
+    ///
+    /// Emitted when the detection manager observes that recent agent
+    /// responses have become semantically similar beyond the configured
+    /// threshold.
+    ConvergenceDetected {
+        /// Configured action to take (e.g. `"stop"`, `"warn"`, `"compact"`).
+        action: String,
+    },
 }
 
 #[cfg(test)]
@@ -351,5 +372,41 @@ mod tests {
 
         let de: ObserveEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(de, ObserveEvent::ToolStart { .. }));
+    }
+
+    #[test]
+    fn loop_detected_round_trip() {
+        let event = ObserveEvent::LoopDetected {
+            tool: "Read(/etc/hosts)".to_string(),
+            repetitions: 3,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"loop_detected\""));
+        assert!(json.contains("\"repetitions\":3"));
+
+        let de: ObserveEvent = serde_json::from_str(&json).unwrap();
+        if let ObserveEvent::LoopDetected { tool, repetitions } = de {
+            assert_eq!(tool, "Read(/etc/hosts)");
+            assert_eq!(repetitions, 3);
+        } else {
+            panic!("expected LoopDetected");
+        }
+    }
+
+    #[test]
+    fn convergence_detected_round_trip() {
+        let event = ObserveEvent::ConvergenceDetected {
+            action: "stop".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"convergence_detected\""));
+        assert!(json.contains("\"action\":\"stop\""));
+
+        let de: ObserveEvent = serde_json::from_str(&json).unwrap();
+        if let ObserveEvent::ConvergenceDetected { action } = de {
+            assert_eq!(action, "stop");
+        } else {
+            panic!("expected ConvergenceDetected");
+        }
     }
 }

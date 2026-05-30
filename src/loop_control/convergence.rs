@@ -975,6 +975,31 @@ impl ConvergenceDetector {
     }
 }
 
+impl Default for ConvergenceDetector {
+    /// Produce a [`ConvergenceDetector`] with the default [`ConvergenceConfig`].
+    ///
+    /// Constructs the detector directly using struct-literal syntax, bypassing
+    /// [`ConvergenceDetector::new`]'s validation. This is safe because the
+    /// default config uses `window_size: 3` (≥ 2) and
+    /// `similarity_threshold: 0.95` (in `0.0..=1.0`), which satisfy all
+    /// validation invariants.
+    ///
+    /// This impl exists so that parent types (e.g. [`DetectionManager`]) can
+    /// derive or delegate `Default` without going through a fallible constructor.
+    ///
+    /// [`DetectionManager`]: crate::loop_control::detection::DetectionManager
+    fn default() -> Self {
+        let config = ConvergenceConfig::default();
+        let window_capacity = config.window_size;
+        Self {
+            config,
+            window: VecDeque::with_capacity(window_capacity),
+            consecutive_count: 0,
+            similar_responses: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

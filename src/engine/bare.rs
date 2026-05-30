@@ -1009,7 +1009,41 @@ impl<C: ApiClient> BareLoop<C> {
                     let pattern = self.managers.detection.record_response(&text);
                     if let Some(result) = self.handle_detected_pattern(&pattern, budget.turn_count)
                     {
-                        return result;
+                        let turn_elapsed = turn_start.elapsed();
+                        return match result {
+                            Ok(session_result) => {
+                                self.emit_turn_complete(
+                                    budget.turn_count,
+                                    turn_elapsed,
+                                    TurnTokens::from_usage(usage.as_ref()).input,
+                                    TurnTokens::from_usage(usage.as_ref()).output,
+                                );
+                                self.notify_turn_end(true, None);
+                                self.emit_session_stop(
+                                    budget.turn_count,
+                                    start.elapsed(),
+                                    true,
+                                    "detection_early_exit",
+                                );
+                                self.notify_session_end(&SessionEndInfo {
+                                    success: true,
+                                    reason: EndReason::Complete,
+                                    total_turns: budget.turn_count,
+                                    total_tokens: budget
+                                        .input_tokens
+                                        .saturating_add(budget.output_tokens),
+                                    duration_secs: start.elapsed().as_secs(),
+                                });
+                                Ok(session_result)
+                            }
+                            Err(e) => self.abort_turn_and_session(
+                                &budget,
+                                turn_elapsed,
+                                start.elapsed(),
+                                &e.to_string(),
+                                e,
+                            ),
+                        };
                     }
 
                     let tool_calls = Self::extract_tool_calls(&assistant_msg);
@@ -1120,6 +1154,15 @@ impl<C: ApiClient> BareLoop<C> {
                     turn,
                     "loop detected"
                 );
+
+                for obs in &self.observers {
+                    obs.on_loop_detected(pattern_description, *repetitions);
+                }
+                self.event_sink.on_event(&ObserveEvent::LoopDetected {
+                    tool: pattern_description.clone(),
+                    repetitions: *repetitions,
+                });
+
                 if *repetitions >= self.managers.detection.config().stop_threshold {
                     tracing::error!(
                         repetitions,
@@ -1127,9 +1170,9 @@ impl<C: ApiClient> BareLoop<C> {
                         turn,
                         "stopping agent: loop threshold exceeded"
                     );
-                    Some(Err(AgentError::Api(format!(
-                        "loop detected: {pattern_description} repeated {repetitions} times"
-                    ))))
+                    Some(Err(AgentError::LoopDetected {
+                        message: format!("{pattern_description} repeated {repetitions} times"),
+                    }))
                 } else {
                     None // warn but continue
                 }
@@ -1141,10 +1184,26 @@ impl<C: ApiClient> BareLoop<C> {
             } => {
                 tracing::warn!(similarity, consecutive_count, turn, "convergence detected");
                 let action = self.managers.detection.config().on_converge;
+                let action_str = match action {
+                    ConvergenceAction::Stop => "stop",
+                    ConvergenceAction::Warn => "warn",
+                    ConvergenceAction::Compact => "compact",
+                    ConvergenceAction::AskUser => "ask_user",
+                    ConvergenceAction::SwitchPhase => "switch_phase",
+                };
+
+                for obs in &self.observers {
+                    obs.on_convergence_detected(action_str);
+                }
+                self.event_sink
+                    .on_event(&ObserveEvent::ConvergenceDetected {
+                        action: action_str.to_string(),
+                    });
+
                 match action {
-                    ConvergenceAction::Stop => Some(Err(AgentError::Api(
-                        "agent stopped: convergence detected".into(),
-                    ))),
+                    ConvergenceAction::Stop => Some(Err(AgentError::LoopDetected {
+                        message: "agent stopped: convergence detected".into(),
+                    })),
                     ConvergenceAction::Warn => None, // log already happened
                     ConvergenceAction::Compact => {
                         // Compact is handled by the existing compaction path,
@@ -1154,9 +1213,10 @@ impl<C: ApiClient> BareLoop<C> {
                     }
                     ConvergenceAction::AskUser => {
                         // Not supported in BareLoop — treat as Stop
-                        Some(Err(AgentError::Api(
-                            "agent stopped: convergence detected, user input needed".into(),
-                        )))
+                        Some(Err(AgentError::LoopDetected {
+                            message: "agent stopped: convergence detected, user input needed"
+                                .into(),
+                        }))
                     }
                     ConvergenceAction::SwitchPhase => {
                         // Not supported in BareLoop — treat as Warn

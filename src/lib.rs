@@ -9,12 +9,11 @@
 //! - **[`builder`]** — Fluent builder API for constructing configured agents.
 //! - **[`cancel`]** — Cooperative cancellation signal (`CancelSignal`).
 //! - **[`compact`]** — Context management and compaction (threshold detection, pluggable strategies).
-//! - **[`core`]** — Foundational traits (`AgentObserver`) and error types.
-//! - **[`builtin`]** — Reference implementations of core traits ([`builtin::memory::InMemoryStore`], [`builtin::observer::LoggingObserver`], etc.).
+//! - **[`core`]** — Foundational traits and error types.
+//! - **[`builtin`]** — Reference implementations of core traits ([`builtin::memory::InMemoryStore`], etc.).
 //! - **[`hooks`]** — Bidirectional lifecycle control (allow/block/ask before tool use, compaction). *Requires `hooks` feature.*
 //! - **[`loop_control`]** — Detection and intervention modules for agent loops.
 //! - **[`engine`]** — The core agentic loop that orchestrates the full agent lifecycle.
-//! - **[`observability`]** — Structured event streaming (`EventSink`, `ObserveEvent`, metrics).
 //! - **[`stream`]** — Streaming event types for LLM API responses.
 //! - **[`tool`]** — Tool trait, registry, and supporting types.
 //! - **[`tool::health`]** — Per-tool health monitoring, circuit breakers, and self-healing routing. *Requires `tool_health` feature.*
@@ -31,7 +30,6 @@ pub mod engine;
 pub mod hooks;
 pub mod loop_control;
 pub mod message;
-pub mod observability;
 pub mod stream;
 #[cfg(feature = "testing")]
 pub mod testing;

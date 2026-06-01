@@ -8,12 +8,13 @@
 use super::HookAction;
 use super::{
     AgentError, ApiClient, Arc, BareLoop, Duration, Instant, PermissionCheck, RecoveryAction,
-    ReflectionContext, ToolCallInfo, ToolContent, ToolContentPart, ToolContext,
-    ToolDispatchContext, ToolDispatchResult, ToolPipeline,
+    ReflectionContext, ToolCallInfo, ToolContent, ToolContext, ToolDispatchContext,
+    ToolDispatchResult, ToolPipeline,
 };
 #[cfg(feature = "hooks")]
 use super::{PostToolUseContext, PreToolUseContext};
-use crate::loop_control::loop_detector;
+use crate::core::observer::{ToolPostContext, ToolPreContext};
+use crate::loop_control::loop_detector::{self, Operation};
 
 /// Result of deciding what to do after a tool error during recovery.
 ///
@@ -45,8 +46,8 @@ impl<C: ApiClient> BareLoop<C> {
     /// attempts use the delay specified by the [`RecoveryAction`].
     ///
     /// Observers are notified before and after each tool invocation via
-    /// [`on_tool_call`](AgentObserver::on_tool_call) and
-    /// [`on_tool_complete`](AgentObserver::on_tool_complete).
+    /// [`LoopObserver::on_tool_pre`](crate::core::observer::LoopObserver::on_tool_pre) and
+    /// [`LoopObserver::on_tool_post`](crate::core::observer::LoopObserver::on_tool_post).
     ///
     /// # Errors
     ///
@@ -100,6 +101,12 @@ impl<C: ApiClient> BareLoop<C> {
                 return Err(AgentError::Cancelled);
             }
 
+            self.managers.observers().on_tool_pre(&ToolPreContext {
+                turn: turn_idx,
+                tool: tc.name.clone(),
+                tool_call_id: tc.id.clone(),
+            });
+
             if let Some(blocked) = self.check_pre_tool_use_hooks(tc, turn_idx) {
                 return Ok(blocked);
             }
@@ -108,15 +115,19 @@ impl<C: ApiClient> BareLoop<C> {
                 return Ok(blocked);
             }
 
-            self.notify_tool_call(&tc.name, &tc.input.to_string());
-            self.emit_tool_start(&tc.name, &tc.input.to_string());
-
             let start = Instant::now();
             let tool_result = self
                 .dispatch_tool(tc, &tool_context, start, turn_idx)
                 .await?;
 
             self.post_detection(tc, &tool_result);
+            self.managers.observers().on_tool_post(&ToolPostContext {
+                turn: turn_idx,
+                tool: tc.name.clone(),
+                result_hash: loop_detector::hash_result(&tool_result.output.to_string()),
+                is_error: tool_result.is_error,
+                duration: tool_result.duration,
+            });
             self.notify_post_tool_use_hooks(tc, &tool_result, turn_idx);
             self.record_tool_health(tc.name.as_str(), &tool_result);
 
@@ -137,52 +148,62 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Check for a loop pattern before executing the tool.
     ///
-    /// Hashes the tool input, records the call with the detection manager,
-    /// and returns a soft-error result if the same (tool, input-hash) pair
+    /// Extracts the primary parameter from the tool input using the
+    /// configured [`ToolSignature`], records the call with the detection
+    /// manager, and returns a soft-error result if the same operation
     /// has exceeded the loop threshold. Returns `None` when dispatch should
     /// proceed normally.
     fn pre_detection(&self, tc: &ToolCallInfo, turn_idx: usize) -> Option<ToolDispatchResult> {
-        let input_hash = Self::hash_tool_input(&tc.input);
-        let pattern = self
-            .managers
-            .detection
-            .record_tool_call(&tc.name, input_hash);
-        self.handle_detected_pattern(&pattern, turn_idx)
+        let operation = Operation::from_input_with_signature(
+            &tc.name,
+            &tc.input,
+            self.managers.detection.signature(),
+        );
+        let pattern = self.managers.detection.record_operation(operation);
+
+        // Check inline detection
+        let inline_blocked = self
+            .handle_detected_pattern(&pattern, turn_idx)
             .map(|_result| ToolDispatchResult {
                 tool_call_id: tc.id.clone(),
                 output: ToolContent::Text("loop detected: aborting tool dispatch".into()),
                 is_error: true,
                 duration: Duration::ZERO,
                 resolved_tool_name: tc.name.clone(),
-            })
+            });
+
+        if inline_blocked.is_some() {
+            return inline_blocked;
+        }
+
+        None
     }
 
     /// Record the tool result with the detection manager (post-execution).
     ///
-    /// Hashes the tool's text output and feeds the (tool, input-hash,
-    /// result-hash) triple back to the detection manager. This lets the
-    /// detector distinguish "same input, same output" (stuck) from
-    /// "same input, different output" (progress).
+    /// Constructs an [`Operation`] with the result hash and records it with
+    /// the detection manager. This lets the detector distinguish "same input,
+    /// same output" (stuck) from "same input, different output" (progress).
     fn post_detection(&self, tc: &ToolCallInfo, tool_result: &ToolDispatchResult) {
-        let input_hash = Self::hash_tool_input(&tc.input);
         let result_hash = match &tool_result.output {
             ToolContent::Text(t) => loop_detector::hash_result(t),
             ToolContent::Multipart(_) => None,
         };
-        if let Some(rh) = result_hash {
-            let _ = self.managers.detection.record_tool_call_with_result(
-                &tc.name,
-                input_hash,
-                Some(rh),
-            );
-        }
+        let operation = Operation::from_input_with_result_and_signature(
+            &tc.name,
+            &tc.input,
+            result_hash,
+            self.managers.detection.signature(),
+        );
+        self.managers.detection.record_operation(operation);
     }
 
     /// Execute a single tool call through the pipeline or registry.
     ///
     /// Tries the middleware pipeline first, then a direct registry lookup,
     /// then produces a not-found error result. Handles cancellation during
-    /// execution and emits observer/sink events.
+    /// execution. Observer notification is handled by the caller
+    /// ([`dispatch_tool_with_recovery`]).
     ///
     /// # Errors
     ///
@@ -197,7 +218,7 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Result<ToolDispatchResult, AgentError> {
         if let Some(ref pipeline) = self.pipeline {
             return self
-                .dispatch_via_pipeline(pipeline, tc, tool_context, start, turn_idx)
+                .dispatch_via_pipeline(pipeline, tc, tool_context, turn_idx)
                 .await;
         }
 
@@ -206,33 +227,12 @@ impl<C: ApiClient> BareLoop<C> {
             let call_result = tokio::select! {
                 r = tool.call(tc.input.clone(), tool_context) => r,
                 () = cancel.notified() => {
-                    let dur = start.elapsed();
-                    self.notify_tool_complete(
-                        &tc.name,
-                        &tc.input.to_string(),
-                        "",
-                        dur,
-                        false,
-                        Some("cancelled"),
-                    );
-                    self.emit_tool_complete(&tc.name, "", true, dur);
                     return Err(AgentError::Cancelled);
                 }
             };
             match call_result {
                 Ok(result) => {
                     let duration = start.elapsed();
-                    let output_text = result.text_content();
-                    let success = !result.is_error;
-                    self.notify_tool_complete(
-                        &tc.name,
-                        &tc.input.to_string(),
-                        &output_text,
-                        duration,
-                        success,
-                        None,
-                    );
-                    self.emit_tool_complete(&tc.name, &output_text, !success, duration);
                     ToolDispatchResult {
                         tool_call_id: tc.id.clone(),
                         output: result.payload,
@@ -244,15 +244,6 @@ impl<C: ApiClient> BareLoop<C> {
                 Err(e) => {
                     let duration = start.elapsed();
                     let error_msg = e.to_string();
-                    self.notify_tool_complete(
-                        &tc.name,
-                        &tc.input.to_string(),
-                        &error_msg,
-                        duration,
-                        false,
-                        Some(&error_msg),
-                    );
-                    self.emit_tool_complete(&tc.name, &error_msg, true, duration);
                     ToolDispatchResult {
                         tool_call_id: tc.id.clone(),
                         output: ToolContent::Text(error_msg),
@@ -271,22 +262,13 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Build a soft-error result for a tool that isn't in the registry.
     ///
-    /// Notifies observers and emits a sink event with the error message
+    /// Notifies observers with the error message
     /// that lists available tool names to help the model recover.
     fn tool_not_found(&self, tc: &ToolCallInfo) -> ToolDispatchResult {
         let available: Vec<String> = self.tools.tool_names();
         let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();
         let error = AgentError::tool_not_found(&tc.name, &available_refs);
         let error_msg = error.to_string();
-        self.notify_tool_complete(
-            &tc.name,
-            &tc.input.to_string(),
-            &error_msg,
-            Duration::ZERO,
-            false,
-            Some(&error_msg),
-        );
-        self.emit_tool_complete(&tc.name, &error_msg, true, Duration::ZERO);
         ToolDispatchResult {
             tool_call_id: tc.id.clone(),
             output: ToolContent::Text(error_msg),
@@ -356,22 +338,18 @@ impl<C: ApiClient> BareLoop<C> {
             };
             match executor.check_pre_tool_use(&ctx) {
                 HookAction::Allow => None,
-                HookAction::Block { reason } => {
-                    self.emit_tool_complete(&tc.name, &reason, true, Duration::ZERO);
-                    Some(ToolDispatchResult {
-                        tool_call_id: tc.id.clone(),
-                        output: ToolContent::Text(reason),
-                        is_error: true,
-                        duration: Duration::ZERO,
-                        resolved_tool_name: tc.name.clone(),
-                    })
-                }
+                HookAction::Block { reason } => Some(ToolDispatchResult {
+                    tool_call_id: tc.id.clone(),
+                    output: ToolContent::Text(reason),
+                    is_error: true,
+                    duration: Duration::ZERO,
+                    resolved_tool_name: tc.name.clone(),
+                }),
                 HookAction::Ask { message } => {
                     // In Headless mode (the default) the executor already
                     // downgrades Ask → Block. If we reach this arm the
                     // executor is Interactive, but BareLoop has no UI to
                     // show a prompt, so we still treat it as Block.
-                    self.emit_tool_complete(&tc.name, &message, true, Duration::ZERO);
                     Some(ToolDispatchResult {
                         tool_call_id: tc.id.clone(),
                         output: ToolContent::Text(message),
@@ -446,8 +424,9 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Builds a [`ToolDispatchContext`] from the tool call info, delegates
     /// to the pipeline's middleware chain, and converts the
-    /// [`ToolDispatchResult`] back to a [`ToolDispatchResult`] with proper
-    /// event emission. Handles cancellation via `tokio::select!`.
+    /// [`ToolDispatchResult`] back to a [`ToolDispatchResult`].
+    /// Observer notification is handled by the caller
+    /// ([`dispatch_tool_with_recovery`]).
     ///
     /// # Errors
     ///
@@ -458,7 +437,6 @@ impl<C: ApiClient> BareLoop<C> {
         pipeline: &ToolPipeline,
         tc: &ToolCallInfo,
         tool_context: &ToolContext,
-        start: Instant,
         turn_idx: usize,
     ) -> Result<ToolDispatchResult, AgentError> {
         let ctx = ToolDispatchContext {
@@ -474,48 +452,9 @@ impl<C: ApiClient> BareLoop<C> {
         let dispatch_result = tokio::select! {
             r = pipeline.invoke(ctx) => r,
             () = cancel.notified() => {
-                let dur = start.elapsed();
-                self.notify_tool_complete(
-                    &tc.name,
-                    &tc.input.to_string(),
-                    "",
-                    dur,
-                    false,
-                    Some("cancelled"),
-                );
-                self.emit_tool_complete(&tc.name, "", true, dur);
                 return Err(AgentError::Cancelled);
             }
         };
-        let output_text = match &dispatch_result.output {
-            ToolContent::Text(t) => t.clone(),
-            ToolContent::Multipart(parts) => parts
-                .iter()
-                .filter_map(|p| match p {
-                    ToolContentPart::Text { text } => Some(text.as_str()),
-                    ToolContentPart::Image { .. } => None,
-                })
-                .collect::<Vec<_>>()
-                .join(""),
-        };
-        self.notify_tool_complete(
-            &tc.name,
-            &tc.input.to_string(),
-            &output_text,
-            dispatch_result.duration,
-            !dispatch_result.is_error,
-            if dispatch_result.is_error {
-                Some(&output_text)
-            } else {
-                None
-            },
-        );
-        self.emit_tool_complete(
-            &tc.name,
-            &output_text,
-            dispatch_result.is_error,
-            dispatch_result.duration,
-        );
         Ok(ToolDispatchResult {
             tool_call_id: if dispatch_result.tool_call_id.is_empty() {
                 tc.id.clone()

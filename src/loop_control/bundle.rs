@@ -26,8 +26,10 @@
 //! bundle.reset_all();
 //! ```
 
+use crate::core::observer::{LoopObserver, ObserverHost};
 use crate::loop_control::detection::DetectionManager;
 use crate::loop_control::fallback::FallbackManager;
+use std::sync::Arc;
 
 /// Bundle of framework-provided manager instances.
 ///
@@ -67,6 +69,14 @@ pub struct ManagerBundle {
     ///
     /// See [`DetectionManager`] for the full API documentation.
     pub detection: DetectionManager,
+
+    /// Observer host for cross-cutting lifecycle hooks.
+    ///
+    /// Observers are registered via [`ManagerBundle::register_observer`] and
+    /// called at well-defined hook points inside the agent loop.
+    ///
+    /// See [`ObserverHost`] and [`LoopObserver`] for details.
+    observers: ObserverHost,
 }
 
 impl ManagerBundle {
@@ -89,6 +99,7 @@ impl ManagerBundle {
         Self {
             fallback: FallbackManager::default(),
             detection: DetectionManager::default(),
+            observers: ObserverHost::new(),
         }
     }
 
@@ -143,11 +154,39 @@ impl ManagerBundle {
         self
     }
 
-    /// Reset all managers to their initial state.
+    /// Register an observer with the observer host.
     ///
-    /// Delegates to each manager's `reset()` method. Typically called at the
-    /// start of a new agent task or session to clear any accumulated state
-    /// from a previous run.
+    /// Observers are called at lifecycle hook points inside the agent
+    /// loop, in registration order. All observers are notified at every
+    /// hook point (no short-circuiting).
+    ///
+    /// See [`LoopObserver`] for the trait definition and available hooks.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::core::observer::LoopObserver;
+    /// use std::sync::Arc;
+    ///
+    /// let mut bundle = ManagerBundle::new();
+    /// bundle.register_observer(Arc::new(MyObserver));
+    /// ```
+    pub fn register_observer(&mut self, observer: Arc<dyn LoopObserver>) {
+        self.observers.register(observer);
+    }
+
+    /// Get a reference to the observer host.
+    ///
+    /// Used by `BareLoop` to dispatch hook calls.
+    pub fn observers(&self) -> &ObserverHost {
+        &self.observers
+    }
+
+    /// Reset all managers and observers to their initial state.
+    ///
+    /// Delegates to each manager's `reset()` method and calls
+    /// [`ObserverHost::reset_all`]. Typically called at the start of
+    /// a new agent task or session.
     ///
     /// # Example
     ///
@@ -161,6 +200,7 @@ impl ManagerBundle {
     pub fn reset_all(&self) {
         self.fallback.reset();
         self.detection.reset();
+        self.observers.reset_all();
     }
 }
 

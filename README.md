@@ -27,7 +27,6 @@ and tool implementations; the framework handles the rest.
 | [`engine`](https://docs.rs/loopctl/latest/loopctl/engine/index.html)      | `BareLoop<C>` — the default agent loop engine (stream → accumulate → dispatch tools → repeat) |
 | [`loop_control`](https://docs.rs/loopctl/latest/loopctl/loop_control/index.html)| Loop detection, convergence detection, fallback model chains, and manager bundle |
 | [`message`](https://docs.rs/loopctl/latest/loopctl/message/index.html)     | Conversation types: `Message`, `MessagePart`, `ToolContent`, roles |
-| [`observability`](https://docs.rs/loopctl/latest/loopctl/observability/index.html) | Structured event streaming: `EventSink` trait, `ObserveEvent`, `CompositeSink`, `ConsoleSink` |
 | [`stream`](https://docs.rs/loopctl/latest/loopctl/stream/index.html)      | Streaming event types, accumulator, stop reasons, usage tracking |
 | [`tool`](https://docs.rs/loopctl/latest/loopctl/tool/index.html)        | `Tool` trait, `ToolRegistry`, `ToolSchema`, `ToolOutput`, `FnTool` adapter |
 | [`testing`](https://docs.rs/loopctl/latest/loopctl/testing/index.html)     | Mock API client, mock tools, and test fixture factories (feature-gated) |

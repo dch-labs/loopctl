@@ -10,6 +10,8 @@
 //! - **[`fallback`]** — Circuit breaker pattern for automatic API model fallback.
 //! - **[`detection`]** — Unified manager that orchestrates loop and convergence detection.
 //! - **[`bundle`]** — Aggregate struct for the agent's infrastructure managers.
+//!
+//! For lifecycle observation, see [`crate::core::observer`].
 
 pub mod bundle;
 pub mod convergence;

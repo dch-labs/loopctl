@@ -253,12 +253,19 @@ impl<S> HeartbeatStream<S> {
     /// );
     /// // let stream = HeartbeatStream::new(inner_stream, config);
     /// ```
-    #[allow(clippy::arithmetic_side_effects)]
     pub fn new(inner: S, config: HeartbeatConfig) -> Self {
+        /// 30 years in seconds — used as a far-future deadline fallback.
+        /// Computed as a const so the compiler verifies no overflow.
+        const THIRTY_YEARS_SECS: u64 = 86400 * 365 * 30;
+
         let now = Instant::now();
         // checked_add returns None only for extreme Duration values (hundreds of years).
-        // Fallback: Instant::now() + 30 years, which is effectively infinite.
-        let far_future = || Instant::now() + Duration::from_secs(86400 * 365 * 30);
+        // Fallback: 30 years from now, which is effectively infinite.
+        let far_future = || {
+            Instant::now()
+                .checked_add(Duration::from_secs(THIRTY_YEARS_SECS))
+                .unwrap_or(Instant::now())
+        };
         let deadline = now.checked_add(config.timeout).unwrap_or_else(far_future);
         let timeout_sleep = Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
             deadline,

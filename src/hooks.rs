@@ -1,7 +1,6 @@
 //! Hook system — bidirectional lifecycle control for agent loops.
 //!
-//! Hooks differ from observers ([`crate::core::AgentObserver`]) and event sinks
-//! ([`crate::observability::EventSink`]) in two key ways:
+//! Hooks differ from observers ([`crate::core::observer::LoopObserver`]) in two key ways:
 //!
 //! 1. **Return values matter.** Pre-hooks return [`HookAction`] (or [`CompactResult`])
 //!    to control whether an action proceeds.
@@ -59,8 +58,7 @@ use context::{
 
 /// Hook trait for bidirectional lifecycle control.
 ///
-/// Hooks differ from observers ([`crate::core::AgentObserver`]) and event sinks
-/// ([`crate::observability::EventSink`]) in two key ways:
+/// Hooks differ from observers ([`crate::core::observer::LoopObserver`]) in two key ways:
 ///
 /// 1. **Return values matter.** `on_pre_*` methods return `Option<HookAction>` (or
 ///    `Option<CompactResult>`). Returning `Some(Block{...})` prevents the action

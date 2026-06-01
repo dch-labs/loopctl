@@ -928,6 +928,14 @@ impl DetectionManager {
         }
     }
 
+    /// Returns the tool signature used for extracting primary parameters.
+    ///
+    /// Useful when callers need to construct [`Operation`]s directly using
+    /// the same signature the detection manager uses internally.
+    pub fn signature(&self) -> &dyn ToolSignature {
+        self.loop_detector.signature()
+    }
+
     /// Record a tool call for loop detection by tool name and input hash.
     ///
     /// Creates an [`Operation`] from a `tool` name and `input_hash`, then

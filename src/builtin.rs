@@ -7,37 +7,23 @@
 //!
 //! # Available Implementations
 //!
-//! | Implementation      | Trait                                         | Purpose                        |
-//! |---------------------|-----------------------------------------------|--------------------------------|
-//! | [`InMemoryStore`]   | [`AgentMemory`](crate::core::AgentMemory)     | `Vec`-backed memory store      |
-//! | [`NoOpObserver`]    | [`AgentObserver`](crate::core::AgentObserver) | No-op (default) observer       |
-//! | [`LoggingObserver`] | [`AgentObserver`](crate::core::AgentObserver) | Logs all events via `tracing`  |
-//! | [`MultiObserver`]   | [`AgentObserver`](crate::core::AgentObserver) | Fans out to multiple observers |
+//! | Implementation    | Trait                                         | Purpose                   |
+//! |-------------------|-----------------------------------------------|---------------------------|
+//! | [`InMemoryStore`] | [`AgentMemory`](crate::core::AgentMemory)     | `Vec`-backed memory store |
 //!
 //! # Quick Start
 //!
 //! ```rust
-//! use loopctl::builtin::{InMemoryStore, LoggingObserver, MultiObserver, NoOpObserver};
+//! use loopctl::builtin::InMemoryStore;
 //! use loopctl::core::{AgentMemory, MemoryEntry, MemoryCategory};
 //!
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
 //! // In-memory store for agent memories
 //! let mut store = InMemoryStore::new();
 //! store.store(MemoryEntry::new(MemoryCategory::Fact, "PostgreSQL 15 is used")).await.unwrap();
-//!
-//! // Logging observer
-//! let observer = LoggingObserver;
-//!
-//! // Compose multiple observers
-//! let multi = MultiObserver::new()
-//!     .with(LoggingObserver)
-//!     .with(NoOpObserver);
-//! assert_eq!(multi.len(), 2);
 //! # });
 //! ```
 
 pub mod memory;
-pub mod observer;
 
 pub use memory::InMemoryStore;
-pub use observer::{LoggingObserver, MultiObserver, NoOpObserver};

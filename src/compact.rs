@@ -283,7 +283,7 @@ impl CompactionOutcome {
 ///
 /// Produced by [`ContextManager::ensure_context_fits`] when compaction
 /// occurs. Observers receive this via
-/// [`on_compaction`](crate::core::AgentObserver::on_compaction).
+/// [`on_compaction`](crate::core::observer::LoopObserver::on_compaction).
 #[derive(Debug, Clone)]
 pub struct CompactTelemetry {
     /// Why compaction was triggered.
@@ -836,7 +836,9 @@ impl ContextManager {
 
     /// The token budget at which compaction triggers.
     ///
-    /// Equal to `context_window * threshold`.
+    /// Equal to `context_window * threshold`. The result is always
+    /// non-negative (percentage × positive count), so the f64→u64
+    /// cast is safe in practice.
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn compact_threshold_tokens(&self) -> u64 {

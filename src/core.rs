@@ -6,11 +6,11 @@
 //!
 //! # Traits
 //!
-//! | Trait              | Purpose                                             |
-//! |--------------------|-----------------------------------------------------|
-//! | [`AgentCore`]      | Main lifecycle trait for all agent types            |
-//! | [`AgentMemory`]    | Interface for agent memory backends                 |
-//! | [`AgentObserver`]  | Lifecycle event hooks for monitoring agents         |
+//! | Trait                                    | Purpose                                             |
+//! |------------------------------------------|-----------------------------------------------------|
+//! | [`AgentCore`]                            | Main lifecycle trait for all agent types            |
+//! | [`AgentMemory`]                          | Interface for agent memory backends                 |
+//! | [`LoopObserver`](observer::LoopObserver) | Notification-only observer for agent lifecycle      |
 //!
 //! # Supporting Types
 //!
@@ -37,17 +37,23 @@
 //! | [`ToolCall`]                   | A tool call requested by the agent                   |
 //! | [`ToolDispatchResult`]         | Result of a single tool execution                    |
 //! | [`TurnResult`]                 | Result of a single agent turn                        |
+//!
+//! # Sub-modules
+//!
+//! - **[`observer`]** — [`LoopObserver`](observer::LoopObserver) trait, context structs, and
+//!   [`ObserverHost`](observer::ObserverHost) for lifecycle notification. Observers are passive —
+//!   they receive callbacks but cannot control flow. For flow control, see the
+//!   [hook system](crate::hooks).
 
 pub mod agent_core;
 pub mod agent_memory;
-pub mod agent_observer;
 pub mod error;
+pub mod observer;
 pub mod reflection;
 pub mod types;
 
 pub use agent_core::*;
 pub use agent_memory::*;
-pub use agent_observer::*;
 pub use error::*;
 pub use reflection::*;
 pub use types::*;

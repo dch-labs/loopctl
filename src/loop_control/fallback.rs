@@ -145,10 +145,8 @@ pub enum FallbackState {
 /// assert_eq!(FallbackState::from(255u8), FallbackState::Primary); // unknown → safe default
 /// ```
 impl From<u8> for FallbackState {
-    #[allow(clippy::match_same_arms)]
     fn from(value: u8) -> Self {
         match value {
-            0 => FallbackState::Primary,
             1 => FallbackState::Fallback,
             2 => FallbackState::Recovering,
             _ => FallbackState::Primary,

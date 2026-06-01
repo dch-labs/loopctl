@@ -4,9 +4,11 @@
 //! When a [`ContextManager`] is configured, checks token usage after each
 //! tool dispatch and triggers compaction if usage exceeds the threshold.
 
-use super::{AgentError, ApiClient, BareLoop, EnsureContextResult, Instant, ObserveEvent};
+use super::{AgentError, ApiClient, BareLoop, EnsureContextResult, Instant};
 #[cfg(feature = "hooks")]
 use super::{CompactTrigger, PostCompactContext, PreCompactContext};
+
+use crate::core::observer::CompactionContext;
 
 impl<C: ApiClient> BareLoop<C> {
     /// Check if context compaction is needed and perform it if so.
@@ -14,8 +16,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// When a [`ContextManager`] is configured, this method:
     /// 1. Calls [`ContextManager::ensure_context_fits()`] to check token usage.
     /// 2. If compaction occurred, replaces `self.conversation` with the compacted messages.
-    /// 3. Notifies observers via [`on_compaction`](AgentObserver::on_compaction).
-    /// 4. Emits [`ObserveEvent::ContextCompacted`] to the event sink.
+    /// 3. Notifies observers via [`LoopObserver::on_compaction`](crate::core::observer::LoopObserver::on_compaction).
     ///
     /// When no `ContextManager` is set, this is a no-op.
     ///
@@ -65,10 +66,7 @@ impl<C: ApiClient> BareLoop<C> {
             Ok(EnsureContextResult::Compacted(outcome)) => {
                 self.conversation = outcome.messages;
                 let messages_after = self.conversation.len();
-                for obs in &self.observers {
-                    obs.on_compaction(messages_before, messages_after);
-                }
-                self.event_sink.on_event(&ObserveEvent::ContextCompacted {
+                self.managers.observers().on_compaction(&CompactionContext {
                     messages_before,
                     messages_after,
                     tokens_saved: outcome.tokens_saved,

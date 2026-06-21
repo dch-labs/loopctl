@@ -336,6 +336,63 @@ pub struct ToolCall {
     pub input: serde_json::Value,
 }
 
+impl ToolCall {
+    /// Apply a [`Correction`](crate::reflection::Correction) from the reflection system in place.
+    ///
+    /// Modifies `self` according to the correction strategy:
+    ///
+    /// - [`InputFix`](crate::reflection::CorrectionType::InputFix) — replaces
+    ///   `self.input` with the corrected input.
+    /// - [`ToolChange`](crate::reflection::CorrectionType::ToolChange) — replaces
+    ///   `self.tool` with an alternative tool name.
+    /// - Other types — no mutation; the retry proceeds with unchanged parameters.
+    ///
+    /// Returns a [`CorrectionResult`](crate::reflection::CorrectionResult) indicating whether the correction
+    /// was applied, failed, or skipped.
+    pub fn apply_correction(
+        &mut self,
+        correction: &crate::reflection::Correction,
+        _prior_result: &crate::tool::ToolDispatchResult,
+    ) -> crate::reflection::CorrectionResult {
+        use crate::reflection::CorrectionType;
+        match correction.correction_type {
+            CorrectionType::InputFix => {
+                if let Some(ref modified) = correction.modified_input {
+                    tracing::debug!(
+                        tool = %self.tool,
+                        "applying InputFix correction from reflector"
+                    );
+                    self.input = modified.clone();
+                    crate::reflection::CorrectionResult::Applied
+                } else {
+                    crate::reflection::CorrectionResult::Failed(
+                        "InputFix correction missing modified_input".to_string(),
+                    )
+                }
+            }
+            CorrectionType::ToolChange => {
+                if let Some(ref alt) = correction.alternative_tool {
+                    tracing::debug!(
+                        old_tool = %self.tool,
+                        new_tool = %alt,
+                        "applying ToolChange correction from reflector"
+                    );
+                    self.tool.clone_from(alt);
+                    crate::reflection::CorrectionResult::Applied
+                } else {
+                    crate::reflection::CorrectionResult::Failed(
+                        "ToolChange correction missing alternative_tool".to_string(),
+                    )
+                }
+            }
+            CorrectionType::PrerequisiteFix | CorrectionType::ApproachChange => {
+                crate::reflection::CorrectionResult::Skipped
+            }
+            CorrectionType::Escalate => crate::reflection::CorrectionResult::Skipped,
+        }
+    }
+}
+
 // ==================================================
 // SessionResult
 // ==================================================
@@ -384,6 +441,22 @@ pub struct SessionResult {
     pub final_output: Option<String>,
     /// `Some` on failure with a human-readable error description.
     pub error: Option<String>,
+}
+
+impl Default for SessionResult {
+    fn default() -> Self {
+        Self {
+            session_id: Uuid::nil(),
+            total_turns: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_duration: Duration::ZERO,
+            tool_calls: 0,
+            success: false,
+            final_output: None,
+            error: None,
+        }
+    }
 }
 
 impl SessionResult {
@@ -549,4 +622,77 @@ pub trait Loop: Send + Sync {
     /// [`should_continue`](Loop::should_continue) can observe it
     /// and return promptly across threads.
     fn cancel(&self);
+
+    /// Explain *why* [`should_continue`](Loop::should_continue) returned `false`.
+    ///
+    /// Called by [`run`](Loop::run) after the drive loop exits. Return:
+    ///
+    /// - `None` — the session ended normally (model finished).
+    /// - `Some(err)` — the session was forced to stop (`Cancelled`,
+    ///   `MaxTurnsExceeded`, etc.).
+    ///
+    /// The default implementation returns `None` (normal completion).
+    fn stop_reason(&self) -> Option<LoopError> {
+        None
+    }
+
+    /// Drive the full agent session: initialize → turn loop → finalize.
+    ///
+    /// This is the main entry point for running an agent. It calls
+    /// [`initialize`](Loop::initialize) with the agent's stored config,
+    /// then repeatedly calls [`process_turn`](Loop::process_turn) until either:
+    ///
+    /// - The turn result is marked `is_complete` (the model finished), or
+    /// - [`should_continue`](Loop::should_continue) returns `false`.
+    ///
+    /// When `should_continue` returns `false`,
+    /// [`stop_reason`](Loop::stop_reason) is consulted to distinguish
+    /// normal completion from an error (cancellation, max-turns, etc.).
+    ///
+    /// # Errors
+    ///
+    /// - [`LoopError::Cancelled`] — if the session was cancelled.
+    /// - [`LoopError::MaxTurnsExceeded`] — if the turn limit was reached.
+    /// - Any error returned by [`process_turn`](Loop::process_turn) or
+    ///   [`finalize`](Loop::finalize).
+    fn run<'a>(
+        &'a mut self,
+        user_input: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionResult, LoopError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.initialize(&self.config()).await?;
+
+            loop {
+                if !self.should_continue() {
+                    break;
+                }
+
+                match self.process_turn(user_input).await {
+                    Ok(turn_result) if turn_result.is_complete => {
+                        return self.finalize().await;
+                    }
+                    Ok(_) => { /* turn produced tool calls — continue */ }
+                    Err(e) => {
+                        self.finalize().await?;
+                        return Err(e);
+                    }
+                }
+            }
+
+            // should_continue() returned false — ask the impl why.
+            if let Some(err) = self.stop_reason() {
+                self.finalize().await?;
+                return Err(err);
+            }
+
+            self.finalize().await
+        })
+    }
+
+    /// Return the configuration that [`run`](Loop::run) passes to
+    /// [`initialize`](Loop::initialize).
+    ///
+    /// Implementors should return the [`LoopConfig`] they want to use
+    /// for the session.
+    fn config(&self) -> LoopConfig;
 }

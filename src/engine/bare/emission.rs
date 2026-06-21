@@ -8,7 +8,9 @@
 //! are called directly at their call sites via
 //! `self.managers.observers().on_*()`.
 
-use super::{ApiClient, BareLoop, Duration, EndReason, SessionEndInfo};
+use super::{ApiClient, BareLoop, Duration, SessionResult};
+#[cfg(feature = "hooks")]
+use crate::capabilities::Hookable;
 #[cfg(feature = "hooks")]
 use crate::hooks::context::{
     SessionEndContext as HookSessionEndContext, SessionEndReason,
@@ -30,7 +32,7 @@ impl<C: ApiClient> BareLoop<C> {
             });
 
         #[cfg(feature = "hooks")]
-        if let Some(ref executor) = self.hook_executor {
+        if let Some(executor) = self.managers.hook_executor() {
             let ctx = HookSessionStartContext {
                 session_id: self.config.session_id,
                 model: self.config.model.clone(),
@@ -43,39 +45,29 @@ impl<C: ApiClient> BareLoop<C> {
     }
 
     /// Notify all observers and hooks that the session has ended.
-    pub(super) fn notify_session_end(&self, info: &SessionEndInfo) {
-        let reason_str = match &info.reason {
-            EndReason::Complete => None,
-            EndReason::Cancelled => Some("cancelled"),
-            EndReason::MaxTurns => Some("max turns exceeded"),
-            EndReason::Error => Some("session ended with error"),
-        };
+    pub(super) fn notify_session_end(&self, result: &SessionResult, duration: Duration) {
         self.managers
             .observers()
             .on_session_end(&SessionEndContext {
-                success: info.success,
-                error: reason_str.map(std::string::ToString::to_string),
-                total_turns: info.total_turns,
-                duration_ms: u64::try_from(
-                    std::time::Duration::from_secs(info.duration_secs).as_millis(),
-                )
-                .unwrap_or(u64::MAX),
+                success: result.success,
+                error: result.error.clone(),
+                total_turns: result.total_turns,
+                duration_ms: Self::millis_u64(duration),
             });
 
         #[cfg(feature = "hooks")]
-        if let Some(ref executor) = self.hook_executor {
-            let reason = match &info.reason {
-                EndReason::Complete => SessionEndReason::Complete,
-                EndReason::Cancelled => SessionEndReason::Cancelled,
-                EndReason::Error => SessionEndReason::Error,
-                EndReason::MaxTurns => SessionEndReason::MaxTurns,
+        if let Some(executor) = self.managers.hook_executor() {
+            let reason = if result.success {
+                SessionEndReason::Complete
+            } else {
+                SessionEndReason::Error
             };
             let ctx = HookSessionEndContext {
-                session_id: self.config.session_id,
+                session_id: result.session_id,
                 reason,
-                total_turns: info.total_turns,
-                total_tokens: info.total_tokens,
-                duration_secs: info.duration_secs,
+                total_turns: result.total_turns,
+                total_tokens: result.input_tokens.saturating_add(result.output_tokens),
+                duration_secs: duration.as_secs(),
             };
             executor.notify_session_end(&ctx);
         }

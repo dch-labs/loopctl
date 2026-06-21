@@ -50,8 +50,19 @@
 //!   `impl Observable + Detectable` rather than a concrete type.
 //! - **Testing** — swap `LoopRuntime` for a stub that implements only the
 //!   traits under test.
-//! - **Incremental adoption** — start with `LoopRuntime::new()` and add
-//!   capabilities via builder methods as needed.
+//! ```rust,ignore
+//! let runtime = LoopRuntime::builder()
+//!     .with_fallback(FallbackManager::for_model("llm-70b"))
+//!     .with_detection(DetectionManager::default())
+//!     .with_observer(Arc::new(logging_observer))
+//!     .build();
+//!
+//! let agent = BareLoop::new_with_managers(client, tools, runtime, config);
+//! ```
+//!
+//! Every capability is optional. A runtime with no `.with_*()` calls still
+//! works — it just has no observers, no hooks, no pipeline, etc.  This means
+//! you only pay for (and configure) the infrastructure you actually use.
 
 use std::sync::Arc;
 
@@ -81,15 +92,20 @@ pub use crate::capabilities::*;
 ///
 /// # Construction
 ///
-/// Use [`LoopRuntime::new`] for defaults or the builder-style `with_*`
-/// methods to configure individual components:
+/// Use [`LoopRuntime::builder()`] to compose only the capabilities you need,
+/// or [`LoopRuntime::new()`] for a runtime with default managers and no
+/// optional components:
 ///
-/// ```rust,ignore
-/// use loopctl::runtime::LoopRuntime;
+/// ```
+/// # use loopctl::runtime::LoopRuntime;
+/// # use loopctl::runtime::FallbackCapable;
 /// use loopctl::fallback::FallbackManager;
 ///
-/// let runtime = LoopRuntime::new()
-///     .with_fallback(FallbackManager::for_model("llm-70b"));
+/// // Builder — explicit capability composition:
+/// let runtime = LoopRuntime::builder()
+///     .with_fallback(FallbackManager::for_model("llm-70b"))
+///     .build();
+/// assert_eq!(runtime.fallback().active_model().as_deref(), Some("llm-70b"));
 /// ```
 ///
 /// # Capability Traits
@@ -130,6 +146,90 @@ pub struct LoopRuntime {
     health_registry: Option<Arc<ToolHealthRegistry>>,
 }
 
+/// Builder for [`LoopRuntime`] — compose only the capabilities you need.
+///
+/// Created via [`LoopRuntime::builder()`]. Each `.with_*()` method adds a
+/// capability and returns `self` for chaining. Call `.build()` to finalize.
+///
+/// # Example
+///
+/// ```
+/// # use loopctl::runtime::LoopRuntime;
+/// # use loopctl::runtime::{Detectable, FallbackCapable};
+/// let runtime = LoopRuntime::builder()
+///     .with_fallback(Default::default())
+///     .with_detection(Default::default())
+///     .build();
+///
+/// // Only the capabilities you configured are present:
+/// assert!(runtime.fallback().active_model().is_none());
+/// ```
+///
+/// All capabilities are optional — a bare `.build()` with no `.with_*()`
+/// calls produces an empty runtime that still works but has no observers,
+/// no hooks, no pipeline, etc.
+#[must_use]
+pub struct LoopRuntimeBuilder {
+    inner: LoopRuntime,
+}
+
+impl LoopRuntimeBuilder {
+    /// Replace the fallback manager.
+    pub fn with_fallback(mut self, fallback: FallbackManager) -> Self {
+        self.inner.fallback = fallback;
+        self
+    }
+
+    /// Replace the detection manager.
+    pub fn with_detection(mut self, detection: DetectionManager) -> Self {
+        self.inner.detection = detection;
+        self
+    }
+
+    /// Register an observer.
+    pub fn with_observer(mut self, observer: Arc<dyn LoopObserver>) -> Self {
+        self.inner.observer_host.register(observer);
+        self
+    }
+
+    /// Set the middleware pipeline for tool dispatch.
+    pub fn with_pipeline(mut self, pipeline: ToolPipeline) -> Self {
+        self.inner.tool_pipeline = Some(pipeline);
+        self
+    }
+
+    /// Set the context manager for automatic compaction.
+    pub fn with_context_manager(mut self, manager: Arc<ContextManager>) -> Self {
+        self.inner.context_manager = Some(manager);
+        self
+    }
+
+    /// Set the stream handler for resilient streaming.
+    pub fn with_stream_handler(mut self, handler: StreamHandler) -> Self {
+        self.inner.stream_handler = Some(handler);
+        self
+    }
+
+    /// Set the hook executor for bidirectional lifecycle interception.
+    #[cfg(feature = "hooks")]
+    pub fn with_hook_executor(mut self, executor: Arc<HookExecutor>) -> Self {
+        self.inner.hook_executor = Some(executor);
+        self
+    }
+
+    /// Set the tool health registry for per-tool health tracking.
+    #[cfg(feature = "tool_health")]
+    pub fn with_health_registry(mut self, registry: Arc<ToolHealthRegistry>) -> Self {
+        self.inner.health_registry = Some(registry);
+        self
+    }
+
+    /// Finalize the builder and return the configured [`LoopRuntime`].
+    pub fn build(self) -> LoopRuntime {
+        self.inner
+    }
+}
+
 impl LoopRuntime {
     /// Create a new runtime with default managers and no optional components.
     ///
@@ -158,8 +258,32 @@ impl LoopRuntime {
     }
 
     // ==================================================
-    // Builder methods
+    // Builder methods — compose only the capabilities you need
     // ==================================================
+
+    /// Create a new runtime builder.
+    ///
+    /// Starts with no capabilities enabled. Use the `.with_*()` methods
+    /// to add only the infrastructure you need, then pass the result to
+    /// [`BareLoop::new_with_managers`](crate::engine::BareLoop::new_with_managers).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use loopctl::runtime::LoopRuntime;
+    /// # use loopctl::runtime::{Detectable, FallbackCapable};
+    /// let runtime = LoopRuntime::builder()
+    ///     .with_fallback(Default::default())
+    ///     .with_detection(Default::default())
+    ///     .build();
+    /// ```
+    ///
+    /// This is equivalent to [`LoopRuntime::new`] — both start from an
+    /// empty runtime. Use `builder()` when you want the intent to be
+    /// explicit that you're composing capabilities.
+    pub fn builder() -> LoopRuntimeBuilder {
+        LoopRuntimeBuilder { inner: Self::new() }
+    }
 
     /// Replace the fallback manager with a custom instance.
     ///
@@ -220,79 +344,122 @@ impl LoopRuntime {
         self.observer_host.register(observer);
     }
 
+    /// Register an observer and return `self` for chaining.
+    ///
+    /// Builder-style alias for [`register_observer`](Self::register_observer).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = LoopRuntime::builder()
+    ///     .with_observer(Arc::new(logging_observer))
+    ///     .with_observer(Arc::new(metrics_observer))
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn LoopObserver>) -> Self {
+        self.observer_host.register(observer);
+        self
+    }
+
     /// Access the observer host directly.
     pub fn observers(&self) -> &ObserverHost {
         &self.observer_host
     }
 
-    /// Set the middleware pipeline for tool dispatch.
+    /// Set the middleware pipeline for tool dispatch (builder-style).
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let mut runtime = LoopRuntime::new();
-    /// runtime.set_pipeline(builder.build()?);
+    /// let runtime = LoopRuntime::builder()
+    ///     .with_pipeline(builder.build()?)
+    ///     .build();
     /// ```
+    #[must_use]
+    pub fn with_pipeline(mut self, pipeline: ToolPipeline) -> Self {
+        self.tool_pipeline = Some(pipeline);
+        self
+    }
+
+    /// Set the middleware pipeline for tool dispatch (`&mut self` variant).
     pub fn set_pipeline(&mut self, pipeline: ToolPipeline) {
         self.tool_pipeline = Some(pipeline);
     }
 
-    /// Set the context manager for automatic compaction.
+    /// Set the context manager for automatic compaction (builder-style).
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// use loopctl::compact::{ContextManager, TruncatingCompactor};
-    /// use std::sync::Arc;
-    ///
-    /// let compactor = TruncatingCompactor::new()
-    ///     .with_preserve_recent(4)
-    ///     .with_min_messages(6);
-    /// let manager = ContextManager::new(Arc::new(compactor))
-    ///     .with_context_window(200_000)
-    ///     .with_threshold(0.80);
-    ///
-    /// let mut runtime = LoopRuntime::new();
-    /// runtime.set_context_manager(Arc::new(manager));
+    /// let runtime = LoopRuntime::builder()
+    ///     .with_context_manager(Arc::new(manager))
+    ///     .build();
     /// ```
+    #[must_use]
+    pub fn with_context_manager(mut self, manager: Arc<ContextManager>) -> Self {
+        self.context_manager = Some(manager);
+        self
+    }
+
+    /// Set the context manager for automatic compaction (`&mut self` variant).
     pub fn set_context_manager(&mut self, manager: Arc<ContextManager>) {
         self.context_manager = Some(manager);
     }
 
-    /// Set the stream handler for resilient streaming with retries.
+    /// Set the stream handler for resilient streaming (builder-style).
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// use loopctl::stream::handler::{StreamHandler, StreamTimeoutConfig};
-    /// use std::time::Duration;
-    ///
-    /// let handler = StreamHandler::with_config(
-    ///     StreamTimeoutConfig {
-    ///         initial_event_timeout: Duration::from_secs(60),
-    ///         ..Default::default()
-    ///     },
-    ///     Default::default(),
-    /// );
-    ///
-    /// let mut runtime = LoopRuntime::new();
-    /// runtime.set_stream_handler(handler);
+    /// let runtime = LoopRuntime::builder()
+    ///     .with_stream_handler(handler)
+    ///     .build();
     /// ```
+    #[must_use]
+    pub fn with_stream_handler(mut self, handler: StreamHandler) -> Self {
+        self.stream_handler = Some(handler);
+        self
+    }
+
+    /// Set the stream handler for resilient streaming (`&mut self` variant).
     pub fn set_stream_handler(&mut self, handler: StreamHandler) {
         self.stream_handler = Some(handler);
     }
 
-    /// Set the hook executor for bidirectional lifecycle interception.
+    /// Set the hook executor for bidirectional lifecycle interception (builder-style).
+    ///
+    /// *Requires `hooks` feature.*
+    #[must_use]
+    #[cfg(feature = "hooks")]
+    pub fn with_hook_executor(mut self, executor: Arc<HookExecutor>) -> Self {
+        self.hook_executor = Some(executor);
+        self
+    }
+
+    /// Set the hook executor (`&mut self` variant).
+    ///
+    /// *Requires `hooks` feature.*
     #[cfg(feature = "hooks")]
     pub fn set_hook_executor(&mut self, executor: Arc<HookExecutor>) {
         self.hook_executor = Some(executor);
     }
 
-    /// Set the tool health registry for per-tool health tracking.
+    /// Set the tool health registry for per-tool health tracking (builder-style).
     ///
     /// When set, records success/failure counts and latency for every
     /// tool dispatch. Tools that exceed the failure threshold have their
     /// circuit breaker opened, blocking subsequent calls until recovery.
+    ///
+    /// *Requires `tool_health` feature.*
+    #[must_use]
+    #[cfg(feature = "tool_health")]
+    pub fn with_health_registry(mut self, registry: Arc<ToolHealthRegistry>) -> Self {
+        self.health_registry = Some(registry);
+        self
+    }
+
+    /// Set the tool health registry (`&mut self` variant).
     ///
     /// *Requires `tool_health` feature.*
     #[cfg(feature = "tool_health")]
@@ -323,6 +490,164 @@ impl LoopRuntime {
         self.fallback.reset();
         self.detection.reset();
         self.observer_host.reset_all();
+    }
+
+    // ==================================================
+    // Detection interpretation
+    // ==================================================
+
+    /// Interpret a [`DetectedPattern`](crate::detection::DetectedPattern) and decide whether to abort.
+    ///
+    /// Generic framework logic: checks loop-detection thresholds,
+    /// maps convergence actions, and notifies observers. Returns
+    /// `None` to continue, or `Some(Err)` to abort the session.
+    ///
+    /// Called by the agent loop after each response is recorded with the
+    /// [`DetectionManager`].
+    pub fn handle_detected_pattern(
+        &self,
+        pattern: &crate::detection::DetectedPattern,
+        turn: usize,
+    ) -> Option<Result<crate::engine::loop_core::SessionResult, crate::error::LoopError>> {
+        use crate::detection::{ConvergenceAction, DetectedPattern};
+        use crate::error::LoopError;
+        use crate::observer::{ConvergenceDetectedContext, LoopDetectedContext};
+
+        match pattern {
+            DetectedPattern::NoPattern => None,
+
+            DetectedPattern::LoopDetected {
+                repetitions,
+                pattern_description,
+            } => {
+                tracing::warn!(
+                    repetitions,
+                    pattern = %pattern_description,
+                    turn,
+                    "loop detected"
+                );
+
+                self.observer_host.on_loop_detected(&LoopDetectedContext {
+                    pattern: pattern_description.clone(),
+                    repetitions: *repetitions,
+                });
+
+                if *repetitions >= self.detection.config().stop_threshold {
+                    tracing::error!(
+                        repetitions,
+                        pattern = %pattern_description,
+                        turn,
+                        "stopping agent: loop threshold exceeded"
+                    );
+                    Some(Err(LoopError::LoopDetected {
+                        message: format!("{pattern_description} repeated {repetitions} times"),
+                    }))
+                } else {
+                    None
+                }
+            }
+
+            DetectedPattern::ConvergenceDetected {
+                similarity,
+                consecutive_count,
+            } => {
+                tracing::warn!(similarity, consecutive_count, turn, "convergence detected");
+                let action = self.detection.config().on_converge;
+                let action_str = match action {
+                    ConvergenceAction::Stop => "stop",
+                    ConvergenceAction::Warn => "warn",
+                    ConvergenceAction::Compact => "compact",
+                    ConvergenceAction::AskUser => "ask_user",
+                    ConvergenceAction::SwitchPhase => "switch_phase",
+                };
+
+                self.observer_host
+                    .on_convergence_detected(&ConvergenceDetectedContext {
+                        action: action_str.to_string(),
+                    });
+
+                match action {
+                    ConvergenceAction::Stop => Some(Err(LoopError::LoopDetected {
+                        message: "agent stopped: convergence detected".into(),
+                    })),
+                    ConvergenceAction::AskUser => Some(Err(LoopError::LoopDetected {
+                        message: "agent stopped: convergence detected, user input needed".into(),
+                    })),
+                    ConvergenceAction::Warn
+                    | ConvergenceAction::Compact
+                    | ConvergenceAction::SwitchPhase => None,
+                }
+            }
+        }
+    }
+
+    // ==================================================
+    // Session lifecycle notifications
+    // ==================================================
+
+    /// Notify observers and hooks that a session has started.
+    ///
+    /// Fan-out to the [`ObserverHost`] and (if configured) the hook
+    /// executor. Generic for any loop implementation.
+    pub fn notify_session_start(&self, session_id: uuid::Uuid, #[allow(unused_variables)] model: &str) {
+        use crate::observer::SessionStartContext;
+
+        self.observer_host
+            .on_session_start(&SessionStartContext { session_id });
+
+        #[cfg(feature = "hooks")]
+        if let Some(executor) = self.hook_executor() {
+            use crate::hooks::context::SessionStartContext as HookSessionStartContext;
+
+            let ctx = HookSessionStartContext {
+                session_id,
+                model: model.to_string(),
+                working_directory: std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            };
+            executor.notify_session_start(&ctx);
+        }
+    }
+
+    /// Notify observers and hooks that a session has ended.
+    ///
+    /// Takes the final [`SessionResult`](crate::engine::loop_core::SessionResult) and duration. Fan-out to
+    /// the [`ObserverHost`] and (if configured) the hook executor.
+    pub fn notify_session_end(
+        &self,
+        result: &crate::engine::loop_core::SessionResult,
+        duration: std::time::Duration,
+    ) {
+        use crate::observer::SessionEndContext;
+
+        self.observer_host.on_session_end(&SessionEndContext {
+            success: result.success,
+            error: result.error.clone(),
+            total_turns: result.total_turns,
+            duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        });
+
+        #[cfg(feature = "hooks")]
+        if let Some(executor) = self.hook_executor() {
+            use crate::hooks::context::{
+                SessionEndContext as HookSessionEndContext, SessionEndReason,
+            };
+
+            let reason = if result.success {
+                SessionEndReason::Complete
+            } else {
+                SessionEndReason::Error
+            };
+            let ctx = HookSessionEndContext {
+                session_id: result.session_id,
+                reason,
+                total_turns: result.total_turns,
+                total_tokens: result.input_tokens.saturating_add(result.output_tokens),
+                duration_secs: duration.as_secs(),
+            };
+            executor.notify_session_end(&ctx);
+        }
     }
 }
 

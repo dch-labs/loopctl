@@ -8,6 +8,7 @@ use super::{
     ApiClient, BareLoop, LoopError, Message, StreamAccumulator, StreamEvent, StreamStopReason,
     Usage,
 };
+use crate::capabilities::StreamCapable;
 use crate::stream::handler::{StreamHandler, StreamHandlerError};
 use futures::StreamExt;
 
@@ -44,7 +45,7 @@ impl<C: ApiClient> BareLoop<C> {
         &self,
     ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
         // Delegate to StreamHandler if configured.
-        if let Some(ref handler) = self.stream_handler {
+        if let Some(handler) = self.managers.stream_handler() {
             return self.stream_turn_via_handler(handler).await;
         }
 

@@ -1,16 +1,16 @@
 //! Error types for the agent framework.
 //!
-//! Every agent operation returns `Result<T, [AgentError]>`, and this
+//! Every agent operation returns `Result<T, [LoopError]>`, and this
 //! module defines the single unified error enum that carries structured
 //! context for each failure mode. The variants are fine-grained enough
 //! for callers to match on and recover programmatically
-//! (see [`AgentError::is_recoverable`]), while still producing
+//! (see [`LoopError::is_recoverable`]), while still producing
 //! human-readable messages via the [`thiserror`] `#[error(...)]`
 //! attributes.
 //!
 //! # Provided Types
 //!
-//! - **[`AgentError`]** — The sole error enum for the framework. Each
+//! - **[`LoopError`]** — The sole error enum for the framework. Each
 //!   variant wraps the relevant context (tool names, token counts,
 //!   phase identifiers) so that diagnostics are precise without
 //!   requiring callers to parse free-form strings.
@@ -18,11 +18,11 @@
 //! # Quick Start
 //!
 //! ```
-//! use loopctl::core::error::AgentError;
+//! use loopctl::error::LoopError;
 //!
-//! fn run_tool(tool: &str, available: &[&str]) -> Result<String, AgentError> {
+//! fn run_tool(tool: &str, available: &[&str]) -> Result<String, LoopError> {
 //!     if !available.contains(&tool) {
-//!         return Err(AgentError::tool_not_found(tool, available));
+//!         return Err(LoopError::tool_not_found(tool, available));
 //!     }
 //!     // invoke the tool
 //!     Ok("done".into())
@@ -31,7 +31,7 @@
 //! fn main() {
 //!     match run_tool("search", &["read", "write"]) {
 //!         Ok(_) => println!("succeeded"),
-//!         Err(AgentError::ToolNotFound { tool, .. }) => {
+//!         Err(LoopError::ToolNotFound { tool, .. }) => {
 //!             eprintln!("unknown tool: {tool}");
 //!         }
 //!         Err(e) => println!("other error: {e}"),
@@ -41,80 +41,76 @@
 
 /// Unified error type for the agent framework.
 ///
-/// All agent operations return `Result<T, AgentError>`. Each variant
+/// All agent operations return `Result<T, LoopError>`. Each variant
 /// carries structured context to aid debugging, logging, and
-/// programmatic error recovery. Use [`AgentError::is_recoverable`]
+/// programmatic error recovery. Use [`LoopError::is_recoverable`]
 /// to decide whether a retry is feasible, or match on specific
 /// variants when you need targeted handling (e.g.
-/// [`AgentError::Cancelled`] to distinguish user-initiated
+/// [`LoopError::Cancelled`] to distinguish user-initiated
 /// cancellation from fatal failures).
 ///
 /// # Variants
 ///
-/// - [`ToolNotFound`](AgentError::ToolNotFound) — The requested tool
+/// - [`ToolNotFound`](LoopError::ToolNotFound) — The requested tool
 ///   is not registered in the tool registry.
-/// - [`ToolExecution`](AgentError::ToolExecution) — A registered tool
+/// - [`ToolExecution`](LoopError::ToolExecution) — A registered tool
 ///   was invoked but returned an error during execution.
-/// - [`InvalidInput`](AgentError::InvalidInput) — The caller provided
+/// - [`InvalidInput`](LoopError::InvalidInput) — The caller provided
 ///   malformed or semantically invalid input.
-/// - [`Api`](AgentError::Api) — An upstream LLM provider or HTTP API
+/// - [`Api`](LoopError::Api) — An upstream LLM provider or HTTP API
 ///   returned an error response.
-/// - [`MaxTurnsExceeded`](AgentError::MaxTurnsExceeded) — The agent
+/// - [`MaxTurnsExceeded`](LoopError::MaxTurnsExceeded) — The agent
 ///   hit its configured turn limit without completing.
-/// - [`ContextExceeded`](AgentError::ContextExceeded) — Token usage
+/// - [`ContextExceeded`](LoopError::ContextExceeded) — Token usage
 ///   overflowed the model's context window and compaction could not
 ///   recover.
-/// - [`PhaseFailed`](AgentError::PhaseFailed) — A named pipeline
+/// - [`PhaseFailed`](LoopError::PhaseFailed) — A named pipeline
 ///   phase (e.g. "reflection", "compaction") failed.
-/// - [`Memory`](AgentError::Memory) — A memory
+/// - [`Memory`](LoopError::Memory) — A memory
 ///   store/retrieve/consolidate operation failed.
-/// - [`Reflection`](AgentError::Reflection) — The self-correction /
+/// - [`Reflection`](LoopError::Reflection) — The self-correction /
 ///   reflection cycle encountered an error.
-/// - [`Cancelled`](AgentError::Cancelled) — The user or a shutdown
+/// - [`Cancelled`](LoopError::Cancelled) — The user or a shutdown
 ///   signal cancelled the session.
-/// - [`LoopDetected`](AgentError::LoopDetected) — The agent was
+/// - [`LoopDetected`](LoopError::LoopDetected) — The agent was
 ///   caught repeating the same operation without making progress.
-/// - [`ToolLimitReached`](AgentError::ToolLimitReached) — The
+/// - [`ToolLimitReached`](LoopError::ToolLimitReached) — The
 ///   session or turn exceeded its tool-call budget.
-/// - [`StreamError`](AgentError::StreamError) — An error occurred
+/// - [`StreamError`](LoopError::StreamError) — An error occurred
 ///   while processing a streaming response from the LLM.
-/// - [`Config`](AgentError::Config) — Configuration validation
+/// - [`Config`](LoopError::Config) — Configuration validation
 ///   failed (missing fields, invalid values).
-/// - [`Internal`](AgentError::Internal) — A catch-all for unexpected
+/// - [`Internal`](LoopError::Internal) — A catch-all for unexpected
 ///   or infrastructure-level errors.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
-pub enum AgentError {
+pub enum LoopError {
     /// A tool was not found in the registry.
     ///
     /// Returned when the agent (or a caller) requests a tool by name
     /// that has not been registered. The error carries both the
     /// requested name and a formatted list of available tools so the
-    /// caller can suggest alternatives. Construct conveniently with
-    /// [`tool_not_found`](AgentError::tool_not_found).
+    /// caller can suggest alternatives. Construct with
+    /// [`tool_not_found`](LoopError::tool_not_found).
     #[error("Tool not found: {tool}. Available: {available}")]
     ToolNotFound {
-        /// The name of the requested tool.
+        /// The name of the requested tool (not normalised or lowercased).
         tool: String,
-        /// Comma-separated list of available tool names.
-        ///
-        /// Generated by [`AgentError::tool_not_found`] — capped at
-        /// ten names with a trailing "... and N more" suffix when the
-        /// registry is large.
+        /// Available tool names, capped at ten with "… and N more" suffix.
         available: String,
     },
 
     /// Tool execution failed.
     ///
     /// The tool was found and invoked, but the tool's internal logic
-    /// returned an error. This is *recoverable* — the agent may retry
+    /// returned an error. Recoverable — the agent may retry
     /// with different inputs or fall back to another tool. See
-    /// [`is_recoverable`](AgentError::is_recoverable).
+    /// [`is_recoverable`](LoopError::is_recoverable).
     #[error("Tool execution error: {tool}: {message}")]
     ToolExecution {
-        /// Name of the tool that failed.
+        /// Name of the tool that failed (matches the [`ToolRegistry`](crate::tool::ToolRegistry) key).
         tool: String,
-        /// Error message produced by the tool.
+        /// Description of the execution failure returned by the tool.
         message: String,
     },
 
@@ -124,13 +120,10 @@ pub enum AgentError {
     /// a malformed JSON parameter, an out-of-range integer, or a
     /// semantically meaningless prompt. This variant is **not**
     /// considered recoverable by
-    /// [`is_recoverable`](AgentError::is_recoverable) because
+    /// [`is_recoverable`](LoopError::is_recoverable) because
     /// retrying the same input will produce the same result.
     #[error("Invalid input: {0}")]
-    InvalidInput(
-        /// Description of the validation failure.
-        String,
-    ),
+    InvalidInput(String),
 
     /// An API call failed (e.g. LLM provider error).
     ///
@@ -140,7 +133,7 @@ pub enum AgentError {
     /// retry with exponential back-off.
     #[error("API error: {0}")]
     Api(
-        /// The upstream error message or status description.
+        /// Upstream error message or status description.
         String,
     ),
 
@@ -151,7 +144,7 @@ pub enum AgentError {
     /// investigate why the agent is not converging.
     #[error("Max turns exceeded: {max}")]
     MaxTurnsExceeded {
-        /// The configured maximum turn count.
+        /// The configured maximum turn count. See [`LoopConfig::max_turns`](crate::config::LoopConfig::max_turns).
         max: usize,
     },
 
@@ -164,9 +157,9 @@ pub enum AgentError {
     /// `limit` fields give precise token counts for diagnostics.
     #[error("Context window exceeded: used {used} of {limit} tokens")]
     ContextExceeded {
-        /// Tokens currently used in the conversation.
+        /// Number of tokens consumed when the limit was exceeded.
         used: u64,
-        /// Maximum tokens allowed by the model.
+        /// Maximum tokens allowed by the model. See [`LoopConfig::context_window`](crate::config::LoopConfig::context_window).
         limit: u64,
     },
 
@@ -179,9 +172,9 @@ pub enum AgentError {
     /// without parsing error messages.
     #[error("Phase '{phase}' failed: {message}")]
     PhaseFailed {
-        /// Name of the phase that failed.
+        /// Name of the phase that failed (e.g. `"pre_process"`, `"reflection"`).
         phase: String,
-        /// Error message from the failed phase.
+        /// Description of the phase failure.
         message: String,
     },
 
@@ -191,10 +184,7 @@ pub enum AgentError {
     /// connection failure, a serialization error, or a capacity limit
     /// reached in the backing store.
     #[error("Memory error: {0}")]
-    Memory(
-        /// Description of the memory failure.
-        String,
-    ),
+    Memory(String),
 
     /// Reflection / self-correction cycle failed.
     ///
@@ -203,15 +193,12 @@ pub enum AgentError {
     /// variant is *recoverable* — the framework may retry the
     /// reflection or fall back to a simpler strategy.
     #[error("Reflection error: {0}")]
-    Reflection(
-        /// Description of the reflection failure.
-        String,
-    ),
+    Reflection(String),
 
     /// The agent was cancelled by the user or a shutdown signal.
     ///
-    /// This is a *clean* termination, not a failure. Check for this
-    /// variant with [`AgentError::is_cancelled`] to avoid logging it
+    /// A *clean* termination, not a failure. Check for this
+    /// variant with [`LoopError::is_cancelled`] to avoid logging it
     /// as an error. The agent may have partial results available in
     /// its state.
     #[error("Agent cancelled")]
@@ -226,7 +213,7 @@ pub enum AgentError {
     /// `message` field describes the detected pattern.
     #[error("Loop detected: {message}")]
     LoopDetected {
-        /// Description of the detected loop.
+        /// Description of the detected loop (e.g. `"Tool Read called 5 times with identical arguments"`).
         message: String,
     },
 
@@ -239,7 +226,7 @@ pub enum AgentError {
     /// to increase the limit or accept the partial result.
     #[error("Tool limit reached: {message}")]
     ToolLimitReached {
-        /// Description of the limit that was reached.
+        /// Description of the limit reached (e.g. `"Session tool limit of 100 reached"`).
         message: String,
     },
 
@@ -251,7 +238,7 @@ pub enum AgentError {
     /// whether to retry from the last complete message.
     #[error("Stream error: {0}")]
     StreamError(
-        /// Description of the streaming failure.
+        /// Description of the streaming failure (network drop, malformed SSE, timeout).
         String,
     ),
 
@@ -264,7 +251,7 @@ pub enum AgentError {
     /// configuration and retry.
     #[error("Configuration error: {0}")]
     Config(
-        /// Description of the configuration problem.
+        /// Description of the configuration problem (e.g. `"max_turns must be > 0"`).
         String,
     ),
 
@@ -275,13 +262,10 @@ pub enum AgentError {
     /// this only for truly unexpected conditions (e.g. a poisoned
     /// mutex, an allocation failure).
     #[error("{0}")]
-    Internal(
-        /// The internal error description.
-        String,
-    ),
+    Internal(String),
 }
 
-impl AgentError {
+impl LoopError {
     /// Create a tool-not-found error with a list of available tools.
     ///
     /// Called by the tool registry when a requested tool name does not
@@ -292,10 +276,10 @@ impl AgentError {
     /// # Example
     ///
     /// ```
-    /// use loopctl::core::error::AgentError;
+    /// use loopctl::error::LoopError;
     ///
-    /// let err = AgentError::tool_not_found("search", &["read", "write", "delete"]);
-    /// assert!(matches!(err, AgentError::ToolNotFound { .. }));
+    /// let err = LoopError::tool_not_found("search", &["read", "write", "delete"]);
+    /// assert!(matches!(err, LoopError::ToolNotFound { .. }));
     /// ```
     pub fn tool_not_found(tool: impl Into<String>, available: &[&str]) -> Self {
         let tool = tool.into();
@@ -326,14 +310,14 @@ impl AgentError {
     /// Returns `true` for variants where a retry with the same or
     /// modified inputs has a reasonable chance of success:
     ///
-    /// - [`ToolExecution`](AgentError::ToolExecution) — the tool may
+    /// - [`ToolExecution`](LoopError::ToolExecution) — the tool may
     ///   succeed on a second attempt (transient failure, rate limit,
     ///   etc.).
-    /// - [`Api`](AgentError::Api) — the upstream provider may recover
+    /// - [`Api`](LoopError::Api) — the upstream provider may recover
     ///   (network blip, temporary overload).
-    /// - [`ContextExceeded`](AgentError::ContextExceeded) —
+    /// - [`ContextExceeded`](LoopError::ContextExceeded) —
     ///   compaction may free enough tokens for a retry.
-    /// - [`Reflection`](AgentError::Reflection) — a second
+    /// - [`Reflection`](LoopError::Reflection) — a second
     ///   reflection pass may produce a valid correction.
     ///
     /// Returns `false` for all other variants (e.g. invalid input,
@@ -352,7 +336,7 @@ impl AgentError {
 
     /// Check whether the agent was explicitly cancelled.
     ///
-    /// Returns `true` only for the [`Cancelled`](AgentError::Cancelled)
+    /// Returns `true` only for the [`Cancelled`](LoopError::Cancelled)
     /// variant. Use this to distinguish user-initiated cancellation
     /// from genuine failures so you can log it as `info!` rather than
     /// `error!`.
@@ -360,9 +344,9 @@ impl AgentError {
     /// # Example
     ///
     /// ```
-    /// use loopctl::core::error::AgentError;
+    /// use loopctl::error::LoopError;
     ///
-    /// let err = AgentError::Cancelled;
+    /// let err = LoopError::Cancelled;
     /// assert!(err.is_cancelled());
     /// ```
     #[must_use]
@@ -376,7 +360,7 @@ mod tests {
     use super::*;
     #[test]
     fn tool_not_found_empty_available_says_none_registered() {
-        let err = AgentError::tool_not_found("my_tool", &[]);
+        let err = LoopError::tool_not_found("my_tool", &[]);
         assert_eq!(
             err.to_string(),
             "Tool not found: my_tool. Available: none registered"
@@ -394,7 +378,7 @@ mod tests {
                 TOOLS[i - 1]
             })
             .collect();
-        let err = AgentError::tool_not_found("missing", &names);
+        let err = LoopError::tool_not_found("missing", &names);
         assert_eq!(
             err.to_string(),
             "Tool not found: missing. Available: tool_1, tool_2, tool_3, tool_4, tool_5, tool_6, tool_7, tool_8, tool_9, tool_10"
@@ -407,7 +391,7 @@ mod tests {
             "tool_1", "tool_2", "tool_3", "tool_4", "tool_5", "tool_6", "tool_7", "tool_8",
             "tool_9", "tool_10", "tool_11", "tool_12", "tool_13",
         ];
-        let err = AgentError::tool_not_found("missing", &names);
+        let err = LoopError::tool_not_found("missing", &names);
         assert_eq!(
             err.to_string(),
             "Tool not found: missing. Available: tool_1, tool_2, tool_3, tool_4, tool_5, tool_6, tool_7, tool_8, tool_9, tool_10... (and 3 more)"
@@ -420,7 +404,7 @@ mod tests {
             "tool_1", "tool_2", "tool_3", "tool_4", "tool_5", "tool_6", "tool_7", "tool_8",
             "tool_9", "tool_10", "tool_11",
         ];
-        let err = AgentError::tool_not_found("missing", &names);
+        let err = LoopError::tool_not_found("missing", &names);
         assert_eq!(
             err.to_string(),
             "Tool not found: missing. Available: tool_1, tool_2, tool_3, tool_4, tool_5, tool_6, tool_7, tool_8, tool_9, tool_10... (and 1 more)"
@@ -429,7 +413,7 @@ mod tests {
 
     #[test]
     fn is_recoverable_true_for_tool_execution() {
-        let err = AgentError::ToolExecution {
+        let err = LoopError::ToolExecution {
             tool: "cat".into(),
             message: "something went wrong".into(),
         };
@@ -438,13 +422,13 @@ mod tests {
 
     #[test]
     fn is_recoverable_true_for_api() {
-        let err = AgentError::Api("rate limited".into());
+        let err = LoopError::Api("rate limited".into());
         assert!(err.is_recoverable());
     }
 
     #[test]
     fn is_recoverable_true_for_context_exceeded() {
-        let err = AgentError::ContextExceeded {
+        let err = LoopError::ContextExceeded {
             used: 200_000,
             limit: 128_000,
         };
@@ -453,19 +437,19 @@ mod tests {
 
     #[test]
     fn is_recoverable_true_for_reflection() {
-        let err = AgentError::Reflection("need to rethink".into());
+        let err = LoopError::Reflection("need to rethink".into());
         assert!(err.is_recoverable());
     }
 
     #[test]
     fn is_recoverable_false_for_tool_not_found() {
-        let err = AgentError::tool_not_found("nope", &["a", "b"]);
+        let err = LoopError::tool_not_found("nope", &["a", "b"]);
         assert!(!err.is_recoverable());
     }
 
     #[test]
     fn is_recoverable_false_for_cancelled() {
-        let err = AgentError::Cancelled;
+        let err = LoopError::Cancelled;
         assert!(!err.is_recoverable());
     }
 }

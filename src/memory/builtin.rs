@@ -1,15 +1,14 @@
-//! Reference memory implementation — in-memory [`AgentMemory`] backend.
+//! Reference memory implementation — in-memory [`LoopMemory`] backend.
 //!
-//! This module provides [`InMemoryStore`], a simple `Vec`-backed
-//! implementation of the [`AgentMemory`] trait. It is intended for
-//! testing, prototyping, and as a reference for building more
-//! sophisticated memory backends (e.g. vector similarity stores).
+//! [`InMemoryStore`], a simple `Vec`-backed implementation of the
+//! [`LoopMemory`] trait. Intended for testing, prototyping, and as a
+//! reference for building more sophisticated memory backends (e.g. vector similarity stores).
 //!
 //! # Provided Implementations
 //!
 //! - **[`InMemoryStore`]** — Stores [`MemoryEntry`] values in a `Vec` and
 //!   retrieves them via weighted keyword + tag scoring. Supports
-//!   [`consolidate`](AgentMemory::consolidate) by pruning entries whose
+//!   [`consolidate`](LoopMemory::consolidate) by pruning entries whose
 //!   [`relevance`](MemoryEntry::relevance) drops below 0.05.
 //!
 //! # When to Use
@@ -17,28 +16,14 @@
 //! Use this backend when you need a zero-dependency, deterministic memory
 //! store — for example in unit tests, benchmarks, or single-session agents
 //! that don't require persistence across restarts. For production agents
-//! that need durable or distributed memory, implement [`AgentMemory`] on
+//! that need durable or distributed memory, implement [`LoopMemory`] on
 //! top of a database or vector store instead.
-//!
-//! # Data Flow
-//!
-//! ```text
-//!                   ┌──────────────────────┐
-//!   agent turn ───▶ │  store(entry)        │
-//!                   │    ▼                 │
-//!                   │  entries: Vec<_>     │
-//!                   │    ▼                 │
-//!   agent turn ◀─── │  retrieve(query, n)  │
-//!                   │    ▼                 │
-//!   periodic   ───▶ │  consolidate()       │
-//!                   └──────────────────────┘
-//! ```
 //!
 //! # Quick Start
 //!
 //! ```rust
-//! use loopctl::builtin::memory::InMemoryStore;
-//! use loopctl::core::{AgentMemory, MemoryEntry, MemoryCategory};
+//! use loopctl::memory::builtin::InMemoryStore;
+//! use loopctl::memory::{LoopMemory, MemoryEntry, MemoryCategory};
 //!
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
 //! let mut store = InMemoryStore::new();
@@ -52,9 +37,12 @@
 //! # });
 //! ```
 
-use crate::core::{AgentError, AgentMemory, ConsolidationStats, MemoryEntry};
+use crate::error::LoopError;
+use crate::memory::{ConsolidationStats, LoopMemory, MemoryEntry};
+use std::future::Future;
+use std::pin::Pin;
 
-/// A simple in-memory store for agent memory entries.
+/// A simple in-memory store for loop memory entries.
 ///
 /// Stores [`MemoryEntry`] values in a flat `Vec` and retrieves them using
 /// a weighted scoring function that combines the entry's base
@@ -69,7 +57,7 @@ use crate::core::{AgentError, AgentMemory, ConsolidationStats, MemoryEntry};
 ///
 /// # Scoring Formula
 ///
-/// Each candidate entry is scored during [`retrieve`](AgentMemory::retrieve)
+/// Each candidate entry is scored during [`retrieve`](LoopMemory::retrieve)
 /// using a weighted blend of three signals:
 ///
 /// ```text
@@ -86,20 +74,20 @@ use crate::core::{AgentError, AgentMemory, ConsolidationStats, MemoryEntry};
 /// # Thread Safety
 ///
 /// [`InMemoryStore`] is `Send + Sync` because all mutation goes through
-/// `&mut self` in the [`AgentMemory`] trait. If you need shared mutable
+/// `&mut self` in the [`LoopMemory`] trait. If you need shared mutable
 /// access from multiple tasks, wrap it in `Arc<Mutex<_>>`.
 ///
 /// # Construction
 ///
 /// ```
-/// use loopctl::builtin::memory::InMemoryStore;
-/// use loopctl::core::{MemoryEntry, MemoryCategory};
+/// use loopctl::memory::builtin::InMemoryStore;
+/// use loopctl::memory::{MemoryEntry, MemoryCategory};
 ///
 /// // Empty store:
 /// let store = InMemoryStore::new();
 ///
 /// // Pre-populated:
-/// let store = InMemoryStore::with_entries(vec![
+/// let store = InMemoryStore::new().with_entries(vec![
 ///     MemoryEntry::new(MemoryCategory::Fact, "The project uses Rust 1.95"),
 /// ]);
 /// ```
@@ -107,8 +95,8 @@ use crate::core::{AgentError, AgentMemory, ConsolidationStats, MemoryEntry};
 /// # Example
 ///
 /// ```rust
-/// use loopctl::builtin::memory::InMemoryStore;
-/// use loopctl::core::{AgentMemory, MemoryEntry, MemoryCategory};
+/// use loopctl::memory::builtin::InMemoryStore;
+/// use loopctl::memory::{LoopMemory, MemoryEntry, MemoryCategory};
 ///
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let mut store = InMemoryStore::new();
@@ -120,22 +108,6 @@ use crate::core::{AgentError, AgentMemory, ConsolidationStats, MemoryEntry};
 /// # });
 /// ```
 pub struct InMemoryStore {
-    /// The internal list of stored memory entries.
-    ///
-    /// Entries are appended in insertion order via [`store`](InMemoryStore::store).
-    /// During [`retrieve`](InMemoryStore::retrieve) the list is scanned linearly
-    /// and entries are scored / sorted by relevance. During
-    /// [`consolidate`](InMemoryStore::consolidate), entries with
-    /// [`relevance`](MemoryEntry::relevance) below 0.05 are removed.
-    ///
-    /// Starts empty when created via [`new`](InMemoryStore::new) or
-    /// [`default`](InMemoryStore::default). Pre-populated when created
-    /// via [`with_entries`](InMemoryStore::with_entries).
-    ///
-    /// **Constraints:** Entries are never reordered — new items are always
-    /// appended to the end. Removals only occur during
-    /// [`consolidate`](AgentMemory::consolidate) and preserve the
-    /// relative order of surviving entries.
     entries: Vec<MemoryEntry>,
 }
 
@@ -146,13 +118,13 @@ pub struct InMemoryStore {
 impl InMemoryStore {
     /// Create a new empty store.
     ///
-    /// Returns a fresh [`InMemoryStore`] whose [`len`](AgentMemory::len) is zero.
+    /// Returns a fresh [`InMemoryStore`] whose [`len`](LoopMemory::len) is zero.
     ///
     /// # Example
     ///
     /// ```
-    /// use loopctl::builtin::memory::InMemoryStore;
-    /// use loopctl::core::AgentMemory;
+    /// use loopctl::memory::builtin::InMemoryStore;
+    /// use loopctl::memory::LoopMemory;
     ///
     /// let store = InMemoryStore::new();
     /// assert!(store.is_empty());
@@ -167,66 +139,55 @@ impl InMemoryStore {
     /// Create a store pre-populated with the given entries.
     ///
     /// Useful for setting up test fixtures or seeding an agent with
-    /// prior knowledge. The entries are stored in the order provided.
+    /// Replace all entries with the provided list.
     ///
     /// # Example
     ///
     /// ```
-    /// use loopctl::builtin::memory::InMemoryStore;
-    /// use loopctl::core::{AgentMemory, MemoryEntry, MemoryCategory};
+    /// use loopctl::memory::builtin::InMemoryStore;
+    /// use loopctl::memory::{LoopMemory, MemoryEntry, MemoryCategory};
     ///
-    /// let store = InMemoryStore::with_entries(vec![
+    /// let store = InMemoryStore::new().with_entries(vec![
     ///     MemoryEntry::new(MemoryCategory::Fact, "Rust 1.75 stabilised async fn in trait"),
     ///     MemoryEntry::new(MemoryCategory::Strategy, "Start refactors with tests"),
     /// ]);
     /// assert_eq!(store.len(), 2);
     /// ```
     #[must_use]
-    pub fn with_entries(entries: Vec<MemoryEntry>) -> Self {
-        Self { entries }
+    pub fn with_entries(mut self, entries: Vec<MemoryEntry>) -> Self {
+        self.entries = entries;
+        self
     }
 }
 
 impl Default for InMemoryStore {
-    /// Returns an empty store, equivalent to [`new`](InMemoryStore::new).
-    ///
-    /// Enables the [`Default`] trait so [`InMemoryStore`] can be used in
-    /// generic contexts that require `T: Default` (e.g. struct initialisation
-    /// with `..Default::default()`).
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use loopctl::builtin::memory::InMemoryStore;
-    /// use loopctl::core::AgentMemory;
-    ///
-    /// let store = InMemoryStore::default();
-    /// assert!(store.is_empty());
-    /// ```
     fn default() -> Self {
         Self::new()
     }
 }
 
 // ===================================================
-// AgentMemory implementation
+// LoopMemory implementation
 // ===================================================
 
-impl AgentMemory for InMemoryStore {
-    /// Store a new memory entry by appending it to the internal list.
+impl LoopMemory for InMemoryStore {
+    /// Store a new memory entry by appending it to the backing list.
     ///
     /// Called whenever the agent encounters information worth remembering —
     /// for example after a successful tool invocation, a resolved error, or
-    /// an insight drawn from conversation. The entry is simply pushed onto
-    /// the internal entries vector.
+    /// an insight drawn from conversation.
     ///
     /// # Errors
     ///
-    /// This implementation never returns an error, but the return type
-    /// conforms to the [`AgentMemory`] trait signature for compatibility.
-    async fn store(&mut self, entry: MemoryEntry) -> Result<(), AgentError> {
-        self.entries.push(entry);
-        Ok(())
+    /// This implementation never returns an error.
+    fn store(
+        &mut self,
+        entry: MemoryEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>> {
+        Box::pin(async move {
+            self.entries.push(entry);
+            Ok(())
+        })
     }
 
     /// Retrieve memory entries relevant to the given query.
@@ -251,8 +212,8 @@ impl AgentMemory for InMemoryStore {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::builtin::memory::InMemoryStore;
-    /// use loopctl::core::{AgentMemory, MemoryEntry, MemoryCategory};
+    /// use loopctl::memory::builtin::InMemoryStore;
+    /// use loopctl::memory::{LoopMemory, MemoryEntry, MemoryCategory};
     ///
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let mut store = InMemoryStore::new();
@@ -264,41 +225,48 @@ impl AgentMemory for InMemoryStore {
     /// }
     /// # });
     /// ```
-    async fn retrieve(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>, AgentError> {
-        let query_lower = query.to_lowercase();
-        let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+    fn retrieve(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + '_>> {
+        let query = query.to_string();
+        Box::pin(async move {
+            let query_lower = query.to_lowercase();
+            let query_words: Vec<&str> = query_lower.split_whitespace().collect();
 
-        let mut scored: Vec<(f32, MemoryEntry)> = self
-            .entries
-            .iter()
-            .map(|entry| {
-                let memory_lower = entry.memory.to_lowercase();
-                let tag_match = entry
-                    .tags
-                    .iter()
-                    .any(|t| t.to_lowercase().contains(&query_lower));
-                let word_matches = query_words
-                    .iter()
-                    .filter(|w| memory_lower.contains(*w))
-                    .count();
-                let base_score = entry.relevance;
-                #[allow(clippy::cast_precision_loss)]
-                let query_bonus = if word_matches > 0 {
-                    word_matches as f32 / query_words.len().max(1) as f32
-                } else {
-                    0.0
-                };
-                let tag_bonus = if tag_match { 0.3 } else { 0.0 };
-                (
-                    base_score * 0.5 + query_bonus * 0.4 + tag_bonus + 0.1,
-                    entry.clone(),
-                )
-            })
-            .collect();
+            let mut scored: Vec<(f32, MemoryEntry)> = self
+                .entries
+                .iter()
+                .map(|entry| {
+                    let memory_lower = entry.memory.to_lowercase();
+                    let tag_match = entry
+                        .tags
+                        .iter()
+                        .any(|t| t.to_lowercase().contains(&query_lower));
+                    let word_matches = query_words
+                        .iter()
+                        .filter(|w| memory_lower.contains(*w))
+                        .count();
+                    let base_score = entry.relevance;
+                    #[allow(clippy::cast_precision_loss)]
+                    let query_bonus = if word_matches > 0 {
+                        word_matches as f32 / query_words.len().max(1) as f32
+                    } else {
+                        0.0
+                    };
+                    let tag_bonus = if tag_match { 0.3 } else { 0.0 };
+                    (
+                        base_score * 0.5 + query_bonus * 0.4 + tag_bonus + 0.1,
+                        entry.clone(),
+                    )
+                })
+                .collect();
 
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        Ok(scored.into_iter().take(limit).map(|(_, e)| e).collect())
+            Ok(scored.into_iter().take(limit).map(|(_, e)| e).collect())
+        })
     }
 
     /// Consolidate memory by pruning low-relevance entries.
@@ -317,8 +285,8 @@ impl AgentMemory for InMemoryStore {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::builtin::memory::InMemoryStore;
-    /// use loopctl::core::AgentMemory;
+    /// use loopctl::memory::builtin::InMemoryStore;
+    /// use loopctl::memory::LoopMemory;
     ///
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let mut store = InMemoryStore::new();
@@ -326,24 +294,27 @@ impl AgentMemory for InMemoryStore {
     /// println!("Pruned {} entries", stats.pruned);
     /// # });
     /// ```
-    async fn consolidate(&mut self) -> Result<ConsolidationStats, AgentError> {
-        let entries_before = self.entries.len();
-        self.entries.retain(|e| e.relevance >= 0.05);
-        let pruned = entries_before.saturating_sub(self.entries.len());
-        Ok(ConsolidationStats {
-            entries_before,
-            entries_after: self.entries.len(),
-            pruned,
-            merged: 0,
-            bytes_saved: 0,
+    fn consolidate(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
+        Box::pin(async move {
+            let entries_before = self.entries.len();
+            self.entries.retain(|e| e.relevance >= 0.05);
+            let pruned = entries_before.saturating_sub(self.entries.len());
+            Ok(ConsolidationStats {
+                entries_before,
+                entries_after: self.entries.len(),
+                pruned,
+                merged: 0,
+                bytes_saved: 0,
+            })
         })
     }
 
     /// Number of entries currently stored.
     ///
-    /// Returns the length of the internal entries
-    /// vector. Used by the framework to monitor memory usage and by the
-    /// [`is_empty`](AgentMemory::is_empty) provided method.
+    /// Used by the framework to monitor memory usage and by the
+    /// [`is_empty`](LoopMemory::is_empty) provided method.
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -352,7 +323,7 @@ impl AgentMemory for InMemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::MemoryCategory;
+    use crate::memory::MemoryCategory;
 
     #[tokio::test]
     async fn test_store_and_retrieve() {
@@ -438,7 +409,7 @@ mod tests {
             MemoryEntry::new(MemoryCategory::Fact, "fact 1"),
             MemoryEntry::new(MemoryCategory::Fact, "fact 2"),
         ];
-        let store = InMemoryStore::with_entries(entries);
+        let store = InMemoryStore::new().with_entries(entries);
         assert_eq!(store.len(), 2);
     }
 

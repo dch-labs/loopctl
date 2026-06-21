@@ -1,6 +1,6 @@
 //! Hook system — bidirectional lifecycle control for agent loops.
 //!
-//! Hooks differ from observers ([`crate::core::observer::LoopObserver`]) in two key ways:
+//! Hooks differ from observers ([`crate::observer::LoopObserver`]) in two key ways:
 //!
 //! 1. **Return values matter.** Pre-hooks return [`HookAction`] (or [`CompactResult`])
 //!    to control whether an action proceeds.
@@ -58,7 +58,7 @@ use context::{
 
 /// Hook trait for bidirectional lifecycle control.
 ///
-/// Hooks differ from observers ([`crate::core::observer::LoopObserver`]) in two key ways:
+/// Hooks differ from observers ([`crate::observer::LoopObserver`]) in two key ways:
 ///
 /// 1. **Return values matter.** `on_pre_*` methods return `Option<HookAction>` (or
 ///    `Option<CompactResult>`). Returning `Some(Block{...})` prevents the action
@@ -176,7 +176,7 @@ pub trait Hook: Send + Sync {
 ///
 /// - [`Interactivity::Headless`] — there is no human in the loop, so
 ///   `Ask` is automatically downgraded to `Block` with a descriptive
-///   reason. This is the default and the correct mode for autonomous
+///   reason. Default and correct mode for autonomous
 ///   / headless agents (e.g. `BareLoop`).
 /// - [`Interactivity::Interactive`] — a human is available to respond
 ///   to prompts, so `Ask` passes through unchanged.
@@ -217,7 +217,7 @@ pub enum HookAction {
     Block {
         /// Why the action was blocked.
         ///
-        /// This is returned to the model as a tool error, allowing it
+        /// Returned to the model as a tool error, allowing it
         /// to adjust its approach.
         reason: String,
     },

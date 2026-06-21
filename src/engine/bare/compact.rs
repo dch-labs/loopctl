@@ -4,11 +4,11 @@
 //! When a [`ContextManager`] is configured, checks token usage after each
 //! tool dispatch and triggers compaction if usage exceeds the threshold.
 
-use super::{AgentError, ApiClient, BareLoop, EnsureContextResult, Instant};
+use super::{ApiClient, BareLoop, EnsureContextResult, Instant, LoopError};
 #[cfg(feature = "hooks")]
 use super::{CompactTrigger, PostCompactContext, PreCompactContext};
 
-use crate::core::observer::CompactionContext;
+use crate::observer::CompactedContext;
 
 impl<C: ApiClient> BareLoop<C> {
     /// Check if context compaction is needed and perform it if so.
@@ -16,20 +16,21 @@ impl<C: ApiClient> BareLoop<C> {
     /// When a [`ContextManager`] is configured, this method:
     /// 1. Calls [`ContextManager::ensure_context_fits()`] to check token usage.
     /// 2. If compaction occurred, replaces `self.conversation` with the compacted messages.
-    /// 3. Notifies observers via [`LoopObserver::on_compaction`](crate::core::observer::LoopObserver::on_compaction).
+    /// 3. Notifies observers via [`LoopObserver::on_compaction`](crate::observer::LoopObserver::on_compaction).
     ///
     /// When no `ContextManager` is set, this is a no-op.
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::ContextExceeded`] if compaction was needed but failed
+    /// Returns [`LoopError::ContextExceeded`] if compaction was needed but failed
     /// (i.e. the conversation exceeds the context window and the compactor
     /// could not reduce it sufficiently).
-    pub(super) async fn maybe_compact_context(&mut self, turn: usize) -> Result<(), AgentError> {
+    pub(super) async fn maybe_compact_context(&mut self, turn: usize) -> Result<(), LoopError> {
         let Some(ref ctx_manager) = self.context_manager else {
             return Ok(());
         };
 
+        #[cfg(feature = "hooks")]
         let messages_before = self.conversation.len();
 
         // Pre-compact hook check
@@ -65,10 +66,12 @@ impl<C: ApiClient> BareLoop<C> {
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
                 self.conversation = outcome.messages;
+                #[cfg(feature = "hooks")]
                 let messages_after = self.conversation.len();
-                self.managers.observers().on_compaction(&CompactionContext {
-                    messages_before,
-                    messages_after,
+                let tokens_before = outcome.tokens_after.saturating_add(outcome.tokens_saved);
+                self.managers.observers().on_compaction(&CompactedContext {
+                    tokens_before,
+                    tokens_after: outcome.tokens_after,
                     tokens_saved: outcome.tokens_saved,
                 });
 
@@ -93,7 +96,7 @@ impl<C: ApiClient> BareLoop<C> {
                 self.conversation = messages;
                 Ok(())
             }
-            Err(overflow) => Err(AgentError::ContextExceeded {
+            Err(overflow) => Err(LoopError::ContextExceeded {
                 used: overflow.tokens_used,
                 limit: overflow.context_window,
             }),

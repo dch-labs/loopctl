@@ -23,19 +23,15 @@ pub enum GitExecutorError {
     /// Failed to execute git command.
     #[error("Failed to execute git: {0}")]
     ExecutionFailed(String),
-
     /// Git command returned non-zero exit code.
     #[error("Git error: {0}")]
     GitError(String),
-
     /// No changes to commit.
     #[error("No changes to commit")]
     NoChanges,
-
     /// Invalid repository state.
     #[error("Invalid repository state: {0}")]
     InvalidState(String),
-
     /// Git command timed out.
     #[error("Git command timed out after {0:?}")]
     Timeout(Duration),
@@ -121,7 +117,6 @@ impl GitExecutor {
     /// or [`GitExecutorError::GitError`] if the command fails.
     pub fn has_changes() -> Result<bool, GitExecutorError> {
         let (stdout, _stderr) = Self::run_git(&["status", "--porcelain"])?;
-
         let status = String::from_utf8_lossy(&stdout);
         Ok(!status.trim().is_empty())
     }
@@ -428,13 +423,11 @@ impl AutoCommitHook {
         }
     }
 
-    /// Create a new auto-commit hook with custom configuration.
+    /// Set custom configuration.
     #[must_use]
-    pub fn with_config(config: AutoCommitConfig) -> Self {
-        Self {
-            config,
-            modified_files: Mutex::new(Vec::new()),
-        }
+    pub fn with_config(mut self, config: AutoCommitConfig) -> Self {
+        self.config = config;
+        self
     }
 
     fn track_modification(&self, file: &str) {
@@ -529,7 +522,7 @@ mod tests {
             enabled: false,
             ..AutoCommitConfig::default()
         };
-        let hook = AutoCommitHook::with_config(config);
+        let hook = AutoCommitHook::new().with_config(config);
         assert_eq!(hook.name(), "auto_commit");
     }
 

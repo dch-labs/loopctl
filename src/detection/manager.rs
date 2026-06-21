@@ -1,6 +1,6 @@
 //! Detection manager — loop and convergence detection for agent behavior.
 //!
-//! This module provides the [`DetectionManager`] which unifies two complementary
+//! [`DetectionManager`] unifies two complementary
 //! detection strategies into a single manager that agents consult after each turn
 //! to decide whether they are making progress or spinning in circles:
 //!
@@ -19,32 +19,34 @@
 //!
 //! # Architecture
 //!
-//! ```text
-//!                          DetectionManager
-//!                    ┌───────────────────────────┐
-//!                    │  config: DetectionConfig  │
-//!                    │  stats: DetectionStats    │
-//!                    └─────┬────────────┬────────┘
-//!                          │            │
-//!            ┌─────────────┘            └───────────┐
-//!            ▼                                      ▼
-//!    ┌──────────────┐                       ┌──────────────────┐
-//!    │ LoopDetector │                       │ ConvergenceDet.  │
-//!    │  (tool call  │                       │  (response text  │
-//!    │   cycles)    │                       │   similarity)    │
-//!    └──────┬───────┘                       └───────┬──────────┘
-//!           │                                       │
-//!   record_tool_call()                       record_response()
-//!   record_operation()                      check_convergence()
-//!      check_loop()                                 │
-//!           │                                       │
-//!           └──────────────────┬────────────────────┘
-//!                              ▼
-//!                       DetectedPattern
-//!               ┌──────────────┼──────────────────┐
-//!               ▼              ▼                  ▼
-//!            NoPattern   LoopDetected   ConvergenceDetected
-//! ```
+//! `DetectionManager` is a **facade** that owns one `LoopDetector` and one
+//! `ConvergenceDetector`, forwarding calls to each and merging their results
+//! into a unified [`DetectedPattern`] enum.
+//!
+//! **Data flow** — On every agent turn the framework feeds two kinds of
+//! telemetry into the manager:
+//!
+//! 1. *Tool calls* are sent to `record_operation` (or its convenience
+//!    wrappers `record_tool_call` / `record_tool_call_with_result`), which
+//!    hands the operation to the `LoopDetector`. The loop detector compares
+//!    consecutive operations by tool name, primary parameter, and optional
+//!    result hash; when the same signature repeats ≥ `loop_threshold`
+//!    times it reports a loop.
+//!
+//! 2. *Assistant responses* (free text) are sent to `record_response`,
+//!    which hands the text to the `ConvergenceDetector`. The convergence
+//!    detector tokenises the text into words, computes Jaccard similarity
+//!    against the previous response, and fires when similarity stays above
+//!    `convergence_threshold` for `convergence_count` consecutive turns.
+//!
+//! **Merging** — `check_current_pattern` queries both detectors and
+//! returns the first non-`NoPattern` result. Loop detection takes priority
+//! over convergence because a tool-calling loop is a stronger signal of
+//! being stuck.
+//!
+//! **Outcome** — The three possible results are carried by [`DetectedPattern`]:
+//! `NoPattern` (agent is making progress), `LoopDetected` (repeated tool
+//! calls), or `ConvergenceDetected` (semantically similar responses).
 //!
 //! # Provided Types
 //!
@@ -53,18 +55,10 @@
 //! - [`DetectedPattern`] — summary enum returned by every check method.
 //! - [`DetectionStats`] — cumulative statistics exposed for observability.
 //!
-//! # Re-exports
-//!
-//! This module re-exports key types from the underlying detector modules so
-//! consumers can import everything from a single path:
-//!
-//! - [`ConvergenceAction`] — what to do when convergence is detected.
-//! - [`LoopStatus`] — detailed loop status from [`DetectionManager::check_loop`].
-//!
 //! # Quick Start
 //!
 //! ```rust,ignore
-//! use loopctl::loop_control::detection::{
+//! use loopctl::detection::manager::{
 //!     DetectionConfig, DetectionManager, DetectedPattern,
 //! };
 //!
@@ -143,12 +137,12 @@ pub use super::loop_detector::LoopStatus;
 /// - [`DetectionStats`] — cumulative detection counters.
 #[derive(Debug, Clone)]
 pub enum DetectedPattern {
-    /// The agent is repeating the same sequence of tool calls.
+    /// Repeated tool-call pattern detected.
     ///
     /// Emitted by [`DetectionManager::record_operation`] (and the
     /// convenience wrappers [`DetectionManager::record_tool_call`] /
     /// [`DetectionManager::record_tool_call_with_result`]) when the
-    /// internal [`LoopDetector`] observes the same operation at least
+    /// [`LoopDetector`] observes the same operation at least
     /// [`DetectionConfig::loop_threshold`] times in a row.
     ///
     /// A "loop" does not mean the agent is calling the *exact same*
@@ -172,24 +166,9 @@ pub enum DetectedPattern {
     /// }
     /// ```
     LoopDetected {
-        /// Number of times the pattern has repeated.
-        ///
-        /// Equal to [`LoopStatus::repetition_count`] at the time of
-        /// detection. When this value reaches
-        /// [`DetectionConfig::stop_threshold`] the agent should terminate.
-        ///
-        /// This is a `usize` ≥ 1. A value of 1 means the loop was just
-        /// detected (the repetition count equals the loop threshold).
+        /// Equal to [`LoopStatus::repetition_count`].
         repetitions: usize,
-        /// Human-readable description of the repeating pattern.
-        ///
-        /// Typically formatted as `"ToolName(primary_param)"` extracted
-        /// from the first entry in [`LoopStatus::repeated_operations`].
-        /// For example, if the agent keeps calling `Read("/etc/hosts")`,
-        /// this field would contain `"Read(/etc/hosts)"`.
-        ///
-        /// Can be empty if the loop detector did not provide any
-        /// repeated operations (which should not happen in practice).
+        /// Formatted as `"ToolName(primary_param)"`.
         pattern_description: String,
     },
     /// The agent's responses have become semantically similar.
@@ -201,7 +180,7 @@ pub enum DetectedPattern {
     ///
     /// Unlike [`LoopDetected`](Self::LoopDetected), which monitors tool
     /// call patterns, this variant tracks the *content* of the agent's
-    /// free-text replies. It fires when the agent keeps saying essentially
+    /// free-text replies. It fires when the agent keeps saying
     /// the same thing in different words — a strong signal that it is
     /// stuck even if it is calling different tools each time.
     ///
@@ -212,38 +191,16 @@ pub enum DetectedPattern {
     /// - `consecutive_count` — how many consecutive response pairs exceeded
     ///   the threshold.
     ConvergenceDetected {
-        /// Jaccard similarity score (0.0–1.0) of the most recent pair of
-        /// responses.
-        ///
-        /// A value of `1.0` means the responses are identical at the
-        /// word-token level. The default threshold is `0.95`.
-        ///
-        /// Note: this score is computed on word-level token sets after
-        /// lowercasing, not on raw character sequences. Two responses
-        /// that are paraphrases with different vocabulary may have a low
-        /// score even if they are semantically equivalent.
+        /// Jaccard similarity (0.0–1.0) of the most recent response pair.
         similarity: f32,
-        /// Number of consecutive responses that exceeded the similarity
-        /// threshold.
-        ///
-        /// Equal to [`ConvergenceStatus::consecutive_count`]. When this
-        /// value reaches [`DetectionConfig::convergence_count`], the
-        /// convergence detector fires.
-        ///
-        /// A value of `1` means this is the first time the threshold was
-        /// exceeded; higher values indicate a sustained period of
-        /// similarity.
+        /// Consecutive similar responses.
         consecutive_count: usize,
     },
-    /// No pattern detected — the agent appears to be making progress.
+    /// Neither the loop detector nor the convergence detector has fired.
     ///
-    /// This is the "healthy" variant. It is returned whenever neither the
-    /// loop detector nor the convergence detector has fired. The agent's
-    /// tool calls are varying and/or its responses are diverging, which
-    /// indicates forward progress.
-    ///
-    /// Callers should simply continue the turn loop when they receive
-    /// this variant.
+    /// The agent's tool calls are varying and/or its responses are diverging,
+    /// which indicates forward progress. Callers should continue the
+    /// turn loop when they receive this variant.
     NoPattern,
 }
 
@@ -255,7 +212,7 @@ pub enum DetectedPattern {
 ///
 /// Groups all tunables for loop detection and convergence detection in a
 /// single struct so consumers can construct a [`DetectionManager`] with
-/// one call to [`DetectionManager::with_config`].
+/// one call to [`DetectionManager::new_with_config`].
 ///
 /// The [`Default`] implementation provides sensible production values:
 /// loop threshold 3, stop threshold 10, convergence threshold 0.95, and
@@ -284,7 +241,7 @@ pub enum DetectedPattern {
 ///     convergence_threshold: 0.9, // looser similarity threshold
 ///     ..DetectionConfig::default()
 /// };
-/// let dm = DetectionManager::with_config(config);
+/// let dm = DetectionManager::new_with_config(config);
 /// ```
 ///
 /// # See Also
@@ -293,147 +250,27 @@ pub enum DetectedPattern {
 /// - [`DetectionConfig::to_loop_detector_config`] — converts to [`LoopDetectorConfig`].
 #[derive(Debug, Clone)]
 pub struct DetectionConfig {
-    // ==================================================
-    // Loop detection (forwarded to LoopDetectorConfig)
-    // ==================================================
-    /// Number of consecutive similar operations before declaring a loop.
-    ///
-    /// When the [`LoopDetector`] sees the same operation this many times
-    /// in a row, [`DetectionManager::check_loop`] will report
-    /// [`LoopStatus::is_looping`] as `true`.
-    ///
-    /// This threshold applies *per tool*, so if a custom [`ToolSignature`]
-    /// provides per-tool overrides via [`ToolSignature::tool_thresholds`],
-    /// those values take precedence for the matching tool name.
-    ///
-    /// Default: **3**.
+    /// Consecutive similar operations before declaring a loop. Default: **3**.
     pub loop_threshold: usize,
-
-    /// Number of repetitions that triggers a forced stop (0 = disabled).
-    ///
-    /// Once the loop detector has seen this many consecutive identical
-    /// operations the framework should terminate the session. Set to `0`
-    /// to disable forced stopping and rely solely on warnings.
-    ///
-    /// This maps to [`LoopDetectorConfig::stop_threshold`] during
-    /// construction via [`DetectionConfig::to_loop_detector_config`].
-    /// When the stop threshold is reached, [`LoopStatus::should_stop`]
-    /// is set to `true` and the detector generates a `"STOPPING"` warning.
-    ///
-    /// Default: **10**.
+    /// Repetitions triggering forced stop (0 = disabled). Default: **10**.
     pub stop_threshold: usize,
-
-    /// Whether loop detection is enabled.
-    ///
-    /// When `false`, [`DetectionManager::record_operation`] and
-    /// [`DetectionManager::record_tool_call`] return
-    /// [`DetectedPattern::NoPattern`] immediately without forwarding to
-    /// the [`LoopDetector`]. This is useful in testing scenarios or when
-    /// the consumer wants to rely solely on convergence detection.
-    ///
-    /// Default: **true**.
+    /// Whether loop detection is enabled. Default: **true**.
     pub enable_loop_detection: bool,
-
-    /// Maximum number of operations to keep in the loop detector's history.
-    ///
-    /// Older operations are evicted once the ring buffer exceeds this
-    /// size. A larger history lets the detector recognise longer cycles,
-    /// at the cost of more memory.
-    ///
-    /// This maps to [`LoopDetectorConfig::window_size`] during
-    /// construction. For most agents the default of 100 is more than
-    /// sufficient — typical loops repeat within 3–10 operations.
-    ///
-    /// Default: **100**.
+    /// Max operations kept in loop detector history. Default: **100**.
     pub max_history: usize,
-
-    // ==================================================
-    // Convergence detection
-    // ==================================================
-    /// Similarity threshold (0.0–1.0) for convergence detection.
-    ///
-    /// The [`ConvergenceDetector`] compares the Jaccard similarity of the
-    /// most recent pair of responses. If the score is at or above this
-    /// value for [`convergence_count`](Self::convergence_count) consecutive
-    /// turns, convergence is declared.
-    ///
-    /// A higher threshold (e.g., 0.99) requires near-identical responses,
-    /// while a lower threshold (e.g., 0.80) catches paraphrasing but may
-    /// produce false positives.
-    ///
-    /// Default: **0.95**.
+    /// Jaccard similarity threshold for convergence (0.0–1.0). Default: **0.95**.
     pub convergence_threshold: f32,
-
-    /// Number of consecutive similar responses required for convergence.
-    ///
-    /// A higher value makes the detector more tolerant — the agent can
-    /// produce several similar responses before being flagged. Setting
-    /// this to 1 would flag any two similar responses immediately.
-    ///
-    /// Maps to [`ConvergenceConfig::window_size`] during construction.
-    ///
-    /// Default: **3**.
+    /// Consecutive similar responses for convergence. Default: **3**.
     pub convergence_count: usize,
-
-    /// Whether convergence detection is enabled.
-    ///
-    /// When `false`, [`DetectionManager::record_response`] returns
-    /// [`DetectedPattern::NoPattern`] immediately without forwarding to
-    /// the [`ConvergenceDetector`]. This is useful when the consumer
-    /// wants to rely solely on loop detection, or in unit tests where
-    /// convergence noise would be distracting.
-    ///
-    /// Default: **true**.
+    /// Whether convergence detection is enabled. Default: **true**.
     pub enable_convergence_detection: bool,
-
-    /// Action to take when convergence is detected.
-    ///
-    /// Determines whether the framework should emit a warning, force a
-    /// stop, or silently note the event. See [`ConvergenceAction`] for
-    /// available options.
-    ///
-    /// The action is forwarded to the internal [`ConvergenceDetector`]
-    /// during construction via [`DetectionConfig::to_convergence_config`].
-    /// It is consulted by the framework when [`DetectionManager::check_convergence`]
-    /// returns a [`ConvergenceStatus`] with `detected == true`.
-    ///
-    /// Default: [`ConvergenceAction::default()`].
+    /// Action on convergence. Default: [`ConvergenceAction::default()`].
     pub on_converge: ConvergenceAction,
-
-    /// Maximum number of responses to keep for convergence checking.
-    ///
-    /// The [`ConvergenceDetector`] maintains a sliding window of responses.
-    /// Older responses are evicted once this limit is reached.
-    ///
-    /// A larger window retains more history (useful for spotting slow
-    /// drift), while a smaller window reduces memory usage and makes the
-    /// detector more responsive to recent changes.
-    ///
-    /// Default: **20**.
+    /// Max responses kept for convergence checking. Default: **20**.
     pub max_response_history: usize,
 }
 
 impl Default for DetectionConfig {
-    /// Produce a configuration with production-ready defaults.
-    ///
-    /// The defaults are chosen to be conservative enough for most agent
-    /// workloads while still catching genuine stuck behaviours:
-    ///
-    /// | Field                          | Default                          |
-    /// |--------------------------------|----------------------------------|
-    /// | `loop_threshold`               | 3                                |
-    /// | `stop_threshold`               | 10                               |
-    /// | `enable_loop_detection`        | `true`                           |
-    /// | `max_history`                  | 100                              |
-    /// | `convergence_threshold`        | 0.95                             |
-    /// | `convergence_count`            | 3                                |
-    /// | `enable_convergence_detection` | `true`                           |
-    /// | `on_converge`                  | [`ConvergenceAction::default()`] |
-    /// | `max_response_history`         | 20                               |
-    ///
-    /// # When called
-    ///
-    /// By [`DetectionManager::new`] and anywhere a default config is needed.
     fn default() -> Self {
         Self {
             loop_threshold: 3,
@@ -452,11 +289,6 @@ impl Default for DetectionConfig {
 impl DetectionConfig {
     /// Convert convergence settings into a [`ConvergenceConfig`].
     ///
-    /// Maps the subset of fields that belong to the convergence subsystem
-    /// (`enable_convergence_detection` → `enabled`, `convergence_count` →
-    /// `window_size`, etc.). Called by [`DetectionManager::with_config`]
-    /// during construction.
-    ///
     /// # Field Mapping
     ///
     /// | `DetectionConfig` field        | [`ConvergenceConfig`] field            |
@@ -465,11 +297,6 @@ impl DetectionConfig {
     /// | `convergence_count`            | `window_size`                          |
     /// | `convergence_threshold`        | `similarity_threshold`                 |
     /// | `on_converge`                  | `on_converge`                          |
-    ///
-    /// # When called
-    ///
-    /// Internally by [`DetectionManager`] constructors; generally not
-    /// needed by external callers.
     #[must_use]
     pub fn to_convergence_config(&self) -> ConvergenceConfig {
         ConvergenceConfig {
@@ -482,10 +309,6 @@ impl DetectionConfig {
 
     /// Convert the loop-related settings into a [`LoopDetectorConfig`].
     ///
-    /// Maps `max_history` → `window_size`, `loop_threshold` →
-    /// `repetition_threshold`, and `stop_threshold` directly. All other
-    /// [`LoopDetectorConfig`] fields inherit their defaults.
-    ///
     /// # Field Mapping
     ///
     /// | `DetectionConfig` field | [`LoopDetectorConfig`] field |
@@ -493,11 +316,6 @@ impl DetectionConfig {
     /// | `max_history`           | `window_size`                |
     /// | `loop_threshold`        | `repetition_threshold`       |
     /// | `stop_threshold`        | `stop_threshold`             |
-    ///
-    /// # When called
-    ///
-    /// Internally by [`DetectionManager`] constructors; generally not
-    /// needed by external callers.
     #[must_use]
     pub fn to_loop_detector_config(&self) -> LoopDetectorConfig {
         LoopDetectorConfig {
@@ -519,7 +337,7 @@ impl DetectionConfig {
 /// debugging. All counters are monotonically increasing within a session
 /// (until [`DetectionManager::reset`] is called).
 ///
-/// This struct is [`Clone`] and [`Default`] so it can be cheaply snapshot
+/// [`Clone`] and [`Default`] — can be cheaply snapshot
 /// and serialised for logging or UI display.
 ///
 /// # Example
@@ -538,51 +356,13 @@ impl DetectionConfig {
 /// - [`DetectionManager::reset`] — zeroes all counters.
 #[derive(Debug, Clone, Default)]
 pub struct DetectionStats {
-    /// Total number of turns (operations + responses) analysed.
-    ///
-    /// Incremented by [`DetectionManager::record_operation`] each time an
-    /// operation is recorded, regardless of whether a loop was found.
-    /// This counter does **not** include responses recorded via
-    /// [`DetectionManager::record_response`] — only tool-call operations.
-    ///
-    /// Reset to `0` by [`DetectionManager::reset`].
+    /// Tool-call operations recorded via `record_operation`. Reset by `reset`.
     pub turns_analyzed: usize,
-
-    /// Number of times a loop was detected.
-    ///
-    /// Incremented only when [`DetectionManager::record_operation`] returns
-    /// [`DetectedPattern::LoopDetected`]. This is a subset of
-    /// [`turns_analyzed`](Self::turns_analyzed).
-    ///
-    /// A high ratio of `loops_detected` to `turns_analyzed` suggests the
-    /// agent is frequently stuck. The framework can use this metric to
-    /// decide whether to terminate the session early.
-    ///
-    /// Reset to `0` by [`DetectionManager::reset`].
+    /// Subset of `turns_analyzed` that returned `LoopDetected`. Reset by `reset`.
     pub loops_detected: usize,
-
-    /// Number of times convergence was detected.
-    ///
-    /// Incremented only when [`DetectionManager::record_response`] returns
-    /// [`DetectedPattern::ConvergenceDetected`]. Unlike `loops_detected`,
-    /// this counter tracks semantic similarity of free-text responses,
-    /// not tool-call repetition.
-    ///
-    /// Reset to `0` by [`DetectionManager::reset`].
+    /// Times `record_response` returned `ConvergenceDetected`. Reset by `reset`.
     pub convergences_detected: usize,
-
-    /// Current streak of consecutive similar operations.
-    ///
-    /// Mirrors [`LoopStatus::repetition_count`] after the most recent
-    /// [`DetectionManager::record_operation`] call. When this value reaches
-    /// [`DetectionConfig::loop_threshold`], the next call to
-    /// [`DetectionManager::record_operation`] will return
-    /// [`DetectedPattern::LoopDetected`].
-    ///
-    /// Useful for progress bars or warning indicators that show "how close"
-    /// the agent is to triggering a loop detection.
-    ///
-    /// Reset to `0` by [`DetectionManager::reset`].
+    /// Mirrors `LoopStatus::repetition_count`. Triggers `LoopDetected` at `loop_threshold`. Reset by `reset`.
     pub current_streak: usize,
 }
 
@@ -601,12 +381,12 @@ pub struct DetectionStats {
 ///
 /// Choose a constructor based on your needs:
 ///
-/// | Constructor | Use case |
-/// |---|---|
-/// | [`DetectionManager::new`] | Quick start with defaults |
-/// | [`DetectionManager::with_config`] | Custom thresholds via [`DetectionConfig`] |
-/// | [`DetectionManager::with_loop_detector`] | Inject a pre-built [`LoopDetector`] |
-/// | [`DetectionManager::with_signature`] | Custom [`ToolSignature`] for JSON parsing |
+/// | Constructor                              | Use case                                  |
+/// |------------------------------------------|-------------------------------------------|
+/// | [`DetectionManager::new`]                | Quick start with defaults                 |
+/// | [`DetectionManager::new_with_config`]        | Custom thresholds via [`DetectionConfig`] |
+/// | [`DetectionManager::new_with_loop_detector`] | Inject a pre-built [`LoopDetector`]       |
+/// | [`DetectionManager::new_with_signature`]     | Custom [`ToolSignature`] for JSON parsing |
 ///
 /// # Loop Detection
 ///
@@ -618,7 +398,7 @@ pub struct DetectionStats {
 ///
 /// Record assistant responses via [`Self::record_response`] and check
 /// for semantic similarity using [`Self::check_convergence`]. Both
-/// delegate to the internal [`ConvergenceDetector`].
+/// delegate to the [`ConvergenceDetector`].
 ///
 /// # Direct Access
 ///
@@ -628,15 +408,15 @@ pub struct DetectionStats {
 ///
 /// # Lifecycle
 ///
-/// ```text
-/// new() / with_config()
-///   → record_operation(op)    [each tool call]
-///   → check_loop()            [after each turn]
-///   → record_response(text)   [each assistant reply]
-///   → check_convergence()     [after each turn]
-///   → stats()                 [observability]
-///   → reset()                 [between tasks]
-/// ```
+/// The manager progresses through a simple per-turn cycle:
+///
+/// 1. **Construct** — `new()` or `with_config()`.
+/// 2. **Feed** — call `record_operation(op)` for each tool invocation and
+///    `record_response(text)` for each assistant reply.
+/// 3. **Check** — call `check_loop()`, `check_convergence()`, or the
+///    combined `check_current_pattern()` after each turn.
+/// 4. **Observe** — call `stats()` at any time for cumulative counters.
+/// 5. **Reset** — call `reset()` between tasks to clear all history.
 ///
 /// # Example
 ///
@@ -672,16 +452,20 @@ pub struct DetectionStats {
 /// - [`DetectedPattern`] — the result type returned by check methods.
 /// - [`DetectionStats`] — cumulative observability counters.
 pub struct DetectionManager {
+    /// Configuration thresholds and feature flags.
     config: DetectionConfig,
+    /// Loop detector shared across compaction and analysis phases.
     loop_detector: Arc<LoopDetector>,
+    /// Convergence detector guarded by interior mutability.
     convergence_detector: Mutex<ConvergenceDetector>,
+    /// Cumulative detection statistics.
     stats: Mutex<DetectionStats>,
 }
 
 impl DetectionManager {
     /// Create a new detection manager with default configuration.
     ///
-    /// Convenience wrapper around [`Self::with_config`] that passes
+    /// Convenience wrapper around [`Self::new_with_config`] that passes
     /// [`DetectionConfig::default`]. Suitable for quick prototyping or
     /// when the default thresholds (loop=3, stop=10, convergence=0.95)
     /// are acceptable.
@@ -697,30 +481,13 @@ impl DetectionManager {
     /// Returns [`ConvergenceConfigError`] if the convergence configuration
     /// is invalid (e.g., threshold out of range, window too small).
     pub fn new() -> Result<Self, ConvergenceConfigError> {
-        Self::with_config(DetectionConfig::default())
+        Self::new_with_config(DetectionConfig::default())
     }
 
     /// Create a new detection manager with custom configuration.
     ///
-    /// Builds a [`LoopDetector`] using a [`NoOpToolSignature`](super::loop_detector::NoOpToolSignature)
-    /// and a [`ConvergenceDetector`] from the relevant config fields.
-    /// For tool-specific JSON parsing, use [`Self::with_signature`] or
-    /// [`Self::with_loop_detector`] instead.
-    ///
-    /// # Construction Flow
-    ///
-    /// ```text
-    /// with_config(config)
-    ///   ├─ config.to_loop_detector_config() → LoopDetectorConfig
-    ///   │    └─ LoopDetector::new(ldc, NoOpToolSignature)
-    ///   ├─ config.to_convergence_config()  → ConvergenceConfig
-    ///   │    └─ ConvergenceDetector::new(cc)
-    ///   └─ DetectionStats::default()
-    /// ```
-    ///
-    /// # When called
-    ///
-    /// Typically during agent initialisation, once per session.
+    /// For tool-specific JSON parsing, use [`Self::new_with_signature`] or
+    /// [`Self::new_with_loop_detector`] instead.
     ///
     /// # Example
     ///
@@ -729,14 +496,14 @@ impl DetectionManager {
     ///     loop_threshold: 5,
     ///     ..DetectionConfig::default()
     /// };
-    /// let dm = DetectionManager::with_config(config);
+    /// let dm = DetectionManager::new_with_config(config);
     /// ```
     ///
     /// # Errors
     ///
     /// Returns [`ConvergenceConfigError`] if the convergence configuration
     /// is invalid (e.g., threshold out of range, window too small).
-    pub fn with_config(config: DetectionConfig) -> Result<Self, ConvergenceConfigError> {
+    pub fn new_with_config(config: DetectionConfig) -> Result<Self, ConvergenceConfigError> {
         let loop_detector = Arc::new(LoopDetector::new(
             config.to_loop_detector_config(),
             Arc::new(super::loop_detector::NoOpToolSignature),
@@ -755,31 +522,25 @@ impl DetectionManager {
     ///
     /// Use this when the caller has already constructed a [`LoopDetector`]
     /// with a custom [`ToolSignature`] or non-default thresholds and wants
-    /// to inject it directly. The detector is wrapped in `Arc` internally
-    /// for cheap sharing.
+    /// to inject it directly.
     ///
     /// This constructor **does not** use the `loop_threshold`, `stop_threshold`,
     /// or `max_history` fields from `config` — those are already baked into
     /// the provided `loop_detector`. Only the convergence-related fields
     /// are read from `config`.
     ///
-    /// # When called
-    ///
-    /// During agent initialisation when the caller needs fine-grained
-    /// control over the loop detector's internals.
-    ///
     /// # Example
     ///
     /// ```rust,ignore
     /// let ld = LoopDetector::new(ld_config, my_signature);
-    /// let dm = DetectionManager::with_loop_detector(config, ld);
+    /// let dm = DetectionManager::new_with_loop_detector(config, ld);
     /// ```
     ///
     /// # Errors
     ///
     /// Returns [`ConvergenceConfigError`] if the convergence configuration
     /// is invalid (e.g., threshold out of range, window too small).
-    pub fn with_loop_detector(
+    pub fn new_with_loop_detector(
         config: DetectionConfig,
         loop_detector: LoopDetector,
     ) -> Result<Self, ConvergenceConfigError> {
@@ -795,27 +556,15 @@ impl DetectionManager {
 
     /// Create with a specific [`ToolSignature`] for tool-specific parsing.
     ///
-    /// Constructs a [`LoopDetector`] using the provided `signature` and
-    /// its associated [`tool_thresholds`](ToolSignature::tool_thresholds).
     /// Useful when the consumer provides its own tool-aware signature
     /// (e.g., `DchToolSignature` for dch.sh tools that extracts
     /// `file_path` from JSON inputs).
-    ///
-    /// The tool thresholds from the signature are merged into a
-    /// [`LoopDetectorConfig`] derived from [`DetectionConfig::default`],
-    /// overriding the generic [`DetectionConfig::loop_threshold`] for any
-    /// tool listed in [`ToolSignature::tool_thresholds`].
-    ///
-    /// # When called
-    ///
-    /// During agent initialisation when the agent runtime has a domain-
-    /// specific [`ToolSignature`] implementation.
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// let signature = Arc::new(MyToolSignature);
-    /// let dm = DetectionManager::with_signature(signature);
+    /// let dm = DetectionManager::new_with_signature(signature);
     /// ```
     ///
     /// # See Also
@@ -827,7 +576,7 @@ impl DetectionManager {
     ///
     /// Returns [`ConvergenceConfigError`] if the convergence configuration
     /// is invalid (e.g., threshold out of range, window too small).
-    pub fn with_signature(
+    pub fn new_with_signature(
         signature: Arc<dyn ToolSignature>,
     ) -> Result<Self, ConvergenceConfigError> {
         let config = DetectionConfig::default();
@@ -852,7 +601,7 @@ impl DetectionManager {
     /// Record an [`Operation`] for loop detection and return the current
     /// [`DetectedPattern`].
     ///
-    /// This is the primary entry point for feeding data into the loop
+    /// Primary entry point for feeding data into the loop
     /// detector. It performs three steps:
     ///
     /// 1. Forwards `operation` to [`LoopDetector::record`].
@@ -900,7 +649,6 @@ impl DetectionManager {
 
         self.loop_detector.record(operation);
 
-        // Check if this triggered a loop
         let status = self.loop_detector.check_loop();
         if status.is_looping {
             let mut guard = self.stats.lock().unwrap_or_else(|e| {
@@ -931,7 +679,7 @@ impl DetectionManager {
     /// Returns the tool signature used for extracting primary parameters.
     ///
     /// Useful when callers need to construct [`Operation`]s directly using
-    /// the same signature the detection manager uses internally.
+    /// the configured [`ToolSignature`].
     pub fn signature(&self) -> &dyn ToolSignature {
         self.loop_detector.signature()
     }
@@ -939,7 +687,7 @@ impl DetectionManager {
     /// Record a tool call for loop detection by tool name and input hash.
     ///
     /// Creates an [`Operation`] from a `tool` name and `input_hash`, then
-    /// delegates to [`Self::record_operation`]. This is the easiest way to
+    /// delegates to [`Self::record_operation`]. Easiest way to
     /// feed data into the loop detector when you only need a numeric hash
     /// as the primary parameter rather than a full JSON-based signature.
     ///
@@ -985,21 +733,19 @@ impl DetectionManager {
     /// when both input and result match across consecutive calls is a loop
     /// flagged.
     ///
-    /// This is essential for tools like `Read` where calling the same file
+    /// Important for tools like `Read` where calling the same file
     /// is perfectly fine if the file content is changing (e.g., the agent
     /// is editing it).
     ///
     /// # How it works
     ///
-    /// ```text
-    /// Turn 1: Read("/foo.txt") → result_hash=0xA  ─┐
-    /// Turn 2: Read("/foo.txt") → result_hash=0xA  ─┤ Same hash → loop candidate
-    /// Turn 3: Read("/foo.txt") → result_hash=0xA  ─┘
-    ///   → LoopDetected after loop_threshold repetitions
-    ///
-    /// Turn 1: Read("/foo.txt") → result_hash=0xA
-    /// Turn 2: Read("/foo.txt") → result_hash=0xB  ← Different hash → not a loop
-    /// ```
+    /// With result hashing, the detector distinguishes between a tool
+    /// that returns the same output every time (a genuine loop) and one
+    /// whose output changes between calls (the agent is making progress).
+    /// For example, calling `Read("/foo.txt")` three times with the same
+    /// result hash is flagged as a loop, but if the file is being edited
+    /// between reads the result hashes will differ and no loop is
+    /// reported.
     ///
     /// # When called
     ///
@@ -1040,7 +786,7 @@ impl DetectionManager {
         self.record_operation(operation)
     }
 
-    /// Query the internal [`LoopDetector`] for the current loop status.
+    /// Query the [`LoopDetector`] for the current loop status.
     ///
     /// Returns a full [`LoopStatus`] snapshot including repetition counts,
     /// the `should_stop` flag, and any warning message. Unlike
@@ -1076,7 +822,7 @@ impl DetectionManager {
         self.loop_detector.check_loop()
     }
 
-    /// Obtain a shared reference to the internal [`LoopDetector`].
+    /// Obtain a shared reference to the [`LoopDetector`].
     ///
     /// Useful for direct access to loop state, e.g. inspecting
     /// the turn count or history during diagnostics.
@@ -1102,7 +848,7 @@ impl DetectionManager {
         &self.loop_detector
     }
 
-    /// Obtain a shared reference to the internal [`ConvergenceDetector`].
+    /// Obtain a shared reference to the [`ConvergenceDetector`].
     ///
     /// Returns `&Mutex<ConvergenceDetector>` so callers can lock and
     /// invoke methods on the convergence detector directly — for example
@@ -1137,15 +883,15 @@ impl DetectionManager {
     }
 
     // ==================================================
-    // Convergence detection (handled internally)
+    // Convergence detection
     // ==================================================
 
     /// Record an assistant response for convergence detection.
     ///
-    /// Forwards `response` to the internal [`ConvergenceDetector`] via
-    /// [`ConvergenceDetector::add_response`], which tokenises the text
-    /// into word-level tokens, computes Jaccard similarity against the
-    /// previous response, and updates the consecutive-similarity counter.
+    /// Forwards `response` to the [`ConvergenceDetector`] via
+    /// [`ConvergenceDetector::add_response`], which computes Jaccard
+    /// similarity against the previous response and updates the
+    /// consecutive-similarity counter.
     ///
     /// If the similarity score exceeds
     /// [`DetectionConfig::convergence_threshold`] for
@@ -1156,14 +902,6 @@ impl DetectionManager {
     /// When [`DetectionConfig::enable_convergence_detection`] is `false`,
     /// this method short-circuits and returns [`DetectedPattern::NoPattern`]
     /// without touching the convergence detector or statistics.
-    ///
-    /// # Tokenisation
-    ///
-    /// Responses are split on whitespace into word-level tokens,
-    /// lowercased, and compared using Jaccard similarity (intersection
-    /// over union of token sets). This is fast and language-agnostic
-    /// but does not capture semantic equivalence — two paraphrased
-    /// sentences with different vocabulary will have a low score.
     ///
     /// # When called
     ///
@@ -1193,6 +931,7 @@ impl DetectionManager {
         if !self.config.enable_convergence_detection {
             return DetectedPattern::NoPattern;
         }
+
         let status = self
             .convergence_detector
             .lock()
@@ -1201,6 +940,7 @@ impl DetectionManager {
                 e.into_inner()
             })
             .add_response(response);
+
         if status.detected {
             let mut guard = self.stats.lock().unwrap_or_else(|e| {
                 tracing::warn!("stats lock poisoned, recovering");
@@ -1215,7 +955,7 @@ impl DetectionManager {
         DetectedPattern::NoPattern
     }
 
-    /// Query the internal [`ConvergenceDetector`] for the current
+    /// Query the [`ConvergenceDetector`] for the current
     /// convergence status.
     ///
     /// Returns a full [`ConvergenceStatus`] snapshot including the
@@ -1264,20 +1004,17 @@ impl DetectionManager {
     ///
     /// Checks both the loop detector and the convergence detector in
     /// sequence and returns the first non-`NoPattern` result (loop takes
-    /// priority over convergence). This is a **read-only** operation —
+    /// priority over convergence). **Read-only** operation —
     /// no statistics are updated and no new data is recorded.
     ///
     /// # Priority order
     ///
-    /// ```text
-    /// check_current_pattern()
-    ///   ├─ check_loop()           → LoopDetected?  (priority 1)
-    ///   └─ check_convergence()    → ConvergenceDetected?  (priority 2)
-    ///      └─ NoPattern  (fallback)
-    /// ```
-    ///
-    /// Loop detection takes priority because a looping agent is more
-    /// urgently stuck than a converging one.
+    /// Loop detection is checked first. If the loop detector reports a
+    /// loop, `LoopDetected` is returned immediately. Only when no loop is
+    /// found does the manager query the convergence detector. If neither
+    /// detector has fired, `NoPattern` is returned. Loop takes priority
+    /// because a tool-calling loop is a stronger and more urgent signal
+    /// that the agent is stuck.
     ///
     /// # When called
     ///
@@ -1340,7 +1077,7 @@ impl DetectionManager {
 
     /// Take a snapshot of the cumulative detection statistics.
     ///
-    /// Locks the internal `Mutex`, clones the [`DetectionStats`] struct,
+    /// Clones the [`DetectionStats`] struct via the `Mutex`,
     /// and returns it. The snapshot reflects all operations recorded since
     /// the last [`Self::reset`] call (or since construction).
     ///
@@ -1400,7 +1137,7 @@ impl DetectionManager {
     /// # See Also
     ///
     /// - [`DetectionConfig`] — full description of all config fields.
-    /// - [`Self::with_config`] — the constructor that accepts a config.
+    /// - [`Self::new_with_config`] — the constructor that accepts a config.
     #[must_use]
     pub fn config(&self) -> &DetectionConfig {
         &self.config
@@ -1464,18 +1201,6 @@ impl DetectionManager {
 }
 
 impl Default for DetectionManager {
-    /// Produce a [`DetectionManager`] with the default [`DetectionConfig`].
-    ///
-    /// Constructs the manager directly using struct-literal syntax, bypassing
-    /// the fallible [`DetectionManager::with_config`] constructor. This is
-    /// infallible because:
-    ///
-    /// - [`LoopDetector::new`] is infallible.
-    /// - [`ConvergenceDetector`] is initialised with a default window and
-    ///   threshold that satisfy its validation invariants (`window_size ≥ 2`,
-    ///   `threshold ∈ 0.0..=1.0`).
-    ///
-    /// [`ConvergenceDetector::new`]: crate::loop_control::convergence::ConvergenceDetector::new
     fn default() -> Self {
         let config = DetectionConfig::default();
         let loop_config = config.to_loop_detector_config();
@@ -1586,7 +1311,7 @@ mod tests {
             enable_convergence_detection: false,
             ..Default::default()
         };
-        let dm = DetectionManager::with_config(config).unwrap();
+        let dm = DetectionManager::new_with_config(config).unwrap();
         for _ in 0..10 {
             let result = dm.record_tool_call("read_file", 42);
             assert!(matches!(result, DetectedPattern::NoPattern));
@@ -1606,7 +1331,7 @@ mod tests {
             stop_threshold: 5,
             ..Default::default()
         };
-        let dm = DetectionManager::with_config(config).unwrap();
+        let dm = DetectionManager::new_with_config(config).unwrap();
 
         // Record 5 identical operations
         for _ in 0..5 {

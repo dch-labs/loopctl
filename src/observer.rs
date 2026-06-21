@@ -13,7 +13,7 @@
 //! - [`StreamContext`] / [`StreamFailureContext`] — stream success/failure
 //! - [`ResponseContext`] — model response text and usage
 //! - [`ToolPreContext`] / [`ToolPostContext`] — tool dispatch lifecycle
-//! - [`CompactionContext`] — context window compaction
+//! - [`CompactedContext`] — context window compaction
 //! - [`FallbackContext`] — model fallback event
 //! - [`LoopDetectedContext`] — loop detection event
 //! - [`ConvergenceDetectedContext`] — convergence detection event
@@ -21,7 +21,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use loopctl::core::observer::{LoopObserver, SessionStartContext};
+//! use loopctl::observer::{LoopObserver, SessionStartContext};
 //!
 //! struct MetricsObserver;
 //!
@@ -36,160 +36,20 @@
 
 use std::sync::Arc;
 
-// ==================================================
-// Context structs
-// ==================================================
+pub mod context;
 
-/// Context for [`LoopObserver::on_session_start`].
-#[derive(Debug, Clone)]
-pub struct SessionStartContext {
-    /// Unique session identifier.
-    pub session_id: uuid::Uuid,
-}
-
-/// Context for [`LoopObserver::on_session_end`].
-#[derive(Debug, Clone)]
-pub struct SessionEndContext {
-    /// Whether the session completed successfully.
-    pub success: bool,
-    /// Error description, if the session ended due to an error.
-    pub error: Option<String>,
-    /// Total turns completed during the session.
-    pub total_turns: usize,
-    /// Total session duration in milliseconds.
-    pub duration_ms: u64,
-}
-
-/// Context for [`LoopObserver::on_turn_start`].
-#[derive(Debug, Clone)]
-pub struct TurnStartContext {
-    /// Turn number (0-indexed).
-    pub turn: usize,
-    /// The user query that initiated this turn.
-    pub query: String,
-}
-
-/// Context for [`LoopObserver::on_turn_end`].
-#[derive(Debug, Clone)]
-pub struct TurnEndContext {
-    /// Turn number.
-    pub turn: usize,
-    /// Whether the turn completed successfully.
-    pub success: bool,
-    /// Error description, if the turn failed.
-    pub error: Option<String>,
-    /// Wall-clock duration of the turn in milliseconds.
-    pub duration_ms: u64,
-    /// Input tokens consumed this turn.
-    pub input_tokens: u64,
-    /// Output tokens generated this turn.
-    pub output_tokens: u64,
-}
-
-/// Context for [`LoopObserver::on_stream_success`].
-#[derive(Debug, Clone)]
-pub struct StreamContext {
-    /// Turn number.
-    pub turn: usize,
-    /// Model that was streamed.
-    pub model: String,
-    /// Input tokens consumed.
-    pub input_tokens: u64,
-    /// Output tokens generated.
-    pub output_tokens: u64,
-}
-
-/// Context for [`LoopObserver::on_stream_failure`].
-#[derive(Debug, Clone)]
-pub struct StreamFailureContext {
-    /// Turn number.
-    pub turn: usize,
-    /// Model that failed.
-    pub model: String,
-    /// The error that occurred.
-    pub error: crate::core::AgentError,
-}
-
-/// Context for [`LoopObserver::on_response`].
-#[derive(Debug, Clone)]
-pub struct ResponseContext {
-    /// Turn number.
-    pub turn: usize,
-    /// The model's text response.
-    pub text: String,
-    /// Token usage for this turn, if available.
-    pub usage: Option<crate::stream::Usage>,
-}
-
-/// Context for [`LoopObserver::on_tool_pre`].
-#[derive(Debug, Clone)]
-pub struct ToolPreContext {
-    /// Turn number.
-    pub turn: usize,
-    /// Tool name.
-    pub tool: String,
-    /// Tool call ID from the API response.
-    pub tool_call_id: String,
-}
-
-/// Context for [`LoopObserver::on_tool_post`].
-#[derive(Debug, Clone)]
-pub struct ToolPostContext {
-    /// Turn number.
-    pub turn: usize,
-    /// Tool name.
-    pub tool: String,
-    /// Deterministic hash of the tool output, if available.
-    pub result_hash: Option<u64>,
-    /// Whether the tool returned an error.
-    pub is_error: bool,
-    /// Wall-clock execution duration.
-    pub duration: std::time::Duration,
-}
-
-/// Context for [`LoopObserver::on_compaction`].
-#[derive(Debug, Clone)]
-pub struct CompactionContext {
-    /// Message count before compaction.
-    pub messages_before: usize,
-    /// Message count after compaction.
-    pub messages_after: usize,
-    /// Estimated tokens saved by compaction.
-    pub tokens_saved: u64,
-}
-
-/// Context for [`LoopObserver::on_fallback`].
-#[derive(Debug, Clone)]
-pub struct FallbackContext {
-    /// Model that failed.
-    pub from: String,
-    /// Replacement model.
-    pub to: String,
-}
-
-/// Context for [`LoopObserver::on_loop_detected`].
-#[derive(Debug, Clone)]
-pub struct LoopDetectedContext {
-    /// Description of the repeating tool pattern.
-    pub pattern: String,
-    /// Number of times the pattern was observed.
-    pub repetitions: usize,
-}
-
-/// Context for [`LoopObserver::on_convergence_detected`].
-#[derive(Debug, Clone)]
-pub struct ConvergenceDetectedContext {
-    /// Configured action to take (e.g. `"stop"`, `"warn"`, `"compact"`).
-    pub action: String,
-}
-
+pub use context::{
+    CompactedContext, ConvergenceDetectedContext, FallbackContext, LoopDetectedContext,
+    ResponseContext, SessionEndContext, SessionStartContext, StreamContext, StreamFailureContext,
+    ToolPostContext, ToolPreContext, TurnEndContext, TurnStartContext,
+};
 // ==================================================
 // LoopObserver Trait
 // ==================================================
 
 /// A notification observer that receives typed callbacks at agent loop lifecycle points.
 ///
-/// Observers are registered via `BareLoop` or `ManagerBundle` and called at each
+/// Observers are registered via [`LoopRuntime`](crate::runtime::LoopRuntime) and called at each
 /// lifecycle point in registration order. All methods are **notification-only** — they
 /// return `()`. Use the [hook system](crate::hooks) if you need to control
 /// flow (block/allow actions).
@@ -197,48 +57,92 @@ pub struct ConvergenceDetectedContext {
 /// All methods have default no-op implementations. Override only the callbacks you need.
 pub trait LoopObserver: Send + Sync {
     /// Human-readable name for diagnostics and logging.
+    ///
+    /// Returned in error messages and telemetry to identify which observer
+    /// produced a side-effect.
     fn name(&self) -> &str;
 
     /// Called when an agent session begins.
+    ///
+    /// Fired once per session, before the first turn starts.
     fn on_session_start(&self, _ctx: &SessionStartContext) {}
 
     /// Called when an agent session ends.
+    ///
+    /// Fired after the last turn completes or when a fatal error stops the loop.
+    /// Check [`SessionEndContext::success`] to distinguish normal exit from failure.
     fn on_session_end(&self, _ctx: &SessionEndContext) {}
 
     /// Called at the start of processing a turn.
+    ///
+    /// Fired before the model is called for this turn.
     fn on_turn_start(&self, _ctx: &TurnStartContext) {}
 
     /// Called when a turn completes.
+    ///
+    /// Fired after tool dispatch and any compaction has finished.
+    /// Check [`TurnEndContext::success`] to detect turn-level failures.
     fn on_turn_end(&self, _ctx: &TurnEndContext) {}
 
     /// Called after the model streams a response successfully.
+    ///
+    /// Provides token counts for the completed streaming request.
+    /// Not fired when the stream fails — see [`on_stream_failure`](Self::on_stream_failure).
     fn on_stream_success(&self, _ctx: &StreamContext) {}
 
     /// Called when the API stream fails.
+    ///
+    /// Fired on network errors, API errors, or stream interruptions.
+    /// The loop may retry or fall back to another model after this notification.
     fn on_stream_failure(&self, _ctx: &StreamFailureContext) {}
 
     /// Called after extracting the model's text response.
+    ///
+    /// Contains the concatenated assistant text and optional token usage.
+    /// Tool-call content is excluded; use [`on_tool_post`](Self::on_tool_post)
+    /// for tool results.
     fn on_response(&self, _ctx: &ResponseContext) {}
 
-    /// Called before a tool is dispatched (notification-only).
+    /// Called before a tool is dispatched.
+    ///
+    /// Notification-only — cannot block or modify the tool call.
+    /// Use the [hook system](crate::hooks) for flow control.
     fn on_tool_pre(&self, _ctx: &ToolPreContext) {}
 
     /// Called after a tool completes execution.
+    ///
+    /// Reports whether the tool errored and includes a hash of the result
+    /// for loop-detection correlation.
     fn on_tool_post(&self, _ctx: &ToolPostContext) {}
 
     /// Called after conversation compaction.
-    fn on_compaction(&self, _ctx: &CompactionContext) {}
+    ///
+    /// Reports token counts before and after compaction. Only fired when
+    /// compaction actually occurred — not on no-action passes.
+    fn on_compaction(&self, _ctx: &CompactedContext) {}
 
     /// Called when a model fallback is triggered.
+    ///
+    /// Indicates that the primary model failed and a fallback model
+    /// was selected for subsequent requests.
     fn on_fallback(&self, _ctx: &FallbackContext) {}
 
     /// Called when a loop is detected in tool operations.
+    ///
+    /// Fired when the same tool operation produces the same result
+    /// repeatedly, exceeding the configured threshold.
     fn on_loop_detected(&self, _ctx: &LoopDetectedContext) {}
 
     /// Called when response convergence is detected.
+    ///
+    /// Fired when consecutive model responses become sufficiently similar
+    /// as determined by the convergence detection policy.
     fn on_convergence_detected(&self, _ctx: &ConvergenceDetectedContext) {}
 
     /// Reset observer state for a new session.
+    ///
+    /// Called before [`on_session_start`](Self::on_session_start) to allow
+    /// observers to clear per-session accumulators.
     fn reset(&self) {}
 }
 
@@ -249,7 +153,7 @@ pub trait LoopObserver: Send + Sync {
 /// Holds registered observers and dispatches notifications to each.
 ///
 /// Observers run in registration order. All observers are always notified —
-/// there is no short-circuiting (that's the [hook system](crate::hooks)'s job).
+/// there is no short-circuiting (use the [hook system](crate::hooks) for flow control).
 ///
 /// An empty host (no observers registered) is effectively zero-cost:
 /// each notification call iterates an empty `Vec`.
@@ -260,12 +164,17 @@ pub struct ObserverHost {
 
 impl ObserverHost {
     /// Create an empty observer host.
+    ///
+    /// Equivalent to [`ObserverHost::default`] but more explicit.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Register an observer. Called in registration order at each notification point.
+    /// Register an observer.
+    ///
+    /// Observers are called in registration order at each lifecycle point.
+    /// Registering the same observer twice will result in duplicate notifications.
     pub fn register(&mut self, observer: Arc<dyn LoopObserver>) {
         self.observers.push(observer);
     }
@@ -283,6 +192,9 @@ impl ObserverHost {
     }
 
     /// Reset all observers for a new session.
+    ///
+    /// Calls [`LoopObserver::reset`] on every registered observer,
+    /// allowing them to clear per-session accumulators.
     pub fn reset_all(&self) {
         for obs in &self.observers {
             obs.reset();
@@ -290,6 +202,8 @@ impl ObserverHost {
     }
 
     /// Dispatch [`LoopObserver::on_session_start`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
     pub fn on_session_start(&self, ctx: &SessionStartContext) {
         for obs in &self.observers {
             obs.on_session_start(ctx);
@@ -297,6 +211,8 @@ impl ObserverHost {
     }
 
     /// Dispatch [`LoopObserver::on_session_end`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
     pub fn on_session_end(&self, ctx: &SessionEndContext) {
         for obs in &self.observers {
             obs.on_session_end(ctx);
@@ -304,6 +220,8 @@ impl ObserverHost {
     }
 
     /// Dispatch [`LoopObserver::on_turn_start`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
     pub fn on_turn_start(&self, ctx: &TurnStartContext) {
         for obs in &self.observers {
             obs.on_turn_start(ctx);
@@ -311,6 +229,8 @@ impl ObserverHost {
     }
 
     /// Dispatch [`LoopObserver::on_turn_end`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
     pub fn on_turn_end(&self, ctx: &TurnEndContext) {
         for obs in &self.observers {
             obs.on_turn_end(ctx);
@@ -318,6 +238,8 @@ impl ObserverHost {
     }
 
     /// Dispatch [`LoopObserver::on_stream_success`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
     pub fn on_stream_success(&self, ctx: &StreamContext) {
         for obs in &self.observers {
             obs.on_stream_success(ctx);
@@ -325,6 +247,8 @@ impl ObserverHost {
     }
 
     /// Dispatch [`LoopObserver::on_stream_failure`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
     pub fn on_stream_failure(&self, ctx: &StreamFailureContext) {
         for obs in &self.observers {
             obs.on_stream_failure(ctx);
@@ -332,6 +256,8 @@ impl ObserverHost {
     }
 
     /// Dispatch [`LoopObserver::on_response`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
     pub fn on_response(&self, ctx: &ResponseContext) {
         for obs in &self.observers {
             obs.on_response(ctx);
@@ -339,6 +265,8 @@ impl ObserverHost {
     }
 
     /// Dispatch [`LoopObserver::on_tool_pre`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
     pub fn on_tool_pre(&self, ctx: &ToolPreContext) {
         for obs in &self.observers {
             obs.on_tool_pre(ctx);
@@ -346,6 +274,8 @@ impl ObserverHost {
     }
 
     /// Dispatch [`LoopObserver::on_tool_post`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
     pub fn on_tool_post(&self, ctx: &ToolPostContext) {
         for obs in &self.observers {
             obs.on_tool_post(ctx);
@@ -353,13 +283,17 @@ impl ObserverHost {
     }
 
     /// Dispatch [`LoopObserver::on_compaction`] to all observers.
-    pub fn on_compaction(&self, ctx: &CompactionContext) {
+    ///
+    /// Iterates registered observers in registration order.
+    pub fn on_compaction(&self, ctx: &CompactedContext) {
         for obs in &self.observers {
             obs.on_compaction(ctx);
         }
     }
 
     /// Dispatch [`LoopObserver::on_fallback`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
     pub fn on_fallback(&self, ctx: &FallbackContext) {
         for obs in &self.observers {
             obs.on_fallback(ctx);
@@ -367,6 +301,8 @@ impl ObserverHost {
     }
 
     /// Dispatch [`LoopObserver::on_loop_detected`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
     pub fn on_loop_detected(&self, ctx: &LoopDetectedContext) {
         for obs in &self.observers {
             obs.on_loop_detected(ctx);
@@ -374,6 +310,8 @@ impl ObserverHost {
     }
 
     /// Dispatch [`LoopObserver::on_convergence_detected`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
     pub fn on_convergence_detected(&self, ctx: &ConvergenceDetectedContext) {
         for obs in &self.observers {
             obs.on_convergence_detected(ctx);

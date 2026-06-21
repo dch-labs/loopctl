@@ -1,6 +1,6 @@
 //! Testing utilities — mock components and fixture factories for loopctl tests.
 //!
-//! This module provides reusable mocks and fixture factories for testing
+//! Reusable mocks and fixture factories for testing
 //! code that depends on loopctl traits. Instead of wiring up real API
 //! clients and tools in tests, these stubs can be used to exercise
 //! agent logic in isolation, assert on streaming events, and verify tool
@@ -50,8 +50,8 @@
 //! - [`test_assistant_message`] — Create a test assistant [`Message`].
 //! - [`test_tool_use_message`] — Create an assistant [`Message`] with
 //!   tool-call content blocks.
-//! - [`test_config`] — Create a test [`AgentConfig`] with sensible defaults.
-//! - [`test_config_with_id`] — Create a test [`AgentConfig`] with a specific
+//! - [`test_config`] — Create a test [`LoopConfig`] with sensible defaults.
+//! - [`test_config_with_id`] — Create a test [`LoopConfig`] with a specific
 //!   session ID.
 //!
 //! # Quick Start
@@ -99,9 +99,9 @@
 //!     },
 //! ]);
 
-use crate::api_client::ApiClient;
-use crate::api_error::ApiError;
-use crate::core::AgentConfig;
+use crate::api::ApiClient;
+use crate::api::error::ApiError;
+use crate::config::LoopConfig;
 use crate::message::{Message, MessagePart, Role};
 use crate::stream::{
     DeltaPart, IndexedDelta, MessageDelta, MessageDeltaPayload, MessageMetadata, MessageStart,
@@ -297,7 +297,7 @@ pub struct MockToolCall {
     ///
     /// Must correspond to a tool registered in the agent's
     /// [`ToolRegistry`](crate::tool::ToolRegistry). The mock does not
-    /// validate this — it simply passes the name through.
+    /// validate this — passes the name through directly.
     ///
     /// During test execution, if the agent loop cannot find a tool
     /// with this name in the registry, it will return an error.
@@ -342,14 +342,14 @@ impl MockApiClient {
     /// Use the builder methods to customize before passing the client
     /// to the code under test.
     ///
-    /// The default response is deliberately simple so that most tests
+    /// The default response is simple so that most tests
     /// only need to call [`with_text_response`](MockApiClient::with_text_response)
     /// to get started.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_client::ApiClient;
+    /// use loopctl::api::ApiClient;
     /// use loopctl::testing::MockApiClient;
     ///
     /// let client = MockApiClient::new("test-model");
@@ -377,7 +377,7 @@ impl MockApiClient {
     /// Set the text response for the first (or only) turn.
     ///
     /// Overwrites the `text` field on the initial [`MockResponse`]
-    /// created by [`new`](MockApiClient::new). This is the simplest way
+    /// created by [`new`](MockApiClient::new). Simplest way
     /// to configure a single-turn mock — the model will "say" the given
     /// text and stop.
     ///
@@ -475,7 +475,7 @@ impl MockApiClient {
     /// and reused, so the mock never panics on an empty queue.
     ///
     /// If `responses` is empty the call is a no-op (the default response
-    /// is retained). This is the recommended way to set up complex
+    /// is retained). Recommended way to set up complex
     /// multi-turn scenarios where the model needs to reply differently
     /// across successive turns.
     ///
@@ -538,10 +538,10 @@ impl MockApiClient {
     /// queue never empties. This ensures repeated calls to
     /// [`stream_messages`](ApiClient::stream_messages) always succeed.
     ///
-    /// This is a private helper used by both
+    /// Helper used by both
     /// [`stream_messages`](ApiClient::stream_messages) and
     /// [`create_message`](ApiClient::create_message). The method
-    /// acquires the `Mutex` guard internally, so callers do not need
+    /// acquires the `Mutex` guard, so callers do not need
     /// to handle locking.
     ///
     /// # Queue exhaustion strategy
@@ -594,7 +594,7 @@ impl MockApiClient {
 /// # Ignored parameters
 ///
 /// The `_messages`, `_system`, and `_tools` parameters are accepted for
-/// trait compatibility but intentionally ignored — the mock always
+/// trait compatibility but ignored — the mock always
 /// returns its preconfigured response regardless of the input.
 impl ApiClient for MockApiClient {
     /// Return the model name this mock was created with.
@@ -607,7 +607,7 @@ impl ApiClient for MockApiClient {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_client::ApiClient;
+    /// use loopctl::api::ApiClient;
     /// use loopctl::testing::MockApiClient;
     ///
     /// let client = MockApiClient::new("my-test-model");
@@ -633,7 +633,7 @@ impl ApiClient for MockApiClient {
     /// contains a single [`ApiError`] event instead.
     ///
     /// The `_messages`, `_system`, and `_tools` parameters are accepted for
-    /// trait compatibility but are intentionally ignored — the mock always
+    /// trait compatibility but ignored — the mock always
     /// returns the preconfigured response.
     ///
     /// # Usage tokens
@@ -646,7 +646,7 @@ impl ApiClient for MockApiClient {
     ///
     /// ```rust
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-    /// use loopctl::api_client::ApiClient;
+    /// use loopctl::api::ApiClient;
     /// use loopctl::testing::MockApiClient;
     ///
     /// let client = MockApiClient::new("test-model").with_text_response("Hi!");
@@ -727,13 +727,13 @@ impl ApiClient for MockApiClient {
     /// response queue entirely.
     ///
     /// The `_messages`, `_system`, and `_tools` parameters are accepted
-    /// for trait compatibility but intentionally ignored.
+    /// for trait compatibility but ignored.
     ///
     /// # Example
     ///
     /// ```rust
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-    /// use loopctl::api_client::ApiClient;
+    /// use loopctl::api::ApiClient;
     /// use loopctl::testing::MockApiClient;
     ///
     /// let client = MockApiClient::new("test-model").with_text_response("Hi!");
@@ -1106,7 +1106,7 @@ impl MockTool {
 /// # Metadata methods
 ///
 /// The [`name`](Tool::name), [`description`](Tool::description), and
-/// [`schema`](Tool::schema) methods simply return the values set at
+/// [`schema`](Tool::schema) methods return the values set at
 /// construction time via [`MockTool::new`]. The
 /// [`is_concurrency_safe`](Tool::is_concurrency_safe),
 /// [`is_read_only`](Tool::is_read_only), and
@@ -1237,7 +1237,7 @@ impl Tool for MockTool {
 /// directly. The returned message has [`Role::User`] and a single
 /// [`MessagePart::Text`] variant containing the provided string.
 ///
-/// This is the most common fixture for constructing the "user says"
+/// Most common fixture for constructing the "user says"
 /// part of a conversation history.
 ///
 /// # Example
@@ -1284,7 +1284,7 @@ pub fn test_assistant_message(text: &str) -> Message {
 /// If `tool_use_id` is an empty string a unique ID of the form
 /// `"call_{i}"` is generated automatically (where `i` is the index).
 ///
-/// This is the message the agent loop produces when the model requests
+/// Message the agent loop produces when the model requests
 /// tool execution — use it to simulate the "assistant asked for a tool"
 /// step in multi-turn tests. Each tuple becomes a [`MessagePart::ToolCall`]
 /// variant in the message's `content` vector.
@@ -1323,7 +1323,7 @@ pub fn test_tool_use_message(calls: &[(&str, &str, Value)]) -> Message {
     Message::new(Role::Assistant, blocks)
 }
 
-/// Create a test [`AgentConfig`] with sensible defaults.
+/// Create a test [`LoopConfig`] with sensible defaults.
 ///
 /// The returned config has:
 ///
@@ -1353,8 +1353,8 @@ pub fn test_tool_use_message(calls: &[(&str, &str, Value)]) -> Message {
 /// assert_eq!(config.max_turns, 10);
 /// ```
 #[must_use]
-pub fn test_config() -> AgentConfig {
-    AgentConfig {
+pub fn test_config() -> LoopConfig {
+    LoopConfig {
         session_id: Uuid::new_v4(),
         max_turns: 10,
         system_prompt: Some("You are a test assistant.".to_string()),
@@ -1362,7 +1362,7 @@ pub fn test_config() -> AgentConfig {
     }
 }
 
-/// Create a test [`AgentConfig`] with a specific session ID.
+/// Create a test [`LoopConfig`] with a specific session ID.
 ///
 /// Same as [`test_config`] but with a caller-supplied session ID.
 /// Useful when tests need to assert on the ID — for example verifying
@@ -1388,8 +1388,8 @@ pub fn test_config() -> AgentConfig {
 /// assert_eq!(config.session_id, id);
 /// ```
 #[must_use]
-pub fn test_config_with_id(id: Uuid) -> AgentConfig {
-    AgentConfig {
+pub fn test_config_with_id(id: Uuid) -> LoopConfig {
+    LoopConfig {
         session_id: id,
         max_turns: 10,
         system_prompt: Some("You are a test assistant.".to_string()),

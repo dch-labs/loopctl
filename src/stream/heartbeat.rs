@@ -45,7 +45,7 @@
 //! );
 //! ```
 
-use crate::api_error::ApiError;
+use crate::api::error::ApiError;
 use crate::stream::StreamEvent;
 use futures::Stream;
 use std::pin::Pin;
@@ -197,7 +197,7 @@ impl HeartbeatConfig {
 ///
 /// `HeartbeatStream` implements `Stream` directly, so it composes with
 /// any other stream wrapper. Use it on any stream you've already opened
-/// when you just need heartbeat/timeout without the full handler lifecycle.
+/// when you need heartbeat/timeout without the full handler lifecycle.
 ///
 /// # Example
 ///

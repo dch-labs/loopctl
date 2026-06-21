@@ -1,7 +1,7 @@
 //! Reflection and recovery for failed agent turns.
 //!
 //! When a tool call fails or a turn produces an unexpected result, the
-//! framework needs to decide what to do. This module provides a pluggable
+//! framework needs to decide what to do. A pluggable
 //! two-layer system:
 //!
 //! 1. **[`Reflector`]** — Analyses the failure and produces a
@@ -18,33 +18,10 @@
 //! - [`ExponentialBackoffRecovery`] — retries with exponential backoff up to
 //!   a configurable limit.
 //!
-//! # Architecture
-//!
-//! ```text
-//!       Tool call fails
-//!             │
-//!             ▼
-//! ┌───────────────────────┐
-//! │  Reflector::analyze() │
-//! │  → FailureAnalysis    │
-//! │    (recoverable?)     │
-//! │    (correction?)      │
-//! │    (severity)         │
-//! └──────────┬────────────┘
-//!            │
-//!            ▼
-//! ┌───────────────────────────────┐
-//! │ RecoveryStrategy::decide()    │
-//! │ → RecoveryAction              │
-//! │   Retry / Skip / AskUser /    │
-//! │   Fail                        │
-//! └───────────────────────────────┘
-//! ```
-//!
 //! # Quick Start
 //!
 //! ```rust
-//! use loopctl::core::reflection::{
+//! use loopctl::reflection::{
 //!     NoopReflector, ExponentialBackoffRecovery, ReflectionContext,
 //! };
 //! use std::sync::Arc;
@@ -57,7 +34,10 @@
 //! // let action = strategy.decide(&analysis, attempt, max_attempts).await;
 //! ```
 
-use crate::core::types::Correction;
+pub mod backoff;
+pub use backoff::ExponentialBackoffRecovery;
+
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -77,7 +57,7 @@ use std::time::Duration;
 /// # Example
 ///
 /// ```rust
-/// use loopctl::core::reflection::FailureSeverity;
+/// use loopctl::reflection::FailureSeverity;
 ///
 /// assert!(FailureSeverity::Low < FailureSeverity::Critical);
 /// ```
@@ -86,7 +66,7 @@ use std::time::Duration;
 )]
 #[serde(rename_all = "snake_case")]
 pub enum FailureSeverity {
-    /// Minor issue — a simple retry will likely fix it.
+    /// Minor issue — a retry will likely fix it.
     Low,
     /// Moderate issue — may need a correction before retrying.
     Medium,
@@ -120,7 +100,7 @@ impl fmt::Display for FailureSeverity {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::core::reflection::ReflectionContext;
+/// use loopctl::reflection::ReflectionContext;
 ///
 /// let context = ReflectionContext {
 ///     task: "Fix the bug in main.rs".to_string(),
@@ -140,6 +120,103 @@ pub struct ReflectionContext {
 }
 
 // ===================================================
+// Correction
+// ===================================================
+
+/// Type of correction to apply.
+///
+/// Categorizes the fix strategy that the reflection system has determined
+/// is most appropriate for the observed failure. Each variant maps to a
+/// different retry approach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrectionType {
+    /// Fix the input to the tool.
+    ///
+    /// The tool was correct but its input parameters were wrong (e.g., a
+    /// typo in a file path). The correction provides a fixed input via
+    /// [`Correction::modified_input`].
+    InputFix,
+
+    /// Use a different tool.
+    ///
+    /// The chosen tool was inappropriate for the task. The correction
+    /// specifies an alternative via [`Correction::alternative_tool`].
+    ToolChange,
+
+    /// Fix a dependency or prerequisite.
+    ///
+    /// The tool call failed because a prerequisite was not met (e.g.,
+    /// a directory doesn't exist). The correction describes what needs
+    /// to be done first.
+    PrerequisiteFix,
+
+    /// Change the approach entirely.
+    ///
+    /// The current strategy is fundamentally flawed. The correction
+    /// provides high-level guidance for a different approach via
+    /// [`Correction::guidance`].
+    ApproachChange,
+
+    /// No fix possible, escalate.
+    ///
+    /// The reflection system cannot determine a correction. The
+    /// framework should propagate the error to the user or higher-level
+    /// handler.
+    Escalate,
+}
+
+/// A correction produced by the reflection system.
+///
+/// When a tool call fails and reflection is enabled (via `Feature::Reflection`),
+/// the agent analyzes the error and produces a `Correction` that describes how to fix
+/// the problem. The framework applies the correction and retries.
+///
+/// # Serialization
+///
+/// Implements `Serialize` and `Deserialize` for persistence and observability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Correction {
+    /// See [`CorrectionType`] for available strategies.
+    pub correction_type: CorrectionType,
+    /// Explains *what* went wrong and *how* the correction addresses it.
+    pub description: String,
+    /// Corrected JSON input when [`CorrectionType::InputFix`]. `None` otherwise.
+    pub modified_input: Option<serde_json::Value>,
+    /// Alternative tool name when [`CorrectionType::ToolChange`]. `None` otherwise.
+    pub alternative_tool: Option<String>,
+    /// Extra context or instructions to help avoid the same failure.
+    pub guidance: Option<String>,
+}
+
+/// Result of applying a correction.
+///
+/// Indicates whether the reflection system's correction was successfully
+/// applied, failed, or was skipped. Produced after attempting to retry
+/// with the corrected parameters.
+#[derive(Debug, Clone)]
+pub enum CorrectionResult {
+    /// Correction was applied successfully.
+    ///
+    /// The retry with corrected parameters succeeded and the agent can
+    /// continue processing normally.
+    Applied,
+
+    /// Correction failed.
+    ///
+    /// The retry also failed. Contains a human-readable error message
+    /// describing what went wrong with the corrected attempt.
+    Failed(String),
+
+    /// No correction was needed or possible.
+    ///
+    /// The reflection system decided not to apply a correction (e.g.,
+    /// the error is transient or the correction type was
+    /// [`Escalate`](CorrectionType::Escalate)).
+    Skipped,
+}
+
+// ===================================================
 // FailureAnalysis
 // ===================================================
 
@@ -152,7 +229,7 @@ pub struct ReflectionContext {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::core::reflection::{FailureAnalysis, FailureSeverity};
+/// use loopctl::reflection::{FailureAnalysis, FailureSeverity};
 ///
 /// let analysis = FailureAnalysis {
 ///     is_recoverable: true,
@@ -165,15 +242,15 @@ pub struct ReflectionContext {
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FailureAnalysis {
-    /// Whether the framework should attempt recovery.
+    /// Whether the failure can be recovered from.
     pub is_recoverable: bool,
-    /// Human-readable description of the root cause.
+    /// Description of what went wrong.
     pub root_cause: String,
     /// How severe the failure is.
     pub severity: FailureSeverity,
-    /// Optional correction the agent can apply before retrying.
+    /// Suggested correction for the agent to apply before retrying.
     pub correction: Option<Correction>,
-    /// Additional context about the failure (e.g., environment state).
+    /// Additional context (e.g., environment state at time of failure).
     pub context: String,
 }
 
@@ -185,7 +262,7 @@ pub struct FailureAnalysis {
 ///
 /// The reflector can either produce a valid analysis, skip analysis
 /// (letting the framework use its default behaviour), or fail
-/// internally.
+/// during analysis.
 #[derive(Debug, thiserror::Error)]
 pub enum ReflectionError {
     /// The reflector opted out of analysing this failure.
@@ -196,7 +273,7 @@ pub enum ReflectionError {
 
     /// The reflector itself encountered an error.
     ///
-    /// This is distinct from the tool failure being analysed — it means
+    /// Distinct from the tool failure being analysed — it means
     /// the reflector's own logic broke (e.g., an LLM call for
     /// summarisation failed).
     #[error("reflection internal error: {0}")]
@@ -215,7 +292,7 @@ pub enum ReflectionError {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::core::reflection::RecoveryAction;
+/// use loopctl::reflection::RecoveryAction;
 /// use std::time::Duration;
 ///
 /// let action = RecoveryAction::Retry {
@@ -256,18 +333,6 @@ pub enum RecoveryAction {
 
 impl RecoveryAction {
     /// Returns the retry delay, if this is a [`Retry`](Self::Retry) action.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::core::reflection::RecoveryAction;
-    /// use std::time::Duration;
-    ///
-    /// let action = RecoveryAction::Retry { delay: Duration::from_secs(2) };
-    /// assert_eq!(action.delay(), Some(Duration::from_secs(2)));
-    ///
-    /// assert_eq!(RecoveryAction::Fail("bad".into()).delay(), None);
-    /// ```
     #[must_use]
     pub fn delay(&self) -> Option<Duration> {
         match self {
@@ -330,7 +395,7 @@ impl fmt::Display for RecoveryAction {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::core::reflection::{
+/// use loopctl::reflection::{
 ///     Reflector, ReflectionContext, FailureAnalysis, FailureSeverity, ReflectionError,
 /// };
 /// use std::future::Future;
@@ -410,7 +475,7 @@ pub trait Reflector: Send + Sync {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::core::reflection::{
+/// use loopctl::reflection::{
 ///     RecoveryStrategy, FailureAnalysis, FailureSeverity, RecoveryAction,
 /// };
 /// use std::future::Future;
@@ -509,152 +574,9 @@ impl fmt::Debug for NoopReflector {
     }
 }
 
-// ===================================================
-// ExponentialBackoffRecovery
-// ===================================================
-
-/// Recovery strategy using exponential backoff.
-///
-/// Retries up to `max_retries` times with exponential delays. If the
-/// [`FailureAnalysis`] says the failure is not recoverable, returns
-/// [`RecoveryAction::Fail`] immediately.
-///
-/// # Backoff Formula
-///
-/// `delay = min(base_delay × 2^attempt, max_delay)`
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use loopctl::core::reflection::{ExponentialBackoffRecovery, RecoveryAction, FailureAnalysis, FailureSeverity, RecoveryStrategy};
-/// use std::time::Duration;
-///
-/// let strategy = ExponentialBackoffRecovery::new(3)
-///     .with_base_delay(Duration::from_millis(100))
-///     .with_max_delay(Duration::from_secs(10));
-///
-/// let recoverable = FailureAnalysis {
-///     is_recoverable: true,
-///     root_cause: "timeout".to_string(),
-///     severity: FailureSeverity::Low,
-///     correction: None,
-///     context: String::new(),
-/// };
-/// let action = strategy.decide(&recoverable, 0, 5).await;
-/// assert!(action.is_retry());
-/// assert_eq!(action.delay(), Some(Duration::from_millis(100)));
-///
-/// let unrecoverable = FailureAnalysis {
-///     is_recoverable: false,
-///     root_cause: "invalid key".to_string(),
-///     severity: FailureSeverity::Critical,
-///     correction: None,
-///     context: String::new(),
-/// };
-/// let action = strategy.decide(&unrecoverable, 0, 5).await;
-/// assert!(action.is_fail());
-/// ```
-#[derive(Debug, Clone)]
-pub struct ExponentialBackoffRecovery {
-    /// Maximum number of retry attempts.
-    max_retries: u32,
-    /// Base delay before the first retry.
-    base_delay: Duration,
-    /// Maximum delay between retries.
-    max_delay: Duration,
-}
-
-impl ExponentialBackoffRecovery {
-    /// Create a new strategy with the given maximum retries.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::core::reflection::ExponentialBackoffRecovery;
-    ///
-    /// let strategy = ExponentialBackoffRecovery::new(5);
-    /// ```
-    #[must_use]
-    pub fn new(max_retries: u32) -> Self {
-        Self {
-            max_retries,
-            base_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(30),
-        }
-    }
-
-    /// Set the base delay (delay before the first retry).
-    #[must_use]
-    pub fn with_base_delay(mut self, delay: Duration) -> Self {
-        self.base_delay = delay;
-        self
-    }
-
-    /// Set the maximum delay between retries.
-    #[must_use]
-    pub fn with_max_delay(mut self, delay: Duration) -> Self {
-        self.max_delay = delay;
-        self
-    }
-
-    /// Returns the configured max retries.
-    #[must_use]
-    pub fn max_retries(&self) -> u32 {
-        self.max_retries
-    }
-
-    /// Returns the configured base delay.
-    #[must_use]
-    pub fn base_delay(&self) -> Duration {
-        self.base_delay
-    }
-
-    /// Returns the configured max delay.
-    #[must_use]
-    pub fn max_delay(&self) -> Duration {
-        self.max_delay
-    }
-
-    /// Calculate the backoff delay for a given attempt.
-    fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let delay_ms = self
-            .base_delay
-            .as_millis()
-            .saturating_mul(1u128.checked_shl(attempt).unwrap_or(u128::MAX));
-        let delay_ms = u64::try_from(delay_ms.min(self.max_delay.as_millis())).unwrap_or(u64::MAX);
-        Duration::from_millis(delay_ms)
-    }
-}
-
-impl RecoveryStrategy for ExponentialBackoffRecovery {
-    fn decide(
-        &self,
-        analysis: &FailureAnalysis,
-        attempt: u32,
-        _max_attempts: u32,
-    ) -> Pin<Box<dyn Future<Output = RecoveryAction> + Send + '_>> {
-        let action = if !analysis.is_recoverable {
-            RecoveryAction::Fail(analysis.root_cause.clone())
-        } else if attempt >= self.max_retries {
-            RecoveryAction::Fail(format!("max retries ({}) exceeded", self.max_retries))
-        } else if analysis.severity >= FailureSeverity::High && analysis.correction.is_some() {
-            RecoveryAction::AskUser(format!(
-                "high-severity failure with correction available: {}",
-                analysis.root_cause
-            ))
-        } else {
-            RecoveryAction::Retry {
-                delay: self.delay_for_attempt(attempt),
-            }
-        };
-        Box::pin(async move { action })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::CorrectionType;
 
     // ===================================================
     // FailureSeverity tests
@@ -839,182 +761,5 @@ mod tests {
         let reflector = NoopReflector;
         let debug = format!("{reflector:?}");
         assert!(debug.contains("NoopReflector"));
-    }
-
-    // ===================================================
-    // ExponentialBackoffRecovery tests
-    // ===================================================
-
-    #[test]
-    fn backoff_builder_defaults() {
-        let strategy = ExponentialBackoffRecovery::new(3);
-        assert_eq!(strategy.max_retries(), 3);
-        assert_eq!(strategy.base_delay(), Duration::from_millis(100));
-        assert_eq!(strategy.max_delay(), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn backoff_builder_custom() {
-        let strategy = ExponentialBackoffRecovery::new(5)
-            .with_base_delay(Duration::from_millis(200))
-            .with_max_delay(Duration::from_secs(60));
-        assert_eq!(strategy.max_retries(), 5);
-        assert_eq!(strategy.base_delay(), Duration::from_millis(200));
-        assert_eq!(strategy.max_delay(), Duration::from_secs(60));
-    }
-
-    #[tokio::test]
-    async fn backoff_recoverable_first_attempt() {
-        let strategy = ExponentialBackoffRecovery::new(3);
-        let analysis = FailureAnalysis {
-            is_recoverable: true,
-            root_cause: "timeout".to_string(),
-            severity: FailureSeverity::Medium,
-            correction: None,
-            context: String::new(),
-        };
-        let action = strategy.decide(&analysis, 0, 5).await;
-        assert!(action.is_retry());
-        assert_eq!(action.delay(), Some(Duration::from_millis(100)));
-    }
-
-    #[tokio::test]
-    async fn backoff_recoverable_second_attempt() {
-        let strategy = ExponentialBackoffRecovery::new(3);
-        let analysis = FailureAnalysis {
-            is_recoverable: true,
-            root_cause: "timeout".to_string(),
-            severity: FailureSeverity::Medium,
-            correction: None,
-            context: String::new(),
-        };
-        let action = strategy.decide(&analysis, 1, 5).await;
-        assert!(action.is_retry());
-        assert_eq!(action.delay(), Some(Duration::from_millis(200)));
-    }
-
-    #[tokio::test]
-    async fn backoff_recoverable_third_attempt() {
-        let strategy = ExponentialBackoffRecovery::new(3);
-        let analysis = FailureAnalysis {
-            is_recoverable: true,
-            root_cause: "timeout".to_string(),
-            severity: FailureSeverity::Medium,
-            correction: None,
-            context: String::new(),
-        };
-        let action = strategy.decide(&analysis, 2, 5).await;
-        assert!(action.is_retry());
-        assert_eq!(action.delay(), Some(Duration::from_millis(400)));
-    }
-
-    #[tokio::test]
-    async fn backoff_max_retries_exceeded() {
-        let strategy = ExponentialBackoffRecovery::new(3);
-        let analysis = FailureAnalysis {
-            is_recoverable: true,
-            root_cause: "timeout".to_string(),
-            severity: FailureSeverity::Low,
-            correction: None,
-            context: String::new(),
-        };
-        let action = strategy.decide(&analysis, 3, 5).await;
-        assert!(action.is_fail());
-        let RecoveryAction::Fail(reason) = action else {
-            unreachable!()
-        };
-        assert!(reason.contains("max retries"));
-    }
-
-    #[tokio::test]
-    async fn backoff_unrecoverable_fails_immediately() {
-        let strategy = ExponentialBackoffRecovery::new(3);
-        let analysis = FailureAnalysis {
-            is_recoverable: false,
-            root_cause: "invalid api key".to_string(),
-            severity: FailureSeverity::Critical,
-            correction: None,
-            context: String::new(),
-        };
-        let action = strategy.decide(&analysis, 0, 5).await;
-        assert!(action.is_fail());
-        let RecoveryAction::Fail(reason) = action else {
-            unreachable!()
-        };
-        assert_eq!(reason, "invalid api key");
-    }
-
-    #[tokio::test]
-    async fn backoff_delay_capped_at_max() {
-        let strategy = ExponentialBackoffRecovery::new(10)
-            .with_base_delay(Duration::from_secs(1))
-            .with_max_delay(Duration::from_secs(5));
-        let analysis = FailureAnalysis {
-            is_recoverable: true,
-            root_cause: "timeout".to_string(),
-            severity: FailureSeverity::Medium,
-            correction: None,
-            context: String::new(),
-        };
-        // 1 * 2^5 = 32s, capped at 5s
-        let action = strategy.decide(&analysis, 5, 10).await;
-        assert_eq!(action.delay(), Some(Duration::from_secs(5)));
-    }
-
-    #[tokio::test]
-    async fn backoff_low_severity_retries() {
-        let strategy = ExponentialBackoffRecovery::new(3);
-        let analysis = FailureAnalysis {
-            is_recoverable: true,
-            root_cause: "transient hiccup".to_string(),
-            severity: FailureSeverity::Low,
-            correction: None,
-            context: String::new(),
-        };
-        let action = strategy.decide(&analysis, 0, 5).await;
-        assert!(action.is_retry());
-    }
-
-    #[tokio::test]
-    async fn backoff_high_severity_with_correction_asks_user() {
-        use crate::core::types::CorrectionType;
-        let strategy = ExponentialBackoffRecovery::new(3);
-        let analysis = FailureAnalysis {
-            is_recoverable: true,
-            root_cause: "bad parameter".to_string(),
-            severity: FailureSeverity::High,
-            correction: Some(Correction {
-                correction_type: CorrectionType::InputFix,
-                description: "fix the file path".to_string(),
-                modified_input: None,
-                alternative_tool: None,
-                guidance: None,
-            }),
-            context: String::new(),
-        };
-        let action = strategy.decide(&analysis, 0, 5).await;
-        assert!(action.is_ask_user());
-    }
-
-    #[tokio::test]
-    async fn backoff_high_severity_without_correction_retries() {
-        let strategy = ExponentialBackoffRecovery::new(3);
-        let analysis = FailureAnalysis {
-            is_recoverable: true,
-            root_cause: "timeout".to_string(),
-            severity: FailureSeverity::High,
-            correction: None,
-            context: String::new(),
-        };
-        let action = strategy.decide(&analysis, 0, 5).await;
-        assert!(action.is_retry());
-    }
-
-    #[test]
-    fn backoff_debug_format() {
-        let strategy = ExponentialBackoffRecovery::new(3);
-        let debug = format!("{strategy:?}");
-        assert!(debug.contains("ExponentialBackoffRecovery"));
-        assert!(debug.contains("max_retries"));
     }
 }

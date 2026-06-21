@@ -1,10 +1,10 @@
 //! API and infrastructure error types.
 //!
-//! This module provides the error hierarchy for LLM API interactions,
-//! tool execution, configuration handling, and general infrastructure
-//! operations. Every failure mode an agent can encounter is captured by
-//! [`ApiError`], with a corresponding [`ErrorCode`] for programmatic
-//! matching, logging, and metrics.
+//! Error hierarchy for LLM API interactions, tool execution,
+//! configuration handling, and general infrastructure operations. Every
+//! failure mode an agent can encounter is captured by [`ApiError`], with
+//! a corresponding [`ErrorCode`] for programmatic matching, logging,
+//! and metrics.
 //!
 //! # Error Categories
 //!
@@ -31,27 +31,10 @@
 //!   via [`ApiError::code`].
 //! - **[`Result<T>`]** — A convenience alias for `std::result::Result<T, ApiError>`.
 //!
-//! # Error Flow
-//!
-//! ```text
-//! [API / Tool / Config / I/O]
-//!         │
-//!         ▼
-//!    ApiError (enum)
-//!         │
-//!         ├──→ code()         → ErrorCode (u32)
-//!         ├──→ is_retryable() → bool
-//!         ├──→ is_auth_error() / is_config_error() / is_context_overflow()
-//!         ├──→ is_io_error() / is_tool_error()
-//!         │
-//!         ▼
-//!    Result<T>  (= std::result::Result<T, ApiError>)
-//! ```
-//!
 //! # Quick Start
 //!
 //! ```rust
-//! use loopctl::api_error::{ApiError, ErrorCode};
+//! use loopctl::api::error::{ApiError, ErrorCode};
 //!
 //! // Construct errors with the ergonomic helpers
 //! let err = ApiError::api("request failed");
@@ -67,10 +50,6 @@
 
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use thiserror::Error;
-
-// ==================================================
-// ErrorCode
-// ==================================================
 
 /// Machine-readable error codes for programmatic error handling.
 ///
@@ -89,7 +68,7 @@ use thiserror::Error;
 /// # Example
 ///
 /// ```rust
-/// use loopctl::api_error::{ApiError, ErrorCode};
+/// use loopctl::api::error::{ApiError, ErrorCode};
 ///
 /// let err = ApiError::api_rate_limited();
 /// assert_eq!(err.code(), ErrorCode::ApiRateLimited);
@@ -107,15 +86,11 @@ pub enum ErrorCode {
     /// request could not be completed for an unspecified reason.
     /// Maps to numeric code **1000**.
     ///
-    /// This is the default code for [`ApiError::Api`] variants whose
-    /// message does not match a more specific pattern (timeout, rate
-    /// limit, stream, or context overflow).
-    ///
-    /// # When to use
+    /// Default code for [`ApiError::Api`] variants whose message does
+    /// not match a more specific pattern (timeout, rate limit, stream,
+    /// or context overflow).
     ///
     /// Use [`ApiError::api`] to construct errors that map to this code.
-    /// The framework's retry loop treats this code as retryable via
-    /// [`ApiError::is_retryable`].
     ApiRequestFailed = 1000,
 
     /// The API response could not be parsed.
@@ -323,13 +298,9 @@ pub enum ErrorCode {
     Interrupted = 1999,
 }
 
-// ==================================================
-// ApiError
-// ==================================================
-
 /// Main error type for API and infrastructure operations.
 ///
-/// This enum covers all failure modes an agent might encounter when
+/// Covers all failure modes an agent might encounter when
 /// interacting with LLM APIs, executing tools, or managing configuration
 /// and I/O. Each variant stores a human-readable message (or a source
 /// error via `#[from]`) and can be mapped to a stable [`ErrorCode`] via
@@ -340,7 +311,7 @@ pub enum ErrorCode {
 /// Prefer the ergonomic constructor methods over enum variants directly:
 ///
 /// ```rust
-/// use loopctl::api_error::{ApiError, ErrorCode};
+/// use loopctl::api::error::{ApiError, ErrorCode};
 /// // Instead of ApiError::Api("...".into())
 /// let err = ApiError::api("request failed");
 ///
@@ -462,11 +433,6 @@ impl ApiError {
     // ==================================================
     // Classifiers
     // ==================================================
-    //
-    // These methods inspect the error variant (and often the message
-    // text) to produce a classification — either an [`ErrorCode`] or
-    // a boolean predicate. They are called by retry loops, logging
-    // middleware, and metrics collectors throughout the framework.
 
     /// Derive the machine-readable [`ErrorCode`] for this error.
     ///
@@ -511,19 +477,6 @@ impl ApiError {
     /// ApiError::Io(_)                         → IoReadError
     /// ApiError::Interrupted                   → Interrupted
     /// ApiError::Other(_)                      → InternalError
-    /// ```
-    ///
-    /// # When called
-    ///
-    /// Called by logging middleware, metrics collectors, and retry
-    /// logic throughout the framework.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
-    /// let err = ApiError::api("rate limit exceeded (429)");
-    /// assert_eq!(err.code(), ErrorCode::ApiRateLimited);
     /// ```
     #[must_use]
     pub fn code(&self) -> ErrorCode {
@@ -610,16 +563,10 @@ impl ApiError {
     /// length — e.g. `"context"`, `"too many tokens"`, or
     /// `"context length"`.
     ///
-    /// # When called
-    ///
-    /// The agent loop calls this after each failed API call to decide
-    /// whether to attempt context reduction (summarisation, truncation)
-    /// before retrying.
-    ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::api("context length exceeded");
     /// assert!(err.is_context_overflow());
     ///
@@ -634,19 +581,7 @@ impl ApiError {
         }
     }
 
-    /// Internal helper that checks a message string for context-overflow
-    /// keywords.
-    ///
-    /// Not part of the public API — extracted so both [`Self::code`]
-    /// and [`Self::is_context_overflow`] share the same heuristic.
-    ///
-    /// The detection looks for any of the following case-insensitive
-    /// substrings within the message:
-    ///
-    /// - `"context"` — catches "context length exceeded" and similar
-    /// - `"too many tokens"` — OpenAI-style phrasing
-    /// - `"exceeds maximum"` — generic overflow wording
-    /// - `"max tokens"` — common provider phrasing
+    /// Check a message string for context-overflow keywords.
     fn is_context_overflow_internal(msg: &str) -> bool {
         let msg_lower = msg.to_lowercase();
         msg_lower.contains("context")
@@ -664,15 +599,10 @@ impl ApiError {
     /// [`ErrorCode::ApiTimeout`], [`ErrorCode::HttpConnectionError`],
     /// [`ErrorCode::HttpRequestError`], and [`ErrorCode::HttpResponseError`].
     ///
-    /// # When called
-    ///
-    /// Retry loops in the API client layer and agent loop call this
-    /// before deciding whether to re-dispatch a request.
-    ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::api_rate_limited();
     /// assert!(err.is_retryable());
     ///
@@ -700,7 +630,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::ApiError;
+    /// use loopctl::api::error::ApiError;
     /// let error = ApiError::auth("bad key");
     /// if error.is_auth_error() {
     ///     eprintln!("Please check your API key.");
@@ -719,7 +649,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::ApiError;
+    /// use loopctl::api::error::ApiError;
     /// let error = ApiError::config("bad config");
     /// if error.is_config_error() {
     ///     eprintln!("Configuration problem — check loopctl.toml.");
@@ -747,7 +677,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::tool_not_found("Bash");
     /// assert!(err.is_tool_error());
     /// ```
@@ -759,11 +689,6 @@ impl ApiError {
     // ==================================================
     // Constructors
     // ==================================================
-    //
-    // Convenience methods that create the appropriate [`ApiError`]
-    // variant with a pre-formatted message. The message formatting
-    // is significant because [`ApiError::code`] performs keyword
-    // matching on the text to select the most specific [`ErrorCode`].
 
     /// Create a generic [`ApiError::Api`] variant.
     ///
@@ -774,7 +699,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::api("unexpected 502 from upstream");
     /// ```
     pub fn api(msg: impl Into<String>) -> Self {
@@ -790,7 +715,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::auth("token expired");
     /// assert_eq!(err.code(), ErrorCode::AuthFailed);
     /// ```
@@ -807,7 +732,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::auth_invalid_key("key expired");
     /// assert_eq!(err.code(), ErrorCode::AuthInvalidKey);
     /// ```
@@ -824,7 +749,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::http("DNS resolution failed");
     /// ```
     pub fn http(msg: impl Into<String>) -> Self {
@@ -844,7 +769,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::http_with_status(503, "service unavailable");
     /// assert!(err.to_string().contains("HTTP 503"));
     /// assert_eq!(err.code(), ErrorCode::HttpResponseError);
@@ -865,7 +790,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::tool("execution failed");
     /// assert_eq!(err.code(), ErrorCode::ToolExecutionFailed);
     /// ```
@@ -875,13 +800,13 @@ impl ApiError {
 
     /// Create a [`ApiError::Tool`] variant prefixed with the tool name.
     ///
-    /// Formats the message as `"{tool}: {msg}"` so logs clearly indicate
+    /// Formats the message as `"{tool}: {msg}"` so logs indicate
     /// which tool failed.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::tool_with_name("Read", "file not found");
     /// assert!(err.to_string().contains("Read"));
     /// ```
@@ -897,7 +822,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::tool_not_found("Bash");
     /// assert_eq!(err.code(), ErrorCode::ToolNotFound);
     /// ```
@@ -913,7 +838,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::tool_permission("Write", "read-only filesystem");
     /// assert_eq!(err.code(), ErrorCode::ToolPermissionDenied);
     /// ```
@@ -929,7 +854,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::tool_input_invalid("Read", "path contains null bytes");
     /// assert_eq!(err.code(), ErrorCode::ToolInputInvalid);
     /// ```
@@ -946,7 +871,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::config("invalid TOML syntax at line 42");
     /// assert_eq!(err.code(), ErrorCode::ConfigParseError);
     /// ```
@@ -962,7 +887,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::config_not_found("/etc/loopctl.toml");
     /// assert_eq!(err.code(), ErrorCode::ConfigFileNotFound);
     /// ```
@@ -978,7 +903,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::config_validation("timeout must be positive");
     /// assert_eq!(err.code(), ErrorCode::ConfigValidationError);
     /// ```
@@ -995,7 +920,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::api_timeout("no response after 30s");
     /// assert!(err.is_retryable());
     /// assert_eq!(err.code(), ErrorCode::ApiTimeout);
@@ -1013,7 +938,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::api_rate_limited();
     /// assert!(err.is_retryable());
     /// assert_eq!(err.code(), ErrorCode::ApiRateLimited);
@@ -1031,7 +956,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::api_stream("connection reset mid-stream");
     /// assert_eq!(err.code(), ErrorCode::ApiStreamError);
     /// ```
@@ -1047,7 +972,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let err = ApiError::other("something unexpected happened");
     /// assert_eq!(err.code(), ErrorCode::InternalError);
     /// ```
@@ -1057,13 +982,13 @@ impl ApiError {
 
     /// Create an I/O error for a missing file.
     ///
-    /// Convenience constructor for callers that know the operation was
-    /// a file lookup that failed. Maps to [`ErrorCode::IoFileNotFound`].
+    /// Constructor for file-lookup failures. Maps to
+    /// [`ErrorCode::IoFileNotFound`].
     ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     ///
     /// let err = ApiError::io_not_found(
     ///     std::io::Error::new(std::io::ErrorKind::NotFound, "config.toml"),
@@ -1089,7 +1014,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     ///
     /// let err = ApiError::io_read(
     ///     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated"),
@@ -1110,7 +1035,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     ///
     /// let err = ApiError::io_write(
     ///     std::io::Error::new(std::io::ErrorKind::WriteZero, "disk full"),
@@ -1132,7 +1057,7 @@ impl ApiError {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::api_error::{ApiError, ErrorCode};
+    /// use loopctl::api::error::{ApiError, ErrorCode};
     /// let io_err = std::io::Error::new(std::io::ErrorKind::Other, "oops");
     /// let api_err = ApiError::from_hyper(io_err);
     /// assert!(matches!(api_err, ApiError::Http(_)));
@@ -1142,22 +1067,12 @@ impl ApiError {
     }
 }
 
-/// Result type alias for operations that can fail with [`ApiError`].
-///
-/// Used throughout the crate so that function signatures stay concise.
-/// Equivalent to `std::result::Result<T, ApiError>`.
-///
-/// # When to use
-///
-/// Any function in the agent framework that can fail should return
-/// `Result<T>` rather than spelling out the full path. This keeps
-/// signatures uniform and allows `?` propagation across the entire
-/// call stack.
+/// Result type for operations that can fail with [`ApiError`].
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use loopctl::api_error::{ApiError, ErrorCode};
+/// use loopctl::api::error::{ApiError, ErrorCode};
 /// fn load_config() -> Result<Config> {
 ///     let text = std::fs::read_to_string("loopctl.toml")
 ///         .map_err(|e| ApiError::config_not_found("loopctl.toml"))?;
@@ -1165,10 +1080,6 @@ impl ApiError {
 /// }
 /// ```
 pub type Result<T> = std::result::Result<T, ApiError>;
-
-// ==================================================
-// Tests
-// ==================================================
 
 #[cfg(test)]
 /// Unit tests for the [`ApiError`] enum and [`ErrorCode`] codes.

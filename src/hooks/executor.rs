@@ -78,17 +78,15 @@ impl HookExecutor {
         }
     }
 
-    /// Create an executor with the given interactivity mode and no hooks.
+    /// Set the interactivity mode.
     ///
     /// Use [`interactivity`](Self::interactivity) to change the mode after
     /// construction, or [`with_hook`](Self::with_hook) to add hooks via
     /// builder pattern.
     #[must_use]
-    pub fn with_interactivity(interactivity: Interactivity) -> Self {
-        Self {
-            hooks: Vec::new(),
-            interactivity,
-        }
+    pub fn with_interactivity(mut self, interactivity: Interactivity) -> Self {
+        self.interactivity = interactivity;
+        self
     }
 
     /// Set the interactivity mode (builder style).
@@ -671,7 +669,8 @@ mod tests {
         }
 
         // Interactive executor passes Ask through unchanged.
-        let executor = HookExecutor::with_interactivity(Interactivity::Interactive)
+        let executor = HookExecutor::new()
+            .with_interactivity(Interactivity::Interactive)
             .with_hook(Arc::new(AskHook));
         let ctx = dummy_pre_ctx();
         let action = executor.check_pre_tool_use(&ctx);
@@ -775,8 +774,9 @@ mod tests {
         }
 
         // with_interactivity(Headless) should downgrade.
-        let headless =
-            HookExecutor::with_interactivity(Interactivity::Headless).with_hook(Arc::new(AskHook));
+        let headless = HookExecutor::new()
+            .with_interactivity(Interactivity::Headless)
+            .with_hook(Arc::new(AskHook));
         assert!(
             headless.check_pre_tool_use(&dummy_pre_ctx()).is_block(),
             "Headless via with_interactivity should downgrade Ask"
@@ -796,7 +796,8 @@ mod tests {
         }
 
         // Interactive mode does NOT alter Block actions.
-        let executor = HookExecutor::with_interactivity(Interactivity::Interactive)
+        let executor = HookExecutor::new()
+            .with_interactivity(Interactivity::Interactive)
             .with_hook(Arc::new(BlockOnlyHook));
         let ctx = dummy_pre_ctx();
         let action = executor.check_pre_tool_use(&ctx);
@@ -813,7 +814,7 @@ mod tests {
 
     #[test]
     fn no_hooks_returns_allow_in_interactive() {
-        let executor = HookExecutor::with_interactivity(Interactivity::Interactive);
+        let executor = HookExecutor::new().with_interactivity(Interactivity::Interactive);
         let ctx = dummy_pre_ctx();
         assert!(executor.check_pre_tool_use(&ctx).is_allow());
     }

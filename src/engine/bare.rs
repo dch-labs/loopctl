@@ -61,7 +61,7 @@
 //! let config = LoopConfig::default();
 //!
 //! // 2. Create the loop
-//! let agent = BareLoop::new(client, registry, config);
+//! let mut agent = BareLoop::new(client, registry, config);
 //!
 //! // 3. Run
 //! let result = agent.run("Hello, agent!").await?;
@@ -69,13 +69,18 @@
 //! ```
 
 use crate::api::ApiClient;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use crate::cancel::CancelSignal;
-use crate::compact::{ContextManager, EnsureContextResult};
+use crate::compact::ContextManager;
 use crate::config::LoopConfig;
-use crate::detection::{ConvergenceAction, DetectedPattern};
+
 use crate::error::LoopError;
 
-use crate::engine::loop_core::SessionResult;
+use crate::engine::loop_core::{LoopState, SessionResult, StopReason, ToolCall, TurnResult};
 #[cfg(feature = "hooks")]
 use crate::hooks::HookAction;
 #[cfg(feature = "hooks")]
@@ -89,12 +94,12 @@ use crate::hooks::context::{
 use crate::message::{Message, MessagePart, Role, ToolContent};
 use crate::middleware::{ToolDispatchContext, ToolPipeline, ToolPipelineBuilder};
 use crate::observer::{
-    ConvergenceDetectedContext, FallbackContext, LoopDetectedContext, ResponseContext,
-    StreamContext, StreamFailureContext, TurnEndContext, TurnStartContext,
+    FallbackContext, ResponseContext, StreamContext, StreamFailureContext, TurnEndContext,
+    TurnStartContext,
 };
 use crate::reflection::{
-    Correction, CorrectionResult, ExponentialBackoffRecovery, NoopReflector, RecoveryAction,
-    RecoveryStrategy, ReflectionContext, Reflector,
+    ExponentialBackoffRecovery, NoopReflector, RecoveryAction, RecoveryStrategy, ReflectionContext,
+    Reflector,
 };
 use crate::runtime::LoopRuntime;
 use crate::stream::handler::StreamHandler;
@@ -102,9 +107,6 @@ use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
 #[cfg(feature = "tool_health")]
 use crate::tool::health::ToolHealthRegistry;
 use crate::tool::{PermissionCheck, ToolContext, ToolDispatchResult, ToolRegistry, ToolSchema};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 // Phase submodules
 mod compact;
@@ -137,13 +139,11 @@ mod stream;
 /// - [`new()`](BareLoop::new) — client + tools + config.
 /// - [`new_with_managers()`](BareLoop::new_with_managers) — full control,
 ///   including a [`LoopRuntime`].
-/// - [`from_parts()`](BareLoop::from_parts) — re-assembles from the
-///   output of `AgentBuilder::into_raw_parts()`.
 ///
 /// # Lifecycle
 ///
 /// ```text
-/// new() / new_with_managers() / from_parts()
+/// new() / new_with_managers()
 ///   → run(user_input)
 ///       → stream_turn() → dispatch_tools() → stream_turn()
 ///       → … (repeat until end_turn or max_turns)
@@ -161,7 +161,7 @@ mod stream;
 /// let registry = ToolRegistry::new();
 /// let config = LoopConfig::default();
 ///
-/// let agent = BareLoop::new(
+/// let mut agent = BareLoop::new(
 ///     Arc::new(my_client),
 ///     registry,
 ///     config,
@@ -183,13 +183,6 @@ pub struct BareLoop<C: ApiClient> {
     /// by name in this registry and invokes it.
     tools: Arc<ToolRegistry>,
 
-    /// Optional middleware pipeline wrapping tool dispatch.
-    ///
-    /// When `Some`, tool calls flow through the pipeline's middleware
-    /// chain (timeouts, output limiting, etc.) before reaching the
-    /// registry. When `None`, dispatches go directly to the registry.
-    pipeline: Option<ToolPipeline>,
-
     /// Session parameters (max turns, model, system prompt).
     ///
     /// See [`LoopConfig`] for the full set of options.
@@ -197,23 +190,34 @@ pub struct BareLoop<C: ApiClient> {
 
     /// Conversation history (system + user + assistant + tool results).
     ///
-    /// Grows over the session lifetime. Each call to [`run()`](BareLoop::run)
+    /// Grows over the session lifetime. Each call to [`run()`](crate::engine::loop_core::Loop::run)
     /// appends the user message, then alternates between assistant responses
     /// and tool-result messages until the model signals `end_turn`.
     conversation: Vec<Message>,
 
-    /// Manager bundle (fallback, loop detection, convergence, observers).
+    /// Framework runtime bundle — holds all cross-cutting infrastructure.
     ///
-    /// Holds the cross-cutting managers that govern session behaviour:
+    /// This is the single source of truth for:
     ///
-    /// - [`FallbackManager`] — circuit breaker that trips after repeated
-    ///   API failures, switching to a fallback model and recovering
-    ///   once the primary stabilises.
-    /// - [`DetectionManager`] — orchestrates loop detection (repeated
-    ///   tool operations) and convergence detection (semantically
-    ///   similar responses).
+    /// - [`FallbackManager`] — circuit breaker for API model fallback.
+    /// - [`DetectionManager`] — loop and convergence detection.
+    /// - [`ObserverHost`] — lifecycle event fan-out.
+    /// - Optional [`ToolPipeline`] — middleware pipeline for tool dispatch.
+    /// - Optional [`ContextManager`] — automatic context compaction.
+    /// - Optional [`StreamHandler`] — resilient streaming with retries.
+    /// - Optional [`HookExecutor`] — bidirectional lifecycle hooks.
+    /// - Optional [`ToolHealthRegistry`] — per-tool health tracking.
     ///
     /// Reset at the start of every session via [`LoopRuntime::reset_all`].
+    ///
+    /// [`FallbackManager`]: crate::fallback::FallbackManager
+    /// [`DetectionManager`]: crate::detection::DetectionManager
+    /// [`ObserverHost`]: crate::observer::ObserverHost
+    /// [`ToolPipeline`]: crate::middleware::ToolPipeline
+    /// [`ContextManager`]: crate::compact::ContextManager
+    /// [`StreamHandler`]: crate::stream::handler::StreamHandler
+    /// [`HookExecutor`]: crate::hooks::HookExecutor
+    /// [`ToolHealthRegistry`]: crate::tool::health::ToolHealthRegistry
     managers: LoopRuntime,
 
     /// Failure analyser for tool errors.
@@ -238,280 +242,22 @@ pub struct BareLoop<C: ApiClient> {
     /// will wake up mid-stream when cancelled.
     cancelled: Arc<CancelSignal>,
 
-    /// Optional context manager for automatic compaction.
-    ///
-    /// When `Some`, the loop checks token usage after each turn and
-    /// triggers compaction when usage exceeds the configured threshold.
-    /// Compaction replaces the conversation messages, notifies observers
-    /// via [`LoopObserver::on_compaction`](crate::observer::LoopObserver::on_compaction),
-    /// and notifies observers via [`on_compaction`](crate::observer::LoopObserver::on_compaction).
-    context_manager: Option<Arc<ContextManager>>,
+    /// Current lifecycle state, exposed via the [`Loop`](crate::engine::loop_core::Loop) trait.
+    state: LoopState,
 
-    /// Optional stream handler for resilient streaming.
+    /// Session-level accumulator for turn counts, token usage, and tool calls.
     ///
-    /// When `Some`, replaces the inline [`stream_turn()`](BareLoop::stream_turn)
-    /// logic with the handler's retry, timeout, and fallback capabilities.
-    /// When `None`, streaming uses the basic inline logic with no retries.
-    stream_handler: Option<StreamHandler>,
+    /// Reused across turns in a single [`run()`](crate::engine::loop_core::Loop::run) call. Reset
+    /// to `SessionResult::default()` in [`initialize`](crate::engine::loop_core::Loop::initialize).
+    budget: SessionResult,
 
-    /// Ordered hook executor for lifecycle interception.
-    ///
-    /// When `Some`, the executor runs registered hooks before and after
-    /// tool dispatch, compaction, and session start/end. Hooks can
-    /// short-circuit with [`HookAction::Block`].
-    /// [`HookAction::Ask`] is automatically downgraded to `Block` by the
-    /// executor in [`crate::hooks::Interactivity::Headless`] mode (the default).
-    /// When `None`, no lifecycle interception occurs.
-    ///
-    /// *Requires `hooks` feature.*
-    #[cfg(feature = "hooks")]
-    hook_executor: Option<Arc<HookExecutor>>,
-
-    /// Per-tool health tracker with circuit breakers.
-    ///
-    /// When `Some`, records success/failure and latency for every tool
-    /// dispatch. Tools that exceed the failure threshold have their circuit
-    /// breaker opened, blocking subsequent calls until recovery.
-    ///
-    /// *Requires `tool_health` feature.*
-    #[cfg(feature = "tool_health")]
-    health_registry: Option<Arc<ToolHealthRegistry>>,
+    /// Session start time, set by [`initialize`](crate::engine::loop_core::Loop::initialize).
+    session_start: Option<Instant>,
 }
 
 // ==================================================
-// Run-loop bookkeeping types
+// Run-loop helpers
 // ==================================================
-
-/// Accumulated token counts, tool-call count, and turn count for a session.
-///
-/// Mutable state that flows through the [`run()`](BareLoop::run) loop.
-/// Using a struct avoids scattering loose counters across the method.
-#[derive(Default)]
-struct SessionBudget {
-    input_tokens: u64,
-    output_tokens: u64,
-    total_tool_calls: usize,
-    turn_count: usize,
-}
-
-impl SessionBudget {
-    /// Accumulate token usage from a single turn into the running totals.
-    ///
-    /// When the API reports [`Usage`] data (input and output token counts),
-    /// this method adds them to the session-wide accumulators using
-    /// saturating arithmetic to prevent overflow on very long sessions.
-    /// If `usage` is `None` (provider did not report counts), this is a
-    /// no-op.
-    fn accumulate_usage(&mut self, usage: Option<&Usage>) {
-        if let Some(u) = usage {
-            self.input_tokens = self.input_tokens.saturating_add(u64::from(u.input_tokens));
-            self.output_tokens = self
-                .output_tokens
-                .saturating_add(u64::from(u.output_tokens));
-        }
-    }
-}
-
-/// Token counts for a single turn, captured before tool dispatch.
-///
-/// Needed because [`SessionBudget::accumulate_usage`] mutates the running
-/// totals, but the per-turn values must be reported separately to observers.
-#[derive(Clone, Copy)]
-struct TurnTokens {
-    input: u64,
-    output: u64,
-}
-
-impl TurnTokens {
-    /// Extract per-turn token counts from optional [`Usage`].
-    ///
-    /// Returns a [`TurnTokens`] capturing the input and output token
-    /// counts for a single turn. When `usage` is `None` (provider did
-    /// not report counts), both fields default to `0`.
-    ///
-    /// Required because [`SessionBudget::accumulate_usage`] mutates
-    /// running totals in place, but the per-turn values must be reported
-    /// separately to observers.
-    fn from_usage(usage: Option<&Usage>) -> Self {
-        match usage {
-            Some(u) => Self {
-                input: u64::from(u.input_tokens),
-                output: u64::from(u.output_tokens),
-            },
-            None => Self {
-                input: 0,
-                output: 0,
-            },
-        }
-    }
-}
-
-/// Per-turn context passed to helper methods during the [`run()`](BareLoop::run) loop.
-///
-/// Bundles the zero-based turn index, wall-clock duration, and token
-/// counts so that extracted methods don't need long parameter lists.
-struct TurnContext {
-    idx: usize,
-    duration: Duration,
-    tokens: TurnTokens,
-}
-
-/// Reason the session was aborted before normal completion.
-///
-/// Used by [`abort_session`](BareLoop::abort_session) to select the
-/// correct [`LoopError`] variant without string matching.
-#[derive(Clone, Copy)]
-enum AbortReason {
-    /// User or external signal requested cancellation.
-    Cancelled,
-    /// The turn budget was exhausted.
-    MaxTurnsExceeded,
-}
-
-/// Aggregated session metrics passed to [`notify_session_end`](BareLoop::notify_session_end).
-///
-/// Captures completion status, an [`EndReason`] discriminant, turn/token
-/// counters, and wall-clock duration — everything a hook needs to log or
-/// react to session termination without pulling data from other sources.
-struct SessionEndInfo {
-    /// Whether the session completed normally.
-    success: bool,
-    /// Structured reason for the session end.
-    reason: EndReason,
-    /// Total turns executed.
-    total_turns: usize,
-    /// Total tokens consumed (input + output).
-    #[cfg_attr(not(feature = "hooks"), allow(dead_code))]
-    total_tokens: u64,
-    /// Wall-clock session duration in seconds.
-    duration_secs: u64,
-}
-
-/// Discriminant for how a session terminated.
-///
-/// Mapped to [`SessionEndReason`] inside the `#[cfg(feature = "hooks")]`
-/// path so the enum itself remains feature-independent.
-enum EndReason {
-    Complete,
-    Cancelled,
-    Error,
-    MaxTurns,
-}
-
-// ==================================================
-// ToolCallInfo
-// ==================================================
-
-/// Internal representation of a tool call extracted from a message.
-///
-/// When the LLM emits a `tool_call` content part, the loop extracts
-/// its fields into this struct for convenient passing to
-/// [`dispatch_tools()`](BareLoop::dispatch_tools).
-///
-/// External consumers interact with tool results via [`SessionResult`] or the
-/// [`LoopObserver`](crate::observer::LoopObserver) callbacks.
-///
-/// # Fields
-///
-/// - [`id`](ToolCallInfo::id) — The unique identifier assigned by the
-///   API to this tool call. Used to correlate the result back to the
-///   request.
-/// - [`name`](ToolCallInfo::name) — The tool name. Must match a tool
-///   registered in the [`ToolRegistry`].
-/// - [`input`](ToolCallInfo::input) — The JSON input provided by the
-///   model. Deserialized into a `serde_json::Value`.
-#[derive(Debug, Clone)]
-struct ToolCallInfo {
-    /// The tool call ID assigned by the API.
-    ///
-    /// Used to correlate the tool result message back to the original
-    /// tool call. Copied into [`ToolDispatchResult::tool_call_id`] after
-    /// execution.
-    id: String,
-
-    /// The tool name requested by the model.
-    ///
-    /// Must exactly match a name returned by a registered
-    /// [`Tool::name()`](crate::tool::Tool::name). If no match is found,
-    /// a soft error result is produced instead of a hard error.
-    name: String,
-
-    /// The tool input as a JSON value.
-    ///
-    /// Deserialized from the API's `tool_call` content part. Passed
-    /// directly to [`Tool::call()`](crate::tool::Tool::call).
-    input: serde_json::Value,
-}
-
-impl ToolCallInfo {
-    /// Apply a [`Correction`] from the reflection system in-place.
-    ///
-    /// Modifies `self` according to the correction strategy:
-    ///
-    /// - [`InputFix`](crate::reflection::CorrectionType::InputFix) — replaces
-    ///   `self.input` with `correction.modified_input` (if provided).
-    /// - [`ToolChange`](crate::reflection::CorrectionType::ToolChange) —
-    ///   replaces `self.name` with `correction.alternative_tool` (if provided).
-    /// - Other types ([`Retry`](crate::reflection::CorrectionType::Retry),
-    ///   [`ApproachChange`](crate::reflection::CorrectionType::ApproachChange),
-    ///   [`Escalate`](crate::reflection::CorrectionType::Escalate)) — no
-    ///   mutation needed; the retry proceeds with unchanged parameters.
-    ///
-    /// Returns a [`CorrectionResult`] indicating whether the correction
-    /// was applied, failed (e.g. missing fields), or skipped.
-    fn apply_correction(
-        &mut self,
-        correction: &Correction,
-        _prior_result: &ToolDispatchResult,
-    ) -> CorrectionResult {
-        use crate::reflection::CorrectionType;
-        match correction.correction_type {
-            CorrectionType::InputFix => {
-                if let Some(ref modified) = correction.modified_input {
-                    tracing::debug!(
-                        tool = %self.name,
-                        "applying InputFix correction from reflector"
-                    );
-                    self.input = modified.clone();
-                    CorrectionResult::Applied
-                } else {
-                    CorrectionResult::Failed(
-                        "InputFix correction missing modified_input".to_string(),
-                    )
-                }
-            }
-            CorrectionType::ToolChange => {
-                if let Some(ref alt) = correction.alternative_tool {
-                    tracing::debug!(
-                        old_tool = %self.name,
-                        new_tool = %alt,
-                        "applying ToolChange correction from reflector"
-                    );
-                    self.name.clone_from(alt);
-                    CorrectionResult::Applied
-                } else {
-                    CorrectionResult::Failed(
-                        "ToolChange correction missing alternative_tool".to_string(),
-                    )
-                }
-            }
-            CorrectionType::PrerequisiteFix | CorrectionType::ApproachChange => {
-                // These types do not modify the tool call parameters.
-                // PrerequisiteFix is advisory (the guidance may describe a
-                // side-effect to perform); ApproachChange is high-level
-                // guidance for a different strategy. The retry proceeds
-                // with unchanged input/tool.
-                CorrectionResult::Skipped
-            }
-            CorrectionType::Escalate => {
-                // Escalation means no correction is possible. The retry
-                // loop should not normally reach here because Escalate
-                // errors are mapped to RecoveryAction::Fail upstream.
-                CorrectionResult::Skipped
-            }
-        }
-    }
-}
 
 impl<C: ApiClient> BareLoop<C> {
     /// Maximum retry attempts for tool recovery before giving up.
@@ -531,7 +277,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let agent = BareLoop::new(
+    /// let mut agent = BareLoop::new(
     ///     Arc::new(my_client),
     ///     ToolRegistry::new(),
     ///     LoopConfig::default(),
@@ -541,19 +287,15 @@ impl<C: ApiClient> BareLoop<C> {
         Self {
             client,
             tools: Arc::new(tools),
-            pipeline: None,
             config,
             conversation: Vec::new(),
             managers: LoopRuntime::new(),
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
-            context_manager: None,
-            stream_handler: None,
-            #[cfg(feature = "hooks")]
-            hook_executor: None,
-            #[cfg(feature = "tool_health")]
-            health_registry: None,
+            state: LoopState::Idle,
+            budget: SessionResult::default(),
+            session_start: None,
         }
     }
 
@@ -574,10 +316,11 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// ```rust,ignore
     /// let managers = LoopRuntime::builder()
-    ///     .with_loop_detection(10)
+    ///     .with_detection(DetectionManager::default())
+    ///     .with_fallback(FallbackManager::default())
     ///     .build();
     ///
-    /// let agent = BareLoop::new_with_managers(
+    /// let mut agent = BareLoop::new_with_managers(
     ///     Arc::new(my_client),
     ///     registry,
     ///     config,
@@ -593,63 +336,15 @@ impl<C: ApiClient> BareLoop<C> {
         Self {
             client,
             tools: Arc::new(tools),
-            pipeline: None,
             config,
             conversation: Vec::new(),
             managers,
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
-            context_manager: None,
-            stream_handler: None,
-            #[cfg(feature = "hooks")]
-            hook_executor: None,
-            #[cfg(feature = "tool_health")]
-            health_registry: None,
-        }
-    }
-
-    /// Create from builder parts (produced by `AgentBuilder::into_raw_parts()`).
-    ///
-    /// Most flexible constructor. It accepts all components
-    /// individually, making it suitable for re-assembly after a builder
-    /// has been consumed via `into_raw_parts()`.
-    ///
-    /// # Parameters
-    ///
-    /// - `client` — The LLM API client, wrapped in `Arc`.
-    /// - `tools` — The [`ToolRegistry`].
-    /// - `managers` — A [`LoopRuntime`].
-    /// - `config` — Session parameters.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let (client, tools, managers, config) = builder.into_raw_parts();
-    /// let agent = BareLoop::from_parts(client, tools, managers, config);
-    /// ```
-    pub fn from_parts(
-        client: Arc<C>,
-        tools: ToolRegistry,
-        managers: LoopRuntime,
-        config: LoopConfig,
-    ) -> Self {
-        Self {
-            client,
-            tools: Arc::new(tools),
-            pipeline: None,
-            config,
-            conversation: Vec::new(),
-            managers,
-            reflector: Arc::new(NoopReflector),
-            recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
-            cancelled: Arc::new(CancelSignal::new()),
-            context_manager: None,
-            stream_handler: None,
-            #[cfg(feature = "hooks")]
-            hook_executor: None,
-            #[cfg(feature = "tool_health")]
-            health_registry: None,
+            state: LoopState::Idle,
+            budget: SessionResult::default(),
+            session_start: None,
         }
     }
 
@@ -735,7 +430,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Set the [`Reflector`] for tool-error analysis.
     ///
     /// Replaces the default [`NoopReflector`] with a caller-supplied
-    /// implementation. Must be called before [`run()`](BareLoop::run).
+    /// implementation. Must be called before [`run()`](crate::engine::loop_core::Loop::run).
     ///
     /// # Example
     ///
@@ -751,7 +446,7 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Replaces the default [`ExponentialBackoffRecovery`] with a
     /// caller-supplied implementation. Must be called before
-    /// [`run()`](BareLoop::run).
+    /// [`run()`](crate::engine::loop_core::Loop::run).
     ///
     /// # Example
     ///
@@ -767,7 +462,7 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// When set, the loop checks token usage after each turn and
     /// triggers compaction when usage exceeds the configured threshold.
-    /// Must be called before [`run()`](BareLoop::run).
+    /// Must be called before [`run()`](crate::engine::loop_core::Loop::run).
     ///
     /// # Example
     ///
@@ -786,7 +481,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// agent.set_context_manager(Arc::new(manager));
     /// ```
     pub fn set_context_manager(&mut self, manager: Arc<ContextManager>) {
-        self.context_manager = Some(manager);
+        self.managers.set_context_manager(manager);
     }
 
     /// Set the [`StreamHandler`] for resilient streaming with retries,
@@ -794,7 +489,7 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// When set, the loop delegates streaming to the handler instead of
     /// using the inline streaming logic. Must be called before
-    /// [`run()`](BareLoop::run).
+    /// [`run()`](crate::engine::loop_core::Loop::run).
     ///
     /// # Example
     ///
@@ -813,7 +508,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// agent.set_stream_handler(handler);
     /// ```
     pub fn set_stream_handler(&mut self, handler: StreamHandler) {
-        self.stream_handler = Some(handler);
+        self.managers.set_stream_handler(handler);
     }
 
     /// Set the [`HookExecutor`] for lifecycle interception.
@@ -823,7 +518,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// short-circuit with [`HookAction::Block`].
     /// [`HookAction::Ask`] is automatically downgraded to `Block` by the
     /// executor in [`crate::hooks::Interactivity::Headless`] mode (the default).
-    /// Must be called before [`run()`](BareLoop::run).
+    /// Must be called before [`run()`](crate::engine::loop_core::Loop::run).
     ///
     /// *Requires `hooks` feature.*
     ///
@@ -839,7 +534,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// ```
     #[cfg(feature = "hooks")]
     pub fn set_hook_executor(&mut self, executor: Arc<HookExecutor>) {
-        self.hook_executor = Some(executor);
+        self.managers.set_hook_executor(executor);
     }
 
     /// Set the [`ToolHealthRegistry`] for per-tool health tracking.
@@ -847,7 +542,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// When set, records success/failure and latency for every tool
     /// dispatch. Tools that exceed the failure threshold have their
     /// circuit breaker opened, blocking subsequent calls until recovery.
-    /// Must be called before [`run()`](BareLoop::run).
+    /// Must be called before [`run()`](crate::engine::loop_core::Loop::run).
     ///
     /// *Requires `tool_health` feature.*
     ///
@@ -863,7 +558,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// ```
     #[cfg(feature = "tool_health")]
     pub fn set_health_registry(&mut self, registry: Arc<ToolHealthRegistry>) {
-        self.health_registry = Some(registry);
+        self.managers.set_health_registry(registry);
     }
 
     /// Set the middleware pipeline for tool dispatch.
@@ -871,7 +566,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Replaces the default (no pipeline) with a caller-supplied
     /// [`ToolPipeline`]. When set, tool calls flow through the
     /// pipeline's middleware chain before reaching the registry.
-    /// Must be called before [`run()`](BareLoop::run).
+    /// Must be called before [`run()`](crate::engine::loop_core::Loop::run).
     ///
     /// Build the pipeline using [`ToolPipeline::builder()`], adding middleware
     /// layers **without** calling `.core()` — the registry is injected
@@ -899,7 +594,7 @@ impl<C: ApiClient> BareLoop<C> {
             .core(Arc::clone(&self.tools))
             .build()
             .map_err(|e| LoopError::Config(e.to_string()))?;
-        self.pipeline = Some(pipeline);
+        self.managers.set_pipeline(pipeline);
         Ok(())
     }
 
@@ -909,7 +604,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// in registration order. See [`LoopObserver`](crate::observer::LoopObserver)
     /// for the trait definition and available hooks.
     ///
-    /// Must be called before [`run()`](BareLoop::run).
+    /// Must be called before [`run()`](crate::engine::loop_core::Loop::run).
     ///
     /// # Example
     ///
@@ -925,177 +620,125 @@ impl<C: ApiClient> BareLoop<C> {
     }
 
     // ==================================================
-    // Main run loop
+    // Run helpers
     // ==================================================
 
-    /// Run the agent loop with the given user input.
+    /// Extract per-turn token counts from optional [`Usage`].
+    fn usage_tokens(usage: Option<&Usage>) -> (u64, u64) {
+        match usage {
+            Some(u) => (u64::from(u.input_tokens), u64::from(u.output_tokens)),
+            None => (0, 0),
+        }
+    }
+
+    /// Dispatch tool calls, push the result message, and record the count.
     ///
-    /// Primary entry point. It:
-    /// 1. Pushes the user message into the conversation
-    /// 2. Loops: stream → accumulate → tool dispatch → feedback
-    /// 3. Returns a [`SessionResult`] when done
-    ///
-    /// The loop terminates when one of these conditions is met:
-    ///
-    /// - **End turn** — the model emits `end_turn` with no tool calls.
-    /// - **Max turns exceeded** — [`config.max_turns`](LoopConfig::max_turns)
-    ///   is reached, producing [`LoopError::MaxTurnsExceeded`].
-    /// - **Cancellation** — [`cancel()`](BareLoop::cancel) was called,
-    ///   producing [`LoopError::Cancelled`]; the caller should handle this
-    ///   variant to distinguish user-initiated cancellation from other errors.
-    /// - **API error** — the streaming request fails, producing
-    ///   [`LoopError::Api`].
-    ///
-    /// # Observers
-    ///
-    /// Observers are notified at the following points:
-    ///
-    /// ```text
-    /// on_session_start(session_id)
-    ///   for each turn:
-    ///     on_turn_start(user_input)
-    ///     [stream from API]
-    ///     for each tool_call:
-    ///       on_tool_call(name, input)
-    ///       on_tool_complete(name, input, output, duration, success, error)
-    ///     on_turn_end(success, error)
-    /// on_session_end(success, error)
-    /// ```
+    /// Notifies observers: turn-end on success, turn-end on error.
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError`] if:
-    /// - The API call fails (after any retries)
-    /// - Max turns is exceeded
-    /// - A tool execution fails critically
-    /// - The loop is cancelled
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let result = agent.run("Summarize this article").await?;
-    /// if result.success {
-    ///     println!("Output: {:?}", result.final_output);
-    ///     println!("Turns: {}", result.total_turns);
-    ///     println!("Input tokens: {}", result.input_tokens);
-    ///     println!("Output tokens: {}", result.output_tokens);
-    /// }
-    /// ```
-    pub async fn run(mut self, user_input: &str) -> Result<SessionResult, LoopError> {
-        let session_id = self.config.session_id;
-        let max_turns = self.config.max_turns;
-        let start = Instant::now();
-        let mut budget = SessionBudget::default();
-
-        self.notify_session_start();
-        self.managers.reset_all();
-        self.conversation.push(Message::user(user_input));
-
-        loop {
-            if self.is_cancelled() {
-                return self.abort_session(&budget, start.elapsed(), AbortReason::Cancelled);
+    /// Returns [`LoopError::Cancelled`] if the cancellation token is set.
+    /// Returns [`LoopError::Api`] if loop or convergence detection forces
+    /// an abort, or if the underlying tool dispatch fails.
+    async fn dispatch_and_record(
+        &mut self,
+        tool_calls: &[ToolCall],
+        turn_index: usize,
+        turn_duration: Duration,
+        turn_input_tokens: u64,
+        turn_output_tokens: u64,
+        budget: &mut SessionResult,
+    ) -> Result<(), LoopError> {
+        match self.dispatch_tools(tool_calls, turn_index).await {
+            Ok(results) => {
+                budget.tool_calls = budget.tool_calls.saturating_add(results.len());
+                let tool_result_msg = Self::build_tool_result_message(results);
+                self.conversation.push(tool_result_msg);
+                self.managers.observers().on_turn_end(&TurnEndContext {
+                    turn: budget.total_turns,
+                    success: true,
+                    error: None,
+                    duration_ms: Self::millis_u64(turn_duration),
+                    input_tokens: turn_input_tokens,
+                    output_tokens: turn_output_tokens,
+                });
+                Ok(())
             }
-            if budget.turn_count >= max_turns {
-                return self.abort_session(&budget, start.elapsed(), AbortReason::MaxTurnsExceeded);
+            Err(e) => {
+                let err_str = e.to_string();
+                self.managers.observers().on_turn_end(&TurnEndContext {
+                    turn: budget.total_turns,
+                    success: false,
+                    error: Some(err_str),
+                    duration_ms: Self::millis_u64(turn_duration),
+                    input_tokens: turn_input_tokens,
+                    output_tokens: turn_output_tokens,
+                });
+                Err(e)
+            }
+        }
+    }
+}
+
+// ==================================================
+// Loop trait implementation
+// ==================================================
+
+impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
+    fn initialize<'a>(
+        &'a mut self,
+        config: &'a crate::config::LoopConfig,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.state = LoopState::Processing { turn: 0 };
+            self.budget = SessionResult::default();
+            self.session_start = Some(Instant::now());
+            self.config = config.clone();
+            self.managers.reset_all();
+            self.notify_session_start();
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn process_turn<'a>(
+        &'a mut self,
+        input: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<TurnResult, LoopError>> + Send + 'a>> {
+        Box::pin(async move {
+            // On the first turn, push the user's message.
+            if self.budget.total_turns == 0 {
+                self.conversation.push(Message::user(input));
             }
 
-            self.managers.observers().on_turn_start(&TurnStartContext {
-                turn: budget.turn_count,
-                query: user_input.to_string(),
-            });
             let turn_start = Instant::now();
 
-            match self.stream_turn().await {
-                Ok((assistant_msg, usage, stop_reason)) => {
+            self.managers.observers().on_turn_start(&TurnStartContext {
+                turn: self.budget.total_turns,
+                query: input.to_string(),
+            });
+
+            // Check cancellation before the API call.
+            if self.is_cancelled() {
+                self.state = LoopState::Failed {
+                    error: "cancelled".into(),
+                };
+                return Err(LoopError::Cancelled);
+            }
+
+            let stream_result = self.stream_turn().await;
+            let (assistant_msg, usage, _stream_stop) = match stream_result {
+                Ok(value) => {
+                    let (msg, usage, stop) = value;
                     self.managers.fallback.record_model_success();
+                    let (in_tok, out_tok) = Self::usage_tokens(usage.as_ref());
                     self.managers.observers().on_stream_success(&StreamContext {
-                        turn: budget.turn_count,
+                        turn: self.budget.total_turns,
                         model: self.client.model().to_string(),
-                        input_tokens: TurnTokens::from_usage(usage.as_ref()).input,
-                        output_tokens: TurnTokens::from_usage(usage.as_ref()).output,
+                        input_tokens: in_tok,
+                        output_tokens: out_tok,
                     });
-
-                    budget.accumulate_usage(usage.as_ref());
-                    let text = Self::extract_text(&assistant_msg);
-                    let pattern = self.managers.detection.record_response(&text);
-
-                    self.managers.observers().on_response(&ResponseContext {
-                        turn: budget.turn_count,
-                        text: text.clone(),
-                        usage,
-                    });
-
-                    if let Some(result) = self.handle_detected_pattern(&pattern, budget.turn_count)
-                    {
-                        let turn_elapsed = turn_start.elapsed();
-                        return match result {
-                            Ok(session_result) => {
-                                self.managers.observers().on_turn_end(&TurnEndContext {
-                                    turn: budget.turn_count,
-                                    success: true,
-                                    error: None,
-                                    duration_ms: Self::millis_u64(turn_start.elapsed()),
-                                    input_tokens: budget.input_tokens,
-                                    output_tokens: budget.output_tokens,
-                                });
-                                self.notify_session_end(&SessionEndInfo {
-                                    success: true,
-                                    reason: EndReason::Complete,
-                                    total_turns: budget.turn_count,
-                                    total_tokens: budget
-                                        .input_tokens
-                                        .saturating_add(budget.output_tokens),
-                                    duration_secs: start.elapsed().as_secs(),
-                                });
-                                Ok(session_result)
-                            }
-                            Err(e) => self.abort_turn_and_session(
-                                &budget,
-                                turn_elapsed,
-                                start.elapsed(),
-                                &e.to_string(),
-                                e,
-                            ),
-                        };
-                    }
-
-                    let tool_calls = Self::extract_tool_calls(&assistant_msg);
-                    self.conversation.push(assistant_msg);
-                    budget.turn_count = budget.turn_count.saturating_add(1);
-
-                    let turn = TurnContext {
-                        idx: budget.turn_count.saturating_sub(1),
-                        duration: turn_start.elapsed(),
-                        tokens: TurnTokens::from_usage(usage.as_ref()),
-                    };
-
-                    if tool_calls.is_empty() {
-                        return Ok(self.finalise_session(
-                            session_id,
-                            text,
-                            stop_reason,
-                            &turn,
-                            start.elapsed(),
-                            &budget,
-                        ));
-                    }
-
-                    if let Err(e) = self
-                        .dispatch_and_record(&tool_calls, &turn, &mut budget)
-                        .await
-                    {
-                        return self.abort_session_from_error(e, start.elapsed(), &budget);
-                    }
-
-                    if let Err(e) = self.maybe_compact_context(budget.turn_count).await {
-                        return self.abort_turn_and_session(
-                            &budget,
-                            turn_start.elapsed(),
-                            start.elapsed(),
-                            &e.to_string(),
-                            e,
-                        );
-                    }
+                    (msg, usage, stop)
                 }
                 Err(e) => {
                     let tripped = self.managers.fallback.record_api_failure();
@@ -1113,349 +756,228 @@ impl<C: ApiClient> BareLoop<C> {
                     self.managers
                         .observers()
                         .on_stream_failure(&StreamFailureContext {
-                            turn: budget.turn_count,
+                            turn: self.budget.total_turns,
                             model: self.client.model().to_string(),
                             error: e.clone(),
                         });
 
-                    let err_str = e.to_string();
-                    return self.abort_turn_and_session(
-                        &budget,
-                        turn_start.elapsed(),
-                        start.elapsed(),
-                        &err_str,
-                        e,
-                    );
+                    self.state = LoopState::Failed {
+                        error: e.to_string(),
+                    };
+                    return Err(e);
                 }
-            }
-        }
-    }
+            };
 
-    // ==================================================
-    // Run helpers
-    // ==================================================
-
-    /// Interpret a detected pattern and decide whether to abort the session.
-    ///
-    /// Called from both the run-loop convergence check (after extracting
-    /// assistant text) and the dispatch path (after recording a tool call).
-    /// Returns `None` to continue the loop, or `Some(result)` to abort
-    /// the session immediately.
-    ///
-    /// # Detection behaviour
-    ///
-    /// - **Loop detection** — only aborts when the repetition count reaches
-    ///   the configured [`DetectionConfig::stop_threshold`]. Below that
-    ///   threshold the pattern is logged as a warning and the loop continues.
-    /// - **Convergence detection** — follows the [`ConvergenceAction`] from
-    ///   the detection config. `Stop` and `AskUser` abort the session;
-    ///   `Warn`, `Compact`, and `SwitchPhase` allow the loop to continue.
-    ///
-    /// # Arguments
-    ///
-    /// - `pattern` — The pattern returned by [`DetectionManager`].
-    /// - `turn` — Zero-based turn index, used in log messages.
-    ///
-    /// [`DetectionConfig::stop_threshold`]: crate::detection::DetectionConfig::stop_threshold
-    /// [`DetectionManager`]: crate::detection::DetectionManager
-    fn handle_detected_pattern(
-        &self,
-        pattern: &DetectedPattern,
-        turn: usize,
-    ) -> Option<Result<SessionResult, LoopError>> {
-        match pattern {
-            DetectedPattern::NoPattern => None,
-
-            DetectedPattern::LoopDetected {
-                repetitions,
-                pattern_description,
-            } => {
-                tracing::warn!(
-                    repetitions,
-                    pattern = %pattern_description,
-                    turn,
-                    "loop detected"
-                );
-
-                self.managers
-                    .observers()
-                    .on_loop_detected(&LoopDetectedContext {
-                        pattern: pattern_description.clone(),
-                        repetitions: *repetitions,
-                    });
-
-                if *repetitions >= self.managers.detection.config().stop_threshold {
-                    tracing::error!(
-                        repetitions,
-                        pattern = %pattern_description,
-                        turn,
-                        "stopping agent: loop threshold exceeded"
-                    );
-                    Some(Err(LoopError::LoopDetected {
-                        message: format!("{pattern_description} repeated {repetitions} times"),
-                    }))
-                } else {
-                    None // warn but continue
-                }
+            // Accumulate usage into session budget.
+            if let Some(u) = &usage {
+                self.budget.input_tokens = self
+                    .budget
+                    .input_tokens
+                    .saturating_add(u64::from(u.input_tokens));
+                self.budget.output_tokens = self
+                    .budget
+                    .output_tokens
+                    .saturating_add(u64::from(u.output_tokens));
             }
 
-            DetectedPattern::ConvergenceDetected {
-                similarity,
-                consecutive_count,
-            } => {
-                tracing::warn!(similarity, consecutive_count, turn, "convergence detected");
-                let action = self.managers.detection.config().on_converge;
-                let action_str = match action {
-                    ConvergenceAction::Stop => "stop",
-                    ConvergenceAction::Warn => "warn",
-                    ConvergenceAction::Compact => "compact",
-                    ConvergenceAction::AskUser => "ask_user",
-                    ConvergenceAction::SwitchPhase => "switch_phase",
-                };
+            let text = Self::extract_text(&assistant_msg);
+            let (turn_in, turn_out) = Self::usage_tokens(usage.as_ref());
 
-                self.managers
-                    .observers()
-                    .on_convergence_detected(&ConvergenceDetectedContext {
-                        action: action_str.to_string(),
-                    });
+            // Record the response text with the detection manager and check
+            // for loop/convergence patterns.
+            let pattern = self.managers.detection.record_response(&text);
 
-                match action {
-                    ConvergenceAction::Stop => Some(Err(LoopError::LoopDetected {
-                        message: "agent stopped: convergence detected".into(),
-                    })),
-                    ConvergenceAction::Warn => None, // log already happened
-                    ConvergenceAction::Compact => {
-                        // Compact is handled by the existing compaction path,
-                        // so just continue. The compact will happen at the
-                        // end of the turn via maybe_compact_context().
-                        None
+            self.managers.observers().on_response(&ResponseContext {
+                turn: self.budget.total_turns,
+                text: text.clone(),
+                usage,
+            });
+
+            if let Some(result) = self
+                .managers
+                .handle_detected_pattern(&pattern, self.budget.total_turns)
+            {
+                match result {
+                    Ok(_) => {
+                        self.state = LoopState::Completed {
+                            summary: text.clone(),
+                        };
+                        return Ok(TurnResult {
+                            text,
+                            tool_calls: Vec::new(),
+                            tool_results: Vec::new(),
+                            input_tokens: turn_in,
+                            output_tokens: turn_out,
+                            duration: turn_start.elapsed(),
+                            is_complete: true,
+                            stop_reason: StopReason::EndTurn,
+                        });
                     }
-                    ConvergenceAction::AskUser => {
-                        // Not supported in BareLoop — treat as Stop
-                        Some(Err(LoopError::LoopDetected {
-                            message: "agent stopped: convergence detected, user input needed"
-                                .into(),
-                        }))
-                    }
-                    ConvergenceAction::SwitchPhase => {
-                        // Not supported in BareLoop — treat as Warn
-                        None
+                    Err(e) => {
+                        self.state = LoopState::Failed {
+                            error: e.to_string(),
+                        };
+                        return Err(e);
                     }
                 }
             }
-        }
-    }
 
-    /// Dispatch tool calls, push the result message, and record the count.
-    ///
-    /// Notifies observers: turn-end on success, turn-end on error.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LoopError::Cancelled`] if the cancellation token is set.
-    /// Returns [`LoopError::Api`] if loop or convergence detection forces
-    /// an abort, or if the underlying tool dispatch fails.
-    async fn dispatch_and_record(
-        &mut self,
-        tool_calls: &[ToolCallInfo],
-        turn: &TurnContext,
-        budget: &mut SessionBudget,
-    ) -> Result<(), LoopError> {
-        match self.dispatch_tools(tool_calls, turn.idx).await {
-            Ok(results) => {
-                budget.total_tool_calls = budget.total_tool_calls.saturating_add(results.len());
-                let tool_result_msg = Self::build_tool_result_message(results);
-                self.conversation.push(tool_result_msg);
+            let tool_calls = Self::extract_tool_calls(&assistant_msg);
+            self.conversation.push(assistant_msg);
+            self.budget.total_turns = self.budget.total_turns.saturating_add(1);
+
+            // No tool calls → this turn is complete.
+            if tool_calls.is_empty() {
                 self.managers.observers().on_turn_end(&TurnEndContext {
-                    turn: budget.turn_count,
+                    turn: self.budget.total_turns.saturating_sub(1),
                     success: true,
                     error: None,
-                    duration_ms: Self::millis_u64(turn.duration),
-                    input_tokens: turn.tokens.input,
-                    output_tokens: turn.tokens.output,
+                    duration_ms: Self::millis_u64(turn_start.elapsed()),
+                    input_tokens: self.budget.input_tokens,
+                    output_tokens: self.budget.output_tokens,
                 });
-                Ok(())
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                self.managers.observers().on_turn_end(&TurnEndContext {
-                    turn: budget.turn_count,
-                    success: false,
-                    error: Some(err_str),
-                    duration_ms: Self::millis_u64(turn.duration),
-                    input_tokens: turn.tokens.input,
-                    output_tokens: turn.tokens.output,
+                self.state = LoopState::Completed {
+                    summary: text.clone(),
+                };
+                return Ok(TurnResult {
+                    text,
+                    tool_calls: Vec::new(),
+                    tool_results: Vec::new(),
+                    input_tokens: turn_in,
+                    output_tokens: turn_out,
+                    duration: turn_start.elapsed(),
+                    is_complete: true,
+                    stop_reason: StopReason::EndTurn,
                 });
-                Err(e)
             }
+
+            // Dispatch tool calls.
+            self.state = LoopState::WaitingForTool {
+                tool: tool_calls
+                    .first()
+                    .map(|tc| tc.tool.clone())
+                    .unwrap_or_default(),
+                started_at: std::time::SystemTime::now(),
+            };
+
+            // Temporarily extract budget to avoid double mutable borrow.
+            let mut budget = std::mem::take(&mut self.budget);
+            let turn_index = budget.total_turns.saturating_sub(1);
+            let turn_duration = turn_start.elapsed();
+            if let Err(e) = self
+                .dispatch_and_record(
+                    &tool_calls,
+                    turn_index,
+                    turn_duration,
+                    turn_in,
+                    turn_out,
+                    &mut budget,
+                )
+                .await
+            {
+                self.budget = budget;
+                self.state = LoopState::Failed {
+                    error: e.to_string(),
+                };
+                return Err(e);
+            }
+            self.budget = budget;
+
+            // Attempt context compaction.
+            if let Err(e) = self.maybe_compact_context(self.budget.total_turns).await {
+                self.state = LoopState::Failed {
+                    error: e.to_string(),
+                };
+                return Err(e);
+            }
+
+            self.state = LoopState::Processing {
+                turn: self.budget.total_turns,
+            };
+
+            Ok(TurnResult {
+                text,
+                tool_calls,
+                tool_results: Vec::new(),
+                input_tokens: turn_in,
+                output_tokens: turn_out,
+                duration: turn_start.elapsed(),
+                is_complete: false,
+                stop_reason: StopReason::ToolCall,
+            })
+        })
+    }
+
+    fn should_continue(&self) -> bool {
+        if self.is_cancelled() {
+            return false;
         }
+        self.budget.total_turns < self.config.max_turns
     }
 
-    /// Build the final [`SessionResult`] when the model ends its turn.
-    ///
-    /// Called when streaming completes with no tool calls. Notifies
-    /// turn-end and session-end events, notifies observers,
-    /// and returns the assembled result.
-    fn finalise_session(
-        &self,
-        session_id: Uuid,
-        text: String,
-        stop_reason: StreamStopReason,
-        turn: &TurnContext,
-        session_duration: Duration,
-        budget: &SessionBudget,
-    ) -> SessionResult {
-        let success = stop_reason == StreamStopReason::EndTurn;
-        let error = if success {
-            None
-        } else {
-            Some(format!("Stream stopped with reason: {stop_reason:?}"))
-        };
+    fn finalize<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionResult, LoopError>> + Send + 'a>> {
+        Box::pin(async move {
+            let duration = self.session_start.map(|s| s.elapsed()).unwrap_or_default();
 
-        self.managers.observers().on_turn_end(&TurnEndContext {
-            turn: turn.idx,
-            success,
-            error: error.as_deref().map(std::string::ToString::to_string),
-            duration_ms: Self::millis_u64(turn.duration),
-            input_tokens: turn.tokens.input,
-            output_tokens: turn.tokens.output,
-        });
+            let success = !matches!(self.state, LoopState::Failed { .. });
 
-        let end_reason = if success {
-            EndReason::Complete
-        } else {
-            EndReason::Error
-        };
-        self.notify_session_end(&SessionEndInfo {
-            success,
-            reason: end_reason,
-            total_turns: budget.turn_count,
-            total_tokens: budget.input_tokens.saturating_add(budget.output_tokens),
-            duration_secs: session_duration.as_secs(),
-        });
+            // Fill in the final fields on the budget accumulator, then
+            // use it as the SessionResult.
+            self.budget.success = success;
+            self.budget.session_id = self.config.session_id;
+            self.budget.total_duration = duration;
 
-        SessionResult {
-            session_id,
-            total_turns: budget.turn_count,
-            input_tokens: budget.input_tokens,
-            output_tokens: budget.output_tokens,
-            total_duration: session_duration,
-            tool_calls: budget.total_tool_calls,
-            success,
-            final_output: Some(text),
-            error,
+            if success {
+                self.budget.final_output = match &self.state {
+                    LoopState::Completed { summary } => Some(summary.clone()),
+                    _ => Some(String::new()),
+                };
+            } else {
+                self.budget.error = Some(match &self.state {
+                    LoopState::Failed { error } => error.clone(),
+                    _ => "session failed".to_string(),
+                });
+            }
+
+            // Notify observers/hooks using the final SessionResult.
+            self.notify_session_end(&self.budget, duration);
+
+            Ok(self.budget.clone())
+        })
+    }
+
+    fn state(&self) -> LoopState {
+        self.state.clone()
+    }
+
+    fn cancel(&self) {
+        BareLoop::cancel(self);
+    }
+
+    fn stop_reason(&self) -> Option<LoopError> {
+        if self.is_cancelled() {
+            return Some(LoopError::Cancelled);
         }
-    }
-
-    /// Abort the session with an error — notifies turn-end + session-end.
-    ///
-    /// Used when the streaming call itself fails (API error, timeout, etc.).
-    ///
-    /// # Errors
-    ///
-    /// Always returns `Err(error)`, passing through the original [`LoopError`].
-    fn abort_turn_and_session(
-        &self,
-        budget: &SessionBudget,
-        turn_duration: Duration,
-        session_duration: Duration,
-        reason: &str,
-        error: LoopError,
-    ) -> Result<SessionResult, LoopError> {
-        self.managers.observers().on_turn_end(&TurnEndContext {
-            turn: budget.turn_count,
-            success: false,
-            error: Some(reason.to_string()),
-            duration_ms: Self::millis_u64(turn_duration),
-            input_tokens: budget.input_tokens,
-            output_tokens: budget.output_tokens,
-        });
-        let end_reason = if matches!(error, LoopError::Cancelled) {
-            EndReason::Cancelled
-        } else {
-            EndReason::Error
-        };
-        self.notify_session_end(&SessionEndInfo {
-            success: false,
-            reason: end_reason,
-            total_turns: budget.turn_count,
-            total_tokens: budget.input_tokens.saturating_add(budget.output_tokens),
-            duration_secs: session_duration.as_secs(),
-        });
-        Err(error)
-    }
-
-    /// Abort the session after a tool-dispatch error.
-    ///
-    /// Handles both [`LoopError::Cancelled`] and other errors uniformly.
-    /// Turn-level notifications were already sent inside [`dispatch_and_record`].
-    ///
-    /// # Errors
-    ///
-    /// Always returns `Err(error)`, passing through the original [`LoopError`].
-    fn abort_session_from_error(
-        &self,
-        error: LoopError,
-        session_duration: Duration,
-        budget: &SessionBudget,
-    ) -> Result<SessionResult, LoopError> {
-        let end_reason = if matches!(error, LoopError::Cancelled) {
-            EndReason::Cancelled
-        } else {
-            EndReason::Error
-        };
-        self.notify_session_end(&SessionEndInfo {
-            success: false,
-            reason: end_reason,
-            total_turns: budget.turn_count,
-            total_tokens: budget.input_tokens.saturating_add(budget.output_tokens),
-            duration_secs: session_duration.as_secs(),
-        });
-        Err(error)
-    }
-
-    /// Abort the session with a known reason string (cancel / max-turns).
-    ///
-    /// Does not send turn-level notifications since no turn was started.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LoopError::Cancelled`] or [`LoopError::MaxTurnsExceeded`]
-    /// depending on the `reason` string.
-    fn abort_session(
-        &self,
-        budget: &SessionBudget,
-        session_duration: Duration,
-        reason: AbortReason,
-    ) -> Result<SessionResult, LoopError> {
-        let end_reason = match &reason {
-            AbortReason::Cancelled => EndReason::Cancelled,
-            AbortReason::MaxTurnsExceeded => EndReason::MaxTurns,
-        };
-        self.notify_session_end(&SessionEndInfo {
-            success: false,
-            reason: end_reason,
-            total_turns: budget.turn_count,
-            total_tokens: budget.input_tokens.saturating_add(budget.output_tokens),
-            duration_secs: session_duration.as_secs(),
-        });
-        match reason {
-            AbortReason::Cancelled => Err(LoopError::Cancelled),
-            AbortReason::MaxTurnsExceeded => Err(LoopError::MaxTurnsExceeded {
+        if self.budget.total_turns >= self.config.max_turns {
+            return Some(LoopError::MaxTurnsExceeded {
                 max: self.config.max_turns,
-            }),
+            });
         }
+        None
+    }
+
+    fn config(&self) -> LoopConfig {
+        self.config.clone()
     }
 }
-
-// ==================================================
-// Tests
-// ==================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::error::ApiError;
+    use crate::engine::loop_core::Loop;
     use crate::stream::{
         DeltaPart, IndexedDelta, MessageDelta, MessageDeltaPayload, MessageMetadata, MessageStart,
         PartStart, Usage,
@@ -1945,7 +1467,7 @@ mod tests {
         client.add_text_response("Hello! I'm done.");
 
         let config = make_config();
-        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
         let result = agent.run("Hi").await.unwrap();
 
         assert!(result.success);
@@ -1969,7 +1491,7 @@ mod tests {
         registry.register(EchoTool);
 
         let config = make_config();
-        let agent = BareLoop::new(Arc::new(client), registry, config);
+        let mut agent = BareLoop::new(Arc::new(client), registry, config);
         let result = agent.run("Echo hello").await.unwrap();
 
         assert!(result.success);
@@ -1997,7 +1519,7 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(EchoTool);
 
-        let agent = BareLoop::new(Arc::new(client), registry, config);
+        let mut agent = BareLoop::new(Arc::new(client), registry, config);
         let result = agent.run("Keep going").await;
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2014,7 +1536,7 @@ mod tests {
         client.add_text_response("Hello!");
 
         let config = make_config();
-        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
 
         // Cancel before running
         agent.cancel();
@@ -2035,7 +1557,7 @@ mod tests {
         // The mock will return an error
         let client = MockClient::new("test-model");
         let config = make_config();
-        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
         let result = agent.run("Hi").await;
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2058,7 +1580,7 @@ mod tests {
 
         // Empty registry — tool won't be found
         let config = make_config();
-        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
         let result = agent.run("Use nonexistent tool").await.unwrap();
 
         // The tool-not-found should be returned as an error result in the conversation,
@@ -2078,7 +1600,7 @@ mod tests {
         registry.register(FailingTool);
 
         let config = make_config();
-        let agent = BareLoop::new(Arc::new(client), registry, config);
+        let mut agent = BareLoop::new(Arc::new(client), registry, config);
         let result = agent.run("Use failing tool").await.unwrap();
 
         assert!(result.success);
@@ -2178,7 +1700,7 @@ mod tests {
         );
         let tool_calls = BareLoop::<MockClient>::extract_tool_calls(&msg_with_tools);
         assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].name, "echo");
+        assert_eq!(tool_calls[0].tool, "echo");
     }
 
     /// Verify that `build_tool_result_message` produces a user message
@@ -2271,7 +1793,7 @@ mod tests {
         registry.register(EchoTool);
 
         let config = make_config();
-        let agent = BareLoop::new(Arc::new(client), registry, config);
+        let mut agent = BareLoop::new(Arc::new(client), registry, config);
 
         let result = agent.run("Echo twice").await.unwrap();
 
@@ -2291,7 +1813,7 @@ mod tests {
         let client = MockClient::new("test-model");
         let config = make_config();
         let session_id = config.session_id;
-        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
 
         assert_eq!(agent.config().session_id, session_id);
         assert!(agent.conversation().is_empty());
@@ -2304,29 +1826,13 @@ mod tests {
     fn test_cancel_signal_shared() {
         let client = MockClient::new("test-model");
         let config = make_config();
-        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
         let signal = agent.cancel_signal();
         assert!(!signal.is_cancelled());
 
         agent.cancel();
         assert!(signal.is_cancelled());
         assert!(agent.is_cancelled());
-    }
-
-    // ==================================================
-    // Tests: from_parts constructor
-    // ==================================================
-
-    /// Verify that `from_parts` produces a loop with an empty
-    /// conversation.
-    #[test]
-    fn test_from_parts() {
-        let client = MockClient::new("test-model");
-        let config = make_config();
-        let managers = LoopRuntime::new();
-        let agent = BareLoop::from_parts(Arc::new(client), ToolRegistry::new(), managers, config);
-
-        assert!(agent.conversation().is_empty());
     }
 
     // ==================================================
@@ -2342,7 +1848,7 @@ mod tests {
 
         let config = make_config();
         let session_id = config.session_id;
-        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
         let result = agent.run("Hi").await.unwrap();
 
         assert_eq!(result.session_id, session_id);
@@ -2364,7 +1870,7 @@ mod tests {
         let mut config = make_config();
         config.max_turns = 1;
 
-        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
         let result = agent.run("Hi").await.unwrap();
 
         assert!(result.success);
@@ -2381,7 +1887,7 @@ mod tests {
         let mut config = make_config();
         config.max_turns = 0;
 
-        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
         let result = agent.run("Hi").await;
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2429,7 +1935,7 @@ mod tests {
         client.add_text_response("Tool wasn't found, but I'll handle it.");
 
         let config = make_config();
-        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
         let result = agent.run("Use missing tool").await.unwrap();
         assert!(result.success);
     }
@@ -2449,7 +1955,7 @@ mod tests {
         let client = MockClient::new("test");
         client.add_tool_then_text("tool_1", "fail", json!({}), "Moving on");
 
-        let agent = BareLoop::new(Arc::new(client), registry, make_config());
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
         let result = agent.run("Test").await.unwrap();
 
         assert!(result.success);
@@ -2463,7 +1969,7 @@ mod tests {
         let client = MockClient::new("test");
         client.add_tool_then_text("tool_1", "nonexistent", json!({}), "OK");
 
-        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
         let result = agent.run("Test").await.unwrap();
 
         assert!(result.success);
@@ -2481,7 +1987,7 @@ mod tests {
         let client = MockClient::new("test");
         client.add_tool_then_text("tool_1", "fail", json!({}), "OK");
 
-        let agent = BareLoop::new(Arc::new(client), registry, make_config());
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
         let result = agent.run("Test").await.unwrap();
 
         assert!(result.success);
@@ -2497,7 +2003,7 @@ mod tests {
         let client = MockClient::new("test");
         client.add_tool_only_response("tc-1", "fail", json!({}));
 
-        let agent = BareLoop::new(Arc::new(client), registry, make_config());
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
 
         // Cancel before running
         agent.cancel();

@@ -4,10 +4,14 @@
 //! When a [`ContextManager`] is configured, checks token usage after each
 //! tool dispatch and triggers compaction if usage exceeds the threshold.
 
-use super::{ApiClient, BareLoop, EnsureContextResult, Instant, LoopError};
+use super::{ApiClient, BareLoop, Instant, LoopError};
 #[cfg(feature = "hooks")]
 use super::{CompactTrigger, PostCompactContext, PreCompactContext};
+use crate::compact::EnsureContextResult;
 
+use crate::capabilities::Compactable;
+#[cfg(feature = "hooks")]
+use crate::capabilities::Hookable;
 use crate::observer::CompactedContext;
 
 impl<C: ApiClient> BareLoop<C> {
@@ -26,7 +30,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// (i.e. the conversation exceeds the context window and the compactor
     /// could not reduce it sufficiently).
     pub(super) async fn maybe_compact_context(&mut self, turn: usize) -> Result<(), LoopError> {
-        let Some(ref ctx_manager) = self.context_manager else {
+        let Some(ctx_manager) = self.managers.context_manager() else {
             return Ok(());
         };
 
@@ -35,7 +39,7 @@ impl<C: ApiClient> BareLoop<C> {
 
         // Pre-compact hook check
         #[cfg(feature = "hooks")]
-        if let Some(ref executor) = self.hook_executor {
+        if let Some(executor) = self.managers.hook_executor() {
             let tokens_before =
                 crate::compact::CompactionOutcome::estimate_tokens(&self.conversation);
             let ctx = PreCompactContext {
@@ -77,7 +81,7 @@ impl<C: ApiClient> BareLoop<C> {
 
                 // Post-compact hook notification
                 #[cfg(feature = "hooks")]
-                if let Some(ref executor) = self.hook_executor {
+                if let Some(executor) = self.managers.hook_executor() {
                     let messages_compacted = messages_before.saturating_sub(messages_after);
                     let ctx = PostCompactContext {
                         trigger: CompactTrigger::Auto,

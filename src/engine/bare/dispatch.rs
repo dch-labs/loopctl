@@ -7,14 +7,20 @@
 #[cfg(feature = "hooks")]
 use super::HookAction;
 use super::{
-    ApiClient, Arc, BareLoop, Correction, CorrectionResult, Duration, Instant, LoopError,
-    PermissionCheck, RecoveryAction, ReflectionContext, ToolCallInfo, ToolContent, ToolContext,
-    ToolDispatchContext, ToolDispatchResult, ToolPipeline,
+    ApiClient, Arc, BareLoop, Duration, Instant, LoopError, PermissionCheck, RecoveryAction,
+    ReflectionContext, ToolCall, ToolContent, ToolContext, ToolDispatchContext, ToolDispatchResult,
+    ToolPipeline,
 };
 #[cfg(feature = "hooks")]
 use super::{PostToolUseContext, PreToolUseContext};
+#[cfg(feature = "tool_health")]
+use crate::capabilities::HealthTrackable;
+#[cfg(feature = "hooks")]
+use crate::capabilities::Hookable;
+use crate::capabilities::PipelineAware;
 use crate::detection::loop_detector::{self, Operation};
 use crate::observer::{ToolPostContext, ToolPreContext};
+use crate::reflection::{Correction, CorrectionResult};
 
 /// Result of deciding what to do after a tool error during recovery.
 ///
@@ -31,7 +37,7 @@ enum RecoveryOutcome {
 impl<C: ApiClient> BareLoop<C> {
     /// Execute tool calls and return results.
     ///
-    /// Iterates over each [`ToolCallInfo`] extracted from the assistant
+    /// Iterates over each [`ToolCall`] extracted from the assistant
     /// message, looks up the corresponding tool in the [`ToolRegistry`],
     /// and invokes it. Each result is wrapped in a [`ToolDispatchResult`].
     ///
@@ -55,7 +61,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// between tool invocations.
     pub(super) async fn dispatch_tools(
         &self,
-        tool_calls: &[ToolCallInfo],
+        tool_calls: &[ToolCall],
         turn_idx: usize,
     ) -> Result<Vec<ToolDispatchResult>, LoopError> {
         let mut results = Vec::with_capacity(tool_calls.len());
@@ -90,7 +96,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// during tool execution or between retry attempts.
     async fn dispatch_tool_with_recovery(
         &self,
-        tc: &ToolCallInfo,
+        tc: &ToolCall,
         turn_idx: usize,
     ) -> Result<ToolDispatchResult, LoopError> {
         let tool_context = self.build_tool_context();
@@ -104,7 +110,7 @@ impl<C: ApiClient> BareLoop<C> {
 
             self.managers.observers().on_tool_pre(&ToolPreContext {
                 turn: turn_idx,
-                tool: tc.name.clone(),
+                tool: tc.tool.clone(),
                 tool_call_id: tc.id.clone(),
             });
 
@@ -124,13 +130,13 @@ impl<C: ApiClient> BareLoop<C> {
             self.post_detection(&tc, &tool_result);
             self.managers.observers().on_tool_post(&ToolPostContext {
                 turn: turn_idx,
-                tool: tc.name.clone(),
+                tool: tc.tool.clone(),
                 result_hash: loop_detector::hash_result(&tool_result.output.to_string()),
                 is_error: tool_result.is_error,
                 duration: tool_result.duration,
             });
             self.notify_post_tool_use_hooks(&tc, &tool_result, turn_idx);
-            self.record_tool_health(tc.name.as_str(), &tool_result);
+            self.record_tool_health(tc.tool.as_str(), &tool_result);
 
             if !tool_result.is_error {
                 return Ok(tool_result);
@@ -146,7 +152,7 @@ impl<C: ApiClient> BareLoop<C> {
                         let correction_result = tc.apply_correction(correction, &tool_result);
                         if let CorrectionResult::Failed(msg) = &correction_result {
                             tracing::warn!(
-                                tool = %tc.name,
+                                tool = %tc.tool,
                                 error = %msg,
                                 "correction failed to produce a usable retry"
                             );
@@ -166,9 +172,9 @@ impl<C: ApiClient> BareLoop<C> {
     /// manager, and returns a soft-error result if the same operation
     /// has exceeded the loop threshold. Returns `None` when dispatch should
     /// proceed normally.
-    fn pre_detection(&self, tc: &ToolCallInfo, turn_idx: usize) -> Option<ToolDispatchResult> {
+    fn pre_detection(&self, tc: &ToolCall, turn_idx: usize) -> Option<ToolDispatchResult> {
         let operation = Operation::from_input_with_signature(
-            &tc.name,
+            &tc.tool,
             &tc.input,
             self.managers.detection.signature(),
         );
@@ -176,13 +182,14 @@ impl<C: ApiClient> BareLoop<C> {
 
         // Check inline detection
         let inline_blocked = self
+            .managers
             .handle_detected_pattern(&pattern, turn_idx)
             .map(|_result| ToolDispatchResult {
                 tool_call_id: tc.id.clone(),
                 output: ToolContent::Text("loop detected: aborting tool dispatch".into()),
                 is_error: true,
                 duration: Duration::ZERO,
-                resolved_tool_name: tc.name.clone(),
+                resolved_tool_name: tc.tool.clone(),
             });
 
         if inline_blocked.is_some() {
@@ -197,13 +204,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// Constructs an [`Operation`] with the result hash and records it with
     /// the detection manager. This lets the detector distinguish "same input,
     /// same output" (stuck) from "same input, different output" (progress).
-    fn post_detection(&self, tc: &ToolCallInfo, tool_result: &ToolDispatchResult) {
+    fn post_detection(&self, tc: &ToolCall, tool_result: &ToolDispatchResult) {
         let result_hash = match &tool_result.output {
             ToolContent::Text(t) => loop_detector::hash_result(t),
             ToolContent::Multipart(_) => None,
         };
         let operation = Operation::from_input_with_result_and_signature(
-            &tc.name,
+            &tc.tool,
             &tc.input,
             result_hash,
             self.managers.detection.signature(),
@@ -224,18 +231,18 @@ impl<C: ApiClient> BareLoop<C> {
     /// during tool execution.
     async fn dispatch_tool(
         &self,
-        tc: &ToolCallInfo,
+        tc: &ToolCall,
         tool_context: &ToolContext,
         start: Instant,
         turn_idx: usize,
     ) -> Result<ToolDispatchResult, LoopError> {
-        if let Some(ref pipeline) = self.pipeline {
+        if let Some(pipeline) = self.managers.pipeline() {
             return self
                 .dispatch_via_pipeline(pipeline, tc, tool_context, turn_idx)
                 .await;
         }
 
-        let tool_result = if let Some(tool) = self.tools.get(&tc.name) {
+        let tool_result = if let Some(tool) = self.tools.get(&tc.tool) {
             let cancel = Arc::clone(&self.cancelled);
             let call_result = tokio::select! {
                 r = tool.call(tc.input.clone(), tool_context) => r,
@@ -251,7 +258,7 @@ impl<C: ApiClient> BareLoop<C> {
                         output: result.payload,
                         is_error: result.is_error,
                         duration,
-                        resolved_tool_name: tc.name.clone(),
+                        resolved_tool_name: tc.tool.clone(),
                     }
                 }
                 Err(e) => {
@@ -262,7 +269,7 @@ impl<C: ApiClient> BareLoop<C> {
                         output: ToolContent::Text(error_msg),
                         is_error: true,
                         duration,
-                        resolved_tool_name: tc.name.clone(),
+                        resolved_tool_name: tc.tool.clone(),
                     }
                 }
             }
@@ -277,17 +284,17 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Notifies observers with the error message
     /// that lists available tool names to help the model recover.
-    fn tool_not_found(&self, tc: &ToolCallInfo) -> ToolDispatchResult {
+    fn tool_not_found(&self, tc: &ToolCall) -> ToolDispatchResult {
         let available: Vec<String> = self.tools.tool_names();
         let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();
-        let error = LoopError::tool_not_found(&tc.name, &available_refs);
+        let error = LoopError::tool_not_found(&tc.tool, &available_refs);
         let error_msg = error.to_string();
         ToolDispatchResult {
             tool_call_id: tc.id.clone(),
             output: ToolContent::Text(error_msg),
             is_error: true,
             duration: Duration::ZERO,
-            resolved_tool_name: tc.name.clone(),
+            resolved_tool_name: tc.tool.clone(),
         }
     }
 
@@ -305,7 +312,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// not to retry — the caller should return this as a soft error.
     async fn recovery_wait_or_return(
         &self,
-        tc: &ToolCallInfo,
+        tc: &ToolCall,
         tool_result: &ToolDispatchResult,
         attempt: u32,
     ) -> Result<(u32, Option<Correction>), RecoveryOutcome> {
@@ -337,15 +344,16 @@ impl<C: ApiClient> BareLoop<C> {
     /// blocked the call, or `None` if the call should proceed.
     ///
     /// *Requires `hooks` feature; returns `None` otherwise.*
+    #[allow(clippy::unused_self)]
     fn check_pre_tool_use_hooks(
         &self,
-        tc: &ToolCallInfo,
+        tc: &ToolCall,
         turn_idx: usize,
     ) -> Option<ToolDispatchResult> {
         #[cfg(feature = "hooks")]
-        if let Some(ref executor) = self.hook_executor {
+        if let Some(executor) = self.managers.hook_executor() {
             let ctx = PreToolUseContext {
-                tool_name: tc.name.clone(),
+                tool_name: tc.tool.clone(),
                 input: tc.input.clone(),
                 session_id: self.config.session_id,
                 turn_number: turn_idx,
@@ -357,7 +365,7 @@ impl<C: ApiClient> BareLoop<C> {
                     output: ToolContent::Text(reason),
                     is_error: true,
                     duration: Duration::ZERO,
-                    resolved_tool_name: tc.name.clone(),
+                    resolved_tool_name: tc.tool.clone(),
                 }),
                 HookAction::Ask { message } => {
                     // In Headless mode (the default) the executor already
@@ -369,7 +377,7 @@ impl<C: ApiClient> BareLoop<C> {
                         output: ToolContent::Text(message),
                         is_error: true,
                         duration: Duration::ZERO,
-                        resolved_tool_name: tc.name.clone(),
+                        resolved_tool_name: tc.tool.clone(),
                     })
                 }
             }
@@ -386,17 +394,18 @@ impl<C: ApiClient> BareLoop<C> {
     /// Notify post-tool-use hooks with the execution result.
     ///
     /// *Requires `hooks` feature; no-op otherwise.*
+    #[allow(clippy::unused_self)]
     fn notify_post_tool_use_hooks(
         &self,
-        tc: &ToolCallInfo,
+        tc: &ToolCall,
         tool_result: &ToolDispatchResult,
         turn_idx: usize,
     ) {
         #[cfg(feature = "hooks")]
-        if let Some(ref executor) = self.hook_executor {
+        if let Some(executor) = self.managers.hook_executor() {
             let output_text = tool_result.output.to_string();
             let ctx = PostToolUseContext {
-                tool_name: tc.name.clone(),
+                tool_name: tc.tool.clone(),
                 input: tc.input.clone(),
                 output: output_text,
                 is_error: tool_result.is_error,
@@ -419,9 +428,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// Record tool health (success or failure) in the health registry.
     ///
     /// *Requires `tool_health` feature; no-op otherwise.*
+    #[allow(clippy::unused_self)]
     fn record_tool_health(&self, tool_name: &str, tool_result: &ToolDispatchResult) {
         #[cfg(feature = "tool_health")]
-        if let Some(ref health) = self.health_registry {
+        if let Some(health) = self.managers.health_registry() {
             if tool_result.is_error {
                 health.record_failure(tool_name, tool_result.duration);
             } else {
@@ -449,12 +459,12 @@ impl<C: ApiClient> BareLoop<C> {
     async fn dispatch_via_pipeline(
         &self,
         pipeline: &ToolPipeline,
-        tc: &ToolCallInfo,
+        tc: &ToolCall,
         tool_context: &ToolContext,
         turn_idx: usize,
     ) -> Result<ToolDispatchResult, LoopError> {
         let ctx = ToolDispatchContext {
-            tool_name: tc.name.clone(),
+            tool_name: tc.tool.clone(),
             input: tc.input.clone(),
             call_id: tc.id.clone(),
             turn_number: turn_idx,
@@ -493,7 +503,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// retry loop can apply it before re-dispatching.
     async fn recover_tool_error(
         &self,
-        tc: &ToolCallInfo,
+        tc: &ToolCall,
         result: &ToolDispatchResult,
         attempt: u32,
     ) -> (RecoveryAction, Option<Correction>) {
@@ -509,7 +519,7 @@ impl<C: ApiClient> BareLoop<C> {
 
         let Ok(analysis) = self
             .reflector
-            .analyze(&error_msg, &tc.name, &tc.input, &context)
+            .analyze(&error_msg, &tc.tool, &tc.input, &context)
             .await
         else {
             // Reflector failed — conservatively fail.

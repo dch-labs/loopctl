@@ -1,6 +1,6 @@
 //! Tool health monitoring, circuit breakers, and self-healing routing.
 //!
-//! This module provides per-tool health tracking using lock-free atomic counters,
+//! Per-tool health tracking using lock-free atomic counters,
 //! circuit-breaker state machines to prevent repeated calls to failing tools,
 //! and a registry that combines both into a unified health picture. A routing
 //! middleware uses the registry to redirect tool calls away from unhealthy tools
@@ -587,7 +587,7 @@ impl ToolCircuitBreaker {
 ///   health + breaker state
 /// - [`health_summary`](Self::health_summary) — snapshot for observability
 ///
-/// Uses `Mutex<HashMap>` for the tool-name → stats/breaker maps. This is
+/// Uses `Mutex<HashMap>` for the tool-name → stats/breaker maps. Only
 /// the cold path — locks are only taken when a new tool name is first seen.
 /// Poisoned mutex recovery follows the pattern: `unwrap_or_else(std::sync::PoisonError::into_inner)`.
 ///
@@ -644,14 +644,11 @@ impl ToolHealthRegistry {
         }
     }
 
-    /// Create a new registry with custom circuit-breaker configuration.
+    /// Set custom circuit-breaker configuration.
     #[must_use]
-    pub fn with_config(config: CircuitBreakerConfig) -> Self {
-        Self {
-            stats: Mutex::new(HashMap::new()),
-            breakers: Mutex::new(HashMap::new()),
-            breaker_config: config,
-        }
+    pub fn with_config(mut self, config: CircuitBreakerConfig) -> Self {
+        self.breaker_config = config;
+        self
     }
 
     /// Get or create stats for a tool.
@@ -1216,7 +1213,7 @@ mod tests {
         assert_eq!(registry.get_health_status("tool_a"), HealthStatus::Healthy);
 
         // Drive tool_b down with failures (with low threshold)
-        let low_threshold_registry = ToolHealthRegistry::with_config(CircuitBreakerConfig {
+        let low_threshold_registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 2,
             recovery_duration: Duration::from_secs(30),
         });
@@ -1232,7 +1229,7 @@ mod tests {
 
     #[test]
     fn registry_is_tool_available() {
-        let registry = ToolHealthRegistry::with_config(CircuitBreakerConfig {
+        let registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 2,
             recovery_duration: Duration::from_secs(30),
         });
@@ -1299,7 +1296,7 @@ mod tests {
 
     #[test]
     fn health_router_resolve_falls_back_to_alternative() {
-        let registry = ToolHealthRegistry::with_config(CircuitBreakerConfig {
+        let registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 1,
             recovery_duration: Duration::from_secs(30),
         });
@@ -1319,7 +1316,7 @@ mod tests {
 
     #[test]
     fn health_router_resolve_returns_primary_when_no_healthy_alternative() {
-        let registry = ToolHealthRegistry::with_config(CircuitBreakerConfig {
+        let registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 1,
             recovery_duration: Duration::from_secs(30),
         });

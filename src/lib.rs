@@ -3,33 +3,64 @@
 //!
 //! # Module Overview
 //!
+//! ## Foundational Types
+//!
 //! - **[`message`]** — Core conversation types: messages, parts, tool results.
-//! - **[`api_client`]** — Trait for LLM provider communication.
-//! - **[`api_error`]** — API and infrastructure error types with classification.
-//! - **[`builder`]** — Fluent builder API for constructing configured agents.
+//! - **[`error`]** — Central error enum ([`LoopError`](error::LoopError)) for all framework operations.
+//! - **[`config`]** — Session configuration ([`LoopConfig`](config::LoopConfig)).
 //! - **[`cancel`]** — Cooperative cancellation signal (`CancelSignal`).
+//!
+//! ## Subsystems
+//!
+//! - **[`observer`]** — Lifecycle event observation ([`LoopObserver`](observer::LoopObserver), [`ObserverHost`](observer::ObserverHost)).
+//! - **[`memory`]** — Agent memory trait ([`LoopMemory`](memory::LoopMemory)) and entry types.
+//! - **[`reflection`]** — Failure reflection and recovery strategies.
+//! - **[`detection`]** — Loop and convergence detection ([`DetectionManager`](detection::DetectionManager)).
+//! - **[`fallback`]** — Circuit breaker pattern for automatic API model fallback.
 //! - **[`compact`]** — Context management and compaction (threshold detection, pluggable strategies).
-//! - **[`core`]** — Foundational traits and error types.
-//! - **[`builtin`]** — Reference implementations of core traits ([`builtin::memory::InMemoryStore`], etc.).
-//! - **[`hooks`]** — Bidirectional lifecycle control (allow/block/ask before tool use, compaction). *Requires `hooks` feature.*
-//! - **[`loop_control`]** — Detection and intervention modules for agent loops.
-//! - **[`engine`]** — The core agentic loop that orchestrates the full agent lifecycle.
 //! - **[`stream`]** — Streaming event types for LLM API responses.
+//! - **[`middleware`]** — Tool dispatch middleware pipeline (timeouts, permissions, output limits).
 //! - **[`tool`]** — Tool trait, registry, and supporting types.
 //! - **[`tool::health`]** — Per-tool health monitoring, circuit breakers, and self-healing routing. *Requires `tool_health` feature.*
+//!
+//! ## API Layer
+//!
+//! - **[`api`]** — LLM API client trait ([`ApiClient`](api::ApiClient)) and error types.
+//!
+//! ## Runtime & Capabilities
+//!
+//! - **[`capabilities`]** — Capability traits ([`Observable`](capabilities::Observable), [`Detectable`](capabilities::Detectable), etc.).
+//! - **[`runtime`]** — [`LoopRuntime`](runtime::LoopRuntime) — the default infrastructure bundle.
+//!
+//! ## Engine
+//!
+//! - **[`engine`]** — The core agentic loop ([`BareLoop`](engine::BareLoop)) that orchestrates the full agent lifecycle.
+//!
+//! ## Support
+//!
+//! - **[`builder`]** — Fluent builder API for constructing configured agents.
+//! - **[`memory::builtin`]** — Reference [`InMemoryStore`](memory::builtin::InMemoryStore) implementation.
+//! - **[`hooks`]** — Bidirectional lifecycle control (allow/block/ask before tool use, compaction). *Requires `hooks` feature.*
+//! - **[`testing`]** — Test utilities and fixtures. *Requires `testing` feature.*
 
-pub mod api_client;
-pub mod api_error;
+pub mod api;
 pub mod builder;
-pub mod builtin;
 pub mod cancel;
+pub mod capabilities;
 pub mod compact;
-pub mod core;
+pub mod config;
+pub mod detection;
 pub mod engine;
+pub mod error;
+pub mod fallback;
 #[cfg(feature = "hooks")]
 pub mod hooks;
-pub mod loop_control;
+pub mod memory;
 pub mod message;
+pub mod middleware;
+pub mod observer;
+pub mod reflection;
+pub mod runtime;
 pub mod stream;
 #[cfg(feature = "testing")]
 pub mod testing;

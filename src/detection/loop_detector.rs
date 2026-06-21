@@ -11,9 +11,9 @@
 //! Autonomous agents can get trapped in repetitive cycles — for example,
 //! repeatedly reading a file and then attempting the same edit that failed
 //! before. Without detection, the agent wastes tokens and time until an
-//! external timeout kicks in. This module provides an early-warning system
-//! that flags loops after just a few repetitions, and can force-stop the
-//! agent when the repetition count becomes dangerous.
+//! external timeout kicks in. An early-warning system
+//! flags loops early and can force-stop the
+//! agent when the repetition count exceeds a threshold.
 //!
 //! # Core Algorithm
 //!
@@ -47,7 +47,7 @@
 //!
 //! ```rust
 //! use std::sync::Arc;
-//! use loopctl::loop_control::loop_detector::{
+//! use loopctl::detection::loop_detector::{
 //!     LoopDetector, LoopDetectorConfig, Operation, ToolSignature,
 //! };
 //!
@@ -66,32 +66,6 @@
 //! }
 //! ```
 //!
-//! # Data Flow
-//!
-//! ```text
-//! ┌──────────────┐     record()       ┌─────────────────────┐
-//! │  Framework   │ ────────────────►  │  LoopDetector       │
-//! │  (tool call) │                    │  ┌───────────────┐  │
-//! └──────────────┘                    │  │ sliding window│  │
-//!                                     │  │ (VecDeque)    │  │
-//!                                     │  └───────────────┘  │
-//!                                     │  ┌───────────────┐  │
-//!                                     │  │ warned_ops    │  │
-//!                                     │  │ (HashSet)     │  │
-//!                                     │  └───────────────┘  │
-//!                                     └─────────┬───────────┘
-//!                                               │
-//!                                   check_loop()/check_turn_limit()
-//!                                               │
-//!                                               ▼
-//!                                     ┌─────────────────────┐
-//!                                     │    LoopStatus       │
-//!                                     │    is_looping       │
-//!                                     │    should_stop      │
-//!                                     │    warning          │
-//!                                     └─────────────────────┘
-//! ```
-//!
 //! # Edit-Recovery Workflow
 //!
 //! The detector includes special handling for the edit-recovery pattern.
@@ -99,14 +73,6 @@
 //! file to get updated contents, the loop warning for that file is cleared
 //! because the agent is making progress. This prevents false positives
 //! during normal edit-retry cycles.
-//!
-//! ```text
-//!  Edit(file, old_text) → FAIL (recoverable)
-//!    ↓
-//!  Read(file) → check_and_reset_on_file_read() clears warning
-//!    ↓
-//!  Edit(file, new_text) → SUCCESS (not counted as a loop)
-//! ```
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -129,7 +95,7 @@ use std::sync::{Arc, Mutex};
 /// Rather than hard-coding tool names and JSON paths inside the detector,
 /// the signature pattern keeps the detector agnostic to any particular
 /// tool set. This allows the same [`LoopDetector`] to work with any
-/// collection of tools — just swap the signature implementation.
+/// collection of tools — swap the signature implementation as needed.
 ///
 /// # Implementing
 ///
@@ -157,7 +123,7 @@ use std::sync::{Arc, Mutex};
 /// # Example
 ///
 /// ```rust
-/// use loopctl::loop_control::loop_detector::ToolSignature;
+/// use loopctl::detection::loop_detector::ToolSignature;
 ///
 /// struct MyToolSignature;
 ///
@@ -213,7 +179,7 @@ pub trait ToolSignature: Send + Sync {
     /// has changed — the agent is making progress, not looping. Returning
     /// `true` prevents the detector from flagging the sequence as a loop.
     ///
-    /// This is one of the most impactful methods to override correctly.
+    /// Overriding this method correctly is critical.
     /// Without recoverable-error detection, the detector will flag every
     /// retry cycle as a loop, even when the agent is following a healthy
     /// read-fail-retry pattern.
@@ -230,7 +196,7 @@ pub trait ToolSignature: Send + Sync {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::loop_detector::ToolSignature;
+    /// use loopctl::detection::loop_detector::ToolSignature;
     ///
     /// struct MySig;
     /// impl ToolSignature for MySig {
@@ -293,7 +259,7 @@ pub trait ToolSignature: Send + Sync {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::loop_detector::ToolSignature;
+    /// use loopctl::detection::loop_detector::ToolSignature;
     ///
     /// struct MySig;
     /// impl ToolSignature for MySig {
@@ -319,8 +285,7 @@ pub trait ToolSignature: Send + Sync {
     ///
     /// # When Called
     ///
-    /// Called during [`LoopDetector::check_file_reads`] and
-    /// [`LoopDetector::check_and_reset_on_file_read`].
+    /// Called during [`LoopDetector::check_file_reads`].
     ///
     /// # Default
     ///
@@ -338,9 +303,7 @@ pub trait ToolSignature: Send + Sync {
     ///
     /// # When Called
     ///
-    /// Called during [`LoopDetector::record`] to detect recoverable edits,
-    /// and during [`LoopDetector::check_and_reset_on_file_read`] to
-    /// identify failed edits in the operation history.
+    /// Called during [`LoopDetector::record`] to detect recoverable edits.
     ///
     /// # Default
     ///
@@ -385,14 +348,12 @@ pub trait ToolSignature: Send + Sync {
     ///
     /// Called during edit-recovery logic in
     /// [`LoopDetector::record_from_input_with_error`] to match edit
-    /// operations to the same file, and during
-    /// [`LoopDetector::check_and_reset_on_file_read`] to find prior
-    /// warned edits for the file being read.
+    /// operations to the same file.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::loop_detector::ToolSignature;
+    /// use loopctl::detection::loop_detector::ToolSignature;
     ///
     /// struct MySig;
     /// impl ToolSignature for MySig {
@@ -424,7 +385,7 @@ pub trait ToolSignature: Send + Sync {
 /// Because [`extract_primary_param`](ToolSignature::extract_primary_param)
 /// always returns an empty string, *every* invocation of the same tool
 /// with the same result hash is considered identical. This means the
-/// detector can still catch loops — it just can't distinguish between
+/// detector can still catch loops — it cannot distinguish between
 /// different targets within the same tool.
 ///
 /// # When to Use
@@ -447,7 +408,7 @@ pub trait ToolSignature: Send + Sync {
 ///
 /// ```rust
 /// use std::sync::Arc;
-/// use loopctl::loop_control::loop_detector::{
+/// use loopctl::detection::loop_detector::{
 ///     LoopDetector, LoopDetectorConfig, NoOpToolSignature,
 /// };
 ///
@@ -466,8 +427,8 @@ pub struct NoOpToolSignature;
 /// returns `""`, every invocation of the same tool with the same result hash
 /// is considered identical for loop-detection purposes.
 ///
-/// This implementation is intentionally empty — it relies entirely on the
-/// default method bodies defined in the [`ToolSignature`] trait. See the
+/// Empty implementation — relies entirely on the
+/// [`ToolSignature`] trait defaults. See the
 /// trait-level documentation for the semantics of each default.
 impl ToolSignature for NoOpToolSignature {}
 
@@ -483,7 +444,7 @@ impl ToolSignature for NoOpToolSignature {}
 /// then override individual fields as needed:
 ///
 /// ```rust
-/// use loopctl::loop_control::loop_detector::LoopDetectorConfig;
+/// use loopctl::detection::loop_detector::LoopDetectorConfig;
 /// use std::collections::HashMap;
 ///
 /// let config = LoopDetectorConfig {
@@ -525,65 +486,32 @@ impl ToolSignature for NoOpToolSignature {}
 ///   `"Grep" → 5`).
 #[derive(Debug, Clone)]
 pub struct LoopDetectorConfig {
-    /// Maximum number of operations kept in the sliding window.
-    ///
-    /// The [`LoopDetector`] maintains a [`VecDeque`] of recent operations.
-    /// When the deque reaches this size, the oldest entry is evicted before
-    /// a new one is appended. A larger window detects slower loops; a
-    /// smaller window is more memory-efficient and focuses on recent
-    /// activity.
+    /// Number of recent operations kept in the sliding window.
     ///
     /// **Default:** `50`.
     pub window_size: usize,
 
-    /// Number of identical repetitions required to flag a loop.
-    ///
-    /// An operation is considered "looping" when it appears at least this
-    /// many times (with the same [`Operation::result_hash`]) within the
-    /// current window. Can be overridden per tool via
-    /// [`tool_thresholds`](LoopDetectorConfig::tool_thresholds).
+    /// Identical repetitions required to flag a loop. Overridden per tool by `tool_thresholds`.
     ///
     /// **Default:** `3`.
     pub repetition_threshold: usize,
 
-    /// Maximum number of tool calls allowed in a single turn.
-    ///
-    /// Once the per-turn call count reaches this limit,
-    /// [`LoopDetector::check_turn_limit`] returns `true`. The turn counter
-    /// is reset by [`LoopDetector::reset_turn`], which the framework calls
-    /// at the start of each new turn.
+    /// Max tool calls per turn. Checked by [`check_turn_limit`](LoopDetector::check_turn_limit).
     ///
     /// **Default:** `9999` (effectively unlimited).
     pub max_tools_per_turn: usize,
 
-    /// Maximum number of identical file reads before a warning is raised.
-    ///
-    /// Checked by [`LoopDetector::check_file_reads`]. When a single file
-    /// path appears in more than this many read-type operations within the
-    /// window, the method returns `true`.
+    /// Max identical file reads before a warning. Checked by [`check_file_reads`](LoopDetector::check_file_reads).
     ///
     /// **Default:** `5`.
     pub max_same_file_reads: usize,
 
-    /// Number of repetitions required to force-stop the agent.
-    ///
-    /// When [`LoopDetector::check_loop`] detects repetitions ≥ this value,
-    /// it sets [`LoopStatus::should_stop`] to `true` and includes
-    /// `"STOPPING to prevent infinite loop"` in the warning message. Set
-    /// to `0` to disable forced stops entirely (the detector will still
-    /// issue warnings).
+    /// Repetitions required to force-stop the agent. Set to `0` to disable forced stops.
     ///
     /// **Default:** `10`.
     pub stop_threshold: usize,
 
-    /// Tool-specific repetition thresholds that override
-    /// [`repetition_threshold`](LoopDetectorConfig::repetition_threshold).
-    ///
-    /// Map keys are tool names (e.g. `"Edit"`, `"MultiEdit"`) and values
-    /// are the repetition count that triggers a loop for that tool. Looked
-    /// up by [`LoopDetectorConfig::threshold_for_tool`]. Consumers should
-    /// populate this with their tool names and desired thresholds. The
-    /// framework default is an empty map (no overrides).
+    /// Per-tool repetition thresholds. Looked up by [`threshold_for_tool`](LoopDetectorConfig::threshold_for_tool).
     ///
     /// **Default:** empty `HashMap`.
     pub tool_thresholds: HashMap<String, usize>,
@@ -611,7 +539,7 @@ pub struct LoopDetectorConfig {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::loop_control::loop_detector::LoopDetectorConfig;
+/// use loopctl::detection::loop_detector::LoopDetectorConfig;
 ///
 /// let config = LoopDetectorConfig::default();
 /// assert_eq!(config.window_size, 50);
@@ -627,11 +555,6 @@ pub struct LoopDetectorConfig {
 /// - [`LoopDetector::new`] — constructs a detector from a config.
 /// - [`LoopDetectorConfig::threshold_for_tool`] — per-tool threshold lookup.
 impl Default for LoopDetectorConfig {
-    /// Build a config with the default values described in the trait-level docs.
-    ///
-    /// All fields are set to their documented defaults. The operation window
-    /// is pre-allocated with capacity matching
-    /// [`window_size`](LoopDetectorConfig::window_size).
     fn default() -> Self {
         Self {
             window_size: 50,
@@ -644,18 +567,6 @@ impl Default for LoopDetectorConfig {
     }
 }
 
-/// Accessor methods for [`LoopDetectorConfig`].
-///
-/// This `impl` block provides helpers for looking up configuration values
-/// with fallback behaviour (e.g. per-tool thresholds that delegate to the
-/// generic default when no override is set).
-///
-/// # Methods
-///
-/// - [`threshold_for_tool`](LoopDetectorConfig::threshold_for_tool) — Returns
-///   the effective repetition threshold for a given tool, checking per-tool
-///   overrides first and falling back to the generic
-///   [`repetition_threshold`](LoopDetectorConfig::repetition_threshold).
 impl LoopDetectorConfig {
     /// Get the effective repetition threshold for a specific tool.
     ///
@@ -671,7 +582,7 @@ impl LoopDetectorConfig {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::loop_detector::LoopDetectorConfig;
+    /// use loopctl::detection::loop_detector::LoopDetectorConfig;
     ///
     /// let mut config = LoopDetectorConfig::default();
     /// config.tool_thresholds.insert("Edit".to_string(), 2);
@@ -698,24 +609,16 @@ impl LoopDetectorConfig {
 ///
 /// # Equality Semantics
 ///
-/// [`Operation`] derives [`PartialEq`] and [`Hash`], so two operations are
+/// [`Operation`] derives [`Eq`] and [`Hash`], so two operations are
 /// equal only when all three fields match exactly. This means the *same*
 /// command producing *different* results is treated as two distinct
 /// operations — a key design choice that prevents false positives when
 /// the agent is making progress.
 ///
-/// # Derives
-///
-/// - [`Debug`] — For logging and diagnostics.
-/// - [`Clone`] — Operations are stored in [`std::collections::HashSet`]s and [`VecDeque`]s
-///   which may require cloning during retention scans.
-/// - [`PartialEq`] + [`Eq`] — For equality comparison in loop counting.
-/// - [`Hash`] — For use as keys in [`HashMap`]s during repetition counting.
-///
 /// # Construction
 ///
 /// ```rust
-/// use loopctl::loop_control::loop_detector::{Operation, hash_result};
+/// use loopctl::detection::loop_detector::{Operation, hash_result};
 ///
 /// // Simple construction (no result hash):
 /// let op = Operation::new("Read", "/src/main.rs");
@@ -734,38 +637,18 @@ impl LoopDetectorConfig {
 /// operations producing *different* outputs are not counted as repetitions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Operation {
-    /// Name of the tool that was invoked (e.g. `"Read"`, `"Edit"`, `"Bash"`).
-    ///
-    /// Used as the first component of the loop-detection key. Together with
-    /// [`primary_param`](Operation::primary_param) and
-    /// [`result_hash`](Operation::result_hash) it uniquely identifies a
-    /// repeated invocation pattern.
+    /// Tool name (e.g. `"Read"`, `"Edit"`, `"Bash"`).
     pub tool: String,
-
-    /// Primary parameter that identifies the operation's target.
-    ///
-    /// Extracted by [`ToolSignature::extract_primary_param`]. Typically a
-    /// file path (for Read/Edit) or a command string (for Bash). Two
-    /// operations with the same `tool` but different `primary_param` are
-    /// *not* considered a loop (they target different resources).
+    /// Operation target (file path, command, etc.). Extracted by [`ToolSignature::extract_primary_param`].
     pub primary_param: String,
-
-    /// Hash of the tool result content, for result-aware loop detection.
-    ///
-    /// When `Some(hash)`, two operations are only considered identical if
-    /// they produced the same result. When `None`, results are not taken
-    /// into account — the detector relies solely on `(tool, primary_param)`.
-    /// Set via [`Operation::with_result_hash`] or the constructor
-    /// [`Operation::from_input_with_result_and_signature`].
-    ///
-    /// Generated by the free function [`hash_result`].
+    /// Hash of the tool result. `None` means results are ignored. Generated by [`hash_result`].
     pub result_hash: Option<u64>,
 }
 
 /// Constructors and builder methods for [`Operation`].
 ///
 /// Operations can be created in several ways depending on what information
-/// is available at call sites:
+/// is available:
 ///
 /// - **[`Operation::new`]** — Simplest path: tool name + primary param.
 /// - **[`Operation::from_input_with_signature`]** — Parses the primary
@@ -774,17 +657,6 @@ pub struct Operation {
 ///   construction with result hash, used after a tool invocation completes.
 /// - **[`Operation::with_result_hash`]** — Builder-style attachment of a
 ///   result hash to an existing operation.
-///
-/// # Construction Decision Tree
-///
-/// ```text
-/// Do you have the result yet?
-///   ├── NO  → Operation::from_input_with_signature(tool, input, sig)
-///   │        or Operation::new(tool, param)
-///   └── YES → Operation::from_input_with_result_and_signature(
-///              tool, input, hash, sig)
-///            or Operation::new(tool, param).with_result_hash(hash)
-/// ```
 impl Operation {
     /// Create a new operation with the given tool name and primary parameter.
     ///
@@ -798,7 +670,7 @@ impl Operation {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::loop_detector::Operation;
+    /// use loopctl::detection::loop_detector::Operation;
     ///
     /// let op = Operation::new("Read", "/src/main.rs");
     /// assert_eq!(op.tool, "Read");
@@ -837,7 +709,7 @@ impl Operation {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::loop_detector::{Operation, ToolSignature};
+    /// use loopctl::detection::loop_detector::{Operation, ToolSignature};
     ///
     /// struct MyToolSignature;
     /// impl ToolSignature for MyToolSignature {
@@ -871,7 +743,7 @@ impl Operation {
     /// Create an operation from tool name, JSON input, result hash, and signature.
     ///
     /// Combines [`ToolSignature::extract_primary_param`] with an explicit
-    /// result hash into a single constructor call. This is the most complete
+    /// result hash into a single constructor call. Most complete
     /// construction path, used when both the input and the result are known.
     ///
     /// The `result_hash` should be computed by [`hash_result`] or set to
@@ -885,7 +757,7 @@ impl Operation {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::loop_detector::{Operation, ToolSignature, hash_result};
+    /// use loopctl::detection::loop_detector::{Operation, ToolSignature, hash_result};
     ///
     /// struct MyToolSignature;
     /// impl ToolSignature for MyToolSignature {
@@ -936,7 +808,7 @@ impl Operation {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::loop_detector::{Operation, hash_result};
+    /// use loopctl::detection::loop_detector::{Operation, hash_result};
     ///
     /// let hash = hash_result("file contents");
     /// let op = Operation::new("Read", "/src/main.rs").with_result_hash(hash);
@@ -966,7 +838,7 @@ impl Operation {
 /// equality comparison inside [`Operation::result_hash`].
 ///
 /// Returns `None` if `content` is empty (no meaningful hash to compute).
-/// This is intentional: an empty result usually means the tool produced
+/// An empty result usually means the tool produced
 /// no output, and hashing it would add noise without value.
 ///
 /// # Use in Loop Detection
@@ -980,11 +852,7 @@ impl Operation {
 ///
 /// # Performance
 ///
-/// [`std::collections::hash_map::DefaultHasher`] is a fast, non-cryptographic hasher suitable for
-/// runtime use. It is *not* suitable for security purposes (e.g. storing
-/// passwords), but it is perfect for quick equality checks in hot paths.
-/// The cost is O(n) in the length of `content`, which is acceptable because
-/// tool results are typically bounded in size.
+/// The cost is O(n) in the length of `content`.
 ///
 /// # Determinism
 ///
@@ -995,7 +863,7 @@ impl Operation {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::loop_control::loop_detector::hash_result;
+/// use loopctl::detection::loop_detector::hash_result;
 ///
 /// let h1 = hash_result("same output");
 /// let h2 = hash_result("same output");
@@ -1031,37 +899,6 @@ pub fn hash_result(content: &str) -> Option<u64> {
 /// force-stopped. Also carries an optional human-readable
 /// [`warning`](LoopStatus::warning) message.
 ///
-/// # Fields Overview
-///
-/// - [`is_looping`](LoopStatus::is_looping) — `true` if any operation
-///   exceeded its repetition threshold.
-/// - [`repeated_operations`](LoopStatus::repeated_operations) — The
-///   specific [`Operation`] values that triggered the loop.
-/// - [`repetition_count`](LoopStatus::repetition_count) — How many times
-///   the most-repeated operation appeared in the window.
-/// - [`warning`](LoopStatus::warning) — Human-readable message for the
-///   agent (or operator). `None` if no loop or already warned.
-/// - [`should_stop`](LoopStatus::should_stop) — `true` when the
-///   framework should halt the agent immediately.
-///
-/// # Lifecycle
-///
-/// ```text
-/// check_loop() returns LoopStatus
-///   │
-///   ├── is_looping = false
-///   │   └── No action needed. Agent continues normally.
-///   │
-///   └── is_looping = true
-///       ├── should_stop = false
-///       │   └── Warning emitted (if not already warned).
-///       │       Agent should adjust behaviour.
-///       │
-///       └── should_stop = true
-///           └── STOPPING message included in warning.
-///               Framework should halt the agent.
-/// ```
-///
 /// # Warning Deduplication
 ///
 /// The [`warning`](LoopStatus::warning) field is `None` when:
@@ -1077,7 +914,7 @@ pub fn hash_result(content: &str) -> Option<u64> {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::loop_control::loop_detector::LoopDetector;
+/// use loopctl::detection::loop_detector::LoopDetector;
 ///
 /// let detector = LoopDetector::default_detector();
 /// let status = detector.check_loop();
@@ -1105,46 +942,15 @@ pub fn hash_result(content: &str) -> Option<u64> {
 /// is rarely useful for status objects.
 #[derive(Debug, Clone, Default)]
 pub struct LoopStatus {
-    /// Whether a loop was detected.
-    ///
-    /// `true` when at least one operation repeats beyond the applicable
-    /// threshold (either the generic
-    /// [`repetition_threshold`](LoopDetectorConfig::repetition_threshold)
-    /// or a per-tool override from
-    /// [`tool_thresholds`](LoopDetectorConfig::tool_thresholds)).
+    /// `true` when an operation repeats beyond the configured threshold.
     pub is_looping: bool,
-
-    /// Operations that triggered the loop detection.
-    ///
-    /// Contains all operations whose repetition count equals the maximum
-    /// observed count and exceeds the threshold. When multiple operations
-    /// tie for the highest repetition count, all of them are included.
-    /// Empty when [`is_looping`](LoopStatus::is_looping) is `false`.
+    /// Operations tied for highest repetition. Empty when `is_looping` is `false`.
     pub repeated_operations: Vec<Operation>,
-
-    /// Number of repetitions of the most-repeated operation.
-    ///
-    /// Equals the count of the first entry in
-    /// [`repeated_operations`](LoopStatus::repeated_operations). Zero when
-    /// no loop was detected.
+    /// Repetitions of the most-repeated operation. Zero when no loop detected.
     pub repetition_count: usize,
-
-    /// Human-readable warning message describing the detected loop.
-    ///
-    /// Contains the operation description, repetition count, a "STOPPING"
-    /// notice if [`should_stop`](LoopStatus::should_stop) is true, and a
-    /// tool-specific suggestion from
-    /// [`ToolSignature::get_suggestion`]. Set to `None` when no loop is
-    /// detected, or when the loop has already been warned about (to avoid
-    /// spamming the agent with duplicate warnings).
+    /// Loop description with count and suggestion. `None` when not looping or already warned.
     pub warning: Option<String>,
-
-    /// Whether the agent should be force-stopped due to severe looping.
-    ///
-    /// `true` when [`repetition_count`](LoopStatus::repetition_count)
-    /// reaches or exceeds [`LoopDetectorConfig::stop_threshold`] (and the
-    /// stop threshold is non-zero). The framework should halt the agent's
-    /// event loop when this is `true`.
+    /// `true` when `repetition_count >= stop_threshold` (non-zero).
     pub should_stop: bool,
 }
 
@@ -1160,7 +966,7 @@ pub struct LoopStatus {
 ///
 /// ```rust
 /// use std::sync::Arc;
-/// use loopctl::loop_control::loop_detector::{
+/// use loopctl::detection::loop_detector::{
 ///     LoopDetector, LoopDetectorConfig, NoOpToolSignature,
 /// };
 ///
@@ -1172,24 +978,7 @@ pub struct LoopStatus {
 /// let detector = LoopDetector::new(config, Arc::new(NoOpToolSignature));
 ///
 /// // With custom tool signature:
-/// // let detector = LoopDetector::with_signature(Arc::new(MyToolSignature));
-/// ```
-///
-/// # Lifecycle
-///
-/// ```text
-/// ┌─────────────────────────────────────────────────────┐
-/// │  For each tool call:                                │
-/// │    1. record_from_input(tool, input, result_hash)   │
-/// │    2. check_loop() → LoopStatus                     │
-/// │    3. check_turn_limit() → bool                     │
-/// │                                                     │
-/// │  At turn boundary:                                  │
-/// │    4. reset_turn()                                  │
-/// │                                                     │
-/// │  At task boundary:                                  │
-/// │    5. reset()                                       │
-/// └─────────────────────────────────────────────────────┘
+/// // let detector = LoopDetector::new_with_signature(Arc::new(MyToolSignature));
 /// ```
 ///
 /// # Thread Safety
@@ -1198,76 +987,16 @@ pub struct LoopStatus {
 /// independently and handle lock poisoning gracefully (by skipping the
 /// operation rather than panicking). This means the detector degrades
 /// gracefully under contention but never blocks the agent loop.
-///
-/// # Design Decisions
-///
-/// - **Sliding window (not global history):** A bounded [`VecDeque`] keeps
-///   memory usage predictable and focuses detection on *recent* behaviour,
-///   avoiding false positives from operations far in the past.
-/// - **Result-aware comparison:** Two invocations of the same tool on the
-///   same target are only considered identical if they produced the same
-///   result hash. This prevents the detector from flagging operations
-///   where the agent is genuinely making progress.
-/// - **Warning deduplication:** Once an operation has triggered a warning,
-///   subsequent warnings are suppressed unless the result changes or the
-///   stop threshold is reached. This prevents the agent's context from
-///   being flooded with identical loop messages.
-/// - **Per-turn limits:** Separate from repetition detection, the turn
-///   counter catches runaway tool usage regardless of whether the tools
-///   are repeating. This catches scenarios like "try 50 different bash
-///   commands" that wouldn't trigger repetition-based detection.
-///
-/// # Interior Fields
-///
-/// The detector holds five pieces of internal state, each in its own
-/// [`Mutex`] to minimise lock contention:
-///
-/// | Field                | Type                      | Purpose                        |
-/// |----------------------|---------------------------|--------------------------------|
-/// | `operations`         | `Mutex<VecDeque<Op>>`     | Sliding window of history      |
-/// | `config`             | `LoopDetectorConfig`      | Thresholds (immutable)         |
-/// | `turn_count`         | `Mutex<usize>`            | Per-turn call counter          |
-/// | `warned_operations`  | `Mutex<HashSet<Op>>`      | Already-warned dedup set       |
-/// | `signature`          | `Arc<dyn ToolSignature>`  | Tool-specific parsing logic    |
 pub struct LoopDetector {
-    /// Sliding window of recent [`Operation`] records.
-    ///
-    /// Bounded by [`LoopDetectorConfig::window_size`]. When full, the
-    /// oldest operation is evicted before a new one is appended. The
-    /// window is scanned by [`LoopDetector::check_loop`] to find repeated
-    /// operations.
+    /// Sliding window of recent [`Operation`] records, bounded by [`LoopDetectorConfig::window_size`].
     operations: Mutex<VecDeque<Operation>>,
-
-    /// Configuration controlling thresholds and limits.
-    ///
-    /// Set at construction time via [`LoopDetector::new`]. Immutable for
-    /// the lifetime of the detector.
+    /// Detector configuration (thresholds and limits). Immutable after construction.
     config: LoopDetectorConfig,
-
-    /// Count of tool invocations in the current turn.
-    ///
-    /// Incremented by [`LoopDetector::record`] and reset to zero by
-    /// [`LoopDetector::reset_turn`]. Checked against
-    /// [`LoopDetectorConfig::max_tools_per_turn`] by
-    /// [`LoopDetector::check_turn_limit`].
+    /// Per-turn tool call count. Reset by [`reset_turn`](LoopDetector::reset_turn).
     turn_count: Mutex<usize>,
-
-    /// Set of operations that have already triggered a warning.
-    ///
-    /// Once an operation appears in this set, subsequent calls to
-    /// [`LoopDetector::check_loop`] will suppress the warning message
-    /// (returning `None` in [`LoopStatus::warning`]) to avoid spamming
-    /// the agent. Entries are cleared when the result changes (indicating
-    /// progress) or when [`LoopDetector::clear`] / [`LoopDetector::reset`]
-    /// is called.
+    /// Operations that already triggered a warning. Cleared on result change or [`reset`](LoopDetector::reset).
     warned_operations: Mutex<std::collections::HashSet<Operation>>,
-
     /// Tool signature for extracting tool-specific parameters.
-    ///
-    /// Wrapped in [`Arc`] because it is shared between the detector and
-    /// any code that needs to inspect the signature via
-    /// [`LoopDetector::signature`]. The trait object is `Send + Sync` so
-    /// it can be used from any thread.
     signature: Arc<dyn ToolSignature>,
 }
 
@@ -1287,15 +1016,11 @@ pub struct LoopDetector {
 impl LoopDetector {
     /// Create a new loop detector with the given configuration and tool signature.
     ///
-    /// Initialises an empty operation window, zero turn count, and an empty
-    /// warned-operations set. The `signature` is stored in an [`Arc`] for
-    /// shared access.
-    ///
     /// # Example
     ///
     /// ```rust
     /// use std::sync::Arc;
-    /// use loopctl::loop_control::loop_detector::{
+    /// use loopctl::detection::loop_detector::{
     ///     LoopDetector, LoopDetectorConfig, NoOpToolSignature,
     /// };
     ///
@@ -1314,12 +1039,11 @@ impl LoopDetector {
 
     /// Create a detector with default configuration and a no-op tool signature.
     ///
-    /// Convenience constructor for simple use cases that don't need
-    /// tool-specific logic. Equivalent to:
+    /// Equivalent to:
     ///
     /// ```rust
     /// use std::sync::Arc;
-    /// use loopctl::loop_control::loop_detector::{LoopDetector, LoopDetectorConfig, NoOpToolSignature};
+    /// use loopctl::detection::loop_detector::{LoopDetector, LoopDetectorConfig, NoOpToolSignature};
     ///
     /// LoopDetector::new(LoopDetectorConfig::default(), Arc::new(NoOpToolSignature));
     /// ```
@@ -1336,12 +1060,12 @@ impl LoopDetector {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::loop_detector::LoopDetector;
+    /// use loopctl::detection::loop_detector::LoopDetector;
     ///
     /// // With a custom signature, you would write:
-    /// // let detector = LoopDetector::with_signature(Arc::new(MyToolSignature));
+    /// // let detector = LoopDetector::new_with_signature(Arc::new(MyToolSignature));
     /// ```
-    pub fn with_signature(signature: Arc<dyn ToolSignature>) -> Self {
+    pub fn new_with_signature(signature: Arc<dyn ToolSignature>) -> Self {
         Self::new(LoopDetectorConfig::default(), signature)
     }
 
@@ -1358,7 +1082,7 @@ impl LoopDetector {
     ///
     /// Uses the configured [`ToolSignature`] to extract the primary
     /// parameter from `input`, constructs an [`Operation`], and delegates
-    /// to [`record`](LoopDetector::record). This is a convenience wrapper
+    /// to [`record`](LoopDetector::record). Convenience wrapper
     /// around [`LoopDetector::record_from_input_with_error`] that passes `None` for the
     /// error parameter.
     ///
@@ -1384,7 +1108,7 @@ impl LoopDetector {
 
     /// Record a tool invocation with an optional error string.
     ///
-    /// This is the primary entry point for the framework. It uses the
+    /// Primary entry point for the framework. Uses the
     /// configured [`ToolSignature`] to extract the primary parameter from
     /// `input`, constructs an [`Operation`], and records it.
     ///
@@ -1410,7 +1134,7 @@ impl LoopDetector {
     ///
     /// ```rust
     /// use std::sync::Arc;
-    /// use loopctl::loop_control::loop_detector::{
+    /// use loopctl::detection::loop_detector::{
     ///     LoopDetector, LoopDetectorConfig, ToolSignature,
     /// };
     ///
@@ -1444,8 +1168,6 @@ impl LoopDetector {
             result_hash,
             self.signature.as_ref(),
         );
-
-        // Determine recoverability accurately via the trait method.
         let is_recoverable =
             error.is_some_and(|err| self.signature.is_recoverable_error(tool, err));
 
@@ -1478,13 +1200,32 @@ impl LoopDetector {
     /// directly, via [`LoopDetector::record_from_input`], or via
     /// [`LoopDetector::record_from_input_with_error`].
     pub fn record(&self, operation: Operation) {
-        // Check if this operation was previously warned with a different result
-        if let Ok(mut warned) = self.warned_operations.lock() {
-            warned.retain(|warned_op| {
-                !(warned_op.tool == operation.tool
-                    && warned_op.primary_param == operation.primary_param
-                    && warned_op.result_hash != operation.result_hash)
-            });
+        let should_clear_history = {
+            let mut clear = false;
+            if let Ok(mut warned) = self.warned_operations.lock() {
+                warned.retain(|warned_op| {
+                    let matches = warned_op.tool == operation.tool
+                        && warned_op.primary_param == operation.primary_param
+                        && warned_op.result_hash != operation.result_hash;
+                    if matches {
+                        clear = true;
+                    }
+                    !matches
+                });
+            }
+            clear
+        };
+
+        // Remove stale operations from the sliding window so they don't
+        // re-trigger loop detection on the next check_loop() call.
+        if should_clear_history {
+            if let Ok(mut ops) = self.operations.lock() {
+                ops.retain(|op| {
+                    !(op.tool == operation.tool
+                        && op.primary_param == operation.primary_param
+                        && op.result_hash != operation.result_hash)
+                });
+            }
         }
 
         if let Ok(mut ops) = self.operations.lock() {
@@ -1578,79 +1319,17 @@ impl LoopDetector {
             return LoopStatus::default();
         };
 
-        let mut repeated_operations = Vec::new();
-        let mut max_repetitions = 0;
-        let mut op_counts: HashMap<Operation, usize> = HashMap::new();
-        for op in ops.iter() {
-            op_counts
-                .entry(op.clone())
-                .and_modify(|c| *c = c.saturating_add(1))
-                .or_insert(1);
-        }
-
-        for (op, count) in op_counts {
-            let threshold = self.config.threshold_for_tool(&op.tool);
-            if count >= threshold {
-                if count > max_repetitions {
-                    max_repetitions = count;
-                    repeated_operations.clear();
-                    repeated_operations.push(op);
-                } else if count == max_repetitions {
-                    repeated_operations.push(op);
-                }
-            }
-        }
-
+        let (repeated_operations, max_repetitions) =
+            Self::find_repeated(&ops, |tool| self.config.threshold_for_tool(tool));
         let is_looping = !repeated_operations.is_empty();
         let should_stop =
             self.config.stop_threshold > 0 && max_repetitions >= self.config.stop_threshold;
-        let warning = if is_looping {
-            let already_warned = if let Some(first_op) = repeated_operations.first() {
-                if let Ok(warned) = self.warned_operations.lock() {
-                    warned.contains(first_op)
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if already_warned && !should_stop {
-                None
-            } else {
-                if let Some(first_op) = repeated_operations.first()
-                    && let Ok(mut warned) = self.warned_operations.lock()
-                {
-                    warned.insert(first_op.clone());
-                }
-
-                let stop_msg = if should_stop {
-                    " STOPPING to prevent infinite loop."
-                } else {
-                    ""
-                };
-
-                let tool_name = repeated_operations.first().map_or("", |o| o.tool.as_str());
-
-                let suggestion = self
-                    .signature
-                    .get_suggestion(tool_name)
-                    .unwrap_or_else(|| "Consider a different approach or tool.".to_string());
-
-                Some(format!(
-                    "Loop detected: Operation '{}' repeated {} times with same result.{} {}",
-                    repeated_operations
-                        .first()
-                        .map(|o| format!("{}({})", o.tool, o.primary_param))
-                        .unwrap_or_default(),
-                    max_repetitions,
-                    stop_msg,
-                    suggestion
-                ))
-            }
-        } else {
-            None
-        };
+        let warning = self.build_warning(
+            &repeated_operations,
+            max_repetitions,
+            is_looping,
+            should_stop,
+        );
 
         LoopStatus {
             is_looping,
@@ -1659,6 +1338,100 @@ impl LoopDetector {
             warning,
             should_stop,
         }
+    }
+
+    /// Count occurrences of each operation in the deque.
+    ///
+    /// Iterates over every operation in `ops` and builds a [`HashMap`] where
+    /// each key is a cloned [`Operation`] and the value is the number of
+    /// times it appears. Counts are capped at `usize::MAX` via saturating
+    /// addition to avoid overflow on extremely long deques.
+    fn count_operations(ops: &VecDeque<Operation>) -> HashMap<Operation, usize> {
+        let mut counts: HashMap<Operation, usize> = HashMap::new();
+        for op in ops {
+            counts
+                .entry(op.clone())
+                .and_modify(|c| *c = c.saturating_add(1))
+                .or_insert(1);
+        }
+        counts
+    }
+
+    /// Find operations exceeding their per-tool threshold.
+    ///
+    /// Only the operations with the highest repetition count are
+    /// returned (ties included). The `threshold` closure maps a tool
+    /// name to its configured threshold.
+    fn find_repeated(
+        ops: &VecDeque<Operation>,
+        threshold: impl Fn(&str) -> usize,
+    ) -> (Vec<Operation>, usize) {
+        let counts = Self::count_operations(ops);
+        let mut repeated = Vec::new();
+        let mut max = 0;
+
+        for (op, count) in counts {
+            let t = threshold(&op.tool);
+            if count >= t {
+                if count > max {
+                    max = count;
+                    repeated.clear();
+                    repeated.push(op);
+                } else if count == max {
+                    repeated.push(op);
+                }
+            }
+        }
+
+        (repeated, max)
+    }
+
+    /// Build the warning string for repeated operations.
+    ///
+    /// Returns `None` when not looping, or when already warned and
+    /// not stopping.  When a new warning is produced, the first
+    /// repeated operation is recorded in `warned_operations`.
+    fn build_warning(
+        &self,
+        repeated_operations: &[Operation],
+        max_repetitions: usize,
+        is_looping: bool,
+        should_stop: bool,
+    ) -> Option<String> {
+        if !is_looping {
+            return None;
+        }
+
+        let first_op = repeated_operations.first()?;
+        let already_warned = self
+            .warned_operations
+            .lock()
+            .is_ok_and(|w| w.contains(first_op));
+        if already_warned && !should_stop {
+            return None;
+        }
+
+        if !already_warned {
+            if let Ok(mut warned) = self.warned_operations.lock() {
+                warned.insert(first_op.clone());
+            }
+        }
+
+        let stop_msg = if should_stop {
+            " STOPPING to prevent infinite loop."
+        } else {
+            ""
+        };
+
+        let suggestion = self
+            .signature
+            .get_suggestion(&first_op.tool)
+            .unwrap_or_else(|| "Consider a different approach or tool.".to_string());
+
+        Some(format!(
+            "Loop detected: Operation '{}({})' repeated {} times with same result.{} {}",
+            first_op.tool, first_op.primary_param, max_repetitions, stop_msg, suggestion
+        ))
     }
 
     /// Check whether the per-turn tool-call limit has been reached.
@@ -1721,10 +1494,6 @@ impl LoopDetector {
     /// Called by the framework before dispatching a file-read tool call,
     /// to guard against excessive re-reading of the same file.
     ///
-    /// # Parameters
-    ///
-    /// - `file_path` — The file path (or a substring of it) to check.
-    ///
     /// # Returns
     ///
     /// `true` if the file has been read ≥ `max_same_file_reads` times,
@@ -1737,60 +1506,13 @@ impl LoopDetector {
         let sig = &self.signature;
         let read_count = ops
             .iter()
-            .filter(|o| sig.is_file_read_tool(&o.tool) && o.primary_param.contains(file_path))
+            .filter(|o| {
+                sig.is_file_read_tool(&o.tool)
+                    && sig.normalize_param_for_comparison(&o.tool, &o.primary_param) == file_path
+            })
             .count();
 
         read_count >= self.config.max_same_file_reads
-    }
-
-    /// Reset loop state when a file-read follows a failed edit to the same file.
-    ///
-    /// If `tool` is a read-type tool (per
-    /// [`ToolSignature::is_file_read_tool`]) and the operation window
-    /// contains a recent edit to `file_path` (per
-    /// [`ToolSignature::is_file_edit_tool`]), this method removes all
-    /// edit operations for that file from the window *and* from the
-    /// warned-operations set. The rationale is that the agent is
-    /// re-reading the file to get updated contents after a failed edit,
-    /// which constitutes progress rather than a loop.
-    ///
-    /// # When Called
-    ///
-    /// Called by the framework when a read tool is dispatched after a
-    /// failed edit, to prevent the edit-read cycle from being flagged as
-    /// a loop.
-    ///
-    /// # Parameters
-    ///
-    /// - `tool` — Name of the tool being dispatched.
-    /// - `file_path` — The file being read.
-    pub fn check_and_reset_on_file_read(&self, tool: &str, file_path: &str) {
-        if !self.signature.is_file_read_tool(tool) {
-            return;
-        }
-
-        let sig = &self.signature;
-        if let Ok(mut ops) = self.operations.lock() {
-            let has_recent_failed_edit = ops.iter().any(|op| {
-                sig.is_file_edit_tool(&op.tool)
-                    && sig.normalize_param_for_comparison(&op.tool, &op.primary_param) == file_path
-            });
-
-            if has_recent_failed_edit {
-                ops.retain(|op| {
-                    let op_file = sig.normalize_param_for_comparison(&op.tool, &op.primary_param);
-                    !(sig.is_file_edit_tool(&op.tool) && op_file == file_path)
-                });
-            }
-        }
-
-        if let Ok(mut warned) = self.warned_operations.lock() {
-            let sig = &self.signature;
-            warned.retain(|op| {
-                let op_file = sig.normalize_param_for_comparison(&op.tool, &op.primary_param);
-                !(sig.is_file_edit_tool(&op.tool) && op_file == file_path)
-            });
-        }
     }
 
     /// Clear all recorded operations and warned-operation state.
@@ -1840,8 +1562,8 @@ impl LoopDetector {
 
 /// Produce a [`LoopDetector`] with default configuration and a no-op signature.
 ///
-/// Delegates to [`LoopDetector::default_detector`]. This is the same as
-/// calling `LoopDetector::default_detector()` and is provided for
+/// Delegates to [`LoopDetector::default_detector`]. Same as
+/// calling `LoopDetector::default_detector()` and provided for
 /// ergonomic compatibility with generic code that uses `Default`.
 ///
 /// The resulting detector uses [`LoopDetectorConfig::default`] thresholds
@@ -1851,7 +1573,7 @@ impl LoopDetector {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::loop_control::loop_detector::LoopDetector;
+/// use loopctl::detection::loop_detector::LoopDetector;
 ///
 /// let detector = LoopDetector::default();
 /// let status = detector.check_loop();
@@ -1861,13 +1583,9 @@ impl LoopDetector {
 /// # See Also
 ///
 /// - [`LoopDetector::new`] — for custom configuration.
-/// - [`LoopDetector::with_signature`] — for custom tool signatures.
+/// - [`LoopDetector::new_with_signature`] — for custom tool signatures.
 /// - [`LoopDetector::default_detector`] — the method this delegates to.
 impl Default for LoopDetector {
-    /// Build a detector with [`LoopDetectorConfig::default`] and [`NoOpToolSignature`].
-    ///
-    /// Equivalent to `LoopDetector::default_detector()`. The internal state
-    /// is empty (no operations recorded, zero turn count, no warnings).
     fn default() -> Self {
         Self::default_detector()
     }
@@ -1878,12 +1596,12 @@ impl Default for LoopDetector {
 /// Provides a process-wide [`LoopDetector`] that can be accessed from
 /// anywhere via [`global_detector`]. The detector is created exactly once
 /// with default configuration ([`LoopDetectorConfig::default`]) and a
-/// [`NoOpToolSignature`]. This is useful for simple agents that don't
+/// [`NoOpToolSignature`]. Useful for simple agents that don't
 /// need tool-specific loop detection logic.
 ///
 /// For production use with custom tool signatures, prefer constructing a
 /// dedicated [`LoopDetector`] via [`LoopDetector::new`] or
-/// [`LoopDetector::with_signature`] instead of relying on this global.
+/// [`LoopDetector::new_with_signature`] instead of relying on this global.
 ///
 /// # Thread Safety
 ///
@@ -1906,7 +1624,7 @@ static GLOBAL_DETECTOR: std::sync::OnceLock<Arc<LoopDetector>> = std::sync::Once
 /// # Example
 ///
 /// ```rust
-/// use loopctl::loop_control::loop_detector::{global_detector, Operation};
+/// use loopctl::detection::loop_detector::{global_detector, Operation};
 ///
 /// let detector = global_detector();
 /// detector.record(Operation::new("Read", "/src/main.rs"));
@@ -1917,7 +1635,7 @@ static GLOBAL_DETECTOR: std::sync::OnceLock<Arc<LoopDetector>> = std::sync::Once
 /// # See Also
 ///
 /// - [`LoopDetector::new`] — for custom configuration.
-/// - [`LoopDetector::with_signature`] — for custom tool signatures.
+/// - [`LoopDetector::new_with_signature`] — for custom tool signatures.
 pub fn global_detector() -> Arc<LoopDetector> {
     Arc::clone(GLOBAL_DETECTOR.get_or_init(|| Arc::new(LoopDetector::default_detector())))
 }
@@ -2373,7 +2091,7 @@ mod tests {
 
     #[test]
     fn test_detector_with_custom_signature() {
-        let detector = LoopDetector::with_signature(Arc::new(TestToolSignature));
+        let detector = LoopDetector::new_with_signature(Arc::new(TestToolSignature));
 
         detector.record(Operation::new("Read", "/test.txt"));
         detector.record(Operation::new("Read", "/test.txt"));
@@ -2419,6 +2137,14 @@ mod tests {
 
         let hash2 = hash_result("different output - progress!");
         detector.record(Operation::new("Bash", "git status").with_result_hash(hash2));
+
+        // After recording with a different hash, both the warned set and
+        // the sliding window are cleared, so the warning should be gone.
+        let status_cleared = detector.check_loop();
+        assert!(
+            status_cleared.warning.is_none(),
+            "warning should be cleared when result hash changes"
+        );
 
         for _ in 0..3 {
             detector.record(Operation::new("Bash", "git status").with_result_hash(hash1));
@@ -2501,6 +2227,30 @@ mod tests {
     }
 
     #[test]
+    fn test_warning_not_cleared_when_result_stays_same() {
+        let detector = test_detector();
+
+        let hash1 = hash_result("same output");
+        for _ in 0..3 {
+            detector.record(Operation::new("Bash", "git status").with_result_hash(hash1));
+        }
+
+        let status1 = detector.check_loop();
+        assert!(status1.warning.is_some());
+
+        // Recording again with the SAME hash should NOT clear the history.
+        // check_loop() suppresses already-warned ops (returns None), but the
+        // loop is still detected (is_looping = true) and the history is intact.
+        detector.record(Operation::new("Bash", "git status").with_result_hash(hash1));
+
+        let status2 = detector.check_loop();
+        assert!(
+            status2.is_looping,
+            "loop should still be detected when result hash stays the same"
+        );
+    }
+
+    #[test]
     fn test_suggestion_from_signature() {
         let detector = test_detector();
 
@@ -2515,6 +2265,205 @@ mod tests {
             warning.contains("Check the command"),
             "Bash warning should contain signature suggestion: {}",
             warning
+        );
+    }
+
+    fn make_ops(pairs: &[(&str, &str)]) -> VecDeque<Operation> {
+        pairs
+            .iter()
+            .map(|&(tool, param)| Operation::new(tool, param))
+            .collect()
+    }
+
+    fn make_ops_hashed(pairs: &[(&str, &str, &str)]) -> VecDeque<Operation> {
+        pairs
+            .iter()
+            .map(|&(tool, param, result)| {
+                Operation::new(tool, param).with_result_hash(hash_result(result))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_count_operations_empty() {
+        let ops: VecDeque<Operation> = VecDeque::new();
+        let counts = LoopDetector::count_operations(&ops);
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn test_count_operations_single_op() {
+        let ops = make_ops(&[("Bash", "ls"), ("Bash", "ls"), ("Bash", "ls")]);
+        let counts = LoopDetector::count_operations(&ops);
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts.get(&Operation::new("Bash", "ls")), Some(&3));
+    }
+
+    #[test]
+    fn test_count_operations_distinct_ops() {
+        let ops = make_ops(&[("Bash", "ls"), ("Read", "file.txt"), ("Bash", "ls")]);
+        let counts = LoopDetector::count_operations(&ops);
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts.get(&Operation::new("Bash", "ls")), Some(&2));
+        assert_eq!(counts.get(&Operation::new("Read", "file.txt")), Some(&1));
+    }
+
+    #[test]
+    fn test_count_operations_different_hashes_are_distinct() {
+        let ops = make_ops_hashed(&[("Bash", "ls", "output_a"), ("Bash", "ls", "output_b")]);
+        let counts = LoopDetector::count_operations(&ops);
+        // Different result hashes → different operations
+        assert_eq!(counts.len(), 2);
+    }
+
+    #[test]
+    fn test_count_operations_same_hashes_are_grouped() {
+        let ops = make_ops_hashed(&[
+            ("Bash", "ls", "same_output"),
+            ("Bash", "ls", "same_output"),
+            ("Bash", "ls", "same_output"),
+        ]);
+        let counts = LoopDetector::count_operations(&ops);
+        assert_eq!(counts.len(), 1);
+        let key = Operation::new("Bash", "ls").with_result_hash(hash_result("same_output"));
+        assert_eq!(counts.get(&key), Some(&3));
+    }
+
+    #[test]
+    fn test_find_repeated_none() {
+        let ops = make_ops(&[("Bash", "ls"), ("Read", "f.txt")]);
+        let (repeated, max) = LoopDetector::find_repeated(&ops, |_tool| 3);
+        assert!(repeated.is_empty());
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn test_find_repeated_single_above_threshold() {
+        let ops = make_ops(&[("Bash", "ls"); 5]);
+        let (repeated, max) = LoopDetector::find_repeated(&ops, |_tool| 3);
+        assert_eq!(max, 5);
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(repeated[0], Operation::new("Bash", "ls"));
+    }
+
+    #[test]
+    fn test_find_repeated_tie_keeps_both() {
+        let mut ops = VecDeque::new();
+        for _ in 0..3 {
+            ops.push_back(Operation::new("Bash", "ls"));
+        }
+        for _ in 0..3 {
+            ops.push_back(Operation::new("Read", "f.txt"));
+        }
+        let (repeated, max) = LoopDetector::find_repeated(&ops, |_tool| 3);
+        assert_eq!(max, 3);
+        assert_eq!(repeated.len(), 2);
+    }
+
+    #[test]
+    fn test_find_repeated_per_tool_threshold() {
+        let mut ops = VecDeque::new();
+        for _ in 0..2 {
+            ops.push_back(Operation::new("Bash", "ls"));
+        }
+        for _ in 0..5 {
+            ops.push_back(Operation::new("Read", "f.txt"));
+        }
+        // Bash threshold = 3, Read threshold = 4
+        let (repeated, max) =
+            LoopDetector::find_repeated(&ops, |tool| if tool == "Bash" { 3 } else { 4 });
+        // Bash(2) < 3 → excluded. Read(5) >= 4 → included.
+        assert_eq!(max, 5);
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(repeated[0].tool, "Read");
+    }
+
+    #[test]
+    fn test_find_repeated_higher_count_wins() {
+        let mut ops = VecDeque::new();
+        for _ in 0..5 {
+            ops.push_back(Operation::new("Bash", "ls"));
+        }
+        for _ in 0..3 {
+            ops.push_back(Operation::new("Read", "f.txt"));
+        }
+        let (repeated, max) = LoopDetector::find_repeated(&ops, |_tool| 2);
+        // Only Bash(5) wins — Read(3) is below max
+        assert_eq!(max, 5);
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(repeated[0].tool, "Bash");
+    }
+
+    #[test]
+    fn test_build_warning_not_looping() {
+        let detector = test_detector();
+        let warning = detector.build_warning(&[], 0, false, false);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_build_warning_first_warning() {
+        let detector = test_detector();
+        let ops = vec![Operation::new("Bash", "ls")];
+        let warning = detector.build_warning(&ops, 3, true, false);
+        assert!(warning.is_some());
+        let msg = warning.unwrap();
+        assert!(msg.contains("Bash(ls)"));
+        assert!(msg.contains("3 times"));
+        assert!(!msg.contains("STOPPING"));
+    }
+
+    #[test]
+    fn test_build_warning_includes_stop_message() {
+        let detector = test_detector();
+        let ops = vec![Operation::new("Bash", "ls")];
+        let warning = detector.build_warning(&ops, 5, true, true);
+        assert!(warning.is_some());
+        let msg = warning.unwrap();
+        assert!(msg.contains("STOPPING"));
+    }
+
+    #[test]
+    fn test_build_warning_suppresses_duplicate() {
+        let detector = test_detector();
+        let op = Operation::new("Bash", "ls");
+        let ops = vec![op.clone()];
+
+        // First call produces a warning and records the op as warned
+        let w1 = detector.build_warning(&ops, 3, true, false);
+        assert!(w1.is_some());
+
+        // Second call suppresses because already warned
+        let w2 = detector.build_warning(&ops, 3, true, false);
+        assert!(w2.is_none());
+    }
+
+    #[test]
+    fn test_build_warning_duplicate_not_suppressed_when_stopping() {
+        let detector = test_detector();
+        let op = Operation::new("Bash", "ls");
+        let ops = vec![op.clone()];
+
+        // First warning
+        let w1 = detector.build_warning(&ops, 3, true, false);
+        assert!(w1.is_some());
+
+        // Second call with should_stop=true still produces a warning
+        let w2 = detector.build_warning(&ops, 3, true, true);
+        assert!(w2.is_some());
+        assert!(w2.unwrap().contains("STOPPING"));
+    }
+
+    #[test]
+    fn test_build_warning_includes_suggestion() {
+        let detector = test_detector();
+        let ops = vec![Operation::new("Bash", "git status")];
+        let warning = detector.build_warning(&ops, 3, true, false);
+        assert!(warning.is_some());
+        let msg = warning.unwrap();
+        assert!(
+            msg.contains("Check the command"),
+            "Should contain tool signature suggestion: {msg}"
         );
     }
 }

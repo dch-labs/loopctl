@@ -22,7 +22,7 @@
 //!
 //! # Middleware Pipeline
 //!
-//! The [`engine::middleware`](crate::engine::middleware) module provides a composable
+//! The [`engine::middleware`](crate::middleware) module provides a composable
 //! middleware chain for tool dispatch with cross-cutting concerns
 //! (timeouts, output limiting, etc.).
 //!
@@ -72,8 +72,15 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::message::ToolContent as MessageToolContent;
+
+pub mod permission;
+pub mod registry;
+
+pub use permission::PermissionCheck;
+pub use registry::{FnTool, ToolRegistry};
 
 // ===================================================
 // ToolSchema
@@ -210,7 +217,7 @@ impl ToolOutput {
     /// the output is a structured [`MessageToolContent`] value.
     /// Sets [`is_error`](ToolOutput::is_error) to `false`.
     ///
-    /// This is the most general success constructor — it accepts any type
+    /// Most general success constructor — accepts any type
     /// that converts into [`MessageToolContent`]. For simple text results,
     /// prefer the more concise [`ToolOutput::text`] helper.
     ///
@@ -260,7 +267,7 @@ impl ToolOutput {
     ///
     /// Convenience wrapper around [`ToolOutput::success`] that converts
     /// the input string into a [`MessageToolContent::Text`] variant.
-    /// This is the most common constructor for simple tool outputs.
+    /// Most common constructor for simple tool outputs.
     ///
     /// # When to use
     ///
@@ -393,6 +400,193 @@ impl From<&str> for ToolOutput {
     /// ```
     fn from(s: &str) -> Self {
         Self::text(s)
+    }
+}
+
+// ===================================================
+// ToolDispatchResult
+// ===================================================
+
+/// The outcome of a single tool invocation.
+///
+/// Produced after the framework dispatches a tool call and collects
+/// the tool's output. Used throughout the middleware pipeline, the
+/// engine dispatch layer, and returned to callers.
+///
+/// # Fields
+///
+/// | Field                  | Source                              |
+/// |------------------------|-------------------------------------|
+/// | `tool_call_id`         | Set by the engine after dispatch    |
+/// | `output`               | From [`ToolOutput::payload`]        |
+/// | `is_error`             | From [`ToolOutput::is_error`]       |
+/// | `duration`             | Measured by the dispatch layer      |
+/// | `resolved_tool_name`   | Set by middleware or engine         |
+///
+/// # Construction
+///
+/// Middlewares build results with [`ToolDispatchResult::ok`],
+/// [`ToolDispatchResult::err`], or [`From<ToolOutput>`] combined with
+/// builder methods. The engine layer attaches the `tool_call_id` via
+/// [`ToolDispatchResult::with_call_id`] after the middleware pipeline
+/// returns.
+///
+/// ```
+/// use std::time::Duration;
+/// use loopctl::tool::{ToolDispatchResult, ToolOutput};
+///
+/// let output = ToolOutput::text("done");
+/// let result = ToolDispatchResult::from(output)
+///     .with_tool_name("bash")
+///     .with_duration(Duration::from_millis(42))
+///     .with_call_id("call_abc123");
+///
+/// assert_eq!(result.tool_call_id, "call_abc123");
+/// assert_eq!(result.resolved_tool_name, "bash");
+/// ```
+#[derive(Debug, Clone)]
+pub struct ToolDispatchResult {
+    /// Set by the engine via [`with_call_id`](Self::with_call_id).
+    pub tool_call_id: String,
+    /// Preserves multipart and image content on success; wraps error in text on failure.
+    pub output: crate::message::ToolContent,
+    /// Whether the tool dispatch resulted in an error.
+    pub is_error: bool,
+    /// Wall-clock execution time.
+    pub duration: Duration,
+    /// May differ from the requested tool name if a routing middleware redirected the call.
+    pub resolved_tool_name: String,
+}
+
+impl ToolDispatchResult {
+    /// Create a successful result with text output.
+    ///
+    /// Constructor for the common case where a tool
+    /// produces a plain-text response.
+    #[must_use]
+    pub fn ok(tool_name: &str, output: String, duration: Duration) -> Self {
+        Self {
+            tool_call_id: String::new(),
+            output: crate::message::ToolContent::Text(output),
+            is_error: false,
+            duration,
+            resolved_tool_name: tool_name.to_string(),
+        }
+    }
+
+    /// Create an error result with a message.
+    ///
+    /// Used when a middleware short-circuits or the tool reports failure.
+    #[must_use]
+    pub fn err(tool_name: &str, message: String, duration: Duration) -> Self {
+        Self {
+            tool_call_id: String::new(),
+            output: crate::message::ToolContent::Text(message),
+            is_error: true,
+            duration,
+            resolved_tool_name: tool_name.to_string(),
+        }
+    }
+
+    /// Create a result from a [`ToolOutput`].
+    ///
+    /// Converts the tool's output struct into a dispatch result,
+    /// preserving the error flag and content payload.
+    #[must_use]
+    pub fn from_tool_output(tool_name: &str, output: ToolOutput, duration: Duration) -> Self {
+        Self::from(output)
+            .with_tool_name(tool_name)
+            .with_duration(duration)
+    }
+
+    /// Builder: attach the [`tool_call_id`](Self::tool_call_id).
+    ///
+    /// Called by the engine layer after the middleware pipeline returns
+    /// to correlate this result with the original tool call.
+    #[must_use]
+    pub fn with_call_id(mut self, id: impl Into<String>) -> Self {
+        self.tool_call_id = id.into();
+        self
+    }
+
+    /// Set the [`resolved_tool_name`](Self::resolved_tool_name).
+    ///
+    /// Part of the builder chain when constructing a
+    /// `ToolDispatchResult` from [`From<ToolOutput>`].
+    #[must_use]
+    pub fn with_tool_name(mut self, name: &str) -> Self {
+        name.clone_into(&mut self.resolved_tool_name);
+        self
+    }
+
+    /// Set the [`duration`](Self::duration).
+    ///
+    /// Part of the builder chain when constructing a
+    /// `ToolDispatchResult` from [`From<ToolOutput>`].
+    #[must_use]
+    pub fn with_duration(mut self, dur: Duration) -> Self {
+        self.duration = dur;
+        self
+    }
+
+    /// Create a result from a [`ToolError`].
+    ///
+    /// Converts the tool's error into a dispatch result with `is_error`
+    /// set to `true`.
+    #[must_use]
+    pub fn from_tool_error(tool_name: &str, error: &ToolError, duration: Duration) -> Self {
+        Self {
+            tool_call_id: String::new(),
+            output: crate::message::ToolContent::Text(error.to_string()),
+            is_error: true,
+            duration,
+            resolved_tool_name: tool_name.to_string(),
+        }
+    }
+
+    /// Create a result from a tool call outcome.
+    ///
+    /// Covers the common `Result<ToolOutput, ToolError>` pattern produced by
+    /// [`Tool::call()`](Tool::call). Maps [`Ok`] through
+    /// [`from_tool_output`](Self::from_tool_output) and [`Err`] through
+    /// [`from_tool_error`](Self::from_tool_error).
+    #[must_use]
+    pub fn from_result(
+        tool_name: &str,
+        result: Result<ToolOutput, ToolError>,
+        duration: Duration,
+    ) -> Self {
+        match result {
+            Ok(output) => Self::from_tool_output(tool_name, output, duration),
+            Err(e) => Self::from_tool_error(tool_name, &e, duration),
+        }
+    }
+}
+
+/// Conversion from a bare [`ToolOutput`].
+///
+/// Produces a `ToolDispatchResult` with no call ID, [`Duration::ZERO`],
+/// and an empty `resolved_tool_name`. Chain builder methods to complete
+/// the fields:
+///
+/// ```
+/// use std::time::Duration;
+/// use loopctl::tool::{ToolDispatchResult, ToolOutput};
+///
+/// let result = ToolDispatchResult::from(ToolOutput::text("ok"))
+///     .with_call_id("call_1")
+///     .with_tool_name("echo")
+///     .with_duration(Duration::from_millis(5));
+/// ```
+impl From<ToolOutput> for ToolDispatchResult {
+    fn from(output: ToolOutput) -> Self {
+        Self {
+            tool_call_id: String::new(),
+            output: output.payload,
+            is_error: output.is_error,
+            duration: Duration::ZERO,
+            resolved_tool_name: String::new(),
+        }
     }
 }
 
@@ -781,295 +975,19 @@ impl Default for ToolContext {
     }
 }
 // ===================================================
-// PermissionCheck
-// ===================================================
-
-/// Result of a permission check before tool execution.
-///
-/// Before invoking [`Tool::call`], the agent loop can run a permission
-/// gate that returns one of four outcomes: allow, deny, ask the user,
-/// or modify the input. This lets host applications enforce safety
-/// policies without modifying individual tool implementations.
-///
-/// # Lifecycle
-///
-/// ```text
-/// tool.call(input, ctx)
-///   → permission_gate(input)
-///     → Allow          [proceed with original input]
-///     → Deny           [return ToolError::Permission]
-///     → Ask { prompt } [prompt user, then Allow or Deny]
-///     → Modify { .. }  [proceed with modified input]
-/// ```
-///
-/// # Decision tree
-///
-/// ```text
-///           ┌─────────────────┐
-///           │ Permission gate │
-///           └───────┬─────────┘
-///            ┌──────┼──────────┐
-///            ▼      ▼          ▼
-///         Allow   Deny      ┌ Ask ──┐
-///           │      │        ▼       │
-///           │      │       user     │
-///           │      │      approves  │
-///           │      │       |        │
-///           │      │       ▼        ▼
-///           ▼      ▼     Allow     Deny
-///      Tool::call  Err(Permission)
-/// ```
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let check = PermissionCheck::deny("dangerous operation");
-/// if check.is_deny() {
-///     return Err(ToolError::Permission("blocked by policy".into()));
-/// }
-/// ```
-#[derive(Debug, Clone)]
-pub enum PermissionCheck {
-    /// Allow the tool to execute unmodified.
-    ///
-    /// The agent loop proceeds with the original input and context.
-    Allow,
-
-    /// Deny execution with a human-readable reason.
-    ///
-    /// The agent loop should return
-    /// [`ToolError::Permission`] with the given
-    /// `reason` so the LLM can react accordingly.
-    Deny {
-        /// Explanation of why the invocation was blocked.
-        ///
-        /// Forwarded to the LLM as part of the error message so it can
-        /// adjust its next action.
-        reason: String,
-    },
-
-    /// Prompt the user for approval before proceeding.
-    ///
-    /// In interactive sessions the agent loop should present `prompt` to
-    /// the user and then treat the response as either [`Allow`](PermissionCheck::Allow)
-    /// or [`Deny`](PermissionCheck::Deny).
-    Ask {
-        /// The question to present to the user.
-        ///
-        /// Should clearly describe the action the tool is about to take
-        /// and any potential side effects.
-        prompt: String,
-    },
-
-    /// Modify the tool's input before execution.
-    ///
-    /// The agent loop should invoke [`Tool::call`] with `modified_input`
-    /// instead of the original input. Useful for sanitising paths,
-    /// redacting secrets, or injecting default values.
-    Modify {
-        /// The sanitized or rewritten input to pass to [`Tool::call`].
-        ///
-        /// Must conform to the tool's [`ToolSchema::input_schema`].
-        modified_input: Value,
-    },
-}
-
-impl PermissionCheck {
-    /// Create an [`Allow`](PermissionCheck::Allow) result.
-    ///
-    /// Signals that the tool invocation may proceed without changes.
-    /// The `#[must_use]` attribute reminds callers to check the result
-    /// rather than silently discarding it.
-    ///
-    /// # When returned
-    ///
-    /// The permission gate returns this variant when the requested
-    /// operation is within the configured safety policy — for example,
-    /// a read-only tool invocation or an operation on an allowed path.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
-    ///
-    /// let check = PermissionCheck::allow();
-    /// assert!(check.is_allow());
-    /// ```
-    #[must_use]
-    pub fn allow() -> Self {
-        Self::Allow
-    }
-
-    /// Create a [`Deny`](PermissionCheck::Deny) result with a reason.
-    ///
-    /// The `reason` string will be forwarded to the LLM as part of the
-    /// error message, helping it understand why the invocation was
-    /// rejected and adjust its next action.
-    ///
-    /// # When returned
-    ///
-    /// The permission gate returns this variant when the requested
-    /// operation violates a hard safety rule — for example, executing
-    /// a shell command when shell access is disabled.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
-    ///
-    /// let check = PermissionCheck::deny("shell execution is disabled");
-    /// assert!(check.is_deny());
-    /// ```
-    pub fn deny(reason: impl Into<String>) -> Self {
-        Self::Deny {
-            reason: reason.into(),
-        }
-    }
-
-    /// Create an [`Ask`](PermissionCheck::Ask) result with a prompt.
-    ///
-    /// The agent loop should present the `prompt` to the user (in
-    /// interactive mode) and then proceed based on the user's response.
-    ///
-    /// # When returned
-    ///
-    /// The permission gate returns this variant for operations that are
-    /// potentially dangerous but not outright prohibited — for example,
-    /// writing to a file for the first time. The user's decision is then
-    /// converted to [`Allow`](PermissionCheck::Allow) or
-    /// [`Deny`](PermissionCheck::Deny).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
-    ///
-    /// let check = PermissionCheck::ask("Allow write to /etc/config.yaml?");
-    /// assert!(check.is_ask());
-    /// ```
-    pub fn ask(prompt: impl Into<String>) -> Self {
-        Self::Ask {
-            prompt: prompt.into(),
-        }
-    }
-
-    /// Create a [`Modify`](PermissionCheck::Modify) result with rewritten input.
-    ///
-    /// The agent loop should replace the original tool input with the
-    /// provided `modified_input` before invoking [`Tool::call`]. Useful
-    /// for sanitising paths, redacting secrets, or injecting default
-    /// values.
-    ///
-    /// # When returned
-    ///
-    /// The permission gate returns this variant when the requested
-    /// operation is acceptable but the input needs adjustment — for
-    /// example, resolving a relative path to an absolute one within
-    /// the allowed directory tree.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
-    /// use serde_json::json;
-    ///
-    /// let check = PermissionCheck::modify(json!({"path": "/safe/dir/file.txt"}));
-    /// assert!(check.is_modify());
-    /// ```
-    #[must_use]
-    pub fn modify(modified_input: Value) -> Self {
-        Self::Modify { modified_input }
-    }
-
-    /// Returns `true` if this is an [`Allow`](PermissionCheck::Allow).
-    ///
-    /// Convenience predicate for the most common happy-path check.
-    /// Used by the agent loop to test whether to proceed with
-    /// [`Tool::call`] without further processing.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// if check.is_allow() {
-    ///     let result = tool.call(input, &ctx).await;
-    /// }
-    /// ```
-    #[must_use]
-    pub fn is_allow(&self) -> bool {
-        matches!(self, Self::Allow)
-    }
-
-    /// Returns `true` if this is a [`Deny`](PermissionCheck::Deny).
-    ///
-    /// When `true`, the agent loop should *not* invoke the tool and
-    /// should instead return a permission error to the LLM. The denial
-    /// reason can be extracted by destructuring the variant or by
-    /// converting to [`ToolError::Permission`].
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// if check.is_deny() {
-    ///     return Err(ToolError::Permission("blocked by policy".into()));
-    /// }
-    /// ```
-    #[must_use]
-    pub fn is_deny(&self) -> bool {
-        matches!(self, Self::Deny { .. })
-    }
-
-    /// Returns `true` if this is an [`Ask`](PermissionCheck::Ask).
-    ///
-    /// When `true`, the agent loop should prompt the user before
-    /// deciding whether to allow or deny the invocation. In
-    /// non-interactive mode ([`ToolContext::is_non_interactive`]), the
-    /// loop typically treats an [`Ask`](PermissionCheck::Ask) as a
-    /// [`Deny`](PermissionCheck::Deny).
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// if check.is_ask() {
-    ///     println!("Tool requests approval: {}", prompt);
-    /// }
-    /// ```
-    #[must_use]
-    pub fn is_ask(&self) -> bool {
-        matches!(self, Self::Ask { .. })
-    }
-
-    /// Returns `true` if this is a [`Modify`](PermissionCheck::Modify).
-    ///
-    /// When `true`, the agent loop should replace the original input
-    /// with the modified version before calling the tool. The modified
-    /// input can be extracted by matching the variant.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// if let PermissionCheck::Modify { modified_input } = check {
-    ///     let result = tool.call(modified_input, &ctx).await;
-    /// }
-    /// ```
-    #[must_use]
-    pub fn is_modify(&self) -> bool {
-        matches!(self, Self::Modify { .. })
-    }
-}
-
-// ===================================================
 // Tool trait
 // ===================================================
 
 /// The trait that all agent tools must implement.
 ///
-/// This is the framework-level tool interface. Concrete tools (defined in
+/// Framework-level tool interface. Concrete tools (defined in
 /// downstream crates like `dch-tools`) implement this trait, and the
 /// [`ToolRegistry`] manages dynamic lookup by name.
 ///
 /// The trait uses a `Pin<Box<dyn Future>>` return type for [`call`](Tool::call)
-/// to be maximally compatible with both `async fn` and manual `Future`
-/// implementations, without requiring `async_fn_in_trait` stabilisation.
+/// to be maximally compatible with both `async fn` bodies and manually
+/// constructed futures, keeping the trait object-safe and free of
+/// lifetime issues that `async fn` in traits can introduce.
 ///
 /// # Lifecycle
 ///
@@ -1112,12 +1030,12 @@ impl PermissionCheck {
 ///
 /// # Provided methods
 ///
-/// | Method                              | Default | Purpose                            |
-/// |-------------------------------------|---------|------------------------------------|
-/// | `is_concurrency_safe`             | `false` | Static concurrency flag            |
-/// | `is_safe_for_concurrent_execution`| delegates| Per-input concurrency check        |
-/// | `is_read_only`                    | `false` | Side-effect flag for permission    |
-/// | `system_prompt`                   | `None`  | Extra LLM context for this tool    |
+/// | Method                              | Default   | Purpose                             |
+/// |-------------------------------------|-----------|-------------------------------------|
+/// | `is_concurrency_safe`               | `false`   | Static concurrency flag             |
+/// | `is_safe_for_concurrent_execution`  | delegates | Per-input concurrency check         |
+/// | `is_read_only`                      | `false`   | Side-effect flag for permission     |
+/// | `system_prompt`                     | `None`    | Extra LLM context for this tool     |
 ///
 /// # Example
 ///
@@ -1194,7 +1112,7 @@ pub trait Tool: Send + Sync {
 
     /// Invoke the tool with the given input and context.
     ///
-    /// This is the main execution entry point. The `input` is a
+    /// Main execution entry point. The `input` is a
     /// [`Value`] (typically a JSON object) matching the tool's
     /// [`ToolSchema::input_schema`]. The [`ToolContext`] provides
     /// session-level data such as working directory and extensions.
@@ -1206,7 +1124,7 @@ pub trait Tool: Send + Sync {
     ///
     /// The `Pin<Box<dyn Future>>` return type maximises compatibility
     /// with both `async fn` bodies and manually constructed futures,
-    /// without requiring `async_fn_in_trait` stabilisation.
+    /// keeping the trait object-safe and free of lifetime issues.
     ///
     /// # Errors
     ///
@@ -1327,635 +1245,6 @@ pub trait Tool: Send + Sync {
     /// ```
     fn system_prompt(&self) -> Option<String> {
         None
-    }
-}
-
-// ===================================================
-// ToolRegistry
-// ===================================================
-
-/// Registry of available tools for dynamic lookup by name.
-///
-/// The agent loop creates a [`ToolRegistry`] at session start, registers
-/// all available tools via [`register`](ToolRegistry::register), and then
-/// uses [`get`](ToolRegistry::get) to dispatch invocations when the LLM
-/// selects a tool by name. The registry also provides bulk accessors for
-/// tool schemas and concurrency-safe tool lists.
-///
-/// # Data flow
-///
-/// ```text
-/// ┌──────────────┐
-/// │ Session init │
-/// └──────┬───────┘
-///        ▼
-/// ToolRegistry::new()
-///   → register(tool_1)
-///   → register(tool_2)
-///   → ...
-///        │
-///        ▼
-/// all_schemas()  ──→  LLM API request (tool definitions)
-/// get("name")    ──→  Tool::call(input, ctx)  (dispatch)
-/// concurrent_safe_tools() ──→ parallel execution planner
-/// ```
-///
-/// # Thread safety
-///
-/// The registry itself is not `Sync` — it is created once during session
-/// setup and then accessed immutably during tool dispatch. If you need
-/// cross-thread sharing, wrap it in an `Arc<RwLock<ToolRegistry>>`.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// let mut registry = ToolRegistry::new();
-/// registry.register(ReadFileTool);
-/// registry.register(WriteFileTool);
-///
-/// // Dispatch an invocation
-/// let tool = registry.get("read_file").expect("tool exists");
-/// let result = tool.call(input, &ctx).await;
-///
-/// // Send schemas to the LLM
-/// let schemas = registry.all_schemas();
-/// ```
-pub struct ToolRegistry {
-    /// Internal name → tool map.
-    ///
-    /// Each entry is a `Box<dyn Tool>` keyed by its [`Tool::name`].
-    /// Populated by [`register`](ToolRegistry::register) and queried by
-    /// [`get`](ToolRegistry::get).
-    tools: HashMap<String, Box<dyn Tool>>,
-}
-
-impl ToolRegistry {
-    /// Create a new empty registry.
-    ///
-    /// The registry starts with no tools. Use [`register`](ToolRegistry::register)
-    /// to add tools before the agent loop begins processing turns.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            tools: HashMap::new(),
-        }
-    }
-
-    /// Register a tool, replacing any previous tool with the same name.
-    ///
-    /// Called during session setup, before any turns are processed. If a
-    /// tool with the same [`Tool::name`] already exists it is silently
-    /// replaced.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// registry.register(ReadFileTool);
-    /// registry.register(WriteFileTool);
-    /// ```
-    pub fn register(&mut self, tool: impl Tool + 'static) {
-        let name = tool.name().to_string();
-        self.tools.insert(name, Box::new(tool));
-    }
-
-    /// Look up a tool by name.
-    ///
-    /// Returns `Some(&dyn Tool)` if a tool with the given name was
-    /// previously [`register`](ToolRegistry::register)ed, or `None`
-    /// otherwise. Called by the agent loop when dispatching an LLM tool
-    /// call.
-    ///
-    /// The returned reference borrows from the registry and is valid for
-    /// as long as the registry is alive.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// if let Some(tool) = registry.get("read_file") {
-    ///     let result = tool.call(input, &ctx).await;
-    /// }
-    /// ```
-    #[must_use]
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.get(name).map(std::convert::AsRef::as_ref)
-    }
-
-    /// Check whether a tool with the given name is registered.
-    ///
-    /// Useful for pre-flight validation before attempting
-    /// [`get`](ToolRegistry::get). Returns `true` if the name maps to a
-    /// registered tool.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// if registry.contains("bash") {
-    ///     // Safe to call registry.get("bash")
-    /// }
-    /// ```
-    #[must_use]
-    pub fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
-    }
-
-    /// Collect [`ToolSchema`] descriptors for all registered tools.
-    ///
-    /// Called by the agent loop to build the tool list sent to the LLM
-    /// at the start of each session (or turn, if the tool set changes).
-    /// The order is unspecified.
-    ///
-    /// Each schema is freshly constructed via [`Tool::schema`], so the
-    /// caller does not need to worry about stale data.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let schemas = registry.all_schemas();
-    /// for schema in &schemas {
-    ///     println!("  - {}: {}", schema.name, schema.description);
-    /// }
-    /// ```
-    #[must_use]
-    pub fn all_schemas(&self) -> Vec<ToolSchema> {
-        self.tools.values().map(|t| t.schema()).collect()
-    }
-
-    /// Return all registered tool names, sorted alphabetically.
-    ///
-    /// Useful for diagnostics, logging, and building error messages
-    /// in [`ToolError::not_found`].
-    #[must_use]
-    pub fn tool_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.tools.keys().cloned().collect();
-        names.sort();
-        names
-    }
-
-    /// Number of registered tools.
-    ///
-    /// Used by the framework and by
-    /// [`is_empty`](ToolRegistry::is_empty). Returns `0` for a freshly
-    /// created registry.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// assert_eq!(registry.len(), 3); // three tools registered
-    /// ```
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.tools.len()
-    }
-
-    /// Whether the registry contains no tools.
-    ///
-    /// Defaults to `self.len() == 0`. The agent loop typically checks
-    /// this during startup to ensure at least one tool is available.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let registry = ToolRegistry::new();
-    /// assert!(registry.is_empty());
-    /// registry.register(MyTool);
-    /// assert!(!registry.is_empty());
-    /// ```
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
-    }
-
-    /// Return references to all tools that are concurrency-safe.
-    ///
-    /// Filters by [`Tool::is_concurrency_safe`] returning `true`. Used
-    /// by the agent loop to decide which tools can be invoked in parallel
-    /// during a single turn.
-    #[must_use]
-    pub fn concurrent_safe_tools(&self) -> Vec<&dyn Tool> {
-        self.tools
-            .values()
-            .map(std::convert::AsRef::as_ref)
-            .filter(|t| t.is_concurrency_safe())
-            .collect()
-    }
-}
-
-impl Default for ToolRegistry {
-    /// Produce an empty registry (equivalent to [`ToolRegistry::new`]).
-    ///
-    /// Allows `ToolRegistry` to be used in contexts that require
-    /// [`Default`], such as struct initialization with `..Default::default()`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
-    ///
-    /// let registry = ToolRegistry::default();
-    /// assert!(registry.is_empty());
-    /// ```
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ===================================================
-// FnTool adapter
-// ===================================================
-
-/// Type alias for an async tool function pointer.
-///
-/// Matches the signature used by concrete tools in downstream crates:
-/// `fn(Value, &ToolContext) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'static>>`.
-///
-/// Stored in the `f` field of [`FnTool`] to adapt function-pointer-based
-/// tool definitions to the [`Tool`] trait.
-pub type ToolFn =
-    fn(
-        Value,
-        &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'static>>;
-
-/// Type alias for a dynamic concurrency check function.
-///
-/// Takes a reference to the tool input [`Value`] and returns `true` if
-/// the tool is safe to run concurrently with that specific input. Used
-/// by [`FnTool::with_concurrency_check`] to override the static
-/// [`Tool::is_concurrency_safe`] flag on a per-call basis.
-pub type ConcurrencyCheckFn = fn(&Value) -> bool;
-
-/// Adapter that wraps a function pointer as a [`Tool`] trait implementation.
-///
-/// Use [`FnTool`] when you have a standalone async function that implements
-/// tool logic and want to register it without defining a dedicated struct.
-/// The adapter wraps the function pointer so it can be stored in a
-/// [`ToolRegistry`] alongside any other [`Tool`] implementation.
-///
-/// For complex tools with internal state, implement [`Tool`] directly on a
-/// struct instead.
-///
-/// # Builder API
-///
-/// [`FnTool`] supports a builder pattern for optional properties:
-///
-/// ```rust,ignore
-/// let tool = FnTool::new("my_tool".into(), "Does a thing".into(),
-///     json!({"type": "object", "properties": {"text": {"type": "string"}}}),
-///     my_tool as ToolFn)
-///     .concurrency_safe()                 // mark as safe for parallel execution
-///     .read_only()                        // mark as side-effect-free
-///     .with_system_prompt("...".into());  // inject extra LLM context
-///
-/// let mut registry = ToolRegistry::new();
-/// registry.register(tool);
-/// ```
-///
-/// # Builder flow
-///
-/// ```text
-/// FnTool::new(name, desc, schema, f)
-///   │
-///   ├─ .concurrency_safe()         → sets is_concurrency_safe = true
-///   ├─ .with_concurrency_check(fn) → sets per-input check
-///   ├─ .read_only()                → sets is_read_only = true
-///   └─ .with_system_prompt(s)      → sets system_prompt = Some(s)
-/// ```
-///
-/// # Example
-///
-/// ```rust,ignore
-/// fn my_tool(input: Value, _ctx: &ToolContext)
-///     -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'static>>
-/// {
-///     let text = input.get("text").unwrap().to_string();
-///     Box::pin(async move { Ok(ToolOutput::text(text)) })
-/// }
-///
-/// let tool = FnTool::new("my_tool".into(), "Does a thing".into(),
-///     json!({"type": "object", "properties": {"text": {"type": "string"}}}),
-///     my_tool as ToolFn)
-///     .concurrency_safe()
-///     .read_only();
-///
-/// let mut registry = ToolRegistry::new();
-/// registry.register(tool);
-/// ```
-pub struct FnTool {
-    /// The tool's unique name identifier.
-    ///
-    /// Must match the name used in the [`ToolSchema`] and serves as the
-    /// [`ToolRegistry`] lookup key. Set at construction time via
-    /// [`FnTool::new`].
-    pub name: String,
-
-    /// Human-readable description for the LLM.
-    ///
-    /// Sent to the LLM as part of the [`ToolSchema`]. A clear
-    /// description improves tool selection accuracy.
-    pub description: String,
-
-    /// JSON Schema describing the tool's input parameters.
-    ///
-    /// Must be a valid JSON Schema object. Embedded in the
-    /// [`ToolSchema`] returned by [`Tool::schema`].
-    pub input_schema: Value,
-
-    /// The function pointer that implements the tool's core logic.
-    ///
-    /// Called by [`Tool::call`] with the LLM-supplied input and the
-    /// session's [`ToolContext`]. Must return a pinned, `Send` future
-    /// producing a `Result<ToolOutput, ToolError>`.
-    pub tool_fn: ToolFn,
-
-    /// Whether this tool is safe to run concurrently with itself.
-    ///
-    /// Set via the [`concurrency_safe`](FnTool::concurrency_safe) builder
-    /// method. Defaults to `false`. When `true`, the agent loop may
-    /// invoke this tool in parallel with other concurrent-safe tools.
-    pub is_concurrency_safe: bool,
-
-    /// Optional dynamic concurrency check function.
-    ///
-    /// When set via [`with_concurrency_check`](FnTool::with_concurrency_check),
-    /// this function is called with the tool input to decide per-invocation
-    /// concurrency safety. Overrides the static
-    /// [`is_concurrency_safe`](FnTool::is_concurrency_safe) flag when present.
-    pub concurrency_check_fn: Option<ConcurrencyCheckFn>,
-
-    /// Whether this tool only reads data (no side effects).
-    ///
-    /// Set via the [`read_only`](FnTool::read_only) builder method.
-    /// Defaults to `false`. Read-only tools can be auto-approved by
-    /// permission gates.
-    pub is_read_only: bool,
-
-    /// Optional extra system prompt injected when this tool is available.
-    ///
-    /// Set via [`with_system_prompt`](FnTool::with_system_prompt).
-    /// The agent loop appends this to the system message. Defaults to
-    /// `None`.
-    pub system_prompt: Option<String>,
-}
-
-impl FnTool {
-    /// Create a new function-pointer tool with the given name, description,
-    /// schema, and implementation function.
-    ///
-    /// All optional properties default to their "off" values:
-    /// `is_concurrency_safe → false`, `concurrency_check_fn → None`,
-    /// `is_read_only → false`, `system_prompt → None`. Use the builder
-    /// methods to enable them.
-    ///
-    /// # Arguments
-    ///
-    /// | Argument        | Type      | Description                                    |
-    /// |-----------------|-----------|------------------------------------------------|
-    /// | `name`          | `String`  | Unique tool identifier, used as registry key    |
-    /// | `description`   | `String`  | Human-readable summary sent to the LLM          |
-    /// | `input_schema`  | `Value`   | JSON Schema for the tool's parameters           |
-    /// | `f`             | [`ToolFn`] | The async function implementing tool logic     |
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let tool = FnTool::new(
-    ///     "grep".into(),
-    ///     "Search files for a pattern".into(),
-    ///     json!({"type": "object", "properties": {"pattern": {"type": "string"}}}),
-    ///     my_grep_fn as ToolFn,
-    /// );
-    /// ```
-    pub fn new(name: String, description: String, input_schema: Value, tool_fn: ToolFn) -> Self {
-        Self {
-            name,
-            description,
-            input_schema,
-            tool_fn,
-            is_concurrency_safe: false,
-            concurrency_check_fn: None,
-            is_read_only: false,
-            system_prompt: None,
-        }
-    }
-
-    /// Builder: mark this tool as concurrency-safe.
-    ///
-    /// Sets [`is_concurrency_safe`](FnTool::is_concurrency_safe) to
-    /// `true`, signalling that the agent loop may invoke this tool in
-    /// parallel with other concurrent-safe tools.
-    ///
-    /// # When to use
-    ///
-    /// Call this for tools that are pure functions or read-only — for
-    /// example, a file-reading tool or a math calculator. Do *not* call
-    /// this for tools that mutate shared state or write to the filesystem.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let tool = FnTool::new(/* ... */)
-    ///     .concurrency_safe();
-    /// ```
-    #[must_use]
-    pub fn concurrency_safe(mut self) -> Self {
-        self.is_concurrency_safe = true;
-        self
-    }
-
-    /// Builder: set a dynamic concurrency check function.
-    ///
-    /// The provided function is called with the tool input on each
-    /// invocation. If it returns `true`, the tool may run concurrently
-    /// for that specific input. Overrides the static
-    /// [`is_concurrency_safe`](FnTool::is_concurrency_safe) flag.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// fn can_run_concurrently(input: &Value) -> bool {
-    ///     // Only safe if writing to different files
-    ///     input.get("append").is_none()
-    /// }
-    /// let tool = FnTool::new(/* ... */).with_concurrency_check(can_run_concurrently);
-    /// ```
-    #[must_use]
-    pub fn with_concurrency_check(mut self, check_fn: ConcurrencyCheckFn) -> Self {
-        self.concurrency_check_fn = Some(check_fn);
-        self
-    }
-
-    /// Builder: mark this tool as read-only (no side effects).
-    ///
-    /// Sets [`is_read_only`](FnTool::is_read_only) to `true`. Read-only
-    /// tools can be auto-approved by permission gates and are generally
-    /// safe to run without user confirmation.
-    ///
-    /// # When to use
-    ///
-    /// Call this for tools that only read data — file readers, search
-    /// tools, calculators. Do *not* call this for tools that write files,
-    /// execute commands, or modify external state.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let tool = FnTool::new(/* ... */)
-    ///     .read_only();
-    /// ```
-    #[must_use]
-    pub fn read_only(mut self) -> Self {
-        self.is_read_only = true;
-        self
-    }
-
-    /// Builder: set an optional extra system prompt for this tool.
-    ///
-    /// The agent loop appends this string to the system message when the
-    /// tool is registered, giving the LLM additional context about how
-    /// to use the tool effectively.
-    ///
-    /// # When to use
-    ///
-    /// Use this when a tool benefits from usage hints or style guidance
-    /// — for example, a shell tool might set a prompt like "Prefer
-    /// single-line bash commands" to steer the LLM's behavior.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let tool = FnTool::new(/* ... */)
-    ///     .with_system_prompt("Always use absolute paths.".into());
-    /// ```
-    #[must_use]
-    pub fn with_system_prompt(mut self, prompt: String) -> Self {
-        self.system_prompt = Some(prompt);
-        self
-    }
-}
-
-/// [`Tool`] trait implementation for [`FnTool`].
-///
-/// Delegates each trait method to the corresponding field or function
-/// pointer stored in the [`FnTool`] adapter. This is the glue that lets
-/// function-pointer-based tools participate in the trait system without
-/// any wrapper overhead.
-///
-/// # Delegation map
-///
-/// | Trait method                               | Delegates to                                 |
-/// |--------------------------------------------|----------------------------------------------|
-/// | [`Tool::name`]                             | [`FnTool::name`] field accessor              |
-/// | [`Tool::description`]                      | [`FnTool::description`] accessor             |
-/// | [`Tool::schema`]                           | Clones fields into [`ToolSchema`]            |
-/// | [`Tool::call`]                             | internal function pointer                    |
-/// | [`Tool::is_concurrency_safe`]              | [`FnTool::is_concurrency_safe`]              |
-/// | [`Tool::is_safe_for_concurrent_execution`] | [`FnTool::concurrency_check_fn`] or fallback |
-/// | [`Tool::is_read_only`]                     | [`FnTool::is_read_only`]                     |
-/// | [`Tool::system_prompt`]                    | [`FnTool::system_prompt`] clone              |
-impl Tool for FnTool {
-    /// Return the tool name from the [`FnTool::name`] field.
-    ///
-    /// This is a trivial field accessor — the name was set at construction
-    /// time via [`FnTool::new`] and does not change for the lifetime of
-    /// the adapter. The returned slice borrows from `self`.
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Return the tool description from the [`FnTool::description`] field.
-    ///
-    /// Like [`name`](FnTool::name), this is a field accessor for the value
-    /// provided at construction time. The description is sent to the LLM as
-    /// part of the [`ToolSchema`] to help it choose the right tool.
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    /// Build a [`ToolSchema`] from the stored fields.
-    ///
-    /// Assembles the [`FnTool::name`], [`FnTool::description`], and
-    /// [`FnTool::input_schema`] into a [`ToolSchema`] suitable for
-    /// sending to the LLM. The fields are cloned so the returned schema
-    /// is independent of `self`.
-    ///
-    /// # When called
-    ///
-    /// Invoked by the agent loop when assembling the list of tool
-    /// definitions to send in an LLM API request. Typically called once
-    /// per session (or per turn if the tool set changes dynamically).
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name.clone(),
-            description: self.description.clone(),
-            input_schema: self.input_schema.clone(),
-        }
-    }
-
-    /// Delegate execution to the stored function pointer.
-    ///
-    /// Invokes the stored function pointer with the provided `input` and `context`,
-    /// returning the pinned future directly. The function pointer owns
-    /// the full future lifecycle — the `'static` bound on [`ToolFn`]
-    /// ensures the future does not borrow from the tool adapter itself.
-    ///
-    /// # When called
-    ///
-    /// Called by the agent loop after the LLM selects this tool by name
-    /// and the permission gate (if any) returns
-    /// [`PermissionCheck::Allow`].
-    fn call(
-        &self,
-        input: Value,
-        context: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        (self.tool_fn)(input, context)
-    }
-
-    /// Return the static concurrency-safety flag.
-    ///
-    /// Reads [`FnTool::is_concurrency_safe`], which is set via the
-    /// [`concurrency_safe`](FnTool::concurrency_safe) builder method.
-    ///
-    /// This is a *static* flag — it does not consider the specific input.
-    /// For input-dependent checks, see
-    /// [`is_safe_for_concurrent_execution`](Tool::is_safe_for_concurrent_execution).
-    fn is_concurrency_safe(&self) -> bool {
-        self.is_concurrency_safe
-    }
-
-    /// Dynamic concurrency check using the optional check function.
-    ///
-    /// If [`FnTool::concurrency_check_fn`] is set (via
-    /// [`with_concurrency_check`](FnTool::with_concurrency_check)),
-    /// delegates to it and returns its result. Otherwise falls back to
-    /// the static [`is_concurrency_safe`](Tool::is_concurrency_safe) flag.
-    ///
-    /// This allows tools to express fine-grained concurrency policies —
-    /// for example, allowing parallel reads to different files while
-    /// serializing writes to the same file.
-    fn is_safe_for_concurrent_execution(&self, input: &Value) -> bool {
-        self.concurrency_check_fn
-            .map_or(self.is_concurrency_safe, |f| f(input))
-    }
-
-    /// Return the read-only flag from [`FnTool::is_read_only`].
-    ///
-    /// Set via the [`read_only`](FnTool::read_only) builder method.
-    /// When `true`, the agent loop's permission gate may auto-approve
-    /// invocations without prompting the user, since the tool has no
-    /// observable side effects.
-    fn is_read_only(&self) -> bool {
-        self.is_read_only
-    }
-
-    /// Clone and return the optional system prompt from [`FnTool::system_prompt`].
-    ///
-    /// The agent loop appends this string to the system message when the
-    /// tool is registered, giving the LLM additional context about how to
-    /// use the tool effectively. Returns `None` if no prompt was set via
-    /// [`with_system_prompt`](FnTool::with_system_prompt).
-    fn system_prompt(&self) -> Option<String> {
-        self.system_prompt.clone()
     }
 }
 

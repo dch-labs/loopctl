@@ -1,47 +1,12 @@
-//! API client trait — interface for LLM provider communication.
+//! API client and error types — interface for LLM provider communication.
 //!
-//! This module defines the [`ApiClient`] trait that all LLM provider
-//! implementations must satisfy. It abstracts away provider-specific details
-//! (authentication, request formatting, SSE parsing, error handling) behind
-//! a single object-safe interface, so the rest of the framework can work
-//! with any LLM backend without knowing the concrete provider.
+//! - **`ApiClient`** — Trait that all LLM provider implementations must satisfy.
+//! - **`error`** — `ApiError` and `ErrorCode` for all API/infrastructure errors.
 //!
-//! # Type Aliases
-//!
-//! - [`BoxedApiClient`] — `Box<dyn ApiClient>`, useful for single ownership.
-//! - [`SharedApiClient`] — `Arc<dyn ApiClient>`, useful for sharing across
-//!   tasks or threads.
-//!
-//! # Provided Implementations
-//!
-//! - Built-in providers ship with the framework.
-//! - A `MockClient` is included in the `tests` module for unit testing.
-//!
-//! # Quick Start
-//!
-//! ```rust,ignore
-//! use loopctl::api_client::ApiClient;
-//! use loopctl::message::Message;
-//!
-//! // Concrete implementation is provided by downstream crates
-//! let client: Box<dyn ApiClient> = get_client();
-//!
-//! // Streaming request
-//! let stream = client.stream_messages(
-//!     vec![Message::user("Hello!")],
-//!     Some("You are helpful.".into()),
-//!     None,
-//! );
-//!
-//! // Non-streaming fallback
-//! let json = client.create_message(
-//!     vec![Message::user("Hello!")],
-//!     Some("You are helpful.".into()),
-//!     None,
-//! ).await?;
-//! ```
+//! See the sub-modules for detailed documentation.
 
-use crate::api_error::ApiError;
+pub mod error;
+use crate::api::error::ApiError;
 use crate::message::Message;
 use crate::stream::StreamEvent;
 use crate::tool::ToolSchema;
@@ -50,9 +15,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// Trait for API clients that communicate with LLM providers.
+/// Interface for API clients that communicate with LLM providers.
 ///
-/// This trait defines the interface for both streaming and non-streaming
+/// Defines the contract for both streaming and non-streaming
 /// message requests. Implementations handle provider-specific details such
 /// as authentication headers, request body formatting, SSE event parsing,
 /// and error code mapping.
@@ -60,17 +25,6 @@ use std::sync::Arc;
 /// The trait is **object-safe**, so clients can be used as
 /// [`BoxedApiClient`] (`Box<dyn ApiClient>`) or [`SharedApiClient`]
 /// (`Arc<dyn ApiClient>`) without issues.
-///
-/// # Lifecycle
-///
-/// ```text
-/// Agent turn begins
-///   → model()                          // identify provider
-///   → stream_messages(messages, ...)   // primary path
-///     or create_message(messages, ...) // fallback / one-shot
-///   → consume StreamEvent items
-///   → turn ends
-/// ```
 ///
 /// # Streaming Contract
 ///
@@ -82,7 +36,7 @@ use std::sync::Arc;
 ///
 /// # Implementors
 ///
-/// - Downstream crates provide Anthropic, OpenAI, Ollama, etc. implementations.
+/// - Downstream crates provide implementations for concrete LLM providers.
 /// - Mock implementations for testing can be found in test utilities.
 ///
 /// # Example
@@ -135,7 +89,7 @@ pub trait ApiClient: Send + Sync {
     /// Returns the provider-specific model string (e.g.,
     /// `"llm-1"`, `"llm-2"`, `"llm-3"`). Used by the
     /// framework for logging, token estimation, and fallback routing via
-    /// [`FallbackManager`](crate::loop_control::fallback::FallbackManager).
+    /// [`FallbackManager`](crate::fallback::FallbackManager).
     ///
     /// Called by the framework during initialization and on each turn for
     /// observability purposes.
@@ -205,16 +159,12 @@ pub trait ApiClient: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>;
 }
 
-// ==================================================
-// Type aliases
-// ==================================================
-
-/// Type alias for a boxed API client with single ownership.
+/// Owned, single-threaded API client handle.
 ///
-/// Represents `Box<dyn ApiClient>`. Use this when you need owned,
-/// single-owner access to a provider client. The underlying client
-/// remains `Send + Sync` (required by the trait), so the box can be
-/// moved across thread boundaries — but it cannot be cloned or shared.
+/// Use when you need owned, single-owner access to a provider client.
+/// The underlying client remains `Send + Sync` (required by the trait),
+/// so the box can be moved across thread boundaries — but it cannot be
+/// cloned or shared.
 ///
 /// Ideal for test fixtures and single-agent runners.
 ///
@@ -228,13 +178,11 @@ pub trait ApiClient: Send + Sync {
 /// ```
 pub type BoxedApiClient = Box<dyn ApiClient>;
 
-/// Type alias for a shared API client with reference-counted ownership.
+/// Shared, reference-counted API client handle.
 ///
-/// Represents `Arc<dyn ApiClient>`. Use this when multiple tasks or
-/// threads need concurrent access to the same provider client — for
-/// example, in a multi-agent system or when sharing a client between
-/// an agent and a background metrics collector. `Arc` provides cheap
-/// cloning (reference count increment) without duplicating the client.
+/// Use when multiple tasks or threads need concurrent access to the
+/// same provider client — for example, in a multi-agent system or when
+/// sharing a client between an agent and a background metrics collector.
 ///
 /// For single-owner usage, see [`BoxedApiClient`].
 ///

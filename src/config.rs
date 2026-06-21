@@ -1,0 +1,87 @@
+//! Agent session configuration.
+//!
+//! Defines [`LoopConfig`] — the configuration struct that controls agent
+//! session parameters such as turn limits, model selection, and context
+//! window size.
+
+use uuid::Uuid;
+
+/// Configuration for an agent session.
+///
+/// Holds generic agent configuration fields that apply to every session
+/// regardless of the specific agent type. Domain-specific configuration
+/// (e.g., ITR engine settings, `ToolShield` rules, fallback model chains)
+/// should live in production-specific config types that embed or wrap
+/// this struct.
+///
+/// # Construction
+///
+/// Use [`LoopConfig::default`] for sensible defaults or override individual
+/// fields through the builder via
+/// `LoopBuilder::with_config`.
+///
+/// ```
+/// use loopctl::config::LoopConfig;
+///
+/// let config = LoopConfig {
+///     max_turns: 50,
+///     model: "default".to_string(),
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Debug, Clone)]
+pub struct LoopConfig {
+    /// Unique session identifier (random UUID v4).
+    pub session_id: Uuid,
+    /// Model identifier (e.g. `"default"`). Passed to the API client on each request.
+    pub model: String,
+    /// Optional system prompt override. `None` means the agent core decides.
+    pub system_prompt: Option<String>,
+    /// Maximum number of turns before forcing completion. Defaults to `200`.
+    pub max_turns: usize,
+    /// Maximum tokens for each API response. Defaults to `16_384`.
+    pub max_tokens: u32,
+    /// Context window size in tokens. Must match the actual window of [`model`](LoopConfig::model). Defaults to `200_000`.
+    pub context_window: u64,
+    /// Threshold to trigger auto-compaction (0.0–1.0). Defaults to `0.80`.
+    pub compact_threshold: f64,
+    /// Whether auto-compaction is enabled. Defaults to `true`.
+    pub auto_compact: bool,
+}
+
+impl Default for LoopConfig {
+    /// Produce a configuration with production-ready defaults.
+    ///
+    /// | Field | Default |
+    /// |-------|---------|
+    /// | [`session_id`](LoopConfig::session_id) | Random UUID v4 |
+    /// | [`model`](LoopConfig::model) | `"default"` |
+    /// | [`system_prompt`](LoopConfig::system_prompt) | `None` |
+    /// | [`max_turns`](LoopConfig::max_turns) | `200` |
+    /// | [`max_tokens`](LoopConfig::max_tokens) | `16_384` |
+    /// | [`context_window`](LoopConfig::context_window) | `200_000` |
+    /// | [`compact_threshold`](LoopConfig::compact_threshold) | `0.80` |
+    /// | [`auto_compact`](LoopConfig::auto_compact) | `true` |
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::config::LoopConfig;
+    ///
+    /// let config = LoopConfig::default();
+    /// assert_eq!(config.max_turns, 200);
+    /// assert_eq!(config.model, "default");
+    /// ```
+    fn default() -> Self {
+        Self {
+            session_id: Uuid::new_v4(),
+            model: "default".to_string(),
+            system_prompt: None,
+            max_turns: 200,
+            max_tokens: 16_384,
+            context_window: 200_000,
+            compact_threshold: 0.80,
+            auto_compact: true,
+        }
+    }
+}

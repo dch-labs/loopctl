@@ -1,6 +1,6 @@
 //! Tool Safety Shield — multi-turn adversarial defense.
 //!
-//! This module provides the [`ToolSafetyShield`] trait — a generic,
+//! [`ToolSafetyShield`] trait — a generic,
 //! platform-agnostic boundary for evaluating tool call safety — and a
 //! reference [`UnixShield`] implementation that matches dangerous Unix
 //! shell patterns.
@@ -356,18 +356,14 @@ impl UnixShield {
         }
     }
 
-    /// Create a shield with custom thresholds.
+    /// Set custom warn and block thresholds.
     ///
     /// Values are clamped to `[0.0, 1.0]`.
     #[must_use]
-    pub fn with_thresholds(warn: f32, block: f32) -> Self {
-        Self {
-            warn_threshold: warn.clamp(0.0, 1.0),
-            block_threshold: block.clamp(0.0, 1.0),
-            turn_history: Mutex::new(Vec::new()),
-            patterns: Self::unix_patterns(),
-            combination_rules: Self::unix_combination_rules(),
-        }
+    pub fn with_thresholds(mut self, warn: f32, block: f32) -> Self {
+        self.warn_threshold = warn.clamp(0.0, 1.0);
+        self.block_threshold = block.clamp(0.0, 1.0);
+        self
     }
 
     /// Create a builder for a shield with custom patterns and rules.

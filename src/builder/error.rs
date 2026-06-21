@@ -32,9 +32,9 @@
 /// actionable error message (e.g. which features conflict, how many
 /// observers exceeded the limit).
 ///
-/// # When this is returned
+/// # Validation invariants
 ///
-/// The builder validates the following invariants at build time:
+/// The builder checks the following at build time:
 ///
 /// - A core implementation must be present (enforced statically in most cases,
 ///   but checked dynamically for edge cases).
@@ -70,7 +70,7 @@ pub enum BuildError {
     /// Configuration is invalid.
     ///
     /// Wraps a human-readable description of what makes the current
-    /// `AgentConfig` invalid — for example, a
+    /// `LoopConfig` invalid — for example, a
     /// `max_turns` value of zero or a malformed model identifier.
     ///
     /// **Fix:** Adjust the config passed to `.with_config()`.

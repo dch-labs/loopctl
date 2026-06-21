@@ -19,19 +19,6 @@
 //! [`ConvergenceConfig::window_size`], convergence is flagged and the
 //! configured [`ConvergenceAction`] is returned.
 //!
-//! # Detection Flow
-//!
-//! ```text
-//! add_response(text)
-//!   ├─ disabled or empty? → return no_convergence()
-//!   ├─ for each prev in window:
-//!   │     compute Jaccard similarity(text, prev)
-//!   │     if similarity >= threshold → increment consecutive_count
-//!   │     else → reset consecutive_count to 1
-//!   ├─ push text into window (evict oldest if full)
-//!   └─ if consecutive_count >= window_size → return converged status
-//! ```
-//!
 //! # Provided Types
 //!
 //! - **[`ConvergenceConfig`]** — Configuration: window size, similarity
@@ -54,7 +41,7 @@
 //! # Quick Start
 //!
 //! ```rust
-//! use loopctl::loop_control::convergence::{
+//! use loopctl::detection::convergence::{
 //!     ConvergenceConfig, ConvergenceDetector, ConvergenceAction,
 //! };
 //!
@@ -72,7 +59,7 @@
 //! let status = detector.add_response("I am working on the task.");
 //! let status = detector.add_response("I am working on the task.");
 //! assert!(status.detected); // 3 consecutive similar responses
-//! # Ok::<(), loopctl::loop_control::convergence::ConvergenceConfigError>(())
+//! # Ok::<(), loopctl::detection::convergence::ConvergenceConfigError>(())
 //! ```
 
 use std::collections::HashSet;
@@ -103,16 +90,11 @@ use serde::{Deserialize, Serialize};
 /// | Interactive / REPL session     | [`AskUser`](ConvergenceAction::AskUser)         |
 /// | Long context / token budget    | [`Compact`](ConvergenceAction::Compact)         |
 ///
-/// # Serde
-///
-/// This enum derives [`Serialize`] and [`Deserialize`] so it can be
-/// loaded from TOML/JSON configuration files. Variant names are serialized
-/// in `snake_case` (e.g., `"switch_phase"`).
 ///
 /// # Example
 ///
 /// ```rust
-/// use loopctl::loop_control::convergence::ConvergenceAction;
+/// use loopctl::detection::convergence::ConvergenceAction;
 ///
 /// let action = ConvergenceAction::Warn;
 /// match action {
@@ -129,7 +111,7 @@ pub enum ConvergenceAction {
     /// Stop the agent loop entirely.
     ///
     /// The agent has converged and is unlikely to make further progress.
-    /// This is the safest default — the caller should report the situation
+    /// Default action — halt the agent loop and report the situation
     /// to the user and await new instructions.
     ///
     /// The `DetectionManager` will
@@ -153,7 +135,7 @@ pub enum ConvergenceAction {
     /// the converged pattern.
     ///
     /// The specific phase transition is left to the caller's discretion;
-    /// the detector simply signals that the current strategy has stagnated.
+    /// the detector signals that the current strategy has stagnated.
     SwitchPhase,
 
     /// Ask the user for guidance before continuing.
@@ -175,7 +157,7 @@ pub enum ConvergenceAction {
     /// turns, keeping only the most recent N exchanges, or pruning
     /// low-relevance messages).
     ///
-    /// This is useful when convergence is caused by the agent repeatedly
+    /// Useful when convergence is caused by the agent repeatedly
     /// revisiting earlier context — compaction removes the redundant
     /// history that may be driving the repetition.
     Compact,
@@ -195,7 +177,7 @@ pub enum ConvergenceAction {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::loop_control::convergence::{ConvergenceConfig, ConvergenceDetector, ConvergenceConfigError};
+/// use loopctl::detection::convergence::{ConvergenceConfig, ConvergenceDetector, ConvergenceConfigError};
 ///
 /// let bad_config = ConvergenceConfig {
 ///     window_size: 1,
@@ -211,20 +193,14 @@ pub enum ConvergenceConfigError {
     /// Convergence requires at least one pair of consecutive responses,
     /// so a window of 1 (or 0) is meaningless.
     #[error("window_size must be at least 2, got {actual}")]
-    WindowTooSmall {
-        /// The invalid value that was provided.
-        actual: usize,
-    },
+    WindowTooSmall { actual: usize },
 
     /// `similarity_threshold` is outside the valid range `[0.0, 1.0]`.
     ///
     /// Jaccard similarity always produces a value in this range; a
     /// threshold outside it would never (or always) trigger.
     #[error("similarity_threshold must be in [0.0, 1.0], got {actual}")]
-    ThresholdOutOfRange {
-        /// The invalid value that was provided.
-        actual: f32,
-    },
+    ThresholdOutOfRange { actual: f32 },
 }
 
 // ===================================================
@@ -235,11 +211,6 @@ pub enum ConvergenceConfigError {
 ///
 /// Controls the sensitivity and behavior of the [`ConvergenceDetector`].
 /// Passed to [`ConvergenceDetector::new`] at construction time.
-///
-/// # Derives
-///
-/// [`Debug`] for logging, [`Clone`] for sharing config across detectors,
-/// and [`Serialize`]/[`Deserialize`] for loading from config files.
 ///
 /// # Defaults
 ///
@@ -263,7 +234,7 @@ pub enum ConvergenceConfigError {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::loop_control::convergence::{ConvergenceConfig, ConvergenceAction, ConvergenceDetector};
+/// use loopctl::detection::convergence::{ConvergenceConfig, ConvergenceAction, ConvergenceDetector};
 ///
 /// let config = ConvergenceConfig {
 ///     enabled: true,
@@ -272,66 +243,17 @@ pub enum ConvergenceConfigError {
 ///     on_converge: ConvergenceAction::Warn,
 /// };
 /// let detector = ConvergenceDetector::new(config)?;
-/// # Ok::<(), loopctl::loop_control::convergence::ConvergenceConfigError>(())
+/// # Ok::<(), loopctl::detection::convergence::ConvergenceConfigError>(())
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConvergenceConfig {
-    /// Whether convergence detection is active.
-    ///
-    /// When `false`, [`ConvergenceDetector::add_response`] and
-    /// [`ConvergenceDetector::check_convergence`] return
-    /// [`ConvergenceStatus::no_convergence`] immediately without performing
-    /// any computation.
-    ///
-    /// Defaults to `true`.
-    ///
-    /// # When to Disable
-    ///
-    /// Set to `false` in performance-critical paths where similarity
-    /// computation overhead is unacceptable, or when the agent's task
-    /// domain makes convergence impossible by design.
+    /// Whether convergence detection is active. Defaults to `true`.
     pub enabled: bool,
-
-    /// Number of consecutive similar responses required to declare convergence.
-    ///
-    /// The detector maintains a sliding window of this size. When every
-    /// response in the window exceeds [`ConvergenceConfig::similarity_threshold`]
-    /// relative to its neighbours, convergence is detected.
-    ///
-    /// Defaults to `3`.
-    ///
-    /// # Constraints
-    ///
-    /// Must be at least `2`. Values below `2` are meaningless since
-    /// convergence requires at least one pair of consecutive responses.
+    /// Consecutive similar responses required to declare convergence. Must be ≥ 2. Defaults to `3`.
     pub window_size: usize,
-
-    /// Similarity threshold (0.0–1.0) above which two responses are considered
-    /// "similar".
-    ///
-    /// Computed via Jaccard similarity on word-level tokens (see
-    /// [`ConvergenceDetector::compute_similarity`]). A value of `1.0` requires
-    /// exact word-set matches; `0.0` considers any two non-empty strings similar.
-    ///
-    /// Defaults to `0.95`.
-    ///
-    /// # Invariant
-    ///
-    /// Must be in the range `0.0..=1.0`. Values outside this range will
-    /// not panic but produce nonsensical results.
+    /// Jaccard similarity threshold (0.0–1.0). Defaults to `0.95`.
     pub similarity_threshold: f32,
-
-    /// Action to take when convergence is detected.
-    ///
-    /// Carried through to [`ConvergenceStatus::action`] so the caller can
-    /// respond appropriately. See [`ConvergenceAction`] for available options.
-    ///
-    /// Defaults to [`ConvergenceAction::Stop`].
-    ///
-    /// # Serde
-    ///
-    /// Uses `#[serde(default)]` so missing fields in TOML/JSON deserialize
-    /// to [`ConvergenceAction::Stop`].
+    /// Action on convergence. Defaults to [`ConvergenceAction::Stop`].
     #[serde(default)]
     pub on_converge: ConvergenceAction,
 }
@@ -341,17 +263,17 @@ impl Default for ConvergenceConfig {
     ///
     /// The defaults are tuned for typical agent workloads:
     ///
-    /// | Field | Default |
-    /// |-------|---------|
-    /// | [`enabled`](ConvergenceConfig::enabled) | `true` |
-    /// | [`window_size`](ConvergenceConfig::window_size) | `3` |
-    /// | [`similarity_threshold`](ConvergenceConfig::similarity_threshold) | `0.95` |
-    /// | [`on_converge`](ConvergenceConfig::on_converge) | [`ConvergenceAction::Stop`] |
+    /// | Field                                                             | Default                     |
+    /// |-------------------------------------------------------------------|-----------------------------|
+    /// | [`enabled`](ConvergenceConfig::enabled)                           | `true`                      |
+    /// | [`window_size`](ConvergenceConfig::window_size)                   | `3`                         |
+    /// | [`similarity_threshold`](ConvergenceConfig::similarity_threshold) | `0.95`                      |
+    /// | [`on_converge`](ConvergenceConfig::on_converge)                   | [`ConvergenceAction::Stop`] |
     ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::convergence::ConvergenceConfig;
+    /// use loopctl::detection::convergence::ConvergenceConfig;
     ///
     /// let config = ConvergenceConfig::default();
     /// assert!(config.enabled);
@@ -380,28 +302,13 @@ impl Default for ConvergenceConfig {
 /// # Construction
 ///
 /// Use [`ConvergenceStatus::no_convergence`] to create a "no convergence"
-/// sentinel. A "converged" status is constructed internally by the detector
+/// sentinel. A "converged" status is returned by the detector
 /// when the [`ConvergenceConfig::window_size`] threshold is met.
-///
-/// # Derives
-///
-/// [`Debug`] for diagnostic output, [`Clone`] for sharing results, and
-/// [`Default`] which produces the same value as [`no_convergence`](ConvergenceStatus::no_convergence).
-///
-/// # Fields Overview
-///
-/// ```text
-/// detected ──────────── true if convergence reached
-/// consecutive_count ─── how many similar responses in a row
-/// similarity_score ──── highest Jaccard score among compared pairs
-/// similar_responses ─── the response texts that triggered detection
-/// action ────────────── what the caller should do (stop, warn, ...)
-/// ```
 ///
 /// # Example
 ///
 /// ```rust
-/// use loopctl::loop_control::convergence::{ConvergenceConfig, ConvergenceDetector};
+/// use loopctl::detection::convergence::{ConvergenceConfig, ConvergenceDetector};
 ///
 /// let config = ConvergenceConfig {
 ///     window_size: 3,
@@ -417,58 +324,19 @@ impl Default for ConvergenceConfig {
 ///     println!("Similarity: {:.2}%", status.similarity_score * 100.0);
 ///     println!("Action: {:?}", status.action);
 /// }
-/// # Ok::<(), loopctl::loop_control::convergence::ConvergenceConfigError>(())
+/// # Ok::<(), loopctl::detection::convergence::ConvergenceConfigError>(())
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct ConvergenceStatus {
-    /// Whether convergence was detected.
-    ///
-    /// `true` when [`ConvergenceStatus::consecutive_count`] is at least
-    /// [`ConvergenceConfig::window_size`], meaning the agent has produced
-    /// enough consecutive similar responses to warrant action.
-    ///
-    /// When `false`, the other fields still contain valid data (streak count,
-    /// latest similarity score, etc.) but should not be treated as a
-    /// convergence signal.
+    /// `true` when `consecutive_count >= window_size`. Other fields still valid when `false`.
     pub detected: bool,
-
-    /// Number of consecutive similar responses observed so far.
-    ///
-    /// Resets to `1` whenever a response falls below
-    /// [`ConvergenceConfig::similarity_threshold`]. Monotonically increases
-    /// while responses remain similar.
-    ///
-    /// Compare against [`ConvergenceConfig::window_size`] to determine
-    /// how close the detector is to declaring convergence.
+    /// Resets to `1` when similarity falls below threshold.
     pub consecutive_count: usize,
-
-    /// Highest Jaccard similarity score (0.0–1.0) among the compared pairs.
-    ///
-    /// Useful for diagnostics: a score of `0.99` means the responses are
-    /// nearly identical; a lower score like `0.75` suggests the detector
-    /// is barely triggering and the threshold may need tuning.
-    ///
-    /// Computed by [`ConvergenceDetector::compute_similarity`] during
-    /// [`ConvergenceDetector::add_response`]. Always `0.0` when returned
-    /// from [`ConvergenceDetector::check_convergence`] since no new
-    /// comparison is performed.
+    /// Highest Jaccard similarity (0.0–1.0). `0.0` when no comparison was made.
     pub similarity_score: f32,
-
-    /// The response strings that contributed to the convergence detection.
-    ///
-    /// Contains deduplicated copies of the recent responses that exceeded
-    /// the similarity threshold. Useful for logging and user-facing reports.
-    ///
-    /// Cleared whenever a dissimilar response breaks the streak, so the
-    /// collection only contains responses from the *current* streak.
+    /// Responses that exceeded the similarity threshold. Cleared on dissimilar response.
     pub similar_responses: Vec<String>,
-
-    /// The configured action to take, forwarded from
-    /// [`ConvergenceConfig::on_converge`].
-    ///
-    /// The caller should inspect this field to decide how to respond (stop,
-    /// warn, switch phase, or ask the user). See [`ConvergenceAction`] for
-    /// the full list of variants and their semantics.
+    /// Forwarded from [`ConvergenceConfig::on_converge`]; see [`ConvergenceAction`].
     pub action: ConvergenceAction,
 }
 
@@ -484,7 +352,7 @@ impl ConvergenceStatus {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::convergence::ConvergenceStatus;
+    /// use loopctl::detection::convergence::ConvergenceStatus;
     ///
     /// let status = ConvergenceStatus::no_convergence();
     /// assert!(!status.detected);
@@ -518,43 +386,10 @@ impl ConvergenceStatus {
 /// Prefer [`ConvergenceDetector::new`] with a custom [`ConvergenceConfig`],
 /// or [`ConvergenceDetector::default_detector`] for sensible defaults.
 ///
-/// # Internal Architecture
-///
-/// ```text
-/// ┌─────────────────────────────────────────────────┐
-/// │           ConvergenceDetector                   │
-/// │                                                 │
-/// │  config: ConvergenceConfig                      │
-/// │  window: VecDeque<String>  ←─ sliding window    │
-/// │  consecutive_count: usize                       │
-/// │  similar_responses: Vec<String>                 │
-/// │                                                 │
-/// │  Methods:                                       │
-/// │    add_response() → ConvergenceStatus           │
-/// │    check_convergence() → ConvergenceStatus      │
-/// │    compute_similarity() → f32                   │
-/// │    clear()                                      │
-/// └─────────────────────────────────────────────────┘
-/// ```
-///
-/// # Derives
-///
-/// [`Debug`] for diagnostic output. Not [`Clone`] — the detector holds
-/// mutable state and should be used as a single instance.
-///
-/// # Lifecycle
-///
-/// ```text
-/// new(config)
-///   → add_response(response)   [repeated, returns ConvergenceStatus]
-///   → check_convergence()      [optional, peek without adding]
-///   → clear()                  [reset for a new task]
-/// ```
-///
 /// # Example
 ///
 /// ```rust
-/// use loopctl::loop_control::convergence::ConvergenceDetector;
+/// use loopctl::detection::convergence::ConvergenceDetector;
 ///
 /// let mut detector = ConvergenceDetector::default_detector()?;
 ///
@@ -568,52 +403,17 @@ impl ConvergenceStatus {
 /// // Reset for a fresh start
 /// detector.clear();
 /// assert!(detector.window().is_empty());
-/// # Ok::<(), loopctl::loop_control::convergence::ConvergenceConfigError>(())
+/// # Ok::<(), loopctl::detection::convergence::ConvergenceConfigError>(())
 /// ```
 #[derive(Debug)]
 pub struct ConvergenceDetector {
-    /// Configuration controlling thresholds and actions.
-    ///
-    /// Set once at construction via [`ConvergenceDetector::new`] and read
-    /// on every call to [`ConvergenceDetector::add_response`]. Immutable
-    /// for the lifetime of the detector — create a new detector to change
-    /// configuration.
+    /// Immutable config set at construction.
     config: ConvergenceConfig,
-
-    /// Sliding window of recent response strings.
-    ///
-    /// Bounded by [`ConvergenceConfig::window_size`]. When full, the oldest
-    /// entry is evicted before a new one is appended. Accessed by the
-    /// `DetectionManager` for
-    /// direct inspection during testing.
-    ///
-    /// The deque is ordered chronologically: index `0` is the oldest
-    /// response, and the last index is the most recent.
-    ///
-    /// # Capacity
-    ///
-    /// Pre-allocated to [`ConvergenceConfig::window_size`] at construction
-    /// to avoid frequent heap allocations during steady-state operation.
+    /// Bounded by `window_size`, ordered oldest→newest.
     pub(super) window: VecDeque<String>,
-
-    /// Number of consecutive responses that exceeded the similarity threshold.
-    ///
-    /// Resets to `1` when a response is sufficiently different from its
-    /// predecessor. When this reaches [`ConvergenceConfig::window_size`],
-    /// convergence is declared.
-    ///
-    /// This field is the internal counterpart of
-    /// [`ConvergenceStatus::consecutive_count`].
+    /// Resets to `1` on dissimilar response; convergence at `window_size`.
     pub(super) consecutive_count: usize,
-
-    /// Deduplicated collection of responses deemed "similar" so far.
-    ///
-    /// Grows as consecutive similar responses are observed and is cleared
-    /// whenever a dissimilar response breaks the streak. Reported in
-    /// [`ConvergenceStatus::similar_responses`] for diagnostics.
-    ///
-    /// Only unique strings are stored — duplicate responses are filtered
-    /// to keep the collection compact.
+    /// Deduplicated similar responses; cleared when streak breaks.
     similar_responses: Vec<String>,
 }
 
@@ -626,9 +426,6 @@ impl ConvergenceDetector {
     /// [`ConvergenceConfigError::ThresholdOutOfRange`] if
     /// [`ConvergenceConfig::similarity_threshold`] is outside `[0.0, 1.0]`.
     ///
-    /// Pre-allocates the internal window to
-    /// [`ConvergenceConfig::window_size`] capacity.
-    ///
     /// The detector starts with an empty window and a zero consecutive
     /// count — no convergence can be detected until at least
     /// `window_size` responses have been added.
@@ -636,7 +433,7 @@ impl ConvergenceDetector {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::convergence::{ConvergenceConfig, ConvergenceDetector};
+    /// use loopctl::detection::convergence::{ConvergenceConfig, ConvergenceDetector};
     ///
     /// let config = ConvergenceConfig {
     ///     window_size: 5,
@@ -644,13 +441,13 @@ impl ConvergenceDetector {
     ///     ..Default::default()
     /// };
     /// let detector = ConvergenceDetector::new(config)?;
-    /// # Ok::<(), loopctl::loop_control::convergence::ConvergenceConfigError>(())
+    /// # Ok::<(), loopctl::detection::convergence::ConvergenceConfigError>(())
     /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`ConvergenceConfigError::WindowTooSmall`] if
-    /// `window_size < 2`, or [`ConvergenceConfigError::ThresholdOutOfRange`]
+    /// Returns [`ConvergenceConfigError::WindowTooSmall`] if `window_size < 2`,
+    /// or [`ConvergenceConfigError::ThresholdOutOfRange`]
     /// if `similarity_threshold` is outside `[0.0, 1.0]`.
     pub fn new(config: ConvergenceConfig) -> Result<Self, ConvergenceConfigError> {
         if config.window_size < 2 {
@@ -692,24 +489,23 @@ impl ConvergenceDetector {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::convergence::ConvergenceDetector;
+    /// use loopctl::detection::convergence::ConvergenceDetector;
     ///
     /// let detector = ConvergenceDetector::default_detector()?;
-    /// # Ok::<(), loopctl::loop_control::convergence::ConvergenceConfigError>(())
+    /// # Ok::<(), loopctl::detection::convergence::ConvergenceConfigError>(())
     /// ```
     ///
     /// # Errors
     ///
     /// Returns [`ConvergenceConfigError`] if the default config fails
-    /// validation. This should never happen — the defaults are hard-coded
-    /// to be valid.
+    /// validation.
     pub fn default_detector() -> Result<Self, ConvergenceConfigError> {
         Self::new(ConvergenceConfig::default())
     }
 
     /// Add a response and check for convergence in one step.
     ///
-    /// This is the primary entry point. The response is compared against
+    /// Primary entry point. The response is compared against
     /// every prior response in the window. If any comparison exceeds
     /// [`ConvergenceConfig::similarity_threshold`], the consecutive count
     /// is incremented; otherwise it resets to `1`.
@@ -728,34 +524,21 @@ impl ConvergenceDetector {
     /// If [`ConvergenceConfig::enabled`] is `false` or `response` is empty,
     /// returns [`ConvergenceStatus::no_convergence`] immediately.
     ///
-    /// # Side Effects
-    ///
-    /// Modifies the internal sliding window, consecutive counter, and
-    /// similar-responses collection. If the window is full, the oldest
-    /// entry is evicted.
-    ///
-    /// # Performance
-    ///
-    /// Each call performs `O(window_size)` similarity comparisons.
-    /// For a typical window of 3, this is negligible; for large windows
-    /// (e.g., 50), consider whether the overhead is acceptable.
-    ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::convergence::ConvergenceDetector;
+    /// use loopctl::detection::convergence::ConvergenceDetector;
     ///
     /// let mut detector = ConvergenceDetector::default_detector()?;
     /// let status = detector.add_response("Working on task...");
     /// assert!(!status.detected); // First response, no comparison possible
-    /// # Ok::<(), loopctl::loop_control::convergence::ConvergenceConfigError>(())
+    /// # Ok::<(), loopctl::detection::convergence::ConvergenceConfigError>(())
     /// ```
     pub fn add_response(&mut self, response: &str) -> ConvergenceStatus {
         if !self.config.enabled || response.is_empty() {
             return ConvergenceStatus::no_convergence();
         }
 
-        // Check similarity with previous responses
         let mut max_similarity = 0.0;
         for prev_response in &self.window {
             let similarity = Self::compute_similarity(response, prev_response);
@@ -769,20 +552,17 @@ impl ConvergenceDetector {
                     self.similar_responses.push(response.to_string());
                 }
             } else {
-                // Response is different, reset counter
                 self.consecutive_count = 1;
                 self.similar_responses.clear();
                 self.similar_responses.push(response.to_string());
             }
         }
 
-        // Add to window
         if self.window.len() >= self.config.window_size {
             self.window.pop_front();
         }
         self.window.push_back(response.to_string());
 
-        // Check if converged
         let detected = self.consecutive_count >= self.config.window_size;
 
         ConvergenceStatus {
@@ -798,7 +578,7 @@ impl ConvergenceDetector {
     ///
     /// Inspects the current window and consecutive count to determine
     /// whether convergence has already been reached. Does not modify
-    /// internal state.
+    /// detector state.
     ///
     /// # Returns
     ///
@@ -809,7 +589,7 @@ impl ConvergenceDetector {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::convergence::{ConvergenceConfig, ConvergenceDetector};
+    /// use loopctl::detection::convergence::{ConvergenceConfig, ConvergenceDetector};
     ///
     /// let config = ConvergenceConfig {
     ///     window_size: 3,
@@ -822,7 +602,7 @@ impl ConvergenceDetector {
     /// detector.add_response("Response three about bananas");
     /// let status = detector.check_convergence();
     /// assert!(!status.detected);
-    /// # Ok::<(), loopctl::loop_control::convergence::ConvergenceConfigError>(())
+    /// # Ok::<(), loopctl::detection::convergence::ConvergenceConfigError>(())
     /// ```
     #[must_use]
     pub fn check_convergence(&self) -> ConvergenceStatus {
@@ -852,14 +632,14 @@ impl ConvergenceDetector {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::loop_control::convergence::ConvergenceDetector;
+    /// use loopctl::detection::convergence::ConvergenceDetector;
     ///
     /// let mut detector = ConvergenceDetector::default_detector()?;
     /// detector.add_response("task in progress");
     /// detector.clear();
     /// assert!(detector.window().is_empty());
     /// assert_eq!(detector.consecutive_count(), 0);
-    /// # Ok::<(), loopctl::loop_control::convergence::ConvergenceConfigError>(())
+    /// # Ok::<(), loopctl::detection::convergence::ConvergenceConfigError>(())
     /// ```
     pub fn clear(&mut self) {
         self.window.clear();
@@ -874,7 +654,7 @@ impl ConvergenceDetector {
     ///
     /// # Returns
     ///
-    /// A reference to the internal [`VecDeque`] of response strings.
+    /// A reference to the [`VecDeque`] of response strings.
     /// The deque is ordered from oldest to newest.
     #[must_use]
     pub fn window(&self) -> &VecDeque<String> {
@@ -897,7 +677,7 @@ impl ConvergenceDetector {
 
     /// Get the number of consecutive similar responses.
     ///
-    /// This is the current streak counter. When it reaches
+    /// Current streak counter. When it reaches
     /// [`ConvergenceConfig::window_size`], convergence is detected.
     ///
     /// # Returns
@@ -915,25 +695,7 @@ impl ConvergenceDetector {
     /// spaces), splits into word sets, then computes the ratio of
     /// intersection size to union size.
     ///
-    /// # Algorithm
-    ///
-    /// ```text
-    /// Jaccard(A, B) = |A ∩ B| / |A ∪ B|
-    ///
-    /// Example:  A = {hello, world}
-    ///           B = {hello, there}
-    ///           Intersection = {hello}     → |1|
-    ///           Union       = {hello, world, there} → |3|
-    ///           Jaccard = 1/3 ≈ 0.33
-    /// ```
-    ///
     /// Returns `0.0` if either input is empty.
-    ///
-    /// # Normalization
-    ///
-    /// Before comparison, both strings are passed through
-    /// the internal `normalize_text` helper to produce a canonical
-    /// lowercased, alphanumeric-only form.
     #[allow(clippy::cast_precision_loss)]
     #[must_use]
     pub fn compute_similarity(a: &str, b: &str) -> f32 {
@@ -962,11 +724,6 @@ impl ConvergenceDetector {
         intersection as f32 / union as f32
     }
 
-    /// Normalize text for similarity comparison.
-    ///
-    /// Lowercases the input and replaces non-alphanumeric characters with
-    /// spaces, producing a canonical form suitable for word-level Jaccard
-    /// comparison via [`ConvergenceDetector::compute_similarity`].
     fn normalize_text(text: &str) -> String {
         text.to_lowercase()
             .chars()
@@ -978,16 +735,10 @@ impl ConvergenceDetector {
 impl Default for ConvergenceDetector {
     /// Produce a [`ConvergenceDetector`] with the default [`ConvergenceConfig`].
     ///
-    /// Constructs the detector directly using struct-literal syntax, bypassing
-    /// [`ConvergenceDetector::new`]'s validation. This is safe because the
-    /// default config uses `window_size: 3` (≥ 2) and
-    /// `similarity_threshold: 0.95` (in `0.0..=1.0`), which satisfy all
-    /// validation invariants.
-    ///
     /// This impl exists so that parent types (e.g. [`DetectionManager`]) can
     /// derive or delegate `Default` without going through a fallible constructor.
     ///
-    /// [`DetectionManager`]: crate::loop_control::detection::DetectionManager
+    /// [`DetectionManager`]: crate::detection::manager::DetectionManager
     fn default() -> Self {
         let config = ConvergenceConfig::default();
         let window_capacity = config.window_size;

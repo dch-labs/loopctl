@@ -7,14 +7,14 @@
 #[cfg(feature = "hooks")]
 use super::HookAction;
 use super::{
-    AgentError, ApiClient, Arc, BareLoop, Duration, Instant, PermissionCheck, RecoveryAction,
-    ReflectionContext, ToolCallInfo, ToolContent, ToolContext, ToolDispatchContext,
-    ToolDispatchResult, ToolPipeline,
+    ApiClient, Arc, BareLoop, Correction, CorrectionResult, Duration, Instant, LoopError,
+    PermissionCheck, RecoveryAction, ReflectionContext, ToolCallInfo, ToolContent, ToolContext,
+    ToolDispatchContext, ToolDispatchResult, ToolPipeline,
 };
 #[cfg(feature = "hooks")]
 use super::{PostToolUseContext, PreToolUseContext};
-use crate::core::observer::{ToolPostContext, ToolPreContext};
-use crate::loop_control::loop_detector::{self, Operation};
+use crate::detection::loop_detector::{self, Operation};
+use crate::observer::{ToolPostContext, ToolPreContext};
 
 /// Result of deciding what to do after a tool error during recovery.
 ///
@@ -37,7 +37,7 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Tool execution is **sequential** so that cancellation can be
     /// checked between invocations. A tool that is not found in the
-    /// registry produces a soft error result (not a hard [`AgentError`]),
+    /// registry produces a soft error result (not a hard [`LoopError`]),
     /// allowing the model to recover.
     ///
     /// When a tool returns an error (execution failure or not-found),
@@ -46,22 +46,22 @@ impl<C: ApiClient> BareLoop<C> {
     /// attempts use the delay specified by the [`RecoveryAction`].
     ///
     /// Observers are notified before and after each tool invocation via
-    /// [`LoopObserver::on_tool_pre`](crate::core::observer::LoopObserver::on_tool_pre) and
-    /// [`LoopObserver::on_tool_post`](crate::core::observer::LoopObserver::on_tool_post).
+    /// [`LoopObserver::on_tool_pre`](crate::observer::LoopObserver::on_tool_pre) and
+    /// [`LoopObserver::on_tool_post`](crate::observer::LoopObserver::on_tool_post).
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::Cancelled`] if the cancellation flag is set
+    /// Returns [`LoopError::Cancelled`] if the cancellation flag is set
     /// between tool invocations.
     pub(super) async fn dispatch_tools(
         &self,
         tool_calls: &[ToolCallInfo],
         turn_idx: usize,
-    ) -> Result<Vec<ToolDispatchResult>, AgentError> {
+    ) -> Result<Vec<ToolDispatchResult>, LoopError> {
         let mut results = Vec::with_capacity(tool_calls.len());
         for tc in tool_calls {
             if self.is_cancelled() {
-                return Err(AgentError::Cancelled);
+                return Err(LoopError::Cancelled);
             }
             let result = self.dispatch_tool_with_recovery(tc, turn_idx).await?;
             results.push(result);
@@ -86,19 +86,20 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::Cancelled`] if the cancellation signal fires
+    /// Returns [`LoopError::Cancelled`] if the cancellation signal fires
     /// during tool execution or between retry attempts.
     async fn dispatch_tool_with_recovery(
         &self,
         tc: &ToolCallInfo,
         turn_idx: usize,
-    ) -> Result<ToolDispatchResult, AgentError> {
+    ) -> Result<ToolDispatchResult, LoopError> {
         let tool_context = self.build_tool_context();
         let mut attempt: u32 = 0;
+        let mut tc = tc.clone();
 
         loop {
             if self.is_cancelled() {
-                return Err(AgentError::Cancelled);
+                return Err(LoopError::Cancelled);
             }
 
             self.managers.observers().on_tool_pre(&ToolPreContext {
@@ -107,20 +108,20 @@ impl<C: ApiClient> BareLoop<C> {
                 tool_call_id: tc.id.clone(),
             });
 
-            if let Some(blocked) = self.check_pre_tool_use_hooks(tc, turn_idx) {
+            if let Some(blocked) = self.check_pre_tool_use_hooks(&tc, turn_idx) {
                 return Ok(blocked);
             }
 
-            if let Some(blocked) = self.pre_detection(tc, turn_idx) {
+            if let Some(blocked) = self.pre_detection(&tc, turn_idx) {
                 return Ok(blocked);
             }
 
             let start = Instant::now();
             let tool_result = self
-                .dispatch_tool(tc, &tool_context, start, turn_idx)
+                .dispatch_tool(&tc, &tool_context, start, turn_idx)
                 .await?;
 
-            self.post_detection(tc, &tool_result);
+            self.post_detection(&tc, &tool_result);
             self.managers.observers().on_tool_post(&ToolPostContext {
                 turn: turn_idx,
                 tool: tc.name.clone(),
@@ -128,7 +129,7 @@ impl<C: ApiClient> BareLoop<C> {
                 is_error: tool_result.is_error,
                 duration: tool_result.duration,
             });
-            self.notify_post_tool_use_hooks(tc, &tool_result, turn_idx);
+            self.notify_post_tool_use_hooks(&tc, &tool_result, turn_idx);
             self.record_tool_health(tc.name.as_str(), &tool_result);
 
             if !tool_result.is_error {
@@ -136,12 +137,24 @@ impl<C: ApiClient> BareLoop<C> {
             }
 
             match self
-                .recovery_wait_or_return(tc, &tool_result, attempt)
+                .recovery_wait_or_return(&tc, &tool_result, attempt)
                 .await
             {
-                Ok(next_attempt) => attempt = next_attempt,
+                Ok((next_attempt, correction)) => {
+                    attempt = next_attempt;
+                    if let Some(ref correction) = correction {
+                        let correction_result = tc.apply_correction(correction, &tool_result);
+                        if let CorrectionResult::Failed(msg) = &correction_result {
+                            tracing::warn!(
+                                tool = %tc.name,
+                                error = %msg,
+                                "correction failed to produce a usable retry"
+                            );
+                        }
+                    }
+                }
                 Err(RecoveryOutcome::SoftError(returned_result)) => return Ok(returned_result),
-                Err(RecoveryOutcome::Cancelled) => return Err(AgentError::Cancelled),
+                Err(RecoveryOutcome::Cancelled) => return Err(LoopError::Cancelled),
             }
         }
     }
@@ -207,7 +220,7 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::Cancelled`] if the cancel signal fires
+    /// Returns [`LoopError::Cancelled`] if the cancel signal fires
     /// during tool execution.
     async fn dispatch_tool(
         &self,
@@ -215,7 +228,7 @@ impl<C: ApiClient> BareLoop<C> {
         tool_context: &ToolContext,
         start: Instant,
         turn_idx: usize,
-    ) -> Result<ToolDispatchResult, AgentError> {
+    ) -> Result<ToolDispatchResult, LoopError> {
         if let Some(ref pipeline) = self.pipeline {
             return self
                 .dispatch_via_pipeline(pipeline, tc, tool_context, turn_idx)
@@ -227,7 +240,7 @@ impl<C: ApiClient> BareLoop<C> {
             let call_result = tokio::select! {
                 r = tool.call(tc.input.clone(), tool_context) => r,
                 () = cancel.notified() => {
-                    return Err(AgentError::Cancelled);
+                    return Err(LoopError::Cancelled);
                 }
             };
             match call_result {
@@ -267,7 +280,7 @@ impl<C: ApiClient> BareLoop<C> {
     fn tool_not_found(&self, tc: &ToolCallInfo) -> ToolDispatchResult {
         let available: Vec<String> = self.tools.tool_names();
         let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();
-        let error = AgentError::tool_not_found(&tc.name, &available_refs);
+        let error = LoopError::tool_not_found(&tc.name, &available_refs);
         let error_msg = error.to_string();
         ToolDispatchResult {
             tool_call_id: tc.id.clone(),
@@ -282,20 +295,21 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Consults the reflector and recovery strategy. On `Retry`, sleeps for
     /// the prescribed delay (cancellation-aware) and returns the updated
-    /// attempt count via `Ok`. On all other recovery actions, returns the
-    /// original error result via `Err` (which ends the retry loop).
+    /// attempt count and the [`Correction`] (if any) via `Ok`. On all other
+    /// recovery actions, returns the original error result via `Err` (which
+    /// ends the retry loop).
     ///
     /// # Errors
     ///
-    /// Returns `Err(ToolDispatchResult)` when the recovery strategy decides
+    /// Returns `Err(RecoveryOutcome)` when the recovery strategy decides
     /// not to retry — the caller should return this as a soft error.
     async fn recovery_wait_or_return(
         &self,
         tc: &ToolCallInfo,
         tool_result: &ToolDispatchResult,
         attempt: u32,
-    ) -> Result<u32, RecoveryOutcome> {
-        let recovery_action = self.recover_tool_error(tc, tool_result, attempt).await;
+    ) -> Result<(u32, Option<Correction>), RecoveryOutcome> {
+        let (recovery_action, correction) = self.recover_tool_error(tc, tool_result, attempt).await;
         match recovery_action {
             RecoveryAction::Retry { delay } => {
                 let next_attempt = attempt.saturating_add(1);
@@ -308,7 +322,7 @@ impl<C: ApiClient> BareLoop<C> {
                         return Err(RecoveryOutcome::Cancelled);
                     }
                 }
-                Ok(next_attempt)
+                Ok((next_attempt, correction))
             }
             RecoveryAction::Skip(_) | RecoveryAction::AskUser(_) | RecoveryAction::Fail(_) => {
                 Err(RecoveryOutcome::SoftError(tool_result.clone()))
@@ -430,7 +444,7 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::Cancelled`] if the cancel signal fires
+    /// Returns [`LoopError::Cancelled`] if the cancel signal fires
     /// during pipeline dispatch.
     async fn dispatch_via_pipeline(
         &self,
@@ -438,7 +452,7 @@ impl<C: ApiClient> BareLoop<C> {
         tc: &ToolCallInfo,
         tool_context: &ToolContext,
         turn_idx: usize,
-    ) -> Result<ToolDispatchResult, AgentError> {
+    ) -> Result<ToolDispatchResult, LoopError> {
         let ctx = ToolDispatchContext {
             tool_name: tc.name.clone(),
             input: tc.input.clone(),
@@ -452,7 +466,7 @@ impl<C: ApiClient> BareLoop<C> {
         let dispatch_result = tokio::select! {
             r = pipeline.invoke(ctx) => r,
             () = cancel.notified() => {
-                return Err(AgentError::Cancelled);
+                return Err(LoopError::Cancelled);
             }
         };
         Ok(ToolDispatchResult {
@@ -473,12 +487,16 @@ impl<C: ApiClient> BareLoop<C> {
     /// Calls [`Reflector::analyze()`] and then [`RecoveryStrategy::decide()`].
     /// If the reflector itself fails, logs the error and returns
     /// [`RecoveryAction::Fail`] (conservative default).
+    ///
+    /// Returns the [`RecoveryAction`] alongside the [`Correction`] (if any)
+    /// produced by the reflector. The correction is threaded through so the
+    /// retry loop can apply it before re-dispatching.
     async fn recover_tool_error(
         &self,
         tc: &ToolCallInfo,
         result: &ToolDispatchResult,
         attempt: u32,
-    ) -> RecoveryAction {
+    ) -> (RecoveryAction, Option<Correction>) {
         let error_msg = match &result.output {
             ToolContent::Text(msg) => msg.clone(),
             ToolContent::Multipart(_) => result.output.to_string(),
@@ -495,11 +513,14 @@ impl<C: ApiClient> BareLoop<C> {
             .await
         else {
             // Reflector failed — conservatively fail.
-            return RecoveryAction::Fail(error_msg);
+            return (RecoveryAction::Fail(error_msg), None);
         };
 
-        self.recovery
+        let correction = analysis.correction.clone();
+        let action = self
+            .recovery
             .decide(&analysis, attempt, Self::MAX_RECOVERY_ATTEMPTS)
-            .await
+            .await;
+        (action, correction)
     }
 }

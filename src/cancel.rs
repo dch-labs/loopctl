@@ -3,7 +3,7 @@
 //! [`CancelSignal`] combines an [`AtomicBool`] flag with a
 //! [`tokio::sync::Notify`] for sub-millisecond wake-up of waiting tasks.
 //!
-//! # Why not just poll an `AtomicBool`?
+//! # Why not poll an `AtomicBool`?
 //!
 //! Polling works but wastes CPU cycles and introduces latency proportional
 //! to the poll interval. By pairing the flag with a `Notify`, any call to
@@ -31,10 +31,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
-/// Shared cancellation signal: [`AtomicBool`] flag + [`Notify`] for instant
-/// wake-up.
+/// Shared cancellation signal backed by an [`AtomicBool`] flag and a
+/// [`Notify`] for instant wake-up.
 ///
-/// Wrap in `Arc` for sharing across tasks/threads. Create with
+/// Wrap in `Arc` for sharing across tasks or threads. Create with
 /// [`CancelSignal::new`], cancel with [`CancelSignal::cancel`], and await
 /// instant notification with [`CancelSignal::notified`].
 pub struct CancelSignal {
@@ -44,6 +44,10 @@ pub struct CancelSignal {
 
 impl CancelSignal {
     /// Create a new, non-cancelled signal.
+    ///
+    /// Returns a [`CancelSignal`] with its internal flag set to `false`.
+    /// The signal is ready to be shared (via `Arc`) and awaited by
+    /// worker tasks until [`cancel`](Self::cancel) is called.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -63,11 +67,20 @@ impl CancelSignal {
     }
 
     /// Reset the signal so it can be reused for a new operation.
+    ///
+    /// Clears the internal cancellation flag, returning the signal to
+    /// its initial non-cancelled state. Any subsequent calls to
+    /// [`is_cancelled`](Self::is_cancelled) will return `false` until
+    /// [`cancel`](Self::cancel) is called again.
     pub fn reset(&self) {
         self.flag.store(false, Ordering::Release);
     }
 
-    /// Check whether the signal has been cancelled (non-blocking).
+    /// Check whether the signal has been cancelled.
+    ///
+    /// Performs a non-blocking load of the internal flag. Returns
+    /// `true` if [`cancel`](Self::cancel) has been called since the
+    /// last [`reset`](Self::reset) (or since construction).
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::Acquire)
     }

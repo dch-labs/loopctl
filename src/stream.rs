@@ -1,6 +1,6 @@
 //! Streaming event types for LLM API responses.
 //!
-//! This module defines the types used when consuming Server-Sent Events
+//! Types used when consuming Server-Sent Events
 //! (SSE) based streaming responses from LLM APIs. The core [`StreamEvent`]
 //! enum represents each discrete event in the stream lifecycle, while
 //! [`StreamAccumulator`] collects those events into a complete [`Message`].
@@ -8,7 +8,7 @@
 //! Streaming allows the framework to process model output incrementally —
 //! displaying text as it arrives, detecting tool invocations as soon as
 //! the part starts, and reporting token usage without waiting for the
-//! full response. This is essential for responsive agent behavior.
+//! full response. Essential for responsive agent behavior.
 //!
 //! # Stream Lifecycle
 //!
@@ -483,8 +483,8 @@ pub enum DeltaPart {
 
 /// Reason why the model stopped generating tokens.
 ///
-/// This is the streaming / API-level stop reason returned by the LLM
-/// provider in the [`MessageDelta`] event. It differs from the
+/// Streaming / API-level stop reason returned by the LLM
+/// provider in the [`MessageDelta`] event. Differs from the
 /// agent-level `StopReason` which is used in `TurnResult`.
 ///
 /// Use [`should_continue_tool_loop`](Self::should_continue_tool_loop)
@@ -524,20 +524,20 @@ pub enum StreamStopReason {
     /// The response was truncated. The caller may want to request
     /// continuation or increase the token budget.
     ///
-    /// *Note: `AgentConfig` will be available once the builder module is complete.*
+    /// *Note: `LoopConfig` will be available once the builder module is complete.*
     MaxTokens,
 
     /// The model hit a configured stop sequence.
     ///
     /// The response ended because it matched one of the stop
-    /// sequences provided in the request. This is uncommon in
+    /// sequences provided in the request. Uncommon in
     /// typical agent usage.
     StopSequence,
 
     /// The model completed its turn naturally.
     ///
     /// The model finished generating its response without hitting
-    /// any limits or invoking tools. This is the normal end-of-turn
+    /// any limits or invoking tools. Normal end-of-turn
     /// signal for non-tool responses.
     EndTurn,
 }
@@ -670,7 +670,7 @@ pub struct MessageDelta {
     ///
     /// `Some` when the API reports usage; `None` if usage data
     /// is not available or not yet received. See [`Usage`].
-    /// This is typically populated in the final `MessageDelta` event
+    /// Typically populated in the final `MessageDelta` event
     /// and reflects cumulative token consumption for the entire request.
     pub usage: Option<Usage>,
 }
@@ -818,7 +818,7 @@ impl Usage {
 
 /// Accumulates streaming events into a complete [`Message`].
 ///
-/// This is a stateful builder that tracks the progress of a streaming
+/// Stateful builder that tracks the progress of a streaming
 /// response as [`StreamEvent`]s arrive and assembles the final
 /// [`Message`] once all events have been processed.
 ///

@@ -1,6 +1,6 @@
 //! Configuration, result types, and error types for resilient LLM stream handling.
 //!
-//! This module defines the types that underpin [`StreamHandler`] — the framework's
+//! Types that underpin [`StreamHandler`] — the framework's
 //! production-grade streaming resilience layer. The handler wraps
 //! [`ApiClient::stream_messages`] with retry, timeout, and fallback behaviour.
 //!
@@ -38,7 +38,7 @@
 //! let handler = StreamHandler::new();
 //!
 //! // Or with custom config:
-//! let handler = StreamHandler::with_config(
+//! let handler = StreamHandler::new().with_config(
 //!     StreamTimeoutConfig {
 //!         initial_event_timeout: std::time::Duration::from_secs(60),
 //!         ..Default::default()
@@ -47,7 +47,7 @@
 //! );
 //! ```
 
-use crate::api_client::ApiClient;
+use crate::api::ApiClient;
 use crate::cancel::CancelSignal;
 use crate::message::Message;
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
@@ -92,7 +92,7 @@ use std::time::{Duration, Instant};
 pub struct StreamTimeoutConfig {
     /// Timeout for the first event after opening the stream.
     ///
-    /// This is the most critical timeout — if the API server never sends
+    /// Most critical timeout — if the API server never sends
     /// the first event, the stream hangs forever. Set to a generous value
     /// since the model may need time to begin generating.
     pub initial_event_timeout: Duration,
@@ -353,7 +353,7 @@ impl StreamRetryConfig {
 pub enum StreamOutcome {
     /// Stream completed normally — all events received, `MessageStop` seen.
     ///
-    /// This is the happy path. The [`StreamAccumulator`]
+    /// Happy path. The [`StreamAccumulator`]
     /// contains the full response.
     Completed {
         /// Number of SSE events processed.
@@ -399,7 +399,7 @@ pub enum StreamOutcome {
         attempts: u32,
     },
 
-    /// Fell back to non-streaming [`create_message`](crate::api_client::ApiClient::create_message).
+    /// Fell back to non-streaming [`create_message`](crate::api::ApiClient::create_message).
     ///
     /// Streaming failed, but a non-streaming request succeeded.
     /// The response is complete but was not streamed incrementally.
@@ -587,7 +587,7 @@ pub struct StreamProgress {
 /// let handler = StreamHandler::new();
 /// assert_eq!(handler.timeout_config().initial_event_timeout, std::time::Duration::from_secs(120));
 ///
-/// let handler = StreamHandler::with_config(
+/// let handler = StreamHandler::new().with_config(
 ///     StreamTimeoutConfig {
 ///         initial_event_timeout: std::time::Duration::from_secs(60),
 ///         ..Default::default()
@@ -650,7 +650,7 @@ impl StreamHandler {
     /// use loopctl::stream::handler::{StreamHandler, StreamTimeoutConfig, StreamRetryConfig};
     /// use std::time::Duration;
     ///
-    /// let handler = StreamHandler::with_config(
+    /// let handler = StreamHandler::new().with_config(
     ///     StreamTimeoutConfig {
     ///         initial_event_timeout: Duration::from_secs(60),
     ///         ..Default::default()
@@ -662,11 +662,10 @@ impl StreamHandler {
     /// );
     /// ```
     #[must_use]
-    pub fn with_config(timeout: StreamTimeoutConfig, retry: StreamRetryConfig) -> Self {
-        Self {
-            timeout_config: timeout,
-            retry_config: retry,
-        }
+    pub fn with_config(mut self, timeout: StreamTimeoutConfig, retry: StreamRetryConfig) -> Self {
+        self.timeout_config = timeout;
+        self.retry_config = retry;
+        self
     }
 
     /// Returns a reference to the timeout configuration.
@@ -687,7 +686,7 @@ impl StreamHandler {
 
     /// Stream one complete turn with retry, timeout, and fallback.
     ///
-    /// This is the primary entry point for resilient streaming. It
+    /// Primary entry point for resilient streaming. It
     /// orchestrates the full lifecycle:
     ///
     /// 1. Opens a stream via [`ApiClient::stream_messages`].
@@ -841,7 +840,7 @@ impl StreamHandler {
         total_deadline: Option<Instant>,
     ) -> Result<StreamTurnResult, StreamHandlerError>
     where
-        S: futures::Stream<Item = Result<crate::stream::StreamEvent, crate::api_error::ApiError>>
+        S: futures::Stream<Item = Result<crate::stream::StreamEvent, crate::api::error::ApiError>>
             + Unpin,
     {
         let mut accumulator = StreamAccumulator::new();
@@ -1212,7 +1211,7 @@ mod tests {
 
     #[test]
     fn handler_with_config() {
-        let handler = StreamHandler::with_config(
+        let handler = StreamHandler::new().with_config(
             StreamTimeoutConfig {
                 initial_event_timeout: Duration::from_secs(60),
                 ..Default::default()
@@ -1439,7 +1438,7 @@ mod tests {
     // process_events async tests
     // ===================================================
 
-    use crate::api_error::ApiError;
+    use crate::api::error::ApiError;
     use crate::stream::{
         DeltaPart, IndexedDelta, MessageDelta, MessageDeltaPayload, MessageMetadata, MessageStart,
         PartStart, StreamEvent,
@@ -1537,7 +1536,7 @@ mod tests {
     #[tokio::test]
     async fn process_events_total_timeout() {
         // Use a very short total timeout to trigger it immediately.
-        let handler = StreamHandler::with_config(
+        let handler = StreamHandler::new().with_config(
             StreamTimeoutConfig {
                 total_stream_timeout: Duration::from_millis(1),
                 per_event_timeout: Duration::from_secs(300),
@@ -1575,7 +1574,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_events_cancelled() {
-        let handler = StreamHandler::with_config(
+        let handler = StreamHandler::new().with_config(
             StreamTimeoutConfig {
                 per_event_timeout: Duration::from_secs(300),
                 ..Default::default()
@@ -1694,7 +1693,7 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_non_streaming_success() {
-        let handler = StreamHandler::with_config(
+        let handler = StreamHandler::new().with_config(
             StreamTimeoutConfig {
                 fallback_to_non_streaming: true,
                 ..Default::default()
@@ -1725,7 +1724,7 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_non_streaming_cancelled_before_start() {
-        let handler = StreamHandler::with_config(
+        let handler = StreamHandler::new().with_config(
             StreamTimeoutConfig {
                 fallback_to_non_streaming: true,
                 ..Default::default()
@@ -1749,7 +1748,7 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_non_streaming_error() {
-        let handler = StreamHandler::with_config(
+        let handler = StreamHandler::new().with_config(
             StreamTimeoutConfig {
                 fallback_to_non_streaming: true,
                 ..Default::default()
@@ -1842,7 +1841,7 @@ mod tests {
         // (covered above). Here we test that stream_turn returns the
         // error when streaming fails and the handler is configured
         // without fallback.
-        let handler = StreamHandler::with_config(
+        let handler = StreamHandler::new().with_config(
             StreamTimeoutConfig {
                 fallback_to_non_streaming: false,
                 ..Default::default()

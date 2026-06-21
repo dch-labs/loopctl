@@ -1,7 +1,7 @@
 //! Session lifecycle notifications.
 //!
 //! Split from [`BareLoop`] for clarity — these methods dispatch to
-//! the [`ObserverHost`](crate::core::observer::ObserverHost) and the hook executor.
+//! the [`ObserverHost`](crate::observer::ObserverHost) and the hook executor.
 //!
 //! Only session start/end live here because they do *two* things:
 //! observer notification + hook dispatch. All other observer notifications
@@ -9,12 +9,12 @@
 //! `self.managers.observers().on_*()`.
 
 use super::{ApiClient, BareLoop, Duration, EndReason, SessionEndInfo};
-use crate::core::observer::{SessionEndContext, SessionStartContext};
 #[cfg(feature = "hooks")]
 use crate::hooks::context::{
     SessionEndContext as HookSessionEndContext, SessionEndReason,
     SessionStartContext as HookSessionStartContext,
 };
+use crate::observer::{SessionEndContext, SessionStartContext};
 
 // ==================================================
 // Session lifecycle notifications

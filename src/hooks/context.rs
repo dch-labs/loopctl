@@ -65,6 +65,25 @@ pub enum CompactTrigger {
     Manual,
 }
 
+impl From<crate::compact::types::CompactReason> for CompactTrigger {
+    /// Map the compaction pipeline's [`CompactReason`](crate::compact::types::CompactReason) into the hook-level
+    /// [`CompactTrigger`].
+    ///
+    /// [`ThresholdExceeded`](crate::compact::types::CompactReason::ThresholdExceeded)
+    /// and
+    /// [`Emergency`](crate::compact::types::CompactReason::Emergency)
+    /// are both automatic triggers, while
+    /// [`Manual`](crate::compact::types::CompactReason::Manual) maps to
+    /// [`Manual`](CompactTrigger::Manual).
+    fn from(reason: crate::compact::types::CompactReason) -> Self {
+        match reason {
+            crate::compact::types::CompactReason::ThresholdExceeded
+            | crate::compact::types::CompactReason::Emergency => CompactTrigger::Auto,
+            crate::compact::types::CompactReason::Manual => CompactTrigger::Manual,
+        }
+    }
+}
+
 /// Context provided to `on_pre_compact` hooks.
 ///
 /// Hooks can inspect the current state and decide to abort

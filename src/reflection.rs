@@ -168,7 +168,7 @@ pub enum CorrectionType {
 
 /// A correction produced by the reflection system.
 ///
-/// When a tool call fails and reflection is enabled (via `Feature::Reflection`),
+/// When a tool call fails and reflection is enabled (via configuration),
 /// the agent analyzes the error and produces a `Correction` that describes how to fix
 /// the problem. The framework applies the correction and retries.
 ///

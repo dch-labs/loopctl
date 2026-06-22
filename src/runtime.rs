@@ -589,7 +589,11 @@ impl LoopRuntime {
     ///
     /// Fan-out to the [`ObserverHost`] and (if configured) the hook
     /// executor. Generic for any loop implementation.
-    pub fn notify_session_start(&self, session_id: uuid::Uuid, #[allow(unused_variables)] model: &str) {
+    pub fn notify_session_start(
+        &self,
+        session_id: uuid::Uuid,
+        #[allow(unused_variables)] model: &str,
+    ) {
         use crate::observer::SessionStartContext;
 
         self.observer_host

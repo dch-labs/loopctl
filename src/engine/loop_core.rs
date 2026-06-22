@@ -123,7 +123,7 @@ pub enum LoopState {
     /// The agent is reflecting on a failure and preparing a correction.
     ///
     /// Entered when a tool call fails and the reflection system is
-    /// enabled (via `Feature::Reflection`).
+    /// enabled (via configuration).
     /// The agent analyzes the error and produces a
     /// [`Correction`](crate::reflection::Correction) before retrying.
     Reflecting {

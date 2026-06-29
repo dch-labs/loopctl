@@ -19,7 +19,6 @@ and tool implementations; the framework handles the rest.
 |--------|-------------|
 | [`api`](https://docs.rs/loopctl/latest/loopctl/api/index.html) | `ApiClient` trait for LLM provider communication (streaming + non-streaming) |
 | [`api::error`](https://docs.rs/loopctl/latest/loopctl/api/error/index.html) | API error types with retry classification |
-| [`builder`](https://docs.rs/loopctl/latest/loopctl/builder/index.html) | Fluent builder API with type-state generics for compile-time safety |
 | [`cancel`](https://docs.rs/loopctl/latest/loopctl/cancel/index.html) | Cooperative cancellation via `CancelSignal` (AtomicBool + tokio::Notify) |
 | [`capabilities`](https://docs.rs/loopctl/latest/loopctl/capabilities/index.html) | Capability traits (`Observable`, `Detectable`, `Compactable`, etc.) |
 | [`compact`](https://docs.rs/loopctl/latest/loopctl/compact/index.html) | Context compaction: `ContextCompactor` trait, `TruncatingCompactor`, `TokenSplitter` |

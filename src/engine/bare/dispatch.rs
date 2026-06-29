@@ -336,9 +336,6 @@ impl<C: ApiClient> BareLoop<C> {
         match recovery_action {
             RecoveryAction::Retry { delay } => {
                 let next_attempt = attempt.saturating_add(1);
-                if next_attempt >= Self::MAX_RECOVERY_ATTEMPTS {
-                    return Err(RecoveryOutcome::SoftError(tool_result.clone()));
-                }
                 tokio::select! {
                     () = tokio::time::sleep(delay) => {},
                     () = self.cancelled.notified() => {

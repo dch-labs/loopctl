@@ -584,10 +584,15 @@ pub trait Loop: Send + Sync {
         config: &'a LoopConfig,
     ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + 'a>>;
 
-    /// Process a single user message / turn.
+    /// Process a single turn of the loop.
     ///
-    /// Main entry point for agent logic. It receives the user's
-    /// input and returns a [`TurnResult`] describing what happened.
+    /// Main entry point for loop logic. On the **first** call within a
+    /// [`run`](Loop::run) session, `input` contains the user's message;
+    /// subsequent calls receive an empty string (`""`) to signal a
+    /// continuation turn (tool results are already in the conversation
+    /// history). Implementations that need the original user message should
+    /// capture it during [`initialize`](Loop::initialize) or the first
+    /// `process_turn` call.
     fn process_turn<'a>(
         &'a mut self,
         input: &'a str,
@@ -662,12 +667,22 @@ pub trait Loop: Send + Sync {
         Box::pin(async move {
             self.initialize(&self.config()).await?;
 
+            let mut is_first_turn = true;
             loop {
                 if !self.should_continue() {
                     break;
                 }
 
-                match self.process_turn(user_input).await {
+                // Pass user_input only on the first turn; subsequent turns
+                // receive "" to signal continuation (tool results are
+                // already in the conversation history).
+                let input = if is_first_turn {
+                    is_first_turn = false;
+                    user_input
+                } else {
+                    ""
+                };
+                match self.process_turn(input).await {
                     Ok(turn_result) if turn_result.is_complete => {
                         return self.finalize().await;
                     }

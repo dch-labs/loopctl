@@ -118,6 +118,9 @@ pub trait ApiClient: Send + Sync {
     /// # Parameters
     ///
     /// - `messages` — The conversation history as a [`Vec<Message>`].
+    ///   Takes ownership because the returned stream must be `'static`;
+    ///   callers (e.g. [`BareLoop`](crate::engine::BareLoop)) clone the
+    ///   full history each turn — O(n) in the number of messages.
     /// - `system` — An optional system prompt to prepend.
     /// - `tools` — Optional tool definitions the model may invoke.
     ///
@@ -144,6 +147,9 @@ pub trait ApiClient: Send + Sync {
     /// # Parameters
     ///
     /// - `messages` — The conversation history as a [`Vec<Message>`].
+    ///   Takes ownership because the returned stream must be `'static`;
+    ///   callers (e.g. [`BareLoop`](crate::engine::BareLoop)) clone the
+    ///   full history each turn — O(n) in the number of messages.
     /// - `system` — An optional system prompt to prepend.
     /// - `tools` — Optional tool definitions the model may invoke.
     ///

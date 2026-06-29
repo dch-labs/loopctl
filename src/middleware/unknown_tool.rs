@@ -294,8 +294,6 @@ mod tests {
         assert_eq!(UnknownToolMiddleware::lcs_length(&a, &b), 2);
     }
 
-    // ---- find_best_match_inner ----
-
     #[test]
     fn find_best_match_exact_hit() {
         let available = ["read_file", "write_file", "list_dir"];
@@ -372,8 +370,6 @@ mod tests {
             UnknownToolMiddleware::find_best_match_inner("read_fil", &available, 1.0).is_none()
         );
     }
-
-    // ---- is_tool_not_found ----
 
     use crate::message::ToolContent;
     use crate::tool::ToolDispatchResult;

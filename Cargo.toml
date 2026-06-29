@@ -8,7 +8,7 @@ repository = "https://github.com/dch-labs/loopctl"
 homepage = "https://github.com/dch-labs/loopctl"
 documentation = "https://docs.rs/loopctl"
 keywords = ["agent", "framework", "llm", "loop"]
-categories = ["agent", "development-tools"]
+categories = ["api-bindings", "development-tools"]
 readme = "README.md"
 rust-version = "1.85"
 

@@ -85,3 +85,47 @@ impl Default for LoopConfig {
         }
     }
 }
+
+impl LoopConfig {
+    /// Validate the configuration fields.
+    ///
+    /// Checks that:
+    /// - `compact_threshold` is in the range `[0.0, 1.0]` (not `NaN`).
+    /// - `max_turns` is greater than zero.
+    /// - `context_window` is greater than zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`String`] describing the first invalid field, or `Ok(())`
+    /// if all fields are valid.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::config::LoopConfig;
+    ///
+    /// let config = LoopConfig::default();
+    /// assert!(config.validate().is_ok());
+    ///
+    /// let bad = LoopConfig { compact_threshold: 1.5, ..config };
+    /// assert!(bad.validate().is_err());
+    /// ```
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_turns == 0 {
+            return Err("max_turns must be greater than 0".to_string());
+        }
+        if self.context_window == 0 {
+            return Err("context_window must be greater than 0".to_string());
+        }
+        if self.compact_threshold.is_nan()
+            || self.compact_threshold < 0.0
+            || self.compact_threshold > 1.0
+        {
+            return Err(format!(
+                "compact_threshold must be in [0.0, 1.0], got {}",
+                self.compact_threshold
+            ));
+        }
+        Ok(())
+    }
+}

@@ -240,6 +240,12 @@ pub struct BareLoop<C: ApiClient> {
 
 impl<C: ApiClient> BareLoop<C> {
     /// Maximum retry attempts for tool recovery before giving up.
+    ///
+    /// This is the engine-level safety ceiling passed to the
+    /// [`RecoveryStrategy`](crate::reflection::RecoveryStrategy) as
+    /// `max_attempts`. The strategy's own `max_retries` limit (typically
+    /// stricter) is the effective limit; this constant prevents a
+    /// misconfigured strategy from retrying indefinitely.
     const MAX_RECOVERY_ATTEMPTS: u32 = 5;
 
     /// Create a new `BareLoop` with the given components.
@@ -697,6 +703,8 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
         config: &'a crate::config::LoopConfig,
     ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + 'a>> {
         Box::pin(async move {
+            config.validate().map_err(LoopError::Config)?;
+
             self.state = LoopState::Processing { turn: 0 };
             self.budget = SessionResult::default();
             self.session_start = Some(Instant::now());
@@ -713,8 +721,10 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
         input: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<TurnResult, LoopError>> + Send + 'a>> {
         Box::pin(async move {
-            // On the first turn, push the user's message.
-            if self.budget.total_turns == 0 {
+            // On the first turn, `input` is the user's message (non-empty).
+            // On continuation turns, `input` is "" — the conversation already
+            // has the tool results appended from the previous turn.
+            if !input.is_empty() {
                 self.conversation.push(Message::user(input));
             }
 
@@ -748,6 +758,14 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
                     (msg, usage, stop)
                 }
                 Err(e) => {
+                    // Record the failure with the fallback circuit breaker.
+                    //
+                    // Note: BareLoop records API failures and trips the
+                    // circuit breaker but does **not** automatically retry
+                    // with the fallback model. The `FallbackManager` is
+                    // infrastructure for downstream consumers that hold
+                    // multiple API clients. BareLoop has a single client,
+                    // so the error is propagated after recording.
                     let tripped = self.managers.fallback.record_api_failure();
                     if tripped {
                         let from = self.client.model();
@@ -891,11 +909,18 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
             self.budget = budget;
 
             // Attempt context compaction.
+            //
+            // Compaction is best-effort: if it fails (e.g. the compactor
+            // cannot reduce the conversation enough), we log a warning and
+            // continue. The next API call may still succeed, and if it
+            // doesn't, the provider's context-overflow error will surface
+            // naturally at that point.
             if let Err(e) = self.maybe_compact_context(self.budget.total_turns).await {
-                self.state = LoopState::Failed {
-                    error: e.to_string(),
-                };
-                return Err(e);
+                tracing::warn!(
+                    error = %e,
+                    turn = self.budget.total_turns,
+                    "context compaction failed; continuing with uncompactd history"
+                );
             }
 
             self.state = LoopState::Processing {
@@ -1988,8 +2013,8 @@ mod tests {
         assert_eq!(result.total_turns, 1);
     }
 
-    /// Verify that setting `max_turns = 0` immediately triggers
-    /// [`LoopError::MaxTurnsExceeded`] before any API call.
+    /// Verify that setting `max_turns = 0` immediately triggers a
+    /// configuration error before any API call.
     #[tokio::test]
     async fn test_loop_terminates_with_max_turns_0() {
         let client = MockClient::new("test-model");
@@ -2002,8 +2027,8 @@ mod tests {
         let result = agent.run("Hi").await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            LoopError::MaxTurnsExceeded { max } => assert_eq!(max, 0),
-            other => panic!("Expected MaxTurnsExceeded, got: {other}"),
+            LoopError::Config(msg) => assert!(msg.contains("max_turns")),
+            other => panic!("Expected Config error, got: {other}"),
         }
     }
 

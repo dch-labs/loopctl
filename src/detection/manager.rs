@@ -410,7 +410,7 @@ pub struct DetectionStats {
 ///
 /// The manager progresses through a simple per-turn cycle:
 ///
-/// 1. **Construct** — `new()` or `with_config()`.
+/// 1. **Construct** — `new()` or `new_with_config()`.
 /// 2. **Feed** — call `record_operation(op)` for each tool invocation and
 ///    `record_response(text)` for each assistant reply.
 /// 3. **Check** — call `check_loop()`, `check_convergence()`, or the

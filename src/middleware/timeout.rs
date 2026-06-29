@@ -65,7 +65,8 @@ impl TimeoutMiddleware {
 
     /// Create a timeout middleware with a fixed timeout in seconds.
     ///
-    /// Uses default retry settings (one retry with double timeout).
+    /// Uses default retry settings (`retry_on_timeout: false`,
+    /// `max_retries: 0` — i.e. no retries).
     #[must_use]
     pub fn from_secs(secs: u64) -> Self {
         Self {

@@ -1146,7 +1146,7 @@ mod tests {
         let part = ToolContentPart::text("output");
         match &part {
             ToolContentPart::Text { text } => assert_eq!(text, "output"),
-            _ => panic!("expected text part"),
+            ToolContentPart::Image { .. } => panic!("expected text part"),
         }
     }
 

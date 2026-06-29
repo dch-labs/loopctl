@@ -37,6 +37,9 @@ pub struct UnknownToolMiddleware {
 impl UnknownToolMiddleware {
     /// Create a new unknown-tool middleware with default settings.
     ///
+    /// `registry` is the [`ToolRegistry`] used to look up known tools and
+    /// generate suggestions when an unknown tool is invoked.
+    ///
     /// Uses a [`suggestion_threshold`](Self::with_threshold) of `0.4`,
     /// which balances catching common typos against false-positive
     /// suggestions.
@@ -163,7 +166,9 @@ impl UnknownToolMiddleware {
     /// Check if a result looks like a "tool not found" error.
     ///
     /// Only considers single [`Text`](ToolContent::Text) results whose
-    /// lowercased body contains `"not found"`.
+    /// lowercased body mentions a tool that was not found. This is more
+    /// specific than matching a bare `"not found"` so that unrelated errors
+    /// like "file not found" are not mistaken for unknown tools.
     /// [`Multipart`](ToolContent::Multipart) results and non-error results
     /// always return `false`.
     fn is_tool_not_found(result: &ToolDispatchResult) -> bool {
@@ -174,7 +179,7 @@ impl UnknownToolMiddleware {
             ToolContent::Text(t) => t.to_lowercase(),
             ToolContent::Multipart(_) => return false,
         };
-        msg.contains("not found")
+        msg.contains("not found") && msg.contains("tool")
     }
 }
 
@@ -300,7 +305,7 @@ mod tests {
         let (suggestion, score) =
             UnknownToolMiddleware::find_best_match_inner("read_file", &available, 0.5).unwrap();
         assert_eq!(suggestion, "read_file");
-        assert_eq!(score, 1.0);
+        assert!((score - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -364,7 +369,7 @@ mod tests {
         let (suggestion, score) =
             UnknownToolMiddleware::find_best_match_inner("read_file", &available, 1.0).unwrap();
         assert_eq!(suggestion, "read_file");
-        assert_eq!(score, 1.0);
+        assert!((score - 1.0).abs() < f64::EPSILON);
 
         assert!(
             UnknownToolMiddleware::find_best_match_inner("read_fil", &available, 1.0).is_none()

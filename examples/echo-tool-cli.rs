@@ -7,6 +7,8 @@
 //! cargo run --example echo-tool-cli --features testing
 //! ```
 
+#![allow(clippy::expect_used, clippy::doc_markdown)]
+
 use std::sync::Arc;
 
 use loopctl::config::LoopConfig;
@@ -27,12 +29,13 @@ fn echo_fn(
             + 'static,
     >,
 > {
-    let text = input
-        .get("message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(empty)")
-        .to_string();
-    Box::pin(async move { Ok(ToolOutput::text(format!("echo: {text}"))) })
+    Box::pin(async move {
+        let text = input
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(empty)");
+        Ok(ToolOutput::text(format!("echo: {text}")))
+    })
 }
 
 #[tokio::main]

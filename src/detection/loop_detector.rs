@@ -1383,6 +1383,14 @@ impl LoopDetector {
             }
         }
 
+        // Sort by tool then primary_param for deterministic ordering
+        // when multiple operations share the same repetition count.
+        repeated.sort_by(|a, b| {
+            a.tool
+                .cmp(&b.tool)
+                .then_with(|| a.primary_param.cmp(&b.primary_param))
+        });
+
         (repeated, max)
     }
 
@@ -1504,11 +1512,15 @@ impl LoopDetector {
         };
 
         let sig = &self.signature;
+        // Normalize the input path the same way stored params are normalized
+        // so the comparison is consistent regardless of the signature used.
+        let normalized_input = sig.normalize_param_for_comparison("", file_path);
         let read_count = ops
             .iter()
             .filter(|o| {
                 sig.is_file_read_tool(&o.tool)
-                    && sig.normalize_param_for_comparison(&o.tool, &o.primary_param) == file_path
+                    && sig.normalize_param_for_comparison(&o.tool, &o.primary_param)
+                        == normalized_input
             })
             .count();
 
@@ -1666,7 +1678,7 @@ mod tests {
                     if path.is_empty() {
                         pattern.to_string()
                     } else {
-                        format!("{}:{}", path, pattern)
+                        format!("{path}:{pattern}")
                     }
                 }
                 "Bash" => input
@@ -1849,7 +1861,7 @@ mod tests {
         let detector = test_detector();
 
         for i in 0..20 {
-            detector.record(Operation::new("Bash", format!("git status {}", i)));
+            detector.record(Operation::new("Bash", format!("git status {i}")));
         }
 
         let status = detector.check_loop();
@@ -1883,7 +1895,7 @@ mod tests {
         let detector = test_detector();
 
         for i in 0..5 {
-            let result_hash = hash_result(&format!("output {}", i));
+            let result_hash = hash_result(&format!("output {i}"));
             detector.record(Operation::new("Bash", "git status").with_result_hash(result_hash));
         }
 
@@ -2159,7 +2171,7 @@ mod tests {
         let detector = test_detector();
 
         for i in 0..5 {
-            let hash = hash_result(&format!("output {}", i));
+            let hash = hash_result(&format!("output {i}"));
             detector.record(Operation::new("Bash", "git status").with_result_hash(hash));
         }
 
@@ -2263,8 +2275,7 @@ mod tests {
         let warning = status.warning.unwrap();
         assert!(
             warning.contains("Check the command"),
-            "Bash warning should contain signature suggestion: {}",
-            warning
+            "Bash warning should contain signature suggestion: {warning}",
         );
     }
 
@@ -2426,8 +2437,7 @@ mod tests {
     #[test]
     fn test_build_warning_suppresses_duplicate() {
         let detector = test_detector();
-        let op = Operation::new("Bash", "ls");
-        let ops = vec![op.clone()];
+        let ops = vec![Operation::new("Bash", "ls")];
 
         // First call produces a warning and records the op as warned
         let w1 = detector.build_warning(&ops, 3, true, false);
@@ -2441,8 +2451,7 @@ mod tests {
     #[test]
     fn test_build_warning_duplicate_not_suppressed_when_stopping() {
         let detector = test_detector();
-        let op = Operation::new("Bash", "ls");
-        let ops = vec![op.clone()];
+        let ops = vec![Operation::new("Bash", "ls")];
 
         // First warning
         let w1 = detector.build_warning(&ops, 3, true, false);

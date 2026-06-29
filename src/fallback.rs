@@ -640,6 +640,8 @@ pub struct FallbackManager {
     active_fallback: Mutex<Option<String>>,
     /// Time when fallback was activated.
     fallback_switched_at: Mutex<Option<Instant>>,
+    /// How long to remain in fallback before attempting primary recovery.
+    recovery_timeout: Duration,
 }
 
 impl FallbackManager {
@@ -680,6 +682,7 @@ impl FallbackManager {
             fallback_models: Mutex::new(Vec::new()),
             active_fallback: Mutex::new(None),
             fallback_switched_at: Mutex::new(None),
+            recovery_timeout: Duration::from_secs(60),
         }
     }
 
@@ -707,7 +710,38 @@ impl FallbackManager {
         self.fallback_threshold = config.trip_threshold;
         self.primary_resume_threshold = config.recovery_successes_needed;
         self.default_max_fail_count = config.max_fail_count;
+        self.recovery_timeout = config.recovery_timeout;
         self
+    }
+
+    /// Set the recovery timeout (builder style).
+    ///
+    /// This is how long the manager stays in fallback before it is willing
+    /// to probe the primary model again via
+    /// [`should_try_resume_primary`](Self::should_try_resume_primary).
+    ///
+    /// Mirrors [`FallbackConfig::recovery_timeout`] for cases where a full
+    /// [`with_config`](Self::with_config) is not desired.
+    #[must_use]
+    pub fn with_recovery_timeout(mut self, recovery_timeout: Duration) -> Self {
+        self.recovery_timeout = recovery_timeout;
+        self
+    }
+
+    /// Configured recovery timeout.
+    ///
+    /// Returns the duration the manager will remain in fallback before it
+    /// is willing to probe the primary model again. Set via
+    /// [`with_config`](Self::with_config) (from
+    /// [`FallbackConfig::recovery_timeout`]) or
+    /// [`with_recovery_timeout`](Self::with_recovery_timeout).
+    ///
+    /// Pass this to
+    /// [`should_try_resume_primary`](Self::should_try_resume_primary) to
+    /// honour the configured timeout without hard-coding a value.
+    #[must_use]
+    pub fn recovery_timeout(&self) -> Duration {
+        self.recovery_timeout
     }
 
     /// Create with fallback already activated.
@@ -1449,8 +1483,8 @@ impl FallbackManager {
     /// let mgr = FallbackManager::new(3, 2);
     /// assert!(!mgr.record_api_failure()); // 1
     /// assert!(!mgr.record_api_failure()); // 2
-    /// assert!(mgr.record_api_failure());  // 3 — threshold reached
-    /// assert!(mgr.record_api_failure());  // 4 — still not activated
+    /// assert!(mgr.record_api_failure());  // 3 — threshold reached, now activated
+    /// assert!(!mgr.record_api_failure()); // 4 — already activated, no re-trip
     /// ```
     pub fn record_api_failure(&self) -> bool {
         let failures = self
@@ -1463,6 +1497,7 @@ impl FallbackManager {
                 threshold = self.fallback_threshold,
                 "Fallback threshold reached"
             );
+            self.fallback_activated.store(true, Ordering::Relaxed);
             true
         } else {
             false

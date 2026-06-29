@@ -80,23 +80,11 @@ impl HookExecutor {
 
     /// Set the interactivity mode.
     ///
-    /// Use [`interactivity`](Self::interactivity) to change the mode after
-    /// construction, or [`with_hook`](Self::with_hook) to add hooks via
-    /// builder pattern.
+    /// Use this builder method to change the mode after construction, or
+    /// [`with_hook`](Self::with_hook) to add hooks via the builder pattern.
     #[must_use]
     pub fn with_interactivity(mut self, interactivity: Interactivity) -> Self {
         self.interactivity = interactivity;
-        self
-    }
-
-    /// Set the interactivity mode (builder style).
-    ///
-    /// Overrides the current [`Interactivity`] mode and returns `self`
-    /// for chaining:
-    /// `HookExecutor::new().interactivity(Interactivity::Interactive).with_hook(h)`.
-    #[must_use]
-    pub fn interactivity(mut self, mode: Interactivity) -> Self {
-        self.interactivity = mode;
         self
     }
 
@@ -316,7 +304,7 @@ mod tests {
 
     struct AllowHook;
     impl Hook for AllowHook {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "allow"
         }
         fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
@@ -328,7 +316,7 @@ mod tests {
         reason: String,
     }
     impl Hook for BlockHook {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "block"
         }
         fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
@@ -350,7 +338,7 @@ mod tests {
         }
     }
     impl Hook for PostRecorder {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "post_recorder"
         }
         fn on_post_tool_use(&self, _ctx: &PostToolUseContext) {
@@ -449,7 +437,7 @@ mod tests {
     fn check_pre_compact_merges_instructions() {
         struct InstructionHook;
         impl Hook for InstructionHook {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "instruction"
             }
             fn on_pre_compact(&self, _ctx: &PreCompactContext) -> Option<CompactResult> {
@@ -479,7 +467,7 @@ mod tests {
     fn check_pre_compact_abort_takes_priority() {
         struct AbortHook;
         impl Hook for AbortHook {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "abort"
             }
             fn on_pre_compact(&self, _ctx: &PreCompactContext) -> Option<CompactResult> {
@@ -488,7 +476,7 @@ mod tests {
         }
         struct InstructionHook;
         impl Hook for InstructionHook {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "instruction"
             }
             fn on_pre_compact(&self, _ctx: &PreCompactContext) -> Option<CompactResult> {
@@ -520,7 +508,7 @@ mod tests {
             ends: AtomicUsize,
         }
         impl Hook for CounterHook {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "counter"
             }
             fn on_session_start(&self, _ctx: &SessionStartContext) {
@@ -587,7 +575,7 @@ mod tests {
             count: AtomicUsize,
         }
         impl Hook for CompactRecorder {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "compact_recorder"
             }
             fn on_post_compact(&self, _ctx: &PostCompactContext) {
@@ -638,7 +626,7 @@ mod tests {
     fn check_pre_tool_use_headless_downgrades_ask_to_block() {
         struct AskHook;
         impl Hook for AskHook {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "ask"
             }
             fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
@@ -660,7 +648,7 @@ mod tests {
     fn check_pre_tool_use_interactive_passes_ask_through() {
         struct AskHook;
         impl Hook for AskHook {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "ask"
             }
             fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
@@ -684,7 +672,7 @@ mod tests {
     fn check_pre_tool_use_interactivity_builder() {
         struct AskHook;
         impl Hook for AskHook {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "ask"
             }
             fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
@@ -694,7 +682,7 @@ mod tests {
 
         // Builder style: start Headless, switch to Interactive.
         let executor = HookExecutor::new()
-            .interactivity(Interactivity::Interactive)
+            .with_interactivity(Interactivity::Interactive)
             .with_hook(Arc::new(AskHook));
         let ctx = dummy_pre_ctx();
         let action = executor.check_pre_tool_use(&ctx);
@@ -717,7 +705,7 @@ mod tests {
     fn headless_block_passes_through_unchanged() {
         struct BlockOnlyHook;
         impl Hook for BlockOnlyHook {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "block_only"
             }
             fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
@@ -737,7 +725,7 @@ mod tests {
     fn headless_downgrade_preserves_original_message() {
         struct AskHook;
         impl Hook for AskHook {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "ask"
             }
             fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
@@ -765,7 +753,7 @@ mod tests {
     fn with_interactivity_constructor_sets_mode() {
         struct AskHook;
         impl Hook for AskHook {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "ask"
             }
             fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {
@@ -787,7 +775,7 @@ mod tests {
     fn interactive_block_passes_through_unchanged() {
         struct BlockOnlyHook;
         impl Hook for BlockOnlyHook {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "block_only"
             }
             fn on_pre_tool_use(&self, _ctx: &PreToolUseContext) -> Option<HookAction> {

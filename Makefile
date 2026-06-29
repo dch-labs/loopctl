@@ -10,7 +10,7 @@ test:
 	cargo test --doc --all-features
 
 clippy:
-	cargo clippy --all-features -- -D warnings
+	cargo clippy --all-targets --all-features -- -D warnings
 
 fmt:
 	cargo fmt --all -- --check

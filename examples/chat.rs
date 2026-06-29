@@ -100,12 +100,13 @@ fn print_usage_and_exit() -> ! {
 // ==================================================
 
 fn echo_fn(input: serde_json::Value, _ctx: &ToolContext) -> ToolFuture {
-    let text = input
-        .get("message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(empty)")
-        .to_string();
-    Box::pin(async move { Ok(ToolOutput::text(format!("echo: {text}"))) })
+    Box::pin(async move {
+        let text = input
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(empty)");
+        Ok(ToolOutput::text(format!("echo: {text}")))
+    })
 }
 
 fn current_time_fn(_input: serde_json::Value, _ctx: &ToolContext) -> ToolFuture {
@@ -119,13 +120,14 @@ fn current_time_fn(_input: serde_json::Value, _ctx: &ToolContext) -> ToolFuture 
 }
 
 fn calculate_fn(input: serde_json::Value, _ctx: &ToolContext) -> ToolFuture {
-    let expr = input
-        .get("expression")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let result = simple_eval(&expr);
-    Box::pin(async move { Ok(ToolOutput::text(result)) })
+    Box::pin(async move {
+        let expr = input
+            .get("expression")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let result = simple_eval(expr);
+        Ok(ToolOutput::text(result))
+    })
 }
 
 /// Build the tool registry for the chat example.

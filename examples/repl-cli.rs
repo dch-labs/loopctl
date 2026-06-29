@@ -8,6 +8,8 @@
 //! cargo run --example repl-cli --features testing
 //! ```
 
+#![allow(clippy::unwrap_used)]
+
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 

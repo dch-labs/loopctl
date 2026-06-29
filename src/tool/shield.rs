@@ -820,7 +820,8 @@ mod tests {
 
     #[test]
     fn null_shield_default_trait() {
-        let _shield = NullShield::default();
+        let shield = NullShield;
+        let _ = &shield;
     }
 
     // ===================================================
@@ -898,7 +899,10 @@ mod tests {
 
         let eval_ctx = ctx("Read", json!({ "path": "/tmp/data" }), 2);
         let combo = shield.assess_combination(&eval_ctx);
-        assert_eq!(combo, 0.0, "reversed order should not match");
+        assert!(
+            (combo - 0.0).abs() < f32::EPSILON,
+            "reversed order should not match"
+        );
 
         // Now test correct order: Write first, then Bash(chmod +x) as the
         // current call.

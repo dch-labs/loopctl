@@ -42,6 +42,24 @@
 //! - **[`hooks`]** — Bidirectional lifecycle control (allow/block/ask before tool use, compaction). *Requires `hooks` feature.*
 //! - **[`testing`]** — Test utilities and fixtures. *Requires `testing` feature.*
 
+// Relax strict lints in test code. The crate enforces a strict no-panic /
+// no-unwrap policy in production code, but test code legitimately uses
+// assertions, unwrap, indexing, etc. for readability.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::missing_panics_doc,
+        clippy::clone_on_ref_ptr,
+        clippy::doc_markdown,
+        clippy::field_reassign_with_default,
+        clippy::used_underscore_items,
+    )
+)]
+
 pub mod api;
 pub mod cancel;
 pub mod capabilities;

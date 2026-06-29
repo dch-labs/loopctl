@@ -540,6 +540,7 @@ impl ConvergenceDetector {
         }
 
         let mut max_similarity = 0.0;
+        let mut any_similar = false;
         for prev_response in &self.window {
             let similarity = Self::compute_similarity(response, prev_response);
             if similarity > max_similarity {
@@ -547,15 +548,23 @@ impl ConvergenceDetector {
             }
 
             if similarity >= self.config.similarity_threshold {
-                self.consecutive_count = self.consecutive_count.saturating_add(1);
+                any_similar = true;
                 if !self.similar_responses.contains(&response.to_string()) {
                     self.similar_responses.push(response.to_string());
                 }
-            } else {
-                self.consecutive_count = 1;
-                self.similar_responses.clear();
-                self.similar_responses.push(response.to_string());
             }
+        }
+
+        // Update consecutive count once per add_response call
+        if self.window.is_empty() {
+            self.consecutive_count = 1;
+            self.similar_responses.push(response.to_string());
+        } else if any_similar {
+            self.consecutive_count = self.consecutive_count.saturating_add(1);
+        } else {
+            self.consecutive_count = 1;
+            self.similar_responses.clear();
+            self.similar_responses.push(response.to_string());
         }
 
         if self.window.len() >= self.config.window_size {
@@ -766,8 +775,8 @@ mod tests {
         let status1 = detector.add_response("alpha");
         assert!(!status1.detected, "first response: no comparison possible");
         assert_eq!(
-            status1.consecutive_count, 0,
-            "first response: window is empty"
+            status1.consecutive_count, 1,
+            "first response: starts a streak of 1"
         );
 
         let status2 = detector.add_response("beta");

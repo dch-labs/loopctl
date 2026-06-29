@@ -29,7 +29,7 @@ use uuid::Uuid;
 ///     ..Default::default()
 /// };
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LoopConfig {
     /// Unique session identifier (random UUID v4).
     pub session_id: Uuid,

@@ -93,6 +93,8 @@ impl LoopConfig {
     /// - `compact_threshold` is in the range `[0.0, 1.0]` (not `NaN`).
     /// - `max_turns` is greater than zero.
     /// - `context_window` is greater than zero.
+    /// - `max_tokens` is greater than zero.
+    /// - `model` is not empty.
     ///
     /// # Errors
     ///
@@ -117,6 +119,12 @@ impl LoopConfig {
         if self.context_window == 0 {
             return Err("context_window must be greater than 0".to_string());
         }
+        if self.max_tokens == 0 {
+            return Err("max_tokens must be greater than 0".to_string());
+        }
+        if self.model.is_empty() {
+            return Err("model must not be empty".to_string());
+        }
         if self.compact_threshold.is_nan()
             || self.compact_threshold < 0.0
             || self.compact_threshold > 1.0
@@ -127,5 +135,57 @@ impl LoopConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_default_config_is_ok() {
+        let config = LoopConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_tokens() {
+        let config = LoopConfig {
+            max_tokens: 0,
+            ..LoopConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("max_tokens"),
+            "error should mention max_tokens: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_one_max_tokens() {
+        let config = LoopConfig {
+            max_tokens: 1,
+            ..LoopConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_model() {
+        let config = LoopConfig {
+            model: String::new(),
+            ..LoopConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("model"), "error should mention model: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_nonempty_model() {
+        let config = LoopConfig {
+            model: "gpt-4".to_string(),
+            ..LoopConfig::default()
+        };
+        assert!(config.validate().is_ok());
     }
 }

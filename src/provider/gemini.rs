@@ -25,6 +25,7 @@ use std::pin::Pin;
 use futures::stream::{Stream, StreamExt};
 use reqwest::Response;
 use serde_json::Value;
+use std::time::Duration;
 
 use crate::api::ApiClient;
 use crate::api::error::ApiError;
@@ -43,6 +44,11 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta
 const DEFAULT_MODEL: &str = "gemini-2.0-flash";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
+
+/// Default total request timeout (connect + response + body).
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default TCP connection establishment timeout.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ==================================================
 // Client
@@ -200,6 +206,8 @@ pub struct GeminiClientBuilder {
     api_key: Option<String>,
     base_url: String,
     model: String,
+    timeout: Duration,
+    connect_timeout: Duration,
 }
 
 impl Default for GeminiClientBuilder {
@@ -208,6 +216,8 @@ impl Default for GeminiClientBuilder {
             api_key: None,
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
 }
@@ -234,6 +244,27 @@ impl GeminiClientBuilder {
         self
     }
 
+    /// Set the total request timeout (connect + response + body).
+    ///
+    /// Defaults to 120 seconds. This bounds the entire HTTP request lifecycle —
+    /// a hanging server will be aborted after this duration rather than
+    /// blocking the agent loop indefinitely.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Set the TCP connection establishment timeout.
+    ///
+    /// Defaults to 10 seconds. This is the maximum time to wait for the TCP
+    /// connection (including TLS handshake) to be established.
+    #[must_use]
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
@@ -244,6 +275,8 @@ impl GeminiClientBuilder {
             .api_key
             .ok_or_else(|| ApiError::auth_invalid_key("API key not provided"))?;
         let http = reqwest::Client::builder()
+            .timeout(self.timeout)
+            .connect_timeout(self.connect_timeout)
             .build()
             .map_err(|e| ApiError::http(e.to_string()))?;
 
@@ -905,5 +938,60 @@ mod tests {
             buf: "data: hi\r\n".into(),
         };
         assert_eq!(reader.take_line().unwrap(), "data: hi");
+    }
+
+    // ================================================
+    // Builder timeout tests
+    // ================================================
+
+    #[test]
+    fn builder_has_default_timeouts() {
+        // The builder should initialize with sensible non-zero defaults
+        // so that a hanging server cannot block the agent loop indefinitely.
+        let builder = GeminiClientBuilder::default();
+        assert_eq!(builder.timeout, DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(builder.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+    }
+
+    #[test]
+    fn builder_custom_timeout() {
+        let custom = Duration::from_secs(300);
+        let builder = GeminiClientBuilder::default().timeout(custom);
+        assert_eq!(builder.timeout, custom);
+        // connect_timeout should be unchanged.
+        assert_eq!(builder.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+    }
+
+    #[test]
+    fn builder_custom_connect_timeout() {
+        let custom = Duration::from_secs(45);
+        let builder = GeminiClientBuilder::default().connect_timeout(custom);
+        assert_eq!(builder.connect_timeout, custom);
+        // timeout should be unchanged.
+        assert_eq!(builder.timeout, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn builder_custom_both_timeouts() {
+        let req_timeout = Duration::from_secs(600);
+        let conn_timeout = Duration::from_secs(30);
+        let builder = GeminiClientBuilder::default()
+            .timeout(req_timeout)
+            .connect_timeout(conn_timeout);
+        assert_eq!(builder.timeout, req_timeout);
+        assert_eq!(builder.connect_timeout, conn_timeout);
+    }
+
+    #[test]
+    fn builder_timeouts_applied_on_build() {
+        // Verify the build succeeds — reqwest validates the configuration
+        // internally. If timeout/connect_timeout were somehow invalid,
+        // .build() would return an error.
+        let client = GeminiClient::builder()
+            .api_key("test-key")
+            .timeout(Duration::from_secs(180))
+            .connect_timeout(Duration::from_secs(15))
+            .build();
+        assert!(client.is_ok(), "build should succeed with valid timeouts");
     }
 }

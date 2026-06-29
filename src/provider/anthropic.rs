@@ -24,6 +24,7 @@ use std::pin::Pin;
 use futures::stream::{Stream, StreamExt};
 use reqwest::Response;
 use serde_json::Value;
+use std::time::Duration;
 
 use crate::api::ApiClient;
 use crate::api::error::ApiError;
@@ -44,6 +45,11 @@ const SSE_EVENT_PREFIX: &str = "event: ";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
+
+/// Default total request timeout (connect + response + body).
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default TCP connection establishment timeout.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ==================================================
 // Client
@@ -208,6 +214,8 @@ pub struct AnthropicClientBuilder {
     base_url: String,
     model: String,
     max_tokens: u32,
+    timeout: Duration,
+    connect_timeout: Duration,
 }
 
 impl Default for AnthropicClientBuilder {
@@ -217,6 +225,8 @@ impl Default for AnthropicClientBuilder {
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
 }
@@ -252,6 +262,27 @@ impl AnthropicClientBuilder {
         self
     }
 
+    /// Set the total request timeout (connect + response + body).
+    ///
+    /// Defaults to 120 seconds. This bounds the entire HTTP request lifecycle —
+    /// a hanging server will be aborted after this duration rather than
+    /// blocking the agent loop indefinitely.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Set the TCP connection establishment timeout.
+    ///
+    /// Defaults to 10 seconds. This is the maximum time to wait for the TCP
+    /// connection (including TLS handshake) to be established.
+    #[must_use]
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
@@ -262,6 +293,8 @@ impl AnthropicClientBuilder {
             .api_key
             .ok_or_else(|| ApiError::auth_invalid_key("API key not provided"))?;
         let http = reqwest::Client::builder()
+            .timeout(self.timeout)
+            .connect_timeout(self.connect_timeout)
             .build()
             .map_err(|e| ApiError::http(e.to_string()))?;
 
@@ -1099,5 +1132,60 @@ mod tests {
             buf: "data: hi\r\n".into(),
         };
         assert_eq!(reader.take_line().unwrap(), "data: hi");
+    }
+
+    // ================================================
+    // Builder timeout tests
+    // ================================================
+
+    #[test]
+    fn builder_has_default_timeouts() {
+        // The builder should initialize with sensible non-zero defaults
+        // so that a hanging server cannot block the agent loop indefinitely.
+        let builder = AnthropicClientBuilder::default();
+        assert_eq!(builder.timeout, DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(builder.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+    }
+
+    #[test]
+    fn builder_custom_timeout() {
+        let custom = Duration::from_secs(300);
+        let builder = AnthropicClientBuilder::default().timeout(custom);
+        assert_eq!(builder.timeout, custom);
+        // connect_timeout should be unchanged.
+        assert_eq!(builder.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+    }
+
+    #[test]
+    fn builder_custom_connect_timeout() {
+        let custom = Duration::from_secs(45);
+        let builder = AnthropicClientBuilder::default().connect_timeout(custom);
+        assert_eq!(builder.connect_timeout, custom);
+        // timeout should be unchanged.
+        assert_eq!(builder.timeout, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn builder_custom_both_timeouts() {
+        let req_timeout = Duration::from_secs(600);
+        let conn_timeout = Duration::from_secs(30);
+        let builder = AnthropicClientBuilder::default()
+            .timeout(req_timeout)
+            .connect_timeout(conn_timeout);
+        assert_eq!(builder.timeout, req_timeout);
+        assert_eq!(builder.connect_timeout, conn_timeout);
+    }
+
+    #[test]
+    fn builder_timeouts_applied_on_build() {
+        // Verify the build succeeds — reqwest validates the configuration
+        // internally. If timeout/connect_timeout were somehow invalid,
+        // .build() would return an error.
+        let client = AnthropicClient::builder()
+            .api_key("sk-test")
+            .timeout(Duration::from_secs(180))
+            .connect_timeout(Duration::from_secs(15))
+            .build();
+        assert!(client.is_ok(), "build should succeed with valid timeouts");
     }
 }

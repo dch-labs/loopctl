@@ -933,7 +933,7 @@ mod tests {
         assert_eq!(stats.total_calls(), 0);
         assert_eq!(stats.success_count(), 0);
         assert_eq!(stats.failure_count(), 0);
-        assert!(stats.success_rate() == 1.0);
+        assert!((stats.success_rate() - 1.0).abs() < f64::EPSILON);
         assert!(stats.health_score() > 0.9);
         assert_eq!(stats.avg_duration(), Duration::ZERO);
         assert_eq!(stats.max_duration(), Duration::ZERO);

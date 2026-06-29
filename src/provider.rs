@@ -420,18 +420,18 @@ mod tests {
     #[cfg(feature = "ollama")]
     #[test]
     fn ollama_client_builds_with_defaults() {
+        use crate::api::ApiClient;
         env_remove!("OLLAMA_BASE_URL");
         let client = ollama("llama3").unwrap();
-        use crate::api::ApiClient;
         assert_eq!(client.model(), "llama3");
     }
 
     #[cfg(feature = "ollama")]
     #[test]
     fn ollama_client_respects_base_url_env() {
+        use crate::api::ApiClient;
         env_set!("OLLAMA_BASE_URL", "http://my-host:1234/v1");
         let client = ollama("test-model").unwrap();
-        use crate::api::ApiClient;
         assert_eq!(client.model(), "test-model");
         env_remove!("OLLAMA_BASE_URL");
     }
@@ -439,11 +439,11 @@ mod tests {
     #[cfg(feature = "ollama")]
     #[test]
     fn ollama_client_uses_api_key_when_set() {
+        use crate::api::ApiClient;
         env_remove!("OLLAMA_BASE_URL");
         env_set!("OLLAMA_API_KEY", "my-cloud-key");
         // Should build successfully with the cloud key — no network call.
         let client = ollama("llama3").unwrap();
-        use crate::api::ApiClient;
         assert_eq!(client.model(), "llama3");
         env_remove!("OLLAMA_API_KEY");
     }
@@ -451,19 +451,19 @@ mod tests {
     #[cfg(feature = "ollama")]
     #[test]
     fn ollama_client_defaults_to_local_without_key() {
+        use crate::api::ApiClient;
         env_remove!("OLLAMA_BASE_URL");
         env_remove!("OLLAMA_API_KEY");
         // Should still build — local Ollama doesn't need a real key.
         let client = ollama("llama3").unwrap();
-        use crate::api::ApiClient;
         assert_eq!(client.model(), "llama3");
     }
 
     #[cfg(feature = "openai")]
     #[test]
     fn self_hosted_client_builds() {
-        let client = self_hosted("http://localhost:8080/v1", "my-model").unwrap();
         use crate::api::ApiClient;
+        let client = self_hosted("http://localhost:8080/v1", "my-model").unwrap();
         assert_eq!(client.model(), "my-model");
     }
 }

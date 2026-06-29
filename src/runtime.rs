@@ -864,7 +864,7 @@ mod tests {
 
         struct NopObserver;
         impl LoopObserver for NopObserver {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "NopObserver"
             }
         }
@@ -892,7 +892,7 @@ mod tests {
 
         struct NopObserver;
         impl LoopObserver for NopObserver {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "NopObserver"
             }
         }

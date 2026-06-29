@@ -18,22 +18,6 @@
 //!   prompt, session ID).
 //! - Optional [`LoopObserver`](crate::observer::LoopObserver) registrations for lifecycle instrumentation.
 //!
-//! ```text
-//! BareLoop
-//!   ┌─────────────────────────────────────────────────────────┐
-//!   │  run(user_input)                                        │
-//!   │    1. Push user message to conversation                 │
-//!   │    2. Loop:                                             │
-//!   │       a. stream_messages(conversation) → StreamEvents   │
-//!   │       b. accumulate into Message (assistant)            │
-//!   │       c. Extract tool calls from Message                │
-//!   │       d. Execute tools via ToolRegistry                 │
-//!   │       e. Push tool_result messages to conversation      │
-//!   │       f. If no tool calls → break                       │
-//!   │    3. Return SessionResult                              │
-//!   └─────────────────────────────────────────────────────────┘
-//! ```
-//!
 //! # Key Design Decisions
 //!
 //! - **Static dispatch** — `BareLoop<C>` is generic over the
@@ -50,9 +34,9 @@
 //! # Quick Start
 //!
 //! ```rust,ignore
-//! use loopctl::loop_::BareLoop;
+//! use loopctl::engine::BareLoop;
 //! use loopctl::tool::ToolRegistry;
-//! use loopctl::core::LoopConfig;
+//! use loopctl::config::LoopConfig;
 //! use std::sync::Arc;
 //!
 //! // 1. Build components
@@ -86,10 +70,8 @@ use crate::hooks::HookAction;
 #[cfg(feature = "hooks")]
 use crate::hooks::HookExecutor;
 #[cfg(feature = "hooks")]
-#[allow(unused_imports)]
 use crate::hooks::context::{
     CompactTrigger, PostCompactContext, PostToolUseContext, PreCompactContext, PreToolUseContext,
-    SessionEndContext, SessionEndReason, SessionStartContext,
 };
 use crate::message::{Message, MessagePart, Role, ToolContent};
 use crate::middleware::{ToolDispatchContext, ToolPipeline, ToolPipelineBuilder};
@@ -108,7 +90,6 @@ use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
 use crate::tool::health::ToolHealthRegistry;
 use crate::tool::{PermissionCheck, ToolContext, ToolDispatchResult, ToolRegistry, ToolSchema};
 
-// Phase submodules
 mod compact;
 mod dispatch;
 mod emission;
@@ -140,22 +121,12 @@ mod stream;
 /// - [`new_with_managers()`](BareLoop::new_with_managers) — full control,
 ///   including a [`LoopRuntime`].
 ///
-/// # Lifecycle
-///
-/// ```text
-/// new() / new_with_managers()
-///   → run(user_input)
-///       → stream_turn() → dispatch_tools() → stream_turn()
-///       → … (repeat until end_turn or max_turns)
-///   → SessionResult
-/// ```
-///
 /// # Example
 ///
 /// ```rust,ignore
-/// use loopctl::loop_::BareLoop;
+/// use loopctl::engine::BareLoop;
 /// use loopctl::tool::ToolRegistry;
-/// use loopctl::core::LoopConfig;
+/// use loopctl::config::LoopConfig;
 /// use std::sync::Arc;
 ///
 /// let registry = ToolRegistry::new();
@@ -619,7 +590,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use loopctl::core::observer::LoopObserver;
+    /// use loopctl::observer::LoopObserver;
     /// use std::sync::Arc;
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
@@ -869,8 +840,8 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
                     success: true,
                     error: None,
                     duration_ms: Self::millis_u64(turn_start.elapsed()),
-                    input_tokens: self.budget.input_tokens,
-                    output_tokens: self.budget.output_tokens,
+                    input_tokens: turn_in,
+                    output_tokens: turn_out,
                 });
                 self.state = LoopState::Completed {
                     summary: text.clone(),
@@ -1326,12 +1297,12 @@ mod tests {
 
     impl Tool for EchoTool {
         /// Return the tool name `"echo"`.
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "echo"
         }
 
         /// Return a human-readable description.
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Echoes back the input"
         }
 
@@ -1377,12 +1348,12 @@ mod tests {
 
     impl Tool for FailingTool {
         /// Return the tool name `"fail"`.
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "fail"
         }
 
         /// Return a human-readable description.
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Always fails"
         }
 
@@ -1451,7 +1422,7 @@ mod tests {
     }
 
     impl crate::observer::LoopObserver for CountingObserver {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "counting"
         }
 
@@ -1868,8 +1839,7 @@ mod tests {
         assert!(!received.is_empty(), "streamer should have fired");
         assert!(
             received.join("").contains("Hello world"),
-            "got: {:?}",
-            received
+            "got: {received:?}",
         );
     }
 
@@ -2193,7 +2163,7 @@ mod tests {
     }
 
     impl crate::middleware::ToolMiddleware for TurnNumberCapture {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "turn_capture"
         }
 

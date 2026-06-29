@@ -40,7 +40,7 @@ pub type AskResolverFn =
 ///     if ctx.tool_name == "safe_read" {
 ///         PermissionCheck::Allow
 ///     } else {
-///         PermissionCheck::Deny
+///         PermissionCheck::Deny { reason: "not on allowlist".into() }
 ///     }
 /// });
 /// ```

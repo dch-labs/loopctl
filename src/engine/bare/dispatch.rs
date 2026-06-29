@@ -115,10 +115,26 @@ impl<C: ApiClient> BareLoop<C> {
             });
 
             if let Some(blocked) = self.check_pre_tool_use_hooks(&tc, turn_idx) {
+                // Pair on_tool_pre with on_tool_post so observers see a
+                // complete lifecycle even when a hook blocks the call.
+                self.managers.observers().on_tool_post(&ToolPostContext {
+                    turn: turn_idx,
+                    tool: tc.tool.clone(),
+                    result_hash: loop_detector::hash_result(&blocked.output.to_string()),
+                    is_error: blocked.is_error,
+                    duration: Duration::ZERO,
+                });
                 return Ok(blocked);
             }
 
             if let Some(blocked) = self.pre_detection(&tc, turn_idx) {
+                self.managers.observers().on_tool_post(&ToolPostContext {
+                    turn: turn_idx,
+                    tool: tc.tool.clone(),
+                    result_hash: loop_detector::hash_result(&blocked.output.to_string()),
+                    is_error: blocked.is_error,
+                    duration: Duration::ZERO,
+                });
                 return Ok(blocked);
             }
 

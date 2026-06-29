@@ -206,7 +206,6 @@ pub enum CompactBase {
     ///
     /// Use this when you want compaction to aim for a fixed fraction
     /// of the model's total capacity regardless of the trigger threshold.
-    #[default]
     Context,
 
     /// Target is a percentage of the trigger threshold.
@@ -216,6 +215,7 @@ pub enum CompactBase {
     /// This is the default. With the default `threshold = 0.80` and
     /// `compact_target_pct = 0.70`, compaction targets 56% of the
     /// context window (0.80 × 0.70 = 0.56).
+    #[default]
     Threshold,
 }
 
@@ -448,7 +448,7 @@ impl ContextManager {
                     .parts
                     .iter()
                     .map(|p| match p {
-                        MessagePart::Text { text } => text.len() as u64,
+                        MessagePart::Text { text } => text.chars().count() as u64,
                         MessagePart::Image { .. } => 256, // rough base64 estimate
                         MessagePart::ToolCall { name, input, .. } => {
                             let name_len = name.len() as u64;
@@ -618,6 +618,16 @@ impl ContextManager {
             });
         }
 
+        if outcome.tokens_after > self.context_window {
+            return Err(ContextOverflow {
+                tokens_used: outcome.tokens_after,
+                context_window: self.context_window,
+                message_count,
+                trigger: CompactReason::Manual,
+                compactor_error: None,
+            });
+        }
+
         Ok(EnsureContextResult::Compacted(outcome))
     }
 
@@ -668,9 +678,10 @@ impl ContextManager {
                 tool_messages: pre_messages
                     .iter()
                     .filter(|m| {
-                        m.parts
-                            .iter()
-                            .any(crate::message::MessagePart::is_tool_call)
+                        m.parts.iter().any(|p| {
+                            crate::message::MessagePart::is_tool_call(p)
+                                || crate::message::MessagePart::is_tool_result(p)
+                        })
                     })
                     .count(),
             },
@@ -932,7 +943,7 @@ mod tests {
         assert_eq!(outcome.messages.len(), 3);
         assert!(outcome.tokens_saved > 0);
         // Verify the first message was preserved.
-        assert!(outcome.messages.first().is_some());
+        assert!(!outcome.messages.is_empty());
         assert_eq!(outcome.messages.first().unwrap().role, first_role.unwrap());
     }
 

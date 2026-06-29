@@ -1260,10 +1260,10 @@ mod tests {
     struct EchoTool;
 
     impl Tool for EchoTool {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "echo"
         }
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Echoes back the input"
         }
         fn schema(&self) -> ToolSchema {
@@ -1300,10 +1300,10 @@ mod tests {
     struct FailTool;
 
     impl Tool for FailTool {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "fail"
         }
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Always fails"
         }
         fn schema(&self) -> ToolSchema {

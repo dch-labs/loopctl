@@ -139,7 +139,7 @@ impl InMemoryStore {
     /// Create a store pre-populated with the given entries.
     ///
     /// Useful for setting up test fixtures or seeding an agent with
-    /// Replace all entries with the provided list.
+    /// initial context.
     ///
     /// # Example
     ///

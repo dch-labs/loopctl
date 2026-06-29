@@ -1127,7 +1127,7 @@ mod tests {
     #[test]
     fn merge_tool_results_single() {
         let r = serde_json::json!({"role": "tool", "content": "ok"});
-        let merged = merge_tool_results(&[r.clone()]);
+        let merged = merge_tool_results(std::slice::from_ref(&r));
         assert_eq!(merged, r);
     }
 

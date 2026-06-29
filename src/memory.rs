@@ -7,7 +7,7 @@
 //!
 //! # Provided Implementations
 //!
-//! - **`TrajectoryMemory`** — Records tool-execution trajectories and
+//! - **[`InMemoryStore`]** — Records tool-execution trajectories and
 //!   retrieves relevant past experiences.
 //!
 //! # Quick Start

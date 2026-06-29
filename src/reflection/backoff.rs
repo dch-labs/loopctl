@@ -130,12 +130,16 @@ impl RecoveryStrategy for ExponentialBackoffRecovery {
         &self,
         analysis: &FailureAnalysis,
         attempt: u32,
-        _max_attempts: u32,
+        max_attempts: u32,
     ) -> Pin<Box<dyn Future<Output = RecoveryAction> + Send + '_>> {
+        // Honour both ceilings: the strategy-local retry limit and the
+        // framework-imposed `max_attempts` budget. Whichever is reached
+        // first causes us to give up.
+        let max_retries = self.max_retries.min(max_attempts);
         let action = if !analysis.is_recoverable {
             RecoveryAction::Fail(analysis.root_cause.clone())
-        } else if attempt >= self.max_retries {
-            RecoveryAction::Fail(format!("max retries ({}) exceeded", self.max_retries))
+        } else if attempt >= max_retries {
+            RecoveryAction::Fail(format!("max retries ({max_retries}) exceeded"))
         } else if analysis.severity >= FailureSeverity::High && analysis.correction.is_some() {
             RecoveryAction::AskUser(format!(
                 "high-severity failure with correction available: {}",
@@ -229,10 +233,33 @@ mod tests {
         };
         let action = strategy.decide(&analysis, 3, 5).await;
         assert!(action.is_fail());
-        let RecoveryAction::Fail(reason) = action else {
-            unreachable!()
+        let reason = match action {
+            RecoveryAction::Fail(r) => r,
+            _ => String::new(),
         };
         assert!(reason.contains("max retries"));
+    }
+
+    #[tokio::test]
+    async fn backoff_respects_framework_max_attempts() {
+        // strategy allows up to 10 retries, but the framework budget is 2.
+        // At attempt == max_attempts we must give up, ignoring the higher
+        // strategy-local limit.
+        let strategy = ExponentialBackoffRecovery::new(10);
+        let analysis = FailureAnalysis {
+            is_recoverable: true,
+            root_cause: "timeout".to_string(),
+            severity: FailureSeverity::Medium,
+            correction: None,
+            context: String::new(),
+        };
+        let action = strategy.decide(&analysis, 2, 2).await;
+        assert!(action.is_fail());
+        let reason = match action {
+            RecoveryAction::Fail(r) => r,
+            _ => String::new(),
+        };
+        assert!(reason.contains("max retries (2)"));
     }
 
     #[tokio::test]
@@ -247,8 +274,9 @@ mod tests {
         };
         let action = strategy.decide(&analysis, 0, 5).await;
         assert!(action.is_fail());
-        let RecoveryAction::Fail(reason) = action else {
-            unreachable!()
+        let reason = match action {
+            RecoveryAction::Fail(r) => r,
+            _ => String::new(),
         };
         assert_eq!(reason, "invalid api key");
     }

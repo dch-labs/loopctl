@@ -2,6 +2,8 @@
 //!
 //! Demonstrates the absolute simplest way to run a [`BareLoop`]:
 //! create a mock client, build the loop, and call [`run`].
+
+#![allow(clippy::expect_used, clippy::doc_markdown)]
 //!
 //! ```sh
 //! cargo run --example hello-cli --features testing

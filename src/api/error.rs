@@ -1305,12 +1305,11 @@ mod tests {
 
     #[test]
     fn test_result_type() {
-        fn returns_result() -> Result<String> {
-            Ok("success".to_string())
+        fn returns_result() -> String {
+            "success".to_string()
         }
         let result = returns_result();
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "success");
+        assert_eq!(result, "success");
     }
 
     #[test]
@@ -1328,7 +1327,7 @@ mod tests {
 
     #[test]
     fn test_from_hyper() {
-        let error = ApiError::from_hyper(std::io::Error::new(std::io::ErrorKind::Other, "oops"));
+        let error = ApiError::from_hyper(std::io::Error::other("oops"));
         assert!(matches!(error, ApiError::Http(_)));
     }
 

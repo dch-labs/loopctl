@@ -1084,7 +1084,7 @@ mod tests {
             ..Default::default()
         };
         // 1000 * 2^3 = 8000, capped at 5000
-        assert_eq!(config.base_delay(3), Duration::from_millis(5000));
+        assert_eq!(config.base_delay(3), Duration::from_secs(5));
     }
 
     #[test]
@@ -1655,7 +1655,7 @@ mod tests {
     }
 
     impl ApiClient for HandlerMock {
-        fn model(&self) -> &str {
+        fn model(&self) -> &'static str {
             "test-model"
         }
 
@@ -1841,21 +1841,10 @@ mod tests {
         // (covered above). Here we test that stream_turn returns the
         // error when streaming fails and the handler is configured
         // without fallback.
-        let handler = StreamHandler::new().with_config(
-            StreamTimeoutConfig {
-                fallback_to_non_streaming: false,
-                ..Default::default()
-            },
-            StreamRetryConfig {
-                max_retries: 0,
-                ..Default::default()
-            },
-        );
-
         /// Mock that always returns an error stream.
         struct ErrorMock;
         impl ApiClient for ErrorMock {
-            fn model(&self) -> &str {
+            fn model(&self) -> &'static str {
                 "test-model"
             }
             fn stream_messages(
@@ -1885,6 +1874,17 @@ mod tests {
                 Box::pin(async { Err(ApiError::api("unreachable")) })
             }
         }
+
+        let handler = StreamHandler::new().with_config(
+            StreamTimeoutConfig {
+                fallback_to_non_streaming: false,
+                ..Default::default()
+            },
+            StreamRetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            },
+        );
 
         let client = ErrorMock;
         let cancel = Arc::new(CancelSignal::new());

@@ -426,7 +426,7 @@ mod tests {
         };
         let mut stream = HeartbeatStream::new(inner, config);
 
-        stream.last_heartbeat = Instant::now() - Duration::from_secs(1);
+        stream.last_heartbeat = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -446,12 +446,11 @@ mod tests {
         // setting start into the past, then poll.
         let callbacks: std::sync::Arc<std::sync::Mutex<Vec<HeartbeatData>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let cb = callbacks.clone();
         let config = HeartbeatConfig::new(
             Duration::from_millis(10),
             Duration::from_millis(1),
             Box::new(move |data: HeartbeatData| {
-                cb.lock().unwrap().push(data);
+                callbacks.lock().unwrap().push(data);
             }),
         );
 
@@ -460,7 +459,7 @@ mod tests {
         let mut stream = HeartbeatStream::new(inner, config);
 
         // Manually set start into the past so timeout has elapsed.
-        stream.start = Instant::now() - Duration::from_secs(10);
+        stream.start = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
 
         // Use a no-op waker to poll manually.
         let waker = futures::task::noop_waker();

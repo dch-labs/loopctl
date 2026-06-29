@@ -1,15 +1,8 @@
 //! Cooperative cancellation signal for agent loops.
 //!
-//! [`CancelSignal`] combines an [`AtomicBool`] flag with a
-//! [`tokio::sync::Notify`] for sub-millisecond wake-up of waiting tasks.
-//!
-//! # Why not poll an `AtomicBool`?
-//!
-//! Polling works but wastes CPU cycles and introduces latency proportional
-//! to the poll interval. By pairing the flag with a `Notify`, any call to
-//! [`CancelSignal::cancel`] instantly wakes every task that is
-//! `tokio::select!`-ing on [`CancelSignal::notified`], giving sub-µs
-//! response time.
+//! [`CancelSignal`] wraps a [`tokio_util::sync::CancellationToken`], which is
+//! purpose-built to avoid the time-of-check-to-time-of-use (TOCTOU) race that
+//! plagues hand-rolled `AtomicBool` + `Notify` combinations.
 //!
 //! # Usage
 //!
@@ -28,61 +21,48 @@
 //! }
 //! ```
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
-/// Shared cancellation signal backed by an [`AtomicBool`] flag and a
-/// [`Notify`] for instant wake-up.
+/// Shared cancellation signal backed by a
+/// [`tokio_util::sync::CancellationToken`].
 ///
 /// Wrap in `Arc` for sharing across tasks or threads. Create with
 /// [`CancelSignal::new`], cancel with [`CancelSignal::cancel`], and await
 /// instant notification with [`CancelSignal::notified`].
 pub struct CancelSignal {
-    flag: AtomicBool,
-    notify: Notify,
+    inner: CancellationToken,
 }
 
 impl CancelSignal {
     /// Create a new, non-cancelled signal.
     ///
-    /// Returns a [`CancelSignal`] with its internal flag set to `false`.
-    /// The signal is ready to be shared (via `Arc`) and awaited by
-    /// worker tasks until [`cancel`](Self::cancel) is called.
+    /// Returns a [`CancelSignal`] backed by a fresh
+    /// [`CancellationToken`]. The signal is ready to be shared (via `Arc`)
+    /// and awaited by worker tasks until [`cancel`](Self::cancel) is called.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            flag: AtomicBool::new(false),
-            notify: Notify::new(),
+            inner: CancellationToken::new(),
         }
     }
 
     /// Fire the cancellation signal.
     ///
-    /// Sets the internal flag to `true` **and** wakes every task currently
+    /// Sets the internal state to cancelled **and** wakes every task currently
     /// awaiting [`Self::notified`]. Idempotent — calling multiple times is
     /// safe.
     pub fn cancel(&self) {
-        self.flag.store(true, Ordering::Release);
-        self.notify.notify_waiters();
-    }
-
-    /// Reset the signal so it can be reused for a new operation.
-    ///
-    /// Clears the internal cancellation flag, returning the signal to
-    /// its initial non-cancelled state. Any subsequent calls to
-    /// [`is_cancelled`](Self::is_cancelled) will return `false` until
-    /// [`cancel`](Self::cancel) is called again.
-    pub fn reset(&self) {
-        self.flag.store(false, Ordering::Release);
+        self.inner.cancel();
     }
 
     /// Check whether the signal has been cancelled.
     ///
-    /// Performs a non-blocking load of the internal flag. Returns
-    /// `true` if [`cancel`](Self::cancel) has been called since the
-    /// last [`reset`](Self::reset) (or since construction).
+    /// Performs a non-blocking check of the internal [`CancellationToken`].
+    /// Returns `true` if [`cancel`](Self::cancel) has been called since
+    /// construction.
+    #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::Acquire)
+        self.inner.is_cancelled()
     }
 
     /// Return a future that completes **instantly** when [`Self::cancel`]
@@ -90,6 +70,9 @@ impl CancelSignal {
     ///
     /// If the signal is already cancelled, the returned future completes
     /// immediately on the first `.await`.
+    ///
+    /// This delegates to [`CancellationToken::cancelled`], which is
+    /// race-free by construction — no flag-then-wait loop required.
     ///
     /// Use inside `tokio::select!` alongside the actual work future:
     ///
@@ -100,11 +83,7 @@ impl CancelSignal {
     /// }
     /// ```
     pub async fn notified(&self) {
-        let notified = self.notify.notified();
-        if self.flag.load(Ordering::Acquire) {
-            return;
-        }
-        notified.await;
+        self.inner.cancelled().await;
     }
 }
 
@@ -149,15 +128,6 @@ mod tests {
         assert!(!signal.is_cancelled());
         signal.cancel();
         assert!(signal.is_cancelled());
-    }
-
-    #[test]
-    fn test_reset() {
-        let signal = CancelSignal::new();
-        signal.cancel();
-        assert!(signal.is_cancelled());
-        signal.reset();
-        assert!(!signal.is_cancelled());
     }
 
     #[tokio::test]

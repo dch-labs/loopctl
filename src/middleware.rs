@@ -432,10 +432,10 @@ mod tests {
     struct EchoTool;
 
     impl Tool for EchoTool {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "echo"
         }
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Echoes back the input"
         }
         fn schema(&self) -> ToolSchema {
@@ -463,10 +463,10 @@ mod tests {
     struct ErrorTool;
 
     impl Tool for ErrorTool {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "error_tool"
         }
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Always returns an error"
         }
         fn schema(&self) -> ToolSchema {
@@ -491,10 +491,10 @@ mod tests {
     }
 
     impl Tool for SlowTool {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "slow"
         }
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Takes a long time"
         }
         fn schema(&self) -> ToolSchema {
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(result.resolved_tool_name, "echo");
         match result.output {
             ToolContent::Text(ref t) => assert_eq!(t, "hello"),
-            other => panic!("expected Text, got {other:?}"),
+            other @ ToolContent::Multipart(_) => panic!("expected Text, got {other:?}"),
         }
     }
 
@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(result.resolved_tool_name, "nonexistent");
         match result.output {
             ToolContent::Text(ref t) => assert!(t.contains("not found")),
-            other => panic!("expected Text, got {other:?}"),
+            other @ ToolContent::Multipart(_) => panic!("expected Text, got {other:?}"),
         }
     }
 
@@ -639,7 +639,7 @@ mod tests {
                 t.contains("Permission") && t.contains("blocked"),
                 "got: {t}"
             ),
-            other => panic!("expected Text, got {other:?}"),
+            other @ ToolContent::Multipart(_) => panic!("expected Text, got {other:?}"),
         }
     }
 
@@ -681,7 +681,7 @@ mod tests {
                 t.contains("Permission") && t.contains("blocked"),
                 "got: {t}"
             ),
-            other => panic!("expected Text, got {other:?}"),
+            other @ ToolContent::Multipart(_) => panic!("expected Text, got {other:?}"),
         }
     }
 
@@ -746,7 +746,7 @@ mod tests {
         assert!(result.is_error);
         match result.output {
             ToolContent::Text(ref t) => assert!(t.contains("timed out")),
-            other => panic!("expected Text, got {other:?}"),
+            other @ ToolContent::Multipart(_) => panic!("expected Text, got {other:?}"),
         }
     }
 
@@ -774,8 +774,8 @@ mod tests {
 
     #[test]
     fn test_similarity_empty() {
-        assert_eq!(UnknownToolMiddleware::similarity("", ""), 1.0);
-        assert_eq!(UnknownToolMiddleware::similarity("a", ""), 0.0);
+        assert!((UnknownToolMiddleware::similarity("", "") - 1.0).abs() < f64::EPSILON);
+        assert!((UnknownToolMiddleware::similarity("a", "") - 0.0).abs() < f64::EPSILON);
     }
 
     // ==================================================
@@ -841,15 +841,14 @@ mod tests {
         // Should return immediately with permission denied, not wait for timeout
         assert!(
             elapsed < Duration::from_millis(200),
-            "permission should short-circuit before timeout, took {:?}",
-            elapsed
+            "permission should short-circuit before timeout, took {elapsed:?}",
         );
         match result.output {
             ToolContent::Text(ref t) => assert!(
                 t.contains("Permission") && t.contains("blocked"),
                 "got: {t}"
             ),
-            other => panic!("expected Text, got {other:?}"),
+            other @ ToolContent::Multipart(_) => panic!("expected Text, got {other:?}"),
         }
     }
 
@@ -877,7 +876,7 @@ mod tests {
         assert!(!result.is_error);
         match result.output {
             ToolContent::Text(ref t) => assert_eq!(t, "hello"),
-            other => panic!("expected Text, got {other:?}"),
+            other @ ToolContent::Multipart(_) => panic!("expected Text, got {other:?}"),
         }
     }
 
@@ -908,7 +907,7 @@ mod tests {
                     "expected suggestion, got: {msg}"
                 );
             }
-            other => panic!("expected Text, got {other:?}"),
+            other @ ToolContent::Multipart(_) => panic!("expected Text, got {other:?}"),
         }
     }
 
@@ -922,7 +921,7 @@ mod tests {
     }
 
     impl ToolMiddleware for ReachTracker {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "reach_tracker"
         }
 
@@ -966,11 +965,11 @@ mod tests {
     struct LongOutputTool;
 
     impl Tool for LongOutputTool {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "long_output"
         }
 
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Returns a long string for testing"
         }
 
@@ -988,7 +987,13 @@ mod tests {
             _ctx: &ToolContext,
         ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
             Box::pin(async move {
-                let count = input.get("count").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+                let count = usize::try_from(
+                    input
+                        .get("count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(100),
+                )
+                .unwrap();
                 let ch = input.get("char").and_then(|v| v.as_str()).unwrap_or("a");
                 Ok(ToolOutput::text(ch.repeat(count)))
             })
@@ -1000,11 +1005,11 @@ mod tests {
     struct MultipartTool;
 
     impl Tool for MultipartTool {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "multipart"
         }
 
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Returns multipart content"
         }
 

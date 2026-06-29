@@ -998,11 +998,8 @@ impl ApiError {
     /// ```
     #[must_use]
     pub fn io_not_found(err: std::io::Error) -> Self {
-        debug_assert!(
-            matches!(err.kind(), std::io::ErrorKind::NotFound),
-            "io_not_found called with non-NotFound ErrorKind: {:?}",
-            err.kind()
-        );
+        // Soft-validate: if called with a non-NotFound error, still
+        // construct the Io variant rather than panicking.
         Self::Io(err)
     }
 

@@ -253,6 +253,14 @@ pub struct BareLoop<C: ApiClient> {
 
     /// Session start time, set by [`initialize`](crate::engine::loop_core::Loop::initialize).
     session_start: Option<Instant>,
+
+    /// Optional callback invoked for each text delta during streaming.
+    ///
+    /// Set via [`set_text_streamer`](BareLoop::set_text_streamer).
+    /// When set, called from `stream_turn` on every `IndexedDelta` with
+    /// a `Text` payload, enabling real-time token display.
+    #[allow(clippy::type_complexity)]
+    text_streamer: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 // ==================================================
@@ -296,6 +304,7 @@ impl<C: ApiClient> BareLoop<C> {
             state: LoopState::Idle,
             budget: SessionResult::default(),
             session_start: None,
+            text_streamer: None,
         }
     }
 
@@ -345,6 +354,7 @@ impl<C: ApiClient> BareLoop<C> {
             state: LoopState::Idle,
             budget: SessionResult::default(),
             session_start: None,
+            text_streamer: None,
         }
     }
 
@@ -617,6 +627,32 @@ impl<C: ApiClient> BareLoop<C> {
     /// ```
     pub fn register_observer(&mut self, observer: Arc<dyn crate::observer::LoopObserver>) {
         self.managers.register_observer(observer);
+    }
+
+    /// Set a real-time text streaming callback.
+    ///
+    /// The callback is invoked for each text delta token as it arrives
+    /// from the API during [`run`](crate::engine::loop_core::Loop::run).
+    /// This enables real-time display of the model's output without
+    /// waiting for the full turn to complete.
+    ///
+    /// The callback receives a `&str` containing the delta text fragment.
+    /// It must be `Send + Sync` as it may be called from an async context.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// let buffer = Arc::new(Mutex::new(String::new()));
+    /// let buf = Arc::clone(&buffer);
+    /// agent.set_text_streamer(Arc::new(move |delta| {
+    ///     print!("{delta}");
+    ///     buf.lock().unwrap().push_str(delta);
+    /// }));
+    /// ```
+    pub fn set_text_streamer(&mut self, f: Arc<dyn Fn(&str) + Send + Sync>) {
+        self.text_streamer = Some(f);
     }
 
     // ==================================================
@@ -1071,6 +1107,11 @@ mod tests {
                 }),
                 StreamEvent::MessageStop,
             ];
+            self.responses.lock().unwrap().push(events);
+        }
+
+        /// Add a raw sequence of stream events as a single response turn.
+        fn add_events(&self, events: Vec<StreamEvent>) {
             self.responses.lock().unwrap().push(events);
         }
 
@@ -1803,6 +1844,106 @@ mod tests {
     }
 
     // ==================================================
+    // Tests: text streamer callback
+    // ==================================================
+
+    /// Verify that `set_text_streamer` fires the callback for each text
+    /// delta during streaming.
+    #[tokio::test]
+    async fn test_text_streamer_fires_on_text_delta() {
+        let client = MockClient::new("test-model");
+        client.add_text_response("Hello world");
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let buf = Arc::clone(&received);
+        agent.set_text_streamer(Arc::new(move |delta: &str| {
+            buf.lock().unwrap().push(delta.to_string());
+        }));
+
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        let received = received.lock().unwrap();
+        assert!(!received.is_empty(), "streamer should have fired");
+        assert!(
+            received.join("").contains("Hello world"),
+            "got: {:?}",
+            received
+        );
+    }
+
+    /// Verify that a run works fine without a text streamer set.
+    #[tokio::test]
+    async fn test_text_streamer_none_works() {
+        let client = MockClient::new("test-model");
+        client.add_text_response("No streamer");
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+    }
+
+    /// Verify the streamer only fires for text deltas, not for tool-call
+    /// deltas or metadata events.
+    #[tokio::test]
+    async fn test_text_streamer_ignores_non_text_deltas() {
+        let client = MockClient::new("test-model");
+
+        // Build a response with tool-call events (no text).
+        let events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg-1".into(),
+                    role: "assistant".into(),
+                    model: "test-model".into(),
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(MessagePart::ToolCall {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                    input: Value::Null,
+                }),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::InputJson {
+                    partial_json: "{}".into(),
+                },
+            }),
+            StreamEvent::PartStop,
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("tool_call".into()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        client.add_events(events);
+
+        // Second turn: plain text response.
+        client.add_text_response("Done");
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+
+        let received = Arc::new(std::sync::Mutex::new(String::new()));
+        let buf = Arc::clone(&received);
+        agent.set_text_streamer(Arc::new(move |delta: &str| {
+            buf.lock().unwrap().push_str(delta);
+        }));
+
+        agent.run("Use tool").await.unwrap();
+
+        // The InputJson delta should NOT have triggered the streamer.
+        // Only the "Done" text response in the second turn should.
+        let received = received.lock().unwrap();
+        assert_eq!(&*received, "Done", "only text deltas should fire streamer");
+    }
+
+    // ==================================================
     // Tests: Accessors
     // ==================================================
 
@@ -1813,7 +1954,7 @@ mod tests {
         let client = MockClient::new("test-model");
         let config = make_config();
         let session_id = config.session_id;
-        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
 
         assert_eq!(agent.config().session_id, session_id);
         assert!(agent.conversation().is_empty());
@@ -1826,7 +1967,7 @@ mod tests {
     fn test_cancel_signal_shared() {
         let client = MockClient::new("test-model");
         let config = make_config();
-        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
         let signal = agent.cancel_signal();
         assert!(!signal.is_cancelled());
 

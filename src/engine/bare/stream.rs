@@ -67,6 +67,14 @@ impl<C: ApiClient> BareLoop<C> {
 
             match event_result {
                 Some(Ok(event)) => {
+                    // Fire text streaming callback for real-time display.
+                    if let Some(ref streamer) = self.text_streamer {
+                        if let StreamEvent::IndexedDelta(indexed_delta) = &event {
+                            if let crate::stream::DeltaPart::Text { text } = &indexed_delta.delta {
+                                streamer(text);
+                            }
+                        }
+                    }
                     if let StreamEvent::MessageDelta(delta) = &event {
                         if let Some(ref reason_str) = delta.delta.stop_reason {
                             stop_reason =

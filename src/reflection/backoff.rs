@@ -327,8 +327,6 @@ mod tests {
         assert!(debug.contains("max_retries"));
     }
 
-    // ---- delay_for_attempt ----
-
     #[test]
     fn delay_for_attempt_zero_yields_base() {
         let strategy = ExponentialBackoffRecovery::new(3);

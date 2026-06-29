@@ -228,7 +228,7 @@ pub struct MockApiClient {
 ///     stop_reason: "end_turn".to_string(),
 /// };
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct MockResponse {
     /// The text content the assistant should produce.
     ///
@@ -393,13 +393,15 @@ impl MockApiClient {
     ///     .with_text_response("I am a test assistant.");
     /// ```
     #[must_use]
-    #[allow(
-        clippy::unwrap_used,
-        clippy::indexing_slicing,
-        clippy::missing_panics_doc
-    )]
     pub fn with_text_response(self, text: &str) -> Self {
-        self.responses.lock().unwrap()[0].text = text.to_string();
+        if let Some(r) = self
+            .responses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first_mut()
+        {
+            r.text = text.to_string();
+        }
         self
     }
 
@@ -424,19 +426,19 @@ impl MockApiClient {
     ///     .with_tool_call("call_1", "bash", json!({"command": "ls"}));
     /// ```
     #[must_use]
-    #[allow(
-        clippy::unwrap_used,
-        clippy::indexing_slicing,
-        clippy::missing_panics_doc
-    )]
     pub fn with_tool_call(self, id: &str, name: &str, input: Value) -> Self {
-        let mut responses = self.responses.lock().unwrap();
-        responses[0].tool_call = Some(MockToolCall {
-            id: id.to_string(),
-            name: name.to_string(),
-            input,
-        });
-        responses[0].stop_reason = "tool_use".to_string();
+        let mut responses = self
+            .responses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(r) = responses.first_mut() {
+            r.tool_call = Some(MockToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                input,
+            });
+            r.stop_reason = "tool_use".to_string();
+        }
         drop(responses);
         self
     }
@@ -458,13 +460,15 @@ impl MockApiClient {
     ///     .with_stop_reason("max_tokens");
     /// ```
     #[must_use]
-    #[allow(
-        clippy::unwrap_used,
-        clippy::indexing_slicing,
-        clippy::missing_panics_doc
-    )]
     pub fn with_stop_reason(self, reason: &str) -> Self {
-        self.responses.lock().unwrap()[0].stop_reason = reason.to_string();
+        if let Some(r) = self
+            .responses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first_mut()
+        {
+            r.stop_reason = reason.to_string();
+        }
         self
     }
 
@@ -498,10 +502,12 @@ impl MockApiClient {
     /// ]);
     /// ```
     #[must_use]
-    #[allow(clippy::unwrap_used, clippy::missing_panics_doc)]
     pub fn with_responses(self, responses: Vec<MockResponse>) -> Self {
         if !responses.is_empty() {
-            *self.responses.lock().unwrap() = responses;
+            *self
+                .responses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = responses;
         }
         self
     }
@@ -551,17 +557,15 @@ impl MockApiClient {
     /// [R2, R3]      → pop → R2, queue becomes [R3]
     /// [R3]          → pop → R3, queue stays   [R3] (cloned)
     /// ```
-    #[allow(
-        clippy::unwrap_used,
-        clippy::indexing_slicing,
-        clippy::missing_panics_doc
-    )]
     fn pop_response(&self) -> MockResponse {
-        let mut guard = self.responses.lock().unwrap();
+        let mut guard = self
+            .responses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.len() > 1 {
             guard.remove(0)
         } else {
-            guard[0].clone()
+            guard.first().cloned().unwrap_or_default()
         }
     }
 }

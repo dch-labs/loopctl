@@ -38,13 +38,11 @@
 //!
 //! ## Support
 //!
-//! - **[`builder`]** — Fluent builder API for constructing configured agents.
 //! - **[`memory::builtin`]** — Reference [`InMemoryStore`](memory::builtin::InMemoryStore) implementation.
 //! - **[`hooks`]** — Bidirectional lifecycle control (allow/block/ask before tool use, compaction). *Requires `hooks` feature.*
 //! - **[`testing`]** — Test utilities and fixtures. *Requires `testing` feature.*
 
 pub mod api;
-pub mod builder;
 pub mod cancel;
 pub mod capabilities;
 pub mod compact;
@@ -59,6 +57,8 @@ pub mod memory;
 pub mod message;
 pub mod middleware;
 pub mod observer;
+#[cfg(feature = "providers")]
+pub mod provider;
 pub mod reflection;
 pub mod runtime;
 pub mod stream;

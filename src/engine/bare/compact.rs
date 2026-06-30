@@ -17,8 +17,8 @@ use crate::observer::CompactedContext;
 impl<C: ApiClient> BareLoop<C> {
     /// Check if context compaction is needed and perform it if so.
     ///
-    /// When a [`ContextManager`] is configured, this method:
-    /// 1. Calls [`ContextManager::ensure_context_fits()`] to check token usage.
+    /// When a [`crate::compact::ContextManager`] is configured, this method:
+    /// 1. Calls [`ContextManager::ensure_context_fits`](crate::compact::ContextManager::ensure_context_fits) to check token usage.
     /// 2. If compaction occurred, replaces `self.conversation` with the compacted messages.
     /// 3. Notifies observers via [`LoopObserver::on_compaction`](crate::observer::LoopObserver::on_compaction).
     ///

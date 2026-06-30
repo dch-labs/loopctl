@@ -181,6 +181,7 @@ pub enum LoopState {
 /// assert!(!more.is_complete);
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TurnResult {
     /// May be empty if the response consists entirely of tool calls.
     pub text: String,
@@ -427,6 +428,7 @@ impl ToolCall {
 /// assert_eq!(err.error.unwrap(), "API rate limit exceeded");
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SessionResult {
     /// Matches [`LoopConfig::session_id`].
     pub session_id: Uuid,

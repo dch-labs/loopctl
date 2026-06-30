@@ -98,8 +98,8 @@ impl LoopConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`String`] describing the first invalid field, or `Ok(())`
-    /// if all fields are valid.
+    /// Returns a [`Config`](crate::error::LoopError::Config) variant describing
+    /// or `Ok(())` if all fields are valid.
     ///
     /// # Example
     ///
@@ -113,27 +113,35 @@ impl LoopConfig {
     /// assert!(bad.validate().is_err());
     /// ```
     #[must_use = "validation errors should not be silently ignored"]
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), crate::error::LoopError> {
         if self.max_turns == 0 {
-            return Err("max_turns must be greater than 0".to_string());
+            return Err(crate::error::LoopError::Config(
+                "max_turns must be greater than 0".to_string(),
+            ));
         }
         if self.context_window == 0 {
-            return Err("context_window must be greater than 0".to_string());
+            return Err(crate::error::LoopError::Config(
+                "context_window must be greater than 0".to_string(),
+            ));
         }
         if self.max_tokens == 0 {
-            return Err("max_tokens must be greater than 0".to_string());
+            return Err(crate::error::LoopError::Config(
+                "max_tokens must be greater than 0".to_string(),
+            ));
         }
         if self.model.is_empty() {
-            return Err("model must not be empty".to_string());
+            return Err(crate::error::LoopError::Config(
+                "model must not be empty".to_string(),
+            ));
         }
         if self.compact_threshold.is_nan()
             || self.compact_threshold < 0.0
             || self.compact_threshold > 1.0
         {
-            return Err(format!(
+            return Err(crate::error::LoopError::Config(format!(
                 "compact_threshold must be in [0.0, 1.0], got {}",
                 self.compact_threshold
-            ));
+            )));
         }
         Ok(())
     }
@@ -156,9 +164,10 @@ mod tests {
             ..LoopConfig::default()
         };
         let err = config.validate().unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.contains("max_tokens"),
-            "error should mention max_tokens: {err}"
+            msg.contains("max_tokens"),
+            "error should mention max_tokens: {msg}"
         );
     }
 
@@ -178,7 +187,8 @@ mod tests {
             ..LoopConfig::default()
         };
         let err = config.validate().unwrap_err();
-        assert!(err.contains("model"), "error should mention model: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("model"), "error should mention model: {msg}");
     }
 
     #[test]

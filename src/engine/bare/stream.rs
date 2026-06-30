@@ -52,6 +52,13 @@ impl<C: ApiClient> BareLoop<C> {
         // Inline streaming (no handler).
         let system = self.config.system_prompt.clone();
         let tool_schemas = self.build_tool_schemas();
+        // Clone the conversation history for the API request. The `ApiClient`
+        // trait requires `'static` streams (it takes ownership of the
+        // messages), so a clone is unavoidable here. The in-memory clone is
+        // O(n) in the number of messages but is typically dwarfed by the
+        // cost of serialising the messages into an HTTP request body. For
+        // very long sessions (>200 turns with large tool outputs), consider
+        // enabling auto-compaction to bound the history size.
         let mut stream =
             self.client
                 .stream_messages(self.conversation.clone(), system, tool_schemas);

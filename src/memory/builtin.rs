@@ -26,7 +26,7 @@
 //! use loopctl::memory::{LoopMemory, MemoryEntry, MemoryCategory};
 //!
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
-//! let mut store = InMemoryStore::new();
+//! let store = InMemoryStore::new();
 //!
 //! store.store(
 //!     MemoryEntry::new(MemoryCategory::Insight, "Prefer Glob over manual file search")
@@ -41,6 +41,7 @@ use crate::error::LoopError;
 use crate::memory::{ConsolidationStats, LoopMemory, MemoryEntry};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{PoisonError, RwLock};
 
 /// A simple in-memory store for loop memory entries.
 ///
@@ -73,9 +74,10 @@ use std::pin::Pin;
 ///
 /// # Thread Safety
 ///
-/// [`InMemoryStore`] is `Send + Sync` because all mutation goes through
-/// `&mut self` in the [`LoopMemory`] trait. If you need shared mutable
-/// access from multiple tasks, wrap it in `Arc<Mutex<_>>`.
+/// [`InMemoryStore`] is `Send + Sync`. Interior mutability is handled via
+/// an internal `RwLock`, so `store` and `consolidate` only require `&self`.
+/// This allows the store to be shared via `Arc<InMemoryStore>` or
+/// `Arc<dyn LoopMemory>` across tasks without external locking.
 ///
 /// # Construction
 ///
@@ -99,7 +101,7 @@ use std::pin::Pin;
 /// use loopctl::memory::{LoopMemory, MemoryEntry, MemoryCategory};
 ///
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-/// let mut store = InMemoryStore::new();
+/// let store = InMemoryStore::new();
 ///
 /// store.store(MemoryEntry::new(MemoryCategory::Insight, "Prefer Glob over manual file search")).await.unwrap();
 ///
@@ -118,7 +120,7 @@ use std::pin::Pin;
 /// calling `consolidate()` periodically or implementing a custom
 /// [`LoopMemory`] with bounded capacity.
 pub struct InMemoryStore {
-    entries: Vec<MemoryEntry>,
+    entries: RwLock<Vec<MemoryEntry>>,
 }
 
 // ===================================================
@@ -142,7 +144,7 @@ impl InMemoryStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: RwLock::new(Vec::new()),
         }
     }
 
@@ -164,8 +166,8 @@ impl InMemoryStore {
     /// assert_eq!(store.len(), 2);
     /// ```
     #[must_use]
-    pub fn with_entries(mut self, entries: Vec<MemoryEntry>) -> Self {
-        self.entries = entries;
+    pub fn with_entries(self, entries: Vec<MemoryEntry>) -> Self {
+        *self.entries.write().unwrap_or_else(PoisonError::into_inner) = entries;
         self
     }
 }
@@ -191,11 +193,14 @@ impl LoopMemory for InMemoryStore {
     ///
     /// This implementation never returns an error.
     fn store(
-        &mut self,
+        &self,
         entry: MemoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>> {
         Box::pin(async move {
-            self.entries.push(entry);
+            self.entries
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(entry);
             Ok(())
         })
     }
@@ -226,7 +231,7 @@ impl LoopMemory for InMemoryStore {
     /// use loopctl::memory::{LoopMemory, MemoryEntry, MemoryCategory};
     ///
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-    /// let mut store = InMemoryStore::new();
+    /// let store = InMemoryStore::new();
     /// store.store(MemoryEntry::new(MemoryCategory::Fact, "file search uses Glob")).await.unwrap();
     ///
     /// let results = store.retrieve("file search", 5).await.unwrap();
@@ -245,8 +250,8 @@ impl LoopMemory for InMemoryStore {
             let query_lower = query.to_lowercase();
             let query_words: Vec<&str> = query_lower.split_whitespace().collect();
 
-            let mut scored: Vec<(f32, MemoryEntry)> = self
-                .entries
+            let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
+            let mut scored: Vec<(f32, MemoryEntry)> = entries
                 .iter()
                 .map(|entry| {
                     let memory_lower = entry.memory.to_lowercase();
@@ -299,21 +304,22 @@ impl LoopMemory for InMemoryStore {
     /// use loopctl::memory::LoopMemory;
     ///
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-    /// let mut store = InMemoryStore::new();
+    /// let store = InMemoryStore::new();
     /// let stats = store.consolidate().await.unwrap();
     /// println!("Pruned {} entries", stats.pruned);
     /// # });
     /// ```
     fn consolidate(
-        &mut self,
+        &self,
     ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
         Box::pin(async move {
-            let entries_before = self.entries.len();
-            self.entries.retain(|e| e.relevance >= 0.05);
-            let pruned = entries_before.saturating_sub(self.entries.len());
+            let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+            let entries_before = entries.len();
+            entries.retain(|e| e.relevance >= 0.05);
+            let pruned = entries_before.saturating_sub(entries.len());
             Ok(ConsolidationStats {
                 entries_before,
-                entries_after: self.entries.len(),
+                entries_after: entries.len(),
                 pruned,
                 merged: 0,
                 bytes_saved: 0,
@@ -326,7 +332,10 @@ impl LoopMemory for InMemoryStore {
     /// Used by the framework to monitor memory usage and by the
     /// [`is_empty`](LoopMemory::is_empty) provided method.
     fn len(&self) -> usize {
-        self.entries.len()
+        self.entries
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 }
 
@@ -337,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_and_retrieve() {
-        let mut store = InMemoryStore::new();
+        let store = InMemoryStore::new();
 
         store
             .store(MemoryEntry::new(
@@ -362,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retrieve_respects_limit() {
-        let mut store = InMemoryStore::new();
+        let store = InMemoryStore::new();
 
         for i in 0..10 {
             store
@@ -394,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_consolidate_prunes_low_relevance() {
-        let mut store = InMemoryStore::new();
+        let store = InMemoryStore::new();
 
         let mut good_entry = MemoryEntry::new(MemoryCategory::Insight, "useful insight");
         good_entry.relevance = 0.9;
@@ -425,7 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tag_matching_boosts_relevance() {
-        let mut store = InMemoryStore::new();
+        let store = InMemoryStore::new();
 
         let tagged =
             MemoryEntry::new(MemoryCategory::Strategy, "use iterators for loops").with_tag("rust");

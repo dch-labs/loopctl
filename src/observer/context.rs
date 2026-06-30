@@ -283,6 +283,19 @@ pub struct FallbackContext {
     pub to: String,
 }
 
+/// Context for [`LoopObserver::on_model_switched`](crate::observer::LoopObserver::on_model_switched).
+///
+/// Emitted when the model is hot-swapped via
+/// [`BareLoop::switch_model`](crate::engine::BareLoop::switch_model).
+/// Carries the previous and new model identifiers.
+#[derive(Debug, Clone)]
+pub struct ModelSwitchedContext {
+    /// Model identifier before the switch.
+    pub from: String,
+    /// Model identifier after the switch.
+    pub to: String,
+}
+
 /// Context for [`LoopObserver::on_loop_detected`](crate::observer::LoopObserver::on_loop_detected).
 ///
 /// Describes the repeating tool pattern and how many times it

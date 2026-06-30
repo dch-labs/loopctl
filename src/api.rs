@@ -48,8 +48,8 @@ use std::sync::Arc;
 /// }
 ///
 /// impl ApiClient for MyProviderClient {
-///     fn model(&self) -> &str {
-///         &self.model
+///     fn model(&self) -> String {
+///         self.model.clone()
 ///     }
 ///
 ///     fn stream_messages(
@@ -93,7 +93,18 @@ pub trait ApiClient: Send + Sync {
     ///
     /// Called by the framework during initialization and on each turn for
     /// observability purposes.
-    fn model(&self) -> &str;
+    fn model(&self) -> String;
+
+    /// Attempt to switch the model at runtime.
+    ///
+    /// Returns `true` if the client supports hot-swapping and the model
+    /// was updated successfully. Returns `false` by default (not supported).
+    /// Provider implementations that store their model behind interior
+    /// mutability override this to enable
+    /// [`BareLoop::switch_model`](crate::engine::BareLoop::switch_model).
+    fn set_model(&self, _model: &str) -> bool {
+        false
+    }
 
     /// Stream messages from the LLM provider.
     ///
@@ -220,8 +231,8 @@ mod tests {
     }
 
     impl ApiClient for MockClient {
-        fn model(&self) -> &str {
-            &self.model_name
+        fn model(&self) -> String {
+            self.model_name.clone()
         }
 
         fn stream_messages(
@@ -321,5 +332,14 @@ mod tests {
     fn test_shared_client() {
         let client: SharedApiClient = Arc::new(MockClient::new("shared"));
         assert_eq!(client.model(), "shared");
+    }
+
+    #[test]
+    fn default_set_model_returns_false() {
+        // MockClient does not override set_model, so the default impl
+        // should return false (unsupported).
+        let client = MockClient::new("test-model");
+        assert!(!client.set_model("other-model"));
+        assert_eq!(client.model(), "test-model");
     }
 }

@@ -23,7 +23,12 @@ use std::sync::Arc;
 /// # Example
 ///
 /// ```rust,ignore
-/// let mw = UnknownToolMiddleware::new();
+/// use std::sync::Arc;
+/// use loopctl::tool::registry::ToolRegistry;
+/// use loopctl::middleware::unknown_tool::UnknownToolMiddleware;
+///
+/// let registry = Arc::new(ToolRegistry::new());
+/// let mw = UnknownToolMiddleware::new(registry);
 /// // If tool "basj" is not found, error message will say:
 /// // "Tool 'basj' not found. Did you mean 'bash'?"
 /// ```

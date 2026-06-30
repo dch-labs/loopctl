@@ -1658,8 +1658,8 @@ mod tests {
     }
 
     impl ApiClient for HandlerMock {
-        fn model(&self) -> &'static str {
-            "test-model"
+        fn model(&self) -> String {
+            "test-model".to_string()
         }
 
         fn stream_messages(
@@ -1847,8 +1847,8 @@ mod tests {
         /// Mock that always returns an error stream.
         struct ErrorMock;
         impl ApiClient for ErrorMock {
-            fn model(&self) -> &'static str {
-                "test-model"
+            fn model(&self) -> String {
+                "test-model".to_string()
             }
             fn stream_messages(
                 &self,

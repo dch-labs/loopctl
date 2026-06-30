@@ -22,7 +22,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-
 use std::time::Duration;
 
 use futures::stream::{Stream, StreamExt};
@@ -68,7 +67,7 @@ pub struct OpenAiClient {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
-    model: String,
+    model: parking_lot::Mutex<String>,
 }
 
 impl OpenAiClient {
@@ -149,8 +148,16 @@ impl OpenAiClient {
 }
 
 impl ApiClient for OpenAiClient {
-    fn model(&self) -> &str {
-        &self.model
+    fn model(&self) -> String {
+        self.model.lock().clone()
+    }
+
+    fn set_model(&self, model: &str) -> bool {
+        if model.trim().is_empty() {
+            return false;
+        }
+        *self.model.lock() = model.to_string();
+        true
     }
 
     fn stream_messages(
@@ -159,7 +166,8 @@ impl ApiClient for OpenAiClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let body = RequestBody::build(&self.model, &messages, system.as_deref(), tools.as_deref());
+        let model = self.model.lock().clone();
+        let body = RequestBody::build(&model, &messages, system.as_deref(), tools.as_deref());
         let url = self.completions_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
@@ -191,7 +199,8 @@ impl ApiClient for OpenAiClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let body = RequestBody::build(&self.model, &messages, system.as_deref(), tools.as_deref());
+        let model = self.model.lock().clone();
+        let body = RequestBody::build(&model, &messages, system.as_deref(), tools.as_deref());
         let url = self.completions_url();
 
         Box::pin(async move {
@@ -302,7 +311,7 @@ impl OpenAiClientBuilder {
             http,
             api_key,
             base_url: self.base_url,
-            model: self.model,
+            model: parking_lot::Mutex::new(self.model),
         })
     }
 }

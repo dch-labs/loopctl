@@ -45,10 +45,8 @@ const SSE_EVENT_PREFIX: &str = "event: ";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
-
-/// Default total request timeout (connect + response + body).
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-/// Default TCP connection establishment timeout.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); /// connect + response + body
+const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ==================================================
@@ -197,9 +195,18 @@ impl ApiClient for AnthropicClient {
         let url = self.messages_url();
         Box::pin(async move {
             let resp = Self::post_messages(&self.http, &url, &self.api_key, &body).await?;
-            resp.json::<Value>()
+            let resp = resp
+                .bytes()
                 .await
-                .map_err(|e| ApiError::http(e.to_string()))
+                .map_err(|e| ApiError::http(e.to_string()))?;
+            if resp.len() > MAX_RESPONSE_BODY {
+                return Err(ApiError::http(format!(
+                    "response body too large: {} bytes (max {})",
+                    resp.len(),
+                    MAX_RESPONSE_BODY
+                )));
+            }
+            serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
 }
@@ -474,7 +481,18 @@ impl SseReader {
                         let parsed = if data.is_empty() {
                             None
                         } else {
-                            serde_json::from_str(&data).ok()
+                            match serde_json::from_str(&data) {
+                                Ok(v) => Some(v),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        event_type = %event_type,
+                                        data_len = data.len(),
+                                        "failed to parse Anthropic SSE data, skipping"
+                                    );
+                                    None
+                                }
+                            }
                         };
                         return Ok(Some((event_type, parsed)));
                     }
@@ -499,7 +517,18 @@ impl SseReader {
                         let parsed = if data.is_empty() {
                             None
                         } else {
-                            serde_json::from_str(&data).ok()
+                            match serde_json::from_str(&data) {
+                                Ok(v) => Some(v),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        event_type = %event_type,
+                                        data_len = data.len(),
+                                        "failed to parse Anthropic SSE data (stream end), skipping"
+                                    );
+                                    None
+                                }
+                            }
                         };
                         return Ok(Some((event_type, parsed)));
                     }

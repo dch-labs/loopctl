@@ -1,6 +1,6 @@
-.PHONY: check test clippy fmt docs ci lint
+.PHONY: check test clippy fmt docs ci lint examples
 
-ci: fmt check clippy test docs
+ci: fmt check clippy test docs examples
 
 check:
 	cargo check --all-features
@@ -20,3 +20,6 @@ lint:
 
 docs:
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+examples:
+	cargo build --examples --all-features

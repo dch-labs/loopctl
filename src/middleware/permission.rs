@@ -145,8 +145,8 @@ impl ToolMiddleware for PermissionMiddleware {
                 next.dispatch(ctx)
             }
             PermissionCheck::Deny { reason } => Self::deny(ctx, &reason),
-            PermissionCheck::Ask { prompt } => match &self.ask_resolver {
-                Some(resolver) => {
+            PermissionCheck::Ask { prompt } => {
+                if let Some(resolver) = &self.ask_resolver {
                     let resolver = Arc::clone(resolver);
                     Box::pin(async move {
                         let tool_name = ctx.tool_name.clone();
@@ -161,9 +161,15 @@ impl ToolMiddleware for PermissionMiddleware {
                             )
                         }
                     })
+                } else {
+                    tracing::warn!(
+                        tool = %ctx.tool_name,
+                        prompt = %prompt,
+                        "permission Ask denied: no resolver configured"
+                    );
+                    Self::deny(ctx, &format!("permission required: {prompt}"))
                 }
-                None => Self::deny(ctx, &format!("permission required: {prompt}")),
-            },
+            }
         }
     }
 }

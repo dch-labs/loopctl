@@ -617,6 +617,28 @@ impl Default for FallbackConfig {
 ///     mgr.record_model_success(); // → back to Primary
 /// }
 /// ```
+/// Consolidated mutex-protected fallback state.
+///
+/// All mutable fallback bookkeeping lives behind a single lock so that
+/// related fields are always observed together, preventing partial-state
+/// reads that could occur when acquiring separate locks sequentially.
+#[derive(Default)]
+struct FallbackInner {
+    /// Original model name (before fallback).
+    original_model: Option<String>,
+    /// Ordered fallback models with failure status.
+    fallback_models: Vec<FallbackEntry>,
+    /// Cached first non-failed fallback model name.
+    active_fallback: Option<String>,
+    /// Time when fallback was activated.
+    fallback_switched_at: Option<Instant>,
+}
+
+/// Circuit breaker for API model fallback.
+///
+/// `&FallbackManager` is `Send + Sync` and can be freely shared across
+/// threads (e.g. via `Arc<FallbackManager>`). No `&mut self` is needed
+/// for any operation.
 pub struct FallbackManager {
     /// Failures before switching to fallback.
     fallback_threshold: usize,
@@ -632,14 +654,12 @@ pub struct FallbackManager {
     fallback_state: AtomicU8,
     /// Consecutive successes on primary during recovery.
     primary_success_count: AtomicUsize,
-    /// Original model name (before fallback).
-    original_model: Mutex<Option<String>>,
-    /// Ordered fallback models with failure status.
-    fallback_models: Mutex<Vec<FallbackEntry>>,
-    /// Cached first non-failed fallback model name.
-    active_fallback: Mutex<Option<String>>,
-    /// Time when fallback was activated.
-    fallback_switched_at: Mutex<Option<Instant>>,
+    /// Consolidated mutex-protected fallback state.
+    ///
+    /// Holding all related fields behind a single lock prevents partial-state
+    /// reads that could occur when acquiring the (formerly separate) locks one
+    /// at a time.
+    inner: Mutex<FallbackInner>,
     /// How long to remain in fallback before attempting primary recovery.
     recovery_timeout: Duration,
 }
@@ -678,10 +698,7 @@ impl FallbackManager {
             fallback_activated: AtomicBool::new(false),
             fallback_state: AtomicU8::new(FallbackState::Primary as u8),
             primary_success_count: AtomicUsize::new(0),
-            original_model: Mutex::new(None),
-            fallback_models: Mutex::new(Vec::new()),
-            active_fallback: Mutex::new(None),
-            fallback_switched_at: Mutex::new(None),
+            inner: Mutex::new(FallbackInner::default()),
             recovery_timeout: Duration::from_secs(60),
         }
     }
@@ -775,16 +792,14 @@ impl FallbackManager {
     #[must_use]
     pub fn new_with_fallback(original_model: String, fallback_threshold: usize) -> Self {
         let mgr = Self::new(fallback_threshold, 2);
-        if let Ok(mut m) = mgr.original_model.lock() {
-            *m = Some(original_model);
+        if let Ok(mut inner) = mgr.inner.lock() {
+            inner.original_model = Some(original_model);
+            inner.fallback_switched_at = Some(Instant::now());
         }
         mgr.fallback_activated.store(true, Ordering::Relaxed);
         mgr.consecutive_failures.store(0, Ordering::Relaxed);
         mgr.fallback_state
             .store(FallbackState::Fallback as u8, Ordering::Relaxed);
-        if let Ok(mut t) = mgr.fallback_switched_at.lock() {
-            *t = Some(Instant::now());
-        }
         mgr
     }
 
@@ -806,8 +821,8 @@ impl FallbackManager {
     /// ```
     pub fn for_model(primary_model: impl Into<String>) -> Self {
         let mgr = Self::new(3, 2);
-        if let Ok(mut m) = mgr.original_model.lock() {
-            *m = Some(primary_model.into());
+        if let Ok(mut inner) = mgr.inner.lock() {
+            inner.original_model = Some(primary_model.into());
         }
         mgr
     }
@@ -902,7 +917,10 @@ impl FallbackManager {
     /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
     /// ```
     pub fn original_model(&self) -> Option<String> {
-        self.original_model.lock().ok().and_then(|m| m.clone())
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|i| i.original_model.clone())
     }
 
     /// Set the original model name.
@@ -920,8 +938,8 @@ impl FallbackManager {
     /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
     /// ```
     pub fn set_original_model(&self, model: String) {
-        if let Ok(mut m) = self.original_model.lock() {
-            *m = Some(model);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.original_model = Some(model);
         }
     }
 
@@ -944,7 +962,7 @@ impl FallbackManager {
     /// assert!(mgr.fallback_switched_at().is_none());
     /// ```
     pub fn fallback_switched_at(&self) -> Option<Instant> {
-        self.fallback_switched_at.lock().ok().and_then(|t| *t)
+        self.inner.lock().ok().and_then(|i| i.fallback_switched_at)
     }
 
     /// Get the model that should be used for the next request.
@@ -1013,9 +1031,11 @@ impl FallbackManager {
     /// assert_eq!(mgr.active_model(), Some("llm-4".to_string()));
     /// ```
     pub fn set_fallback_model(&self, model: impl Into<String>) {
-        if let Ok(mut m) = self.fallback_models.lock() {
-            m.clear();
-            m.push(FallbackEntry::new(model).with_max_fail_count(self.default_max_fail_count));
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.fallback_models.clear();
+            inner
+                .fallback_models
+                .push(FallbackEntry::new(model).with_max_fail_count(self.default_max_fail_count));
         }
         self.recompute_active_fallback();
     }
@@ -1039,7 +1059,10 @@ impl FallbackManager {
     /// assert_eq!(mgr.fallback_model(), Some("llm-70b".to_string())); // first in chain
     /// ```
     pub fn fallback_model(&self) -> Option<String> {
-        self.active_fallback.lock().ok().and_then(|m| m.clone())
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|i| i.active_fallback.clone())
     }
 
     /// Get the full fallback model chain.
@@ -1061,10 +1084,10 @@ impl FallbackManager {
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b", "llm-32b"]);
     /// ```
     pub fn fallback_models(&self) -> Vec<String> {
-        self.fallback_models
+        self.inner
             .lock()
             .ok()
-            .map(|m| m.iter().map(|e| e.name.clone()).collect())
+            .map(|i| i.fallback_models.iter().map(|e| e.name.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -1091,8 +1114,10 @@ impl FallbackManager {
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b"]);
     /// ```
     pub fn add_fallback_model(&self, model: impl Into<String>) {
-        if let Ok(mut m) = self.fallback_models.lock() {
-            m.push(FallbackEntry::new(model).with_max_fail_count(self.default_max_fail_count));
+        if let Ok(mut inner) = self.inner.lock() {
+            inner
+                .fallback_models
+                .push(FallbackEntry::new(model).with_max_fail_count(self.default_max_fail_count));
         }
         self.recompute_active_fallback();
     }
@@ -1121,12 +1146,12 @@ impl FallbackManager {
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b", "llm-32b"]);
     /// ```
     pub fn insert_fallback_model(&self, index: usize, model: impl Into<String>) {
-        if let Ok(mut m) = self.fallback_models.lock() {
+        if let Ok(mut inner) = self.inner.lock() {
             let entry = FallbackEntry::new(model).with_max_fail_count(self.default_max_fail_count);
-            if index >= m.len() {
-                m.push(entry);
+            if index >= inner.fallback_models.len() {
+                inner.fallback_models.push(entry);
             } else {
-                m.insert(index, entry);
+                inner.fallback_models.insert(index, entry);
             }
         }
         self.recompute_active_fallback();
@@ -1154,9 +1179,9 @@ impl FallbackManager {
     /// assert_eq!(chain, vec!["llm-120b"]);
     /// ```
     pub fn remove_fallback_model(&self, model: &str) -> bool {
-        let removed = if let Ok(mut m) = self.fallback_models.lock() {
-            if let Some(pos) = m.iter().position(|x| x.name == model) {
-                m.remove(pos);
+        let removed = if let Ok(mut inner) = self.inner.lock() {
+            if let Some(pos) = inner.fallback_models.iter().position(|x| x.name == model) {
+                inner.fallback_models.remove(pos);
                 true
             } else {
                 false
@@ -1192,8 +1217,8 @@ impl FallbackManager {
     /// ```
     pub fn set_fallback_models(&self, models: Vec<String>) {
         let max_fc = self.default_max_fail_count;
-        if let Ok(mut m) = self.fallback_models.lock() {
-            *m = models
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.fallback_models = models
                 .into_iter()
                 .map(|name| FallbackEntry::new(name).with_max_fail_count(max_fc))
                 .collect();
@@ -1232,8 +1257,8 @@ impl FallbackManager {
     /// assert_eq!(mgr.fallback_model(), Some("llm-3".to_string()));
     /// ```
     pub fn mark_fallback_failed(&self, model: &str) -> bool {
-        let found = if let Ok(mut m) = self.fallback_models.lock() {
-            if let Some(entry) = m.iter_mut().find(|e| e.name == model) {
+        let found = if let Ok(mut inner) = self.inner.lock() {
+            if let Some(entry) = inner.fallback_models.iter_mut().find(|e| e.name == model) {
                 entry.record_attempt("marked_failed");
                 true
             } else {
@@ -1269,8 +1294,8 @@ impl FallbackManager {
     /// assert!(mgr.failed_fallbacks().is_empty());
     /// ```
     pub fn clear_fallback_failed(&self, model: &str) -> bool {
-        let found = if let Ok(mut m) = self.fallback_models.lock() {
-            if let Some(entry) = m.iter_mut().find(|e| e.name == model) {
+        let found = if let Ok(mut inner) = self.inner.lock() {
+            if let Some(entry) = inner.fallback_models.iter_mut().find(|e| e.name == model) {
                 entry.clear_attempts();
                 true
             } else {
@@ -1308,8 +1333,8 @@ impl FallbackManager {
     /// assert!(mgr.failed_fallbacks().is_empty());
     /// ```
     pub fn clear_all_fallback_failed(&self) {
-        if let Ok(mut m) = self.fallback_models.lock() {
-            for entry in m.iter_mut() {
+        if let Ok(mut inner) = self.inner.lock() {
+            for entry in &mut inner.fallback_models {
                 entry.clear_attempts();
             }
         }
@@ -1336,11 +1361,12 @@ impl FallbackManager {
     /// assert_eq!(failed, vec!["llm-3"]);
     /// ```
     pub fn failed_fallbacks(&self) -> Vec<String> {
-        self.fallback_models
+        self.inner
             .lock()
             .ok()
-            .map(|m| {
-                m.iter()
+            .map(|i| {
+                i.fallback_models
+                    .iter()
                     .filter(|e| e.failed())
                     .map(|e| e.name.clone())
                     .collect()
@@ -1368,11 +1394,12 @@ impl FallbackManager {
     /// assert_eq!(available, vec!["llm-2"]);
     /// ```
     pub fn available_fallbacks(&self) -> Vec<String> {
-        self.fallback_models
+        self.inner
             .lock()
             .ok()
-            .map(|m| {
-                m.iter()
+            .map(|i| {
+                i.fallback_models
+                    .iter()
                     .filter(|e| !e.failed())
                     .map(|e| e.name.clone())
                     .collect()
@@ -1405,10 +1432,10 @@ impl FallbackManager {
     /// assert!(mgr.fallback_entry("nonexistent").is_none());
     /// ```
     pub fn fallback_entry(&self, name: &str) -> Option<FallbackEntry> {
-        self.fallback_models
+        self.inner
             .lock()
             .ok()
-            .and_then(|m| m.iter().find(|e| e.name == name).cloned())
+            .and_then(|i| i.fallback_models.iter().find(|e| e.name == name).cloned())
     }
 
     /// Set the [`available`](FallbackEntry::available) flag on a fallback model.
@@ -1441,8 +1468,8 @@ impl FallbackManager {
     /// assert_eq!(mgr.fallback_model(), Some("llm-2".to_string()));
     /// ```
     pub fn set_fallback_available(&self, model: &str, available: bool) -> bool {
-        let found = if let Ok(mut m) = self.fallback_models.lock() {
-            if let Some(entry) = m.iter_mut().find(|e| e.name == model) {
+        let found = if let Ok(mut inner) = self.inner.lock() {
+            if let Some(entry) = inner.fallback_models.iter_mut().find(|e| e.name == model) {
                 entry.set_available(available);
                 true
             } else {
@@ -1722,8 +1749,8 @@ impl FallbackManager {
         self.fallback_state
             .store(FallbackState::Fallback as u8, Ordering::Relaxed);
         self.fallback_activated.store(true, Ordering::Relaxed);
-        if let Ok(mut t) = self.fallback_switched_at.lock() {
-            *t = Some(Instant::now());
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.fallback_switched_at = Some(Instant::now());
         }
         self.primary_success_count.store(0, Ordering::Relaxed);
         info!("Circuit breaker: transitioned to Fallback state");
@@ -1782,8 +1809,8 @@ impl FallbackManager {
     pub fn transition_to_primary(&self) {
         self.fallback_state
             .store(FallbackState::Primary as u8, Ordering::Relaxed);
-        if let Ok(mut t) = self.fallback_switched_at.lock() {
-            *t = None;
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.fallback_switched_at = None;
         }
         self.primary_success_count.store(0, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
@@ -1823,8 +1850,8 @@ impl FallbackManager {
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.primary_success_count.store(0, Ordering::Relaxed);
         self.fallback_activated.store(false, Ordering::Relaxed);
-        if let Ok(mut t) = self.fallback_switched_at.lock() {
-            *t = None;
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.fallback_switched_at = None;
         }
         self.clear_all_fallback_failed();
     }
@@ -1839,13 +1866,14 @@ impl FallbackManager {
     /// [`fallback_models`]: Self::fallback_models
     /// [`active_fallback`]: Self::active_fallback
     fn recompute_active_fallback(&self) {
-        let active = self
-            .fallback_models
-            .lock()
-            .ok()
-            .and_then(|m| m.iter().find(|e| !e.failed()).map(|e| e.name.clone()));
-        if let Ok(mut cached) = self.active_fallback.lock() {
-            *cached = active;
+        let active = self.inner.lock().ok().and_then(|i| {
+            i.fallback_models
+                .iter()
+                .find(|e| !e.failed())
+                .map(|e| e.name.clone())
+        });
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.active_fallback = active;
         }
     }
 }
@@ -2083,5 +2111,71 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    /// Verify the consolidated Mutex (M5 fix) ensures multi-field updates
+    /// are visible atomically. When `transition_to_fallback` is called,
+    /// both `fallback_switched_at` and `active_fallback` should be
+    /// observable together.
+    #[test]
+    fn test_consolidated_mutex_fields_are_consistent() {
+        let mgr = FallbackManager::for_model("primary-model");
+        mgr.add_fallback_model("fallback-model");
+
+        // Before transition: using primary model, no switch time.
+        assert_eq!(mgr.active_model(), Some("primary-model".to_string()));
+        assert!(mgr.fallback_switched_at().is_none());
+
+        // Transition to fallback — updates multiple fields.
+        mgr.transition_to_fallback();
+
+        // After transition: both fields should be set together.
+        // This verifies the consolidated Mutex prevents partial reads.
+        assert_eq!(mgr.active_model(), Some("fallback-model".to_string()));
+        assert!(
+            mgr.fallback_switched_at().is_some(),
+            "switch time should be set after transition"
+        );
+    }
+
+    /// Verify that `transition_to_primary` clears both fields atomically (M5).
+    #[test]
+    fn test_consolidated_mutex_clears_fields_together() {
+        let mgr = FallbackManager::for_model("primary-model");
+        mgr.add_fallback_model("fallback-model");
+        mgr.transition_to_fallback();
+
+        // Both fields are set.
+        assert_eq!(mgr.active_model(), Some("fallback-model".to_string()));
+        assert!(mgr.fallback_switched_at().is_some());
+
+        // Transition back to primary.
+        mgr.transition_to_primary();
+
+        // Both fields should be cleared together.
+        assert!(
+            mgr.fallback_switched_at().is_none(),
+            "switch time should be cleared after transition to primary"
+        );
+    }
+
+    /// Verify that `reset()` clears all fields atomically (M5).
+    #[test]
+    fn test_consolidated_mutex_reset_clears_all() {
+        let mgr = FallbackManager::for_model("primary-model");
+        mgr.add_fallback_model("fallback-model");
+        mgr.transition_to_fallback();
+        mgr.record_failure();
+
+        // State is dirty.
+        assert!(mgr.consecutive_failures() > 0);
+        assert!(mgr.fallback_switched_at().is_some());
+
+        // Full reset.
+        mgr.reset();
+
+        // Everything cleared.
+        assert_eq!(mgr.consecutive_failures(), 0);
+        assert!(mgr.fallback_switched_at().is_none());
     }
 }

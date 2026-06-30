@@ -308,12 +308,20 @@ mod tests {
 
     /// Helper to safely set an env var in tests (Rust 2024 requires unsafe).
     macro_rules! env_set {
-        ($($arg:tt)*) => {{ unsafe { std::env::set_var($($arg)*) } }};
+        ($($arg:tt)*) => {{
+            // SAFETY: This is only used in single-threaded test code where
+            // no other task is reading or writing environment variables.
+            unsafe { std::env::set_var($($arg)*) }
+        }};
     }
 
     /// Helper to safely remove an env var in tests.
     macro_rules! env_remove {
-        ($($arg:tt)*) => {{ unsafe { std::env::remove_var($($arg)*) } }};
+        ($($arg:tt)*) => {{
+            // SAFETY: This is only used in single-threaded test code where
+            // no other task is reading or writing environment variables.
+            unsafe { std::env::remove_var($($arg)*) }
+        }};
     }
 
     #[test]

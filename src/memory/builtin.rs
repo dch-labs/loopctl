@@ -107,6 +107,16 @@ use std::pin::Pin;
 /// assert_eq!(results.len(), 1);
 /// # });
 /// ```
+///
+/// # Unbounded Growth
+///
+/// `InMemoryStore` accumulates entries in a `Vec` with no automatic
+/// eviction. The [`consolidate()`](InMemoryStore::consolidate) method
+/// prunes entries with `relevance < 0.05`, but it must be called
+/// explicitly. A long-running session that never calls `consolidate()`
+/// will accumulate memory indefinitely. For production use, consider
+/// calling `consolidate()` periodically or implementing a custom
+/// [`LoopMemory`] with bounded capacity.
 pub struct InMemoryStore {
     entries: Vec<MemoryEntry>,
 }

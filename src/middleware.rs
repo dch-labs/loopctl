@@ -702,6 +702,34 @@ mod tests {
         assert!(result.is_error);
     }
 
+    /// Verify that PermissionMiddleware with Ask permission and no resolver
+    /// denies the tool call (M2 fix).
+    #[tokio::test]
+    async fn test_permission_ask_without_resolver_denies() {
+        let mut ctx = test_ctx("echo");
+        ctx.permission = PermissionCheck::Ask {
+            prompt: "Allow echo?".to_string(),
+        };
+
+        // from_context() has no ask_resolver configured.
+        let pipeline = ToolPipeline::builder()
+            .with(PermissionMiddleware::from_context())
+            .core(test_registry())
+            .build()
+            .expect("valid");
+
+        let result = pipeline.invoke(ctx).await;
+        assert!(
+            result.is_error,
+            "Ask without resolver should deny the tool call"
+        );
+        let msg = result.output.to_string();
+        assert!(
+            msg.contains("permission"),
+            "error should mention permission: {msg}"
+        );
+    }
+
     // ==================================================
     // TimeoutMiddleware tests
     // ==================================================

@@ -69,6 +69,7 @@ use crate::tool::health::ToolHealthRegistry;
 /// }
 /// ```
 pub trait Observable {
+    /// Returns the observer host for lifecycle event fan-out.
     fn observers(&self) -> &ObserverHost;
 }
 
@@ -97,6 +98,7 @@ pub trait Observable {
 /// }
 /// ```
 pub trait Detectable {
+    /// Returns the detection manager for loop and convergence detection.
     fn detection(&self) -> &DetectionManager;
 }
 
@@ -126,6 +128,7 @@ pub trait Detectable {
 /// }
 /// ```
 pub trait FallbackCapable {
+    /// Returns the fallback manager (circuit breaker) for API model fallback.
     fn fallback(&self) -> &FallbackManager;
 }
 
@@ -146,6 +149,7 @@ pub trait FallbackCapable {
 /// compaction during the agent loop. Useful for custom loop
 /// implementations that need to manage the context window directly.
 pub trait Compactable {
+    /// Returns the context manager, if compaction is configured.
     fn context_manager(&self) -> Option<&Arc<ContextManager>>;
 }
 
@@ -167,6 +171,7 @@ pub trait Compactable {
 /// that need to control streaming behaviour (timeouts, retries, fallback
 /// to non-streaming mode).
 pub trait StreamCapable {
+    /// Returns the stream handler, if resilient streaming is configured.
     fn stream_handler(&self) -> Option<&StreamHandler>;
 }
 
@@ -187,6 +192,7 @@ pub trait StreamCapable {
 /// tool dispatch, compaction, or session start/end.
 #[cfg(feature = "hooks")]
 pub trait Hookable {
+    /// Returns the hook executor, if hooks are configured.
     fn hook_executor(&self) -> Option<&HookExecutor>;
 }
 
@@ -214,6 +220,7 @@ pub trait Hookable {
 /// }
 /// ```
 pub trait PipelineAware {
+    /// Returns the tool middleware pipeline, if configured.
     fn pipeline(&self) -> Option<&ToolPipeline>;
 }
 
@@ -230,5 +237,6 @@ pub trait PipelineAware {
 /// - [`LoopRuntime`](crate::runtime::LoopRuntime) — the framework's default implementation.
 #[cfg(feature = "tool_health")]
 pub trait HealthTrackable {
+    /// Returns the tool health registry, if health tracking is configured.
     fn health_registry(&self) -> Option<&ToolHealthRegistry>;
 }

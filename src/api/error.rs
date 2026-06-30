@@ -76,6 +76,7 @@ use thiserror::Error;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum ErrorCode {
     // ==================================================
     // API errors (1000-1005)
@@ -345,6 +346,7 @@ pub enum ErrorCode {
 /// variant documentation for details on when each is produced and how
 /// the message text influences code selection.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ApiError {
     /// An error returned by the LLM API provider.
     ///

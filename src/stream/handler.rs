@@ -350,6 +350,7 @@ impl StreamRetryConfig {
 /// Completed < TotalTimeout < EventTimeout < InitFailed < FallbackToNonStreaming < Cancelled
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum StreamOutcome {
     /// Stream completed normally — all events received, `MessageStop` seen.
     ///
@@ -479,6 +480,7 @@ impl fmt::Display for StreamOutcome {
 /// to distinguish between transient failures (retryable) and permanent
 /// errors (non-retryable).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StreamHandlerError {
     /// Streaming initialization failed after all retries.
     ///

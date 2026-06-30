@@ -1266,42 +1266,14 @@ mod tests {
 
     use parking_lot::Mutex;
 
-    // ==================================================
-    // Mock ApiClient
-    // ==================================================
-
-    /// A mock API client that returns configurable responses.
-    ///
-    /// Used exclusively in tests. Stores a queue of response vectors,
-    /// where each response is a `Vec<StreamEvent>`. Each call to
-    /// [`stream_messages`](MockClient::stream_messages) pops the next
-    /// response from the front of the queue.
-    ///
-    /// When the queue is empty, `stream_messages` returns a single
-    /// [`ApiError`] — this lets tests verify error-handling paths.
     #[derive(Clone)]
     struct MockClient {
-        /// Responses to return, in order.
-        ///
-        /// Each entry is a `Vec<StreamEvent>` representing one complete
-        /// streaming response from the API. Popped from the front by
-        /// [`stream_messages`](MockClient::stream_messages).
         responses: Arc<Mutex<Vec<Vec<StreamEvent>>>>,
 
-        /// Model name reported by [`ApiClient::model()`].
-        ///
-        /// Copied into mock response metadata so that assertions can
-        /// verify which model produced a given response.
         model_name: Arc<parking_lot::Mutex<String>>,
     }
 
     impl MockClient {
-        /// Create a new mock client with the given model name.
-        ///
-        /// The response queue starts empty. Add responses with
-        /// [`add_text_response()`](MockClient::add_text_response),
-        /// [`add_tool_then_text()`](MockClient::add_tool_then_text), or
-        /// [`add_tool_only_response()`](MockClient::add_tool_only_response).
         fn new(model: &str) -> Self {
             Self {
                 responses: Arc::new(Mutex::new(Vec::new())),
@@ -1309,17 +1281,6 @@ mod tests {
             }
         }
 
-        /// Add a simple text response that ends the turn.
-        ///
-        /// Generates a complete stream: `MessageStart` →
-        /// `PartStart(text)` → `IndexedDelta(text)` →
-        /// `PartStop` → `MessageDelta(end_turn, usage)` →
-        /// `MessageStop`. The model will emit no tool calls, so the
-        /// loop terminates after this response.
-        ///
-        /// # Parameters
-        ///
-        /// - `text` — The text the model will "say".
         fn add_text_response(&self, text: &str) {
             let events = vec![
                 StreamEvent::MessageStart(MessageStart {
@@ -1351,25 +1312,10 @@ mod tests {
             self.responses.lock().push(events);
         }
 
-        /// Add a raw sequence of stream events as a single response turn.
         fn add_events(&self, events: Vec<StreamEvent>) {
             self.responses.lock().push(events);
         }
 
-        /// Add a tool_call response followed by an end_turn response.
-        ///
-        /// The first response contains a single `tool_call` content part
-        /// (causing the loop to dispatch the tool), and the second
-        /// response is a plain text `end_turn` (causing the loop to
-        /// terminate). This simulates the common two-turn pattern:
-        /// model requests tool → model sees result → model responds.
-        ///
-        /// # Parameters
-        ///
-        /// - `tool_id` — Unique ID for the tool call.
-        /// - `tool_name` — Name of the tool to invoke.
-        /// - `tool_input` — JSON input for the tool.
-        /// - `final_text` — Text the model says after seeing the result.
         fn add_tool_then_text(
             &self,
             tool_id: &str,
@@ -1432,18 +1378,6 @@ mod tests {
             self.responses.lock().push(text_events);
         }
 
-        /// Add a tool_call-only response (no end_turn).
-        ///
-        /// The response contains a single `tool_call` content part with
-        /// stop reason `tool_call`. After the tool is dispatched, the
-        /// loop will request another turn from the API. Useful for
-        /// testing max-turns and multi-turn tool chains.
-        ///
-        /// # Parameters
-        ///
-        /// - `tool_id` — Unique ID for the tool call.
-        /// - `tool_name` — Name of the tool to invoke.
-        /// - `tool_input` — JSON input for the tool.
         fn add_tool_only_response(&self, tool_id: &str, tool_name: &str, tool_input: Value) {
             let tool_events = vec![
                 StreamEvent::MessageStart(MessageStart {
@@ -1469,12 +1403,6 @@ mod tests {
             self.responses.lock().push(tool_events);
         }
 
-        /// Add an error response. Reserved for future use.
-        ///
-        /// Currently pushes an incomplete response (only `MessageStart`)
-        /// which does not trigger an error on its own. Reserved for
-        /// testing streaming-error scenarios once the accumulator
-        /// handles partial messages.
         #[expect(dead_code)]
         fn add_error_response(&self) {
             // Return an empty response that will cause the stream to error
@@ -1491,7 +1419,6 @@ mod tests {
     }
 
     impl ApiClient for MockClient {
-        /// Return the model name configured at construction.
         fn model(&self) -> String {
             self.model_name.lock().clone()
         }
@@ -1504,11 +1431,6 @@ mod tests {
             true
         }
 
-        /// Pop the next queued response and return it as a stream.
-        ///
-        /// If the response queue is empty, returns a single-element
-        /// stream containing an [`ApiError`]. This enables tests that
-        /// exhaust all responses to verify error handling.
         fn stream_messages(
             &self,
             _messages: Vec<Message>,
@@ -1528,10 +1450,6 @@ mod tests {
             }
         }
 
-        /// Non-streaming message creation — not used in these tests.
-        ///
-        /// Returns an empty JSON object. The `BareLoop` tests
-        /// exercise only the streaming path.
         fn create_message(
             &self,
             _messages: Vec<Message>,
@@ -1544,11 +1462,6 @@ mod tests {
 
     // Helper trait for Vec-like pop_front on Vec
     trait PopFront<T> {
-        /// Remove and return the first element, shifting the rest left.
-        ///
-        /// Returns `None` if the vector is empty. O(n)
-        /// operation because it calls `Vec::remove(0)`. Acceptable
-        /// for test-only code with small queues.
         fn pop_front(&mut self) -> Option<T>;
     }
 
@@ -1562,31 +1475,17 @@ mod tests {
         }
     }
 
-    // ==================================================
-    // Mock Tool
-    // ==================================================
-
-    /// A test tool that echoes back its input.
-    ///
-    /// Implements [`Tool`] with a single `message` string parameter.
-    /// Returns `ToolOutput::text(format!("Echo: {msg}"))` so callers
-    /// can verify round-trip data flow.
     struct EchoTool;
 
     impl Tool for EchoTool {
-        /// Return the tool name `"echo"`.
         fn name(&self) -> &'static str {
             "echo"
         }
 
-        /// Return a human-readable description.
         fn description(&self) -> &'static str {
             "Echoes back the input"
         }
 
-        /// Return the JSON schema for this tool.
-        ///
-        /// Requires a single string property `message`.
         fn schema(&self) -> ToolSchema {
             ToolSchema {
                 tool: "echo".into(),
@@ -1599,10 +1498,6 @@ mod tests {
             }
         }
 
-        /// Execute the tool: extract `message` from input and echo it.
-        ///
-        /// If the `message` field is missing or not a string, defaults
-        /// to an empty string.
         fn call(
             &self,
             input: Value,
@@ -1617,27 +1512,17 @@ mod tests {
         }
     }
 
-    /// A test tool that always fails.
-    ///
-    /// Used to verify that tool-execution errors are handled gracefully:
-    /// the loop should record the error as a soft tool result and
-    /// continue, not abort the session.
     struct FailingTool;
 
     impl Tool for FailingTool {
-        /// Return the tool name `"fail"`.
         fn name(&self) -> &'static str {
             "fail"
         }
 
-        /// Return a human-readable description.
         fn description(&self) -> &'static str {
             "Always fails"
         }
 
-        /// Return the JSON schema for this tool.
-        ///
-        /// Accepts an empty object (no parameters).
         fn schema(&self) -> ToolSchema {
             ToolSchema {
                 tool: "fail".into(),
@@ -1646,11 +1531,6 @@ mod tests {
             }
         }
 
-        /// Execute the tool: always returns an execution error.
-        ///
-        /// Returns [`ToolError::Execution`] with a fixed message so
-        /// tests can assert on the error path without triggering
-        /// panics or unwinds.
         fn call(
             &self,
             _input: Value,
@@ -1660,33 +1540,16 @@ mod tests {
         }
     }
 
-    // ==================================================
-    // Counting Plugin (test helper)
-    // ==================================================
-
-    /// A [`LoopObserver`](crate::observer::LoopObserver) that counts
-    /// how many times each hook fires.
-    ///
-    /// Uses [`AtomicUsize`] counters with `SeqCst` ordering so that
-    /// test assertions can read the counts from any thread after the
-    /// agent loop completes.
     struct CountingObserver {
-        /// Number of times `on_session_start` was called.
         session_starts: AtomicUsize,
-        /// Number of times `on_session_end` was called.
         session_ends: AtomicUsize,
-        /// Number of times `on_turn_start` was called.
         turn_starts: AtomicUsize,
-        /// Number of times `on_turn_end` was called.
         turn_ends: AtomicUsize,
-        /// Number of times `on_tool_pre` was called.
         tool_pres: AtomicUsize,
-        /// Number of times `on_tool_post` was called.
         tool_posts: AtomicUsize,
     }
 
     impl CountingObserver {
-        /// Create a new observer with all counters initialized to zero.
         fn new() -> Self {
             Self {
                 session_starts: AtomicUsize::new(0),
@@ -1729,15 +1592,6 @@ mod tests {
         }
     }
 
-    // ==================================================
-    // Test Helpers
-    // ==================================================
-
-    /// Create a default [`LoopConfig`] with `max_turns = 10`.
-    ///
-    /// Most tests use this as a baseline. Tests that need a different
-    /// max-turns value mutate the returned config before constructing
-    /// the loop.
     fn make_config() -> LoopConfig {
         LoopConfig {
             max_turns: 10,
@@ -1745,12 +1599,6 @@ mod tests {
         }
     }
 
-    // ==================================================
-    // Tests: Basic lifecycle
-    // ==================================================
-
-    /// Verify that a single-turn session (text response, no tool calls)
-    /// completes successfully and returns the model's text output.
     #[tokio::test]
     async fn test_bare_loop_single_turn() {
         let client = MockClient::new("test-model");
@@ -1765,8 +1613,6 @@ mod tests {
         assert_eq!(result.final_output.as_deref(), Some("Hello! I'm done."));
     }
 
-    /// Verify that a two-turn session (tool call → tool result → end turn)
-    /// completes successfully and records the tool invocation.
     #[tokio::test]
     async fn test_bare_loop_with_tool_call() {
         let client = MockClient::new("test-model");
@@ -1789,8 +1635,6 @@ mod tests {
         assert_eq!(result.tool_calls, 1);
     }
 
-    /// Verify that exceeding `max_turns` returns
-    /// [`LoopError::MaxTurnsExceeded`] and reports `success = false`.
     #[tokio::test]
     async fn test_bare_loop_max_turns_exceeded() {
         let client = MockClient::new("test-model");
@@ -1818,8 +1662,6 @@ mod tests {
         }
     }
 
-    /// Verify that calling [`cancel()`](BareLoop::cancel) mid-session
-    /// returns [`LoopError::Cancelled`].
     #[tokio::test]
     async fn test_bare_loop_cancellation() {
         let client = MockClient::new("test-model");
@@ -1840,8 +1682,6 @@ mod tests {
         }
     }
 
-    /// Verify that an API error during streaming propagates as
-    /// [`LoopError::Api`] and marks the session as failed.
     #[tokio::test]
     async fn test_bare_loop_api_error() {
         // The mock will return an error
@@ -1856,13 +1696,6 @@ mod tests {
         }
     }
 
-    // ==================================================
-    // Tests: Tool dispatch
-    // ==================================================
-
-    /// Verify that requesting a tool not present in the registry produces
-    /// a soft error result (not a hard [`LoopError`]), allowing the model
-    /// to see the failure and adapt.
     #[tokio::test]
     async fn test_tool_not_found_returns_error_result() {
         let client = MockClient::new("test-model");
@@ -1879,8 +1712,6 @@ mod tests {
         assert_eq!(result.total_turns, 2);
     }
 
-    /// Verify that a tool returning an execution error produces a soft
-    /// error result and the session continues to completion.
     #[tokio::test]
     async fn test_tool_execution_failure() {
         let client = MockClient::new("test-model");
@@ -1897,12 +1728,6 @@ mod tests {
         assert_eq!(result.total_turns, 2);
     }
 
-    // ==================================================
-    // Tests: Observers
-    // ==================================================
-
-    /// Verify that a single-turn session fires `session_start`,
-    /// `turn_start`, `turn_end`, and `session_end` on the observer.
     #[tokio::test]
     async fn test_observer_lifecycle_events() {
         let client = MockClient::new("test-model");
@@ -1922,12 +1747,6 @@ mod tests {
         assert_eq!(plugin.turn_ends.load(Ordering::SeqCst), 1);
     }
 
-    /// Verify that a tool-using session fires `on_tool_pre` and
-    /// `on_tool_post` observer hooks in addition to the turn hooks.
-    ///
-    /// A two-turn session (tool_call + end_turn) should produce:
-    /// - 2 turn starts, 2 turn ends
-    /// - 1 tool pre, 1 tool post
     #[tokio::test]
     async fn test_observer_tool_events() {
         let client = MockClient::new("test-model");
@@ -1950,13 +1769,6 @@ mod tests {
         assert_eq!(plugin.turn_ends.load(Ordering::SeqCst), 2);
     }
 
-    // ==================================================
-    // Tests: Conversation management
-    // ==================================================
-
-    /// Verify that `extract_tool_calls` returns an empty list for a
-    /// text-only message and correctly parses tool_call parts when
-    /// present.
     #[tokio::test]
     async fn test_conversation_built_correctly() {
         let client = MockClient::new("test-model");
@@ -1993,9 +1805,6 @@ mod tests {
         assert_eq!(tool_calls[0].tool, "echo");
     }
 
-    /// Verify that `build_tool_result_message` produces a user message
-    /// with the correct `tool_result` content parts, including the
-    /// tool_call_id, output text, and is_error flag.
     #[tokio::test]
     async fn test_tool_result_message_format() {
         let results = vec![super::ToolDispatchResult {
@@ -2025,16 +1834,6 @@ mod tests {
         }
     }
 
-    // ==================================================
-    // Tests: Multiple tools in one turn
-    // ==================================================
-
-    /// Verify that multiple tool_call parts in a single assistant message
-    /// are all dispatched and counted.
-    ///
-    /// The mock emits two `tool_call` parts in one response, followed by
-    /// an `end_turn` response. The session should report 2 turns and 2
-    /// tool calls.
     #[tokio::test]
     async fn test_multiple_tool_calls_in_one_turn() {
         let client = MockClient::new("test-model");
@@ -2092,12 +1891,6 @@ mod tests {
         assert_eq!(result.tool_calls, 2);
     }
 
-    // ==================================================
-    // Tests: text streamer callback
-    // ==================================================
-
-    /// Verify that `set_text_streamer` fires the callback for each text
-    /// delta during streaming.
     #[tokio::test]
     async fn test_text_streamer_fires_on_text_delta() {
         let client = MockClient::new("test-model");
@@ -2121,7 +1914,6 @@ mod tests {
         );
     }
 
-    /// Verify that a run works fine without a text streamer set.
     #[tokio::test]
     async fn test_text_streamer_none_works() {
         let client = MockClient::new("test-model");
@@ -2132,8 +1924,6 @@ mod tests {
         assert!(result.success);
     }
 
-    /// Verify the streamer only fires for text deltas, not for tool-call
-    /// deltas or metadata events.
     #[tokio::test]
     async fn test_text_streamer_ignores_non_text_deltas() {
         let client = MockClient::new("test-model");
@@ -2191,12 +1981,6 @@ mod tests {
         assert_eq!(&*received, "Done", "only text deltas should fire streamer");
     }
 
-    // ==================================================
-    // Tests: Accessors
-    // ==================================================
-
-    /// Verify that accessor methods return the values passed at
-    /// construction.
     #[test]
     fn test_accessors() {
         let client = MockClient::new("test-model");
@@ -2209,8 +1993,6 @@ mod tests {
         assert!(!agent.is_cancelled());
     }
 
-    /// Verify that `cancel_signal()` returns a shared reference to the
-    /// same signal used by `cancel()` and `is_cancelled()`.
     #[test]
     fn test_cancel_signal_shared() {
         let client = MockClient::new("test-model");
@@ -2224,12 +2006,6 @@ mod tests {
         assert!(agent.is_cancelled());
     }
 
-    // ==================================================
-    // Tests: Session result fields
-    // ==================================================
-
-    /// Verify that the returned [`SessionResult`] has the correct
-    /// session ID, positive duration, and non-zero token count.
     #[tokio::test]
     async fn test_session_result_fields() {
         let client = MockClient::new("test-model");
@@ -2245,12 +2021,6 @@ mod tests {
         assert!(result.input_tokens > 0 || result.output_tokens > 0); // from mock usage
     }
 
-    // ==================================================
-    // Tests: Property — loop always terminates
-    // ==================================================
-
-    /// Verify that setting `max_turns = 1` still allows a single-turn
-    /// session to complete normally.
     #[tokio::test]
     async fn test_loop_terminates_with_max_turns_1() {
         let client = MockClient::new("test-model");
@@ -2266,8 +2036,6 @@ mod tests {
         assert_eq!(result.total_turns, 1);
     }
 
-    /// Verify that setting `max_turns = 0` immediately triggers a
-    /// configuration error before any API call.
     #[tokio::test]
     async fn test_loop_terminates_with_max_turns_0() {
         let client = MockClient::new("test-model");
@@ -2285,13 +2053,6 @@ mod tests {
         }
     }
 
-    // ==================================================
-    // Tests: Error in tool-not-found returns error result, not hard error
-    // ==================================================
-
-    /// Verify that requesting a nonexistent tool produces a soft error
-    /// result (not a hard [`LoopError`]), allowing the model to see
-    /// the error and respond gracefully.
     #[tokio::test]
     async fn test_tool_error_is_soft_not_hard() {
         let client = MockClient::new("test-model");
@@ -2329,13 +2090,80 @@ mod tests {
         assert!(result.success);
     }
 
-    // ==================================================
-    // ==================================================
-    // Recovery wiring tests
-    // ==================================================
+    #[tokio::test]
+    async fn test_loop_detection_hard_stop_propagates_loop_error() {
+        use crate::detection::{DetectionConfig, DetectionManager};
+        use crate::runtime::LoopRuntime;
 
-    /// Verify the default `NoopReflector` + `ExponentialBackoffRecovery`
-    /// wiring returns soft errors (no infinite loop, no panic).
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let client = MockClient::new("test");
+        for i in 0..10 {
+            client.add_tool_only_response(&format!("call_{i}"), "echo", json!({ "message": "hi" }));
+        }
+
+        let runtime = LoopRuntime::new().with_detection(
+            DetectionManager::new_with_config(DetectionConfig {
+                loop_threshold: 2,
+                stop_threshold: 2,
+                ..Default::default()
+            })
+            .expect("valid detection config"),
+        );
+
+        let mut agent =
+            BareLoop::new_with_managers(Arc::new(client), registry, make_config(), runtime);
+        let result = agent.run("test").await;
+
+        assert!(
+            matches!(result, Err(LoopError::LoopDetected { .. })),
+            "expected Err(LoopError::LoopDetected), got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loop_detection_soft_block_before_stop_threshold() {
+        use crate::detection::{DetectionConfig, DetectionManager};
+        use crate::runtime::LoopRuntime;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let client = MockClient::new("test");
+        client.add_tool_only_response("c1", "echo", json!({ "message": "hi" }));
+        client.add_tool_only_response("c2", "echo", json!({ "message": "hi" }));
+        client.add_text_response("Done");
+
+        let runtime = LoopRuntime::new().with_detection(
+            DetectionManager::new_with_config(DetectionConfig {
+                loop_threshold: 2,
+                stop_threshold: 10,
+                ..Default::default()
+            })
+            .expect("valid detection config"),
+        );
+
+        let mut agent =
+            BareLoop::new_with_managers(Arc::new(client), registry, make_config(), runtime);
+        let result = agent.run("test").await;
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_before_run_returns_cancelled() {
+        let client = MockClient::new("test");
+        client.add_text_response("Hello");
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        agent.cancel();
+        let result = agent.run("test").await;
+
+        assert!(
+            matches!(result, Err(LoopError::Cancelled)),
+            "expected Err(LoopError::Cancelled), got {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_default_recovery_on_tool_error_returns_soft_result() {
         let mut registry = ToolRegistry::new();
@@ -2351,8 +2179,6 @@ mod tests {
         assert_eq!(result.tool_calls, 1);
     }
 
-    /// Verify that when a tool is not found, the recovery wiring still
-    /// produces a soft error result (no hard error propagated).
     #[tokio::test]
     async fn test_recovery_on_missing_tool_returns_soft_result() {
         let client = MockClient::new("test");
@@ -2365,9 +2191,6 @@ mod tests {
         assert_eq!(result.tool_calls, 1);
     }
 
-    /// Verify that a failing tool with the default recovery produces
-    /// exactly one tool dispatch (NoopReflector marks everything as
-    /// non-recoverable, so no retries).
     #[tokio::test]
     async fn test_recovery_noop_reflector_no_retries() {
         let mut registry = ToolRegistry::new();
@@ -2383,7 +2206,6 @@ mod tests {
         assert_eq!(result.tool_calls, 1);
     }
 
-    /// Verify cancellation is still respected during tool recovery.
     #[tokio::test]
     async fn test_recovery_respects_cancellation() {
         let mut registry = ToolRegistry::new();
@@ -2401,13 +2223,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ==================================================
-    // Tests: set_pipeline uses self.tools registry
-    // ==================================================
-
-    /// Verify that `set_pipeline` automatically injects `self.tools` as the
-    /// pipeline's core registry, so dispatch never diverges from schema
-    /// generation.
     #[tokio::test]
     async fn test_set_pipeline_injects_self_tools_registry() {
         let client = MockClient::new("test-model");
@@ -2425,11 +2240,6 @@ mod tests {
         assert!(result.unwrap().success);
     }
 
-    // ==================================================
-    // Tests: turn_number is actual turn index
-    // ==================================================
-
-    /// A middleware that records the `turn_number` from each dispatch context.
     struct TurnNumberCapture {
         turns: Arc<Mutex<Vec<usize>>>,
     }
@@ -2459,8 +2269,6 @@ mod tests {
         }
     }
 
-    /// Verify that `turn_number` reflects the actual turn index, not
-    /// `config.max_turns`.
     #[tokio::test]
     async fn test_turn_number_is_actual_turn_index() {
         let client = MockClient::new("test-model");
@@ -2497,10 +2305,6 @@ mod tests {
         );
     }
 
-    // ─── Model switching tests ───
-
-    /// `switch_model` updates config.model, the client's model, and the
-    /// fallback manager's original-model tracker.
     #[tokio::test]
     async fn switch_model_updates_config_and_client() {
         let client = MockClient::new("model-a");
@@ -2520,7 +2324,6 @@ mod tests {
         assert_eq!(client_arc.model(), "model-b");
     }
 
-    /// `switch_model` fires `on_model_switched` to all registered observers.
     #[tokio::test]
     async fn switch_model_notifies_observers() {
         #[derive(Default)]
@@ -2557,12 +2360,8 @@ mod tests {
         assert_eq!(recorded[1], ("m2".to_string(), "m3".to_string()));
     }
 
-    /// `switch_model` updates config even when the client doesn't support
-    /// hot-swapping.  The client's internal model stays the same, but the
-    /// framework-level config, fallback, and observers are updated.
     #[tokio::test]
     async fn switch_model_unsupported_client() {
-        /// A client that does NOT override `set_model` (returns `false`).
         struct StaticClient {
             model_name: Arc<parking_lot::Mutex<String>>,
         }
@@ -2621,8 +2420,6 @@ mod tests {
         assert_eq!(loop_.client.model(), "static");
     }
 
-    /// `switch_model` syncs the fallback manager's original-model tracker
-    /// so subsequent fallback decisions compare against the new primary.
     #[tokio::test]
     async fn switch_model_updates_fallback_original() {
         let client = std::sync::Arc::new(MockClient::new("primary"));
@@ -2644,7 +2441,6 @@ mod tests {
         );
     }
 
-    /// `switch_model` rejects empty/whitespace-only model names.
     #[tokio::test]
     async fn switch_model_rejects_empty() {
         let client = std::sync::Arc::new(MockClient::new("model"));
@@ -2662,7 +2458,6 @@ mod tests {
         assert_eq!(loop_.config().model, "default");
     }
 
-    /// `switch_model` can be called multiple times in succession.
     #[tokio::test]
     async fn switch_model_chained() {
         let client = std::sync::Arc::new(MockClient::new("a"));
@@ -2679,7 +2474,6 @@ mod tests {
         assert_eq!(loop_.config().model, "d");
     }
 
-    /// `switch_model` with `.context_window()` updates the config.
     #[tokio::test]
     async fn switch_model_updates_context_window() {
         let client = std::sync::Arc::new(MockClient::new("big-model"));
@@ -2699,7 +2493,6 @@ mod tests {
         assert_eq!(loop_.config().context_window, 8192);
     }
 
-    /// `switch_model` with `.max_tokens()` updates the config.
     #[tokio::test]
     async fn switch_model_updates_max_tokens() {
         let client = std::sync::Arc::new(MockClient::new("m"));
@@ -2712,7 +2505,6 @@ mod tests {
         assert_eq!(loop_.config().max_tokens, 4096);
     }
 
-    /// `switch_model` trims whitespace from the model name.
     #[tokio::test]
     async fn switch_model_trims_whitespace() {
         let client = std::sync::Arc::new(MockClient::new("m"));
@@ -2723,7 +2515,6 @@ mod tests {
         assert_eq!(loop_.config().model, "gpt-4o");
     }
 
-    /// `switch_model` resets the fallback circuit breaker.
     #[tokio::test]
     async fn switch_model_resets_fallback_circuit() {
         use crate::fallback::FallbackState;

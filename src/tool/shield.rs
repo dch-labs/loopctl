@@ -806,10 +806,6 @@ mod tests {
         }
     }
 
-    // ===================================================
-    // NullShield tests
-    // ===================================================
-
     #[test]
     fn null_shield_allows_everything() {
         let shield = NullShield;
@@ -823,10 +819,6 @@ mod tests {
         let shield = NullShield;
         let _ = &shield;
     }
-
-    // ===================================================
-    // UnixShield tests
-    // ===================================================
 
     #[test]
     fn unix_shield_allows_safe_command() {
@@ -919,10 +911,6 @@ mod tests {
         assert!(combo2 > 0.0, "correct order should match");
     }
 
-    // ===================================================
-    // Builder tests
-    // ===================================================
-
     #[test]
     fn builder_blank_has_no_patterns() {
         let shield = UnixShieldBuilder::blank().build();
@@ -969,10 +957,6 @@ mod tests {
     fn builder_default_trait() {
         let _builder = UnixShieldBuilder::default();
     }
-
-    // ===================================================
-    // Type tests
-    // ===================================================
 
     #[test]
     fn risk_level_display() {

@@ -343,7 +343,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A test observer that counts notification invocations.
     struct CountingObserver {
         name: &'static str,
         stream_success: AtomicUsize,

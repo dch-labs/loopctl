@@ -306,7 +306,6 @@ pub fn self_hosted(base_url: &str, model: &str) -> Result<OpenAiClient, ApiError
 mod tests {
     use super::*;
 
-    /// Helper to safely set an env var in tests (Rust 2024 requires unsafe).
     macro_rules! env_set {
         ($($arg:tt)*) => {{
             // SAFETY: This is only used in single-threaded test code where
@@ -315,7 +314,6 @@ mod tests {
         }};
     }
 
-    /// Helper to safely remove an env var in tests.
     macro_rules! env_remove {
         ($($arg:tt)*) => {{
             // SAFETY: This is only used in single-threaded test code where

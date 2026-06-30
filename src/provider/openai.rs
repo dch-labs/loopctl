@@ -1265,10 +1265,6 @@ mod tests {
         assert_eq!(line, "data: hi");
     }
 
-    // ================================================
-    // Builder timeout tests
-    // ================================================
-
     #[test]
     fn builder_has_default_timeouts() {
         // The builder should initialize with sensible non-zero defaults
@@ -1319,10 +1315,6 @@ mod tests {
             .build();
         assert!(client.is_ok(), "build should succeed with valid timeouts");
     }
-
-    // ==================================================
-    // SSE buffer cap tests (M1)
-    // ==================================================
 
     #[tokio::test]
     async fn sse_reader_take_line_splits_on_newline() {
@@ -1378,10 +1370,6 @@ mod tests {
             "error should mention SSE buffer: {err_msg}"
         );
     }
-
-    // ==================================================
-    // Body size limit tests (H5)
-    // ==================================================
 
     #[test]
     fn max_response_body_is_ten_mb() {

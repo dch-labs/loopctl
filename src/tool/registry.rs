@@ -517,7 +517,6 @@ impl Tool for FnTool {
 mod tests {
     use super::*;
 
-    /// A simple tool function for testing duplicate registration (L1 fix).
     fn test_tool_fn(
         _input: Value,
         _ctx: &ToolContext,
@@ -525,7 +524,6 @@ mod tests {
         Box::pin(async { Ok(ToolOutput::text("ok")) })
     }
 
-    /// A simple tool for testing duplicate registration (L1 fix).
     fn make_tool(name: &str) -> FnTool {
         FnTool::new(
             name.into(),

@@ -1024,10 +1024,6 @@ impl ToolContentPart {
 mod tests {
     use super::*;
 
-    /// Verify that [`Message::user`] produces a message with [`Role::User`]
-    /// and a single [`MessagePart::Text`] containing the provided string.
-    ///
-    /// Also checks that [`MessagePart::as_text`] returns the original text.
     #[test]
     fn test_message_user_shortcut() {
         let msg = Message::user("Hello");
@@ -1036,10 +1032,6 @@ mod tests {
         assert_eq!(msg.parts[0].as_text(), Some("Hello"));
     }
 
-    /// Verify [`Message::assistant`] produces a message with the correct role.
-    ///
-    /// Asserts that the returned [`Message`] has [`Role::Assistant`] and contains
-    /// exactly one [`MessagePart::Text`] with the provided content.
     #[test]
     fn test_message_assistant_shortcut() {
         let msg = Message::assistant("Hi there!");
@@ -1047,20 +1039,12 @@ mod tests {
         assert_eq!(msg.parts.len(), 1);
     }
 
-    /// Verify [`Message`]'s [`Display`](fmt::Display) renders plain-text content.
-    ///
-    /// For a user message containing only [`MessagePart::Text`], the output
-    /// should be the raw text with no prefix or decoration.
     #[test]
     fn test_message_display() {
         let msg = Message::user("Hello world");
         assert_eq!(msg.to_string(), "Hello world");
     }
 
-    /// Verify [`Message`]'s [`Display`](fmt::Display) renders tool-call parts.
-    ///
-    /// For a message containing [`MessagePart::ToolCall`], the output should
-    /// include the tool name (e.g., "Tool: read_file") in the formatted string.
     #[test]
     fn test_message_display_with_tool_call() {
         let msg = Message {
@@ -1075,20 +1059,12 @@ mod tests {
         assert!(display.contains("Tool: read_file"));
     }
 
-    /// Verify [`Role`]'s [`Display`](fmt::Display) produces the expected strings.
-    ///
-    /// Each variant should render as its lowercase name: `"user"` or `"assistant"`.
     #[test]
     fn test_role_display() {
         assert_eq!(Role::User.to_string(), "user");
         assert_eq!(Role::Assistant.to_string(), "assistant");
     }
 
-    /// Verify [`MessagePart`] helper predicates and accessors.
-    ///
-    /// Tests [`is_text`](MessagePart::is_text), [`is_tool_call`](MessagePart::is_tool_call),
-    /// [`is_tool_result`](MessagePart::is_tool_result), and [`as_text`](MessagePart::as_text)
-    /// across all three part types.
     #[test]
     fn test_part_helpers() {
         let text = MessagePart::text("hello");
@@ -1105,10 +1081,6 @@ mod tests {
         assert!(tool_result.is_tool_result());
     }
 
-    /// Verify [`ImageSource::new_base64`] sets the source type and media type.
-    ///
-    /// Asserts that `encoding` is `"base64"` and that the provided MIME type
-    /// is stored unchanged in the [`media_type`](ImageSource::media_type) field.
     #[test]
     fn test_image_source() {
         let src = ImageSource::new_base64("image/png", "iVBOR...");
@@ -1116,11 +1088,6 @@ mod tests {
         assert_eq!(src.media_type, "image/png");
     }
 
-    /// Verify `From<&str>` for [`ToolContent`] produces a string variant.
-    ///
-    /// The conversion should wrap the provided text in
-    /// [`ToolContent::Text`] and [`Display`](std::fmt::Display) should
-    /// yield the original text.
     #[test]
     fn test_tool_result_from_string() {
         let result: ToolContent = "hello".into();
@@ -1128,19 +1095,12 @@ mod tests {
         assert_eq!(result.to_string(), "hello");
     }
 
-    /// Verify that [`ToolContent::default`] produces an empty-string variant.
-    ///
-    /// Equivalent to `ToolContent::from_string("")`.
     #[test]
     fn test_tool_result_default() {
         let result = ToolContent::default();
         assert!(result.is_string());
     }
 
-    /// Verify [`ToolContentPart::text`] produces the [`Text`](ToolContentPart::Text) variant.
-    ///
-    /// The constructor should create a [`ToolContentPart::Text`] containing the
-    /// provided string, accessible via pattern matching on the variant.
     #[test]
     fn test_tool_result_part_text() {
         let part = ToolContentPart::text("output");
@@ -1150,10 +1110,6 @@ mod tests {
         }
     }
 
-    /// Verify that a [`Message`] round-trips through JSON serialization.
-    ///
-    /// Ensures that `serde_json::to_string` → `serde_json::from_str` preserves
-    /// the message [`Role`].
     #[test]
     fn test_message_serialization() {
         let msg = Message::user("test");
@@ -1162,10 +1118,6 @@ mod tests {
         assert_eq!(msg.role, deserialized.role);
     }
 
-    /// Verify that a `Vec<MessagePart>` round-trips through JSON serialization.
-    ///
-    /// Tests the `#[serde(tag = "type")]` representation for [`Text`](MessagePart::Text)
-    /// and [`ToolCall`](MessagePart::ToolCall) variants.
     #[test]
     fn test_part_serialization_roundtrip() {
         let parts = vec![
@@ -1177,11 +1129,6 @@ mod tests {
         assert_eq!(parts.len(), back.len());
     }
 
-    /// Verify [`ToolContent`]'s [`Display`](fmt::Display) joins text parts.
-    ///
-    /// When a Multipart [`ToolContent`] contains multiple
-    /// [`ToolContentPart::Text`] entries, the [`Display`](fmt::Display) impl
-    /// should join them with newlines.
     #[test]
     fn test_tool_result_multipart_display() {
         let result = ToolContent::from_multipart(vec![

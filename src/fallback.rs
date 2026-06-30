@@ -303,7 +303,13 @@ impl FallbackEntry {
     /// ```
     #[must_use]
     pub fn with_max_fail_count(mut self, max_fail_count: usize) -> Self {
-        self.max_fail_count = max_fail_count.max(1);
+        let new_max = max_fail_count.max(1);
+        // If the entry was already failed, add attempts to keep it failed
+        // under the new threshold.
+        while self.attempts.len() < new_max && self.failed() {
+            self.attempts.push(AttemptRecord::anonymous());
+        }
+        self.max_fail_count = new_max;
         self
     }
 
@@ -1905,13 +1911,6 @@ mod tests {
     use super::*;
 
     #[test]
-    /// Verify that a freshly-constructed manager starts in [`FallbackState::Primary`]
-    /// with no failures and no fallback activation.
-    ///
-    /// Asserts initial values for [`state()`](FallbackManager::state),
-    /// [`is_using_fallback()`](FallbackManager::is_using_fallback),
-    /// [`is_fallback_active()`](FallbackManager::is_fallback_active), and
-    /// [`consecutive_failures()`](FallbackManager::consecutive_failures).
     fn test_initial_state() {
         let mgr = FallbackManager::new(3, 2);
         assert_eq!(mgr.state(), FallbackState::Primary);
@@ -1921,11 +1920,6 @@ mod tests {
     }
 
     #[test]
-    /// Verify that [`record_api_failure`](FallbackManager::record_api_failure) returns
-    /// `true` only when the failure count first reaches the threshold.
-    ///
-    /// Calls [`record_api_failure`](FallbackManager::record_api_failure) three times
-    /// and asserts that only the third call returns `true`.
     fn test_failure_threshold() {
         let mgr = FallbackManager::new(3, 2);
         assert!(!mgr.record_api_failure()); // 1
@@ -1934,10 +1928,6 @@ mod tests {
     }
 
     #[test]
-    /// Verify that [`record_model_failure`](FallbackManager::record_model_failure)
-    /// transitions to [`FallbackState::Fallback`] when the threshold is reached.
-    ///
-    /// Also checks that the method returns `true` only on the threshold-crossing call.
     fn test_model_failure_triggers_fallback() {
         let mgr = FallbackManager::new(3, 2);
         assert!(!mgr.record_model_failure()); // 1
@@ -1947,10 +1937,6 @@ mod tests {
     }
 
     #[test]
-    /// Verify the full recovery cycle: Primary → Fallback → Recovering → Primary.
-    ///
-    /// Trips the circuit with three failures, then transitions to recovering
-    /// and records two successes to close the circuit back to primary.
     fn test_recovery() {
         let mgr = FallbackManager::new(3, 2);
         // Trigger fallback
@@ -1970,11 +1956,6 @@ mod tests {
     }
 
     #[test]
-    /// Verify that a failure during [`FallbackState::Recovering`] reopens the circuit.
-    ///
-    /// After transitioning to recovering, a single call to
-    /// [`record_model_failure`](FallbackManager::record_model_failure) should
-    /// move the state back to [`FallbackState::Fallback`].
     fn test_recovery_failure_goes_back_to_fallback() {
         let mgr = FallbackManager::new(3, 2);
         for _ in 0..3 {
@@ -1986,12 +1967,6 @@ mod tests {
     }
 
     #[test]
-    /// Verify [`should_try_resume_primary`](FallbackManager::should_try_resume_primary)
-    /// enforces both the state check and the cooldown duration.
-    ///
-    /// Asserts `false` when in [`FallbackState::Primary`], `false` when in
-    /// fallback but the cooldown hasn't elapsed, and `true` when the cooldown
-    /// has passed (using a 0-second timeout).
     fn test_should_try_resume_primary() {
         let mgr = FallbackManager::new(3, 2);
         assert!(!mgr.should_try_resume_primary(Duration::from_secs(10)));
@@ -2007,12 +1982,6 @@ mod tests {
     }
 
     #[test]
-    /// Verify that [`new_with_fallback`](FallbackManager::new_with_fallback)
-    /// starts in [`FallbackState::Fallback`] with the model name stored.
-    ///
-    /// Checks [`is_fallback_active()`](FallbackManager::is_fallback_active),
-    /// [`is_using_fallback()`](FallbackManager::is_using_fallback), and
-    /// [`original_model()`](FallbackManager::original_model).
     fn test_new_with_fallback() {
         let mgr = FallbackManager::new_with_fallback("llm-70b".into(), 3);
         assert!(mgr.is_fallback_active());
@@ -2021,11 +1990,6 @@ mod tests {
     }
 
     #[test]
-    /// Verify that [`reset`](FallbackManager::reset) clears all state back to
-    /// [`FallbackState::Primary`], including counters and flags.
-    ///
-    /// Trips the circuit first, then asserts that [`reset`] restores
-    /// every field to its initial value.
     fn test_reset() {
         let mgr = FallbackManager::new(3, 2);
         for _ in 0..3 {
@@ -2040,11 +2004,6 @@ mod tests {
     }
 
     #[test]
-    /// Verify that [`record_api_failure`](FallbackManager::record_api_failure)
-    /// does not re-trip the circuit after it has already been activated.
-    ///
-    /// The [`fallback_activated`](FallbackManager::is_fallback_active) flag
-    /// prevents the sticky `true` return on every subsequent failure.
     fn test_api_failure_does_not_retrip() {
         let mgr = FallbackManager::new(3, 2);
         // Trip the circuit
@@ -2060,10 +2019,6 @@ mod tests {
     }
 
     #[test]
-    /// Verify that [`record_model_success`](FallbackManager::record_model_success)
-    /// resets the failure counter when in [`FallbackState::Primary`].
-    ///
-    /// After recording two failures, a single success should zero the counter.
     fn test_record_success_resets_on_primary() {
         let mgr = FallbackManager::new(3, 2);
         mgr.record_api_failure();
@@ -2075,10 +2030,6 @@ mod tests {
     }
 
     #[test]
-    /// Verify [`for_model`](FallbackManager::for_model) stores the model name.
-    ///
-    /// Asserts that [`FallbackManager::original_model`] returns the provided
-    /// model string and that the initial state is [`FallbackState::Primary`].
     fn test_for_model() {
         let mgr = FallbackManager::for_model("llm-70b");
         assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
@@ -2086,11 +2037,6 @@ mod tests {
     }
 
     #[test]
-    /// Verify thread safety — concurrent reads and writes via `Arc<FallbackManager>`.
-    ///
-    /// Spawns 10 threads that each call [`record_api_failure`], [`record_model_success`],
-    /// [`state`], and [`consecutive_failures`] concurrently. The test passes if no
-    /// thread panics due to data races (guaranteed by atomic operations).
     fn test_concurrent_access() {
         use std::sync::Arc;
         use std::thread;
@@ -2113,10 +2059,6 @@ mod tests {
         }
     }
 
-    /// Verify the consolidated Mutex (M5 fix) ensures multi-field updates
-    /// are visible atomically. When `transition_to_fallback` is called,
-    /// both `fallback_switched_at` and `active_fallback` should be
-    /// observable together.
     #[test]
     fn test_consolidated_mutex_fields_are_consistent() {
         let mgr = FallbackManager::for_model("primary-model");
@@ -2138,7 +2080,6 @@ mod tests {
         );
     }
 
-    /// Verify that `transition_to_primary` clears both fields atomically (M5).
     #[test]
     fn test_consolidated_mutex_clears_fields_together() {
         let mgr = FallbackManager::for_model("primary-model");
@@ -2159,7 +2100,6 @@ mod tests {
         );
     }
 
-    /// Verify that `reset()` clears all fields atomically (M5).
     #[test]
     fn test_consolidated_mutex_reset_clears_all() {
         let mgr = FallbackManager::for_model("primary-model");
@@ -2177,5 +2117,58 @@ mod tests {
         // Everything cleared.
         assert_eq!(mgr.consecutive_failures(), 0);
         assert!(mgr.fallback_switched_at().is_none());
+    }
+
+    #[test]
+    fn with_max_fail_count_no_padding_when_not_failed() {
+        let entry = FallbackEntry::new("model-a").with_max_fail_count(5);
+        assert!(!entry.failed());
+        assert_eq!(entry.attempt_count(), 0);
+        assert_eq!(entry.max_fail_count, 5);
+    }
+
+    #[test]
+    fn with_max_fail_count_pads_already_failed_entry() {
+        let mut entry = FallbackEntry::new("model-b");
+        entry.record_attempt("timeout");
+        entry.record_attempt("timeout");
+        assert!(entry.failed());
+        assert_eq!(entry.attempt_count(), 2);
+
+        let entry = entry.with_max_fail_count(5);
+        assert_eq!(entry.max_fail_count, 5);
+        assert_eq!(entry.attempt_count(), 5);
+        assert!(entry.failed());
+    }
+
+    #[test]
+    fn with_max_fail_count_pads_exactly_to_new_threshold() {
+        let mut entry = FallbackEntry::new("model-c");
+        entry.record_attempt("err");
+        entry.record_attempt("err");
+        assert!(entry.failed());
+
+        let entry = entry.with_max_fail_count(3);
+        assert_eq!(entry.attempt_count(), 3);
+        assert!(entry.failed());
+    }
+
+    #[test]
+    fn with_max_fail_count_no_padding_when_lowering() {
+        let mut entry = FallbackEntry::new("model-d");
+        entry.record_attempt("err");
+        entry.record_attempt("err");
+        assert!(entry.failed());
+
+        let entry = entry.with_max_fail_count(1);
+        assert_eq!(entry.max_fail_count, 1);
+        assert_eq!(entry.attempt_count(), 2);
+        assert!(entry.failed());
+    }
+
+    #[test]
+    fn with_max_fail_count_clamps_to_minimum_one() {
+        let entry = FallbackEntry::new("model-e").with_max_fail_count(0);
+        assert_eq!(entry.max_fail_count, 1);
     }
 }

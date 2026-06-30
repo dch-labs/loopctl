@@ -1248,10 +1248,6 @@ mod tests {
         assert!(debug.contains("timeout_config"));
     }
 
-    // ===================================================
-    // StreamTimeoutConfig::validate tests
-    // ===================================================
-
     #[test]
     fn timeout_config_validate_default_ok() {
         assert!(StreamTimeoutConfig::default().validate().is_ok());
@@ -1308,10 +1304,6 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(err.contains("progress_interval"));
     }
-
-    // ===================================================
-    // StreamRetryConfig::validate tests
-    // ===================================================
 
     #[test]
     fn retry_config_validate_default_ok() {
@@ -1406,10 +1398,6 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
-    // ===================================================
-    // StreamTurnResult tests
-    // ===================================================
-
     #[test]
     fn stream_turn_result_fields() {
         let result = StreamTurnResult {
@@ -1437,20 +1425,12 @@ mod tests {
         assert!(result.usage.is_none());
     }
 
-    // ===================================================
-    // process_events async tests
-    // ===================================================
-
     use crate::api::error::ApiError;
     use crate::stream::{
         DeltaPart, IndexedDelta, MessageDelta, MessageDeltaPayload, MessageMetadata, MessageStart,
         PartStart, StreamEvent,
     };
 
-    /// Helper: build a minimal happy-path event stream.
-    ///
-    /// Produces: MessageStart → PartStart(text) → IndexedDelta("hi") →
-    /// PartStop → MessageDelta(end_turn) → MessageStop
     fn happy_stream_events() -> Vec<Result<StreamEvent, ApiError>> {
         vec![
             Ok(StreamEvent::MessageStart(MessageStart {
@@ -1481,7 +1461,6 @@ mod tests {
         ]
     }
 
-    /// Build a `futures::stream` from a vec of events.
     fn event_stream(
         events: Vec<Result<StreamEvent, ApiError>>,
     ) -> std::pin::Pin<
@@ -1618,18 +1597,8 @@ mod tests {
         assert!(!result.from_fallback);
     }
 
-    // ===================================================
-    // fallback_non_streaming async tests
-    // ===================================================
-
-    /// Minimal mock that implements [`ApiClient`] for handler tests.
-    ///
-    /// Unlike the full [`MockApiClient`](crate::testing::MockApiClient),
-    /// this is defined locally so it works without the `testing` feature.
     struct HandlerMock {
-        /// If set, `create_message` returns this error.
         create_error: Option<String>,
-        /// If set, `create_message` returns this JSON.
         create_response: Option<serde_json::Value>,
     }
 
@@ -1641,7 +1610,6 @@ mod tests {
             }
         }
 
-        /// Make `create_message` succeed with the given text.
         fn with_text_response(mut self, text: &str) -> Self {
             self.create_response = Some(serde_json::json!({
                 "content": [{"type": "text", "text": text}],
@@ -1650,7 +1618,6 @@ mod tests {
             self
         }
 
-        /// Make `create_message` fail with the given error message.
         fn with_create_error(mut self, msg: &str) -> Self {
             self.create_error = Some(msg.to_string());
             self
@@ -1795,10 +1762,6 @@ mod tests {
         }
     }
 
-    // ===================================================
-    // stream_turn async tests
-    // ===================================================
-
     #[tokio::test]
     async fn stream_turn_happy_path() {
         let handler = StreamHandler::new();
@@ -1844,7 +1807,6 @@ mod tests {
         // (covered above). Here we test that stream_turn returns the
         // error when streaming fails and the handler is configured
         // without fallback.
-        /// Mock that always returns an error stream.
         struct ErrorMock;
         impl ApiClient for ErrorMock {
             fn model(&self) -> String {

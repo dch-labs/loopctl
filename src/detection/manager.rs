@@ -230,8 +230,7 @@ pub enum DetectedPattern {
 ///   [`convergence_threshold`](Self::convergence_threshold),
 ///   [`convergence_count`](Self::convergence_count),
 ///   [`enable_convergence_detection`](Self::enable_convergence_detection),
-///   [`on_converge`](Self::on_converge),
-///   [`max_response_history`](Self::max_response_history).
+///   [`on_converge`](Self::on_converge).
 ///
 /// # Example
 ///
@@ -266,8 +265,6 @@ pub struct DetectionConfig {
     pub enable_convergence_detection: bool,
     /// Action on convergence. Default: [`ConvergenceAction::default()`].
     pub on_converge: ConvergenceAction,
-    /// Max responses kept for convergence checking. Default: **20**.
-    pub max_response_history: usize,
 }
 
 impl Default for DetectionConfig {
@@ -281,7 +278,6 @@ impl Default for DetectionConfig {
             convergence_count: 3,
             enable_convergence_detection: true,
             on_converge: ConvergenceAction::default(),
-            max_response_history: 20,
         }
     }
 }
@@ -1231,10 +1227,6 @@ impl Default for DetectionManager {
 mod tests {
     use super::*;
 
-    /// Verify that a freshly constructed [`DetectionManager`] reports [`DetectedPattern::NoPattern`].
-    ///
-    /// Creates a new manager and immediately calls [`check_current_pattern`](DetectionManager::check_current_pattern).
-    /// Asserts that no pattern is detected before any data has been recorded.
     #[test]
     fn test_no_pattern_initially() {
         let dm = DetectionManager::new().unwrap();
@@ -1244,11 +1236,6 @@ mod tests {
         ));
     }
 
-    /// Verify that repeating the same tool call triggers [`DetectedPattern::LoopDetected`].
-    ///
-    /// Calls [`record_tool_call`](DetectionManager::record_tool_call) with identical arguments
-    /// five times. Asserts that at least one call returns a loop detection result,
-    /// confirming the default [`DetectionConfig::loop_threshold`] of 3 is respected.
     #[test]
     fn test_loop_detection() {
         let dm = DetectionManager::new().unwrap();
@@ -1262,11 +1249,6 @@ mod tests {
         panic!("Expected loop detection after 5 identical calls");
     }
 
-    /// Verify that submitting identical responses triggers [`DetectedPattern::ConvergenceDetected`].
-    ///
-    /// Calls [`record_response`](DetectionManager::record_response) with the same string five
-    /// times. Asserts that convergence is detected, validating the Jaccard similarity
-    /// check and the [`DetectionConfig::convergence_count`] threshold.
     #[test]
     fn test_convergence_detection() {
         let dm = DetectionManager::new().unwrap();
@@ -1280,11 +1262,6 @@ mod tests {
         panic!("Expected convergence detection after 5 identical responses");
     }
 
-    /// Verify that [`reset`](DetectionManager::reset) clears all detection state.
-    ///
-    /// Records a tool call and a response, then calls [`reset`](DetectionManager::reset).
-    /// Asserts that [`check_current_pattern`](DetectionManager::check_current_pattern) returns
-    /// [`DetectedPattern::NoPattern`] and that [`stats`](DetectionManager::stats) shows zero turns.
     #[test]
     fn test_reset() {
         let dm = DetectionManager::new().unwrap();
@@ -1299,11 +1276,6 @@ mod tests {
         assert_eq!(stats.turns_analyzed, 0);
     }
 
-    /// Verify that disabling both detectors causes all calls to return [`DetectedPattern::NoPattern`].
-    ///
-    /// Constructs a [`DetectionManager`] with `enable_loop_detection: false` and
-    /// `enable_convergence_detection: false`. Records 10 identical tool calls and asserts
-    /// none trigger a detection, confirming the feature-flag short-circuits work.
     #[test]
     fn test_no_detection_when_disabled() {
         let config = DetectionConfig {
@@ -1318,12 +1290,6 @@ mod tests {
         }
     }
 
-    /// Verify that the [`LoopStatus::should_stop`] flag activates after `stop_threshold` repetitions.
-    ///
-    /// Configures `loop_threshold: 3` and `stop_threshold: 5`, then records 5 identical
-    /// operations. Asserts that [`check_loop`](DetectionManager::check_loop) reports
-    /// [`is_looping`](LoopStatus::is_looping), [`should_stop`](LoopStatus::should_stop), and a
-    /// warning containing `"STOPPING"`.
     #[test]
     fn test_loop_status_should_stop() {
         let config = DetectionConfig {
@@ -1345,12 +1311,6 @@ mod tests {
         assert!(status.warning.unwrap().contains("STOPPING"));
     }
 
-    /// Verify loop detection using the rich [`Operation`] API.
-    ///
-    /// Creates [`Operation`] values with [`Operation::new`] and records them via
-    /// [`record_operation`](DetectionManager::record_operation). Asserts that the loop
-    /// detector correctly identifies repeated tool + parameter pairs and reports
-    /// a repetition count of at least 3.
     #[test]
     fn test_record_operation_with_operation_struct() {
         let dm = DetectionManager::new().unwrap();
@@ -1365,11 +1325,6 @@ mod tests {
         assert!(status.repetition_count >= 3);
     }
 
-    /// Verify that [`Operation::from_input_with_signature`] integrates with loop detection.
-    ///
-    /// Parses a JSON input using [`NoOpToolSignature`](super::loop_detector::NoOpToolSignature)
-    /// and records 5 operations. Because `NoOpToolSignature` produces an empty `primary_param`,
-    /// all `"Read"` operations are considered identical and a loop is detected.
     #[test]
     fn test_record_operation_from_input() {
         use super::super::loop_detector::NoOpToolSignature;
@@ -1390,12 +1345,6 @@ mod tests {
         assert!(status.is_looping);
     }
 
-    /// Verify that changing result hashes prevent loop detection.
-    ///
-    /// Calls [`record_tool_call_with_result`](DetectionManager::record_tool_call_with_result)
-    /// with the same tool and input but a different result hash each time. Asserts that
-    /// [`check_loop`](DetectionManager::check_loop) reports `is_looping: false`, confirming
-    /// that the result-aware logic treats varying outputs as progress.
     #[test]
     fn test_result_aware_detection() {
         let dm = DetectionManager::new().unwrap();
@@ -1410,12 +1359,6 @@ mod tests {
         assert!(!status.is_looping, "Different results should not be a loop");
     }
 
-    /// Verify that identical result hashes trigger loop detection.
-    ///
-    /// Calls [`record_tool_call_with_result`](DetectionManager::record_tool_call_with_result)
-    /// with the same tool, input, *and* result hash. Asserts that the loop detector
-    /// identifies this as a genuine loop, confirming the result-aware path works when
-    /// results do not change.
     #[test]
     fn test_result_aware_same_result_is_loop() {
         let dm = DetectionManager::new().unwrap();
@@ -1429,12 +1372,6 @@ mod tests {
         assert!(status.is_looping, "Same results should be detected as loop");
     }
 
-    /// Verify that [`loop_detector`](DetectionManager::loop_detector) provides access
-    /// to the inner [`LoopDetector`].
-    ///
-    /// Calls [`loop_detector()`](DetectionManager::loop_detector) on a fresh manager
-    /// and asserts that [`turn_count`](LoopDetector::turn_count) returns 0, confirming
-    /// the accessor returns a usable reference.
     #[test]
     fn test_access_loop_detector() {
         let dm = DetectionManager::new().unwrap();
@@ -1442,11 +1379,6 @@ mod tests {
         assert_eq!(dm.loop_detector().turn_count(), 0);
     }
 
-    /// Verify that [`DetectionConfig::to_loop_detector_config`] correctly maps fields.
-    ///
-    /// Creates a [`DetectionConfig`] with custom `loop_threshold`, `stop_threshold`, and
-    /// `max_history`, then converts it to a [`LoopDetectorConfig`]. Asserts that each field
-    /// maps to the expected value (`repetition_threshold`, `stop_threshold`, `window_size`).
     #[test]
     fn test_config_to_loop_detector_config() {
         let config = DetectionConfig {
@@ -1459,5 +1391,24 @@ mod tests {
         assert_eq!(ldc.repetition_threshold, 5);
         assert_eq!(ldc.stop_threshold, 15);
         assert_eq!(ldc.window_size, 200);
+    }
+
+    #[test]
+    fn test_detection_config_default_has_no_max_response_history() {
+        let config = DetectionConfig {
+            loop_threshold: 3,
+            stop_threshold: 5,
+            ..Default::default()
+        };
+        assert_eq!(config.loop_threshold, 3);
+        assert_eq!(config.stop_threshold, 5);
+        let default = DetectionConfig::default();
+        assert_eq!(default.loop_threshold, 3);
+        assert_eq!(default.stop_threshold, 10);
+        assert!(default.enable_loop_detection);
+        assert_eq!(default.max_history, 100);
+        assert!((default.convergence_threshold - 0.95).abs() < f32::EPSILON);
+        assert_eq!(default.convergence_count, 3);
+        assert!(default.enable_convergence_detection);
     }
 }

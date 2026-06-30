@@ -1120,7 +1120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_output_limit_multipart_passes_through() {
+    async fn test_output_limit_multipart_text_parts_are_truncated() {
         let registry = long_output_registry();
         let pipeline = ToolPipeline::builder()
             .with(OutputLimitMiddleware::new(3))
@@ -1130,12 +1130,58 @@ mod tests {
 
         let result = pipeline.invoke(test_ctx("multipart")).await;
         assert!(!result.is_error);
-        // Multipart content should pass through even though it exceeds
-        // the character limit — truncation only applies to Text variant.
-        assert!(
-            matches!(result.output, ToolContent::Multipart(_)),
-            "multipart should pass through unchanged"
-        );
+        // Each text part in the multipart result should be individually
+        // truncated. "part1" (5 chars > 3) → "par\n[truncated]".
+        match result.output {
+            ToolContent::Multipart(parts) => {
+                assert_eq!(parts.len(), 2, "should still have 2 parts");
+                for (i, part) in parts.iter().enumerate() {
+                    match part {
+                        ToolContentPart::Text { text } => {
+                            assert!(
+                                text.contains("[truncated]"),
+                                "part {i} should be truncated: got {text:?}"
+                            );
+                            assert!(
+                                text.starts_with("par"),
+                                "part {i} should start with first 3 chars: got {text:?}"
+                            );
+                        }
+                        ToolContentPart::Image { .. } => {
+                            panic!("unexpected image part in MultipartTool output");
+                        }
+                    }
+                }
+            }
+            other => panic!("expected Multipart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_output_limit_multipart_short_parts_pass_through() {
+        // When all text parts are within the limit, multipart should
+        // pass through unchanged.
+        let registry = long_output_registry();
+        let pipeline = ToolPipeline::builder()
+            .with(OutputLimitMiddleware::new(100))
+            .core(Arc::clone(&registry))
+            .build()
+            .expect("valid");
+
+        let result = pipeline.invoke(test_ctx("multipart")).await;
+        assert!(!result.is_error);
+        match result.output {
+            ToolContent::Multipart(parts) => {
+                assert_eq!(parts.len(), 2);
+                if let ToolContentPart::Text { text } = &parts[0] {
+                    assert_eq!(text, "part1", "short part should not be truncated");
+                }
+                if let ToolContentPart::Text { text } = &parts[1] {
+                    assert_eq!(text, "part2", "short part should not be truncated");
+                }
+            }
+            other => panic!("expected Multipart, got {other:?}"),
+        }
     }
 
     #[tokio::test]

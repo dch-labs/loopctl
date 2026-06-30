@@ -1,15 +1,16 @@
 //! Middleware that truncates tool output to a maximum character count.
 
 use super::{ToolDispatchContext, ToolDispatchResult, ToolMiddleware, ToolPipeline};
-use crate::message::ToolContent;
+use crate::message::{ToolContent, ToolContentPart};
 use std::future::Future;
 use std::pin::Pin;
 
 /// Middleware that truncates tool output to a maximum character count.
 ///
 /// If the tool's text output exceeds the limit, it is truncated and
-/// suffixed with a `[truncated]` marker. Non-text outputs ([`ToolContent::Multipart`])
-/// are passed through unchanged.
+/// suffixed with a `[truncated]` marker. For [`ToolContent::Multipart`]
+/// results, each text part is individually truncated in the same way;
+/// image parts are left unchanged.
 ///
 /// This prevents runaway tools from flooding the conversation with
 /// excessive output that would blow the context window.
@@ -53,11 +54,24 @@ impl ToolMiddleware for OutputLimitMiddleware {
         Box::pin(async move {
             let mut result = next.dispatch(ctx).await;
 
-            if let ToolContent::Text(ref text) = result.output {
-                let char_count = text.chars().count();
-                if char_count > max_chars {
-                    let truncated: String = text.chars().take(max_chars).collect();
-                    result.output = ToolContent::Text(format!("{truncated}\n[truncated]"));
+            match result.output {
+                ToolContent::Text(ref text) => {
+                    let char_count = text.chars().count();
+                    if char_count > max_chars {
+                        let truncated: String = text.chars().take(max_chars).collect();
+                        result.output = ToolContent::Text(format!("{truncated}\n[truncated]"));
+                    }
+                }
+                ToolContent::Multipart(ref mut parts) => {
+                    for part in parts.iter_mut() {
+                        if let ToolContentPart::Text { text } = part {
+                            let char_count = text.chars().count();
+                            if char_count > max_chars {
+                                let truncated: String = text.chars().take(max_chars).collect();
+                                *text = format!("{truncated}\n[truncated]");
+                            }
+                        }
+                    }
                 }
             }
 

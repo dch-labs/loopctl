@@ -44,10 +44,8 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta
 const DEFAULT_MODEL: &str = "gemini-2.0-flash";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
-
-/// Default total request timeout (connect + response + body).
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-/// Default TCP connection establishment timeout.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); // connect + response + body
+const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ==================================================
@@ -190,9 +188,18 @@ impl ApiClient for GeminiClient {
 
         Box::pin(async move {
             let resp = Self::post_content(&self.http, &url, &body).await?;
-            resp.json::<Value>()
+            let resp = resp
+                .bytes()
                 .await
-                .map_err(|e| ApiError::http(e.to_string()))
+                .map_err(|e| ApiError::http(e.to_string()))?;
+            if resp.len() > MAX_RESPONSE_BODY {
+                return Err(ApiError::http(format!(
+                    "response body too large: {} bytes (max {})",
+                    resp.len(),
+                    MAX_RESPONSE_BODY
+                )));
+            }
+            serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
 }
@@ -416,8 +423,15 @@ impl SseReader {
                 }
 
                 if let Some(data) = line.strip_prefix(SSE_DATA_PREFIX) {
-                    if let Ok(json) = serde_json::from_str::<Value>(data) {
-                        return Ok(Some(json));
+                    match serde_json::from_str::<Value>(data) {
+                        Ok(json) => return Ok(Some(json)),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                data_len = data.len(),
+                                "failed to parse Gemini SSE data, skipping"
+                            );
+                        }
                     }
                 }
             }

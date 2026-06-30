@@ -1153,7 +1153,7 @@ mod tests {
                     }
                 }
             }
-            other => panic!("expected Multipart, got {other:?}"),
+            other @ ToolContent::Text(_) => panic!("expected Multipart, got {other:?}"),
         }
     }
 
@@ -1180,7 +1180,7 @@ mod tests {
                     assert_eq!(text, "part2", "short part should not be truncated");
                 }
             }
-            other => panic!("expected Multipart, got {other:?}"),
+            other @ ToolContent::Text(_) => panic!("expected Multipart, got {other:?}"),
         }
     }
 

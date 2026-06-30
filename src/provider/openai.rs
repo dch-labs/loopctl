@@ -48,10 +48,8 @@ const DEFAULT_MODEL: &str = "gpt-4o";
 const SSE_DONE: &str = "[DONE]";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
-
-/// Default total request timeout (connect + response + body).
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-/// Default TCP connection establishment timeout.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); // connect + response + body
+const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ==================================================
@@ -199,9 +197,18 @@ impl ApiClient for OpenAiClient {
             let resp =
                 Self::post_completions(&self.http, &url, &self.api_key, &body.to_json(false))
                     .await?;
-            resp.json::<Value>()
+            let resp = resp
+                .bytes()
                 .await
-                .map_err(|e| ApiError::http(e.to_string()))
+                .map_err(|e| ApiError::http(e.to_string()))?;
+            if resp.len() > MAX_RESPONSE_BODY {
+                return Err(ApiError::http(format!(
+                    "response body too large: {} bytes (max {})",
+                    resp.len(),
+                    MAX_RESPONSE_BODY
+                )));
+            }
+            serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
 }
@@ -547,7 +554,17 @@ impl OpenAiChunk {
     /// Returns `None` for malformed payloads so the caller can skip
     /// them without interrupting the stream.
     fn parse(data: &str) -> Option<Self> {
-        serde_json::from_str(data).ok()
+        match serde_json::from_str(data) {
+            Ok(chunk) => Some(chunk),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    data_len = data.len(),
+                    "failed to parse OpenAI SSE chunk, skipping"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -913,6 +930,21 @@ mod tests {
     fn parse_malformed_returns_none() {
         assert!(OpenAiChunk::parse("not json").is_none());
         assert!(OpenAiChunk::parse("").is_none());
+    }
+
+    #[test]
+    fn parse_malformed_partial_json_returns_none() {
+        // Truncated JSON should also fail gracefully with a warning log.
+        assert!(OpenAiChunk::parse(r#"{"id":"chatcmpl-1","choices":[{"delta":{"con"#).is_none());
+    }
+
+    #[test]
+    fn parse_valid_chunk_with_all_fields() {
+        let data = r#"{"id":"abc","model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}],"usage":null}"#;
+        let chunk = OpenAiChunk::parse(data).unwrap();
+        assert_eq!(chunk.id, "abc");
+        assert_eq!(chunk.model, "gpt-4o");
+        assert_eq!(chunk.choices.len(), 1);
     }
 
     #[test]

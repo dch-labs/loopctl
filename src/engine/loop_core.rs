@@ -73,6 +73,7 @@ pub use crate::tool::ToolDispatchResult;
 ///                  ↘ Reflecting ↗
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoopState {
     /// The agent is idle, waiting for a user message.
     ///
@@ -148,7 +149,10 @@ pub enum LoopState {
     /// [`SessionResult::error`].
     ///
     /// No further turns will be executed after entering this state.
-    Failed { error: String },
+    Failed {
+        /// A human-readable description of the error that caused the failure.
+        error: String,
+    },
 }
 
 // ==================================================
@@ -281,6 +285,7 @@ impl TurnResult {
 /// to determine the next step: dispatch tools, continue the conversation,
 /// or end the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum StopReason {
     /// The model decided to stop (natural end of turn).
     ///

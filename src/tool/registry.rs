@@ -75,6 +75,12 @@ impl ToolRegistry {
     /// ```
     pub fn register(&mut self, tool: impl Tool + 'static) {
         let name = tool.name().to_string();
+        if self.tools.contains_key(&name) {
+            tracing::warn!(
+                tool = %name,
+                "overwriting previously registered tool with the same name"
+            );
+        }
         self.tools.insert(name, Box::new(tool));
     }
 
@@ -504,5 +510,61 @@ impl Tool for FnTool {
     /// [`with_system_prompt`](FnTool::with_system_prompt).
     fn system_prompt(&self) -> Option<String> {
         self.system_prompt.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A simple tool function for testing duplicate registration (L1 fix).
+    fn test_tool_fn(
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'static>> {
+        Box::pin(async { Ok(ToolOutput::text("ok")) })
+    }
+
+    /// A simple tool for testing duplicate registration (L1 fix).
+    fn make_tool(name: &str) -> FnTool {
+        FnTool::new(
+            name.into(),
+            "test tool".into(),
+            serde_json::json!({"type": "object"}),
+            test_tool_fn,
+        )
+    }
+
+    #[test]
+    fn register_duplicate_overwrites_previous() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_tool("my_tool"));
+        assert_eq!(registry.len(), 1);
+
+        // Registering with the same name should overwrite, not add.
+        registry.register(make_tool("my_tool"));
+        assert_eq!(
+            registry.len(),
+            1,
+            "duplicate registration should not increase count"
+        );
+    }
+
+    #[test]
+    fn register_different_names_adds_both() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_tool("tool_a"));
+        registry.register(make_tool("tool_b"));
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn register_overwrite_uses_new_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_tool("my_tool"));
+
+        // After overwriting, the tool should still be callable.
+        registry.register(make_tool("my_tool"));
+        assert!(registry.get("my_tool").is_some());
     }
 }

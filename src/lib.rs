@@ -45,6 +45,7 @@
 // Relax strict lints in test code. The crate enforces a strict no-panic /
 // no-unwrap policy in production code, but test code legitimately uses
 // assertions, unwrap, indexing, etc. for readability.
+#![warn(missing_docs)]
 #![cfg_attr(
     test,
     allow(

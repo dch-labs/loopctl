@@ -73,6 +73,7 @@ pub mod heartbeat;
 /// handled correctly — for example, when accumulated tool-call JSON
 /// is malformed at [`PartStop`](StreamEvent::PartStop) time.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StreamError {
     /// The concatenated tool-call input JSON could not be parsed.
     ///
@@ -509,6 +510,7 @@ pub enum DeltaPart {
 /// assert!(!reason.should_continue_tool_loop());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum StreamStopReason {
     /// The model decided to invoke a tool.
     ///

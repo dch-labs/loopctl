@@ -61,6 +61,23 @@
 //! assert!(status.detected); // 3 consecutive similar responses
 //! # Ok::<(), loopctl::detection::convergence::ConvergenceConfigError>(())
 //! ```
+//!
+//! # Known Limitations
+//!
+//! This detector uses **Jaccard similarity** on whitespace-tokenized words:
+//!
+//! - **Semantic blindness**: Responses that are semantically identical but
+//!   use different vocabulary will not be detected as convergent.
+//! - **Word-order sensitivity**: Rearranging words may reduce similarity
+//!   below the threshold, even when the meaning is unchanged.
+//! - **Punctuation/whitespace sensitivity**: Tokenization is purely
+//!   whitespace-based, so minor formatting changes can affect results.
+//! - **False positives**: Boilerplate-heavy responses with shared prefixes
+//!   (e.g., "Let me check that for you...") may trigger false positives.
+//!
+//! Choose a conservative `threshold` (see [`ConvergenceConfig`]) to
+//! minimise false positives, and consider combining with
+//! [`LoopDetector`](super::LoopDetector) for complementary pattern detection.
 
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -103,10 +120,12 @@ use serde::{Deserialize, Serialize};
 ///     ConvergenceAction::SwitchPhase => println!("Switching phase"),
 ///     ConvergenceAction::AskUser => println!("Asking user"),
 ///     ConvergenceAction::Compact => println!("Compacting history"),
+///     _ => println!("Other action"),
 /// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ConvergenceAction {
     /// Stop the agent loop entirely.
     ///
@@ -193,14 +212,20 @@ pub enum ConvergenceConfigError {
     /// Convergence requires at least one pair of consecutive responses,
     /// so a window of 1 (or 0) is meaningless.
     #[error("window_size must be at least 2, got {actual}")]
-    WindowTooSmall { actual: usize },
+    WindowTooSmall {
+        /// The invalid window size that was provided.
+        actual: usize,
+    },
 
     /// `similarity_threshold` is outside the valid range `[0.0, 1.0]`.
     ///
     /// Jaccard similarity always produces a value in this range; a
     /// threshold outside it would never (or always) trigger.
     #[error("similarity_threshold must be in [0.0, 1.0], got {actual}")]
-    ThresholdOutOfRange { actual: f32 },
+    ThresholdOutOfRange {
+        /// The invalid threshold value that was provided.
+        actual: f32,
+    },
 }
 
 // ===================================================

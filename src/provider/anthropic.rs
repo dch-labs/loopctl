@@ -47,6 +47,7 @@ const TEXT_PART_INDEX: usize = 0;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
+const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ==================================================
@@ -509,7 +510,14 @@ impl SseReader {
             }
 
             match self.bytes.next().await {
-                Some(Ok(chunk)) => self.buf.push_str(&chunk),
+                Some(Ok(chunk)) => {
+                    self.buf.push_str(&chunk);
+                    if self.buf.len() > SSE_MAX_BUFFER {
+                        return Err(ApiError::http(format!(
+                            "SSE buffer exceeded {SSE_MAX_BUFFER} bytes"
+                        )));
+                    }
+                }
                 Some(Err(e)) => return Err(e),
                 None => {
                     // End of stream — emit any pending event.
@@ -1216,5 +1224,78 @@ mod tests {
             .connect_timeout(Duration::from_secs(15))
             .build();
         assert!(client.is_ok(), "build should succeed with valid timeouts");
+    }
+
+    // ==================================================
+    // SSE buffer cap tests (M1)
+    // ==================================================
+
+    #[tokio::test]
+    async fn sse_reader_take_line_splits_on_newline() {
+        let mut reader = SseReader {
+            bytes: Box::pin(futures::stream::empty()),
+            buf: "event: message_start\ndata: {}\n\n".to_string(),
+        };
+        assert_eq!(reader.take_line(), Some("event: message_start".to_string()));
+        assert_eq!(reader.take_line(), Some("data: {}".to_string()));
+        assert_eq!(reader.take_line(), Some(String::new()));
+    }
+
+    #[tokio::test]
+    async fn sse_reader_next_event_extracts_payload() {
+        let chunk = "event: content_block_delta\ndata: {\"type\":\"text_delta\"}\n\n";
+        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(chunk.to_string())]);
+        let mut reader = SseReader {
+            bytes: Box::pin(stream),
+            buf: String::new(),
+        };
+        let result = reader.next_event().await.unwrap();
+        assert!(result.is_some());
+        let (event_type, data) = result.unwrap();
+        assert_eq!(event_type, "content_block_delta");
+        assert!(data.is_some());
+    }
+
+    #[tokio::test]
+    async fn sse_reader_next_event_malformed_data_returns_none_value() {
+        // Malformed JSON data should be logged and returned as None for the
+        // data payload, but the event_type is still captured (H4).
+        let chunk = "event: ping\ndata: not valid json\n\n";
+        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(chunk.to_string())]);
+        let mut reader = SseReader {
+            bytes: Box::pin(stream),
+            buf: String::new(),
+        };
+        let result = reader.next_event().await.unwrap();
+        assert!(result.is_some());
+        let (event_type, data) = result.unwrap();
+        assert_eq!(event_type, "ping");
+        assert!(data.is_none(), "malformed JSON should yield None data");
+    }
+
+    #[tokio::test]
+    async fn sse_reader_buffer_overflow_returns_error() {
+        let huge = "x".repeat(SSE_MAX_BUFFER + 1);
+        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(huge)]);
+        let mut reader = SseReader {
+            bytes: Box::pin(stream),
+            buf: String::new(),
+        };
+        let result = reader.next_event().await;
+        assert!(result.is_err(), "should error on buffer overflow");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("SSE buffer"),
+            "error should mention SSE buffer: {err_msg}"
+        );
+    }
+
+    // ==================================================
+    // Body size limit tests (H5)
+    // ==================================================
+
+    #[test]
+    fn max_response_body_is_ten_mb() {
+        assert_eq!(MAX_RESPONSE_BODY, 10 * 1024 * 1024);
     }
 }

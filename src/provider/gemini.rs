@@ -46,6 +46,7 @@ const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
+const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ==================================================
@@ -437,7 +438,14 @@ impl SseReader {
             }
 
             match self.bytes.next().await {
-                Some(Ok(chunk)) => self.buf.push_str(&chunk),
+                Some(Ok(chunk)) => {
+                    self.buf.push_str(&chunk);
+                    if self.buf.len() > SSE_MAX_BUFFER {
+                        return Err(ApiError::http(format!(
+                            "SSE buffer exceeded {SSE_MAX_BUFFER} bytes"
+                        )));
+                    }
+                }
                 Some(Err(e)) => return Err(e),
                 None => return Ok(None),
             }
@@ -1041,5 +1049,80 @@ mod tests {
             .connect_timeout(Duration::from_secs(15))
             .build();
         assert!(client.is_ok(), "build should succeed with valid timeouts");
+    }
+
+    // ==================================================
+    // SSE buffer cap tests (M1)
+    // ==================================================
+
+    #[tokio::test]
+    async fn sse_reader_take_line_splits_on_newline() {
+        let mut reader = SseReader {
+            bytes: Box::pin(futures::stream::empty()),
+            buf: "data: {\"candidates\":[]}\n\n".to_string(),
+        };
+        assert_eq!(
+            reader.take_line(),
+            Some("data: {\"candidates\":[]}".to_string())
+        );
+        assert_eq!(reader.take_line(), Some(String::new()));
+        assert_eq!(reader.take_line(), None);
+    }
+
+    #[tokio::test]
+    async fn sse_reader_next_data_extracts_payload() {
+        let chunk = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n";
+        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(chunk.to_string())]);
+        let mut reader = SseReader {
+            bytes: Box::pin(stream),
+            buf: String::new(),
+        };
+        let result = reader.next_data().await.unwrap();
+        assert!(result.is_some());
+        let json = result.unwrap();
+        assert!(json["candidates"].is_array());
+    }
+
+    #[tokio::test]
+    async fn sse_reader_next_data_malformed_returns_none() {
+        // Malformed JSON data should be logged (H4) and the reader
+        // continues looking for the next valid data line.
+        let chunk = "data: not valid json\n\ndata: {\"ok\":true}\n\n";
+        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(chunk.to_string())]);
+        let mut reader = SseReader {
+            bytes: Box::pin(stream),
+            buf: String::new(),
+        };
+        // First call should skip malformed and return the valid one.
+        let result = reader.next_data().await.unwrap();
+        assert!(result.is_some());
+        let json = result.unwrap();
+        assert_eq!(json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn sse_reader_buffer_overflow_returns_error() {
+        let huge = "x".repeat(SSE_MAX_BUFFER + 1);
+        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(huge)]);
+        let mut reader = SseReader {
+            bytes: Box::pin(stream),
+            buf: String::new(),
+        };
+        let result = reader.next_data().await;
+        assert!(result.is_err(), "should error on buffer overflow");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("SSE buffer"),
+            "error should mention SSE buffer: {err_msg}"
+        );
+    }
+
+    // ==================================================
+    // Body size limit tests (H5)
+    // ==================================================
+
+    #[test]
+    fn max_response_body_is_ten_mb() {
+        assert_eq!(MAX_RESPONSE_BODY, 10 * 1024 * 1024);
     }
 }

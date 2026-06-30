@@ -112,6 +112,7 @@ impl LoopConfig {
     /// let bad = LoopConfig { compact_threshold: 1.5, ..config };
     /// assert!(bad.validate().is_err());
     /// ```
+    #[must_use = "validation errors should not be silently ignored"]
     pub fn validate(&self) -> Result<(), String> {
         if self.max_turns == 0 {
             return Err("max_turns must be greater than 0".to_string());

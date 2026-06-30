@@ -198,7 +198,6 @@ impl ToolMiddleware for UnknownToolMiddleware {
         ctx: &'a mut ToolDispatchContext,
         next: &'a ToolPipeline,
     ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
-        let tool_name = ctx.tool_name.clone();
         let registry_names = self.registry.tool_names();
         let threshold = self.suggestion_threshold;
 
@@ -206,10 +205,14 @@ impl ToolMiddleware for UnknownToolMiddleware {
             let mut result = next.dispatch(ctx).await;
 
             if Self::is_tool_not_found(&result) {
+                // Read the tool name from ctx *after* dispatch so that any
+                // redirection applied by downstream middleware is reflected
+                // in the suggestion lookup.
+                let tool_name = ctx.tool_name.as_str();
                 let available_refs: Vec<&str> = registry_names.iter().map(String::as_str).collect();
 
                 if let Some((suggestion, score)) =
-                    Self::find_best_match_inner(&tool_name, &available_refs, threshold)
+                    Self::find_best_match_inner(tool_name, &available_refs, threshold)
                 {
                     tracing::info!(
                         requested = %tool_name,
@@ -419,5 +422,136 @@ mod tests {
             resolved_tool_name: "x".into(),
         };
         assert!(!UnknownToolMiddleware::is_tool_not_found(&result));
+    }
+
+    use crate::cancel::CancelSignal;
+    use crate::middleware::{ToolDispatchContext, ToolMiddleware, ToolPipeline};
+    use crate::tool::{
+        PermissionCheck, Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSchema,
+    };
+    use serde_json::{Value, json};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    struct ReadFileTool;
+    impl Tool for ReadFileTool {
+        fn name(&self) -> &'static str {
+            "read_file"
+        }
+        fn description(&self) -> &'static str {
+            "Reads a file"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "read_file".into(),
+                description: "Reads a file".into(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async { Ok(ToolOutput::text("ok")) })
+        }
+    }
+
+    fn make_registry() -> Arc<ToolRegistry> {
+        let mut reg = ToolRegistry::new();
+        reg.register(ReadFileTool);
+        Arc::new(reg)
+    }
+
+    fn make_ctx(name: &str) -> ToolDispatchContext {
+        ToolDispatchContext {
+            tool_name: name.to_string(),
+            input: json!({}),
+            call_id: "call_1".to_string(),
+            turn_number: 1,
+            cancel: Arc::new(CancelSignal::new()),
+            permission: PermissionCheck::Allow,
+            tool_context: ToolContext::default(),
+        }
+    }
+
+    struct RenameMiddleware {
+        new_name: String,
+    }
+
+    impl ToolMiddleware for RenameMiddleware {
+        fn name(&self) -> &'static str {
+            "rename"
+        }
+        fn dispatch<'a>(
+            &'a self,
+            ctx: &'a mut ToolDispatchContext,
+            next: &'a ToolPipeline,
+        ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
+            ctx.tool_name = self.new_name.clone();
+            Box::pin(async move { next.dispatch(ctx).await })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_appends_suggestion_for_typo() {
+        let registry = make_registry();
+        let pipeline = ToolPipeline::builder()
+            .with(UnknownToolMiddleware::new(Arc::clone(&registry)))
+            .core(registry)
+            .build()
+            .expect("valid pipeline");
+
+        let result = pipeline.invoke(make_ctx("read_fil")).await;
+        assert!(result.is_error);
+        match result.output {
+            ToolContent::Text(ref msg) => {
+                assert!(msg.contains("not found"), "message was: {msg}");
+                assert!(
+                    msg.contains("Did you mean 'read_file'?"),
+                    "expected suggestion in message: {msg}"
+                );
+            }
+            other @ ToolContent::Multipart(_) => panic!("expected Text output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_suggestion_uses_post_dispatch_tool_name() {
+        let registry = make_registry();
+        let pipeline = ToolPipeline::builder()
+            .with(UnknownToolMiddleware::new(Arc::clone(&registry)))
+            .with(RenameMiddleware {
+                new_name: "read_fil".into(),
+            })
+            .core(registry)
+            .build()
+            .expect("valid pipeline");
+
+        let result = pipeline.invoke(make_ctx("xyz")).await;
+        assert!(result.is_error);
+        match result.output {
+            ToolContent::Text(ref msg) => {
+                assert!(
+                    msg.contains("Did you mean 'read_file'?"),
+                    "suggestion should reflect the renamed tool_name, message was: {msg}"
+                );
+            }
+            other @ ToolContent::Multipart(_) => panic!("expected Text output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_known_tool_no_suggestion() {
+        let registry = make_registry();
+        let pipeline = ToolPipeline::builder()
+            .with(UnknownToolMiddleware::new(Arc::clone(&registry)))
+            .core(registry)
+            .build()
+            .expect("valid pipeline");
+
+        let result = pipeline.invoke(make_ctx("read_file")).await;
+        assert!(!result.is_error, "known tool should not error");
     }
 }

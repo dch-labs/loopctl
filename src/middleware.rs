@@ -424,11 +424,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    // ==================================================
-    // Test tools
-    // ==================================================
-
-    /// A simple echo tool for testing.
     struct EchoTool;
 
     impl Tool for EchoTool {
@@ -459,7 +454,6 @@ mod tests {
         }
     }
 
-    /// A tool that always errors.
     struct ErrorTool;
 
     impl Tool for ErrorTool {
@@ -485,7 +479,6 @@ mod tests {
         }
     }
 
-    /// A slow tool for testing timeouts.
     struct SlowTool {
         delay_ms: u64,
     }
@@ -517,10 +510,6 @@ mod tests {
         }
     }
 
-    // ==================================================
-    // Helpers
-    // ==================================================
-
     fn test_registry() -> Arc<ToolRegistry> {
         let mut reg = ToolRegistry::new();
         reg.register(EchoTool);
@@ -540,10 +529,6 @@ mod tests {
             tool_context: ToolContext::default(),
         }
     }
-
-    // ==================================================
-    // Pipeline builder tests
-    // ==================================================
 
     #[test]
     fn test_builder_requires_core() {
@@ -584,10 +569,6 @@ mod tests {
         );
     }
 
-    // ==================================================
-    // Core dispatch tests
-    // ==================================================
-
     #[tokio::test]
     async fn test_core_dispatch_echo() {
         let pipeline = ToolPipeline::new(test_registry());
@@ -619,10 +600,6 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(result.resolved_tool_name, "error_tool");
     }
-
-    // ==================================================
-    // PermissionMiddleware tests
-    // ==================================================
 
     #[tokio::test]
     async fn test_permission_deny_all() {
@@ -702,8 +679,6 @@ mod tests {
         assert!(result.is_error);
     }
 
-    /// Verify that PermissionMiddleware with Ask permission and no resolver
-    /// denies the tool call (M2 fix).
     #[tokio::test]
     async fn test_permission_ask_without_resolver_denies() {
         let mut ctx = test_ctx("echo");
@@ -729,10 +704,6 @@ mod tests {
             "error should mention permission: {msg}"
         );
     }
-
-    // ==================================================
-    // TimeoutMiddleware tests
-    // ==================================================
 
     #[tokio::test]
     async fn test_timeout_fast_tool_succeeds() {
@@ -778,10 +749,6 @@ mod tests {
         }
     }
 
-    // ==================================================
-    // UnknownToolMiddleware tests
-    // ==================================================
-
     #[test]
     fn test_similarity_identical() {
         let score = UnknownToolMiddleware::similarity("bash", "bash");
@@ -805,10 +772,6 @@ mod tests {
         assert!((UnknownToolMiddleware::similarity("", "") - 1.0).abs() < f64::EPSILON);
         assert!((UnknownToolMiddleware::similarity("a", "") - 0.0).abs() < f64::EPSILON);
     }
-
-    // ==================================================
-    // dispatch_all tests
-    // ==================================================
 
     #[tokio::test]
     async fn test_dispatch_all_sequential() {
@@ -836,10 +799,6 @@ mod tests {
 
         assert!(result.is_err());
     }
-
-    // ==================================================
-    // Ordering tests
-    // ==================================================
 
     #[tokio::test]
     async fn test_middleware_ordering_permission_before_timeout() {
@@ -879,10 +838,6 @@ mod tests {
             other @ ToolContent::Multipart(_) => panic!("expected Text, got {other:?}"),
         }
     }
-
-    // ===================================================
-    // Integration: full pipeline
-    // ===================================================
 
     #[tokio::test]
     async fn test_full_pipeline_echo() {
@@ -939,11 +894,6 @@ mod tests {
         }
     }
 
-    // ==================================================
-    // Short-circuit test
-    // ==================================================
-
-    /// A middleware that tracks whether it was reached.
     struct ReachTracker {
         reached: Arc<AtomicBool>,
     }
@@ -983,13 +933,6 @@ mod tests {
         );
     }
 
-    // ===================================================
-    // OutputLimitMiddleware tests
-    // ===================================================
-
-    /// A tool that returns a string of repeated characters for testing
-    /// output truncation. The tool name encodes the repeat count as
-    /// `long_output_N` where N is the number of characters.
     struct LongOutputTool;
 
     impl Tool for LongOutputTool {
@@ -1028,8 +971,6 @@ mod tests {
         }
     }
 
-    /// A tool that returns [`ToolContent::Multipart`] output for testing
-    /// that non-text output passes through unchanged.
     struct MultipartTool;
 
     impl Tool for MultipartTool {
@@ -1295,8 +1236,6 @@ mod tests {
         );
     }
 
-    /// Multi-byte UTF-8 text whose byte count exceeds `max_chars` but whose
-    /// character count does **not** must pass through un-truncated.
     #[tokio::test]
     async fn test_output_limit_multibyte_under_char_limit_not_truncated() {
         // "日" is 3 bytes. 5 repetitions = 5 chars, 15 bytes.
@@ -1323,10 +1262,6 @@ mod tests {
         assert_eq!(result.output, ToolContent::Text("日日日日日".to_string()));
     }
 
-    // ==================================================
-    // ToolDispatchResult::from_result
-    // ==================================================
-
     #[test]
     fn from_result_maps_ok_output() {
         let output = ToolOutput::text("hello");
@@ -1345,10 +1280,6 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(result.resolved_tool_name, "missing_tool");
     }
-
-    // ==================================================
-    // From<ToolOutput> + builder methods
-    // ==================================================
 
     #[test]
     fn from_tool_output_defaults() {

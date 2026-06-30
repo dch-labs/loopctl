@@ -923,10 +923,6 @@ impl HealthRouterBuilder {
 mod tests {
     use super::*;
 
-    // ==================================================
-    // ToolStats tests
-    // ==================================================
-
     #[test]
     fn tool_stats_starts_healthy() {
         let stats = ToolStats::new();
@@ -1033,10 +1029,6 @@ mod tests {
         assert_eq!(ewma, 643_000);
     }
 
-    // ==================================================
-    // CircuitState tests
-    // ==================================================
-
     #[test]
     fn circuit_state_from_u32() {
         assert_eq!(CircuitState::from(0u32), CircuitState::Closed);
@@ -1051,10 +1043,6 @@ mod tests {
         assert_eq!(format!("{}", CircuitState::Open), "open");
         assert_eq!(format!("{}", CircuitState::HalfOpen), "half-open");
     }
-
-    // ==================================================
-    // ToolCircuitBreaker tests
-    // ==================================================
 
     #[test]
     fn circuit_breaker_starts_closed() {
@@ -1158,20 +1146,12 @@ mod tests {
         assert!(cb.is_open(), "5 failures should open breaker");
     }
 
-    // ==================================================
-    // HealthStatus tests
-    // ==================================================
-
     #[test]
     fn health_status_display() {
         assert_eq!(format!("{}", HealthStatus::Healthy), "healthy");
         assert_eq!(format!("{}", HealthStatus::Degraded), "degraded");
         assert_eq!(format!("{}", HealthStatus::Unhealthy), "unhealthy");
     }
-
-    // ==================================================
-    // ToolHealthRegistry tests
-    // ==================================================
 
     #[test]
     fn registry_starts_empty() {
@@ -1261,10 +1241,6 @@ mod tests {
         assert!(*bash_score > 0.5);
     }
 
-    // ==================================================
-    // HealthRouter tests
-    // ==================================================
-
     #[test]
     fn health_router_no_fallbacks() {
         let router = HealthRouter::new();
@@ -1332,10 +1308,6 @@ mod tests {
         // No healthy alternative — returns primary
         assert_eq!(router.resolve_tool("bash", &registry), "bash");
     }
-
-    // ==================================================
-    // Concurrent stress test
-    // ==================================================
 
     #[test]
     fn registry_concurrent_access() {

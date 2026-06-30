@@ -578,10 +578,6 @@ impl fmt::Debug for NoopReflector {
 mod tests {
     use super::*;
 
-    // ===================================================
-    // FailureSeverity tests
-    // ===================================================
-
     #[test]
     fn severity_ordering() {
         assert!(FailureSeverity::Low < FailureSeverity::Medium);
@@ -606,10 +602,6 @@ mod tests {
         assert_eq!(deserialized, severity);
     }
 
-    // ===================================================
-    // ReflectionContext tests
-    // ===================================================
-
     #[test]
     fn reflection_context_fields() {
         let ctx = ReflectionContext {
@@ -621,10 +613,6 @@ mod tests {
         assert_eq!(ctx.attempt, 2);
         assert_eq!(ctx.max_attempts, 5);
     }
-
-    // ===================================================
-    // FailureAnalysis tests
-    // ===================================================
 
     #[test]
     fn failure_analysis_recoverable() {
@@ -660,10 +648,6 @@ mod tests {
         assert_eq!(c.description, "fix path");
     }
 
-    // ===================================================
-    // ReflectionError tests
-    // ===================================================
-
     #[test]
     fn reflection_error_skipped_display() {
         let err = ReflectionError::Skipped("not applicable".to_string());
@@ -679,10 +663,6 @@ mod tests {
         assert!(s.contains("internal"));
         assert!(s.contains("llm timeout"));
     }
-
-    // ===================================================
-    // RecoveryAction tests
-    // ===================================================
 
     #[test]
     fn action_retry_accessors() {
@@ -733,10 +713,6 @@ mod tests {
         let fail = RecoveryAction::Fail("bad".to_string());
         assert!(fail.to_string().contains("fail: bad"));
     }
-
-    // ===================================================
-    // NoopReflector tests
-    // ===================================================
 
     #[tokio::test]
     async fn noop_reflector_marks_non_recoverable() {

@@ -422,25 +422,6 @@ mod tests {
         }
     }
 
-    /// Build a conversation where a tool-call and its result straddle
-    /// what would be the naive split point.
-    ///
-    /// Layout (index: content):
-    ///
-    /// ```text
-    /// 0  user      "msg0"
-    /// 1  assistant "reply0"
-    /// 2  user      "msg1"
-    /// 3  assistant "reply1"
-    /// 4  user      "msg2"
-    /// 5  assistant tool_call("call_a", "search", ...)
-    /// 6  user      tool_result("call_a", ...)
-    /// 7  assistant "final reply"
-    /// ```
-    ///
-    /// With `preserve_recent = 2`, the naive split would be at index 6,
-    /// dropping the tool-call (index 5) but keeping the result (index 6).
-    /// The fix should move the split back to index 5.
     fn convo_with_straddling_tool_pair() -> Vec<Message> {
         vec![
             Message::user("msg0"),

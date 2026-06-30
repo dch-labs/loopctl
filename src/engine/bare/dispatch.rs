@@ -127,7 +127,7 @@ impl<C: ApiClient> BareLoop<C> {
                 return Ok(blocked);
             }
 
-            if let Some(blocked) = self.pre_detection(&tc, turn_idx) {
+            if let Some(blocked) = self.pre_detection(&tc, turn_idx)? {
                 self.managers.observers().on_tool_post(&ToolPostContext {
                     turn: turn_idx,
                     tool: tc.tool.clone(),
@@ -183,12 +183,15 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Check for a loop pattern before executing the tool.
     ///
-    /// Extracts the primary parameter from the tool input using the
-    /// configured [`ToolSignature`], records the call with the detection
-    /// manager, and returns a soft-error result if the same operation
-    /// has exceeded the loop threshold. Returns `None` when dispatch should
-    /// proceed normally.
-    fn pre_detection(&self, tc: &ToolCall, turn_idx: usize) -> Option<ToolDispatchResult> {
+    /// # Errors
+    ///
+    /// Returns [`LoopError`] when the detection manager signals a hard
+    /// stop (e.g. [`LoopError::LoopDetected`]).
+    fn pre_detection(
+        &self,
+        tc: &ToolCall,
+        turn_idx: usize,
+    ) -> Result<Option<ToolDispatchResult>, LoopError> {
         let operation = Operation::from_input_with_signature(
             &tc.tool,
             &tc.input,
@@ -196,23 +199,21 @@ impl<C: ApiClient> BareLoop<C> {
         );
         let pattern = self.managers.detection.record_operation(operation);
 
-        // Check inline detection
-        let inline_blocked = self
-            .managers
-            .handle_detected_pattern(&pattern, turn_idx)
-            .map(|_result| ToolDispatchResult {
+        // Check inline detection.  When the pattern triggers a hard stop
+        // (Err), propagate it so the agent loop terminates.  When it
+        // produces a soft block (Ok), return the soft-error result so
+        // the model can see the warning and try a different approach.
+        match self.managers.handle_detected_pattern(&pattern, turn_idx) {
+            Some(Err(e)) => Err(e),
+            Some(Ok(_)) => Ok(Some(ToolDispatchResult {
                 tool_call_id: tc.id.clone(),
                 output: ToolContent::Text("loop detected: aborting tool dispatch".into()),
                 is_error: true,
                 duration: Duration::ZERO,
                 resolved_tool_name: tc.tool.clone(),
-            });
-
-        if inline_blocked.is_some() {
-            return inline_blocked;
+            })),
+            None => Ok(None),
         }
-
-        None
     }
 
     /// Record the tool result with the detection manager (post-execution).
@@ -492,6 +493,13 @@ impl<C: ApiClient> BareLoop<C> {
                 return Err(LoopError::Cancelled);
             }
         };
+        // Guard against a late-arriving cancellation that races with the
+        // pipeline future resolving first. Without this check the result
+        // would be treated as a soft tool error by ToolCallMiddleware
+        // instead of a hard cancellation.
+        if cancel.is_cancelled() {
+            return Err(LoopError::Cancelled);
+        }
         Ok(ToolDispatchResult {
             tool_call_id: if dispatch_result.tool_call_id.is_empty() {
                 tc.id.clone()

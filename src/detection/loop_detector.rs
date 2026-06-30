@@ -1657,11 +1657,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// A test tool signature that knows about "Read" and "Bash" tools.
-    ///
-    /// Implements [`ToolSignature`] for unit tests within this module. Extracts
-    /// the `file_path` parameter for `Read` calls and the `command` parameter
-    /// for `Bash` calls, falling back to an empty string for unknown tools.
     struct TestToolSignature;
 
     impl ToolSignature for TestToolSignature {

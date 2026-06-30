@@ -101,17 +101,14 @@ impl GeminiClient {
     /// parameter rather than using headers.
     fn stream_url(&self) -> String {
         format!(
-            "{}/models/{}:streamGenerateContent?alt=sse&key={}",
-            self.base_url, self.model, self.api_key
+            "{}/models/{}:streamGenerateContent?alt=sse",
+            self.base_url, self.model
         )
     }
 
     /// Build the non-streaming Generate Content URL.
     fn generate_url(&self) -> String {
-        format!(
-            "{}/models/{}:generateContent?key={}",
-            self.base_url, self.model, self.api_key
-        )
+        format!("{}/models/{}:generateContent", self.base_url, self.model)
     }
 
     /// Send a POST request and return the raw response.
@@ -126,10 +123,12 @@ impl GeminiClient {
     async fn post_content(
         http: &reqwest::Client,
         url: &str,
+        api_key: &str,
         body: &Value,
     ) -> Result<reqwest::Response, ApiError> {
         let resp = http
             .post(url)
+            .header("x-goog-api-key", api_key)
             .json(body)
             .send()
             .await
@@ -158,9 +157,10 @@ impl ApiClient for GeminiClient {
         let body = build_request_body(&messages, system.as_deref(), tools.as_deref());
         let url = self.stream_url();
         let http = self.http.clone();
+        let api_key = self.api_key.clone();
 
         Box::pin(async_stream::try_stream! {
-            let resp = Self::post_content(&http, &url, &body).await?;
+            let resp = Self::post_content(&http, &url, &api_key, &body).await?;
             let mut sse = SseReader::from_response(resp);
             let mut emitter = StreamEmitter::default();
 
@@ -187,7 +187,7 @@ impl ApiClient for GeminiClient {
         let url = self.generate_url();
 
         Box::pin(async move {
-            let resp = Self::post_content(&self.http, &url, &body).await?;
+            let resp = Self::post_content(&self.http, &url, &self.api_key, &body).await?;
             let resp = resp
                 .bytes()
                 .await
@@ -791,6 +791,40 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(client.model(), "gemini-pro");
+    }
+
+    #[test]
+    fn stream_url_does_not_expose_api_key() {
+        let client = GeminiClient::builder()
+            .api_key("secret-key-123")
+            .build()
+            .unwrap();
+        let url = client.stream_url();
+        assert!(
+            !url.contains("secret-key-123"),
+            "API key must not appear in stream URL: {url}"
+        );
+        assert!(
+            !url.contains("key="),
+            "URL must not have key= query param: {url}"
+        );
+    }
+
+    #[test]
+    fn generate_url_does_not_expose_api_key() {
+        let client = GeminiClient::builder()
+            .api_key("secret-key-456")
+            .build()
+            .unwrap();
+        let url = client.generate_url();
+        assert!(
+            !url.contains("secret-key-456"),
+            "API key must not appear in generate URL: {url}"
+        );
+        assert!(
+            !url.contains("key="),
+            "URL must not have key= query param: {url}"
+        );
     }
 
     #[test]

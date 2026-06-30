@@ -414,10 +414,33 @@ impl<C: ApiClient> BareLoop<C> {
     // Dependency setters
     // ==================================================
 
+    /// Assert that the loop has not started running yet.
+    ///
+    /// Configuration setters must be called before [`run()`](crate::engine::loop_core::Loop::run).
+    /// Calling them during a running session is a logic bug — the new value
+    /// takes effect immediately but parts of the session may have already
+    /// been initialised with the old value, leading to subtle inconsistencies.
+    ///
+    /// This check is only active in debug builds (`debug_assertions`).
+    #[inline]
+    fn debug_assert_idle(&self) {
+        debug_assert!(
+            matches!(self.state, LoopState::Idle),
+            "BareLoop configuration setters must be called before run() — \
+             current state is {:?}, expected Idle",
+            self.state
+        );
+    }
+
     /// Set the [`Reflector`] for tool-error analysis.
     ///
     /// Replaces the default [`NoopReflector`] with a caller-supplied
     /// implementation. Must be called before [`run()`](crate::engine::loop_core::Loop::run).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started
+    /// (i.e., when [`state`](LoopState) is not [`Idle`](LoopState::Idle)).
     ///
     /// # Example
     ///
@@ -426,6 +449,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// agent.set_reflector(Arc::new(MyReflector));
     /// ```
     pub fn set_reflector(&mut self, reflector: Arc<dyn Reflector>) {
+        self.debug_assert_idle();
         self.reflector = reflector;
     }
 
@@ -435,6 +459,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// caller-supplied implementation. Must be called before
     /// [`run()`](crate::engine::loop_core::Loop::run).
     ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -442,6 +470,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// agent.set_recovery_strategy(Arc::new(MyStrategy));
     /// ```
     pub fn set_recovery_strategy(&mut self, strategy: Arc<dyn RecoveryStrategy>) {
+        self.debug_assert_idle();
         self.recovery = strategy;
     }
 
@@ -450,6 +479,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// When set, the loop checks token usage after each turn and
     /// triggers compaction when usage exceeds the configured threshold.
     /// Must be called before [`run()`](crate::engine::loop_core::Loop::run).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
     ///
     /// # Example
     ///
@@ -468,6 +501,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// agent.set_context_manager(Arc::new(manager));
     /// ```
     pub fn set_context_manager(&mut self, manager: Arc<ContextManager>) {
+        self.debug_assert_idle();
         self.managers.set_context_manager(manager);
     }
 
@@ -477,6 +511,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// When set, the loop delegates streaming to the handler instead of
     /// using the inline streaming logic. Must be called before
     /// [`run()`](crate::engine::loop_core::Loop::run).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
     ///
     /// # Example
     ///
@@ -495,6 +533,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// agent.set_stream_handler(handler);
     /// ```
     pub fn set_stream_handler(&mut self, handler: StreamHandler) {
+        self.debug_assert_idle();
         self.managers.set_stream_handler(handler);
     }
 
@@ -506,6 +545,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`HookAction::Ask`] is automatically downgraded to `Block` by the
     /// executor in [`crate::hooks::Interactivity::Headless`] mode (the default).
     /// Must be called before [`run()`](crate::engine::loop_core::Loop::run).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
     ///
     /// *Requires `hooks` feature.*
     ///
@@ -521,6 +564,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// ```
     #[cfg(feature = "hooks")]
     pub fn set_hook_executor(&mut self, executor: Arc<HookExecutor>) {
+        self.debug_assert_idle();
         self.managers.set_hook_executor(executor);
     }
 
@@ -530,6 +574,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// dispatch. Tools that exceed the failure threshold have their
     /// circuit breaker opened, blocking subsequent calls until recovery.
     /// Must be called before [`run()`](crate::engine::loop_core::Loop::run).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
     ///
     /// *Requires `tool_health` feature.*
     ///
@@ -545,6 +593,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// ```
     #[cfg(feature = "tool_health")]
     pub fn set_health_registry(&mut self, registry: Arc<ToolHealthRegistry>) {
+        self.debug_assert_idle();
         self.managers.set_health_registry(registry);
     }
 
@@ -554,6 +603,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`ToolPipeline`]. When set, tool calls flow through the
     /// pipeline's middleware chain before reaching the registry.
     /// Must be called before [`run()`](crate::engine::loop_core::Loop::run).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
     ///
     /// Build the pipeline using [`ToolPipeline::builder()`], adding middleware
     /// layers **without** calling `.core()` — the registry is injected
@@ -577,6 +630,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Returns [`LoopError::Config`] if the builder fails to produce a valid
     /// pipeline (e.g. internal invariant violated).
     pub fn set_pipeline(&mut self, builder: ToolPipelineBuilder) -> Result<(), LoopError> {
+        self.debug_assert_idle();
         let pipeline = builder
             .core(Arc::clone(&self.tools))
             .build()
@@ -593,6 +647,10 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Must be called before [`run()`](crate::engine::loop_core::Loop::run).
     ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -603,6 +661,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// agent.register_observer(Arc::new(MyObserver));
     /// ```
     pub fn register_observer(&mut self, observer: Arc<dyn crate::observer::LoopObserver>) {
+        self.debug_assert_idle();
         self.managers.register_observer(observer);
     }
 
@@ -615,6 +674,10 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// The callback receives a `&str` containing the delta text fragment.
     /// It must be `Send + Sync` as it may be called from an async context.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
     ///
     /// # Example
     ///
@@ -629,6 +692,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// }));
     /// ```
     pub fn set_text_streamer(&mut self, f: Arc<dyn Fn(&str) + Send + Sync>) {
+        self.debug_assert_idle();
         self.text_streamer = Some(f);
     }
 
@@ -1000,8 +1064,8 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
         None
     }
 
-    fn config(&self) -> LoopConfig {
-        self.config.clone()
+    fn config(&self) -> &LoopConfig {
+        &self.config
     }
 }
 

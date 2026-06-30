@@ -672,7 +672,8 @@ pub trait Loop: Send + Sync {
         user_input: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<SessionResult, LoopError>> + Send + 'a>> {
         Box::pin(async move {
-            self.initialize(&self.config()).await?;
+            let config = self.config().clone();
+            self.initialize(&config).await?;
 
             let mut is_first_turn = true;
             loop {
@@ -714,7 +715,10 @@ pub trait Loop: Send + Sync {
     /// Return the configuration that [`run`](Loop::run) passes to
     /// [`initialize`](Loop::initialize).
     ///
-    /// Implementors should return the [`LoopConfig`] they want to use
-    /// for the session.
-    fn config(&self) -> LoopConfig;
+    /// Implementors should return a reference to the [`LoopConfig`] they
+    /// want to use for the session.  Returning a reference (rather than an
+    /// owned clone) avoids a mandatory `Clone` on every call — the default
+    /// [`run`](Loop::run) implementation only needs the config during
+    /// [`initialize`], so the borrow is short-lived.
+    fn config(&self) -> &LoopConfig;
 }

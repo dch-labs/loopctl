@@ -58,7 +58,6 @@
 
 use crate::error::LoopError;
 use std::future::Future;
-use std::pin::Pin;
 
 pub use builtin::InMemoryStore;
 pub use entry::{ConsolidationStats, MemoryCategory, MemoryEntry};
@@ -82,8 +81,6 @@ pub mod entry;
 /// ```rust
 /// use loopctl::memory::{LoopMemory, MemoryEntry, MemoryCategory, ConsolidationStats};
 /// use loopctl::error::LoopError;
-/// use std::future::Future;
-/// use std::pin::Pin;
 /// use std::sync::RwLock;
 ///
 /// struct MyStore {
@@ -92,30 +89,30 @@ pub mod entry;
 ///
 /// impl LoopMemory for MyStore {
 ///     fn store(&self, entry: MemoryEntry)
-///         -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>>
+///         -> impl Future<Output = Result<(), LoopError>> + Send
 ///     {
-///         Box::pin(async move {
+///         async move {
 ///             self.entries.write().unwrap().push(entry);
 ///             Ok(())
-///         })
+///         }
 ///     }
 ///     fn retrieve(&self, query: &str, limit: usize)
-///         -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + '_>>
+///         -> impl Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send
 ///     {
 ///         let query = query.to_string();
-///         Box::pin(async move {
+///         async move {
 ///             let entries = self.entries.read().unwrap();
 ///             Ok(entries.iter()
 ///                 .filter(|e| e.memory.contains(&query))
 ///                 .take(limit)
 ///                 .cloned()
 ///                 .collect())
-///         })
+///         }
 ///     }
 ///     fn consolidate(&self)
-///         -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>>
+///         -> impl Future<Output = Result<ConsolidationStats, LoopError>> + Send
 ///     {
-///         Box::pin(async move {
+///         async move {
 ///             let mut entries = self.entries.write().unwrap();
 ///             let before = entries.len();
 ///             entries.retain(|e| e.relevance > 0.1);
@@ -126,7 +123,7 @@ pub mod entry;
 ///                 pruned: before - after,
 ///                 ..Default::default()
 ///             })
-///         })
+///         }
 ///     }
 ///     fn len(&self) -> usize {
 ///         self.entries.read().unwrap().len()
@@ -141,13 +138,13 @@ pub trait LoopMemory: Send + Sync {
     /// an insight drawn from conversation. Implementations should persist the
     /// entry in whatever backing store they use.
     ///
-    /// Takes `&self` so that memory stores can be shared via `Arc<dyn LoopMemory>`.
+    /// Takes `&self` so that memory stores can be shared via `Arc<impl LoopMemory>`.
     /// Implementations that need interior mutability (e.g. an in-memory `Vec`)
     /// should use `Mutex`, `RwLock`, or lock-free structures internally.
     fn store(
         &self,
         entry: MemoryEntry,
-    ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>>;
+    ) -> impl Future<Output = Result<(), LoopError>> + Send;
 
     /// Retrieve memory entries relevant to the given query.
     ///
@@ -164,7 +161,7 @@ pub trait LoopMemory: Send + Sync {
         &self,
         query: &str,
         limit: usize,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + '_>>;
+    ) -> impl Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send;
 
     /// Consolidate memory (e.g. prune, summarize, compress).
     ///
@@ -173,11 +170,11 @@ pub trait LoopMemory: Send + Sync {
     /// compressed summaries. Returns [`ConsolidationStats`] describing what
     /// was done.
     ///
-    /// Takes `&self` so that memory stores can be shared via `Arc<dyn LoopMemory>`.
+    /// Takes `&self` so that memory stores can be shared via `Arc<impl LoopMemory>`.
     /// Implementations should use interior mutability as needed.
     fn consolidate(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>>;
+    ) -> impl Future<Output = Result<ConsolidationStats, LoopError>> + Send;
 
     /// Number of entries currently stored.
     ///

@@ -1018,6 +1018,7 @@ impl StreamHandler {
 /// println!("Response: {:?}", result.message);
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StreamTurnResult {
     /// The fully accumulated assistant message.
     pub message: Message,

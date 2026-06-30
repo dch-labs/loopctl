@@ -51,6 +51,22 @@ grok = ["providers", "openai"]
 gemini = ["providers"]
 zai = ["providers", "anthropic"]
 
+[[example]]
+name = "hello-cli"
+required-features = ["testing"]
+
+[[example]]
+name = "repl-cli"
+required-features = ["testing"]
+
+[[example]]
+name = "echo-tool-cli"
+required-features = ["testing"]
+
+[[example]]
+name = "chat"
+required-features = ["testing", "providers"]
+
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"

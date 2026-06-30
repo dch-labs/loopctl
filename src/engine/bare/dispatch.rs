@@ -38,7 +38,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Execute tool calls and return results.
     ///
     /// Iterates over each [`ToolCall`] extracted from the assistant
-    /// message, looks up the corresponding tool in the [`ToolRegistry`],
+    /// message, looks up the corresponding tool in the [`ToolRegistry`](crate::tool::ToolRegistry),
     /// and invokes it. Each result is wrapped in a [`ToolDispatchResult`].
     ///
     /// Tool execution is **sequential** so that cancellation can be
@@ -47,7 +47,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// allowing the model to recover.
     ///
     /// When a tool returns an error (execution failure or not-found),
-    /// the framework consults the [`Reflector`] and [`RecoveryStrategy`]
+    /// the framework consults the [`Reflector`](crate::reflection::Reflector) and [`RecoveryStrategy`](crate::reflection::RecoveryStrategy)
     /// to decide whether to retry, skip, ask user, or fail. Retry
     /// attempts use the delay specified by the [`RecoveryAction`].
     ///
@@ -78,7 +78,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Dispatch a single tool call, using reflector + recovery on errors.
     ///
     /// If the tool call succeeds, returns the result immediately. If it
-    /// fails, calls [`Reflector::analyze()`] and [`RecoveryStrategy::decide()`]
+    /// fails, calls [`Reflector::analyze`](crate::reflection::Reflector::analyze) and [`RecoveryStrategy::decide`](crate::reflection::RecoveryStrategy::decide)
     /// to determine the next action:
     ///
     /// - [`Retry`](RecoveryAction::Retry) — re-dispatch the tool after the
@@ -239,7 +239,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Tries the middleware pipeline first, then a direct registry lookup,
     /// then produces a not-found error result. Handles cancellation during
     /// execution. Observer notification is handled by the caller
-    /// ([`dispatch_tool_with_recovery`]).
+    /// (`dispatch_tool_with_recovery`).
     ///
     /// # Errors
     ///

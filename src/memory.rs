@@ -12,41 +12,46 @@
 //!
 //! # Quick Start
 //!
-//! ```
+//! ```rust
 //! use loopctl::memory::{LoopMemory, MemoryEntry, MemoryCategory, ConsolidationStats};
 //! use loopctl::error::LoopError;
 //! use std::future::Future;
 //! use std::pin::Pin;
+//! use std::sync::RwLock;
 //!
-//! struct InMemoryStore {
-//!     entries: Vec<MemoryEntry>,
+//! struct MyStore {
+//!     entries: RwLock<Vec<MemoryEntry>>,
 //! }
 //!
-//! impl LoopMemory for InMemoryStore {
-//!     fn store(&mut self, entry: MemoryEntry)
+//! impl LoopMemory for MyStore {
+//!     fn store(&self, entry: MemoryEntry)
 //!         -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>>
 //!     {
-//!         Box::pin(async move { self.entries.push(entry); Ok(()) })
+//!         Box::pin(async move {
+//!             self.entries.write().unwrap().push(entry);
+//!             Ok(())
+//!         })
 //!     }
 //!     fn retrieve(&self, query: &str, limit: usize)
 //!         -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + '_>>
 //!     {
 //!         let query = query.to_string();
 //!         Box::pin(async move {
-//!             Ok(self.entries.iter()
+//!             let entries = self.entries.read().unwrap();
+//!             Ok(entries.iter()
 //!                 .filter(|e| e.memory.contains(&query))
 //!                 .take(limit)
 //!                 .cloned()
 //!                 .collect())
 //!         })
 //!     }
-//!     fn consolidate(&mut self)
+//!     fn consolidate(&self)
 //!         -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>>
 //!     {
 //!         Box::pin(async move { Ok(ConsolidationStats::default()) })
 //!     }
 //!     fn len(&self) -> usize {
-//!         self.entries.len()
+//!         self.entries.read().unwrap().len()
 //!     }
 //! }
 //! ```
@@ -74,41 +79,47 @@ pub mod entry;
 ///
 /// # Example
 ///
-/// ```
+/// ```rust
 /// use loopctl::memory::{LoopMemory, MemoryEntry, MemoryCategory, ConsolidationStats};
 /// use loopctl::error::LoopError;
 /// use std::future::Future;
 /// use std::pin::Pin;
+/// use std::sync::RwLock;
 ///
-/// struct InMemoryStore {
-///     entries: Vec<MemoryEntry>,
+/// struct MyStore {
+///     entries: RwLock<Vec<MemoryEntry>>,
 /// }
 ///
-/// impl LoopMemory for InMemoryStore {
-///     fn store(&mut self, entry: MemoryEntry)
+/// impl LoopMemory for MyStore {
+///     fn store(&self, entry: MemoryEntry)
 ///         -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>>
 ///     {
-///         Box::pin(async move { self.entries.push(entry); Ok(()) })
+///         Box::pin(async move {
+///             self.entries.write().unwrap().push(entry);
+///             Ok(())
+///         })
 ///     }
 ///     fn retrieve(&self, query: &str, limit: usize)
 ///         -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + '_>>
 ///     {
 ///         let query = query.to_string();
 ///         Box::pin(async move {
-///             Ok(self.entries.iter()
+///             let entries = self.entries.read().unwrap();
+///             Ok(entries.iter()
 ///                 .filter(|e| e.memory.contains(&query))
 ///                 .take(limit)
 ///                 .cloned()
 ///                 .collect())
 ///         })
 ///     }
-///     fn consolidate(&mut self)
+///     fn consolidate(&self)
 ///         -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>>
 ///     {
 ///         Box::pin(async move {
-///             let before = self.entries.len();
-///             self.entries.retain(|e| e.relevance > 0.1);
-///             let after = self.entries.len();
+///             let mut entries = self.entries.write().unwrap();
+///             let before = entries.len();
+///             entries.retain(|e| e.relevance > 0.1);
+///             let after = entries.len();
 ///             Ok(ConsolidationStats {
 ///                 entries_before: before,
 ///                 entries_after: after,
@@ -118,7 +129,7 @@ pub mod entry;
 ///         })
 ///     }
 ///     fn len(&self) -> usize {
-///         self.entries.len()
+///         self.entries.read().unwrap().len()
 ///     }
 /// }
 /// ```
@@ -129,8 +140,12 @@ pub trait LoopMemory: Send + Sync {
     /// for example after a successful tool invocation, a resolved error, or
     /// an insight drawn from conversation. Implementations should persist the
     /// entry in whatever backing store they use.
+    ///
+    /// Takes `&self` so that memory stores can be shared via `Arc<dyn LoopMemory>`.
+    /// Implementations that need interior mutability (e.g. an in-memory `Vec`)
+    /// should use `Mutex`, `RwLock`, or lock-free structures internally.
     fn store(
-        &mut self,
+        &self,
         entry: MemoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>>;
 
@@ -157,8 +172,11 @@ pub trait LoopMemory: Send + Sync {
     /// may remove low-relevance entries, merge duplicates, or produce
     /// compressed summaries. Returns [`ConsolidationStats`] describing what
     /// was done.
+    ///
+    /// Takes `&self` so that memory stores can be shared via `Arc<dyn LoopMemory>`.
+    /// Implementations should use interior mutability as needed.
     fn consolidate(
-        &mut self,
+        &self,
     ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>>;
 
     /// Number of entries currently stored.

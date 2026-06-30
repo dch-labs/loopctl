@@ -703,7 +703,7 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
         config: &'a crate::config::LoopConfig,
     ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + 'a>> {
         Box::pin(async move {
-            config.validate().map_err(LoopError::Config)?;
+            config.validate()?;
 
             self.state = LoopState::Processing { turn: 0 };
             self.budget = SessionResult::default();

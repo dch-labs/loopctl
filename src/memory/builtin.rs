@@ -40,7 +40,6 @@
 use crate::error::LoopError;
 use crate::memory::{ConsolidationStats, LoopMemory, MemoryEntry};
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::{PoisonError, RwLock};
 
 /// A simple in-memory store for loop memory entries.
@@ -182,6 +181,7 @@ impl Default for InMemoryStore {
 // LoopMemory implementation
 // ===================================================
 
+#[allow(clippy::manual_async_fn)]
 impl LoopMemory for InMemoryStore {
     /// Store a new memory entry by appending it to the backing list.
     ///
@@ -195,14 +195,14 @@ impl LoopMemory for InMemoryStore {
     fn store(
         &self,
         entry: MemoryEntry,
-    ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = Result<(), LoopError>> + Send {
+        async move {
             self.entries
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(entry);
             Ok(())
-        })
+        }
     }
 
     /// Retrieve memory entries relevant to the given query.
@@ -244,9 +244,9 @@ impl LoopMemory for InMemoryStore {
         &self,
         query: &str,
         limit: usize,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + '_>> {
+    ) -> impl Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send {
         let query = query.to_string();
-        Box::pin(async move {
+        async move {
             let query_lower = query.to_lowercase();
             let query_words: Vec<&str> = query_lower.split_whitespace().collect();
 
@@ -281,7 +281,7 @@ impl LoopMemory for InMemoryStore {
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
             Ok(scored.into_iter().take(limit).map(|(_, e)| e).collect())
-        })
+        }
     }
 
     /// Consolidate memory by pruning low-relevance entries.
@@ -311,8 +311,8 @@ impl LoopMemory for InMemoryStore {
     /// ```
     fn consolidate(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
-        Box::pin(async move {
+    ) -> impl Future<Output = Result<ConsolidationStats, LoopError>> + Send {
+        async move {
             let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
             let entries_before = entries.len();
             entries.retain(|e| e.relevance >= 0.05);
@@ -324,7 +324,7 @@ impl LoopMemory for InMemoryStore {
                 merged: 0,
                 bytes_saved: 0,
             })
-        })
+        }
     }
 
     /// Number of entries currently stored.

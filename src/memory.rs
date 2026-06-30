@@ -141,10 +141,7 @@ pub trait LoopMemory: Send + Sync {
     /// Takes `&self` so that memory stores can be shared via `Arc<impl LoopMemory>`.
     /// Implementations that need interior mutability (e.g. an in-memory `Vec`)
     /// should use `Mutex`, `RwLock`, or lock-free structures internally.
-    fn store(
-        &self,
-        entry: MemoryEntry,
-    ) -> impl Future<Output = Result<(), LoopError>> + Send;
+    fn store(&self, entry: MemoryEntry) -> impl Future<Output = Result<(), LoopError>> + Send;
 
     /// Retrieve memory entries relevant to the given query.
     ///
@@ -172,9 +169,7 @@ pub trait LoopMemory: Send + Sync {
     ///
     /// Takes `&self` so that memory stores can be shared via `Arc<impl LoopMemory>`.
     /// Implementations should use interior mutability as needed.
-    fn consolidate(
-        &self,
-    ) -> impl Future<Output = Result<ConsolidationStats, LoopError>> + Send;
+    fn consolidate(&self) -> impl Future<Output = Result<ConsolidationStats, LoopError>> + Send;
 
     /// Number of entries currently stored.
     ///

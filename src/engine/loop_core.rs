@@ -538,6 +538,156 @@ impl SessionResult {
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
     }
+
+    /// Construct a `SessionResult` with full control over every field.
+    ///
+    /// Intended for tests that need to assert on specific field
+    /// combinations that the `success()` / `failed()` constructors
+    /// don't cover (e.g. non-zero `tool_calls` or `total_turns`).
+    ///
+    /// Only available with the `testing` feature.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use loopctl::engine::loop_core::SessionResult;
+    /// # use std::time::Duration;
+    /// # use uuid::Uuid;
+    /// let result = SessionResult::builder()
+    ///     .session_id(Uuid::nil())
+    ///     .total_turns(5)
+    ///     .tool_calls(3)
+    ///     .success(true)
+    /// .build();
+    /// assert_eq!(result.total_turns, 5);
+    /// assert_eq!(result.tool_calls, 3);
+    /// assert!(result.success);
+    /// ```
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn builder() -> SessionResultBuilder {
+        SessionResultBuilder {
+            session_id: Uuid::nil(),
+            total_turns: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_duration: Duration::ZERO,
+            tool_calls: 0,
+            success: false,
+            final_output: None,
+            error: None,
+        }
+    }
+}
+
+/// Builder for constructing [`SessionResult`] instances in tests.
+///
+/// Created by [`SessionResult::builder`]. All fields default to zeroed
+/// or empty values; override only the ones your test cares about, then
+/// call `.build()`.
+#[cfg(feature = "testing")]
+#[derive(Debug, Clone)]
+pub struct SessionResultBuilder {
+    /// Unique session identifier.
+    session_id: Uuid,
+    /// Number of turns executed.
+    total_turns: usize,
+    /// Total input tokens consumed.
+    input_tokens: u64,
+    /// Total output tokens produced.
+    output_tokens: u64,
+    /// Wall-clock duration of the session.
+    total_duration: Duration,
+    /// Number of tool calls dispatched.
+    tool_calls: usize,
+    /// Whether the session completed successfully.
+    success: bool,
+    /// Final text output, if any.
+    final_output: Option<String>,
+    /// Error message if the session failed.
+    error: Option<String>,
+}
+
+#[cfg(feature = "testing")]
+impl SessionResultBuilder {
+    /// Set the session ID.
+    #[must_use]
+    pub fn session_id(mut self, id: Uuid) -> Self {
+        self.session_id = id;
+        self
+    }
+
+    /// Set the total turns executed.
+    #[must_use]
+    pub fn total_turns(mut self, turns: usize) -> Self {
+        self.total_turns = turns;
+        self
+    }
+
+    /// Set the total input tokens.
+    #[must_use]
+    pub fn input_tokens(mut self, tokens: u64) -> Self {
+        self.input_tokens = tokens;
+        self
+    }
+
+    /// Set the total output tokens.
+    #[must_use]
+    pub fn output_tokens(mut self, tokens: u64) -> Self {
+        self.output_tokens = tokens;
+        self
+    }
+
+    /// Set the total session duration.
+    #[must_use]
+    pub fn total_duration(mut self, duration: Duration) -> Self {
+        self.total_duration = duration;
+        self
+    }
+
+    /// Set the total tool calls made.
+    #[must_use]
+    pub fn tool_calls(mut self, calls: usize) -> Self {
+        self.tool_calls = calls;
+        self
+    }
+
+    /// Set whether the session succeeded.
+    #[must_use]
+    pub fn success(mut self, success: bool) -> Self {
+        self.success = success;
+        self
+    }
+
+    /// Set the final output text.
+    #[must_use]
+    pub fn final_output(mut self, output: impl Into<String>) -> Self {
+        self.final_output = Some(output.into());
+        self
+    }
+
+    /// Set the error message.
+    #[must_use]
+    pub fn error(mut self, error: impl Into<String>) -> Self {
+        self.error = Some(error.into());
+        self
+    }
+
+    /// Build the [`SessionResult`].
+    #[must_use]
+    pub fn build(self) -> SessionResult {
+        SessionResult {
+            session_id: self.session_id,
+            total_turns: self.total_turns,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            total_duration: self.total_duration,
+            tool_calls: self.tool_calls,
+            success: self.success,
+            final_output: self.final_output,
+            error: self.error,
+        }
+    }
 }
 
 // ==================================================
@@ -672,6 +822,8 @@ pub trait Loop: Send + Sync {
         user_input: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<SessionResult, LoopError>> + Send + 'a>> {
         Box::pin(async move {
+            // Clone is required: `initialize` takes `&mut self` which
+            // conflicts with the shared borrow from `config()`.
             let config = self.config().clone();
             self.initialize(&config).await?;
 
@@ -719,6 +871,6 @@ pub trait Loop: Send + Sync {
     /// want to use for the session.  Returning a reference (rather than an
     /// owned clone) avoids a mandatory `Clone` on every call — the default
     /// [`run`](Loop::run) implementation only needs the config during
-    /// [`initialize`], so the borrow is short-lived.
+    /// initialization, so the borrow is short-lived.
     fn config(&self) -> &LoopConfig;
 }

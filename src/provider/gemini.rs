@@ -61,7 +61,7 @@ pub struct GeminiClient {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
-    model: String,
+    model: parking_lot::Mutex<String>,
 }
 
 impl GeminiClient {
@@ -101,15 +101,17 @@ impl GeminiClient {
     /// Gemini puts the model in the URL path and the API key as a query
     /// parameter rather than using headers.
     fn stream_url(&self) -> String {
+        let model = self.model.lock().clone();
         format!(
             "{}/models/{}:streamGenerateContent?alt=sse",
-            self.base_url, self.model
+            self.base_url, model
         )
     }
 
     /// Build the non-streaming Generate Content URL.
     fn generate_url(&self) -> String {
-        format!("{}/models/{}:generateContent", self.base_url, self.model)
+        let model = self.model.lock().clone();
+        format!("{}/models/{}:generateContent", self.base_url, model)
     }
 
     /// Send a POST request and return the raw response.
@@ -145,8 +147,16 @@ impl GeminiClient {
 }
 
 impl ApiClient for GeminiClient {
-    fn model(&self) -> &str {
-        &self.model
+    fn model(&self) -> String {
+        self.model.lock().clone()
+    }
+
+    fn set_model(&self, model: &str) -> bool {
+        if model.trim().is_empty() {
+            return false;
+        }
+        *self.model.lock() = model.to_string();
+        true
     }
 
     fn stream_messages(
@@ -292,7 +302,7 @@ impl GeminiClientBuilder {
             http,
             api_key,
             base_url: self.base_url,
-            model: self.model,
+            model: parking_lot::Mutex::new(self.model),
         })
     }
 }

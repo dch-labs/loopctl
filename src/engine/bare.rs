@@ -76,8 +76,8 @@ use crate::hooks::context::{
 use crate::message::{Message, MessagePart, Role, ToolContent};
 use crate::middleware::{ToolDispatchContext, ToolPipeline, ToolPipelineBuilder};
 use crate::observer::{
-    FallbackContext, ResponseContext, StreamContext, StreamFailureContext, TurnEndContext,
-    TurnStartContext,
+    FallbackContext, ModelSwitchedContext, ResponseContext, StreamContext, StreamFailureContext,
+    TurnEndContext, TurnStartContext,
 };
 use crate::reflection::{
     ExponentialBackoffRecovery, NoopReflector, RecoveryAction, RecoveryStrategy, ReflectionContext,
@@ -688,12 +688,54 @@ impl<C: ApiClient> BareLoop<C> {
     /// let buf = Arc::clone(&buffer);
     /// agent.set_text_streamer(Arc::new(move |delta| {
     ///     print!("{delta}");
-    ///     buf.lock().unwrap().push_str(delta);
+    ///     buf.lock().push_str(delta);
     /// }));
     /// ```
     pub fn set_text_streamer(&mut self, f: Arc<dyn Fn(&str) + Send + Sync>) {
         self.debug_assert_idle();
         self.text_streamer = Some(f);
+    }
+
+    /// Begin a model switch operation.
+    ///
+    /// Returns a [`ModelSwitch`] builder that lets you optionally update
+    /// the context window and max tokens before calling `.apply()`.
+    ///
+    /// This is the preferred way to switch models when the new model has
+    /// a different context window or token limit:
+    ///
+    /// ```rust,ignore
+    /// # use loopctl::engine::BareLoop;
+    /// # use loopctl::config::LoopConfig;
+    /// # use loopctl::tool::registry::ToolRegistry;
+    /// # use loopctl::testing::MockApiClient;
+    /// # let client = std::sync::Arc::new(MockApiClient::new("model-a"));
+    /// # let tools = ToolRegistry::new();
+    /// # let mut loop_ = BareLoop::new(client, tools, LoopConfig::default());
+    /// loop_.switch_model("model-b").context_window(8192).apply().unwrap();
+    /// assert_eq!(loop_.config().model, "model-b");
+    /// assert_eq!(loop_.config().context_window, 8192);
+    /// ```
+    ///
+    /// For simple cases where you just want to swap the model name:
+    ///
+    /// ```rust,ignore
+    /// # use loopctl::engine::BareLoop;
+    /// # use loopctl::config::LoopConfig;
+    /// # use loopctl::tool::registry::ToolRegistry;
+    /// # use loopctl::testing::MockApiClient;
+    /// # let client = std::sync::Arc::new(MockApiClient::new("a"));
+    /// # let tools = ToolRegistry::new();
+    /// # let mut loop_ = BareLoop::new(client, tools, LoopConfig::default());
+    /// loop_.switch_model("b").apply().unwrap();
+    /// ```
+    pub fn switch_model(&mut self, model: &str) -> ModelSwitch<'_, C> {
+        ModelSwitch {
+            loop_: self,
+            target_model: model.to_string(),
+            context_window: None,
+            max_tokens: None,
+        }
     }
 
     // ==================================================
@@ -732,7 +774,7 @@ impl<C: ApiClient> BareLoop<C> {
                 let tool_result_msg = Self::build_tool_result_message(results);
                 self.conversation.push(tool_result_msg);
                 self.managers.observers().on_turn_end(&TurnEndContext {
-                    turn: budget.total_turns,
+                    turn: turn_index,
                     success: true,
                     error: None,
                     duration_ms: Self::millis_u64(turn_duration),
@@ -744,7 +786,7 @@ impl<C: ApiClient> BareLoop<C> {
             Err(e) => {
                 let err_str = e.to_string();
                 self.managers.observers().on_turn_end(&TurnEndContext {
-                    turn: budget.total_turns,
+                    turn: turn_index,
                     success: false,
                     error: Some(err_str),
                     duration_ms: Self::millis_u64(turn_duration),
@@ -755,11 +797,241 @@ impl<C: ApiClient> BareLoop<C> {
             }
         }
     }
+    // ==================================================
+    // Turn helpers (used by process_turn)
+    // ==================================================
+
+    /// Return `Err(Cancelled)` if the cancel signal has been set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::Cancelled`] if the cancel signal has been set.
+    fn check_cancellation(&mut self) -> Result<(), LoopError> {
+        if self.is_cancelled() {
+            self.state = LoopState::Failed {
+                error: "cancelled".into(),
+            };
+            return Err(LoopError::Cancelled);
+        }
+        Ok(())
+    }
+
+    /// Execute the streaming API call and process the result.
+    ///
+    /// On success, records the success with the fallback manager and fires
+    /// [`on_stream_success`](crate::observer::LoopObserver::on_stream_success).
+    ///
+    /// On failure, records the failure with the fallback circuit breaker
+    /// (firing [`on_fallback`](crate::observer::LoopObserver::on_fallback)
+    /// if it trips), fires
+    /// [`on_stream_failure`](crate::observer::LoopObserver::on_stream_failure),
+    /// and returns the error.
+    ///
+    /// `BareLoop` records API failures and trips the circuit breaker but does
+    /// **not** automatically retry with the fallback model — it has a single
+    /// client. The `FallbackManager` is infrastructure for downstream
+    /// consumers that hold multiple API clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`LoopError`] from [`stream_turn`](Self::stream_turn) if
+    /// the API call fails.
+    async fn do_stream(&mut self) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
+        match self.stream_turn().await {
+            Ok((msg, usage, stop)) => {
+                self.managers.fallback.record_model_success();
+                let (in_tok, out_tok) = Self::usage_tokens(usage.as_ref());
+                self.managers.observers().on_stream_success(&StreamContext {
+                    turn: self.budget.total_turns,
+                    model: self.client.model(),
+                    input_tokens: in_tok,
+                    output_tokens: out_tok,
+                });
+                Ok((msg, usage, stop))
+            }
+            Err(e) => {
+                let tripped = self.managers.fallback.record_api_failure();
+                if tripped {
+                    let from = self.client.model();
+                    if let Some(to) = self.managers.fallback.fallback_model() {
+                        tracing::warn!(from = %from, to = %to, "fallback manager tripped");
+                        self.managers
+                            .observers()
+                            .on_fallback(&FallbackContext { from, to });
+                    }
+                }
+
+                self.managers
+                    .observers()
+                    .on_stream_failure(&StreamFailureContext {
+                        turn: self.budget.total_turns,
+                        model: self.client.model(),
+                        error: e.clone(),
+                    });
+
+                self.state = LoopState::Failed {
+                    error: e.to_string(),
+                };
+                Err(e)
+            }
+        }
+    }
+
+    /// Add this turn's token usage into the session-level budget.
+    fn accumulate_usage(&mut self, usage: Option<&Usage>) {
+        if let Some(u) = usage {
+            self.budget.input_tokens = self
+                .budget
+                .input_tokens
+                .saturating_add(u64::from(u.input_tokens));
+            self.budget.output_tokens = self
+                .budget
+                .output_tokens
+                .saturating_add(u64::from(u.output_tokens));
+        }
+    }
+
+    /// Fire [`on_turn_end`](crate::observer::LoopObserver::on_turn_end).
+    fn finish_turn(&mut self, turn_in: u64, turn_out: u64, duration: Duration) {
+        self.managers.observers().on_turn_end(&TurnEndContext {
+            turn: self.budget.total_turns.saturating_sub(1),
+            success: true,
+            error: None,
+            duration_ms: Self::millis_u64(duration),
+            input_tokens: turn_in,
+            output_tokens: turn_out,
+        });
+    }
+
+    /// Build a [`TurnResult`] signalling turn completion.
+    fn turn_complete(text: String, turn_in: u64, turn_out: u64, duration: Duration) -> TurnResult {
+        TurnResult {
+            text,
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            input_tokens: turn_in,
+            output_tokens: turn_out,
+            duration,
+            is_complete: true,
+            stop_reason: StopReason::EndTurn,
+        }
+    }
+
+    /// Run context compaction if a [`ContextManager`] is configured.
+    ///
+    /// Best-effort: failures are logged and the turn continues with
+    /// un-compacted history.
+    async fn try_compact_context(&mut self) {
+        if let Err(e) = self.maybe_compact_context(self.budget.total_turns).await {
+            tracing::warn!(
+                error = %e,
+                turn = self.budget.total_turns,
+                "context compaction failed; continuing with uncompactd history"
+            );
+        }
+    }
 }
 
 // ==================================================
-// Loop trait implementation
+// ModelSwitch builder
 // ==================================================
+
+/// Builder for a runtime model switch on [`BareLoop`].
+///
+/// Created by [`BareLoop::switch_model`]. Allows updating
+/// context-window and max-tokens alongside the model name, then applies
+/// all changes atomically via [`apply`](Self::apply).
+///
+/// The switch resets the fallback circuit breaker (stale failure counts
+/// from the old model are meaningless for the new one) and fires
+/// [`on_model_switched`](crate::observer::LoopObserver::on_model_switched)
+/// to all observers.
+pub struct ModelSwitch<'a, C: ApiClient> {
+    loop_: &'a mut BareLoop<C>,
+    target_model: String,
+    context_window: Option<u64>,
+    max_tokens: Option<u32>,
+}
+
+impl<C: ApiClient> ModelSwitch<'_, C> {
+    /// Set the context window (in tokens) for the new model.
+    ///
+    /// If omitted, the existing `LoopConfig::context_window` is kept.
+    /// Updating this is important when switching to a model with a
+    /// significantly different context window — otherwise the
+    /// auto-compactor will use the wrong threshold.
+    #[must_use]
+    pub fn context_window(mut self, tokens: u64) -> Self {
+        self.context_window = Some(tokens);
+        self
+    }
+
+    /// Set the max output tokens for the new model.
+    ///
+    /// If omitted, the existing `LoopConfig::max_tokens` is kept.
+    #[must_use]
+    pub fn max_tokens(mut self, tokens: u32) -> Self {
+        self.max_tokens = Some(tokens);
+        self
+    }
+
+    /// Apply the model switch.
+    ///
+    /// Performs the following atomically:
+    /// 1. Validates the target model is non-empty.
+    /// 2. Delegates to [`ApiClient::set_model`] on the underlying client.
+    /// 3. Updates `LoopConfig::model`, `context_window`, and `max_tokens`.
+    /// 4. Resets the [`FallbackManager`](crate::fallback::FallbackManager)
+    ///    circuit breaker to `Primary` and updates the original-model
+    ///    tracker to the new model.
+    /// 5. Fires [`on_model_switched`](crate::observer::LoopObserver::on_model_switched).
+    ///
+    /// # Errors
+    ///
+    /// - [`LoopError::Config`] if the model name is empty/whitespace.
+    pub fn apply(self) -> Result<(), LoopError> {
+        let Self {
+            loop_,
+            target_model,
+            context_window,
+            max_tokens,
+        } = self;
+
+        let trimmed = target_model.trim();
+        if trimmed.is_empty() {
+            return Err(LoopError::Config(
+                "model name must not be empty or whitespace".into(),
+            ));
+        }
+
+        let from = loop_.config.model.clone();
+        loop_.client.set_model(trimmed);
+        loop_.config.model = trimmed.to_string();
+
+        if let Some(cw) = context_window {
+            loop_.config.context_window = cw;
+        }
+
+        if let Some(mt) = max_tokens {
+            loop_.config.max_tokens = mt;
+        }
+
+        loop_.managers.fallback.reset();
+        loop_
+            .managers
+            .fallback
+            .set_original_model(trimmed.to_string());
+        loop_
+            .managers
+            .observers()
+            .on_model_switched(&ModelSwitchedContext {
+                from,
+                to: trimmed.to_string(),
+            });
+
+        Ok(())
+    }
+}
 
 impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
     fn initialize<'a>(
@@ -779,7 +1051,6 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     fn process_turn<'a>(
         &'a mut self,
         input: &'a str,
@@ -799,81 +1070,16 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
                 query: input.to_string(),
             });
 
-            // Check cancellation before the API call.
-            if self.is_cancelled() {
-                self.state = LoopState::Failed {
-                    error: "cancelled".into(),
-                };
-                return Err(LoopError::Cancelled);
-            }
+            self.check_cancellation()?;
 
-            let stream_result = self.stream_turn().await;
-            let (assistant_msg, usage, _stream_stop) = match stream_result {
-                Ok(value) => {
-                    let (msg, usage, stop) = value;
-                    self.managers.fallback.record_model_success();
-                    let (in_tok, out_tok) = Self::usage_tokens(usage.as_ref());
-                    self.managers.observers().on_stream_success(&StreamContext {
-                        turn: self.budget.total_turns,
-                        model: self.client.model().to_string(),
-                        input_tokens: in_tok,
-                        output_tokens: out_tok,
-                    });
-                    (msg, usage, stop)
-                }
-                Err(e) => {
-                    // Record the failure with the fallback circuit breaker.
-                    //
-                    // Note: BareLoop records API failures and trips the
-                    // circuit breaker but does **not** automatically retry
-                    // with the fallback model. The `FallbackManager` is
-                    // infrastructure for downstream consumers that hold
-                    // multiple API clients. BareLoop has a single client,
-                    // so the error is propagated after recording.
-                    let tripped = self.managers.fallback.record_api_failure();
-                    if tripped {
-                        let from = self.client.model();
-                        if let Some(to) = self.managers.fallback.fallback_model() {
-                            tracing::warn!(from, to, "fallback manager tripped");
-                            self.managers.observers().on_fallback(&FallbackContext {
-                                from: from.to_string(),
-                                to,
-                            });
-                        }
-                    }
+            let (assistant_msg, usage, _stream_stop) = self.do_stream().await?;
 
-                    self.managers
-                        .observers()
-                        .on_stream_failure(&StreamFailureContext {
-                            turn: self.budget.total_turns,
-                            model: self.client.model().to_string(),
-                            error: e.clone(),
-                        });
-
-                    self.state = LoopState::Failed {
-                        error: e.to_string(),
-                    };
-                    return Err(e);
-                }
-            };
-
-            // Accumulate usage into session budget.
-            if let Some(u) = &usage {
-                self.budget.input_tokens = self
-                    .budget
-                    .input_tokens
-                    .saturating_add(u64::from(u.input_tokens));
-                self.budget.output_tokens = self
-                    .budget
-                    .output_tokens
-                    .saturating_add(u64::from(u.output_tokens));
-            }
+            self.accumulate_usage(usage.as_ref());
 
             let text = Self::extract_text(&assistant_msg);
             let (turn_in, turn_out) = Self::usage_tokens(usage.as_ref());
 
-            // Record the response text with the detection manager and check
-            // for loop/convergence patterns.
+            // Record the response and check for loop/convergence patterns.
             let pattern = self.managers.detection.record_response(&text);
 
             self.managers.observers().on_response(&ResponseContext {
@@ -886,29 +1092,25 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
                 .managers
                 .handle_detected_pattern(&pattern, self.budget.total_turns)
             {
-                match result {
+                return match result {
                     Ok(_) => {
                         self.state = LoopState::Completed {
                             summary: text.clone(),
                         };
-                        return Ok(TurnResult {
+                        Ok(Self::turn_complete(
                             text,
-                            tool_calls: Vec::new(),
-                            tool_results: Vec::new(),
-                            input_tokens: turn_in,
-                            output_tokens: turn_out,
-                            duration: turn_start.elapsed(),
-                            is_complete: true,
-                            stop_reason: StopReason::EndTurn,
-                        });
+                            turn_in,
+                            turn_out,
+                            turn_start.elapsed(),
+                        ))
                     }
                     Err(e) => {
                         self.state = LoopState::Failed {
                             error: e.to_string(),
                         };
-                        return Err(e);
+                        Err(e)
                     }
-                }
+                };
             }
 
             let tool_calls = Self::extract_tool_calls(&assistant_msg);
@@ -917,27 +1119,16 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
 
             // No tool calls → this turn is complete.
             if tool_calls.is_empty() {
-                self.managers.observers().on_turn_end(&TurnEndContext {
-                    turn: self.budget.total_turns.saturating_sub(1),
-                    success: true,
-                    error: None,
-                    duration_ms: Self::millis_u64(turn_start.elapsed()),
-                    input_tokens: turn_in,
-                    output_tokens: turn_out,
-                });
+                self.finish_turn(turn_in, turn_out, turn_start.elapsed());
                 self.state = LoopState::Completed {
                     summary: text.clone(),
                 };
-                return Ok(TurnResult {
+                return Ok(Self::turn_complete(
                     text,
-                    tool_calls: Vec::new(),
-                    tool_results: Vec::new(),
-                    input_tokens: turn_in,
-                    output_tokens: turn_out,
-                    duration: turn_start.elapsed(),
-                    is_complete: true,
-                    stop_reason: StopReason::EndTurn,
-                });
+                    turn_in,
+                    turn_out,
+                    turn_start.elapsed(),
+                ));
             }
 
             // Dispatch tool calls.
@@ -972,20 +1163,8 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
             }
             self.budget = budget;
 
-            // Attempt context compaction.
-            //
-            // Compaction is best-effort: if it fails (e.g. the compactor
-            // cannot reduce the conversation enough), we log a warning and
-            // continue. The next API call may still succeed, and if it
-            // doesn't, the provider's context-overflow error will surface
-            // naturally at that point.
-            if let Err(e) = self.maybe_compact_context(self.budget.total_turns).await {
-                tracing::warn!(
-                    error = %e,
-                    turn = self.budget.total_turns,
-                    "context compaction failed; continuing with uncompactd history"
-                );
-            }
+            // Attempt context compaction (best-effort).
+            self.try_compact_context().await;
 
             self.state = LoopState::Processing {
                 turn: self.budget.total_turns,
@@ -1085,6 +1264,8 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use parking_lot::Mutex;
+
     // ==================================================
     // Mock ApiClient
     // ==================================================
@@ -1105,13 +1286,13 @@ mod tests {
         /// Each entry is a `Vec<StreamEvent>` representing one complete
         /// streaming response from the API. Popped from the front by
         /// [`stream_messages`](MockClient::stream_messages).
-        responses: Arc<std::sync::Mutex<Vec<Vec<StreamEvent>>>>,
+        responses: Arc<Mutex<Vec<Vec<StreamEvent>>>>,
 
         /// Model name reported by [`ApiClient::model()`].
         ///
         /// Copied into mock response metadata so that assertions can
-        /// verify the model field.
-        model_name: String,
+        /// verify which model produced a given response.
+        model_name: Arc<parking_lot::Mutex<String>>,
     }
 
     impl MockClient {
@@ -1123,8 +1304,8 @@ mod tests {
         /// [`add_tool_only_response()`](MockClient::add_tool_only_response).
         fn new(model: &str) -> Self {
             Self {
-                responses: Arc::new(std::sync::Mutex::new(Vec::new())),
-                model_name: model.to_string(),
+                responses: Arc::new(Mutex::new(Vec::new())),
+                model_name: Arc::new(parking_lot::Mutex::new(model.to_string())),
             }
         }
 
@@ -1145,7 +1326,7 @@ mod tests {
                     message: MessageMetadata {
                         id: "msg_test".into(),
                         role: "assistant".into(),
-                        model: self.model_name.clone(),
+                        model: self.model_name.lock().clone(),
                     },
                 }),
                 StreamEvent::PartStart(PartStart {
@@ -1167,12 +1348,12 @@ mod tests {
                 }),
                 StreamEvent::MessageStop,
             ];
-            self.responses.lock().unwrap().push(events);
+            self.responses.lock().push(events);
         }
 
         /// Add a raw sequence of stream events as a single response turn.
         fn add_events(&self, events: Vec<StreamEvent>) {
-            self.responses.lock().unwrap().push(events);
+            self.responses.lock().push(events);
         }
 
         /// Add a tool_call response followed by an end_turn response.
@@ -1202,7 +1383,7 @@ mod tests {
                     message: MessageMetadata {
                         id: "msg_tool".into(),
                         role: "assistant".into(),
-                        model: self.model_name.clone(),
+                        model: self.model_name.lock().clone(),
                     },
                 }),
                 StreamEvent::PartStart(PartStart {
@@ -1218,7 +1399,7 @@ mod tests {
                 }),
                 StreamEvent::MessageStop,
             ];
-            self.responses.lock().unwrap().push(tool_events);
+            self.responses.lock().push(tool_events);
 
             // Second response: end_turn with text
             let text_events = vec![
@@ -1226,7 +1407,7 @@ mod tests {
                     message: MessageMetadata {
                         id: "msg_final".into(),
                         role: "assistant".into(),
-                        model: self.model_name.clone(),
+                        model: self.model_name.lock().clone(),
                     },
                 }),
                 StreamEvent::PartStart(PartStart {
@@ -1248,7 +1429,7 @@ mod tests {
                 }),
                 StreamEvent::MessageStop,
             ];
-            self.responses.lock().unwrap().push(text_events);
+            self.responses.lock().push(text_events);
         }
 
         /// Add a tool_call-only response (no end_turn).
@@ -1269,7 +1450,7 @@ mod tests {
                     message: MessageMetadata {
                         id: format!("msg_{tool_id}"),
                         role: "assistant".into(),
-                        model: self.model_name.clone(),
+                        model: self.model_name.lock().clone(),
                     },
                 }),
                 StreamEvent::PartStart(PartStart {
@@ -1285,7 +1466,7 @@ mod tests {
                 }),
                 StreamEvent::MessageStop,
             ];
-            self.responses.lock().unwrap().push(tool_events);
+            self.responses.lock().push(tool_events);
         }
 
         /// Add an error response. Reserved for future use.
@@ -1302,17 +1483,25 @@ mod tests {
                 message: MessageMetadata {
                     id: "msg_err".into(),
                     role: "assistant".into(),
-                    model: self.model_name.clone(),
+                    model: self.model_name.lock().clone(),
                 },
             })];
-            self.responses.lock().unwrap().push(events);
+            self.responses.lock().push(events);
         }
     }
 
     impl ApiClient for MockClient {
         /// Return the model name configured at construction.
-        fn model(&self) -> &str {
-            &self.model_name
+        fn model(&self) -> String {
+            self.model_name.lock().clone()
+        }
+
+        fn set_model(&self, model: &str) -> bool {
+            if model.trim().is_empty() {
+                return false;
+            }
+            *self.model_name.lock() = model.to_string();
+            true
         }
 
         /// Pop the next queued response and return it as a stream.
@@ -1327,7 +1516,7 @@ mod tests {
             _tools: Option<Vec<ToolSchema>>,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
-            let mut guard = self.responses.lock().unwrap();
+            let mut guard = self.responses.lock();
             if let Some(events) = guard.pop_front() {
                 let events: Vec<Result<StreamEvent, ApiError>> =
                     events.into_iter().map(Ok).collect();
@@ -1885,7 +2074,7 @@ mod tests {
             }),
             StreamEvent::MessageStop,
         ];
-        client.responses.lock().unwrap().push(tool_events);
+        client.responses.lock().push(tool_events);
 
         // Second response: end_turn
         client.add_text_response("Both tools executed.");
@@ -1915,16 +2104,16 @@ mod tests {
         client.add_text_response("Hello world");
         let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
 
-        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = Arc::new(Mutex::new(Vec::new()));
         let buf = Arc::clone(&received);
         agent.set_text_streamer(Arc::new(move |delta: &str| {
-            buf.lock().unwrap().push(delta.to_string());
+            buf.lock().push(delta.to_string());
         }));
 
         let result = agent.run("Hi").await.unwrap();
         assert!(result.success);
 
-        let received = received.lock().unwrap();
+        let received = received.lock();
         assert!(!received.is_empty(), "streamer should have fired");
         assert!(
             received.join("").contains("Hello world"),
@@ -1988,17 +2177,17 @@ mod tests {
 
         let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
 
-        let received = Arc::new(std::sync::Mutex::new(String::new()));
+        let received = Arc::new(Mutex::new(String::new()));
         let buf = Arc::clone(&received);
         agent.set_text_streamer(Arc::new(move |delta: &str| {
-            buf.lock().unwrap().push_str(delta);
+            buf.lock().push_str(delta);
         }));
 
         agent.run("Use tool").await.unwrap();
 
         // The InputJson delta should NOT have triggered the streamer.
         // Only the "Done" text response in the second turn should.
-        let received = received.lock().unwrap();
+        let received = received.lock();
         assert_eq!(&*received, "Done", "only text deltas should fire streamer");
     }
 
@@ -2129,7 +2318,7 @@ mod tests {
             }),
             StreamEvent::MessageStop,
         ];
-        client.responses.lock().unwrap().push(tool_events);
+        client.responses.lock().push(tool_events);
 
         // Second response: end_turn after seeing error result
         client.add_text_response("Tool wasn't found, but I'll handle it.");
@@ -2242,11 +2431,11 @@ mod tests {
 
     /// A middleware that records the `turn_number` from each dispatch context.
     struct TurnNumberCapture {
-        turns: Arc<std::sync::Mutex<Vec<usize>>>,
+        turns: Arc<Mutex<Vec<usize>>>,
     }
 
     impl TurnNumberCapture {
-        fn new(shared: Arc<std::sync::Mutex<Vec<usize>>>) -> Self {
+        fn new(shared: Arc<Mutex<Vec<usize>>>) -> Self {
             Self { turns: shared }
         }
     }
@@ -2265,7 +2454,7 @@ mod tests {
                 dyn std::future::Future<Output = crate::middleware::ToolDispatchResult> + Send + 'a,
             >,
         > {
-            self.turns.lock().unwrap().push(ctx.turn_number);
+            self.turns.lock().push(ctx.turn_number);
             next.dispatch(ctx)
         }
     }
@@ -2285,7 +2474,7 @@ mod tests {
         let mut config = make_config();
         config.max_turns = 10;
 
-        let capture = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let capture = Arc::new(Mutex::new(Vec::<usize>::new()));
         let mut agent = BareLoop::new(Arc::new(client), registry, config);
         let builder = ToolPipeline::builder().with(TurnNumberCapture::new(Arc::clone(&capture)));
         agent.set_pipeline(builder).unwrap();
@@ -2293,7 +2482,7 @@ mod tests {
         let result = agent.run("test").await;
         assert!(result.is_ok());
 
-        let turns = capture.lock().unwrap().clone();
+        let turns = capture.lock().clone();
         // Tool was called on turn 0 (first turn) and turn 1 (second turn).
         assert_eq!(
             turns.len(),
@@ -2305,6 +2494,260 @@ mod tests {
         assert!(
             turns.iter().all(|&t| t < 10),
             "turn_number must be actual index, not max_turns (10): got {turns:?}"
+        );
+    }
+
+    // ─── Model switching tests ───
+
+    /// `switch_model` updates config.model, the client's model, and the
+    /// fallback manager's original-model tracker.
+    #[tokio::test]
+    async fn switch_model_updates_config_and_client() {
+        let client = MockClient::new("model-a");
+        let client_arc = std::sync::Arc::new(client);
+        let tools = ToolRegistry::new();
+        let mut config = LoopConfig::default();
+        config.model = "model-a".to_string();
+
+        let mut loop_ = BareLoop::new(client_arc.clone(), tools, config);
+
+        loop_.switch_model("model-b").apply().unwrap();
+
+        // Config was updated.
+        assert_eq!(loop_.config().model, "model-b");
+
+        // Client was also updated via set_model.
+        assert_eq!(client_arc.model(), "model-b");
+    }
+
+    /// `switch_model` fires `on_model_switched` to all registered observers.
+    #[tokio::test]
+    async fn switch_model_notifies_observers() {
+        #[derive(Default)]
+        struct RecordingObserver {
+            switches: Mutex<Vec<(String, String)>>,
+        }
+
+        impl crate::observer::LoopObserver for RecordingObserver {
+            fn name(&self) -> &'static str {
+                "recording"
+            }
+
+            fn on_model_switched(&self, ctx: &ModelSwitchedContext) {
+                self.switches
+                    .lock()
+                    .push((ctx.from.clone(), ctx.to.clone()));
+            }
+        }
+
+        let client = std::sync::Arc::new(MockClient::new("m1"));
+        let tools = ToolRegistry::new();
+        let mut loop_ = BareLoop::new(client, tools, LoopConfig::default());
+        let obs = std::sync::Arc::new(RecordingObserver::default());
+        let obs_clone = obs.clone();
+        loop_.register_observer(obs);
+
+        loop_.switch_model("m2").apply().unwrap();
+        loop_.switch_model("m3").apply().unwrap();
+
+        // Observer should have received both switches.
+        let recorded = obs_clone.switches.lock();
+        assert_eq!(recorded.len(), 2, "should have 2 model-switch events");
+        assert_eq!(recorded[0], ("default".to_string(), "m2".to_string()));
+        assert_eq!(recorded[1], ("m2".to_string(), "m3".to_string()));
+    }
+
+    /// `switch_model` updates config even when the client doesn't support
+    /// hot-swapping.  The client's internal model stays the same, but the
+    /// framework-level config, fallback, and observers are updated.
+    #[tokio::test]
+    async fn switch_model_unsupported_client() {
+        /// A client that does NOT override `set_model` (returns `false`).
+        struct StaticClient {
+            model_name: Arc<parking_lot::Mutex<String>>,
+        }
+
+        impl ApiClient for StaticClient {
+            fn model(&self) -> String {
+                self.model_name.lock().clone()
+            }
+            // Uses default set_model which returns false.
+
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<crate::tool::ToolSchema>>,
+            ) -> Pin<
+                Box<
+                    dyn futures::stream::Stream<Item = Result<StreamEvent, ApiError>>
+                        + Send
+                        + 'static,
+                >,
+            > {
+                Box::pin(futures::stream::empty())
+            }
+
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<crate::tool::ToolSchema>>,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::Value::Null) })
+            }
+        }
+
+        let client = std::sync::Arc::new(StaticClient {
+            model_name: std::sync::Arc::new(parking_lot::Mutex::new("static".to_string())),
+        });
+        let tools = ToolRegistry::new();
+        let mut loop_ = BareLoop::new(client, tools, LoopConfig::default());
+
+        // set_model returns false (unsupported), but apply() is best-effort
+        // and still updates config-level state.
+        loop_.switch_model("new-model").apply().unwrap();
+
+        // Config was updated even though client didn't support it.
+        assert_eq!(loop_.config().model, "new-model");
+
+        // Client's model remains unchanged (no interior mutability).
+        assert_eq!(loop_.client.model(), "static");
+    }
+
+    /// `switch_model` syncs the fallback manager's original-model tracker
+    /// so subsequent fallback decisions compare against the new primary.
+    #[tokio::test]
+    async fn switch_model_updates_fallback_original() {
+        let client = std::sync::Arc::new(MockClient::new("primary"));
+        let tools = ToolRegistry::new();
+        let mut config = LoopConfig::default();
+        config.model = "primary".to_string();
+
+        let mut loop_ = BareLoop::new(client, tools, config);
+
+        // Before switch, fallback manager has no original model set.
+        assert_eq!(loop_.managers.fallback.original_model(), None);
+
+        loop_.switch_model("new-primary").apply().unwrap();
+
+        // After switch, fallback manager tracks the new primary.
+        assert_eq!(
+            loop_.managers.fallback.original_model(),
+            Some("new-primary".to_string())
+        );
+    }
+
+    /// `switch_model` rejects empty/whitespace-only model names.
+    #[tokio::test]
+    async fn switch_model_rejects_empty() {
+        let client = std::sync::Arc::new(MockClient::new("model"));
+        let tools = ToolRegistry::new();
+        let mut loop_ = BareLoop::new(client, tools, LoopConfig::default());
+
+        let result = loop_.switch_model("").apply();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty"));
+
+        let result = loop_.switch_model("   ").apply();
+        assert!(result.is_err());
+
+        // Model should remain unchanged.
+        assert_eq!(loop_.config().model, "default");
+    }
+
+    /// `switch_model` can be called multiple times in succession.
+    #[tokio::test]
+    async fn switch_model_chained() {
+        let client = std::sync::Arc::new(MockClient::new("a"));
+        let tools = ToolRegistry::new();
+        let mut loop_ = BareLoop::new(client, tools, LoopConfig::default());
+
+        loop_.switch_model("b").apply().unwrap();
+        assert_eq!(loop_.config().model, "b");
+
+        loop_.switch_model("c").apply().unwrap();
+        assert_eq!(loop_.config().model, "c");
+
+        loop_.switch_model("d").apply().unwrap();
+        assert_eq!(loop_.config().model, "d");
+    }
+
+    /// `switch_model` with `.context_window()` updates the config.
+    #[tokio::test]
+    async fn switch_model_updates_context_window() {
+        let client = std::sync::Arc::new(MockClient::new("big-model"));
+        let tools = ToolRegistry::new();
+        let mut loop_ = BareLoop::new(client, tools, LoopConfig::default());
+
+        let original_cw = loop_.config().context_window;
+        assert_ne!(original_cw, 8192);
+
+        loop_
+            .switch_model("small-model")
+            .context_window(8192)
+            .apply()
+            .unwrap();
+
+        assert_eq!(loop_.config().model, "small-model");
+        assert_eq!(loop_.config().context_window, 8192);
+    }
+
+    /// `switch_model` with `.max_tokens()` updates the config.
+    #[tokio::test]
+    async fn switch_model_updates_max_tokens() {
+        let client = std::sync::Arc::new(MockClient::new("m"));
+        let tools = ToolRegistry::new();
+        let mut loop_ = BareLoop::new(client, tools, LoopConfig::default());
+
+        loop_.switch_model("m2").max_tokens(4096).apply().unwrap();
+
+        assert_eq!(loop_.config().model, "m2");
+        assert_eq!(loop_.config().max_tokens, 4096);
+    }
+
+    /// `switch_model` trims whitespace from the model name.
+    #[tokio::test]
+    async fn switch_model_trims_whitespace() {
+        let client = std::sync::Arc::new(MockClient::new("m"));
+        let tools = ToolRegistry::new();
+        let mut loop_ = BareLoop::new(client, tools, LoopConfig::default());
+
+        loop_.switch_model("  gpt-4o  ").apply().unwrap();
+        assert_eq!(loop_.config().model, "gpt-4o");
+    }
+
+    /// `switch_model` resets the fallback circuit breaker.
+    #[tokio::test]
+    async fn switch_model_resets_fallback_circuit() {
+        use crate::fallback::FallbackState;
+
+        let client = std::sync::Arc::new(MockClient::new("primary"));
+        let tools = ToolRegistry::new();
+        let mut config = LoopConfig::default();
+        config.model = "primary".to_string();
+
+        let mut loop_ = BareLoop::new(client, tools, config);
+
+        // Trip the circuit breaker.
+        loop_.managers.fallback.set_original_model("primary".into());
+        loop_.managers.fallback.set_fallback_model("backup");
+        loop_.managers.fallback.transition_to_fallback();
+        assert_eq!(loop_.managers.fallback.state(), FallbackState::Fallback);
+
+        // Switch model — circuit should reset to Primary.
+        loop_.switch_model("new-primary").apply().unwrap();
+
+        assert_eq!(loop_.managers.fallback.state(), FallbackState::Primary);
+        assert_eq!(
+            loop_.managers.fallback.original_model(),
+            Some("new-primary".to_string())
         );
     }
 }

@@ -192,10 +192,7 @@ impl LoopMemory for InMemoryStore {
     /// # Errors
     ///
     /// This implementation never returns an error.
-    fn store(
-        &self,
-        entry: MemoryEntry,
-    ) -> impl Future<Output = Result<(), LoopError>> + Send {
+    fn store(&self, entry: MemoryEntry) -> impl Future<Output = Result<(), LoopError>> + Send {
         async move {
             self.entries
                 .write()
@@ -309,9 +306,7 @@ impl LoopMemory for InMemoryStore {
     /// println!("Pruned {} entries", stats.pruned);
     /// # });
     /// ```
-    fn consolidate(
-        &self,
-    ) -> impl Future<Output = Result<ConsolidationStats, LoopError>> + Send {
+    fn consolidate(&self) -> impl Future<Output = Result<ConsolidationStats, LoopError>> + Send {
         async move {
             let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
             let entries_before = entries.len();

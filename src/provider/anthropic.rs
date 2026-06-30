@@ -65,7 +65,7 @@ pub struct AnthropicClient {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
-    model: String,
+    model: parking_lot::Mutex<String>,
     max_tokens: u32,
 }
 
@@ -139,8 +139,16 @@ impl AnthropicClient {
 }
 
 impl ApiClient for AnthropicClient {
-    fn model(&self) -> &str {
-        &self.model
+    fn model(&self) -> String {
+        self.model.lock().clone()
+    }
+
+    fn set_model(&self, model: &str) -> bool {
+        if model.trim().is_empty() {
+            return false;
+        }
+        *self.model.lock() = model.to_string();
+        true
     }
 
     fn stream_messages(
@@ -149,8 +157,9 @@ impl ApiClient for AnthropicClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let model = self.model.lock().clone();
         let body = build_request_body(
-            &self.model,
+            &model,
             &messages,
             system.as_deref(),
             tools.as_deref(),
@@ -185,8 +194,9 @@ impl ApiClient for AnthropicClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+        let model = self.model.lock().clone();
         let body = build_request_body(
-            &self.model,
+            &model,
             &messages,
             system.as_deref(),
             tools.as_deref(),
@@ -310,7 +320,7 @@ impl AnthropicClientBuilder {
             http,
             api_key,
             base_url: self.base_url,
-            model: self.model,
+            model: parking_lot::Mutex::new(self.model),
             max_tokens: self.max_tokens,
         })
     }

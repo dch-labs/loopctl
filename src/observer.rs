@@ -40,8 +40,8 @@ pub mod context;
 
 pub use context::{
     CompactedContext, ConvergenceDetectedContext, FallbackContext, LoopDetectedContext,
-    ResponseContext, SessionEndContext, SessionStartContext, StreamContext, StreamFailureContext,
-    ToolPostContext, ToolPreContext, TurnEndContext, TurnStartContext,
+    ModelSwitchedContext, ResponseContext, SessionEndContext, SessionStartContext, StreamContext,
+    StreamFailureContext, ToolPostContext, ToolPreContext, TurnEndContext, TurnStartContext,
 };
 // ==================================================
 // LoopObserver Trait
@@ -126,6 +126,12 @@ pub trait LoopObserver: Send + Sync {
     /// Indicates that the primary model failed and a fallback model
     /// was selected for subsequent requests.
     fn on_fallback(&self, _ctx: &FallbackContext) {}
+
+    /// Called when the model is hot-swapped at runtime.
+    ///
+    /// Fired by [`BareLoop::switch_model`](crate::engine::BareLoop::switch_model)
+    /// after the client has accepted the new model.
+    fn on_model_switched(&self, _ctx: &ModelSwitchedContext) {}
 
     /// Called when a loop is detected in tool operations.
     ///
@@ -300,6 +306,15 @@ impl ObserverHost {
         }
     }
 
+    /// Dispatch [`LoopObserver::on_model_switched`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
+    pub fn on_model_switched(&self, ctx: &ModelSwitchedContext) {
+        for obs in &self.observers {
+            obs.on_model_switched(ctx);
+        }
+    }
+
     /// Dispatch [`LoopObserver::on_loop_detected`] to all observers.
     ///
     /// Iterates registered observers in registration order.
@@ -414,5 +429,58 @@ mod tests {
         assert_eq!(obs.stream_success.load(Ordering::SeqCst), 1);
         host.reset_all();
         assert_eq!(obs.resets.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn host_dispatches_model_switched() {
+        struct SwitchRecorder {
+            events: parking_lot::Mutex<Vec<(String, String)>>,
+        }
+        impl LoopObserver for SwitchRecorder {
+            fn name(&self) -> &'static str {
+                "switch-recorder"
+            }
+            fn on_model_switched(&self, ctx: &ModelSwitchedContext) {
+                self.events.lock().push((ctx.from.clone(), ctx.to.clone()));
+            }
+        }
+
+        let obs = Arc::new(SwitchRecorder {
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+        let mut host = ObserverHost::new();
+        host.register(Arc::clone(&obs) as Arc<dyn LoopObserver>);
+
+        host.on_model_switched(&ModelSwitchedContext {
+            from: "a".into(),
+            to: "b".into(),
+        });
+        host.on_model_switched(&ModelSwitchedContext {
+            from: "b".into(),
+            to: "c".into(),
+        });
+
+        let events = obs.events.lock();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], ("a".into(), "b".into()));
+        assert_eq!(events[1], ("b".into(), "c".into()));
+    }
+
+    #[test]
+    fn model_switched_default_is_noop() {
+        // The default impl of on_model_switched should be a no-op
+        // (no panic, no crash).
+        struct NoopObserver;
+        impl LoopObserver for NoopObserver {
+            fn name(&self) -> &'static str {
+                "noop"
+            }
+        }
+
+        let obs = NoopObserver;
+        obs.on_model_switched(&ModelSwitchedContext {
+            from: "x".into(),
+            to: "y".into(),
+        });
     }
 }

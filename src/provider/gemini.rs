@@ -47,6 +47,9 @@ const TEXT_PART_INDEX: usize = 0;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
+/// Maximum bytes to read from an error response body.  Prevents OOM when a
+/// misconfigured or malicious server returns a multi-GB body on a 4xx/5xx.
+const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ==================================================
@@ -140,7 +143,12 @@ impl GeminiClient {
         if status.is_success() {
             Ok(resp)
         } else {
-            let text = resp.text().await.unwrap_or_default();
+            // Cap the error body to prevent OOM from oversized error responses.
+            let bytes = resp.bytes().await.unwrap_or_default();
+            let text = match bytes.get(..MAX_ERROR_BODY) {
+                Some(truncated) => String::from_utf8_lossy(truncated).into_owned(),
+                None => String::from_utf8_lossy(&bytes).into_owned(),
+            };
             Err(ApiError::http_with_status(status.as_u16(), text))
         }
     }

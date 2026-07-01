@@ -48,6 +48,9 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
+/// Maximum bytes to read from an error response body.  Prevents OOM when a
+/// misconfigured or malicious server returns a multi-GB body on a 4xx/5xx.
+const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ==================================================
@@ -127,7 +130,12 @@ impl AnthropicClient {
         if status.is_success() {
             Ok(resp)
         } else {
-            let text = resp.text().await.unwrap_or_default();
+            // Cap the error body to prevent OOM from oversized error responses.
+            let bytes = resp.bytes().await.unwrap_or_default();
+            let text = match bytes.get(..MAX_ERROR_BODY) {
+                Some(truncated) => String::from_utf8_lossy(truncated).into_owned(),
+                None => String::from_utf8_lossy(&bytes).into_owned(),
+            };
             Err(ApiError::http_with_status(status.as_u16(), text))
         }
     }
@@ -514,7 +522,16 @@ impl SseReader {
                     event_type = ev.into();
                     have_event = true;
                 } else if let Some(d) = line.strip_prefix(SSE_DATA_PREFIX) {
-                    data = d.into();
+                    // Per the SSE specification, multiple consecutive `data:`
+                    // lines must be concatenated with `\n` to form a single
+                    // event payload.  Using assignment here would silently
+                    // discard earlier data lines.
+                    if data.is_empty() {
+                        data = d.into();
+                    } else {
+                        data.push('\n');
+                        data.push_str(d);
+                    }
                     have_event = true;
                 }
             }
@@ -1256,6 +1273,27 @@ mod tests {
         let (event_type, data) = result.unwrap();
         assert_eq!(event_type, "content_block_delta");
         assert!(data.is_some());
+    }
+
+    #[tokio::test]
+    async fn sse_reader_next_event_concatenates_multiline_data() {
+        let chunk = "event: content_block_delta\ndata: {\"type\":\"text_delta\",\ndata: \"text\":\"hello\"}\n\n";
+        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(chunk.to_string())]);
+        let mut reader = SseReader {
+            bytes: Box::pin(stream),
+            buf: String::new(),
+        };
+        let result = reader.next_event().await.unwrap();
+        assert!(result.is_some());
+        let (event_type, data) = result.unwrap();
+        assert_eq!(event_type, "content_block_delta");
+        assert!(
+            data.is_some(),
+            "multi-line data should concatenate into valid JSON"
+        );
+        let parsed = data.unwrap();
+        assert_eq!(parsed["type"], "text_delta");
+        assert_eq!(parsed["text"], "hello");
     }
 
     #[tokio::test]

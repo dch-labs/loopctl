@@ -565,26 +565,32 @@ impl ConvergenceDetector {
         }
 
         let mut max_similarity = 0.0;
-        let mut any_similar = false;
         for prev_response in &self.window {
             let similarity = Self::compute_similarity(response, prev_response);
             if similarity > max_similarity {
                 max_similarity = similarity;
             }
-
-            if similarity >= self.config.similarity_threshold {
-                any_similar = true;
-                if !self.similar_responses.contains(&response.to_string()) {
-                    self.similar_responses.push(response.to_string());
-                }
-            }
         }
 
-        // Update consecutive count once per add_response call
+        let prev_is_similar = match self.window.back() {
+            Some(prev) => {
+                let sim = Self::compute_similarity(response, prev);
+                if sim >= self.config.similarity_threshold {
+                    if !self.similar_responses.contains(&response.to_string()) {
+                        self.similar_responses.push(response.to_string());
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+
         if self.window.is_empty() {
             self.consecutive_count = 1;
             self.similar_responses.push(response.to_string());
-        } else if any_similar {
+        } else if prev_is_similar {
             self.consecutive_count = self.consecutive_count.saturating_add(1);
         } else {
             self.consecutive_count = 1;
@@ -925,6 +931,116 @@ mod tests {
             err,
             ConvergenceConfigError::ThresholdOutOfRange { .. }
         ));
+    }
+
+    #[test]
+    fn test_streak_resets_on_dissimilar_response() {
+        let config = ConvergenceConfig {
+            window_size: 3,
+            similarity_threshold: 0.5,
+            ..Default::default()
+        };
+        let mut detector = ConvergenceDetector::new(config).unwrap();
+
+        // Two similar responses build a streak of 2.
+        let s1 = detector.add_response("same text");
+        assert_eq!(s1.consecutive_count, 1);
+        let s2 = detector.add_response("same text");
+        assert_eq!(s2.consecutive_count, 2);
+
+        // A dissimilar response breaks the streak and resets to 1.
+        let s3 = detector.add_response("completely different content here");
+        assert_eq!(
+            s3.consecutive_count, 1,
+            "dissimilar response should reset streak"
+        );
+
+        // Another similar-to-immediately-previous response starts fresh.
+        let s4 = detector.add_response("completely different content here");
+        assert_eq!(s4.consecutive_count, 2);
+    }
+
+    #[test]
+    fn test_alternating_responses_never_converge() {
+        // The streak must only compare against the *immediately previous*
+        // response, not any similar response in the window.  Alternating
+        // A / B / A / B should never build a streak longer than 1.
+        let config = ConvergenceConfig {
+            window_size: 3,
+            similarity_threshold: 0.5,
+            ..Default::default()
+        };
+        let mut detector = ConvergenceDetector::new(config).unwrap();
+
+        detector.add_response("alpha alpha alpha");
+        detector.add_response("beta beta beta");
+        detector.add_response("alpha alpha alpha");
+        detector.add_response("beta beta beta");
+        detector.add_response("alpha alpha alpha");
+
+        // Even though "alpha" appeared 3 times, they were never consecutive,
+        // so the streak should never reach window_size.
+        let status = detector.check_convergence();
+        assert!(
+            !status.detected,
+            "alternating responses must not trigger convergence"
+        );
+        assert!(
+            status.consecutive_count <= 1,
+            "alternating responses should not build a streak"
+        );
+    }
+
+    #[test]
+    fn test_similar_after_gap_starts_fresh_streak() {
+        // A, A (streak=2), B (streak resets to 1), A (streak=1, NOT 3)
+        let config = ConvergenceConfig {
+            window_size: 3,
+            similarity_threshold: 0.5,
+            ..Default::default()
+        };
+        let mut detector = ConvergenceDetector::new(config).unwrap();
+
+        detector.add_response("same text");
+        let s2 = detector.add_response("same text");
+        assert_eq!(s2.consecutive_count, 2);
+
+        detector.add_response("totally different stuff");
+
+        // "same text" again — similar to the *previous* response? No.
+        // Previous was "totally different stuff", so streak should be 1.
+        let s4 = detector.add_response("same text");
+        assert_eq!(
+            s4.consecutive_count, 1,
+            "similar response after a gap should start a fresh streak"
+        );
+    }
+
+    #[test]
+    fn test_converge_then_break_then_re_converge() {
+        let config = ConvergenceConfig {
+            window_size: 3,
+            similarity_threshold: 0.5,
+            ..Default::default()
+        };
+        let mut detector = ConvergenceDetector::new(config).unwrap();
+
+        // Build to convergence.
+        detector.add_response("loop loop loop");
+        detector.add_response("loop loop loop");
+        let s3 = detector.add_response("loop loop loop");
+        assert!(s3.detected);
+
+        // Break the streak.
+        let s4 = detector.add_response("something entirely new and different");
+        assert!(!s4.detected);
+
+        // Build back up — need 3 consecutive again, not just 1 more.
+        let s5 = detector.add_response("something entirely new and different");
+        assert!(!s5.detected, "only 2 consecutive so far");
+
+        let s6 = detector.add_response("something entirely new and different");
+        assert!(s6.detected, "3 consecutive of the new response");
     }
 
     #[test]

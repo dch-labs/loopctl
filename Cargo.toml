@@ -8,7 +8,7 @@ repository = "https://github.com/dch-labs/loopctl"
 homepage = "https://github.com/dch-labs/loopctl"
 documentation = "https://docs.rs/loopctl"
 keywords = ["agent", "framework", "llm", "loop"]
-categories = ["agent", "development-tools"]
+categories = ["api-bindings", "development-tools"]
 readme = "README.md"
 rust-version = "1.85"
 
@@ -23,8 +23,13 @@ serde_json = "1"
 serde_repr = "0.1"
 thiserror = "2"
 tokio = { version = "1.52.3", features = ["sync", "macros", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
+
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
+async-stream = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -36,6 +41,32 @@ hooks = []
 testing = []
 tool_health = []
 tool_shield = ["tool_health"]
+
+# Providers
+providers = ["dep:reqwest", "dep:async-stream"]
+openai = ["providers"]
+anthropic = ["providers"]
+ollama = ["providers", "openai"]
+deepseek = ["providers", "openai"]
+grok = ["providers", "openai"]
+gemini = ["providers"]
+zai = ["providers", "anthropic"]
+
+[[example]]
+name = "hello-cli"
+required-features = ["testing"]
+
+[[example]]
+name = "repl-cli"
+required-features = ["testing"]
+
+[[example]]
+name = "echo-tool-cli"
+required-features = ["testing"]
+
+[[example]]
+name = "chat"
+required-features = ["testing", "providers"]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

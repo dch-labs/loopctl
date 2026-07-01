@@ -5,9 +5,10 @@
 //! (retry, timeout, fallback). Otherwise, uses basic inline logic.
 
 use super::{
-    AgentError, ApiClient, BareLoop, Message, StreamAccumulator, StreamEvent, StreamStopReason,
+    ApiClient, BareLoop, LoopError, Message, StreamAccumulator, StreamEvent, StreamStopReason,
     Usage,
 };
+use crate::capabilities::StreamCapable;
 use crate::stream::handler::{StreamHandler, StreamHandlerError};
 use futures::StreamExt;
 
@@ -38,19 +39,26 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentError::Api`] if any stream event is an error.
-    /// Returns [`AgentError::Cancelled`] if the cancellation signal fires mid-stream.
+    /// Returns [`LoopError::Api`] if any stream event is an error.
+    /// Returns [`LoopError::Cancelled`] if the cancellation signal fires mid-stream.
     pub(super) async fn stream_turn(
         &self,
-    ) -> Result<(Message, Option<Usage>, StreamStopReason), AgentError> {
+    ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
         // Delegate to StreamHandler if configured.
-        if let Some(ref handler) = self.stream_handler {
+        if let Some(handler) = self.managers.stream_handler() {
             return self.stream_turn_via_handler(handler).await;
         }
 
         // Inline streaming (no handler).
         let system = self.config.system_prompt.clone();
         let tool_schemas = self.build_tool_schemas();
+        // Clone the conversation history for the API request. The `ApiClient`
+        // trait requires `'static` streams (it takes ownership of the
+        // messages), so a clone is unavoidable here. The in-memory clone is
+        // O(n) in the number of messages but is typically dwarfed by the
+        // cost of serialising the messages into an HTTP request body. For
+        // very long sessions (>200 turns with large tool outputs), consider
+        // enabling auto-compaction to bound the history size.
         let mut stream =
             self.client
                 .stream_messages(self.conversation.clone(), system, tool_schemas);
@@ -60,12 +68,20 @@ impl<C: ApiClient> BareLoop<C> {
             let event_result = tokio::select! {
                 event = stream.next() => event,
                 () = self.cancelled.notified() => {
-                    return Err(AgentError::Cancelled);
+                    return Err(LoopError::Cancelled);
                 }
             };
 
             match event_result {
                 Some(Ok(event)) => {
+                    // Fire text streaming callback for real-time display.
+                    if let Some(ref streamer) = self.text_streamer {
+                        if let StreamEvent::IndexedDelta(indexed_delta) = &event {
+                            if let crate::stream::DeltaPart::Text { text } = &indexed_delta.delta {
+                                streamer(text);
+                            }
+                        }
+                    }
                     if let StreamEvent::MessageDelta(delta) = &event {
                         if let Some(ref reason_str) = delta.delta.stop_reason {
                             stop_reason =
@@ -74,10 +90,10 @@ impl<C: ApiClient> BareLoop<C> {
                     }
                     accumulator
                         .process(&event)
-                        .map_err(|e| AgentError::Api(format!("stream accumulation error: {e}")))?;
+                        .map_err(|e| LoopError::Api(format!("stream accumulation error: {e}")))?;
                 }
                 Some(Err(api_error)) => {
-                    return Err(AgentError::Api(api_error.to_string()));
+                    return Err(LoopError::Api(api_error.to_string()));
                 }
                 None => break,
             }
@@ -99,15 +115,15 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Errors
     ///
     /// Maps [`StreamHandlerError`] variants to the appropriate
-    /// [`AgentError`] variants:
-    /// - [`Cancelled`](StreamHandlerError::Cancelled) → [`AgentError::Cancelled`]
-    /// - [`InitFailed`](StreamHandlerError::InitFailed) → [`AgentError::Api`]
-    /// - [`StreamFailed`](StreamHandlerError::StreamFailed) → [`AgentError::Api`]
-    /// - [`FallbackFailed`](StreamHandlerError::FallbackFailed) → [`AgentError::Api`]
+    /// [`LoopError`] variants:
+    /// - [`Cancelled`](StreamHandlerError::Cancelled) → [`LoopError::Cancelled`]
+    /// - [`InitFailed`](StreamHandlerError::InitFailed) → [`LoopError::Api`]
+    /// - [`StreamFailed`](StreamHandlerError::StreamFailed) → [`LoopError::Api`]
+    /// - [`FallbackFailed`](StreamHandlerError::FallbackFailed) → [`LoopError::Api`]
     async fn stream_turn_via_handler(
         &self,
         handler: &StreamHandler,
-    ) -> Result<(Message, Option<Usage>, StreamStopReason), AgentError> {
+    ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
         let system = self.config.system_prompt.clone();
         let tool_schemas = self.build_tool_schemas();
         let result = handler
@@ -123,25 +139,25 @@ impl<C: ApiClient> BareLoop<C> {
         Ok((result.message, result.usage, result.stop_reason))
     }
 
-    /// Map a [`StreamHandlerError`] to an [`AgentError`].
+    /// Map a [`StreamHandlerError`] to an [`LoopError`].
     ///
     /// Preserves cancellation semantics —
-    /// [`StreamHandlerError::Cancelled`] maps to [`AgentError::Cancelled`].
-    /// All other variants map to [`AgentError::Api`] with a descriptive
+    /// [`StreamHandlerError::Cancelled`] maps to [`LoopError::Cancelled`].
+    /// All other variants map to [`LoopError::Api`] with a descriptive
     /// message.
-    fn map_handler_error(error: StreamHandlerError) -> AgentError {
+    fn map_handler_error(error: StreamHandlerError) -> LoopError {
         match error {
-            StreamHandlerError::Cancelled => AgentError::Cancelled,
+            StreamHandlerError::Cancelled => LoopError::Cancelled,
             StreamHandlerError::InitFailed(outcome) => {
-                AgentError::Api(format!("stream init failed: {outcome}"))
+                LoopError::Api(format!("stream init failed: {outcome}"))
             }
             StreamHandlerError::StreamFailed(outcome) => {
-                AgentError::Api(format!("stream failed: {outcome}"))
+                LoopError::Api(format!("stream failed: {outcome}"))
             }
             StreamHandlerError::FallbackFailed {
                 stream_outcome,
                 fallback_error,
-            } => AgentError::Api(format!(
+            } => LoopError::Api(format!(
                 "stream ({stream_outcome}) and fallback failed: {fallback_error}"
             )),
         }

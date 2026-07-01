@@ -45,7 +45,7 @@
 //! );
 //! ```
 
-use crate::api_error::ApiError;
+use crate::api::error::ApiError;
 use crate::stream::StreamEvent;
 use futures::Stream;
 use std::pin::Pin;
@@ -197,7 +197,7 @@ impl HeartbeatConfig {
 ///
 /// `HeartbeatStream` implements `Stream` directly, so it composes with
 /// any other stream wrapper. Use it on any stream you've already opened
-/// when you just need heartbeat/timeout without the full handler lifecycle.
+/// when you need heartbeat/timeout without the full handler lifecycle.
 ///
 /// # Example
 ///
@@ -253,12 +253,19 @@ impl<S> HeartbeatStream<S> {
     /// );
     /// // let stream = HeartbeatStream::new(inner_stream, config);
     /// ```
-    #[allow(clippy::arithmetic_side_effects)]
     pub fn new(inner: S, config: HeartbeatConfig) -> Self {
+        /// 30 years in seconds — used as a far-future deadline fallback.
+        /// Computed as a const so the compiler verifies no overflow.
+        const THIRTY_YEARS_SECS: u64 = 86400 * 365 * 30;
+
         let now = Instant::now();
         // checked_add returns None only for extreme Duration values (hundreds of years).
-        // Fallback: Instant::now() + 30 years, which is effectively infinite.
-        let far_future = || Instant::now() + Duration::from_secs(86400 * 365 * 30);
+        // Fallback: 30 years from now, which is effectively infinite.
+        let far_future = || {
+            Instant::now()
+                .checked_add(Duration::from_secs(THIRTY_YEARS_SECS))
+                .unwrap_or(Instant::now())
+        };
         let deadline = now.checked_add(config.timeout).unwrap_or_else(far_future);
         let timeout_sleep = Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
             deadline,
@@ -419,7 +426,7 @@ mod tests {
         };
         let mut stream = HeartbeatStream::new(inner, config);
 
-        stream.last_heartbeat = Instant::now() - Duration::from_secs(1);
+        stream.last_heartbeat = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
         let waker = futures::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -439,12 +446,11 @@ mod tests {
         // setting start into the past, then poll.
         let callbacks: std::sync::Arc<std::sync::Mutex<Vec<HeartbeatData>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let cb = callbacks.clone();
         let config = HeartbeatConfig::new(
             Duration::from_millis(10),
             Duration::from_millis(1),
             Box::new(move |data: HeartbeatData| {
-                cb.lock().unwrap().push(data);
+                callbacks.lock().unwrap().push(data);
             }),
         );
 
@@ -453,7 +459,7 @@ mod tests {
         let mut stream = HeartbeatStream::new(inner, config);
 
         // Manually set start into the past so timeout has elapsed.
-        stream.start = Instant::now() - Duration::from_secs(10);
+        stream.start = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
 
         // Use a no-op waker to poll manually.
         let waker = futures::task::noop_waker();

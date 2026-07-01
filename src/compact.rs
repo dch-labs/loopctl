@@ -1,8 +1,8 @@
 //! Context management and compaction for agent conversations.
 //!
 //! As conversations grow, they approach the model's context window limit.
-//! This module provides the infrastructure to detect when compaction is
-//! needed and to carry it out through a pluggable strategy.
+//! Infrastructure to detect when compaction is needed and to carry it out
+//! through a pluggable strategy.
 //!
 //! # Architecture
 //!
@@ -15,19 +15,19 @@
 //!   approach.
 //!
 //! ```text
-//! ┌───────────────────────────────┐
-//! │       ContextManager          │
-//! │                               │
-//! │  estimate_tokens()            │
-//! │  should_compact()             │
-//! │  ensure_context_fits()        │
-//! │          │                    │
-//! │          ▼                    │
-//! │  ┌──────────────────────┐     │
-//! │  │  dyn ContextCompactor│     │
-//! │  │  .compact()          │     │
-//! │  └──────────────────────┘     │
-//! └───────────────────────────────┘
+//! ┌────────────────────────────┐
+//! │       ContextManager       │
+//! │                            │
+//! │     estimate_tokens()      │
+//! │     should_compact()       │
+//! │     ensure_context_fits()  │
+//! │             │              │
+//! │             ▼              │
+//! │  ┌──────────────────────┐  │
+//! │  │  dyn ContextCompactor│  │
+//! │  │  .compact()          │  │
+//! │  └──────────────────────┘  │
+//! └────────────────────────────┘
 //! ```
 //!
 //! # Provided Compactors
@@ -71,12 +71,21 @@
 //! [`ContextManager`]. When present, it checks token usage after each turn
 //! and triggers compaction automatically when usage exceeds the threshold.
 
-use crate::message::{Message, Role};
+use crate::message::{Message, MessagePart, Role};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
+
+pub mod truncating;
+pub mod types;
+
+pub use truncating::{SplitResult, TokenSplitter, TruncatingCompactor};
+pub use types::{
+    CompactReason, CompactTelemetry, CompactionContext, CompactionOutcome, ContextOverflow,
+    EnsureContextResult, PostCompactStats, PreCompactStats,
+};
 
 // ===================================================
 // ContextCompactor trait
@@ -150,7 +159,6 @@ pub trait ContextCompactor: Send + Sync {
     /// * `target_tokens` — The target token count for the compacted output.
     /// * `context` — Metadata about the compaction trigger.
     // The return-type boxing is required for object safety.
-    #[allow(clippy::type_complexity)]
     fn compact(
         &self,
         messages: Vec<Message>,
@@ -160,565 +168,55 @@ pub trait ContextCompactor: Send + Sync {
 }
 
 // ===================================================
-// CompactionContext
+// CompactBase
 // ===================================================
 
-/// Metadata passed to [`ContextCompactor::compact`] describing the
-/// compaction trigger and current state.
+/// Determines the base used to calculate the compaction target.
 ///
-/// Compactors can use this information to decide how aggressively to
-/// compact — e.g. an emergency compaction may use more aggressive
-/// summarization than a routine threshold check.
-#[derive(Debug, Clone)]
-pub struct CompactionContext {
-    /// Estimated token count before compaction.
-    pub tokens_before: u64,
-    /// Why compaction was triggered.
-    pub reason: CompactReason,
-    /// The model's context window size.
-    pub context_window: u64,
-    /// The current turn number in the session.
-    pub turn: usize,
-}
-
-// ===================================================
-// CompactReason
-// ===================================================
-
-/// Why compaction was triggered.
+/// When compaction triggers, the manager asks the compactor to reduce
+/// the conversation to some target token count. This enum controls
+/// *what* that target is a percentage *of*:
 ///
-/// Different triggers may warrant different compaction strategies.
-/// For example, an [`Emergency`](CompactReason::Emergency) compaction
-/// should be more aggressive than a routine threshold check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompactReason {
-    /// Token usage exceeded the configured threshold percentage.
-    ThresholdExceeded,
-    /// Token usage is dangerously close to the context window limit.
-    Emergency,
-    /// Compaction was explicitly requested (e.g. by the agent or a tool).
-    Manual,
-}
-
-impl fmt::Display for CompactReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ThresholdExceeded => write!(f, "threshold exceeded"),
-            Self::Emergency => write!(f, "emergency"),
-            Self::Manual => write!(f, "manual"),
-        }
-    }
-}
-
-// ===================================================
-// CompactionOutcome
-// ===================================================
-
-/// Result of a single compaction pass.
+/// - [`Threshold`](CompactBase::Threshold): the target is a percentage
+///   of the trigger threshold (`context_window × threshold`).
+/// - [`Context`](CompactBase::Context): the target is a percentage
+///   of the full context window.
 ///
-/// Returned by [`ContextCompactor::compact`], this struct contains the
-/// compacted message list along with telemetry data about what happened.
-#[derive(Debug, Clone)]
-pub struct CompactionOutcome {
-    /// The compacted message list.
-    pub messages: Vec<Message>,
-    /// How many messages were removed by compaction.
-    pub messages_compacted: usize,
-    /// Estimated token count after compaction.
-    pub tokens_after: u64,
-    /// Estimated tokens saved by compaction.
-    pub tokens_saved: u64,
-    /// Whether compaction succeeded.
-    pub success: bool,
-    /// Error message if compaction failed.
-    pub error: Option<String>,
-}
-
-impl CompactionOutcome {
-    /// Create an outcome representing no change (compaction was not needed).
-    ///
-    /// Use this when the compactor decides the messages don't need
-    /// compaction — e.g. when the message count is below the minimum.
-    #[must_use]
-    pub fn no_change(messages: Vec<Message>) -> Self {
-        let tokens = Self::estimate_tokens(&messages);
-        Self {
-            messages,
-            messages_compacted: 0,
-            tokens_after: tokens,
-            tokens_saved: 0,
-            success: true,
-            error: None,
-        }
-    }
-
-    /// Create an outcome representing successful compaction.
-    #[must_use]
-    pub fn compacted(messages: Vec<Message>, tokens_before: u64, tokens_after: u64) -> Self {
-        Self {
-            messages_compacted: 0, // caller should set
-            tokens_saved: tokens_before.saturating_sub(tokens_after),
-            messages,
-            tokens_after,
-            success: true,
-            error: None,
-        }
-    }
-
-    /// Estimate the token count for a slice of messages.
-    ///
-    /// Uses the standard 4-chars-per-token heuristic. This is the same
-    /// heuristic used by [`ContextManager::estimate_tokens`].
-    #[must_use]
-    pub fn estimate_tokens(messages: &[Message]) -> u64 {
-        ContextManager::estimate_tokens(messages)
-    }
-}
-
-// ===================================================
-// CompactTelemetry
-// ===================================================
-
-/// Telemetry data for a single compaction operation.
-///
-/// Produced by [`ContextManager::ensure_context_fits`] when compaction
-/// occurs. Observers receive this via
-/// [`on_compaction`](crate::core::AgentObserver::on_compaction).
-#[derive(Debug, Clone)]
-pub struct CompactTelemetry {
-    /// Why compaction was triggered.
-    pub trigger: CompactReason,
-    /// Conversation stats before compaction.
-    pub pre_compact: PreCompactStats,
-    /// Conversation stats after compaction.
-    pub post_compact: PostCompactStats,
-    /// Wall-clock duration of the compaction.
-    pub duration: std::time::Duration,
-}
-
-/// Conversation statistics captured before compaction.
-#[derive(Debug, Clone)]
-pub struct PreCompactStats {
-    /// Total number of messages in the conversation.
-    pub total_messages: usize,
-    /// Estimated token count.
-    pub estimated_tokens: u64,
-    /// Number of user-role messages.
-    pub user_messages: usize,
-    /// Number of assistant-role messages.
-    pub assistant_messages: usize,
-    /// Number of messages containing tool calls or results.
-    pub tool_messages: usize,
-}
-
-/// Conversation statistics captured after compaction.
-#[derive(Debug, Clone)]
-pub struct PostCompactStats {
-    /// Total number of messages after compaction.
-    pub total_messages: usize,
-    /// Estimated token count after compaction.
-    pub estimated_tokens: u64,
-    /// Tokens removed by compaction.
-    pub tokens_saved: u64,
-    /// Percentage of tokens saved (0–100).
-    pub percent_saved: u8,
-}
-
-// ===================================================
-// TruncatingCompactor
-// ===================================================
-
-/// A simple compactor that drops the oldest messages.
-///
-/// Keeps the first message (typically the system prompt) and a configurable
-/// number of recent messages. No LLM calls required — useful as a fallback
-/// or for contexts where summarization isn't available.
-///
-/// # Strategy
-///
-/// ```text
-/// [System?] [Old₁, Old₂, ..., Oldₙ] [Recent₁, Recent₂, ..., Recentₘ]
-///  ↑ kept   ↑ discarded ↑            ↑ preserved ↑
-/// ```
-///
-/// The first message is always retained (if present) because it usually
-/// contains the system prompt or conversation instructions. This prevents
-/// the compactor from discarding essential context that shapes the agent's
-/// behavior. If the conversation is shorter than `min_messages`, no
-/// compaction occurs.
+/// The percentage itself is configured via
+/// [`with_compact_target_pct`](ContextManager::with_compact_target_pct).
 ///
 /// # Example
 ///
 /// ```rust
-/// use loopctl::compact::TruncatingCompactor;
+/// use loopctl::compact::{CompactBase, ContextManager, TruncatingCompactor};
 /// use std::sync::Arc;
 ///
-/// let compactor = TruncatingCompactor::new()
-///     .with_preserve_recent(6)
-///     .with_min_messages(8);
-///
-/// // Pass to ContextManager:
-/// // let manager = ContextManager::new(Arc::new(compactor));
+/// let compactor = TruncatingCompactor::new();
+/// let manager = ContextManager::new(Arc::new(compactor))
+///     .with_context_window(200_000)
+///     .with_threshold(0.80)                // triggers at 160k tokens
+///     .with_compact_target(CompactBase::Context)   // target = % of 200k
+///     .with_compact_target_pct(0.50);      // compact to 50% of 200k = 100k
 /// ```
-#[derive(Debug, Clone)]
-pub struct TruncatingCompactor {
-    /// Number of recent messages to always preserve.
-    preserve_recent: usize,
-    /// Minimum messages before compaction is considered.
-    min_messages: usize,
-}
-
-impl TruncatingCompactor {
-    /// Create a new truncating compactor with sensible defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompactBase {
+    /// Target is a percentage of the full context window.
     ///
-    /// Defaults:
+    /// `target = context_window × compact_target_pct`
     ///
-    /// | Setting           | Default |
-    /// |-------------------|---------|
-    /// | `preserve_recent` | 4       |
-    /// | `min_messages`    | 6       |
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            preserve_recent: 4,
-            min_messages: 6,
-        }
-    }
+    /// Use this when you want compaction to aim for a fixed fraction
+    /// of the model's total capacity regardless of the trigger threshold.
+    Context,
 
-    /// Set how many recent messages to preserve during compaction.
+    /// Target is a percentage of the trigger threshold.
     ///
-    /// This many messages from the end of the conversation are kept
-    /// intact. The rest are dropped. Must be at least 1.
-    #[must_use]
-    pub fn with_preserve_recent(mut self, count: usize) -> Self {
-        self.preserve_recent = count.max(1);
-        self
-    }
-
-    /// Set the minimum number of messages before compaction is attempted.
+    /// `target = compact_threshold_tokens × compact_target_pct`
     ///
-    /// If the conversation has fewer messages than this, compaction is
-    /// skipped entirely. Prevents aggressive truncation of short
-    /// conversations.
-    #[must_use]
-    pub fn with_min_messages(mut self, count: usize) -> Self {
-        self.min_messages = count.max(2);
-        self
-    }
-
-    /// Number of recent messages that will be preserved.
-    #[must_use]
-    pub fn preserve_recent(&self) -> usize {
-        self.preserve_recent
-    }
-
-    /// Minimum messages before compaction is attempted.
-    #[must_use]
-    pub fn min_messages(&self) -> usize {
-        self.min_messages
-    }
-}
-
-impl Default for TruncatingCompactor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ContextCompactor for TruncatingCompactor {
-    fn compact(
-        &self,
-        messages: Vec<Message>,
-        _target_tokens: u64,
-        context: CompactionContext,
-    ) -> Pin<Box<dyn Future<Output = CompactionOutcome> + Send + '_>> {
-        Box::pin(async move {
-            let total = messages.len();
-            if total <= self.min_messages {
-                return CompactionOutcome::no_change(messages);
-            }
-
-            // Determine split point: keep `preserve_recent` from the end.
-            let split = total.saturating_sub(self.preserve_recent);
-            let recent: Vec<Message> = messages.get(split..).unwrap_or_default().to_vec();
-
-            // Always preserve the first message (typically the system prompt)
-            // unless it is already included in the recent slice (split == 0).
-            let preserved = if split > 0 {
-                if let Some(first) = messages.first() {
-                    let mut v = vec![first.clone()];
-                    v.extend(recent);
-                    v
-                } else {
-                    recent
-                }
-            } else {
-                // split == 0 means recent already contains all messages.
-                recent
-            };
-
-            let tokens_after = CompactionOutcome::estimate_tokens(&preserved);
-            let messages_compacted = total.saturating_sub(preserved.len());
-
-            CompactionOutcome {
-                messages: preserved,
-                messages_compacted,
-                tokens_after,
-                tokens_saved: context.tokens_before.saturating_sub(tokens_after),
-                success: true,
-                error: None,
-            }
-        })
-    }
-}
-
-// ===================================================
-// TokenSplitter
-// ===================================================
-
-/// Splits a conversation into "old" and "recent" at a turn boundary.
-///
-/// Used by compactors (and agent-side code) that need to know which
-/// messages to compact versus preserve. Splits at role transitions for
-/// coherent summarization — the split always occurs between a complete
-/// request/response pair.
-///
-/// # Rules
-///
-/// - Never compact the last user message (it's the current request).
-/// - Split at turn boundaries (role transitions) for coherent output.
-/// - If the conversation is too short, `to_compact` will be empty.
-///
-/// # Example
-///
-/// ```rust
-/// use loopctl::compact::TokenSplitter;
-/// use loopctl::message::Message;
-///
-/// let splitter = TokenSplitter::new()
-///     .with_preserve_recent(4)
-///     .with_min_messages(6);
-///
-/// let messages = vec![
-///     Message::user("Hello"),
-///     Message::assistant("Hi there!"),
-///     Message::user("What is 2+2?"),
-///     Message::assistant("4"),
-/// ];
-///
-/// let result = splitter.split(&messages);
-/// // With only 4 messages and min_messages=6, nothing is split off.
-/// assert!(result.to_compact.is_empty());
-/// assert_eq!(result.preserved.len(), 4);
-/// ```
-#[derive(Debug, Clone)]
-pub struct TokenSplitter {
-    /// Number of recent messages to always preserve.
-    preserve_recent: usize,
-    /// Minimum messages before considering a split.
-    min_messages: usize,
-}
-
-/// Result of splitting a conversation into old and recent portions.
-#[derive(Debug, Clone)]
-pub struct SplitResult {
-    /// Messages to compact or summarize (the "old" part).
-    pub to_compact: Vec<Message>,
-    /// Messages to preserve as-is (the "recent" part).
-    pub preserved: Vec<Message>,
-    /// Estimated tokens in `to_compact`.
-    pub compact_tokens: u64,
-    /// Estimated tokens in `preserved`.
-    pub preserved_tokens: u64,
-    /// The index in the original message list where the split occurred.
-    pub split_index: usize,
-}
-
-impl TokenSplitter {
-    /// Create a new splitter with sensible defaults.
-    ///
-    /// Defaults:
-    ///
-    /// | Setting           | Default |
-    /// |-------------------|---------|
-    /// | `preserve_recent` | 4       |
-    /// | `min_messages`    | 6       |
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            preserve_recent: 4,
-            min_messages: 6,
-        }
-    }
-
-    /// Set how many recent messages to preserve.
-    #[must_use]
-    pub fn with_preserve_recent(mut self, count: usize) -> Self {
-        self.preserve_recent = count.max(1);
-        self
-    }
-
-    /// Set the minimum messages before splitting is considered.
-    #[must_use]
-    pub fn with_min_messages(mut self, count: usize) -> Self {
-        self.min_messages = count.max(2);
-        self
-    }
-
-    /// Split the given messages into old and recent portions.
-    ///
-    /// The split point is chosen at a turn boundary (a role transition
-    /// from assistant to user) as close as possible to leaving
-    /// `preserve_recent` messages in the recent portion.
-    ///
-    /// If the conversation has fewer than `min_messages`, the entire
-    /// conversation goes into `preserved` and `to_compact` is empty.
-    #[must_use]
-    pub fn split(&self, messages: &[Message]) -> SplitResult {
-        if messages.len() <= self.min_messages {
-            return SplitResult {
-                to_compact: vec![],
-                preserved: messages.to_vec(),
-                compact_tokens: 0,
-                preserved_tokens: ContextManager::estimate_tokens(messages),
-                split_index: 0,
-            };
-        }
-
-        // Find a split point: we want `preserve_recent` messages at the end.
-        // Look for a turn boundary (assistant→user transition) near the
-        // target split point.
-        let target_split = messages.len().saturating_sub(self.preserve_recent);
-        let split_index = Self::find_turn_boundary(messages, target_split);
-        let (to_compact, preserved) = messages.split_at(split_index);
-        SplitResult {
-            to_compact: to_compact.to_vec(),
-            preserved: preserved.to_vec(),
-            compact_tokens: ContextManager::estimate_tokens(to_compact),
-            preserved_tokens: ContextManager::estimate_tokens(preserved),
-            split_index,
-        }
-    }
-
-    /// Find the nearest turn boundary at or before the target index.
-    ///
-    /// A turn boundary is a position where the previous message is
-    /// assistant-role and the next is user-role. This ensures we split
-    /// at a coherent conversation boundary.
-    fn find_turn_boundary(messages: &[Message], target: usize) -> usize {
-        if target == 0 {
-            return 0;
-        }
-
-        // Search backwards from target for an assistant→user transition.
-        for i in (1..=target).rev() {
-            if i < messages.len() {
-                let Some(prev) = messages.get(i.saturating_sub(1)) else {
-                    continue;
-                };
-                let Some(curr) = messages.get(i) else {
-                    continue;
-                };
-                let prev_is_assistant = prev.role == Role::Assistant;
-                let curr_is_user = curr.role == Role::User;
-                if prev_is_assistant && curr_is_user {
-                    return i;
-                }
-            }
-        }
-
-        // Fallback: no clean boundary found, split at target.
-        target
-    }
-}
-
-impl Default for TokenSplitter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ===================================================
-// ContextOverflow error
-// ===================================================
-
-/// Error returned when the conversation cannot fit within the context
-/// window, even after compaction.
-///
-/// This is a terminal condition — the conversation is too large and the
-/// compactor was unable to reduce it sufficiently.
-#[derive(Debug, Clone)]
-pub struct ContextOverflow {
-    /// Estimated token count of the conversation.
-    pub tokens_used: u64,
-    /// The model's context window size.
-    pub context_window: u64,
-    /// How many messages were in the conversation.
-    pub message_count: usize,
-    /// The reason compaction was attempted.
-    pub trigger: CompactReason,
-    /// Error from the compactor, if compaction was attempted.
-    pub compactor_error: Option<String>,
-}
-
-impl ContextOverflow {
-    /// How many tokens the conversation exceeds the window by.
-    #[must_use]
-    pub fn overflow(&self) -> u64 {
-        self.tokens_used.saturating_sub(self.context_window)
-    }
-
-    /// The fraction of the context window used (0.0–1.0+).
-    #[must_use]
-    pub fn utilization(&self) -> f64 {
-        if self.context_window == 0 {
-            return f64::INFINITY;
-        }
-        f64::from(u32::try_from(self.tokens_used).unwrap_or(u32::MAX))
-            / f64::from(u32::try_from(self.context_window).unwrap_or(u32::MAX))
-    }
-}
-
-impl fmt::Display for ContextOverflow {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "context overflow: {} tokens used of {} window ({} messages, {} overflow)",
-            self.tokens_used,
-            self.context_window,
-            self.message_count,
-            self.overflow()
-        )
-    }
-}
-
-impl std::error::Error for ContextOverflow {}
-
-// ===================================================
-// EnsureContextResult
-// ===================================================
-
-/// Result of [`ContextManager::ensure_context_fits`].
-///
-/// Tells the caller whether compaction occurred and provides the
-/// (possibly compacted) message list.
-#[derive(Debug, Clone)]
-pub enum EnsureContextResult {
-    /// Compaction occurred and produced a shorter message list.
-    Compacted(CompactionOutcome),
-    /// No compaction was needed; messages returned as-is.
-    NoAction(Vec<Message>),
-}
-
-impl EnsureContextResult {
-    /// Extract the message list from this result, regardless of variant.
-    #[must_use]
-    pub fn into_messages(self) -> Vec<Message> {
-        match self {
-            Self::Compacted(outcome) => outcome.messages,
-            Self::NoAction(messages) => messages,
-        }
-    }
+    /// This is the default. With the default `threshold = 0.80` and
+    /// `compact_target_pct = 0.70`, compaction targets 56% of the
+    /// context window (0.80 × 0.70 = 0.56).
+    #[default]
+    Threshold,
 }
 
 // ===================================================
@@ -727,14 +225,14 @@ impl EnsureContextResult {
 
 /// Manages context window usage and triggers compaction when needed.
 ///
-/// This is the main entry point for context management. It monitors
+/// Main entry point for context management. It monitors
 /// token usage, checks thresholds, and delegates to a pluggable
 /// [`ContextCompactor`] when compaction is needed.
 ///
 /// # Token Estimation
 ///
 /// Token counts are *estimates* using a 4-chars-per-token heuristic.
-/// This is deliberately simple — the goal is to trigger compaction
+/// Deliberately simple — the goal is to trigger compaction
 /// *before* hitting the actual limit, not to be perfectly accurate.
 /// Production systems should calibrate against their model's actual
 /// tokenizer.
@@ -771,6 +269,10 @@ pub struct ContextManager {
     threshold: f64,
     /// Whether auto-compaction is enabled.
     auto_compact: bool,
+    /// The base used to compute the compaction target.
+    compact_base: CompactBase,
+    /// The fraction (0.0–1.0) of the target base to compact down to.
+    compact_target: f64,
 }
 
 impl ContextManager {
@@ -778,11 +280,13 @@ impl ContextManager {
     ///
     /// Defaults:
     ///
-    /// | Setting          | Default |
-    /// |------------------|---------|
-    /// | `context_window` | 200_000 |
-    /// | `threshold`      | 0.80    |
-    /// | `auto_compact`   | `true`  |
+    /// | Setting              | Default                      |
+    /// |----------------------|------------------------------|
+    /// | `context_window`     | 200_000                      |
+    /// | `threshold`          | 0.80                         |
+    /// | `auto_compact`       | `true`                       |
+    /// | `compact_target`     | [`CompactBase::Threshold`] |
+    /// | `compact_target_pct` | 0.70                         |
     #[must_use]
     pub fn new(compactor: Arc<dyn ContextCompactor>) -> Self {
         Self {
@@ -790,10 +294,15 @@ impl ContextManager {
             context_window: 200_000,
             threshold: 0.80,
             auto_compact: true,
+            compact_base: CompactBase::Threshold,
+            compact_target: 0.70,
         }
     }
 
     /// Set the model's context window size.
+    ///
+    /// Determines the upper bound on estimated tokens the manager
+    /// will allow before triggering compaction.
     #[must_use]
     pub fn with_context_window(mut self, tokens: u64) -> Self {
         self.context_window = tokens;
@@ -810,46 +319,119 @@ impl ContextManager {
     }
 
     /// Set whether auto-compaction is enabled.
+    ///
+    /// When disabled, [`should_compact`](Self::should_compact) always
+    /// returns `false` and [`ensure_context_fits`](Self::ensure_context_fits)
+    /// will never trigger compaction.
     #[must_use]
     pub fn with_auto_compact(mut self, enabled: bool) -> Self {
         self.auto_compact = enabled;
         self
     }
 
+    /// Set the base used to compute the compaction target.
+    ///
+    /// See [`CompactBase`] for details. Defaults to
+    /// [`CompactBase::Threshold`].
+    #[must_use]
+    pub fn with_compact_target(mut self, target: CompactBase) -> Self {
+        self.compact_base = target;
+        self
+    }
+
+    /// Set the fraction (0.0–1.0) of the target base to compact down to.
+    ///
+    /// Clamped to `[0.1, 1.0]` to prevent degenerate configurations.
+    /// Defaults to `0.70` (70%).
+    #[must_use]
+    pub fn with_compact_target_pct(mut self, pct: f64) -> Self {
+        self.compact_target = pct.clamp(0.1, 1.0);
+        self
+    }
+
     /// The model's context window size in tokens.
+    ///
+    /// This is the upper limit the manager uses to decide when compaction
+    /// is necessary. See [`with_context_window`](Self::with_context_window).
     #[must_use]
     pub fn context_window(&self) -> u64 {
         self.context_window
     }
 
     /// The compaction threshold (0.0–1.0).
+    ///
+    /// Compaction triggers when estimated tokens reach
+    /// `context_window * threshold`. See [`with_threshold`](Self::with_threshold).
     #[must_use]
     pub fn threshold(&self) -> f64 {
         self.threshold
     }
 
     /// Whether auto-compaction is enabled.
+    ///
+    /// When `false`, the manager never triggers compaction automatically.
+    /// See [`with_auto_compact`](Self::with_auto_compact).
     #[must_use]
     pub fn auto_compact(&self) -> bool {
         self.auto_compact
     }
 
+    /// The base used to compute the compaction target.
+    ///
+    /// See [`CompactBase`] and [`with_compact_target`](Self::with_compact_target).
+    #[must_use]
+    pub fn compact_target(&self) -> CompactBase {
+        self.compact_base
+    }
+
+    /// The fraction (0.0–1.0) of the target base to compact down to.
+    ///
+    /// See [`with_compact_target_pct`](Self::with_compact_target_pct).
+    #[must_use]
+    pub fn compact_target_pct(&self) -> f64 {
+        self.compact_target
+    }
+
     /// The token budget at which compaction triggers.
     ///
-    /// Equal to `context_window * threshold`.
+    /// Equal to `context_window * threshold`. The result is always
+    /// non-negative (percentage × positive count), so the f64→u64
+    /// cast is safe in practice.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     pub fn compact_threshold_tokens(&self) -> u64 {
-        let threshold =
-            self.threshold * f64::from(u32::try_from(self.context_window).unwrap_or(u32::MAX));
-        threshold as u64
+        (self.threshold * self.context_window as f64) as u64
+    }
+
+    /// The token count to compact down to.
+    ///
+    /// Computed from [`compact_target`](Self::compact_target) and
+    /// [`compact_target_pct`](Self::compact_target_pct):
+    ///
+    /// - [`CompactBase::Threshold`]: `compact_threshold_tokens × pct`
+    /// - [`CompactBase::Context`]: `context_window × pct`
+    #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    pub fn compact_target_tokens(&self) -> u64 {
+        let base: u64 = match self.compact_base {
+            CompactBase::Threshold => self.compact_threshold_tokens(),
+            CompactBase::Context => self.context_window,
+        };
+        (self.compact_target * base as f64) as u64
     }
 
     /// Estimate the token count for a slice of messages.
     ///
     /// Uses a 4-chars-per-token heuristic based on the text content
-    /// of all message parts. This is deliberately conservative — it
-    /// overestimates rather than underestimates.
+    /// of all message parts. Conservative — overestimates rather than underestimates.
     ///
     /// The estimation:
     /// - Counts text content from all parts (text, tool calls, tool results).
@@ -865,15 +447,15 @@ impl ContextManager {
                 let part_chars: u64 = m
                     .parts
                     .iter()
-                    .map(|part| match part {
-                        crate::message::MessagePart::Text { text } => text.len() as u64,
-                        crate::message::MessagePart::Image { .. } => 256, // rough base64 estimate
-                        crate::message::MessagePart::ToolCall { name, input, .. } => {
+                    .map(|p| match p {
+                        MessagePart::Text { text } => text.chars().count() as u64,
+                        MessagePart::Image { .. } => 256, // rough base64 estimate
+                        MessagePart::ToolCall { name, input, .. } => {
                             let name_len = name.len() as u64;
                             let input_len = input.to_string().len() as u64;
                             name_len.saturating_add(input_len)
                         }
-                        crate::message::MessagePart::ToolResult { output, .. } => match output {
+                        MessagePart::ToolResult { output, .. } => match output {
                             crate::message::ToolContent::Text(s) => s.len() as u64,
                             crate::message::ToolContent::Multipart(parts) => parts
                                 .iter()
@@ -909,6 +491,9 @@ impl ContextManager {
     }
 
     /// Check whether usage is in the emergency zone (>95% of window).
+    ///
+    /// Emergency compaction is more aggressive because the context is
+    /// dangerously close to overflowing the model's window.
     #[must_use]
     pub fn is_emergency(&self, used_tokens: u64) -> bool {
         let emergency_line = self.context_window.saturating_mul(19) / 20; // 95%
@@ -916,6 +501,9 @@ impl ContextManager {
     }
 
     /// Determine the compaction reason for the given token count.
+    ///
+    /// Returns [`CompactReason::Emergency`] when usage exceeds 95% of
+    /// the window, or [`CompactReason::ThresholdExceeded`] otherwise.
     #[must_use]
     pub fn compact_reason(&self, used_tokens: u64) -> CompactReason {
         if self.is_emergency(used_tokens) {
@@ -927,7 +515,7 @@ impl ContextManager {
 
     /// Ensure the conversation fits within the context window.
     ///
-    /// This is the main entry point called by the agent loop after each
+    /// Main entry point called by the agent loop after each
     /// turn. It:
     ///
     /// 1. Estimates the current token usage.
@@ -945,14 +533,14 @@ impl ContextManager {
         turn: usize,
     ) -> Result<EnsureContextResult, ContextOverflow> {
         let tokens_before = Self::estimate_tokens(&messages);
-        let message_count = messages.len();
 
         if !self.should_compact(tokens_before) {
             return Ok(EnsureContextResult::NoAction(messages));
         }
 
+        let message_count = messages.len();
         let reason = self.compact_reason(tokens_before);
-        let target_tokens = self.compact_threshold_tokens().saturating_mul(7) / 10; // compact to 70% of threshold
+        let target_tokens = self.compact_target_tokens();
         let context = CompactionContext {
             tokens_before,
             reason,
@@ -974,9 +562,8 @@ impl ContextManager {
             });
         }
 
-        // Verify the compactor actually reduced the context.
         let tokens_after = Self::estimate_tokens(&outcome.messages);
-        if tokens_after > self.context_window && self.is_emergency(tokens_after) {
+        if tokens_after > self.context_window {
             return Err(ContextOverflow {
                 tokens_used: tokens_after,
                 context_window: self.context_window,
@@ -1003,16 +590,13 @@ impl ContextManager {
         turn: usize,
     ) -> Result<EnsureContextResult, ContextOverflow> {
         let tokens_before = Self::estimate_tokens(&messages);
-        let message_count = messages.len();
 
         if messages.is_empty() {
             return Ok(EnsureContextResult::NoAction(messages));
         }
 
-        let target_tokens = self
-            .compact_threshold_tokens()
-            .saturating_mul(7)
-            .saturating_div(10);
+        let message_count = messages.len();
+        let target_tokens = self.compact_target_tokens();
         let context = CompactionContext {
             tokens_before,
             reason: CompactReason::Manual,
@@ -1031,6 +615,16 @@ impl ContextManager {
                 message_count,
                 trigger: CompactReason::Manual,
                 compactor_error: outcome.error,
+            });
+        }
+
+        if outcome.tokens_after > self.context_window {
+            return Err(ContextOverflow {
+                tokens_used: outcome.tokens_after,
+                context_window: self.context_window,
+                message_count,
+                trigger: CompactReason::Manual,
+                compactor_error: None,
             });
         }
 
@@ -1084,9 +678,10 @@ impl ContextManager {
                 tool_messages: pre_messages
                     .iter()
                     .filter(|m| {
-                        m.parts
-                            .iter()
-                            .any(crate::message::MessagePart::is_tool_call)
+                        m.parts.iter().any(|p| {
+                            crate::message::MessagePart::is_tool_call(p)
+                                || crate::message::MessagePart::is_tool_result(p)
+                        })
                     })
                     .count(),
             },
@@ -1105,8 +700,10 @@ impl fmt::Debug for ContextManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ContextManager")
             .field("context_window", &self.context_window)
-            .field("threshold", &self.threshold)
+            .field("threshold", &self.threshold())
             .field("auto_compact", &self.auto_compact)
+            .field("compact_target", &self.compact_base)
+            .field("compact_target_pct", &self.compact_target)
             .finish_non_exhaustive()
     }
 }
@@ -1251,6 +848,64 @@ mod tests {
         assert_eq!(manager.compact_threshold_tokens(), 160_000);
     }
 
+    #[test]
+    fn test_compact_target_tokens_default() {
+        // Default: CompactBase::Threshold with pct 0.70
+        // threshold = 200_000 * 0.80 = 160_000
+        // target   = 160_000 * 0.70 = 112_000
+        let compactor = TruncatingCompactor::new();
+        let manager = ContextManager::new(Arc::new(compactor))
+            .with_context_window(200_000)
+            .with_threshold(0.80);
+        assert_eq!(manager.compact_target_tokens(), 112_000);
+    }
+
+    #[test]
+    fn test_compact_target_tokens_context_base() {
+        // CompactBase::Context with pct 0.50
+        // target = 200_000 * 0.50 = 100_000
+        let compactor = TruncatingCompactor::new();
+        let manager = ContextManager::new(Arc::new(compactor))
+            .with_context_window(200_000)
+            .with_threshold(0.80)
+            .with_compact_target(CompactBase::Context)
+            .with_compact_target_pct(0.50);
+        assert_eq!(manager.compact_target_tokens(), 100_000);
+    }
+
+    #[test]
+    fn test_compact_target_tokens_threshold_base() {
+        // CompactBase::Threshold with pct 0.50
+        // threshold = 200_000 * 0.80 = 160_000
+        // target   = 160_000 * 0.50 = 80_000
+        let compactor = TruncatingCompactor::new();
+        let manager = ContextManager::new(Arc::new(compactor))
+            .with_context_window(200_000)
+            .with_threshold(0.80)
+            .with_compact_target(CompactBase::Threshold)
+            .with_compact_target_pct(0.50);
+        assert_eq!(manager.compact_target_tokens(), 80_000);
+    }
+
+    #[test]
+    fn test_compact_target_pct_clamped() {
+        let compactor = TruncatingCompactor::new();
+        let manager = ContextManager::new(Arc::new(compactor)).with_compact_target_pct(0.01);
+        assert!((manager.compact_target_pct() - 0.1).abs() < f64::EPSILON);
+
+        let compactor2 = TruncatingCompactor::new();
+        let manager2 = ContextManager::new(Arc::new(compactor2)).with_compact_target_pct(2.0);
+        assert!((manager2.compact_target_pct() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compact_target_default_is_threshold() {
+        let compactor = TruncatingCompactor::new();
+        let manager = ContextManager::new(Arc::new(compactor));
+        assert_eq!(manager.compact_target(), CompactBase::Threshold);
+        assert!((manager.compact_target_pct() - 0.70).abs() < f64::EPSILON);
+    }
+
     #[tokio::test]
     async fn test_truncating_compactor_no_change() {
         let compactor = TruncatingCompactor::new()
@@ -1266,7 +921,6 @@ mod tests {
         let outcome = compactor.compact(msgs.clone(), 500, context).await;
         assert!(outcome.success);
         assert_eq!(outcome.messages.len(), msgs.len());
-        assert_eq!(outcome.messages_compacted, 0);
     }
 
     #[tokio::test]
@@ -1287,10 +941,9 @@ mod tests {
         assert!(outcome.success);
         // 1 (first/system prompt) + 2 (preserve_recent) = 3 messages preserved.
         assert_eq!(outcome.messages.len(), 3);
-        assert_eq!(outcome.messages_compacted, 17);
         assert!(outcome.tokens_saved > 0);
         // Verify the first message was preserved.
-        assert!(outcome.messages.first().is_some());
+        assert!(!outcome.messages.is_empty());
         assert_eq!(outcome.messages.first().unwrap().role, first_role.unwrap());
     }
 
@@ -1426,7 +1079,6 @@ mod tests {
         let post = make_conversation(2);
         let outcome = CompactionOutcome {
             messages: post.clone(),
-            messages_compacted: 16,
             tokens_after: 100,
             tokens_saved: 800,
             success: true,
@@ -1481,7 +1133,6 @@ mod tests {
         assert!(outcome.success);
         assert_eq!(outcome.tokens_after, 400);
         assert_eq!(outcome.tokens_saved, 600); // 1000 - 400
-        assert_eq!(outcome.messages_compacted, 0); // caller sets
         assert!(outcome.error.is_none());
     }
 

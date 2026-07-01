@@ -1,6 +1,6 @@
 //! Tool Safety Shield — multi-turn adversarial defense.
 //!
-//! This module provides the [`ToolSafetyShield`] trait — a generic,
+//! [`ToolSafetyShield`] trait — a generic,
 //! platform-agnostic boundary for evaluating tool call safety — and a
 //! reference [`UnixShield`] implementation that matches dangerous Unix
 //! shell patterns.
@@ -356,18 +356,14 @@ impl UnixShield {
         }
     }
 
-    /// Create a shield with custom thresholds.
+    /// Set custom warn and block thresholds.
     ///
     /// Values are clamped to `[0.0, 1.0]`.
     #[must_use]
-    pub fn with_thresholds(warn: f32, block: f32) -> Self {
-        Self {
-            warn_threshold: warn.clamp(0.0, 1.0),
-            block_threshold: block.clamp(0.0, 1.0),
-            turn_history: Mutex::new(Vec::new()),
-            patterns: Self::unix_patterns(),
-            combination_rules: Self::unix_combination_rules(),
-        }
+    pub fn with_thresholds(mut self, warn: f32, block: f32) -> Self {
+        self.warn_threshold = warn.clamp(0.0, 1.0);
+        self.block_threshold = block.clamp(0.0, 1.0);
+        self
     }
 
     /// Create a builder for a shield with custom patterns and rules.
@@ -810,10 +806,6 @@ mod tests {
         }
     }
 
-    // ===================================================
-    // NullShield tests
-    // ===================================================
-
     #[test]
     fn null_shield_allows_everything() {
         let shield = NullShield;
@@ -824,12 +816,9 @@ mod tests {
 
     #[test]
     fn null_shield_default_trait() {
-        let _shield = NullShield::default();
+        let shield = NullShield;
+        let _ = &shield;
     }
-
-    // ===================================================
-    // UnixShield tests
-    // ===================================================
 
     #[test]
     fn unix_shield_allows_safe_command() {
@@ -902,7 +891,10 @@ mod tests {
 
         let eval_ctx = ctx("Read", json!({ "path": "/tmp/data" }), 2);
         let combo = shield.assess_combination(&eval_ctx);
-        assert_eq!(combo, 0.0, "reversed order should not match");
+        assert!(
+            (combo - 0.0).abs() < f32::EPSILON,
+            "reversed order should not match"
+        );
 
         // Now test correct order: Write first, then Bash(chmod +x) as the
         // current call.
@@ -918,10 +910,6 @@ mod tests {
         let combo2 = shield2.assess_combination(&eval_ctx2);
         assert!(combo2 > 0.0, "correct order should match");
     }
-
-    // ===================================================
-    // Builder tests
-    // ===================================================
 
     #[test]
     fn builder_blank_has_no_patterns() {
@@ -969,10 +957,6 @@ mod tests {
     fn builder_default_trait() {
         let _builder = UnixShieldBuilder::default();
     }
-
-    // ===================================================
-    // Type tests
-    // ===================================================
 
     #[test]
     fn risk_level_display() {

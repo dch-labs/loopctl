@@ -5,7 +5,7 @@
 //! file focuses on orchestration rather than message wrangling.
 
 use super::{
-    ApiClient, BareLoop, Message, MessagePart, Role, ToolCallInfo, ToolContext, ToolDispatchResult,
+    ApiClient, BareLoop, Message, MessagePart, Role, ToolCall, ToolContext, ToolDispatchResult,
     ToolSchema,
 };
 
@@ -29,18 +29,18 @@ impl<C: ApiClient> BareLoop<C> {
     /// Extract tool call information from a message.
     ///
     /// Scans the message's [`MessagePart`]s for `ToolCall` variants and
-    /// maps each one to a [`ToolCallInfo`] containing the call ID, tool
+    /// maps each one to a [`ToolCall`] containing the call ID, tool
     /// name, and JSON input. Non-`ToolCall` parts are silently skipped.
     ///
     /// Returns an empty `Vec` when the message contains no tool calls
     /// (i.e. the model ended with plain text).
-    pub(super) fn extract_tool_calls(msg: &Message) -> Vec<ToolCallInfo> {
+    pub(super) fn extract_tool_calls(msg: &Message) -> Vec<ToolCall> {
         msg.parts
             .iter()
             .filter_map(|part| match part {
-                MessagePart::ToolCall { id, name, input } => Some(ToolCallInfo {
+                MessagePart::ToolCall { id, name, input } => Some(ToolCall {
                     id: id.clone(),
-                    name: name.clone(),
+                    tool: name.clone(),
                     input: input.clone(),
                 }),
                 _ => None,

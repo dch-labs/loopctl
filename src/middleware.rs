@@ -1099,26 +1099,38 @@ mod tests {
 
         let result = pipeline.invoke(test_ctx("multipart")).await;
         assert!(!result.is_error);
-        // Each text part in the multipart result should be individually
-        // truncated. "part1" (5 chars > 3) → "par\n[truncated]".
+        // The shared character budget (3) is consumed by the first text
+        // part. "part1" (5 chars > 3) → "par\n[truncated]", remaining=0.
+        // "part2" gets zero remaining budget → "[truncated]".
         match result.output {
             ToolContent::Multipart(parts) => {
                 assert_eq!(parts.len(), 2, "should still have 2 parts");
-                for (i, part) in parts.iter().enumerate() {
-                    match part {
-                        ToolContentPart::Text { text } => {
-                            assert!(
-                                text.contains("[truncated]"),
-                                "part {i} should be truncated: got {text:?}"
-                            );
-                            assert!(
-                                text.starts_with("par"),
-                                "part {i} should start with first 3 chars: got {text:?}"
-                            );
-                        }
-                        ToolContentPart::Image { .. } => {
-                            panic!("unexpected image part in MultipartTool output");
-                        }
+                // Part 0 consumes the entire budget.
+                match &parts[0] {
+                    ToolContentPart::Text { text } => {
+                        assert!(
+                            text.starts_with("par"),
+                            "part 0 should start with first 3 chars: got {text:?}"
+                        );
+                        assert!(
+                            text.contains("[truncated]"),
+                            "part 0 should be truncated: got {text:?}"
+                        );
+                    }
+                    ToolContentPart::Image { .. } => {
+                        panic!("unexpected image part in MultipartTool output");
+                    }
+                }
+                // Part 1 gets zero remaining budget.
+                match &parts[1] {
+                    ToolContentPart::Text { text } => {
+                        assert_eq!(
+                            text, "[truncated]",
+                            "part 1 should be fully truncated with zero budget: got {text:?}"
+                        );
+                    }
+                    ToolContentPart::Image { .. } => {
+                        panic!("unexpected image part in MultipartTool output");
                     }
                 }
             }
@@ -1314,5 +1326,178 @@ mod tests {
         assert_eq!(result.resolved_tool_name, "bash");
         assert_eq!(result.duration, Duration::from_millis(99));
         assert!(!result.is_error);
+    }
+
+    /// A tool that returns 3 text parts, each individually under the limit
+    /// but collectively exceeding it.
+    struct ThreePartTextTool;
+
+    impl Tool for ThreePartTextTool {
+        fn name(&self) -> &'static str {
+            "three_part_text"
+        }
+
+        fn description(&self) -> &'static str {
+            "Returns 3 short text parts"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: self.name().to_string(),
+                description: self.description().to_string(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(ToolOutput {
+                    payload: ToolContent::Multipart(vec![
+                        ToolContentPart::Text {
+                            text: "aaaa".to_string(),
+                        },
+                        ToolContentPart::Text {
+                            text: "bbbb".to_string(),
+                        },
+                        ToolContentPart::Text {
+                            text: "cccc".to_string(),
+                        },
+                    ]),
+                    is_error: false,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn output_limit_multipart_shared_budget_truncates_later_parts() {
+        // max_chars = 6: part 0 (4) fits, leaving 2.
+        // Part 1 (4 > 2) → "bb\n[truncated]". Part 2 → 0 remaining.
+        let mut registry = ToolRegistry::new();
+        registry.register(ThreePartTextTool);
+        let pipeline = ToolPipeline::builder()
+            .with(OutputLimitMiddleware::new(6))
+            .core(Arc::new(registry))
+            .build()
+            .expect("valid");
+
+        let result = pipeline.invoke(test_ctx("three_part_text")).await;
+        assert!(!result.is_error);
+
+        match result.output {
+            ToolContent::Multipart(parts) => {
+                assert_eq!(parts.len(), 3);
+                match &parts[0] {
+                    ToolContentPart::Text { text } => {
+                        assert_eq!(text, "aaaa", "part 0 should be unmodified");
+                    }
+                    ToolContentPart::Image { .. } => panic!("expected Text part 0"),
+                }
+                match &parts[1] {
+                    ToolContentPart::Text { text } => {
+                        assert!(
+                            text.starts_with("bb"),
+                            "part 1 should start with 2 chars: got {text:?}"
+                        );
+                        assert!(
+                            text.contains("[truncated]"),
+                            "part 1 should be truncated: got {text:?}"
+                        );
+                    }
+                    ToolContentPart::Image { .. } => panic!("expected Text part 1"),
+                }
+                match &parts[2] {
+                    ToolContentPart::Text { text } => {
+                        assert_eq!(
+                            text, "[truncated]",
+                            "part 2 should be fully truncated: got {text:?}"
+                        );
+                    }
+                    ToolContentPart::Image { .. } => panic!("expected Text part 2"),
+                }
+            }
+            ToolContent::Text(t) => panic!("expected Multipart, got Text({t})"),
+        }
+    }
+
+    #[tokio::test]
+    async fn output_limit_multipart_shared_budget_all_fit() {
+        // max_chars = 20: all three 4-char parts (12 total) fit.
+        let mut registry = ToolRegistry::new();
+        registry.register(ThreePartTextTool);
+        let pipeline = ToolPipeline::builder()
+            .with(OutputLimitMiddleware::new(20))
+            .core(Arc::new(registry))
+            .build()
+            .expect("valid");
+
+        let result = pipeline.invoke(test_ctx("three_part_text")).await;
+        assert!(!result.is_error);
+
+        match result.output {
+            ToolContent::Multipart(parts) => {
+                assert_eq!(parts.len(), 3);
+                for (i, part) in parts.iter().enumerate() {
+                    match part {
+                        ToolContentPart::Text { text } => {
+                            assert!(
+                                !text.contains("[truncated]"),
+                                "part {i} should not be truncated: got {text:?}"
+                            );
+                        }
+                        ToolContentPart::Image { .. } => panic!("expected Text part {i}"),
+                    }
+                }
+            }
+            ToolContent::Text(t) => panic!("expected Multipart, got Text({t})"),
+        }
+    }
+
+    #[tokio::test]
+    async fn output_limit_multipart_shared_budget_exactly_consumed() {
+        // max_chars = 8: parts 0+1 (4+4) exactly consume the budget.
+        // Part 2 → 0 remaining → "[truncated]".
+        let mut registry = ToolRegistry::new();
+        registry.register(ThreePartTextTool);
+        let pipeline = ToolPipeline::builder()
+            .with(OutputLimitMiddleware::new(8))
+            .core(Arc::new(registry))
+            .build()
+            .expect("valid");
+
+        let result = pipeline.invoke(test_ctx("three_part_text")).await;
+        assert!(!result.is_error);
+
+        match result.output {
+            ToolContent::Multipart(parts) => {
+                assert_eq!(parts.len(), 3);
+                match &parts[0] {
+                    ToolContentPart::Text { text } => {
+                        assert_eq!(text, "aaaa", "part 0 unmodified");
+                    }
+                    ToolContentPart::Image { .. } => panic!("expected Text part 0"),
+                }
+                match &parts[1] {
+                    ToolContentPart::Text { text } => {
+                        assert_eq!(text, "bbbb", "part 1 unmodified");
+                    }
+                    ToolContentPart::Image { .. } => panic!("expected Text part 1"),
+                }
+                match &parts[2] {
+                    ToolContentPart::Text { text } => {
+                        assert_eq!(
+                            text, "[truncated]",
+                            "part 2 should be fully truncated: got {text:?}"
+                        );
+                    }
+                    ToolContentPart::Image { .. } => panic!("expected Text part 2"),
+                }
+            }
+            ToolContent::Text(t) => panic!("expected Multipart, got Text({t})"),
+        }
     }
 }

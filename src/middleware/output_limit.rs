@@ -63,12 +63,21 @@ impl ToolMiddleware for OutputLimitMiddleware {
                     }
                 }
                 ToolContent::Multipart(ref mut parts) => {
+                    let mut remaining = max_chars;
                     for part in parts.iter_mut() {
                         if let ToolContentPart::Text { text } = part {
                             let char_count = text.chars().count();
-                            if char_count > max_chars {
-                                let truncated: String = text.chars().take(max_chars).collect();
-                                *text = format!("{truncated}\n[truncated]");
+                            if char_count > remaining {
+                                if remaining == 0 {
+                                    text.clear();
+                                    text.push_str("[truncated]");
+                                } else {
+                                    let truncated: String = text.chars().take(remaining).collect();
+                                    *text = format!("{truncated}\n[truncated]");
+                                }
+                                remaining = 0;
+                            } else {
+                                remaining = remaining.saturating_sub(char_count);
                             }
                         }
                     }

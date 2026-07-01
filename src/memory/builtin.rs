@@ -76,7 +76,7 @@ use std::sync::{PoisonError, RwLock};
 /// [`InMemoryStore`] is `Send + Sync`. Interior mutability is handled via
 /// an internal `RwLock`, so `store` and `consolidate` only require `&self`.
 /// This allows the store to be shared via `Arc<InMemoryStore>` or
-/// `Arc<dyn LoopMemory>` across tasks without external locking.
+/// `Arc<InMemoryStore>` across tasks without external locking.
 ///
 /// # Construction
 ///
@@ -248,8 +248,10 @@ impl LoopMemory for InMemoryStore {
             let query_words: Vec<&str> = query_lower.split_whitespace().collect();
 
             let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
-            let mut scored: Vec<(f32, MemoryEntry)> = entries
-                .iter()
+            let snapshot: Vec<MemoryEntry> = entries.iter().cloned().collect();
+            drop(entries);
+            let mut scored: Vec<(f32, MemoryEntry)> = snapshot
+                .into_iter()
                 .map(|entry| {
                     let memory_lower = entry.memory.to_lowercase();
                     let tag_match = entry
@@ -270,7 +272,7 @@ impl LoopMemory for InMemoryStore {
                     let tag_bonus = if tag_match { 0.3 } else { 0.0 };
                     (
                         base_score * 0.5 + query_bonus * 0.4 + tag_bonus + 0.1,
-                        entry.clone(),
+                        entry,
                     )
                 })
                 .collect();
@@ -452,5 +454,66 @@ mod tests {
     async fn test_default_is_empty() {
         let store = InMemoryStore::default();
         assert!(store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_retrieve_does_not_block_writers() {
+        // Populate enough entries to make scoring non-trivial.
+        let store = InMemoryStore::new();
+        for i in 0..200 {
+            store
+                .store(MemoryEntry::new(
+                    MemoryCategory::Fact,
+                    format!("Fact number {i} about concurrency"),
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Start a retrieve future (it will be polled once we await below).
+        let retrieve_fut = store.retrieve("concurrency", 5);
+
+        // While retrieve is pending, a store should succeed without timing
+        // out — if the read lock were still held during scoring this would
+        // deadlock or at least block until retrieve completes.
+        let store_fut = store.store(MemoryEntry::new(
+            MemoryCategory::Insight,
+            "writer proceeds concurrently",
+        ));
+
+        // Drive both to completion.
+        let (retrieved, store_res) = tokio::join!(retrieve_fut, store_fut);
+        let retrieved = retrieved.unwrap();
+        store_res.unwrap();
+
+        assert!(retrieved.len() <= 5);
+        assert_eq!(store.len(), 201); // 200 originals + 1 concurrent store
+    }
+
+    #[tokio::test]
+    async fn test_retrieve_ranking_preserved() {
+        let store = InMemoryStore::new();
+
+        let mut high = MemoryEntry::new(MemoryCategory::Insight, "rust rust rust rust");
+        high.relevance = 0.95;
+
+        let mut mid = MemoryEntry::new(MemoryCategory::Fact, "rust rust rust");
+        mid.relevance = 0.5;
+
+        let mut low = MemoryEntry::new(MemoryCategory::Working, "rust rust");
+        low.relevance = 0.1;
+
+        store.store(low.clone()).await.unwrap();
+        store.store(high.clone()).await.unwrap();
+        store.store(mid.clone()).await.unwrap();
+
+        let results = store.retrieve("rust", 3).await.unwrap();
+        assert_eq!(results.len(), 3);
+
+        // Entries should come back ordered by descending score.  The
+        // highest-relevance entry must be first and the lowest last.
+        assert!((results[0].relevance - 0.95).abs() < 1e-6);
+        assert!((results[1].relevance - 0.5).abs() < 1e-6);
+        assert!((results[2].relevance - 0.1).abs() < 1e-6);
     }
 }

@@ -51,7 +51,7 @@ pub use context::{
 ///
 /// Observers are registered via [`LoopRuntime`](crate::runtime::LoopRuntime) and called at each
 /// lifecycle point in registration order. All methods are **notification-only** — they
-/// return `()`. Use the [hook system](crate::hooks) if you need to control
+/// return `()`. Use the hook system (requires `hooks` feature) if you need to control
 /// flow (block/allow actions).
 ///
 /// All methods have default no-op implementations. Override only the callbacks you need.
@@ -106,7 +106,7 @@ pub trait LoopObserver: Send + Sync {
     /// Called before a tool is dispatched.
     ///
     /// Notification-only — cannot block or modify the tool call.
-    /// Use the [hook system](crate::hooks) for flow control.
+    /// Use the hook system (requires `hooks` feature) for flow control.
     fn on_tool_pre(&self, _ctx: &ToolPreContext) {}
 
     /// Called after a tool completes execution.
@@ -159,7 +159,7 @@ pub trait LoopObserver: Send + Sync {
 /// Holds registered observers and dispatches notifications to each.
 ///
 /// Observers run in registration order. All observers are always notified —
-/// there is no short-circuiting (use the [hook system](crate::hooks) for flow control).
+/// there is no short-circuiting (use the hook system, requires `hooks` feature, for flow control).
 ///
 /// An empty host (no observers registered) is effectively zero-cost:
 /// each notification call iterates an empty `Vec`.

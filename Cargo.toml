@@ -82,3 +82,7 @@ match_same_arms = "deny"
 redundant_clone = "deny"
 clone_on_ref_ptr = "deny"
 let_underscore_must_use = "deny"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

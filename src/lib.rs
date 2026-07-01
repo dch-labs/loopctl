@@ -21,7 +21,7 @@
 //! - **[`stream`]** — Streaming event types for LLM API responses.
 //! - **[`middleware`]** — Tool dispatch middleware pipeline (timeouts, permissions, output limits).
 //! - **[`tool`]** — Tool trait, registry, and supporting types.
-//! - **[`tool::health`]** — Per-tool health monitoring, circuit breakers, and self-healing routing. *Requires `tool_health` feature.*
+//! - **`tool::health`** — Per-tool health monitoring, circuit breakers, and self-healing routing. *Requires `tool_health` feature.*
 //!
 //! ## API Layer
 //!
@@ -39,8 +39,8 @@
 //! ## Support
 //!
 //! - **[`memory::builtin`]** — Reference [`InMemoryStore`](memory::builtin::InMemoryStore) implementation.
-//! - **[`hooks`]** — Bidirectional lifecycle control (allow/block/ask before tool use, compaction). *Requires `hooks` feature.*
-//! - **[`testing`]** — Test utilities and fixtures. *Requires `testing` feature.*
+//! - **hooks** — Bidirectional lifecycle control (allow/block/ask before tool use, compaction). *Requires `hooks` feature.*
+//! - **testing** — Test utilities and fixtures. *Requires `testing` feature.*
 
 // Relax strict lints in test code. The crate enforces a strict no-panic /
 // no-unwrap policy in production code, but test code legitimately uses

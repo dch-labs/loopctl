@@ -18,9 +18,9 @@
 //! | [`FallbackCapable`]      | Circuit-breaker fallback to alternate models     |
 //! | [`Compactable`]          | Automatic context compaction when tokens exceed  |
 //! | [`StreamCapable`]        | Resilient streaming with retries and timeouts    |
-//! | [`Hookable`]             | Bidirectional hooks that can block actions       |
+//! | `Hookable`               | Bidirectional hooks that can block actions       |
 //! | [`PipelineAware`]        | Dispatch tools through a middleware pipeline     |
-//! | [`HealthTrackable`]      | Per-tool health tracking with circuit breakers   |
+//! | `HealthTrackable`        | Per-tool health tracking with circuit breakers   |
 //!
 //! # `LoopRuntime`
 //!
@@ -117,9 +117,9 @@ pub use crate::capabilities::*;
 /// - [`FallbackCapable`] — via the internal [`FallbackManager`]
 /// - [`Compactable`] — via an optional [`ContextManager`]
 /// - [`StreamCapable`] — via an optional [`StreamHandler`]
-/// - [`Hookable`] — via an optional [`HookExecutor`] **
+/// - `Hookable` — via an optional `HookExecutor` *(requires `hooks` feature)*
 /// - [`PipelineAware`] — via an optional [`ToolPipeline`]
-/// - [`HealthTrackable`] — via an optional [`ToolHealthRegistry`] *(requires `tool_health` feature)*
+/// - `HealthTrackable` — via an optional `ToolHealthRegistry` *(requires `tool_health` feature)*
 ///
 /// # Reset
 ///

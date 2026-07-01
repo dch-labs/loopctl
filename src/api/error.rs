@@ -1284,12 +1284,14 @@ mod tests {
 
     #[test]
     fn test_result_type() {
-        #[allow(clippy::unnecessary_wraps)]
-        fn returns_result() -> super::Result<String> {
+        fn ok_path() -> super::Result<String> {
             Ok("success".to_string())
         }
-        let result = returns_result();
-        assert_eq!(result.unwrap(), "success");
+        fn err_path() -> super::Result<String> {
+            Err(ApiError::other("failure"))
+        }
+        assert_eq!(ok_path().unwrap(), "success");
+        assert!(err_path().is_err());
     }
 
     #[test]

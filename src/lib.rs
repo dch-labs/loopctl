@@ -54,6 +54,8 @@
         clippy::panic,
         clippy::indexing_slicing,
         clippy::missing_panics_doc,
+        clippy::missing_errors_doc,
+        clippy::unnecessary_wraps,
         clippy::clone_on_ref_ptr,
         clippy::doc_markdown,
         clippy::field_reassign_with_default,

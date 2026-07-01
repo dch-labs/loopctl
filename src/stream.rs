@@ -1,6 +1,6 @@
 //! Streaming event types for LLM API responses.
 //!
-//! This module defines the types used when consuming Server-Sent Events
+//! Types used when consuming Server-Sent Events
 //! (SSE) based streaming responses from LLM APIs. The core [`StreamEvent`]
 //! enum represents each discrete event in the stream lifecycle, while
 //! [`StreamAccumulator`] collects those events into a complete [`Message`].
@@ -8,7 +8,7 @@
 //! Streaming allows the framework to process model output incrementally —
 //! displaying text as it arrives, detecting tool invocations as soon as
 //! the part starts, and reporting token usage without waiting for the
-//! full response. This is essential for responsive agent behavior.
+//! full response. Essential for responsive agent behavior.
 //!
 //! # Stream Lifecycle
 //!
@@ -73,6 +73,7 @@ pub mod heartbeat;
 /// handled correctly — for example, when accumulated tool-call JSON
 /// is malformed at [`PartStop`](StreamEvent::PartStop) time.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StreamError {
     /// The concatenated tool-call input JSON could not be parsed.
     ///
@@ -483,8 +484,8 @@ pub enum DeltaPart {
 
 /// Reason why the model stopped generating tokens.
 ///
-/// This is the streaming / API-level stop reason returned by the LLM
-/// provider in the [`MessageDelta`] event. It differs from the
+/// Streaming / API-level stop reason returned by the LLM
+/// provider in the [`MessageDelta`] event. Differs from the
 /// agent-level `StopReason` which is used in `TurnResult`.
 ///
 /// Use [`should_continue_tool_loop`](Self::should_continue_tool_loop)
@@ -509,6 +510,7 @@ pub enum DeltaPart {
 /// assert!(!reason.should_continue_tool_loop());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum StreamStopReason {
     /// The model decided to invoke a tool.
     ///
@@ -524,20 +526,20 @@ pub enum StreamStopReason {
     /// The response was truncated. The caller may want to request
     /// continuation or increase the token budget.
     ///
-    /// *Note: `AgentConfig` will be available once the builder module is complete.*
+    /// *Note: `LoopConfig` will be available once the builder module is complete.*
     MaxTokens,
 
     /// The model hit a configured stop sequence.
     ///
     /// The response ended because it matched one of the stop
-    /// sequences provided in the request. This is uncommon in
+    /// sequences provided in the request. Uncommon in
     /// typical agent usage.
     StopSequence,
 
     /// The model completed its turn naturally.
     ///
     /// The model finished generating its response without hitting
-    /// any limits or invoking tools. This is the normal end-of-turn
+    /// any limits or invoking tools. Normal end-of-turn
     /// signal for non-tool responses.
     EndTurn,
 }
@@ -670,7 +672,7 @@ pub struct MessageDelta {
     ///
     /// `Some` when the API reports usage; `None` if usage data
     /// is not available or not yet received. See [`Usage`].
-    /// This is typically populated in the final `MessageDelta` event
+    /// Typically populated in the final `MessageDelta` event
     /// and reflects cumulative token consumption for the entire request.
     pub usage: Option<Usage>,
 }
@@ -818,7 +820,7 @@ impl Usage {
 
 /// Accumulates streaming events into a complete [`Message`].
 ///
-/// This is a stateful builder that tracks the progress of a streaming
+/// Stateful builder that tracks the progress of a streaming
 /// response as [`StreamEvent`]s arrive and assembles the final
 /// [`Message`] once all events have been processed.
 ///
@@ -826,27 +828,6 @@ impl Usage {
 /// call [`build`](Self::build) to consume the accumulator and produce
 /// the final message. Token usage can be retrieved at any time via
 /// [`usage`](Self::usage).
-///
-/// # State Machine
-///
-/// ```text
-///                            MessageStart
-/// ┌───────┐  ────────────▶  ┌─────────────┐
-/// │ Idle  │                 │   Started   │
-/// └───────┘                 └──────┬──────┘
-///                        PartStart │ PartEnd
-///                            ┌─────▼──────┐
-///                            │ Receiving  │
-///                            │   Part     │
-///                            └─────┬──────┘
-///                     IndexedDelta │
-///                            (accumulate)
-///                                  │
-///                     MessageDelta │
-///                       ┌──────────▼──────────┐
-///                       │      Complete       │──▶ build()
-///                       └─────────────────────┘
-/// ```
 ///
 /// # Example
 ///
@@ -1026,13 +1007,12 @@ impl StreamAccumulator {
                 Ok(())
             }
             StreamEvent::IndexedDelta(delta) => {
-                debug_assert_eq!(
-                    self.current_index,
-                    Some(delta.index),
-                    "IndexedDelta index mismatch: expected {:?}, got {}",
-                    self.current_index,
-                    delta.index,
-                );
+                // Gracefully ignore deltas whose index doesn't match the
+                // current part — this can happen with malformed SSE or
+                // provider-specific quirks.
+                if self.current_index != Some(delta.index) {
+                    return Ok(());
+                }
                 match &delta.delta {
                     DeltaPart::Text { text } => {
                         self.current_text.push_str(text);
@@ -1155,11 +1135,6 @@ impl StreamAccumulator {
 mod tests {
     use super::*;
 
-    /// Verify that [`StreamStopReason::from_api_str`] parses all known API
-    /// strings and returns `None` for unknown values.
-    ///
-    /// Tests `"tool_call"`, `"max_tokens"`, `"end_turn"`, `"stop_sequence"`,
-    /// and `"unknown"`.
     #[test]
     fn test_stream_stop_reason_from_api_str() {
         assert_eq!(
@@ -1181,11 +1156,6 @@ mod tests {
         assert_eq!(StreamStopReason::from_api_str("unknown"), None);
     }
 
-    /// Verify that [`StreamStopReason::to_api_str`] produces the correct
-    /// static string for each variant.
-    ///
-    /// Ensures the round-trip `from_api_str(s) == Some(v)` implies
-    /// `v.to_api_str() == s`.
     #[test]
     fn test_stream_stop_reason_to_api_str() {
         assert_eq!(StreamStopReason::ToolCall.to_api_str(), "tool_call");
@@ -1194,11 +1164,6 @@ mod tests {
         assert_eq!(StreamStopReason::StopSequence.to_api_str(), "stop_sequence");
     }
 
-    /// Verify that [`StreamStopReason::should_continue_tool_loop`] returns `true`
-    /// only for [`ToolCall`](StreamStopReason::ToolCall).
-    ///
-    /// [`EndTurn`](StreamStopReason::EndTurn) and [`MaxTokens`](StreamStopReason::MaxTokens)
-    /// should both return `false`.
     #[test]
     fn test_stream_stop_reason_should_continue() {
         assert!(StreamStopReason::ToolCall.should_continue_tool_loop());
@@ -1206,10 +1171,6 @@ mod tests {
         assert!(!StreamStopReason::MaxTokens.should_continue_tool_loop());
     }
 
-    /// Verify [`Usage::new`] stores token counts and computes the total.
-    ///
-    /// Asserts that [`Usage::input_tokens`] and [`Usage::output_tokens`] are
-    /// stored as provided, and that [`Usage::total_tokens`] returns their sum.
     #[test]
     fn test_usage() {
         let usage = Usage::new(100, 50);
@@ -1218,27 +1179,12 @@ mod tests {
         assert_eq!(usage.total_tokens(), 150);
     }
 
-    /// Verify that [`Usage::default`] produces zeroed counters.
-    ///
-    /// [`Usage::total_tokens`] should be `0` when both fields are `0`.
     #[test]
     fn test_usage_default() {
         let usage = Usage::default();
         assert_eq!(usage.total_tokens(), 0);
     }
 
-    /// Verify that [`StreamAccumulator`] correctly assembles a text-only
-    /// streaming response into a [`Message`].
-    ///
-    /// Feeds a full event sequence: [`MessageStart`](StreamEvent::MessageStart) →
-    /// [`PartStart`](StreamEvent::PartStart) → two
-    /// [`IndexedDelta`](StreamEvent::IndexedDelta)s →
-    /// [`PartStop`](StreamEvent::PartStop) →
-    /// [`MessageDelta`](StreamEvent::MessageDelta) →
-    /// [`MessageStop`](StreamEvent::MessageStop).
-    ///
-    /// Asserts the final message has [`Role::Assistant`](crate::message::Role::Assistant),
-    /// one part with the concatenated text "Hello world", and correct usage.
     #[test]
     fn test_accumulator_text_message() {
         let mut acc = StreamAccumulator::new();
@@ -1285,13 +1231,6 @@ mod tests {
         assert_eq!(msg.parts[0].as_text(), Some("Hello world"));
     }
 
-    /// Verify that [`StreamAccumulator`] correctly assembles a tool-call
-    /// part from streaming events.
-    ///
-    /// Feeds [`PartStart`](StreamEvent::PartStart) with a
-    /// [`ToolCall`](MessagePart::ToolCall) seed, then an [`InputJson`](DeltaPart::InputJson)
-    /// delta, then [`PartStop`](StreamEvent::PartStop). Asserts the
-    /// resulting message contains a tool-call part.
     #[test]
     fn test_accumulator_tool_call() {
         let mut acc = StreamAccumulator::new();
@@ -1318,10 +1257,6 @@ mod tests {
         assert!(msg.parts[0].is_tool_call());
     }
 
-    /// Verify that [`StreamAccumulator::build`] on a fresh accumulator
-    /// produces a [`Message`] with an empty content vector.
-    ///
-    /// No events processed means no parts assembled.
     #[test]
     fn test_accumulator_empty() {
         let acc = StreamAccumulator::new();
@@ -1329,11 +1264,6 @@ mod tests {
         assert_eq!(msg.parts.len(), 0);
     }
 
-    /// Verify that [`StreamAccumulator::usage`] returns the [`Usage`] data
-    /// from a [`MessageDelta`](StreamEvent::MessageDelta) event.
-    ///
-    /// Feeds a single `MessageDelta` with known token counts and asserts
-    /// [`Usage::total_tokens`] returns the expected sum.
     #[test]
     fn test_accumulator_usage() {
         let mut acc = StreamAccumulator::new();
@@ -1345,11 +1275,6 @@ mod tests {
         assert_eq!(acc.usage().unwrap().total_tokens(), 150);
     }
 
-    /// Verify that all [`StreamEvent`] variants can be constructed.
-    ///
-    /// Constructs [`Ping`](StreamEvent::Ping), [`MessageStop`](StreamEvent::MessageStop),
-    /// and [`PartStop`](StreamEvent::PartStop) to confirm no compile-time
-    /// regressions in the enum definition.
     #[test]
     fn test_stream_event_variants() {
         // Just verify all variants can be constructed
@@ -1358,9 +1283,6 @@ mod tests {
         let _ = StreamEvent::PartStop;
     }
 
-    /// Verify that [`StreamAccumulator::process`] returns
-    /// [`StreamError::InvalidToolInputJson`] when the accumulated tool-call
-    /// JSON is malformed at [`PartStop`](StreamEvent::PartStop).
     #[test]
     fn test_accumulator_invalid_tool_json() {
         let mut acc = StreamAccumulator::new();
@@ -1391,8 +1313,6 @@ mod tests {
         }
     }
 
-    /// Verify that a tool-call part with no delta input defaults to an
-    /// empty JSON object `{}` rather than erroring.
     #[test]
     fn test_accumulator_tool_call_empty_input() {
         let mut acc = StreamAccumulator::new();
@@ -1410,5 +1330,216 @@ mod tests {
         let msg = acc.build();
         assert_eq!(msg.parts.len(), 1);
         assert!(msg.parts[0].is_tool_call());
+    }
+
+    #[test]
+    fn test_accumulator_ignores_delta_with_mismatched_index() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("")),
+        }))
+        .unwrap();
+
+        // Delta arrives with index 1 — mismatch! Must NOT panic, must be ignored.
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 1,
+            delta: DeltaPart::Text {
+                text: "ignored".into(),
+            },
+        }))
+        .unwrap();
+
+        // Delta with correct index 0 — should be applied.
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "hello".into(),
+            },
+        }))
+        .unwrap();
+
+        acc.process(&StreamEvent::PartStop).unwrap();
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 1);
+        assert_eq!(msg.parts[0].as_text(), Some("hello"));
+    }
+
+    #[test]
+    fn test_accumulator_ignores_input_json_with_mismatched_index() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("")),
+        }))
+        .unwrap();
+
+        // InputJson delta at wrong index — should be ignored.
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 5,
+            delta: DeltaPart::InputJson {
+                partial_json: "{\"bad\":true}".into(),
+            },
+        }))
+        .unwrap();
+
+        acc.process(&StreamEvent::PartStop).unwrap();
+
+        let msg = acc.build();
+        // Empty text → no parts.
+        assert!(msg.parts.is_empty());
+    }
+
+    #[test]
+    fn test_accumulator_delta_tool_call_string_value() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::tool_call("id1", "search", Value::Null)),
+        }))
+        .unwrap();
+
+        // DeltaPart::ToolCall carries a string JSON value.
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::ToolCall {
+                partial_json: Value::String("{\"q\":\"rust\"}".into()),
+            },
+        }))
+        .unwrap();
+
+        acc.process(&StreamEvent::PartStop).unwrap();
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 1);
+        if let MessagePart::ToolCall { input, .. } = &msg.parts[0] {
+            assert_eq!(input["q"], "rust");
+        } else {
+            panic!("expected ToolCall");
+        }
+    }
+
+    #[test]
+    fn test_accumulator_delta_tool_call_non_string_ignored() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::tool_call("id1", "search", Value::Null)),
+        }))
+        .unwrap();
+
+        // Non-string JSON value — should be silently ignored.
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::ToolCall {
+                partial_json: Value::Number(42.into()),
+            },
+        }))
+        .unwrap();
+
+        acc.process(&StreamEvent::PartStop).unwrap();
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 1);
+        if let MessagePart::ToolCall { input, .. } = &msg.parts[0] {
+            assert!(input.is_object());
+        }
+    }
+
+    #[test]
+    fn test_accumulator_ping_no_op() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::Ping).unwrap();
+        assert!(acc.usage().is_none());
+        let msg = acc.build();
+        assert!(msg.parts.is_empty());
+    }
+
+    #[test]
+    fn test_accumulator_message_stop_no_op() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("")),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text { text: "hi".into() },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::MessageStop).unwrap();
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 1);
+        assert_eq!(msg.parts[0].as_text(), Some("hi"));
+    }
+
+    #[test]
+    fn test_accumulator_multiple_text_parts() {
+        let mut acc = StreamAccumulator::new();
+
+        // First text part at index 0.
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("")),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "hello".into(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop).unwrap();
+
+        // Second text part at index 1.
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 1,
+            part: Some(MessagePart::text("")),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 1,
+            delta: DeltaPart::Text {
+                text: "world".into(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop).unwrap();
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 2);
+        assert_eq!(msg.parts[0].as_text(), Some("hello"));
+        assert_eq!(msg.parts[1].as_text(), Some("world"));
+    }
+
+    #[test]
+    fn test_accumulator_message_delta_overwrites_usage() {
+        let mut acc = StreamAccumulator::new();
+
+        acc.process(&StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".into()),
+            },
+            usage: Some(Usage::new(100, 50)),
+        }))
+        .unwrap();
+        assert_eq!(acc.usage().unwrap().input_tokens, 100);
+        assert_eq!(acc.usage().unwrap().output_tokens, 50);
+
+        // Second delta overwrites usage.
+        acc.process(&StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("max_tokens".into()),
+            },
+            usage: Some(Usage::new(200, 75)),
+        }))
+        .unwrap();
+        assert_eq!(acc.usage().unwrap().input_tokens, 200);
+        assert_eq!(acc.usage().unwrap().output_tokens, 75);
     }
 }

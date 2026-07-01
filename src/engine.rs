@@ -8,21 +8,21 @@
 //! 3. **Tool dispatch** — Execute tool calls requested by the model
 //! 4. **Feedback** — Feed tool results back into the conversation
 //! 5. **Loop** — Repeat until the model stops or max turns is reached
-//! 6. **Finalize** — Produce a [`SessionResult`](crate::core::SessionResult)
+//! 6. **Finalize** — Produce a [`SessionResult`](crate::engine::loop_core::SessionResult)
 //!
 //! # Example
 //!
 //! ```rust,ignore
 //! use loopctl::engine::BareLoop;
 //! use loopctl::tool::ToolRegistry;
-//! use loopctl::api_client::ApiClient;
-//! use loopctl::core::AgentConfig;
+//! use loopctl::api::ApiClient;
+//! use loopctl::config::LoopConfig;
 //!
 //! let agent = BareLoop::new(client, registry, config);
 //! let result = agent.run("Write a hello world program").await?;
 //! ```
 
 mod bare;
-pub mod middleware;
+pub mod loop_core;
 
 pub use bare::*;

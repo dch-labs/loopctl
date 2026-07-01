@@ -1,6 +1,6 @@
 //! Tool health monitoring, circuit breakers, and self-healing routing.
 //!
-//! This module provides per-tool health tracking using lock-free atomic counters,
+//! Per-tool health tracking using lock-free atomic counters,
 //! circuit-breaker state machines to prevent repeated calls to failing tools,
 //! and a registry that combines both into a unified health picture. A routing
 //! middleware uses the registry to redirect tool calls away from unhealthy tools
@@ -587,7 +587,7 @@ impl ToolCircuitBreaker {
 ///   health + breaker state
 /// - [`health_summary`](Self::health_summary) — snapshot for observability
 ///
-/// Uses `Mutex<HashMap>` for the tool-name → stats/breaker maps. This is
+/// Uses `Mutex<HashMap>` for the tool-name → stats/breaker maps. Only
 /// the cold path — locks are only taken when a new tool name is first seen.
 /// Poisoned mutex recovery follows the pattern: `unwrap_or_else(std::sync::PoisonError::into_inner)`.
 ///
@@ -644,14 +644,11 @@ impl ToolHealthRegistry {
         }
     }
 
-    /// Create a new registry with custom circuit-breaker configuration.
+    /// Set custom circuit-breaker configuration.
     #[must_use]
-    pub fn with_config(config: CircuitBreakerConfig) -> Self {
-        Self {
-            stats: Mutex::new(HashMap::new()),
-            breakers: Mutex::new(HashMap::new()),
-            breaker_config: config,
-        }
+    pub fn with_config(mut self, config: CircuitBreakerConfig) -> Self {
+        self.breaker_config = config;
+        self
     }
 
     /// Get or create stats for a tool.
@@ -926,17 +923,13 @@ impl HealthRouterBuilder {
 mod tests {
     use super::*;
 
-    // ==================================================
-    // ToolStats tests
-    // ==================================================
-
     #[test]
     fn tool_stats_starts_healthy() {
         let stats = ToolStats::new();
         assert_eq!(stats.total_calls(), 0);
         assert_eq!(stats.success_count(), 0);
         assert_eq!(stats.failure_count(), 0);
-        assert!(stats.success_rate() == 1.0);
+        assert!((stats.success_rate() - 1.0).abs() < f64::EPSILON);
         assert!(stats.health_score() > 0.9);
         assert_eq!(stats.avg_duration(), Duration::ZERO);
         assert_eq!(stats.max_duration(), Duration::ZERO);
@@ -1036,10 +1029,6 @@ mod tests {
         assert_eq!(ewma, 643_000);
     }
 
-    // ==================================================
-    // CircuitState tests
-    // ==================================================
-
     #[test]
     fn circuit_state_from_u32() {
         assert_eq!(CircuitState::from(0u32), CircuitState::Closed);
@@ -1054,10 +1043,6 @@ mod tests {
         assert_eq!(format!("{}", CircuitState::Open), "open");
         assert_eq!(format!("{}", CircuitState::HalfOpen), "half-open");
     }
-
-    // ==================================================
-    // ToolCircuitBreaker tests
-    // ==================================================
 
     #[test]
     fn circuit_breaker_starts_closed() {
@@ -1161,20 +1146,12 @@ mod tests {
         assert!(cb.is_open(), "5 failures should open breaker");
     }
 
-    // ==================================================
-    // HealthStatus tests
-    // ==================================================
-
     #[test]
     fn health_status_display() {
         assert_eq!(format!("{}", HealthStatus::Healthy), "healthy");
         assert_eq!(format!("{}", HealthStatus::Degraded), "degraded");
         assert_eq!(format!("{}", HealthStatus::Unhealthy), "unhealthy");
     }
-
-    // ==================================================
-    // ToolHealthRegistry tests
-    // ==================================================
 
     #[test]
     fn registry_starts_empty() {
@@ -1216,7 +1193,7 @@ mod tests {
         assert_eq!(registry.get_health_status("tool_a"), HealthStatus::Healthy);
 
         // Drive tool_b down with failures (with low threshold)
-        let low_threshold_registry = ToolHealthRegistry::with_config(CircuitBreakerConfig {
+        let low_threshold_registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 2,
             recovery_duration: Duration::from_secs(30),
         });
@@ -1232,7 +1209,7 @@ mod tests {
 
     #[test]
     fn registry_is_tool_available() {
-        let registry = ToolHealthRegistry::with_config(CircuitBreakerConfig {
+        let registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 2,
             recovery_duration: Duration::from_secs(30),
         });
@@ -1263,10 +1240,6 @@ mod tests {
         assert_eq!(*bash_status, HealthStatus::Healthy);
         assert!(*bash_score > 0.5);
     }
-
-    // ==================================================
-    // HealthRouter tests
-    // ==================================================
 
     #[test]
     fn health_router_no_fallbacks() {
@@ -1299,7 +1272,7 @@ mod tests {
 
     #[test]
     fn health_router_resolve_falls_back_to_alternative() {
-        let registry = ToolHealthRegistry::with_config(CircuitBreakerConfig {
+        let registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 1,
             recovery_duration: Duration::from_secs(30),
         });
@@ -1319,7 +1292,7 @@ mod tests {
 
     #[test]
     fn health_router_resolve_returns_primary_when_no_healthy_alternative() {
-        let registry = ToolHealthRegistry::with_config(CircuitBreakerConfig {
+        let registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 1,
             recovery_duration: Duration::from_secs(30),
         });
@@ -1335,10 +1308,6 @@ mod tests {
         // No healthy alternative — returns primary
         assert_eq!(router.resolve_tool("bash", &registry), "bash");
     }
-
-    // ==================================================
-    // Concurrent stress test
-    // ==================================================
 
     #[test]
     fn registry_concurrent_access() {

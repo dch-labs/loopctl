@@ -253,7 +253,16 @@ fn simple_eval(expr: &str) -> String {
     let tokens = tokenize(expr);
     let mut pos = 0usize;
     match parse_expr(&tokens, &mut pos) {
-        Ok(val) => format!("{val}"),
+        Ok(val) => {
+            if pos < tokens.len() {
+                format!(
+                    "Error: unexpected token after expression: {:?}",
+                    tokens[pos]
+                )
+            } else {
+                format!("{val}")
+            }
+        }
         Err(e) => format!("Error: {e}"),
     }
 }
@@ -319,8 +328,10 @@ fn parse_factor(tokens: &[Token], pos: &mut usize) -> Result<f64, String> {
             let val = parse_expr(tokens, pos)?;
             if matches!(peek(tokens, *pos), Some(Token::RParen)) {
                 advance(pos);
+                Ok(val)
+            } else {
+                Err("expected closing parenthesis".into())
             }
-            Ok(val)
         }
         Token::Minus => {
             advance(pos);

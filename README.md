@@ -147,6 +147,14 @@ let agent = BareLoop::new(
 | `testing` | No | — | Mock clients, tools, and test fixtures |
 | `tool_health` | No | — | Per-tool health monitoring, circuit breakers, and self-healing routing |
 | `tool_shield` | No | `tool_health` | Tool permission shielding and access control |
+| `providers` | No | — | Base provider support (`reqwest` + `async-stream`); enables `provider` module |
+| `openai` | No | `providers` | OpenAI-compatible API client (`provider::openai`) |
+| `anthropic` | No | `providers` | Anthropic Claude API client (`provider::anthropic`) |
+| `ollama` | No | `providers`, `openai` | Ollama local model client (OpenAI-compatible) |
+| `deepseek` | No | `providers`, `openai` | DeepSeek API client (OpenAI-compatible) |
+| `grok` | No | `providers`, `openai` | Grok (xAI) API client (OpenAI-compatible) |
+| `gemini` | No | `providers` | Google Gemini API client (`provider::gemini`) |
+| `zai` | No | `providers`, `anthropic` | Z.AI API client (Anthropic-compatible) |
 
 ## Architecture
 

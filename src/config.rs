@@ -129,7 +129,7 @@ impl LoopConfig {
                 "max_tokens must be greater than 0".to_string(),
             ));
         }
-        if self.model.is_empty() {
+        if self.model.trim().is_empty() {
             return Err(crate::error::LoopError::Config(
                 "model must not be empty".to_string(),
             ));
@@ -198,5 +198,16 @@ mod tests {
             ..LoopConfig::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_model() {
+        let config = LoopConfig {
+            model: "   ".to_string(),
+            ..LoopConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("model"), "error should mention model: {msg}");
     }
 }

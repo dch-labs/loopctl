@@ -1284,11 +1284,12 @@ mod tests {
 
     #[test]
     fn test_result_type() {
-        fn returns_result() -> String {
-            "success".to_string()
+        #[allow(clippy::unnecessary_wraps)]
+        fn returns_result() -> super::Result<String> {
+            Ok("success".to_string())
         }
         let result = returns_result();
-        assert_eq!(result, "success");
+        assert_eq!(result.unwrap(), "success");
     }
 
     #[test]

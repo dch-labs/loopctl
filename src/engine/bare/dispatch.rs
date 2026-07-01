@@ -22,6 +22,9 @@ use crate::detection::loop_detector::{self, Operation};
 use crate::observer::{ToolPostContext, ToolPreContext};
 use crate::reflection::{Correction, CorrectionResult};
 
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
+
 /// Result of deciding what to do after a tool error during recovery.
 ///
 /// Distinguishes between returning a soft-error result (the tool failed,
@@ -261,14 +264,17 @@ impl<C: ApiClient> BareLoop<C> {
 
         let tool_result = if let Some(tool) = self.tools.get(&tc.tool) {
             let cancel = Arc::clone(&self.cancelled);
+            // Wrap the tool call in `catch_unwind` so a panicking tool
+            // implementation produces an error result instead of unwinding
+            // through and aborting the entire agent loop.
             let call_result = tokio::select! {
-                r = tool.call(tc.input.clone(), tool_context) => r,
+                r = AssertUnwindSafe(tool.call(tc.input.clone(), tool_context)).catch_unwind() => r,
                 () = cancel.notified() => {
                     return Err(LoopError::Cancelled);
                 }
             };
             match call_result {
-                Ok(result) => {
+                Ok(Ok(result)) => {
                     let duration = start.elapsed();
                     ToolDispatchResult {
                         tool_call_id: tc.id.clone(),
@@ -278,12 +284,34 @@ impl<C: ApiClient> BareLoop<C> {
                         resolved_tool_name: tc.tool.clone(),
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let duration = start.elapsed();
                     let error_msg = e.to_string();
                     ToolDispatchResult {
                         tool_call_id: tc.id.clone(),
                         output: ToolContent::Text(error_msg),
+                        is_error: true,
+                        duration,
+                        resolved_tool_name: tc.tool.clone(),
+                    }
+                }
+                Err(panic_payload) => {
+                    let duration = start.elapsed();
+                    let msg = panic_payload
+                        .downcast_ref::<&'static str>()
+                        .map(std::string::ToString::to_string)
+                        .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| {
+                            format!("Tool '{}' panicked (unknown payload)", tc.tool)
+                        });
+                    tracing::error!(
+                        tool = %tc.tool,
+                        panic_message = %msg,
+                        "tool panicked during execution"
+                    );
+                    ToolDispatchResult {
+                        tool_call_id: tc.id.clone(),
+                        output: ToolContent::Text(format!("Tool '{}' panicked: {msg}", tc.tool)),
                         is_error: true,
                         duration,
                         resolved_tool_name: tc.tool.clone(),
@@ -553,5 +581,169 @@ impl<C: ApiClient> BareLoop<C> {
             .decide(&analysis, attempt, Self::MAX_RECOVERY_ATTEMPTS)
             .await;
         (action, correction)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unnecessary_literal_bound)]
+mod tests {
+    use crate::api::error::ApiError;
+    use crate::config::LoopConfig;
+    use crate::engine::loop_core::ToolCall;
+    use crate::message::ToolContent;
+    use crate::tool::{
+        Tool, ToolContext, ToolError, ToolOutput, ToolSchema, registry::ToolRegistry,
+    };
+    use serde_json::Value;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use parking_lot::Mutex;
+
+    use super::*;
+
+    struct MockClient {
+        model_name: Arc<Mutex<String>>,
+    }
+
+    impl MockClient {
+        fn new(model: &str) -> Self {
+            Self {
+                model_name: Arc::new(Mutex::new(model.to_string())),
+            }
+        }
+    }
+
+    impl ApiClient for MockClient {
+        fn model(&self) -> String {
+            self.model_name.lock().clone()
+        }
+        fn set_model(&self, model: &str) -> bool {
+            if model.trim().is_empty() {
+                return false;
+            }
+            *self.model_name.lock() = model.to_string();
+            true
+        }
+        fn stream_messages(
+            &self,
+            _history: Vec<crate::message::Message>,
+            _system: Option<String>,
+            _tools: Option<Vec<ToolSchema>>,
+        ) -> Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::stream::StreamEvent, ApiError>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+        fn create_message(
+            &self,
+            _history: Vec<crate::message::Message>,
+            _system: Option<String>,
+            _tools: Option<Vec<ToolSchema>>,
+        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
+        {
+            Box::pin(async { Err(ApiError::http("not implemented")) })
+        }
+    }
+
+    struct PanicTool;
+
+    impl Tool for PanicTool {
+        fn name(&self) -> &str {
+            "panic_tool"
+        }
+        fn description(&self) -> &str {
+            "Panics on call"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "panic_tool".into(),
+                description: "Panics on call".into(),
+                input_schema: Value::Object(serde_json::Map::new()),
+            }
+        }
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async { panic!("dispatch.rs panic tool") })
+        }
+    }
+
+    fn echo_fn(
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'static>> {
+        Box::pin(async { Ok(ToolOutput::text("ok")) })
+    }
+
+    fn make_loop(tools: ToolRegistry) -> BareLoop<MockClient> {
+        let config = LoopConfig::default();
+        let client = Arc::new(MockClient::new("test"));
+        BareLoop::new(client, tools, config)
+    }
+
+    #[tokio::test]
+    async fn dispatch_tool_catches_panic() {
+        let mut registry = ToolRegistry::new();
+        registry.register(PanicTool);
+        let bare = make_loop(registry);
+
+        let tc = ToolCall {
+            id: "tc1".into(),
+            tool: "panic_tool".into(),
+            input: Value::Null,
+        };
+        let tool_context = ToolContext::default();
+        let start = Instant::now();
+
+        let result = bare.dispatch_tool(&tc, &tool_context, start, 0).await;
+
+        assert!(result.is_ok(), "panic should be caught, not propagated");
+        let dispatch_result = result.unwrap();
+        assert!(dispatch_result.is_error);
+        match &dispatch_result.output {
+            ToolContent::Text(text) => {
+                assert!(text.contains("panicked"), "expected panic message: {text}");
+            }
+            ToolContent::Multipart(_) => panic!("expected Text"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_tool_normal_tool_works() {
+        let mut registry = ToolRegistry::new();
+        registry.register(crate::tool::FnTool::new(
+            "echo".into(),
+            "echo".into(),
+            Value::Object(serde_json::Map::new()),
+            echo_fn,
+        ));
+        let bare = make_loop(registry);
+
+        let tc = ToolCall {
+            id: "tc1".into(),
+            tool: "echo".into(),
+            input: Value::Null,
+        };
+        let tool_context = ToolContext::default();
+        let start = Instant::now();
+
+        let result = bare.dispatch_tool(&tc, &tool_context, start, 0).await;
+
+        assert!(result.is_ok());
+        let dispatch_result = result.unwrap();
+        assert!(!dispatch_result.is_error);
+        match &dispatch_result.output {
+            ToolContent::Text(text) => assert_eq!(text, "ok"),
+            ToolContent::Multipart(_) => panic!("expected Text"),
+        }
     }
 }

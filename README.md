@@ -79,6 +79,7 @@ impl Tool for EchoTool {
 
 ```rust,no_run
 use loopctl::engine::BareLoop;
+use loopctl::engine::loop_core::Loop;
 use loopctl::tool::ToolRegistry;
 use loopctl::config::LoopConfig;
 use std::sync::Arc;
@@ -122,6 +123,7 @@ loopctl = { version = "0.1", features = ["testing"] }
 ```rust,no_run
 use loopctl::testing::{MockApiClient, MockTool, test_config};
 use loopctl::engine::BareLoop;
+use loopctl::engine::loop_core::Loop;
 use loopctl::tool::ToolRegistry;
 use std::sync::Arc;
 
@@ -158,28 +160,17 @@ let agent = BareLoop::new(
 
 ## Architecture
 
-```text
-                ┌──────────────┐
-                │   ApiClient  │
-                └───────┬──────┘
-                        │
-          ┌─────────────▼─────────────┐
-          │         BareLoop          │
-          │  ┌─────────────────────┐  │
-          │  │  stream → accumulate│  │
-          │  │  → tool dispatch    │  │
-          │  │  → repeat           │  │
-          │  └─────────────────────┘  │
-          └─────┬──────────┬──────────┘
-                │          │
-   ┌────────────▼──┐  ┌────▼───────────┐
-   │  ToolRegistry │  │  Detection &   │
-   │  (your tools) │  │  Fallback      │
-   └───────────────┘  │  • convergence │
-                      │  • loop detect │
-                      │  • fallback    │
-                      └────────────────┘
-```
+At the center is **BareLoop**, the default agent loop. Each turn it streams a
+response from an **ApiClient** (your LLM provider), accumulates the result, and
+dispatches any requested tool calls through a **ToolRegistry**. Results are fed
+back into the conversation and the cycle repeats until the model ends its turn
+or a configured limit is reached.
+
+Two cross-cutting concerns run alongside the main loop:
+
+- **Detection & Fallback** — convergence detection, loop detection, and
+  automatic model/API fallback when requests fail.
+- **ToolRegistry** — holds your registered tools and routes tool calls to them.
 
 ## Development
 

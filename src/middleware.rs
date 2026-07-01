@@ -1142,11 +1142,17 @@ mod tests {
         match result.output {
             ToolContent::Multipart(parts) => {
                 assert_eq!(parts.len(), 2);
-                if let ToolContentPart::Text { text } = &parts[0] {
-                    assert_eq!(text, "part1", "short part should not be truncated");
+                match &parts[0] {
+                    ToolContentPart::Text { text } => {
+                        assert_eq!(text, "part1", "short part should not be truncated");
+                    }
+                    ToolContentPart::Image { .. } => panic!("expected Text part[0], got Image"),
                 }
-                if let ToolContentPart::Text { text } = &parts[1] {
-                    assert_eq!(text, "part2", "short part should not be truncated");
+                match &parts[1] {
+                    ToolContentPart::Text { text } => {
+                        assert_eq!(text, "part2", "short part should not be truncated");
+                    }
+                    ToolContentPart::Image { .. } => panic!("expected Text part[1], got Image"),
                 }
             }
             other @ ToolContent::Text(_) => panic!("expected Multipart, got {other:?}"),

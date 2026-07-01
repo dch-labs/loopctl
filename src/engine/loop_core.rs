@@ -364,12 +364,18 @@ impl ToolCall {
         match correction.correction_type {
             CorrectionType::InputFix => {
                 if let Some(ref modified) = correction.modified_input {
-                    tracing::debug!(
-                        tool = %self.tool,
-                        "applying InputFix correction from reflector"
-                    );
-                    self.input = modified.clone();
-                    crate::reflection::CorrectionResult::Applied
+                    if modified.is_object() {
+                        tracing::debug!(
+                            tool = %self.tool,
+                            "applying InputFix correction from reflector"
+                        );
+                        self.input = modified.clone();
+                        crate::reflection::CorrectionResult::Applied
+                    } else {
+                        crate::reflection::CorrectionResult::Failed(
+                            "InputFix correction modified_input must be a JSON object".to_string(),
+                        )
+                    }
                 } else {
                     crate::reflection::CorrectionResult::Failed(
                         "InputFix correction missing modified_input".to_string(),
@@ -873,4 +879,106 @@ pub trait Loop: Send + Sync {
     /// [`run`](Loop::run) implementation only needs the config during
     /// initialization, so the borrow is short-lived.
     fn config(&self) -> &LoopConfig;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reflection::{Correction, CorrectionResult, CorrectionType};
+    use crate::tool::ToolDispatchResult;
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn make_call() -> ToolCall {
+        ToolCall {
+            id: "test".to_string(),
+            tool: "Read".to_string(),
+            input: json!({"path": "/tmp"}),
+        }
+    }
+
+    fn empty_prior_result() -> ToolDispatchResult {
+        ToolDispatchResult::ok("Read", String::new(), Duration::ZERO)
+    }
+
+    #[test]
+    fn input_fix_accepts_json_object() {
+        let mut call = make_call();
+        let correction = Correction {
+            correction_type: CorrectionType::InputFix,
+            description: "fix path".into(),
+            modified_input: Some(json!({"path": "/tmp/fixed"})),
+            alternative_tool: None,
+            guidance: None,
+        };
+        let result = call.apply_correction(&correction, &empty_prior_result());
+        assert!(matches!(result, CorrectionResult::Applied));
+        assert_eq!(call.input, json!({"path": "/tmp/fixed"}));
+    }
+
+    #[test]
+    fn input_fix_rejects_scalar() {
+        let mut call = make_call();
+        let correction = Correction {
+            correction_type: CorrectionType::InputFix,
+            description: "bad fix".into(),
+            modified_input: Some(json!("/tmp/scalar")),
+            alternative_tool: None,
+            guidance: None,
+        };
+        let result = call.apply_correction(&correction, &empty_prior_result());
+        match result {
+            CorrectionResult::Failed(msg) => {
+                assert!(msg.contains("JSON object"), "{msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // Input should remain unchanged.
+        assert_eq!(call.input, json!({"path": "/tmp"}));
+    }
+
+    #[test]
+    fn input_fix_rejects_array() {
+        let mut call = make_call();
+        let correction = Correction {
+            correction_type: CorrectionType::InputFix,
+            description: "bad fix".into(),
+            modified_input: Some(json!(["a", "b"])),
+            alternative_tool: None,
+            guidance: None,
+        };
+        let result = call.apply_correction(&correction, &empty_prior_result());
+        assert!(matches!(result, CorrectionResult::Failed(_)));
+        assert_eq!(call.input, json!({"path": "/tmp"}));
+    }
+
+    #[test]
+    fn input_fix_rejects_null() {
+        let mut call = make_call();
+        let correction = Correction {
+            correction_type: CorrectionType::InputFix,
+            description: "bad fix".into(),
+            modified_input: Some(serde_json::Value::Null),
+            alternative_tool: None,
+            guidance: None,
+        };
+        let result = call.apply_correction(&correction, &empty_prior_result());
+        assert!(matches!(result, CorrectionResult::Failed(_)));
+        assert_eq!(call.input, json!({"path": "/tmp"}));
+    }
+
+    #[test]
+    fn input_fix_rejects_missing() {
+        let mut call = make_call();
+        let correction = Correction {
+            correction_type: CorrectionType::InputFix,
+            description: "no input".into(),
+            modified_input: None,
+            alternative_tool: None,
+            guidance: None,
+        };
+        let result = call.apply_correction(&correction, &empty_prior_result());
+        assert!(matches!(result, CorrectionResult::Failed(_)));
+        assert_eq!(call.input, json!({"path": "/tmp"}));
+    }
 }

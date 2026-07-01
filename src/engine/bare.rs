@@ -65,14 +65,16 @@ use crate::config::LoopConfig;
 use crate::error::LoopError;
 
 use crate::engine::loop_core::{LoopState, SessionResult, StopReason, ToolCall, TurnResult};
-#[cfg(feature = "hooks")]
-use crate::hooks::HookAction;
-#[cfg(feature = "hooks")]
-use crate::hooks::HookExecutor;
+#[cfg(all(test, feature = "hooks"))]
+use crate::hooks::Hook;
 #[cfg(feature = "hooks")]
 use crate::hooks::context::{
     CompactTrigger, PostCompactContext, PostToolUseContext, PreCompactContext, PreToolUseContext,
 };
+#[cfg(all(test, feature = "hooks"))]
+use crate::hooks::context::{SessionEndContext as HookSessionEndContext, SessionEndReason};
+#[cfg(feature = "hooks")]
+use crate::hooks::{HookAction, HookExecutor};
 use crate::message::{Message, MessagePart, Role, ToolContent};
 use crate::middleware::{ToolDispatchContext, ToolPipeline, ToolPipelineBuilder};
 use crate::observer::{
@@ -2540,5 +2542,117 @@ mod tests {
             loop_.managers.fallback.original_model(),
             Some("new-primary".to_string())
         );
+    }
+
+    #[cfg(feature = "hooks")]
+    struct ReasonCaptureHook {
+        reason: Mutex<Option<SessionEndReason>>,
+    }
+
+    #[cfg(feature = "hooks")]
+    impl ReasonCaptureHook {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                reason: Mutex::new(None),
+            })
+        }
+
+        fn captured(&self) -> Option<SessionEndReason> {
+            *self.reason.lock()
+        }
+    }
+
+    #[cfg(feature = "hooks")]
+    impl Hook for ReasonCaptureHook {
+        fn name(&self) -> &'static str {
+            "ReasonCaptureHook"
+        }
+
+        fn on_session_end(&self, ctx: &HookSessionEndContext) {
+            *self.reason.lock() = Some(ctx.reason);
+        }
+    }
+
+    #[cfg(feature = "hooks")]
+    fn loop_with_reason_hook() -> (BareLoop<MockClient>, Arc<ReasonCaptureHook>) {
+        let hook = ReasonCaptureHook::new();
+        let executor = Arc::new(HookExecutor::new().with_hook(hook.clone()));
+        let config = LoopConfig {
+            max_turns: 5,
+            ..LoopConfig::default()
+        };
+        let mut loop_ = BareLoop::new(
+            Arc::new(MockClient::new("test")),
+            ToolRegistry::new(),
+            config,
+        );
+        loop_.set_hook_executor(executor);
+        (loop_, hook)
+    }
+
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn session_end_reason_complete() {
+        let (mut loop_, hook) = loop_with_reason_hook();
+        // Normal completion: state is Completed, not cancelled, under max_turns.
+        loop_.budget.success = true;
+        loop_.budget.total_turns = 2;
+
+        loop_.notify_session_end(&loop_.budget.clone(), Duration::from_millis(100));
+
+        assert_eq!(hook.captured(), Some(SessionEndReason::Complete));
+    }
+
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn session_end_reason_cancelled() {
+        let (mut loop_, hook) = loop_with_reason_hook();
+        // Cancel signal fired — success is true (not Failed) but cancelled.
+        loop_.budget.success = true;
+        loop_.budget.total_turns = 2;
+        loop_.cancelled.cancel();
+
+        loop_.notify_session_end(&loop_.budget.clone(), Duration::from_millis(100));
+
+        assert_eq!(hook.captured(), Some(SessionEndReason::Cancelled));
+    }
+
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn session_end_reason_max_turns() {
+        let (mut loop_, hook) = loop_with_reason_hook();
+        // Hit max_turns: total_turns == max_turns, not cancelled, success true.
+        loop_.budget.success = true;
+        loop_.budget.total_turns = 5; // equals config.max_turns
+
+        loop_.notify_session_end(&loop_.budget.clone(), Duration::from_millis(100));
+
+        assert_eq!(hook.captured(), Some(SessionEndReason::MaxTurns));
+    }
+
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn session_end_reason_error() {
+        let (mut loop_, hook) = loop_with_reason_hook();
+        // Generic failure: success false, no context-overflow keyword.
+        loop_.budget.success = false;
+        loop_.budget.error = Some("API connection refused".to_string());
+
+        loop_.notify_session_end(&loop_.budget.clone(), Duration::from_millis(100));
+
+        assert_eq!(hook.captured(), Some(SessionEndReason::Error));
+    }
+
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn session_end_reason_context_overflow() {
+        let (mut loop_, hook) = loop_with_reason_hook();
+        // Failure with context-overflow keyword in the error message.
+        loop_.budget.success = false;
+        loop_.budget.error = Some("context length exceeded".to_string());
+
+        loop_.notify_session_end(&loop_.budget.clone(), Duration::from_millis(100));
+
+        assert_eq!(hook.captured(), Some(SessionEndReason::ContextOverflow));
     }
 }

@@ -57,11 +57,7 @@ impl<C: ApiClient> BareLoop<C> {
 
         #[cfg(feature = "hooks")]
         if let Some(executor) = self.managers.hook_executor() {
-            let reason = if result.success {
-                SessionEndReason::Complete
-            } else {
-                SessionEndReason::Error
-            };
+            let reason = self.session_end_reason(result.success);
             let ctx = HookSessionEndContext {
                 session_id: result.session_id,
                 reason,
@@ -70,6 +66,35 @@ impl<C: ApiClient> BareLoop<C> {
                 duration_secs: duration.as_secs(),
             };
             executor.notify_session_end(&ctx);
+        }
+    }
+
+    /// Derive the structured [`SessionEndReason`] from the loop's
+    /// terminal state.
+    ///
+    /// Unlike a simple `success` boolean, this distinguishes
+    /// cancellation, max-turns exhaustion, and context overflow.
+    #[cfg(feature = "hooks")]
+    fn session_end_reason(&self, success: bool) -> SessionEndReason {
+        if !success {
+            // Context overflow is a specific failure mode distinguishable
+            // from a generic error by its message.
+            if self
+                .budget
+                .error
+                .as_ref()
+                .is_some_and(|e| e.contains("context") || e.contains("overflow"))
+            {
+                SessionEndReason::ContextOverflow
+            } else {
+                SessionEndReason::Error
+            }
+        } else if self.is_cancelled() {
+            SessionEndReason::Cancelled
+        } else if self.budget.total_turns >= self.config.max_turns {
+            SessionEndReason::MaxTurns
+        } else {
+            SessionEndReason::Complete
         }
     }
 

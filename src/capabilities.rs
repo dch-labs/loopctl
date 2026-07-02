@@ -14,9 +14,9 @@
 //! | [`FallbackCapable`] | Model fallback / circuit breaker |
 //! | [`Compactable`] | Context compaction |
 //! | [`StreamCapable`] | Resilient LLM streaming |
-//! | [`Hookable`] | Bidirectional lifecycle hooks |
+//! | `Hookable` | Bidirectional lifecycle hooks *(requires `hooks` feature)* |
 //! | [`PipelineAware`] | Middleware pipeline dispatch |
-//! | [`HealthTrackable`] | Per-tool health monitoring *(requires `tool_health` feature)* |
+//! | `HealthTrackable` | Per-tool health monitoring *(requires `tool_health` feature)* |
 //!
 //! # When to use
 //!
@@ -50,7 +50,7 @@ use crate::tool::health::ToolHealthRegistry;
 ///
 /// Observers receive read-only notifications at well-defined hook points
 /// in the agent loop. They cannot influence control flow — for that, see
-/// [`Hookable`].
+/// the `Hookable` trait *(requires `hooks` feature)*.
 ///
 /// # Implementors
 ///

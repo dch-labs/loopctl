@@ -1983,6 +1983,292 @@ mod tests {
         assert_eq!(&*received, "Done", "only text deltas should fire streamer");
     }
 
+    #[tokio::test]
+    async fn test_on_text_delta_fires_per_sse_chunk_in_order() {
+        struct DeltaRecorder {
+            deltas: Arc<Mutex<Vec<(usize, String)>>>,
+        }
+        impl crate::observer::LoopObserver for DeltaRecorder {
+            fn name(&self) -> &'static str {
+                "delta-recorder"
+            }
+            fn on_text_delta(&self, ctx: &crate::observer::TextDeltaContext) {
+                self.deltas.lock().push((ctx.turn, ctx.delta.clone()));
+            }
+        }
+
+        let client = MockClient::new("test-model");
+        let events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg-1".into(),
+                    role: "assistant".into(),
+                    model: "test-model".into(),
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(MessagePart::text("ignored")),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Text {
+                    text: "Hello".into(),
+                },
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Text { text: " ".into() },
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Text {
+                    text: "world".into(),
+                },
+            }),
+            StreamEvent::PartStop,
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".into()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        client.add_events(events);
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::new(DeltaRecorder {
+            deltas: Arc::clone(&captured),
+        });
+        agent.register_observer(recorder as Arc<dyn crate::observer::LoopObserver>);
+
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        let captured = captured.lock();
+        assert_eq!(captured.len(), 3, "one on_text_delta per SSE text chunk");
+        let joined: String = captured.iter().map(|(_, d)| d.as_str()).collect();
+        assert_eq!(joined, "Hello world");
+    }
+
+    #[tokio::test]
+    async fn test_text_delta_turn_number_matches_surrounding_turn() {
+        struct TurnRecorder {
+            deltas: Arc<Mutex<Vec<(usize, String)>>>,
+            response_turns: Arc<Mutex<Vec<usize>>>,
+        }
+        impl crate::observer::LoopObserver for TurnRecorder {
+            fn name(&self) -> &'static str {
+                "turn-recorder"
+            }
+            fn on_text_delta(&self, ctx: &crate::observer::TextDeltaContext) {
+                self.deltas.lock().push((ctx.turn, ctx.delta.clone()));
+            }
+            fn on_response(&self, ctx: &crate::observer::ResponseContext) {
+                self.response_turns.lock().push(ctx.turn);
+            }
+        }
+
+        let client = MockClient::new("test-model");
+        client.add_tool_then_text("tool_1", "echo", json!({"message": "hi"}), "All done");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+        let deltas = Arc::new(Mutex::new(Vec::new()));
+        let response_turns = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::new(TurnRecorder {
+            deltas: Arc::clone(&deltas),
+            response_turns: Arc::clone(&response_turns),
+        });
+        agent.register_observer(recorder as Arc<dyn crate::observer::LoopObserver>);
+
+        let result = agent.run("Use echo then finish").await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.total_turns, 2);
+
+        let response_turns = response_turns.lock();
+        let deltas = deltas.lock();
+
+        assert_eq!(
+            response_turns.len(),
+            2,
+            "both turns should fire on_response",
+        );
+        assert!(!deltas.is_empty(), "text turn should produce deltas");
+        for (turn, _) in deltas.iter() {
+            assert!(
+                response_turns.contains(turn),
+                "on_text_delta turn {turn} must match an on_response turn",
+            );
+        }
+
+        let text_turn = deltas.iter().map(|(t, _)| *t).next().unwrap();
+        let joined: String = deltas
+            .iter()
+            .filter(|(t, _)| *t == text_turn)
+            .map(|(_, d)| d.as_str())
+            .collect();
+        assert_eq!(joined, "All done");
+        assert_eq!(
+            text_turn, 1,
+            "text deltas belong to the second turn (the text turn), not the tool turn",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_text_delta_ignores_non_text_deltas() {
+        struct DeltaRecorder {
+            count: Arc<AtomicUsize>,
+        }
+        impl crate::observer::LoopObserver for DeltaRecorder {
+            fn name(&self) -> &'static str {
+                "delta-recorder"
+            }
+            fn on_text_delta(&self, _ctx: &crate::observer::TextDeltaContext) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let client = MockClient::new("test-model");
+        let events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg-1".into(),
+                    role: "assistant".into(),
+                    model: "test-model".into(),
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(MessagePart::ToolCall {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                    input: Value::Null,
+                }),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::InputJson {
+                    partial_json: "{}".into(),
+                },
+            }),
+            StreamEvent::PartStop,
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("tool_call".into()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        client.add_events(events);
+        client.add_text_response("Done");
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        let count = Arc::new(AtomicUsize::new(0));
+        let recorder = Arc::new(DeltaRecorder {
+            count: Arc::clone(&count),
+        });
+        agent.register_observer(recorder as Arc<dyn crate::observer::LoopObserver>);
+
+        agent.run("Use tool").await.unwrap();
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "only the text delta should fire on_text_delta",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_text_delta_fires_without_streamer() {
+        struct DeltaRecorder {
+            deltas: Arc<Mutex<Vec<String>>>,
+        }
+        impl crate::observer::LoopObserver for DeltaRecorder {
+            fn name(&self) -> &'static str {
+                "delta-recorder"
+            }
+            fn on_text_delta(&self, ctx: &crate::observer::TextDeltaContext) {
+                self.deltas.lock().push(ctx.delta.clone());
+            }
+        }
+
+        let client = MockClient::new("test-model");
+        client.add_text_response("Hello world");
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::new(DeltaRecorder {
+            deltas: Arc::clone(&captured),
+        });
+        agent.register_observer(recorder as Arc<dyn crate::observer::LoopObserver>);
+
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        let captured = captured.lock();
+        assert!(
+            !captured.is_empty(),
+            "observer should receive deltas with no streamer set"
+        );
+        let joined: String = captured.iter().map(String::as_str).collect();
+        assert!(joined.contains("Hello world"), "got: {joined:?}");
+    }
+
+    #[tokio::test]
+    async fn test_on_text_delta_and_streamer_coexist() {
+        struct DeltaRecorder {
+            deltas: Arc<Mutex<Vec<String>>>,
+        }
+        impl crate::observer::LoopObserver for DeltaRecorder {
+            fn name(&self) -> &'static str {
+                "delta-recorder"
+            }
+            fn on_text_delta(&self, ctx: &crate::observer::TextDeltaContext) {
+                self.deltas.lock().push(ctx.delta.clone());
+            }
+        }
+
+        let client = MockClient::new("test-model");
+        client.add_text_response("Hello world");
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+
+        let streamer_buf = Arc::new(Mutex::new(Vec::new()));
+        let buf = Arc::clone(&streamer_buf);
+        agent.set_text_streamer(Arc::new(move |delta: &str| {
+            buf.lock().push(delta.to_string());
+        }));
+
+        let observer_buf = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::new(DeltaRecorder {
+            deltas: Arc::clone(&observer_buf),
+        });
+        agent.register_observer(recorder as Arc<dyn crate::observer::LoopObserver>);
+
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        let streamer_buf = streamer_buf.lock();
+        let observer_buf = observer_buf.lock();
+        assert!(!streamer_buf.is_empty(), "streamer should fire");
+        assert!(!observer_buf.is_empty(), "observer should fire");
+        assert_eq!(
+            streamer_buf.len(),
+            observer_buf.len(),
+            "both paths receive the same number of deltas",
+        );
+        assert_eq!(
+            *streamer_buf, *observer_buf,
+            "both paths receive identical chunks"
+        );
+    }
+
     #[test]
     fn test_accessors() {
         let client = MockClient::new("test-model");

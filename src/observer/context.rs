@@ -183,6 +183,46 @@ pub struct ResponseContext {
     pub usage: Option<crate::stream::Usage>,
 }
 
+/// Context for [`LoopObserver::on_text_delta`](crate::observer::LoopObserver::on_text_delta).
+///
+/// Carries one incremental text chunk from the model's streaming response. Fires
+/// once per `IndexedDelta(Text)` event, *during* the stream — as opposed to
+/// [`ResponseContext`], which fires once after the whole assistant text is
+/// assembled.
+///
+/// Concatenate `delta` across all `on_text_delta` calls for a given `turn`, in
+/// arrival order, to reconstruct the per-turn text. Observers that need a
+/// running total maintain their own accumulator; the context carries only the
+/// per-chunk slice.
+///
+/// # Examples
+///
+/// ```
+/// use loopctl::observer::TextDeltaContext;
+///
+/// let ctx = TextDeltaContext { turn: 0, delta: "Hello".to_string() };
+/// assert_eq!(ctx.turn, 0);
+/// assert_eq!(ctx.delta, "Hello");
+/// ```
+#[derive(Debug, Clone)]
+pub struct TextDeltaContext {
+    /// Turn number (0-indexed).
+    ///
+    /// Matches the `turn` passed to the surrounding
+    /// [`on_turn_start`](crate::observer::LoopObserver::on_turn_start) /
+    /// [`on_turn_end`](crate::observer::LoopObserver::on_turn_end) and to
+    /// [`ResponseContext::turn`]. Lets observers correlate deltas with the
+    /// turn they belong to and detect a fresh turn.
+    pub turn: usize,
+
+    /// The incremental text chunk for this delta.
+    ///
+    /// A small fragment of the assistant's text output. Concatenate in arrival
+    /// order per turn to reconstruct the full text. No normalization, no
+    /// trimming — what the provider sent, verbatim.
+    pub delta: String,
+}
+
 /// Context for [`LoopObserver::on_tool_pre`](crate::observer::LoopObserver::on_tool_pre).
 ///
 /// Sent before a tool is executed, providing the tool name and

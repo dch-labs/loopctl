@@ -12,6 +12,7 @@
 //! - [`TurnStartContext`] / [`TurnEndContext`] — turn boundaries
 //! - [`StreamContext`] / [`StreamFailureContext`] — stream success/failure
 //! - [`ResponseContext`] — model response text and usage
+//! - [`TextDeltaContext`] — incremental text chunk while streaming
 //! - [`ToolPreContext`] / [`ToolPostContext`] — tool dispatch lifecycle
 //! - [`CompactedContext`] — context window compaction
 //! - [`FallbackContext`] — model fallback event
@@ -41,7 +42,8 @@ pub mod context;
 pub use context::{
     CompactedContext, ConvergenceDetectedContext, FallbackContext, LoopDetectedContext,
     ModelSwitchedContext, ResponseContext, SessionEndContext, SessionStartContext, StreamContext,
-    StreamFailureContext, ToolPostContext, ToolPreContext, TurnEndContext, TurnStartContext,
+    StreamFailureContext, TextDeltaContext, ToolPostContext, ToolPreContext, TurnEndContext,
+    TurnStartContext,
 };
 // ==================================================
 // LoopObserver Trait
@@ -102,6 +104,44 @@ pub trait LoopObserver: Send + Sync {
     /// Tool-call content is excluded; use [`on_tool_post`](Self::on_tool_post)
     /// for tool results.
     fn on_response(&self, _ctx: &ResponseContext) {}
+
+    /// Called for each text delta while the model streams a response.
+    ///
+    /// Fires once per `IndexedDelta(Text)` stream event, *during* streaming —
+    /// before [`on_response`](Self::on_response), which delivers the assembled
+    /// text once the stream ends. Concatenate
+    /// [`TextDeltaContext::delta`](TextDeltaContext::delta) across calls, in
+    /// arrival order, to reconstruct the per-turn text.
+    ///
+    /// This is the per-token counterpart to the raw
+    /// [`text_streamer`](crate::engine::BareLoop::set_text_streamer) callback,
+    /// delivered through the observer system so multiple observers each receive
+    /// every chunk. The streamer remains available for simple single-consumer
+    /// use.
+    ///
+    /// Default no-op — override only if you need live per-chunk text. An
+    /// override should do minimal work (append to a buffer, notify a waker) and
+    /// must not parse, render, or perform I/O synchronously, since it runs on
+    /// the stream-ingestion task.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::{Arc, Mutex};
+    /// use loopctl::observer::{LoopObserver, TextDeltaContext};
+    ///
+    /// // A minimal observer that records every streamed chunk.
+    /// struct Recorder { chunks: Arc<Mutex<Vec<String>>> }
+    /// impl LoopObserver for Recorder {
+    ///     fn name(&self) -> &str { "recorder" }
+    ///     fn on_text_delta(&self, ctx: &TextDeltaContext) {
+    ///         if let Ok(mut buf) = self.chunks.lock() {
+    ///             buf.push(ctx.delta.clone());
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    fn on_text_delta(&self, _ctx: &TextDeltaContext) {}
 
     /// Called before a tool is dispatched.
     ///
@@ -267,6 +307,16 @@ impl ObserverHost {
     pub fn on_response(&self, ctx: &ResponseContext) {
         for obs in &self.observers {
             obs.on_response(ctx);
+        }
+    }
+
+    /// Dispatch [`LoopObserver::on_text_delta`] to all observers.
+    ///
+    /// Iterates registered observers in registration order. Called once per
+    /// streamed text delta, so each observer's `on_text_delta` must be cheap.
+    pub fn on_text_delta(&self, ctx: &TextDeltaContext) {
+        for obs in &self.observers {
+            obs.on_text_delta(ctx);
         }
     }
 
@@ -480,6 +530,66 @@ mod tests {
         obs.on_model_switched(&ModelSwitchedContext {
             from: "x".into(),
             to: "y".into(),
+        });
+    }
+
+    #[test]
+    fn on_text_delta_default_is_noop() {
+        struct NoopObserver;
+        impl LoopObserver for NoopObserver {
+            fn name(&self) -> &'static str {
+                "noop"
+            }
+        }
+
+        let obs = NoopObserver;
+        let mut host = ObserverHost::new();
+        host.register(Arc::new(obs) as Arc<dyn LoopObserver>);
+        host.on_text_delta(&TextDeltaContext {
+            turn: 0,
+            delta: "x".into(),
+        });
+    }
+
+    #[test]
+    fn host_dispatches_on_text_delta_to_all_observers() {
+        struct DeltaRecorder {
+            deltas: parking_lot::Mutex<Vec<String>>,
+        }
+        impl LoopObserver for DeltaRecorder {
+            fn name(&self) -> &'static str {
+                "delta-recorder"
+            }
+            fn on_text_delta(&self, ctx: &TextDeltaContext) {
+                self.deltas.lock().push(ctx.delta.clone());
+            }
+        }
+
+        let obs1 = Arc::new(DeltaRecorder {
+            deltas: parking_lot::Mutex::new(Vec::new()),
+        });
+        let obs2 = Arc::new(DeltaRecorder {
+            deltas: parking_lot::Mutex::new(Vec::new()),
+        });
+        let mut host = ObserverHost::new();
+        host.register(Arc::clone(&obs1) as Arc<dyn LoopObserver>);
+        host.register(Arc::clone(&obs2) as Arc<dyn LoopObserver>);
+
+        host.on_text_delta(&TextDeltaContext {
+            turn: 0,
+            delta: "x".into(),
+        });
+
+        assert_eq!(obs1.deltas.lock().clone(), vec!["x".to_string()]);
+        assert_eq!(obs2.deltas.lock().clone(), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn host_dispatches_on_text_delta_with_no_observers() {
+        let host = ObserverHost::new();
+        host.on_text_delta(&TextDeltaContext {
+            turn: 0,
+            delta: "x".into(),
         });
     }
 }

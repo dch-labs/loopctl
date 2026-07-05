@@ -503,7 +503,7 @@ impl LoopRuntime {
     ///
     /// Generic framework logic: checks loop-detection thresholds,
     /// maps convergence actions, and notifies observers. Returns
-    /// `None` to continue, or `Some(Err)` to abort the session.
+    /// `None` to continue the session, or `Some(error)` to abort.
     ///
     /// Called by the agent loop after each response is recorded with the
     /// [`DetectionManager`].
@@ -511,7 +511,7 @@ impl LoopRuntime {
         &self,
         pattern: &crate::detection::DetectedPattern,
         turn: usize,
-    ) -> Option<Result<(), LoopError>> {
+    ) -> Option<LoopError> {
         match pattern {
             DetectedPattern::NoPattern => None,
 
@@ -538,9 +538,9 @@ impl LoopRuntime {
                         turn,
                         "stopping agent: loop threshold exceeded"
                     );
-                    Some(Err(LoopError::LoopDetected {
+                    Some(LoopError::LoopDetected {
                         message: format!("{pattern_description} repeated {repetitions} times"),
-                    }))
+                    })
                 } else {
                     None
                 }
@@ -566,12 +566,12 @@ impl LoopRuntime {
                     });
 
                 match action {
-                    ConvergenceAction::Stop => Some(Err(LoopError::LoopDetected {
+                    ConvergenceAction::Stop => Some(LoopError::LoopDetected {
                         message: "agent stopped: convergence detected".into(),
-                    })),
-                    ConvergenceAction::AskUser => Some(Err(LoopError::LoopDetected {
+                    }),
+                    ConvergenceAction::AskUser => Some(LoopError::LoopDetected {
                         message: "agent stopped: convergence detected, user input needed".into(),
-                    })),
+                    }),
                     ConvergenceAction::Warn
                     | ConvergenceAction::Compact
                     | ConvergenceAction::SwitchPhase => None,

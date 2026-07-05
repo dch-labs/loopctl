@@ -1009,36 +1009,23 @@ impl<C: ApiClient> BareLoop<C> {
     /// `Some(Err(..))` when detection forced a hard failure (caller
     /// propagates). Either `Some` arm is a terminal transition; both set the
     /// appropriate [`LoopState`] before returning.
+    /// Consult the detection manager and, if a pattern forced a hard stop,
+    /// produce the abort outcome for `process_turn` to return.
+    ///
+    /// Returns `None` when no pattern fired (caller continues with tool
+    /// extraction and dispatch), or `Some(Err(..))` with the propagated error
+    /// when detection aborted the session. The terminal state is set via
+    /// [`set_error_state`](Self::set_error_state) before returning.
     fn apply_loop_detection(
         &mut self,
         current_turn: usize,
-        text: &str,
         pattern: &crate::detection::DetectedPattern,
-        turn_in: u64,
-        turn_out: u64,
-        turn_start: Instant,
-    ) -> Option<Result<TurnResult, LoopError>> {
-        let result = self
+    ) -> Option<LoopError> {
+        let e = self
             .managers
             .handle_detected_pattern(pattern, current_turn)?;
-        let outcome = match result {
-            Ok(()) => {
-                self.state = LoopState::Completed {
-                    summary: text.to_string(),
-                };
-                Ok(Self::turn_complete(
-                    text.to_string(),
-                    turn_in,
-                    turn_out,
-                    turn_start.elapsed(),
-                ))
-            }
-            Err(e) => {
-                self.set_error_state(&e);
-                Err(e)
-            }
-        };
-        Some(outcome)
+        self.set_error_state(&e);
+        Some(e)
     }
 
     /// End the session because the model finished its turn without requesting
@@ -1221,15 +1208,8 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
             let pattern = self.managers.detection.record_response(&text);
             self.fire_response(current_turn, &text, usage);
 
-            if let Some(result) = self.apply_loop_detection(
-                current_turn,
-                &text,
-                &pattern,
-                turn_in,
-                turn_out,
-                turn_start,
-            ) {
-                return result;
+            if let Some(e) = self.apply_loop_detection(current_turn, &pattern) {
+                return Err(e);
             }
 
             let tool_calls = Self::extract_tool_calls(&msg);

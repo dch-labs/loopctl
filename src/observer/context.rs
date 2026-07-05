@@ -223,6 +223,58 @@ pub struct TextDeltaContext {
     pub delta: String,
 }
 
+/// Context for [`LoopObserver::on_tool_call_received`](crate::observer::LoopObserver::on_tool_call_received).
+///
+/// Fired once per tool call after the streaming response has been accumulated
+/// and before dispatch of that call begins — strictly earlier than
+/// [`ToolPreContext`]. Use this to surface a pending indicator the moment the
+/// model decides to call a tool, before execution starts.
+///
+/// Unlike [`ToolPreContext`], this context also carries the call's `input`,
+/// because the input is fully known at accumulation time and downstream
+/// consumers may want to render it before execution. It fires exactly once per
+/// call regardless of how many recovery retries the call later undergoes.
+///
+/// # Examples
+///
+/// ```
+/// use loopctl::observer::ToolCallReceivedContext;
+///
+/// let ctx = ToolCallReceivedContext {
+///     turn: 0,
+///     tool: "edit".to_string(),
+///     call_id: "call_1".to_string(),
+///     input: serde_json::json!({"path": "/tmp/a"}),
+/// };
+/// assert_eq!(ctx.tool, "edit");
+/// assert_eq!(ctx.call_id, "call_1");
+/// ```
+#[derive(Debug, Clone)]
+pub struct ToolCallReceivedContext {
+    /// Turn number (0-indexed).
+    ///
+    /// Matches the value passed to the corresponding `on_response` and
+    /// `on_tool_pre` for the same assistant message.
+    pub turn: usize,
+
+    /// Tool name.
+    ///
+    /// Matches the name the tool was registered under. Same value as
+    /// [`ToolPreContext::tool`] for the same call.
+    pub tool: String,
+
+    /// Tool call ID assigned by the API.
+    ///
+    /// Correlates with [`ToolPreContext::tool_call_id`] for the same call.
+    pub call_id: String,
+
+    /// JSON input the model supplied for this call.
+    ///
+    /// The full input object, as accumulated from the stream. Not present on
+    /// `ToolPreContext` (which fires later but omits input).
+    pub input: serde_json::Value,
+}
+
 /// Context for [`LoopObserver::on_tool_pre`](crate::observer::LoopObserver::on_tool_pre).
 ///
 /// Sent before a tool is executed, providing the tool name and

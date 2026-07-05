@@ -68,10 +68,13 @@ use std::sync::Arc;
 
 use crate::compact::ContextManager;
 use crate::detection::DetectionManager;
+use crate::detection::{ConvergenceAction, DetectedPattern};
+use crate::error::LoopError;
 use crate::fallback::FallbackManager;
 #[cfg(feature = "hooks")]
 use crate::hooks::HookExecutor;
 use crate::middleware::ToolPipeline;
+use crate::observer::{ConvergenceDetectedContext, LoopDetectedContext};
 use crate::observer::{LoopObserver, ObserverHost};
 use crate::stream::handler::StreamHandler;
 #[cfg(feature = "tool_health")]
@@ -496,7 +499,7 @@ impl LoopRuntime {
     // Detection interpretation
     // ==================================================
 
-    /// Interpret a [`DetectedPattern`](crate::detection::DetectedPattern) and decide whether to abort.
+    /// Interpret a [`DetectedPattern`] and decide whether to abort.
     ///
     /// Generic framework logic: checks loop-detection thresholds,
     /// maps convergence actions, and notifies observers. Returns
@@ -508,11 +511,7 @@ impl LoopRuntime {
         &self,
         pattern: &crate::detection::DetectedPattern,
         turn: usize,
-    ) -> Option<Result<crate::engine::loop_core::SessionResult, crate::error::LoopError>> {
-        use crate::detection::{ConvergenceAction, DetectedPattern};
-        use crate::error::LoopError;
-        use crate::observer::{ConvergenceDetectedContext, LoopDetectedContext};
-
+    ) -> Option<Result<(), LoopError>> {
         match pattern {
             DetectedPattern::NoPattern => None,
 

@@ -208,7 +208,7 @@ impl<C: ApiClient> BareLoop<C> {
         // the model can see the warning and try a different approach.
         match self.managers.handle_detected_pattern(&pattern, turn_idx) {
             Some(Err(e)) => Err(e),
-            Some(Ok(_)) => Ok(Some(ToolDispatchResult {
+            Some(Ok(())) => Ok(Some(ToolDispatchResult {
                 tool_call_id: tc.id.clone(),
                 output: ToolContent::Text("loop detected: aborting tool dispatch".into()),
                 is_error: true,

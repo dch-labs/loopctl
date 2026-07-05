@@ -25,6 +25,7 @@
 
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use loopctl::api::ApiClient;
 use loopctl::config::LoopConfig;
@@ -364,6 +365,20 @@ async fn run_repl<C: ApiClient>(client: Arc<C>) {
         let _ = std::io::stdout().flush();
     }));
 
+    // Ctrl-C interrupts the in-flight turn (via loopctl's CancelSignal, which
+    // `select!`s against the stream) and ends the session. The token is
+    // one-shot, so the REPL exits after the interrupted turn rather than
+    // continuing.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let cancel_signal = agent.cancel_signal();
+    let interrupted_flag = Arc::clone(&interrupted);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            interrupted_flag.store(true, Ordering::SeqCst);
+            cancel_signal.cancel();
+        }
+    });
+
     let stdin = io::stdin();
     let mut total_input: u64 = 0;
     let mut total_output: u64 = 0;
@@ -407,6 +422,10 @@ async fn run_repl<C: ApiClient>(client: Arc<C>) {
                 );
             }
             Err(e) => {
+                if interrupted.load(Ordering::SeqCst) {
+                    eprintln!("\n  Interrupted.");
+                    break;
+                }
                 eprintln!("\n  Error: {e}\n");
             }
         }

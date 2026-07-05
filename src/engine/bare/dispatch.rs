@@ -202,19 +202,11 @@ impl<C: ApiClient> BareLoop<C> {
         );
         let pattern = self.managers.detection.record_operation(operation);
 
-        // Check inline detection.  When the pattern triggers a hard stop
-        // (Err), propagate it so the agent loop terminates.  When it
-        // produces a soft block (Ok), return the soft-error result so
-        // the model can see the warning and try a different approach.
+        // Inline loop/convergence detection. Some(error) forces a hard stop —
+        // propagate it so the agent loop terminates. None means no detection
+        // fired and dispatch continues.
         match self.managers.handle_detected_pattern(&pattern, turn_idx) {
-            Some(Err(e)) => Err(e),
-            Some(Ok(())) => Ok(Some(ToolDispatchResult {
-                tool_call_id: tc.id.clone(),
-                output: ToolContent::Text("loop detected: aborting tool dispatch".into()),
-                is_error: true,
-                duration: Duration::ZERO,
-                resolved_tool_name: tc.tool.clone(),
-            })),
+            Some(e) => Err(e),
             None => Ok(None),
         }
     }

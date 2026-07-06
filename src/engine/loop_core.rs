@@ -153,6 +153,14 @@ pub enum LoopState {
         /// A human-readable description of the error that caused the failure.
         error: String,
     },
+
+    /// The agent was cancelled by the user or a shutdown signal.
+    ///
+    /// Terminal state, distinct from [`Failed`](Self::Failed): cancellation is
+    /// a clean, cooperative termination ([`LoopError::Cancelled`]), not an
+    /// error condition. The agent may hold partial results in its
+    /// conversation history.
+    Cancelled,
 }
 
 // ==================================================

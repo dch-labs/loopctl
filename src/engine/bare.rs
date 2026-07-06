@@ -79,7 +79,7 @@ use crate::message::{Message, MessagePart, Role, ToolContent};
 use crate::middleware::{ToolDispatchContext, ToolPipeline, ToolPipelineBuilder};
 use crate::observer::{
     FallbackContext, ModelSwitchedContext, ResponseContext, StreamContext, StreamFailureContext,
-    TurnEndContext, TurnStartContext,
+    ToolCallReceivedContext, TurnEndContext, TurnStartContext,
 };
 use crate::reflection::{
     ExponentialBackoffRecovery, NoopReflector, RecoveryAction, RecoveryStrategy, ReflectionContext,
@@ -744,7 +744,9 @@ impl<C: ApiClient> BareLoop<C> {
     // Run helpers
     // ==================================================
 
-    /// Extract per-turn token counts from optional [`Usage`].
+    /// Pull per-turn `(input_tokens, output_tokens)` from optional [`Usage`].
+    ///
+    /// Returns `(0, 0)` when the provider did not report usage for the turn.
     fn usage_tokens(usage: Option<&Usage>) -> (u64, u64) {
         match usage {
             Some(u) => (u64::from(u.input_tokens), u64::from(u.output_tokens)),
@@ -752,15 +754,22 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Dispatch tool calls, push the result message, and record the count.
+    /// Dispatch a batch of tool calls, append the results to the conversation,
+    /// record the call count on `budget`, and fire `on_turn_end`.
     ///
-    /// Notifies observers: turn-end on success, turn-end on error.
+    /// `on_turn_end` fires on both success and error paths with the
+    /// corresponding `success` flag. On error the conversation is *not*
+    /// extended — the caller's error handling owns the terminal state.
+    ///
+    /// Takes `budget` by mutable reference (rather than `&mut self`) because
+    /// the caller has already `mem::take`n it to avoid a double mutable borrow
+    /// while dispatch runs.
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::Cancelled`] if the cancellation token is set.
-    /// Returns [`LoopError::Api`] if loop or convergence detection forces
-    /// an abort, or if the underlying tool dispatch fails.
+    /// Propagates [`LoopError::Cancelled`] if cancellation fired during
+    /// dispatch, or any error the recovery system escalates to a hard failure
+    /// (e.g. loop detection aborts, exhaustion of retry budget).
     async fn dispatch_and_record(
         &mut self,
         tool_calls: &[ToolCall],
@@ -803,41 +812,23 @@ impl<C: ApiClient> BareLoop<C> {
     // Turn helpers (used by process_turn)
     // ==================================================
 
-    /// Return `Err(Cancelled)` if the cancel signal has been set.
+    /// Stream one assistant response from the API and apply post-stream bookkeeping.
     ///
-    /// # Errors
-    ///
-    /// Returns [`LoopError::Cancelled`] if the cancel signal has been set.
-    fn check_cancellation(&mut self) -> Result<(), LoopError> {
-        if self.is_cancelled() {
-            self.state = LoopState::Failed {
-                error: "cancelled".into(),
-            };
-            return Err(LoopError::Cancelled);
-        }
-        Ok(())
-    }
-
-    /// Execute the streaming API call and process the result.
-    ///
-    /// On success, records the success with the fallback manager and fires
+    /// On success: records the success with the fallback manager and fires
     /// [`on_stream_success`](crate::observer::LoopObserver::on_stream_success).
-    ///
-    /// On failure, records the failure with the fallback circuit breaker
-    /// (firing [`on_fallback`](crate::observer::LoopObserver::on_fallback)
-    /// if it trips), fires
+    /// On failure: records the failure (firing
+    /// [`on_fallback`](crate::observer::LoopObserver::on_fallback) if the
+    /// circuit breaker trips), fires
     /// [`on_stream_failure`](crate::observer::LoopObserver::on_stream_failure),
-    /// and returns the error.
+    /// sets the terminal state, and returns the error.
     ///
-    /// `BareLoop` records API failures and trips the circuit breaker but does
-    /// **not** automatically retry with the fallback model — it has a single
-    /// client. The `FallbackManager` is infrastructure for downstream
-    /// consumers that hold multiple API clients.
+    /// `LoopError::Cancelled` short-circuits the failure bookkeeping:
+    /// cancellation is a clean termination, so it sets [`LoopState::Cancelled`]
+    /// without tripping the fallback or firing `on_stream_failure`.
     ///
     /// # Errors
     ///
-    /// Returns the [`LoopError`] from [`stream_turn`](Self::stream_turn) if
-    /// the API call fails.
+    /// Propagates whatever [`stream_turn`](Self::stream_turn) returned.
     async fn do_stream(&mut self) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
         match self.stream_turn().await {
             Ok((msg, usage, stop)) => {
@@ -852,6 +843,11 @@ impl<C: ApiClient> BareLoop<C> {
                 Ok((msg, usage, stop))
             }
             Err(e) => {
+                if matches!(e, LoopError::Cancelled) {
+                    self.state = LoopState::Cancelled;
+                    return Err(e);
+                }
+
                 let tripped = self.managers.fallback.record_api_failure();
                 if tripped {
                     let from = self.client.model();
@@ -879,7 +875,10 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Add this turn's token usage into the session-level budget.
+    /// Fold this turn's token counts into the running session totals on
+    /// `budget`. No-op when the provider did not report usage.
+    ///
+    /// Uses saturating add so a runaway session cannot overflow the counters.
     fn accumulate_usage(&mut self, usage: Option<&Usage>) {
         if let Some(u) = usage {
             self.budget.input_tokens = self
@@ -893,7 +892,12 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Fire [`on_turn_end`](crate::observer::LoopObserver::on_turn_end).
+    /// Fire [`on_turn_end`](crate::observer::LoopObserver::on_turn_end) for the
+    /// turn that just completed.
+    ///
+    /// Reports `total_turns - 1` as the turn number: callers invoke this after
+    /// the per-turn increment, so subtracting one recovers the 0-indexed turn
+    /// that just ran.
     fn finish_turn(&mut self, turn_in: u64, turn_out: u64, duration: Duration) {
         self.managers.observers().on_turn_end(&TurnEndContext {
             turn: self.budget.total_turns.saturating_sub(1),
@@ -905,7 +909,10 @@ impl<C: ApiClient> BareLoop<C> {
         });
     }
 
-    /// Build a [`TurnResult`] signalling turn completion.
+    /// Build the [`TurnResult`] returned by a turn that completed the session
+    /// (`is_complete: true`, [`StopReason::EndTurn`]). Used by the no-tool-calls
+    /// and loop-detection success paths, both of which end the session from
+    /// inside `process_turn`.
     fn turn_complete(text: String, turn_in: u64, turn_out: u64, duration: Duration) -> TurnResult {
         TurnResult {
             text,
@@ -921,8 +928,8 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Run context compaction if a [`ContextManager`] is configured.
     ///
-    /// Best-effort: failures are logged and the turn continues with
-    /// un-compacted history.
+    /// Best-effort: failures are logged and the turn continues with the
+    /// un-compacted history rather than failing the session.
     async fn try_compact_context(&mut self) {
         if let Err(e) = self.maybe_compact_context(self.budget.total_turns).await {
             tracing::warn!(
@@ -931,6 +938,135 @@ impl<C: ApiClient> BareLoop<C> {
                 "context compaction failed; continuing with uncompactd history"
             );
         }
+    }
+
+    /// Push the user's message onto the conversation (first turn only).
+    ///
+    /// Continuation turns receive `input == ""` because the previous turn's
+    /// tool results are already in the history.
+    fn record_user_input(&mut self, input: &str) {
+        if !input.is_empty() {
+            self.conversation.push(Message::user(input));
+        }
+    }
+
+    /// Fire [`on_turn_start`](crate::observer::LoopObserver::on_turn_start)
+    /// for the turn about to stream.
+    ///
+    /// `turn` is the 0-indexed current turn (the same value `on_response` and
+    /// `on_tool_call_received` will report for this turn — captured before the
+    /// per-turn counter increment). `query` is the user's message on the first
+    /// turn and `""` on continuation turns (the previous turn's tool results
+    /// are already in the conversation history).
+    fn fire_turn_start(&self, turn: usize, query: &str) {
+        self.managers.observers().on_turn_start(&TurnStartContext {
+            turn,
+            query: query.to_string(),
+        });
+    }
+
+    /// Fire [`on_response`](crate::observer::LoopObserver::on_response) with
+    /// the assembled assistant text for the turn that just streamed.
+    ///
+    /// `turn` is the same 0-indexed current turn passed to
+    /// [`fire_turn_start`](Self::fire_turn_start). `usage` is `None` when the
+    /// provider did not report token counts for the turn.
+    fn fire_response(&self, turn: usize, text: &str, usage: Option<crate::stream::Usage>) {
+        self.managers.observers().on_response(&ResponseContext {
+            turn,
+            text: text.to_string(),
+            usage,
+        });
+    }
+
+    /// Fire [`on_tool_call_received`](crate::observer::LoopObserver::on_tool_call_received)
+    /// for each accumulated tool call, before dispatch begins.
+    ///
+    /// Fires once per call regardless of how many recovery retries the call
+    /// later undergoes (the retry loop lives in dispatch and re-fires only
+    /// `on_tool_pre`/`on_tool_post`). `turn` is the same 0-indexed current
+    /// turn passed to [`fire_turn_start`](Self::fire_turn_start); it reaches
+    /// the dispatch path as `turn_idx`, so the two events correlate.
+    fn fire_tool_calls_received(&self, turn: usize, tool_calls: &[ToolCall]) {
+        for tc in tool_calls {
+            self.managers
+                .observers()
+                .on_tool_call_received(&ToolCallReceivedContext {
+                    turn,
+                    tool: tc.tool.clone(),
+                    call_id: tc.id.clone(),
+                    input: tc.input.clone(),
+                });
+        }
+    }
+
+    /// Consult the detection manager and, if a pattern fired, produce the
+    /// early-exit outcome for `process_turn` to return.
+    ///
+    /// Returns `None` when no pattern was detected — the caller continues with
+    /// tool extraction and dispatch. Returns `Some(Ok(..))` when detection
+    /// ended the turn softly (caller returns the `TurnResult`), or
+    /// `Some(Err(..))` when detection forced a hard failure (caller
+    /// propagates). Either `Some` arm is a terminal transition; both set the
+    /// appropriate [`LoopState`] before returning.
+    /// Consult the detection manager and, if a pattern forced a hard stop,
+    /// produce the abort outcome for `process_turn` to return.
+    ///
+    /// Returns `None` when no pattern fired (caller continues with tool
+    /// extraction and dispatch), or `Some(Err(..))` with the propagated error
+    /// when detection aborted the session. The terminal state is set via
+    /// [`set_error_state`](Self::set_error_state) before returning.
+    fn apply_loop_detection(
+        &mut self,
+        current_turn: usize,
+        pattern: &crate::detection::DetectedPattern,
+    ) -> Option<LoopError> {
+        let e = self
+            .managers
+            .handle_detected_pattern(pattern, current_turn)?;
+        self.set_error_state(&e);
+        Some(e)
+    }
+
+    /// End the session because the model finished its turn without requesting
+    /// any tool calls.
+    ///
+    /// Fires [`on_turn_end`](crate::observer::LoopObserver::on_turn_end)
+    /// (via [`finish_turn`](Self::finish_turn)), transitions to
+    /// [`LoopState::Completed`], and returns a session-completing
+    /// [`TurnResult`] (`is_complete: true`) for `process_turn` to return.
+    ///
+    /// Distinct from the success arm of
+    /// [`apply_loop_detection`](Self::apply_loop_detection), which transitions
+    /// to `Completed` *without* firing `on_turn_end` — that path ends the
+    /// session from detection, not from natural turn completion, so the
+    /// turn-end bookkeeping is intentionally skipped there.
+    fn complete_session(
+        &mut self,
+        text: String,
+        turn_in: u64,
+        turn_out: u64,
+        turn_start: Instant,
+    ) -> TurnResult {
+        self.finish_turn(turn_in, turn_out, turn_start.elapsed());
+        self.state = LoopState::Completed {
+            summary: text.clone(),
+        };
+        Self::turn_complete(text, turn_in, turn_out, turn_start.elapsed())
+    }
+
+    /// Set the terminal state for a propagated error.
+    ///
+    /// Cancellation is a clean termination ([`LoopError::Cancelled`]), not a
+    /// failure; all other errors are recorded as [`LoopState::Failed`].
+    fn set_error_state(&mut self, e: &LoopError) {
+        self.state = if matches!(e, LoopError::Cancelled) {
+            LoopState::Cancelled
+        } else {
+            LoopState::Failed {
+                error: e.to_string(),
+            }
+        };
     }
 }
 
@@ -1058,82 +1194,33 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
         input: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<TurnResult, LoopError>> + Send + 'a>> {
         Box::pin(async move {
-            // On the first turn, `input` is the user's message (non-empty).
-            // On continuation turns, `input` is "" — the conversation already
-            // has the tool results appended from the previous turn.
-            if !input.is_empty() {
-                self.conversation.push(Message::user(input));
-            }
-
             let turn_start = Instant::now();
+            let current_turn = self.budget.total_turns;
 
-            self.managers.observers().on_turn_start(&TurnStartContext {
-                turn: self.budget.total_turns,
-                query: input.to_string(),
-            });
+            self.record_user_input(input);
+            self.fire_turn_start(current_turn, input);
 
-            self.check_cancellation()?;
-
-            let (assistant_msg, usage, _stream_stop) = self.do_stream().await?;
-
+            let (msg, usage, _stream_stop) = self.do_stream().await?;
             self.accumulate_usage(usage.as_ref());
 
-            let text = Self::extract_text(&assistant_msg);
+            let text = Self::extract_text(&msg);
             let (turn_in, turn_out) = Self::usage_tokens(usage.as_ref());
-
-            // Record the response and check for loop/convergence patterns.
             let pattern = self.managers.detection.record_response(&text);
+            self.fire_response(current_turn, &text, usage);
 
-            self.managers.observers().on_response(&ResponseContext {
-                turn: self.budget.total_turns,
-                text: text.clone(),
-                usage,
-            });
-
-            if let Some(result) = self
-                .managers
-                .handle_detected_pattern(&pattern, self.budget.total_turns)
-            {
-                return match result {
-                    Ok(_) => {
-                        self.state = LoopState::Completed {
-                            summary: text.clone(),
-                        };
-                        Ok(Self::turn_complete(
-                            text,
-                            turn_in,
-                            turn_out,
-                            turn_start.elapsed(),
-                        ))
-                    }
-                    Err(e) => {
-                        self.state = LoopState::Failed {
-                            error: e.to_string(),
-                        };
-                        Err(e)
-                    }
-                };
+            if let Some(e) = self.apply_loop_detection(current_turn, &pattern) {
+                return Err(e);
             }
 
-            let tool_calls = Self::extract_tool_calls(&assistant_msg);
-            self.conversation.push(assistant_msg);
+            let tool_calls = Self::extract_tool_calls(&msg);
+            self.conversation.push(msg);
             self.budget.total_turns = self.budget.total_turns.saturating_add(1);
 
-            // No tool calls → this turn is complete.
             if tool_calls.is_empty() {
-                self.finish_turn(turn_in, turn_out, turn_start.elapsed());
-                self.state = LoopState::Completed {
-                    summary: text.clone(),
-                };
-                return Ok(Self::turn_complete(
-                    text,
-                    turn_in,
-                    turn_out,
-                    turn_start.elapsed(),
-                ));
+                return Ok(self.complete_session(text, turn_in, turn_out, turn_start));
             }
 
-            // Dispatch tool calls.
+            self.fire_tool_calls_received(current_turn, &tool_calls);
             self.state = LoopState::WaitingForTool {
                 tool: tool_calls
                     .first()
@@ -1144,30 +1231,25 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
 
             // Temporarily extract budget to avoid double mutable borrow.
             let mut budget = std::mem::take(&mut self.budget);
-            let turn_index = budget.total_turns.saturating_sub(1);
             let turn_duration = turn_start.elapsed();
-            if let Err(e) = self
+            let dispatch_result = self
                 .dispatch_and_record(
                     &tool_calls,
-                    turn_index,
+                    current_turn,
                     turn_duration,
                     turn_in,
                     turn_out,
                     &mut budget,
                 )
-                .await
-            {
-                self.budget = budget;
-                self.state = LoopState::Failed {
-                    error: e.to_string(),
-                };
+                .await;
+
+            self.budget = budget;
+            if let Err(e) = dispatch_result {
+                self.set_error_state(&e);
                 return Err(e);
             }
-            self.budget = budget;
 
-            // Attempt context compaction (best-effort).
             self.try_compact_context().await;
-
             self.state = LoopState::Processing {
                 turn: self.budget.total_turns,
             };
@@ -1198,7 +1280,7 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
         Box::pin(async move {
             let duration = self.session_start.map(|s| s.elapsed()).unwrap_or_default();
 
-            let success = !matches!(self.state, LoopState::Failed { .. });
+            let success = !matches!(self.state, LoopState::Failed { .. } | LoopState::Cancelled);
 
             // Fill in the final fields on the budget accumulator, then
             // use it as the SessionResult.
@@ -1214,6 +1296,7 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
             } else {
                 self.budget.error = Some(match &self.state {
                     LoopState::Failed { error } => error.clone(),
+                    LoopState::Cancelled => "session cancelled".to_string(),
                     _ => "session failed".to_string(),
                 });
             }
@@ -1542,11 +1625,59 @@ mod tests {
         }
     }
 
+    struct FlakyTool {
+        fail_threshold: usize,
+        attempts: AtomicUsize,
+    }
+
+    impl FlakyTool {
+        fn new(fail_threshold: usize) -> Self {
+            Self {
+                fail_threshold,
+                attempts: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Tool for FlakyTool {
+        fn name(&self) -> &'static str {
+            "flaky"
+        }
+
+        fn description(&self) -> &'static str {
+            "Fails the first N calls, then succeeds"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "flaky".into(),
+                description: "Fails the first N calls, then succeeds".into(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }
+        }
+
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if attempt < self.fail_threshold {
+                    Err(ToolError::Execution("Flaky tool failing".into()))
+                } else {
+                    Ok(ToolOutput::text("Flaky tool succeeded"))
+                }
+            })
+        }
+    }
+
     struct CountingObserver {
         session_starts: AtomicUsize,
         session_ends: AtomicUsize,
         turn_starts: AtomicUsize,
         turn_ends: AtomicUsize,
+        tool_calls_received: AtomicUsize,
         tool_pres: AtomicUsize,
         tool_posts: AtomicUsize,
     }
@@ -1558,6 +1689,7 @@ mod tests {
                 session_ends: AtomicUsize::new(0),
                 turn_starts: AtomicUsize::new(0),
                 turn_ends: AtomicUsize::new(0),
+                tool_calls_received: AtomicUsize::new(0),
                 tool_pres: AtomicUsize::new(0),
                 tool_posts: AtomicUsize::new(0),
             }
@@ -1583,6 +1715,10 @@ mod tests {
 
         fn on_turn_end(&self, _ctx: &crate::observer::TurnEndContext) {
             self.turn_ends.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn on_tool_call_received(&self, _ctx: &crate::observer::ToolCallReceivedContext) {
+            self.tool_calls_received.fetch_add(1, Ordering::SeqCst);
         }
 
         fn on_tool_pre(&self, _ctx: &crate::observer::ToolPreContext) {
@@ -2269,6 +2405,229 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_on_tool_call_received_fires_once_per_call() {
+        let client = MockClient::new("test-model");
+        client.add_tool_then_text("tool_1", "echo", json!({"message": "hi"}), "Done");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+        let observer = Arc::new(CountingObserver::new());
+        agent.register_observer(observer.clone());
+
+        let result = agent.run("Use echo").await.unwrap();
+        assert!(result.success);
+
+        assert_eq!(
+            observer.tool_calls_received.load(Ordering::SeqCst),
+            1,
+            "one accumulated call → one received event",
+        );
+        assert_eq!(observer.tool_pres.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_on_tool_call_received_fires_per_call_for_multiple_calls() {
+        let client = MockClient::new("test-model");
+        let tool_events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg_multi".into(),
+                    role: "assistant".into(),
+                    model: "test-model".into(),
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(MessagePart::tool_call(
+                    "t1",
+                    "echo",
+                    json!({"message": "first"}),
+                )),
+            }),
+            StreamEvent::PartStop,
+            StreamEvent::PartStart(PartStart {
+                index: 1,
+                part: Some(MessagePart::tool_call(
+                    "t2",
+                    "echo",
+                    json!({"message": "second"}),
+                )),
+            }),
+            StreamEvent::PartStop,
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("tool_call".to_string()),
+                },
+                usage: Some(Usage::new(50, 20)),
+            }),
+            StreamEvent::MessageStop,
+        ];
+        client.responses.lock().push(tool_events);
+        client.add_text_response("All done");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+        let observer = Arc::new(CountingObserver::new());
+        agent.register_observer(observer.clone());
+
+        let result = agent.run("Echo twice").await.unwrap();
+        assert!(result.success);
+
+        assert_eq!(
+            observer.tool_calls_received.load(Ordering::SeqCst),
+            2,
+            "two accumulated calls → two received events",
+        );
+        assert_eq!(observer.tool_pres.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_on_tool_call_received_not_fired_for_text_only_turn() {
+        let client = MockClient::new("test-model");
+        client.add_text_response("Just text, no tools");
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        let observer = Arc::new(CountingObserver::new());
+        agent.register_observer(observer.clone());
+
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        assert_eq!(
+            observer.tool_calls_received.load(Ordering::SeqCst),
+            0,
+            "no tool calls → no received event",
+        );
+        assert_eq!(observer.tool_pres.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_on_tool_call_received_turn_matches_other_events() {
+        struct TurnCapture {
+            received_turns: Arc<Mutex<Vec<usize>>>,
+            response_turns: Arc<Mutex<Vec<usize>>>,
+            pre_turns: Arc<Mutex<Vec<usize>>>,
+        }
+        impl crate::observer::LoopObserver for TurnCapture {
+            fn name(&self) -> &'static str {
+                "turn-capture"
+            }
+            fn on_response(&self, ctx: &crate::observer::ResponseContext) {
+                self.response_turns.lock().push(ctx.turn);
+            }
+            fn on_tool_call_received(&self, ctx: &crate::observer::ToolCallReceivedContext) {
+                self.received_turns.lock().push(ctx.turn);
+            }
+            fn on_tool_pre(&self, ctx: &crate::observer::ToolPreContext) {
+                self.pre_turns.lock().push(ctx.turn);
+            }
+        }
+
+        let client = MockClient::new("test-model");
+        client.add_tool_then_text("tool_1", "echo", json!({"message": "hi"}), "Done");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let response = Arc::new(Mutex::new(Vec::new()));
+        let pre = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::new(TurnCapture {
+            received_turns: Arc::clone(&received),
+            response_turns: Arc::clone(&response),
+            pre_turns: Arc::clone(&pre),
+        });
+        agent.register_observer(recorder as Arc<dyn crate::observer::LoopObserver>);
+
+        let result = agent.run("Use echo").await.unwrap();
+        assert!(result.success);
+
+        let received = received.lock();
+        let response = response.lock();
+        let pre = pre.lock();
+        assert_eq!(received.len(), 1, "one tool call → one received event");
+        for turn in received.iter() {
+            assert!(
+                response.contains(turn),
+                "received turn {turn} must match an on_response turn",
+            );
+            assert!(
+                pre.contains(turn),
+                "received turn {turn} must match an on_tool_pre turn",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_tool_call_received_does_not_refire_on_retry() {
+        struct AlwaysRecoverable;
+        impl crate::reflection::Reflector for AlwaysRecoverable {
+            fn analyze(
+                &self,
+                error: &str,
+                tool_name: &str,
+                _tool_input: &serde_json::Value,
+                _context: &crate::reflection::ReflectionContext,
+            ) -> Pin<
+                Box<
+                    dyn Future<
+                            Output = Result<
+                                crate::reflection::FailureAnalysis,
+                                crate::reflection::ReflectionError,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let error = error.to_string();
+                let tool_name = tool_name.to_string();
+                Box::pin(async move {
+                    Ok(crate::reflection::FailureAnalysis {
+                        is_recoverable: true,
+                        root_cause: error,
+                        severity: crate::reflection::FailureSeverity::Medium,
+                        correction: None,
+                        context: format!("tool: {tool_name}"),
+                    })
+                })
+            }
+        }
+
+        let client = MockClient::new("test-model");
+        client.add_tool_then_text("tool_1", "flaky", json!({}), "Recovered");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(FlakyTool::new(2));
+
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+        agent.set_reflector(Arc::new(AlwaysRecoverable));
+        agent.set_recovery_strategy(Arc::new(
+            crate::reflection::ExponentialBackoffRecovery::new(3)
+                .with_base_delay(std::time::Duration::ZERO),
+        ));
+        let observer = Arc::new(CountingObserver::new());
+        agent.register_observer(observer.clone());
+
+        let result = agent.run("Use flaky").await.unwrap();
+        assert!(result.success);
+
+        assert_eq!(
+            observer.tool_calls_received.load(Ordering::SeqCst),
+            1,
+            "received fires once per call regardless of retries",
+        );
+        assert!(
+            observer.tool_pres.load(Ordering::SeqCst) >= 2,
+            "tool_pre must re-fire on each retry attempt",
+        );
+    }
+
     #[test]
     fn test_accessors() {
         let client = MockClient::new("test-model");
@@ -2509,6 +2868,177 @@ mod tests {
 
         let result = agent.run("Test").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_during_dispatch_lands_in_cancelled_state() {
+        // Cancellation fired after process_turn has begun dispatching flows
+        // through LoopState::Cancelled (not Failed). Uses AlwaysRecoverable so
+        // FailingTool's error triggers a retry; the retry loop polls
+        // is_cancelled() at the top of each iteration (dispatch.rs), so the
+        // cancel signal set here is observed on the next retry attempt.
+        struct AlwaysRecoverable;
+        impl crate::reflection::Reflector for AlwaysRecoverable {
+            fn analyze(
+                &self,
+                error: &str,
+                tool_name: &str,
+                _tool_input: &serde_json::Value,
+                _context: &crate::reflection::ReflectionContext,
+            ) -> Pin<
+                Box<
+                    dyn Future<
+                            Output = Result<
+                                crate::reflection::FailureAnalysis,
+                                crate::reflection::ReflectionError,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let error = error.to_string();
+                let tool_name = tool_name.to_string();
+                Box::pin(async move {
+                    Ok(crate::reflection::FailureAnalysis {
+                        is_recoverable: true,
+                        root_cause: error,
+                        severity: crate::reflection::FailureSeverity::Medium,
+                        correction: None,
+                        context: format!("tool: {tool_name}"),
+                    })
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(FailingTool);
+
+        let client = MockClient::new("test");
+        client.add_tool_only_response("tc-1", "fail", json!({}));
+
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+        agent.set_reflector(Arc::new(AlwaysRecoverable));
+        agent.set_recovery_strategy(Arc::new(
+            crate::reflection::ExponentialBackoffRecovery::new(5)
+                .with_base_delay(std::time::Duration::ZERO),
+        ));
+        let signal = agent.cancel_signal();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            signal.cancel();
+        });
+
+        let result = agent.run("Test").await;
+        match result {
+            Err(LoopError::Cancelled) => {}
+            other => panic!("expected Err(LoopError::Cancelled), got {other:?}"),
+        }
+        assert_eq!(
+            agent.state(),
+            LoopState::Cancelled,
+            "cancellation must land in LoopState::Cancelled, not Failed",
+        );
+    }
+
+    struct StreamingMockClient {
+        model: String,
+        rx: parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<Result<StreamEvent, ApiError>>>>,
+    }
+
+    impl StreamingMockClient {
+        fn new(
+            model: &str,
+        ) -> (
+            Self,
+            tokio::sync::mpsc::Sender<Result<StreamEvent, ApiError>>,
+        ) {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, ApiError>>(8);
+            (
+                Self {
+                    model: model.to_string(),
+                    rx: parking_lot::Mutex::new(Some(rx)),
+                },
+                tx,
+            )
+        }
+    }
+
+    impl ApiClient for StreamingMockClient {
+        fn model(&self) -> String {
+            self.model.clone()
+        }
+
+        fn set_model(&self, _model: &str) -> bool {
+            false
+        }
+
+        fn stream_messages(
+            &self,
+            _messages: Vec<Message>,
+            _system: Option<String>,
+            _tools: Option<Vec<ToolSchema>>,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+        {
+            let rx = self.rx.lock().take().expect("stream_messages called twice");
+            Box::pin(ReceiverStream { rx })
+        }
+
+        fn create_message(
+            &self,
+            _messages: Vec<Message>,
+            _system: Option<String>,
+            _tools: Option<Vec<ToolSchema>>,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+            Box::pin(async { Err(ApiError::api("not implemented")) })
+        }
+    }
+
+    struct ReceiverStream<T> {
+        rx: tokio::sync::mpsc::Receiver<T>,
+    }
+
+    impl<T> futures::Stream for ReceiverStream<T> {
+        type Item = T;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.rx.poll_recv(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_turn_cancelled_mid_stream() {
+        let (client, tx) = StreamingMockClient::new("test-model");
+        let model = client.model.clone();
+        tx.send(Ok(StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg-1".into(),
+                role: "assistant".into(),
+                model,
+            },
+        })))
+        .await
+        .unwrap();
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        let signal = agent.cancel_signal();
+
+        let handle = tokio::spawn(async move { agent.run("Hi").await });
+
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        signal.cancel();
+
+        // `tx` stays open until function exit, so the channel never closes —
+        // the only way `run()` returns is via the cancel signal.
+        let result = handle.await.unwrap();
+        match result {
+            Err(LoopError::Cancelled) => {}
+            other => panic!("expected Err(LoopError::Cancelled), got {other:?}"),
+        }
     }
 
     #[tokio::test]

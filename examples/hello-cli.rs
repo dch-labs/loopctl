@@ -31,6 +31,14 @@ async fn main() {
     // 3. Construct the loop.
     let mut agent = BareLoop::new(Arc::new(client), tools, config);
 
+    // Ctrl-C interrupts the in-flight turn via loopctl's CancelSignal.
+    let cancel_signal = agent.cancel_signal();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel_signal.cancel();
+        }
+    });
+
     // 4. Run and print the result.
     let result = agent
         .run("Say hello!")

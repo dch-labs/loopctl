@@ -79,6 +79,15 @@ async fn main() {
 
     // 3. Construct and run the loop.
     let mut agent = BareLoop::new(Arc::new(client), tools, LoopConfig::default());
+
+    // Ctrl-C interrupts the in-flight turn via loopctl's CancelSignal.
+    let cancel_signal = agent.cancel_signal();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            cancel_signal.cancel();
+        }
+    });
+
     let result = agent
         .run("Please echo something.")
         .await

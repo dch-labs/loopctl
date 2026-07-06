@@ -13,6 +13,7 @@
 //! - [`StreamContext`] / [`StreamFailureContext`] — stream success/failure
 //! - [`ResponseContext`] — model response text and usage
 //! - [`TextDeltaContext`] — incremental text chunk while streaming
+//! - [`ToolCallReceivedContext`] — tool call accumulated, before dispatch
 //! - [`ToolPreContext`] / [`ToolPostContext`] — tool dispatch lifecycle
 //! - [`CompactedContext`] — context window compaction
 //! - [`FallbackContext`] — model fallback event
@@ -42,8 +43,8 @@ pub mod context;
 pub use context::{
     CompactedContext, ConvergenceDetectedContext, FallbackContext, LoopDetectedContext,
     ModelSwitchedContext, ResponseContext, SessionEndContext, SessionStartContext, StreamContext,
-    StreamFailureContext, TextDeltaContext, ToolPostContext, ToolPreContext, TurnEndContext,
-    TurnStartContext,
+    StreamFailureContext, TextDeltaContext, ToolCallReceivedContext, ToolPostContext,
+    ToolPreContext, TurnEndContext, TurnStartContext,
 };
 // ==================================================
 // LoopObserver Trait
@@ -142,6 +143,33 @@ pub trait LoopObserver: Send + Sync {
     /// }
     /// ```
     fn on_text_delta(&self, _ctx: &TextDeltaContext) {}
+
+    /// Called when the engine has accumulated a tool call and is about to dispatch it.
+    ///
+    /// Fires once per call, after the streaming response is accumulated and
+    /// before dispatch begins — strictly earlier than
+    /// [`on_tool_pre`](Self::on_tool_pre). Unlike `on_tool_pre`, the context
+    /// carries the call `input`, and the event does **not** repeat on recovery
+    /// retries (it is per-call, not per-attempt).
+    ///
+    /// Notification-only — cannot block or modify the tool call. Use the hook
+    /// system (requires `hooks` feature) for flow control.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    /// use loopctl::observer::{LoopObserver, ToolCallReceivedContext};
+    ///
+    /// struct PendingTracker { pending: Arc<AtomicUsize> }
+    /// impl LoopObserver for PendingTracker {
+    ///     fn name(&self) -> &str { "pending-tracker" }
+    ///     fn on_tool_call_received(&self, _ctx: &ToolCallReceivedContext) {
+    ///         self.pending.fetch_add(1, Ordering::SeqCst);
+    ///     }
+    /// }
+    /// ```
+    fn on_tool_call_received(&self, _ctx: &ToolCallReceivedContext) {}
 
     /// Called before a tool is dispatched.
     ///
@@ -326,6 +354,15 @@ impl ObserverHost {
     pub fn on_tool_pre(&self, ctx: &ToolPreContext) {
         for obs in &self.observers {
             obs.on_tool_pre(ctx);
+        }
+    }
+
+    /// Dispatch [`LoopObserver::on_tool_call_received`] to all observers.
+    ///
+    /// Iterates registered observers in registration order.
+    pub fn on_tool_call_received(&self, ctx: &ToolCallReceivedContext) {
+        for obs in &self.observers {
+            obs.on_tool_call_received(ctx);
         }
     }
 
@@ -590,6 +627,72 @@ mod tests {
         host.on_text_delta(&TextDeltaContext {
             turn: 0,
             delta: "x".into(),
+        });
+    }
+
+    #[test]
+    fn on_tool_call_received_default_is_noop() {
+        struct NoopObserver;
+        impl LoopObserver for NoopObserver {
+            fn name(&self) -> &'static str {
+                "noop"
+            }
+        }
+
+        let obs = NoopObserver;
+        let mut host = ObserverHost::new();
+        host.register(Arc::new(obs) as Arc<dyn LoopObserver>);
+        host.on_tool_call_received(&ToolCallReceivedContext {
+            turn: 0,
+            tool: "echo".into(),
+            call_id: "c1".into(),
+            input: serde_json::Value::Null,
+        });
+    }
+
+    #[test]
+    fn host_dispatches_on_tool_call_received_to_all_observers() {
+        struct ReceivedRecorder {
+            calls: parking_lot::Mutex<Vec<String>>,
+        }
+        impl LoopObserver for ReceivedRecorder {
+            fn name(&self) -> &'static str {
+                "received-recorder"
+            }
+            fn on_tool_call_received(&self, ctx: &ToolCallReceivedContext) {
+                self.calls.lock().push(ctx.tool.clone());
+            }
+        }
+
+        let obs1 = Arc::new(ReceivedRecorder {
+            calls: parking_lot::Mutex::new(Vec::new()),
+        });
+        let obs2 = Arc::new(ReceivedRecorder {
+            calls: parking_lot::Mutex::new(Vec::new()),
+        });
+        let mut host = ObserverHost::new();
+        host.register(Arc::clone(&obs1) as Arc<dyn LoopObserver>);
+        host.register(Arc::clone(&obs2) as Arc<dyn LoopObserver>);
+
+        host.on_tool_call_received(&ToolCallReceivedContext {
+            turn: 0,
+            tool: "edit".into(),
+            call_id: "c1".into(),
+            input: serde_json::Value::Null,
+        });
+
+        assert_eq!(obs1.calls.lock().clone(), vec!["edit".to_string()]);
+        assert_eq!(obs2.calls.lock().clone(), vec!["edit".to_string()]);
+    }
+
+    #[test]
+    fn host_dispatches_on_tool_call_received_with_no_observers() {
+        let host = ObserverHost::new();
+        host.on_tool_call_received(&ToolCallReceivedContext {
+            turn: 0,
+            tool: "echo".into(),
+            call_id: "c1".into(),
+            input: serde_json::Value::Null,
         });
     }
 }

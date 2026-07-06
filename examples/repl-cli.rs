@@ -47,13 +47,25 @@ async fn main() {
 
         let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), LoopConfig::default());
 
+        // A fresh agent per turn means a fresh CancelSignal per turn: Ctrl-C
+        // interrupts the current turn only, and the next prompt gets a clean
+        // signal. The listener is aborted when the turn ends so it doesn't
+        // outlive the agent.
+        let cancel_signal = agent.cancel_signal();
+        let listener = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                cancel_signal.cancel();
+            }
+        });
+
         match agent.run(input).await {
             Ok(result) => {
-                // Print.
+                listener.abort();
                 let output = result.final_output.unwrap_or_default();
                 writeln!(&mut stdout, "{output}\n").unwrap();
             }
             Err(e) => {
+                listener.abort();
                 writeln!(&mut stdout, "Error: {e}\n").unwrap();
             }
         }

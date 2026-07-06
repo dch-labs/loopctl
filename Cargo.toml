@@ -32,7 +32,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 async-stream = { version = "0.3", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 proptest = "1"
 
 [features]

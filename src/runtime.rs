@@ -68,10 +68,13 @@ use std::sync::Arc;
 
 use crate::compact::ContextManager;
 use crate::detection::DetectionManager;
+use crate::detection::{ConvergenceAction, DetectedPattern};
+use crate::error::LoopError;
 use crate::fallback::FallbackManager;
 #[cfg(feature = "hooks")]
 use crate::hooks::HookExecutor;
 use crate::middleware::ToolPipeline;
+use crate::observer::{ConvergenceDetectedContext, LoopDetectedContext};
 use crate::observer::{LoopObserver, ObserverHost};
 use crate::stream::handler::StreamHandler;
 #[cfg(feature = "tool_health")]
@@ -496,11 +499,11 @@ impl LoopRuntime {
     // Detection interpretation
     // ==================================================
 
-    /// Interpret a [`DetectedPattern`](crate::detection::DetectedPattern) and decide whether to abort.
+    /// Interpret a [`DetectedPattern`] and decide whether to abort.
     ///
     /// Generic framework logic: checks loop-detection thresholds,
     /// maps convergence actions, and notifies observers. Returns
-    /// `None` to continue, or `Some(Err)` to abort the session.
+    /// `None` to continue the session, or `Some(error)` to abort.
     ///
     /// Called by the agent loop after each response is recorded with the
     /// [`DetectionManager`].
@@ -508,11 +511,7 @@ impl LoopRuntime {
         &self,
         pattern: &crate::detection::DetectedPattern,
         turn: usize,
-    ) -> Option<Result<crate::engine::loop_core::SessionResult, crate::error::LoopError>> {
-        use crate::detection::{ConvergenceAction, DetectedPattern};
-        use crate::error::LoopError;
-        use crate::observer::{ConvergenceDetectedContext, LoopDetectedContext};
-
+    ) -> Option<LoopError> {
         match pattern {
             DetectedPattern::NoPattern => None,
 
@@ -539,9 +538,9 @@ impl LoopRuntime {
                         turn,
                         "stopping agent: loop threshold exceeded"
                     );
-                    Some(Err(LoopError::LoopDetected {
+                    Some(LoopError::LoopDetected {
                         message: format!("{pattern_description} repeated {repetitions} times"),
-                    }))
+                    })
                 } else {
                     None
                 }
@@ -567,12 +566,12 @@ impl LoopRuntime {
                     });
 
                 match action {
-                    ConvergenceAction::Stop => Some(Err(LoopError::LoopDetected {
+                    ConvergenceAction::Stop => Some(LoopError::LoopDetected {
                         message: "agent stopped: convergence detected".into(),
-                    })),
-                    ConvergenceAction::AskUser => Some(Err(LoopError::LoopDetected {
+                    }),
+                    ConvergenceAction::AskUser => Some(LoopError::LoopDetected {
                         message: "agent stopped: convergence detected, user input needed".into(),
-                    })),
+                    }),
                     ConvergenceAction::Warn
                     | ConvergenceAction::Compact
                     | ConvergenceAction::SwitchPhase => None,

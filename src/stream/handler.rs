@@ -1,34 +1,21 @@
-//! Configuration, result types, and error types for resilient LLM stream handling.
+//! Resilient LLM stream handling.
 //!
-//! Types that underpin [`StreamHandler`] — the framework's
-//! production-grade streaming resilience layer. The handler wraps
-//! [`ApiClient::stream_messages`] with retry, timeout, and fallback behaviour.
+//! [`StreamHandler`] wraps [`ApiClient::stream_messages`] with retry, timeout,
+//! rate-limit detection, and fallback behaviour. Configure it with
+//! [`StreamTimeoutConfig`], [`StreamRetryConfig`], and [`RateLimitConfig`].
 //!
 //! # Architecture
 //!
-//! ```text
-//! ┌─────────────────────────────────────────────────┐
-//! │              StreamHandler                      │
-//! │                                                 │
-//! │  1. init_with_retry()                           │
-//! │    └─ stream_messages() → first event timeout   │
-//! │    └─ retry with backoff on failure             │
-//! │                                                 │
-//! │  2. process_events()                            │
-//! │    └─ per-event timeout + total timeout         │
-//! │    └─ progress callbacks at intervals           │
-//! │                                                 │
-//! │  3. fallback_non_streaming()                    │
-//! │    └─ create_message() if streaming exhausted   │
-//! └─────────────────────────────────────────────────┘
-//! ```
+//! A turn flows through three phases:
 //!
-//! # Configuration
-//!
-//! | Config                  | Purpose                          | Default                              |
-//! |-------------------------|----------------------------------|--------------------------------------|
-//! | [`StreamTimeoutConfig`] | Timeout durations and thresholds | See [`StreamTimeoutConfig::default`] |
-//! | [`StreamRetryConfig`]   | Retry count, backoff, jitter     | See [`StreamRetryConfig::default`]   |
+//! 1. **Initialization with retry.** Open the SSE connection via
+//!    `stream_messages` and wait for the first event. On failure, back off and
+//!    retry per [`StreamRetryConfig`] (exponential, jittered).
+//! 2. **Event processing.** Assemble the response while enforcing three guards:
+//!    a per-event timeout, a total-stream timeout, and rate-limit detection
+//!    (429/503/529 mid-stream). Cancellation is honoured throughout.
+//! 3. **Fallback.** If streaming is exhausted, retry the request as a
+//!    single-shot [`ApiClient::create_message`] call.
 //!
 //! # Quick Start
 //!
@@ -48,6 +35,7 @@
 //! ```
 
 use crate::api::ApiClient;
+use crate::api::error::{ApiError, http_status_is_overload};
 use crate::cancel::CancelSignal;
 use crate::message::Message;
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
@@ -333,6 +321,244 @@ impl StreamRetryConfig {
 }
 
 // ===================================================
+// RateLimitConfig + detection
+// ===================================================
+
+/// Policy for handling 429 / 503 rate-limit responses from LLM providers.
+///
+/// Governs backoff and retry behaviour when the server signals that the client
+/// should slow down: a 429 *Too Many Requests*, a 503 *Service Unavailable*,
+/// or a 529 *Overloaded*. All three can carry a `Retry-After` hint that this
+/// config can honour.
+///
+/// Distinct from [`StreamRetryConfig`], which covers generic
+/// stream-initialization transport failures (the connection itself failed to
+/// open).
+///
+/// # Example
+///
+/// ```
+/// use loopctl::stream::handler::RateLimitConfig;
+/// use std::time::Duration;
+///
+/// let cfg = RateLimitConfig {
+///     default_delay: Duration::from_secs(2),
+///     fallback_after_retries: 2,
+///     ..Default::default()
+/// };
+/// assert!(cfg.validate().is_ok());
+/// ```
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    /// Whether to honour a 429/503 `Retry-After` value when the server
+    /// provides one.
+    ///
+    /// When `true` (the default), [`backoff`](Self::backoff) returns the
+    /// server-advised delay (capped at [`max_delay`](Self::max_delay)). When
+    /// `false`, the server's hint is ignored and
+    /// [`default_delay`](Self::default_delay) is always used.
+    pub respect_retry_after: bool,
+
+    /// Backoff used when the server gives no `Retry-After`, or when
+    /// [`respect_retry_after`](Self::respect_retry_after) is `false`.
+    pub default_delay: Duration,
+
+    /// Upper bound on any single rate-limit backoff.
+    ///
+    /// Caps both the server's `Retry-After` (when honoured) and
+    /// [`default_delay`](Self::default_delay) so a misbehaving provider cannot
+    /// stall the agent indefinitely.
+    pub max_delay: Duration,
+
+    /// Local request ceiling in requests per minute (0 = disabled).
+    ///
+    /// Set above zero to proactively throttle outgoing requests before the
+    /// server returns a 429. Zero means no local throttling — the config only
+    /// governs reactive handling of server-returned rate limits.
+    pub requests_per_minute: u32,
+
+    /// Number of rate-limit retries before switching to a fallback model.
+    ///
+    /// After this many retries on the same model, the next rate limit triggers
+    /// a fallback to a different model (if one is configured).
+    pub fallback_after_retries: u32,
+
+    /// Hard cap on rate-limit retries for a single turn.
+    ///
+    /// Once this many retries have been exhausted, the turn fails. Distinct
+    /// from [`fallback_after_retries`](Self::fallback_after_retries), which
+    /// controls the *escalation* threshold, not the hard stop.
+    pub max_retries: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            respect_retry_after: true,
+            default_delay: Duration::from_secs(5),
+            max_delay: Duration::from_secs(60),
+            requests_per_minute: 0,
+            fallback_after_retries: 3,
+            max_retries: 5,
+        }
+    }
+}
+
+impl RateLimitConfig {
+    /// Validate the policy.
+    ///
+    /// `default_delay` and `max_delay` must be non-zero, `max_delay` must be at
+    /// least `default_delay`, and `max_retries` must be at least 1.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable description of the first violated constraint.
+    ///
+    /// ```
+    /// use loopctl::stream::handler::RateLimitConfig;
+    /// use std::time::Duration;
+    ///
+    /// assert!(RateLimitConfig::default().validate().is_ok());
+    /// let bad = RateLimitConfig { max_retries: 0, ..Default::default() };
+    /// assert!(bad.validate().is_err());
+    /// ```
+    pub fn validate(&self) -> Result<(), String> {
+        if self.default_delay == Duration::ZERO {
+            return Err("default_delay must be non-zero".into());
+        }
+        if self.max_delay < self.default_delay {
+            return Err("max_delay must be >= default_delay".into());
+        }
+        if self.max_retries == 0 {
+            return Err("max_retries must be >= 1".into());
+        }
+        Ok(())
+    }
+
+    /// Effective backoff for a detected rate limit given an optional server hint.
+    ///
+    /// - If `server_hint` is `Some(d)` and `respect_retry_after` is `true`,
+    ///   returns `min(d, max_delay)`.
+    /// - Otherwise returns `min(default_delay, max_delay)`.
+    ///
+    /// ```
+    /// use loopctl::stream::handler::RateLimitConfig;
+    /// use std::time::Duration;
+    ///
+    /// let cfg = RateLimitConfig::default();
+    /// assert_eq!(cfg.backoff(Some(Duration::from_secs(12))), Duration::from_secs(12));
+    /// assert_eq!(cfg.backoff(None), cfg.default_delay);
+    /// ```
+    #[must_use]
+    pub fn backoff(&self, server_hint: Option<Duration>) -> Duration {
+        match server_hint {
+            Some(d) if self.respect_retry_after => d.min(self.max_delay),
+            _ => self.default_delay.min(self.max_delay),
+        }
+    }
+}
+
+/// Which kind of rate-limit / overload response was detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitKind {
+    /// HTTP 429 Too Many Requests.
+    RateLimited,
+    /// HTTP 503 Service Unavailable / 529 Overloaded — a rate-limit-adjacent
+    /// transient that honours `Retry-After`.
+    Overloaded,
+}
+
+/// A rate-limit response detected on an established stream.
+///
+/// Produced by [`DetectedRateLimit::detect`] from an [`ApiError`]. Carries the
+/// parsed `Retry-After` (when available) so the caller can back off accordingly
+/// without re-parsing.
+#[derive(Debug, Clone)]
+pub struct DetectedRateLimit {
+    /// The detected rate-limit class.
+    pub kind: RateLimitKind,
+    /// The server-advised delay, `None` if absent or malformed.
+    pub retry_after: Option<Duration>,
+    /// The original error message, preserved for logging / fallback context.
+    pub message: String,
+}
+
+impl DetectedRateLimit {
+    /// Inspect an [`ApiError`] for a rate-limit signature.
+    ///
+    /// Returns `Some(DetectedRateLimit)` when the error is:
+    /// - the structured [`ApiError::RateLimit`] variant (typed `retry_after`),
+    /// - an `Api(String)` whose body contains `"rate limit"` or `"429"`, or
+    /// - an `Http(String)` whose `"HTTP {status}:"` prefix indicates 503/529.
+    ///
+    /// Returns `None` for everything else (500s, auth errors, generic transport
+    /// failures, etc.).
+    #[must_use]
+    pub fn detect(err: &crate::api::error::ApiError) -> Option<Self> {
+        match err {
+            ApiError::RateLimit {
+                retry_after,
+                message,
+            } => Some(Self {
+                kind: RateLimitKind::RateLimited,
+                retry_after: *retry_after,
+                message: message.clone(),
+            }),
+            ApiError::Api(msg) => {
+                let lower = msg.to_lowercase();
+                if lower.contains("rate limit") || lower.contains("429") {
+                    Some(Self {
+                        kind: RateLimitKind::RateLimited,
+                        retry_after: parse_retry_after(msg),
+                        message: msg.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            ApiError::Http(msg) if http_status_is_overload(msg) => Some(Self {
+                kind: RateLimitKind::Overloaded,
+                retry_after: parse_retry_after(msg),
+                message: msg.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Parse an HTTP `Retry-After` value into a [`Duration`].
+///
+/// Accepts the two RFC 9110 forms:
+/// - **delta-seconds** (`"12"`) → `Duration::from_secs(12)`. Huge values are
+///   clamped rather than overflowing.
+/// - **HTTP-date** (`"Wed, 21 Oct 2026 07:28:00 GMT"`) → `max(ZERO, date − now)`.
+///   Only available when the `providers` feature is enabled (the `httpdate`
+///   crate lives there); returns `None` otherwise.
+///
+/// Returns `None` for anything unparseable.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    #[cfg(feature = "providers")]
+    {
+        if let Ok(target) = httpdate::parse_http_date(trimmed) {
+            let now = std::time::SystemTime::now();
+            return now
+                .duration_since(target)
+                .ok()
+                .map(|_| Duration::ZERO)
+                .or_else(|| target.duration_since(now).ok());
+        }
+    }
+    None
+}
+
+// ===================================================
 // StreamOutcome
 // ===================================================
 
@@ -347,7 +573,7 @@ impl StreamRetryConfig {
 /// The variants are ordered by severity:
 ///
 /// ```text
-/// Completed < TotalTimeout < EventTimeout < InitFailed < FallbackToNonStreaming < Cancelled
+/// Completed < TotalTimeout < EventTimeout < RateLimited < InitFailed < FallbackToNonStreaming < Cancelled
 /// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -387,6 +613,21 @@ pub enum StreamOutcome {
         has_partial_data: bool,
         /// Consecutive timeouts that triggered the failure.
         consecutive_timeouts: u32,
+    },
+
+    /// A 429 / 503 rate-limit response arrived mid-stream.
+    ///
+    /// Distinct from [`InitFailed`](Self::InitFailed): the stream *was*
+    /// established and may have produced partial output. The
+    /// [`DetectedRateLimit`] carries the parsed `Retry-After`, if the server
+    /// provided one.
+    RateLimited {
+        /// Decoded rate-limit detail (kind + parsed `Retry-After`).
+        detail: DetectedRateLimit,
+        /// Whether partial content was accumulated before the rate limit.
+        has_partial_data: bool,
+        /// Events processed before the rate limit fired.
+        events_processed: u64,
     },
 
     /// Stream initialization failed after all retries.
@@ -454,6 +695,29 @@ impl fmt::Display for StreamOutcome {
                 write!(
                     f,
                     "event timeout after {consecutive_timeouts} consecutive timeouts{partial}"
+                )
+            }
+            Self::RateLimited {
+                detail,
+                has_partial_data,
+                events_processed,
+            } => {
+                let kind = match detail.kind {
+                    RateLimitKind::RateLimited => "rate limit",
+                    RateLimitKind::Overloaded => "overloaded",
+                };
+                let retry = detail
+                    .retry_after
+                    .map(|d| format!(" (retry after {d:?})"))
+                    .unwrap_or_default();
+                let partial = if *has_partial_data {
+                    " (partial data)"
+                } else {
+                    ""
+                };
+                write!(
+                    f,
+                    "{kind}{retry}{partial}, {events_processed} events processed"
                 )
             }
             Self::InitFailed {
@@ -603,6 +867,8 @@ pub struct StreamHandler {
     timeout_config: StreamTimeoutConfig,
     /// Retry configuration for stream initialization.
     retry_config: StreamRetryConfig,
+    /// Rate-limit detection + backoff policy.
+    rate_limit_config: RateLimitConfig,
 }
 
 impl fmt::Debug for StreamHandler {
@@ -610,6 +876,7 @@ impl fmt::Debug for StreamHandler {
         f.debug_struct("StreamHandler")
             .field("timeout_config", &self.timeout_config)
             .field("retry_config", &self.retry_config)
+            .field("rate_limit_config", &self.rate_limit_config)
             .finish()
     }
 }
@@ -641,6 +908,7 @@ impl StreamHandler {
         Self {
             timeout_config: StreamTimeoutConfig::default(),
             retry_config: StreamRetryConfig::default(),
+            rate_limit_config: RateLimitConfig::default(),
         }
     }
 
@@ -680,6 +948,31 @@ impl StreamHandler {
     #[must_use]
     pub fn retry_config(&self) -> &StreamRetryConfig {
         &self.retry_config
+    }
+
+    /// Set a custom [`RateLimitConfig`]. Consuming builder.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::stream::handler::{StreamHandler, RateLimitConfig};
+    /// use std::time::Duration;
+    ///
+    /// let handler = StreamHandler::new().with_rate_limit_config(
+    ///     RateLimitConfig { max_retries: 2, ..Default::default() },
+    /// );
+    /// assert_eq!(handler.rate_limit_config().max_retries, 2);
+    /// ```
+    #[must_use]
+    pub fn with_rate_limit_config(mut self, rl: RateLimitConfig) -> Self {
+        self.rate_limit_config = rl;
+        self
+    }
+
+    /// Returns a reference to the rate-limit configuration.
+    #[must_use]
+    pub fn rate_limit_config(&self) -> &RateLimitConfig {
+        &self.rate_limit_config
     }
 
     // ==================================================
@@ -736,9 +1029,6 @@ impl StreamHandler {
         let max_attempts = self.retry_config.max_retries.saturating_add(1);
         let mut last_stream_outcome: Option<StreamOutcome> = None;
         for attempt in 0..max_attempts {
-            if cancel.is_cancelled() {
-                return Err(StreamHandlerError::Cancelled);
-            }
             if let Some(deadline) = total_deadline {
                 if Instant::now() >= deadline {
                     return Err(StreamHandlerError::InitFailed(
@@ -789,8 +1079,16 @@ impl StreamHandler {
                         }
                         return Err(e);
                     }
-                    let delay = self.retry_config.base_delay(attempt);
-                    tokio::time::sleep(delay).await;
+                    let delay = match &last_stream_outcome {
+                        Some(StreamOutcome::RateLimited { detail, .. }) => {
+                            self.rate_limit_config.backoff(detail.retry_after)
+                        }
+                        _ => self.retry_config.base_delay(attempt),
+                    };
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = cancel.notified() => return Err(StreamHandlerError::Cancelled),
+                    }
                 }
             }
         }
@@ -850,6 +1148,7 @@ impl StreamHandler {
         let mut consecutive_timeouts: usize = 0;
         let mut events_processed: u64 = 0;
         let stream_start = Instant::now();
+
         loop {
             if let Some(deadline) = total_deadline {
                 if Instant::now() >= deadline {
@@ -908,6 +1207,16 @@ impl StreamHandler {
                     }
                 }
                 Some(Err(api_error)) => {
+                    if let Some(detail) = DetectedRateLimit::detect(&api_error) {
+                        let has_partial_data = !accumulator.peek_parts().is_empty();
+                        return Err(StreamHandlerError::StreamFailed(
+                            StreamOutcome::RateLimited {
+                                detail,
+                                has_partial_data,
+                                events_processed,
+                            },
+                        ));
+                    }
                     return Err(StreamHandlerError::StreamFailed(
                         StreamOutcome::InitFailed {
                             attempts: 1,
@@ -1867,5 +2176,454 @@ mod tests {
             }
             other => panic!("expected StreamFailed, got: {other}"),
         }
+    }
+
+    #[test]
+    fn rate_limit_config_default_values() {
+        let cfg = RateLimitConfig::default();
+        assert!(cfg.respect_retry_after);
+        assert_eq!(cfg.default_delay, Duration::from_secs(5));
+        assert_eq!(cfg.max_delay, Duration::from_secs(60));
+        assert_eq!(cfg.requests_per_minute, 0);
+        assert_eq!(cfg.fallback_after_retries, 3);
+        assert_eq!(cfg.max_retries, 5);
+    }
+
+    #[test]
+    fn rate_limit_config_validate_rejects_invalid() {
+        assert!(RateLimitConfig::default().validate().is_ok());
+        assert!(
+            RateLimitConfig {
+                default_delay: Duration::ZERO,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RateLimitConfig {
+                max_delay: Duration::from_secs(1),
+                default_delay: Duration::from_secs(10),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RateLimitConfig {
+                max_retries: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rate_limit_config_backoff_honours_hint_and_caps() {
+        let cfg = RateLimitConfig::default();
+        assert_eq!(
+            cfg.backoff(Some(Duration::from_secs(12))),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            cfg.backoff(Some(Duration::from_secs(120))),
+            cfg.max_delay,
+            "should cap at max_delay"
+        );
+        assert_eq!(cfg.backoff(None), cfg.default_delay);
+
+        let ignore = RateLimitConfig {
+            respect_retry_after: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            ignore.backoff(Some(Duration::from_secs(12))),
+            ignore.default_delay
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_delta_seconds() {
+        assert_eq!(parse_retry_after("12"), Some(Duration::from_secs(12)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::ZERO));
+        assert_eq!(parse_retry_after("  7  "), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn parse_retry_after_huge_value_clamps() {
+        let parsed = parse_retry_after("999999999999");
+        assert!(parsed.is_some(), "huge value should parse, not panic");
+    }
+
+    #[test]
+    fn parse_retry_after_garbage_returns_none() {
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("abc"), None);
+    }
+
+    #[test]
+    #[cfg(feature = "providers")]
+    fn parse_retry_after_http_date() {
+        let parsed = parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT");
+        assert!(parsed.is_some(), "HTTP-date should parse under providers");
+    }
+
+    #[test]
+    fn detected_rate_limit_from_structured_variant() {
+        let err = ApiError::RateLimit {
+            retry_after: Some(Duration::from_secs(7)),
+            message: "slow down".into(),
+        };
+        let detected = DetectedRateLimit::detect(&err).expect("RateLimit variant should detect");
+        assert_eq!(detected.kind, RateLimitKind::RateLimited);
+        assert_eq!(detected.retry_after, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn detected_rate_limit_from_structured_variant_no_hint() {
+        let err = ApiError::RateLimit {
+            retry_after: None,
+            message: "slow down".into(),
+        };
+        let detected = DetectedRateLimit::detect(&err).expect("RateLimit variant should detect");
+        assert_eq!(detected.retry_after, None);
+    }
+
+    #[test]
+    fn detected_rate_limit_from_http_503() {
+        let err = ApiError::http_with_status(503, "overloaded");
+        let detected = DetectedRateLimit::detect(&err).expect("503 should detect as Overloaded");
+        assert_eq!(detected.kind, RateLimitKind::Overloaded);
+    }
+
+    #[test]
+    fn detected_rate_limit_http_500_is_not_overload() {
+        let err = ApiError::http_with_status(500, "boom");
+        assert!(DetectedRateLimit::detect(&err).is_none());
+    }
+
+    #[test]
+    fn detected_rate_limit_non_rate_errors_return_none() {
+        assert!(DetectedRateLimit::detect(&ApiError::api("connection reset")).is_none());
+        assert!(DetectedRateLimit::detect(&ApiError::auth("bad key")).is_none());
+    }
+
+    #[test]
+    fn is_rate_limited_matches_detect() {
+        let cases: &[ApiError] = &[
+            ApiError::RateLimit {
+                retry_after: None,
+                message: "x".into(),
+            },
+            ApiError::http_with_status(503, "overloaded"),
+            ApiError::http_with_status(500, "boom"),
+            ApiError::api("connection reset"),
+            ApiError::auth("bad key"),
+        ];
+        for err in cases {
+            assert_eq!(
+                err.is_rate_limited(),
+                DetectedRateLimit::detect(err).is_some(),
+                "is_rate_limited disagree with detect on {err}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn process_events_rate_limit_mid_stream() {
+        let handler = StreamHandler::new();
+        let cancel = Arc::new(CancelSignal::new());
+        let events = vec![
+            Ok(StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg_test".to_string(),
+                    role: "assistant".to_string(),
+                    model: "test-model".to_string(),
+                },
+            })),
+            Err(ApiError::RateLimit {
+                retry_after: Some(Duration::from_secs(4)),
+                message: "slow down".into(),
+            }),
+        ];
+        let stream = event_stream(events);
+
+        let err = handler
+            .process_events(stream, &cancel, None)
+            .await
+            .expect_err("rate-limit error should fail the stream");
+
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::RateLimited {
+                detail,
+                has_partial_data,
+                ..
+            }) => {
+                assert_eq!(detail.kind, RateLimitKind::RateLimited);
+                assert_eq!(detail.retry_after, Some(Duration::from_secs(4)));
+                assert!(!has_partial_data, "MessageStart carries no parts");
+            }
+            other => panic!("expected RateLimited outcome, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_events_rate_limit_with_partial_data() {
+        let handler = StreamHandler::new();
+        let cancel = Arc::new(CancelSignal::new());
+        let events = vec![
+            Ok(StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg_test".to_string(),
+                    role: "assistant".to_string(),
+                    model: "test-model".to_string(),
+                },
+            })),
+            Ok(StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(crate::stream::MessagePart::text("partial")),
+            })),
+            Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Text {
+                    text: " response".into(),
+                },
+            })),
+            Ok(StreamEvent::PartStop),
+            Err(ApiError::http_with_status(503, "overloaded")),
+        ];
+        let stream = event_stream(events);
+
+        let err = handler
+            .process_events(stream, &cancel, None)
+            .await
+            .expect_err("503 should fail the stream");
+
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::RateLimited {
+                detail,
+                has_partial_data,
+                events_processed,
+            }) => {
+                assert_eq!(detail.kind, RateLimitKind::Overloaded);
+                assert!(has_partial_data, "PartStart+delta should count as partial");
+                assert!(events_processed >= 2, "at least 2 events processed");
+            }
+            other => panic!("expected RateLimited outcome, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_events_non_rate_error_still_init_failed() {
+        let handler = StreamHandler::new();
+        let cancel = Arc::new(CancelSignal::new());
+        let events: Vec<Result<StreamEvent, ApiError>> = vec![
+            Ok(StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg_test".to_string(),
+                    role: "assistant".to_string(),
+                    model: "test-model".to_string(),
+                },
+            })),
+            Err(ApiError::api("connection reset")),
+        ];
+        let stream = event_stream(events);
+
+        let err = handler
+            .process_events(stream, &cancel, None)
+            .await
+            .expect_err("should fail");
+
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::InitFailed { .. }) => {}
+            other => panic!("expected InitFailed for non-rate error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_outcome_rate_limited_display() {
+        let outcome = StreamOutcome::RateLimited {
+            detail: DetectedRateLimit {
+                kind: RateLimitKind::RateLimited,
+                retry_after: Some(Duration::from_secs(12)),
+                message: "slow down".into(),
+            },
+            has_partial_data: false,
+            events_processed: 5,
+        };
+        let s = outcome.to_string();
+        assert!(s.contains("rate limit"), "got: {s}");
+        assert!(s.contains("12"), "retry-after seconds missing: {s}");
+    }
+
+    #[test]
+    fn stream_handler_rate_limit_config_round_trip() {
+        let handler = StreamHandler::new();
+        assert_eq!(
+            handler.rate_limit_config().max_retries,
+            RateLimitConfig::default().max_retries
+        );
+
+        let custom = RateLimitConfig {
+            max_retries: 2,
+            default_delay: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let handler = StreamHandler::new().with_rate_limit_config(custom);
+        assert_eq!(handler.rate_limit_config().max_retries, 2);
+        assert_eq!(
+            handler.rate_limit_config().default_delay,
+            Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_turn_uses_rate_limit_delay_on_rate_limited_outcome() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RateLimitOnceMock {
+            attempts: AtomicUsize,
+        }
+        impl ApiClient for RateLimitOnceMock {
+            fn model(&self) -> String {
+                "test-model".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Box::pin(futures::stream::once(async {
+                        Err(ApiError::RateLimit {
+                            retry_after: None,
+                            message: "slow down".into(),
+                        })
+                    }))
+                } else {
+                    Box::pin(futures::stream::iter(happy_stream_events()))
+                }
+            }
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::json!({})) })
+            }
+        }
+
+        // Rate-limit delay tiny; transport retry delay large. If the retry
+        // loop honours the rate-limit outcome, the test finishes in ~1ms; if
+        // it falls back to the transport base_delay, it sleeps 2s.
+        let handler = StreamHandler::new().with_config(
+            StreamTimeoutConfig::default(),
+            StreamRetryConfig {
+                max_retries: 1,
+                base_delay_ms: 2_000,
+                ..Default::default()
+            },
+        );
+        let handler = handler.with_rate_limit_config(RateLimitConfig {
+            default_delay: Duration::from_millis(1),
+            ..Default::default()
+        });
+        let client = RateLimitOnceMock {
+            attempts: AtomicUsize::new(0),
+        };
+        let cancel = Arc::new(CancelSignal::new());
+
+        let start = Instant::now();
+        let result = handler
+            .stream_turn(&client, vec![], None, None, &cancel)
+            .await
+            .expect("second attempt should succeed");
+        let elapsed = start.elapsed();
+
+        assert!(!result.from_fallback);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "rate-limit retry should use RateLimitConfig delay, not the 2s transport delay; elapsed {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_turn_cancel_during_backoff_returns_immediately() {
+        struct AlwaysFailingMock;
+        impl ApiClient for AlwaysFailingMock {
+            fn model(&self) -> String {
+                "test-model".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                Box::pin(futures::stream::once(async {
+                    Err(ApiError::api("connection lost"))
+                }))
+            }
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::json!({})) })
+            }
+        }
+
+        let handler = StreamHandler::new().with_config(
+            StreamTimeoutConfig::default(),
+            StreamRetryConfig {
+                max_retries: 5,
+                base_delay_ms: 60_000,
+                ..Default::default()
+            },
+        );
+        let cancel = Arc::new(CancelSignal::new());
+        let cancel_clone = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancel_clone.cancel();
+        });
+
+        let start = Instant::now();
+        let err = handler
+            .stream_turn(&AlwaysFailingMock, vec![], None, None, &cancel)
+            .await
+            .expect_err("should return Cancelled, not hang for 60s");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err, StreamHandlerError::Cancelled),
+            "expected Cancelled, got {err:?}",
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancellation during backoff should return immediately, not wait for the 60s sleep; elapsed {elapsed:?}",
+        );
     }
 }

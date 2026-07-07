@@ -356,6 +356,22 @@ pub enum ApiError {
     #[error("API error: {0}")]
     Api(String),
 
+    /// A rate-limit response (HTTP 429 / 503 / 529) carrying the server's
+    /// advised `Retry-After` delay when the provider captured it.
+    ///
+    /// Maps to [`ErrorCode::ApiRateLimited`]. Distinct from [`Api`](Self::Api),
+    /// which carries no structured retry hint — providers that read the
+    /// `Retry-After` header at HTTP-time should construct this variant so
+    /// downstream layers (the stream handler, fallback manager) recover the
+    /// delay without re-parsing.
+    #[error("Rate limit exceeded (retry after {retry_after:?}): {message}")]
+    RateLimit {
+        /// The server-advised delay.
+        retry_after: Option<std::time::Duration>,
+        /// The error body or human-readable message.
+        message: String,
+    },
+
     /// An authentication or authorisation error.
     ///
     /// Invalid API keys, expired tokens, or account-level restrictions.
@@ -476,7 +492,13 @@ impl ApiError {
     ///   └─ (default)                          → HttpConnectionError
     ///
     /// ApiError::Json(_)                       → JsonParseError
-    /// ApiError::Io(_)                         → IoReadError
+    ///
+    /// ApiError::Io(err)
+    ///   ├─ ErrorKind::NotFound                → IoFileNotFound
+    ///   ├─ ErrorKind::PermissionDenied / WriteZero → IoWriteError
+    ///   └─ (default)                          → IoReadError
+    ///
+    /// ApiError::RateLimit { .. }              → ApiRateLimited
     /// ApiError::Interrupted                   → Interrupted
     /// ApiError::Other(_)                      → InternalError
     /// ```
@@ -504,6 +526,7 @@ impl ApiError {
                     ErrorCode::AuthFailed
                 }
             }
+            Self::RateLimit { .. } => ErrorCode::ApiRateLimited,
             Self::Http(msg) => {
                 if let Some(rest) = msg.strip_prefix("HTTP ") {
                     if let Some(colon) = rest.find(':') {
@@ -622,6 +645,24 @@ impl ApiError {
                 | ErrorCode::HttpRequestError
                 | ErrorCode::HttpResponseError
         )
+    }
+
+    /// `true` for rate-limit-class errors.
+    ///
+    /// Matches the structured [`RateLimit`](Self::RateLimit) variant, or an
+    /// [`Api`](Self::Api)/[`Http`](Self::Http) error whose body text indicates
+    /// 429 / 503 / 529.
+    #[must_use]
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            Self::RateLimit { .. } => true,
+            Self::Api(msg) => {
+                let lower = msg.to_lowercase();
+                lower.contains("rate limit") || lower.contains("429")
+            }
+            Self::Http(msg) => http_status_is_overload(msg),
+            _ => false,
+        }
     }
 
     /// Check whether this is an authentication error ([`ApiError::Auth`]).
@@ -1066,6 +1107,21 @@ impl ApiError {
     }
 }
 
+/// Inspect an `Http(String)` body (formatted `"HTTP {status}: ..."`) and return
+/// `true` when the status is a rate-limit-adjacent overload: 429, 503, or 529.
+///
+/// Returns `false` for any other status, malformed prefixes, or other error
+/// shapes.
+pub(crate) fn http_status_is_overload(msg: &str) -> bool {
+    let Some(rest) = msg.strip_prefix("HTTP ") else {
+        return false;
+    };
+    let Some(colon) = rest.find(':') else {
+        return false;
+    };
+    matches!(rest[..colon].parse::<u16>().ok(), Some(429 | 503 | 529))
+}
+
 /// Result type for operations that can fail with [`ApiError`].
 ///
 /// # Example
@@ -1344,5 +1400,74 @@ mod tests {
         assert_eq!(json, "1999");
         let back: ErrorCode = serde_json::from_str(&json).unwrap();
         assert_eq!(code, back);
+    }
+
+    #[test]
+    fn http_status_is_overload_detects_429_503_529() {
+        assert!(http_status_is_overload("HTTP 429: Too Many Requests"));
+        assert!(http_status_is_overload("HTTP 503: Service Unavailable"));
+        assert!(http_status_is_overload("HTTP 529: Overloaded"));
+    }
+
+    #[test]
+    fn http_status_is_overload_rejects_other_statuses() {
+        assert!(!http_status_is_overload("HTTP 500: Internal Server Error"));
+        assert!(!http_status_is_overload("HTTP 504: Gateway Timeout"));
+        assert!(!http_status_is_overload("HTTP 404: Not Found"));
+        assert!(!http_status_is_overload("HTTP 200: OK"));
+    }
+
+    #[test]
+    fn http_status_is_overload_rejects_malformed_prefix() {
+        assert!(!http_status_is_overload("https 429: not the prefix"));
+        assert!(!http_status_is_overload("429 Too Many Requests"));
+        assert!(!http_status_is_overload("HTTP 429"));
+        assert!(!http_status_is_overload("HTTP abc: non-numeric"));
+        assert!(!http_status_is_overload(""));
+    }
+
+    #[test]
+    fn is_rate_limited_true_for_structured_variant() {
+        assert!(
+            ApiError::RateLimit {
+                retry_after: None,
+                message: "slow down".into(),
+            }
+            .is_rate_limited()
+        );
+        assert!(
+            ApiError::RateLimit {
+                retry_after: Some(std::time::Duration::from_secs(7)),
+                message: "slow down".into(),
+            }
+            .is_rate_limited()
+        );
+    }
+
+    #[test]
+    fn is_rate_limited_true_for_api_body_with_rate_limit_text() {
+        assert!(ApiError::api("rate limit exceeded").is_rate_limited());
+        assert!(ApiError::api("Rate Limit Exceeded").is_rate_limited());
+        assert!(ApiError::api("HTTP 429 from upstream").is_rate_limited());
+        assert!(!ApiError::api("connection reset").is_rate_limited());
+        assert!(!ApiError::api("timeout").is_rate_limited());
+    }
+
+    #[test]
+    fn is_rate_limited_true_for_http_overload_statuses() {
+        assert!(ApiError::http_with_status(429, "Too Many Requests").is_rate_limited());
+        assert!(ApiError::http_with_status(503, "Service Unavailable").is_rate_limited());
+        assert!(ApiError::http_with_status(529, "Overloaded").is_rate_limited());
+        assert!(!ApiError::http_with_status(500, "Internal Server Error").is_rate_limited());
+        assert!(!ApiError::http_with_status(404, "Not Found").is_rate_limited());
+    }
+
+    #[test]
+    fn is_rate_limited_false_for_other_variants() {
+        assert!(!ApiError::auth("bad key").is_rate_limited());
+        assert!(!ApiError::tool("execution failed").is_rate_limited());
+        assert!(!ApiError::config("missing field").is_rate_limited());
+        assert!(!ApiError::Other("misc".into()).is_rate_limited());
+        assert!(!ApiError::Interrupted.is_rate_limited());
     }
 }

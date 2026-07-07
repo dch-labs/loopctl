@@ -75,10 +75,11 @@ impl<C: ApiClient> BareLoop<C> {
 
             match event_result {
                 Some(Ok(event)) => {
-                    // Match the text delta once, then notify the legacy raw
-                    // streamer (if any) and every registered observer. The
-                    // match is hoisted out of the `if let Some(streamer)`
-                    // guard so observers fire even when no streamer is set.
+                    // Match the text delta once, then notify both the raw
+                    // text_streamer callback (if set) and every registered
+                    // observer. The match is hoisted out of the
+                    // `if let Some(streamer)` guard so observers fire even
+                    // when no streamer is set.
                     if let StreamEvent::IndexedDelta(indexed_delta) = &event {
                         if let crate::stream::DeltaPart::Text { text } = &indexed_delta.delta {
                             if let Some(ref streamer) = self.text_streamer {

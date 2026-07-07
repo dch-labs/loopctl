@@ -1029,9 +1029,6 @@ impl StreamHandler {
         let max_attempts = self.retry_config.max_retries.saturating_add(1);
         let mut last_stream_outcome: Option<StreamOutcome> = None;
         for attempt in 0..max_attempts {
-            if cancel.is_cancelled() {
-                return Err(StreamHandlerError::Cancelled);
-            }
             if let Some(deadline) = total_deadline {
                 if Instant::now() >= deadline {
                     return Err(StreamHandlerError::InitFailed(
@@ -1082,8 +1079,16 @@ impl StreamHandler {
                         }
                         return Err(e);
                     }
-                    let delay = self.retry_config.base_delay(attempt);
-                    tokio::time::sleep(delay).await;
+                    let delay = match &last_stream_outcome {
+                        Some(StreamOutcome::RateLimited { detail, .. }) => {
+                            self.rate_limit_config.backoff(detail.retry_after)
+                        }
+                        _ => self.retry_config.base_delay(attempt),
+                    };
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = cancel.notified() => return Err(StreamHandlerError::Cancelled),
+                    }
                 }
             }
         }
@@ -2259,6 +2264,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "providers")]
     fn parse_retry_after_http_date() {
         let parsed = parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT");
         assert!(parsed.is_some(), "HTTP-date should parse under providers");
@@ -2470,6 +2476,154 @@ mod tests {
         assert_eq!(
             handler.rate_limit_config().default_delay,
             Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_turn_uses_rate_limit_delay_on_rate_limited_outcome() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RateLimitOnceMock {
+            attempts: AtomicUsize,
+        }
+        impl ApiClient for RateLimitOnceMock {
+            fn model(&self) -> String {
+                "test-model".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Box::pin(futures::stream::once(async {
+                        Err(ApiError::RateLimit {
+                            retry_after: None,
+                            message: "slow down".into(),
+                        })
+                    }))
+                } else {
+                    Box::pin(futures::stream::iter(happy_stream_events()))
+                }
+            }
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::json!({})) })
+            }
+        }
+
+        // Rate-limit delay tiny; transport retry delay large. If the retry
+        // loop honours the rate-limit outcome, the test finishes in ~1ms; if
+        // it falls back to the transport base_delay, it sleeps 2s.
+        let handler = StreamHandler::new().with_config(
+            StreamTimeoutConfig::default(),
+            StreamRetryConfig {
+                max_retries: 1,
+                base_delay_ms: 2_000,
+                ..Default::default()
+            },
+        );
+        let handler = handler.with_rate_limit_config(RateLimitConfig {
+            default_delay: Duration::from_millis(1),
+            ..Default::default()
+        });
+        let client = RateLimitOnceMock {
+            attempts: AtomicUsize::new(0),
+        };
+        let cancel = Arc::new(CancelSignal::new());
+
+        let start = Instant::now();
+        let result = handler
+            .stream_turn(&client, vec![], None, None, &cancel)
+            .await
+            .expect("second attempt should succeed");
+        let elapsed = start.elapsed();
+
+        assert!(!result.from_fallback);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "rate-limit retry should use RateLimitConfig delay, not the 2s transport delay; elapsed {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_turn_cancel_during_backoff_returns_immediately() {
+        struct AlwaysFailingMock;
+        impl ApiClient for AlwaysFailingMock {
+            fn model(&self) -> String {
+                "test-model".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                Box::pin(futures::stream::once(async {
+                    Err(ApiError::api("connection lost"))
+                }))
+            }
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::json!({})) })
+            }
+        }
+
+        let handler = StreamHandler::new().with_config(
+            StreamTimeoutConfig::default(),
+            StreamRetryConfig {
+                max_retries: 5,
+                base_delay_ms: 60_000,
+                ..Default::default()
+            },
+        );
+        let cancel = Arc::new(CancelSignal::new());
+        let cancel_clone = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancel_clone.cancel();
+        });
+
+        let start = Instant::now();
+        let err = handler
+            .stream_turn(&AlwaysFailingMock, vec![], None, None, &cancel)
+            .await
+            .expect_err("should return Cancelled, not hang for 60s");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err, StreamHandlerError::Cancelled),
+            "expected Cancelled, got {err:?}",
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancellation during backoff should return immediately, not wait for the 60s sleep; elapsed {elapsed:?}",
         );
     }
 }

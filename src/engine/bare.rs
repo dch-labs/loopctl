@@ -1,7 +1,6 @@
 //! `BareLoop` — the framework's default agent loop implementation.
 //!
-//! [`BareLoop`] — a generic, framework-level agent
-//! loop that orchestrates the full lifecycle of an LLM-based agent session:
+//! [`BareLoop`] orchestrates the full lifecycle of an LLM-based agent session:
 //! sending messages to an LLM API, accumulating streaming responses,
 //! dispatching tool calls, and feeding results back into the conversation
 //! until the model ends its turn or a configured limit is reached.
@@ -24,8 +23,7 @@
 //!   [`ApiClient`](crate::api::ApiClient) type parameter `C`,
 //!   avoiding `dyn` overhead for the hot path.
 //! - **Sequential tool dispatch** — tools within a single turn are
-//!   executed one after another so cancellation is checked between each.
-//!   Parallel execution may be added in a future release.
+//!   executed one after another.
 //! - **Soft tool errors** — when a tool is not found or returns an error,
 //!   the loop records the error as a tool result and continues, letting
 //!   the model decide how to recover. Only hard errors (API failures,
@@ -843,11 +841,6 @@ impl<C: ApiClient> BareLoop<C> {
                 Ok((msg, usage, stop))
             }
             Err(e) => {
-                if matches!(e, LoopError::Cancelled) {
-                    self.state = LoopState::Cancelled;
-                    return Err(e);
-                }
-
                 let tripped = self.managers.fallback.record_api_failure();
                 if tripped {
                     let from = self.client.model();
@@ -1057,15 +1050,13 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Set the terminal state for a propagated error.
     ///
-    /// Cancellation is a clean termination ([`LoopError::Cancelled`]), not a
-    /// failure; all other errors are recorded as [`LoopState::Failed`].
+    /// All errors from the turn body are recorded as [`LoopState::Failed`].
+    /// Cancellation is handled separately by the `select!` in `process_turn`,
+    /// which sets [`LoopState::Cancelled`] directly and never reaches this
+    /// method.
     fn set_error_state(&mut self, e: &LoopError) {
-        self.state = if matches!(e, LoopError::Cancelled) {
-            LoopState::Cancelled
-        } else {
-            LoopState::Failed {
-                error: e.to_string(),
-            }
+        self.state = LoopState::Failed {
+            error: e.to_string(),
         };
     }
 }
@@ -1171,6 +1162,87 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
     }
 }
 
+impl<C: ApiClient> BareLoop<C> {
+    /// Execute the turn body without cancellation awareness.
+    ///
+    /// Cancellation is handled by the `select!` in `process_turn`, which
+    /// drops this future if `cancel.notified()` fires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError`] on streaming failure, loop detection abort, tool
+    /// dispatch error, or compaction failure.
+    async fn run_turn_body(
+        &mut self,
+        current_turn: usize,
+        turn_start: Instant,
+    ) -> Result<TurnResult, LoopError> {
+        let (msg, usage, _stream_stop) = self.do_stream().await?;
+        self.accumulate_usage(usage.as_ref());
+
+        let text = Self::extract_text(&msg);
+        let (turn_in, turn_out) = Self::usage_tokens(usage.as_ref());
+        let pattern = self.managers.detection.record_response(&text);
+        self.fire_response(current_turn, &text, usage);
+
+        if let Some(e) = self.apply_loop_detection(current_turn, &pattern) {
+            return Err(e);
+        }
+
+        let tool_calls = Self::extract_tool_calls(&msg);
+        self.conversation.push(msg);
+        self.budget.total_turns = self.budget.total_turns.saturating_add(1);
+
+        if tool_calls.is_empty() {
+            return Ok(self.complete_session(text, turn_in, turn_out, turn_start));
+        }
+
+        self.fire_tool_calls_received(current_turn, &tool_calls);
+        self.state = LoopState::WaitingForTool {
+            tool: tool_calls
+                .first()
+                .map(|tc| tc.tool.clone())
+                .unwrap_or_default(),
+            started_at: std::time::SystemTime::now(),
+        };
+
+        let mut budget = std::mem::take(&mut self.budget);
+        let turn_duration = turn_start.elapsed();
+        let dispatch_result = self
+            .dispatch_and_record(
+                &tool_calls,
+                current_turn,
+                turn_duration,
+                turn_in,
+                turn_out,
+                &mut budget,
+            )
+            .await;
+
+        self.budget = budget;
+        if let Err(e) = dispatch_result {
+            self.set_error_state(&e);
+            return Err(e);
+        }
+
+        self.try_compact_context().await;
+        self.state = LoopState::Processing {
+            turn: self.budget.total_turns,
+        };
+
+        Ok(TurnResult {
+            text,
+            tool_calls,
+            tool_results: Vec::new(),
+            input_tokens: turn_in,
+            output_tokens: turn_out,
+            duration: turn_start.elapsed(),
+            is_complete: false,
+            stop_reason: StopReason::ToolCall,
+        })
+    }
+}
+
 impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
     fn initialize<'a>(
         &'a mut self,
@@ -1200,70 +1272,23 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
             self.record_user_input(input);
             self.fire_turn_start(current_turn, input);
 
-            let (msg, usage, _stream_stop) = self.do_stream().await?;
-            self.accumulate_usage(usage.as_ref());
-
-            let text = Self::extract_text(&msg);
-            let (turn_in, turn_out) = Self::usage_tokens(usage.as_ref());
-            let pattern = self.managers.detection.record_response(&text);
-            self.fire_response(current_turn, &text, usage);
-
-            if let Some(e) = self.apply_loop_detection(current_turn, &pattern) {
-                return Err(e);
+            let cancel = Arc::clone(&self.cancelled);
+            tokio::select! {
+                biased;
+                () = cancel.notified() => {
+                    self.state = LoopState::Cancelled;
+                    self.managers.observers().on_turn_end(&TurnEndContext {
+                        turn: current_turn,
+                        success: false,
+                        error: Some("cancelled".into()),
+                        duration_ms: Self::millis_u64(turn_start.elapsed()),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    });
+                    Err(LoopError::Cancelled)
+                }
+                result = self.run_turn_body(current_turn, turn_start) => result,
             }
-
-            let tool_calls = Self::extract_tool_calls(&msg);
-            self.conversation.push(msg);
-            self.budget.total_turns = self.budget.total_turns.saturating_add(1);
-
-            if tool_calls.is_empty() {
-                return Ok(self.complete_session(text, turn_in, turn_out, turn_start));
-            }
-
-            self.fire_tool_calls_received(current_turn, &tool_calls);
-            self.state = LoopState::WaitingForTool {
-                tool: tool_calls
-                    .first()
-                    .map(|tc| tc.tool.clone())
-                    .unwrap_or_default(),
-                started_at: std::time::SystemTime::now(),
-            };
-
-            // Temporarily extract budget to avoid double mutable borrow.
-            let mut budget = std::mem::take(&mut self.budget);
-            let turn_duration = turn_start.elapsed();
-            let dispatch_result = self
-                .dispatch_and_record(
-                    &tool_calls,
-                    current_turn,
-                    turn_duration,
-                    turn_in,
-                    turn_out,
-                    &mut budget,
-                )
-                .await;
-
-            self.budget = budget;
-            if let Err(e) = dispatch_result {
-                self.set_error_state(&e);
-                return Err(e);
-            }
-
-            self.try_compact_context().await;
-            self.state = LoopState::Processing {
-                turn: self.budget.total_turns,
-            };
-
-            Ok(TurnResult {
-                text,
-                tool_calls,
-                tool_results: Vec::new(),
-                input_tokens: turn_in,
-                output_tokens: turn_out,
-                duration: turn_start.elapsed(),
-                is_complete: false,
-                stop_reason: StopReason::ToolCall,
-            })
         })
     }
 
@@ -3470,5 +3495,185 @@ mod tests {
         loop_.notify_session_end(&loop_.budget.clone(), Duration::from_millis(100));
 
         assert_eq!(hook.captured(), Some(SessionEndReason::ContextOverflow));
+    }
+
+    #[tokio::test]
+    async fn process_turn_cancel_during_streaming_returns_fast() {
+        let (client, tx) = StreamingMockClient::new("test-model");
+        tx.send(Ok(StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg-1".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        })))
+        .await
+        .unwrap();
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        let observer = Arc::new(CountingObserver::new());
+        agent.register_observer(observer.clone());
+        let signal = agent.cancel_signal();
+
+        let handle = tokio::spawn(async move { agent.run("Hi").await });
+
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let start = Instant::now();
+        signal.cancel();
+
+        let result = handle.await.unwrap();
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(LoopError::Cancelled) => {}
+            other => panic!("expected Err(LoopError::Cancelled), got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancel during streaming should return fast; elapsed {elapsed:?}",
+        );
+        assert_eq!(
+            observer.turn_ends.load(Ordering::SeqCst),
+            1,
+            "on_turn_end should fire once on cancel",
+        );
+    }
+
+    #[tokio::test]
+    async fn process_turn_cancel_during_dispatch_fires_turn_end() {
+        struct SlowTool {
+            notify: Arc<tokio::sync::Notify>,
+        }
+        impl Tool for SlowTool {
+            fn name(&self) -> &'static str {
+                "slow"
+            }
+            fn description(&self) -> &'static str {
+                "Blocks until notified"
+            }
+            fn schema(&self) -> ToolSchema {
+                ToolSchema {
+                    tool: "slow".into(),
+                    description: "Blocks until notified".into(),
+                    input_schema: json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn call(
+                &self,
+                _input: Value,
+                _ctx: &ToolContext,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>>
+            {
+                let notify = self.notify.clone();
+                Box::pin(async move {
+                    notify.notified().await;
+                    Ok(ToolOutput::text("done"))
+                })
+            }
+        }
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(SlowTool {
+            notify: notify.clone(),
+        });
+
+        let client = MockClient::new("test");
+        client.add_tool_only_response("tc-1", "slow", json!({}));
+
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+        let observer = Arc::new(CountingObserver::new());
+        agent.register_observer(observer.clone());
+        let signal = agent.cancel_signal();
+
+        let handle = tokio::spawn(async move { agent.run("Use slow tool").await });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        signal.cancel();
+
+        let result = handle.await.unwrap();
+        match result {
+            Err(LoopError::Cancelled) => {}
+            other => panic!("expected Err(LoopError::Cancelled), got {other:?}"),
+        }
+        assert_eq!(
+            observer.turn_ends.load(Ordering::SeqCst),
+            1,
+            "on_turn_end(false) must fire on cancel during dispatch",
+        );
+    }
+
+    #[tokio::test]
+    async fn process_turn_cancel_during_recovery_backoff_returns_fast() {
+        struct AlwaysRecoverable;
+        impl crate::reflection::Reflector for AlwaysRecoverable {
+            fn analyze(
+                &self,
+                error: &str,
+                tool_name: &str,
+                _tool_input: &serde_json::Value,
+                _context: &crate::reflection::ReflectionContext,
+            ) -> Pin<
+                Box<
+                    dyn Future<
+                            Output = Result<
+                                crate::reflection::FailureAnalysis,
+                                crate::reflection::ReflectionError,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                let error = error.to_string();
+                let tool_name = tool_name.to_string();
+                Box::pin(async move {
+                    Ok(crate::reflection::FailureAnalysis {
+                        is_recoverable: true,
+                        root_cause: error,
+                        severity: crate::reflection::FailureSeverity::Medium,
+                        correction: None,
+                        context: format!("tool: {tool_name}"),
+                    })
+                })
+            }
+        }
+
+        let client = MockClient::new("test");
+        client.add_tool_only_response("tc-1", "fail", json!({}));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(FailingTool);
+
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+        agent.set_reflector(Arc::new(AlwaysRecoverable));
+        agent.set_recovery_strategy(Arc::new(
+            crate::reflection::ExponentialBackoffRecovery::new(5)
+                .with_base_delay(Duration::from_secs(60)),
+        ));
+        let signal = agent.cancel_signal();
+
+        let handle = tokio::spawn(async move { agent.run("Use failing tool").await });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let start = Instant::now();
+        signal.cancel();
+
+        let result = handle.await.unwrap();
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(LoopError::Cancelled) => {}
+            other => panic!("expected Err(LoopError::Cancelled), got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancel during recovery backoff should return fast, not wait 60s; elapsed {elapsed:?}",
+        );
     }
 }

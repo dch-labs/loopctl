@@ -1,8 +1,7 @@
-//! Tool dispatch phase — execute tool calls requested by the model.
+//! Tool dispatch — execute tool calls requested by the model.
 //!
-//! Extracted from [`BareLoop`] to isolate the tool dispatch concern.
-//! Handles sequential tool execution, reflection/recovery on errors,
-//! hook interception, health recording, and middleware pipeline dispatch.
+//! Sequential tool execution with reflection and recovery on errors, hook
+//! interception, health recording, and middleware pipeline support.
 
 #[cfg(feature = "hooks")]
 use super::HookAction;
@@ -33,35 +32,22 @@ use std::panic::AssertUnwindSafe;
 enum RecoveryOutcome {
     /// Return this soft-error result to the caller.
     SoftError(ToolDispatchResult),
-    /// The session was cancelled during the recovery wait.
-    Cancelled,
 }
 
 impl<C: ApiClient> BareLoop<C> {
     /// Execute tool calls and return results.
     ///
-    /// Iterates over each [`ToolCall`] extracted from the assistant
-    /// message, looks up the corresponding tool in the [`ToolRegistry`](crate::tool::ToolRegistry),
-    /// and invokes it. Each result is wrapped in a [`ToolDispatchResult`].
+    /// Dispatch a batch of tool calls sequentially.
     ///
-    /// Tool execution is **sequential** so that cancellation can be
-    /// checked between invocations. A tool that is not found in the
-    /// registry produces a soft error result (not a hard [`LoopError`]),
-    /// allowing the model to recover.
-    ///
-    /// When a tool returns an error (execution failure or not-found),
-    /// the framework consults the [`Reflector`](crate::reflection::Reflector) and [`RecoveryStrategy`](crate::reflection::RecoveryStrategy)
-    /// to decide whether to retry, skip, ask user, or fail. Retry
-    /// attempts use the delay specified by the [`RecoveryAction`].
-    ///
-    /// Observers are notified before and after each tool invocation via
-    /// [`LoopObserver::on_tool_pre`](crate::observer::LoopObserver::on_tool_pre) and
-    /// [`LoopObserver::on_tool_post`](crate::observer::LoopObserver::on_tool_post).
+    /// Each [`ToolCall`] is executed one at a time via
+    /// [`dispatch_tool_with_recovery`](Self::dispatch_tool_with_recovery).
+    /// A tool that is not found in the registry produces a soft error result
+    /// (not a hard [`LoopError`]), allowing the model to recover.
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::Cancelled`] if the cancellation flag is set
-    /// between tool invocations.
+    /// Returns [`LoopError`] if any tool dispatch fails with a hard error
+    /// (e.g. loop detection forces an abort).
     pub(super) async fn dispatch_tools(
         &self,
         tool_calls: &[ToolCall],
@@ -69,34 +55,27 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Result<Vec<ToolDispatchResult>, LoopError> {
         let mut results = Vec::with_capacity(tool_calls.len());
         for tc in tool_calls {
-            if self.is_cancelled() {
-                return Err(LoopError::Cancelled);
-            }
             let result = self.dispatch_tool_with_recovery(tc, turn_idx).await?;
             results.push(result);
         }
         Ok(results)
     }
 
-    /// Dispatch a single tool call, using reflector + recovery on errors.
+    /// Dispatch a single tool call with reflection and recovery on errors.
     ///
-    /// If the tool call succeeds, returns the result immediately. If it
-    /// fails, calls [`Reflector::analyze`](crate::reflection::Reflector::analyze) and [`RecoveryStrategy::decide`](crate::reflection::RecoveryStrategy::decide)
-    /// to determine the next action:
+    /// If the tool succeeds, returns immediately. On failure, consults the
+    /// [`Reflector`](crate::reflection::Reflector) and
+    /// [`RecoveryStrategy`](crate::reflection::RecoveryStrategy) to decide
+    /// whether to retry, skip, ask the user, or fail.
     ///
-    /// - [`Retry`](RecoveryAction::Retry) — re-dispatch the tool after the
-    ///   specified delay, up to the recovery strategy's retry limit.
-    /// - [`Skip`](RecoveryAction::Skip) — produce a soft error result and
-    ///   continue to the next tool.
-    /// - [`Fail`](RecoveryAction::Fail) — produce a soft error result (the
-    ///   model sees the failure and can decide how to respond).
-    /// - [`AskUser`](RecoveryAction::AskUser) — treated as `Skip` (interactive
-    ///   recovery not yet supported in `BareLoop`).
+    /// Each attempt fires [`on_tool_pre`](crate::observer::LoopObserver::on_tool_pre)
+    /// before dispatch and [`on_tool_post`](crate::observer::LoopObserver::on_tool_post)
+    /// after, so observers always see a complete lifecycle pair.
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::Cancelled`] if the cancellation signal fires
-    /// during tool execution or between retry attempts.
+    /// Returns [`LoopError`] if the detection manager signals a hard stop
+    /// (e.g. [`LoopError::LoopDetected`]).
     async fn dispatch_tool_with_recovery(
         &self,
         tc: &ToolCall,
@@ -107,37 +86,15 @@ impl<C: ApiClient> BareLoop<C> {
         let mut tc = tc.clone();
 
         loop {
-            if self.is_cancelled() {
-                return Err(LoopError::Cancelled);
-            }
-
-            self.managers.observers().on_tool_pre(&ToolPreContext {
-                turn: turn_idx,
-                tool: tc.tool.clone(),
-                tool_call_id: tc.id.clone(),
-            });
+            self.fire_tool_pre(turn_idx, &tc);
 
             if let Some(blocked) = self.check_pre_tool_use_hooks(&tc, turn_idx) {
-                // Pair on_tool_pre with on_tool_post so observers see a
-                // complete lifecycle even when a hook blocks the call.
-                self.managers.observers().on_tool_post(&ToolPostContext {
-                    turn: turn_idx,
-                    tool: tc.tool.clone(),
-                    result_hash: loop_detector::hash_result(&blocked.output.to_string()),
-                    is_error: blocked.is_error,
-                    duration: Duration::ZERO,
-                });
+                self.fire_tool_post(turn_idx, &tc, &blocked);
                 return Ok(blocked);
             }
 
             if let Some(blocked) = self.pre_detection(&tc, turn_idx)? {
-                self.managers.observers().on_tool_post(&ToolPostContext {
-                    turn: turn_idx,
-                    tool: tc.tool.clone(),
-                    result_hash: loop_detector::hash_result(&blocked.output.to_string()),
-                    is_error: blocked.is_error,
-                    duration: Duration::ZERO,
-                });
+                self.fire_tool_post(turn_idx, &tc, &blocked);
                 return Ok(blocked);
             }
 
@@ -147,13 +104,7 @@ impl<C: ApiClient> BareLoop<C> {
                 .await?;
 
             self.post_detection(&tc, &tool_result);
-            self.managers.observers().on_tool_post(&ToolPostContext {
-                turn: turn_idx,
-                tool: tc.tool.clone(),
-                result_hash: loop_detector::hash_result(&tool_result.output.to_string()),
-                is_error: tool_result.is_error,
-                duration: tool_result.duration,
-            });
+            self.fire_tool_post(turn_idx, &tc, &tool_result);
             self.notify_post_tool_use_hooks(&tc, &tool_result, turn_idx);
             self.record_tool_health(tc.tool.as_str(), &tool_result);
 
@@ -167,29 +118,66 @@ impl<C: ApiClient> BareLoop<C> {
             {
                 Ok((next_attempt, correction)) => {
                     attempt = next_attempt;
-                    if let Some(ref correction) = correction {
-                        let correction_result = tc.apply_correction(correction, &tool_result);
-                        if let CorrectionResult::Failed(msg) = &correction_result {
-                            tracing::warn!(
-                                tool = %tc.tool,
-                                error = %msg,
-                                "correction failed to produce a usable retry"
-                            );
-                        }
-                    }
+                    Self::apply_correction_if_present(&mut tc, correction, &tool_result);
                 }
                 Err(RecoveryOutcome::SoftError(returned_result)) => return Ok(returned_result),
-                Err(RecoveryOutcome::Cancelled) => return Err(LoopError::Cancelled),
             }
         }
     }
 
-    /// Check for a loop pattern before executing the tool.
+    /// Fire [`on_tool_pre`](crate::observer::LoopObserver::on_tool_pre) for
+    /// the tool call about to be dispatched.
+    fn fire_tool_pre(&self, turn_idx: usize, tc: &ToolCall) {
+        self.managers.observers().on_tool_pre(&ToolPreContext {
+            turn: turn_idx,
+            tool: tc.tool.clone(),
+            tool_call_id: tc.id.clone(),
+        });
+    }
+
+    /// Fire [`on_tool_post`](crate::observer::LoopObserver::on_tool_post).
+    ///
+    /// Called for both successful dispatches and blocked paths (hooks,
+    /// detection) so observers always see a complete `pre` / `post` pair.
+    fn fire_tool_post(&self, turn_idx: usize, tc: &ToolCall, result: &ToolDispatchResult) {
+        self.managers.observers().on_tool_post(&ToolPostContext {
+            turn: turn_idx,
+            tool: tc.tool.clone(),
+            result_hash: loop_detector::hash_result(&result.output.to_string()),
+            is_error: result.is_error,
+            duration: result.duration,
+        });
+    }
+
+    /// Apply a correction produced by the recovery strategy, if any.
+    ///
+    /// The correction modifies the tool call's input before the next retry
+    /// attempt. If the correction cannot be applied, logs a warning and
+    /// proceeds with the original input.
+    fn apply_correction_if_present(
+        tc: &mut ToolCall,
+        correction: Option<Correction>,
+        tool_result: &ToolDispatchResult,
+    ) {
+        let Some(correction) = correction else { return };
+        if let CorrectionResult::Failed(msg) = tc.apply_correction(&correction, tool_result) {
+            tracing::warn!(
+                tool = %tc.tool,
+                error = %msg,
+                "correction failed to produce a usable retry"
+            );
+        }
+    }
+
+    /// Record the tool call's input signature and check for loop patterns.
+    ///
+    /// Returns `Some(blocked_result)` if loop detection blocks the call,
+    /// or `None` if dispatch should proceed.
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError`] when the detection manager signals a hard
-    /// stop (e.g. [`LoopError::LoopDetected`]).
+    /// Returns [`LoopError::LoopDetected`] if the detection manager signals
+    /// a hard stop.
     fn pre_detection(
         &self,
         tc: &ToolCall,
@@ -211,11 +199,10 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Record the tool result with the detection manager (post-execution).
+    /// Record the tool result's output hash for loop detection.
     ///
-    /// Constructs an [`Operation`] with the result hash and records it with
-    /// the detection manager. This lets the detector distinguish "same input,
-    /// same output" (stuck) from "same input, different output" (progress).
+    /// Lets the detector distinguish "same input, same output" (stuck) from
+    /// "same input, different output" (progress).
     fn post_detection(&self, tc: &ToolCall, tool_result: &ToolDispatchResult) {
         let result_hash = match &tool_result.output {
             ToolContent::Text(t) => loop_detector::hash_result(t),
@@ -230,17 +217,18 @@ impl<C: ApiClient> BareLoop<C> {
         self.managers.detection.record_operation(operation);
     }
 
-    /// Execute a single tool call through the pipeline or registry.
+    /// Execute a single tool call.
     ///
-    /// Tries the middleware pipeline first, then a direct registry lookup,
-    /// then produces a not-found error result. Handles cancellation during
-    /// execution. Observer notification is handled by the caller
-    /// (`dispatch_tool_with_recovery`).
+    /// Tries the middleware pipeline first (if configured), then falls back
+    /// to a direct registry lookup. Tool panics are caught and converted to
+    /// error results. A tool not in the registry produces a soft error.
+    ///
+    /// Observer notifications are handled by the caller
+    /// ([`dispatch_tool_with_recovery`](Self::dispatch_tool_with_recovery)).
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::Cancelled`] if the cancel signal fires
-    /// during tool execution.
+    /// Returns [`LoopError`] if loop detection forces a hard stop.
     async fn dispatch_tool(
         &self,
         tc: &ToolCall,
@@ -255,16 +243,9 @@ impl<C: ApiClient> BareLoop<C> {
         }
 
         let tool_result = if let Some(tool) = self.tools.get(&tc.tool) {
-            let cancel = Arc::clone(&self.cancelled);
-            // Wrap the tool call in `catch_unwind` so a panicking tool
-            // implementation produces an error result instead of unwinding
-            // through and aborting the entire agent loop.
-            let call_result = tokio::select! {
-                r = AssertUnwindSafe(tool.call(tc.input.clone(), tool_context)).catch_unwind() => r,
-                () = cancel.notified() => {
-                    return Err(LoopError::Cancelled);
-                }
-            };
+            let call_result = AssertUnwindSafe(tool.call(tc.input.clone(), tool_context))
+                .catch_unwind()
+                .await;
             match call_result {
                 Ok(Ok(result)) => {
                     let duration = start.elapsed();
@@ -317,10 +298,9 @@ impl<C: ApiClient> BareLoop<C> {
         Ok(tool_result)
     }
 
-    /// Build a soft-error result for a tool that isn't in the registry.
+    /// Build a soft-error result for a tool that is not in the registry.
     ///
-    /// Notifies observers with the error message
-    /// that lists available tool names to help the model recover.
+    /// The error message lists available tool names to help the model recover.
     fn tool_not_found(&self, tc: &ToolCall) -> ToolDispatchResult {
         let available: Vec<String> = self.tools.tool_names();
         let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();
@@ -335,18 +315,19 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Decide whether to retry a failed tool or return the error result.
+    /// Decide whether to retry a failed tool or return the error as a soft result.
     ///
-    /// Consults the reflector and recovery strategy. On `Retry`, sleeps for
-    /// the prescribed delay (cancellation-aware) and returns the updated
-    /// attempt count and the [`Correction`] (if any) via `Ok`. On all other
-    /// recovery actions, returns the original error result via `Err` (which
-    /// ends the retry loop).
+    /// Consults the [`Reflector`](crate::reflection::Reflector) and
+    /// [`RecoveryStrategy`](crate::reflection::RecoveryStrategy). On
+    /// [`Retry`](RecoveryAction::Retry), sleeps for the prescribed delay and
+    /// returns the updated attempt count and optional [`Correction`]. On all
+    /// other actions (`Skip`, `Fail`, `AskUser`), returns the original error
+    /// result as a soft error.
     ///
     /// # Errors
     ///
-    /// Returns `Err(RecoveryOutcome)` when the recovery strategy decides
-    /// not to retry — the caller should return this as a soft error.
+    /// Returns `Err(RecoveryOutcome::SoftError)` when the recovery strategy
+    /// decides not to retry.
     async fn recovery_wait_or_return(
         &self,
         tc: &ToolCall,
@@ -357,12 +338,7 @@ impl<C: ApiClient> BareLoop<C> {
         match recovery_action {
             RecoveryAction::Retry { delay } => {
                 let next_attempt = attempt.saturating_add(1);
-                tokio::select! {
-                    () = tokio::time::sleep(delay) => {},
-                    () = self.cancelled.notified() => {
-                        return Err(RecoveryOutcome::Cancelled);
-                    }
-                }
+                tokio::time::sleep(delay).await;
                 Ok((next_attempt, correction))
             }
             RecoveryAction::Skip(_) | RecoveryAction::AskUser(_) | RecoveryAction::Fail(_) => {
@@ -376,120 +352,114 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Returns `Some(ToolDispatchResult)` with an error result if a hook
     /// blocked the call, or `None` if the call should proceed.
-    ///
-    /// *Requires `hooks` feature; returns `None` otherwise.*
-    #[allow(clippy::unused_self)]
+    #[cfg(feature = "hooks")]
     fn check_pre_tool_use_hooks(
         &self,
         tc: &ToolCall,
         turn_idx: usize,
     ) -> Option<ToolDispatchResult> {
-        #[cfg(feature = "hooks")]
-        if let Some(executor) = self.managers.hook_executor() {
-            let ctx = PreToolUseContext {
-                tool_name: tc.tool.clone(),
-                input: tc.input.clone(),
-                session_id: self.config.session_id,
-                turn_number: turn_idx,
-            };
-            match executor.check_pre_tool_use(&ctx) {
-                HookAction::Allow => None,
-                HookAction::Block { reason } => Some(ToolDispatchResult {
-                    tool_call_id: tc.id.clone(),
-                    output: ToolContent::Text(reason),
-                    is_error: true,
-                    duration: Duration::ZERO,
-                    resolved_tool_name: tc.tool.clone(),
-                }),
-                HookAction::Ask { message } => {
-                    // In Headless mode (the default) the executor already
-                    // downgrades Ask → Block. If we reach this arm the
-                    // executor is Interactive, but BareLoop has no UI to
-                    // show a prompt, so we still treat it as Block.
-                    Some(ToolDispatchResult {
-                        tool_call_id: tc.id.clone(),
-                        output: ToolContent::Text(message),
-                        is_error: true,
-                        duration: Duration::ZERO,
-                        resolved_tool_name: tc.tool.clone(),
-                    })
-                }
-            }
-        } else {
-            None
-        }
-        #[cfg(not(feature = "hooks"))]
-        {
-            let _ = (tc, turn_idx);
-            None
+        let executor = self.managers.hook_executor()?;
+        let ctx = PreToolUseContext {
+            tool_name: tc.tool.clone(),
+            input: tc.input.clone(),
+            session_id: self.config.session_id,
+            turn_number: turn_idx,
+        };
+        match executor.check_pre_tool_use(&ctx) {
+            HookAction::Allow => None,
+            HookAction::Block { reason } => Some(ToolDispatchResult {
+                tool_call_id: tc.id.clone(),
+                output: ToolContent::Text(reason),
+                is_error: true,
+                duration: Duration::ZERO,
+                resolved_tool_name: tc.tool.clone(),
+            }),
+            HookAction::Ask { message } => Some(ToolDispatchResult {
+                tool_call_id: tc.id.clone(),
+                output: ToolContent::Text(message),
+                is_error: true,
+                duration: Duration::ZERO,
+                resolved_tool_name: tc.tool.clone(),
+            }),
         }
     }
 
+    #[cfg(not(feature = "hooks"))]
+    fn check_pre_tool_use_hooks(
+        &self,
+        _tc: &ToolCall,
+        _turn_idx: usize,
+    ) -> Option<ToolDispatchResult> {
+        None
+    }
+
     /// Notify post-tool-use hooks with the execution result.
-    ///
-    /// *Requires `hooks` feature; no-op otherwise.*
-    #[allow(clippy::unused_self)]
+    #[cfg(feature = "hooks")]
     fn notify_post_tool_use_hooks(
         &self,
         tc: &ToolCall,
         tool_result: &ToolDispatchResult,
         turn_idx: usize,
     ) {
-        #[cfg(feature = "hooks")]
-        if let Some(executor) = self.managers.hook_executor() {
-            let output_text = tool_result.output.to_string();
-            let ctx = PostToolUseContext {
-                tool_name: tc.tool.clone(),
-                input: tc.input.clone(),
-                output: output_text,
-                is_error: tool_result.is_error,
-                duration_ms: tool_result
-                    .duration
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-                session_id: self.config.session_id,
-                turn_number: turn_idx,
-            };
-            executor.notify_post_tool_use(&ctx);
-        }
-        #[cfg(not(feature = "hooks"))]
-        {
-            let _ = (tc, tool_result, turn_idx);
-        }
+        let Some(executor) = self.managers.hook_executor() else {
+            return;
+        };
+        let output_text = tool_result.output.to_string();
+        let ctx = PostToolUseContext {
+            tool_name: tc.tool.clone(),
+            input: tc.input.clone(),
+            output: output_text,
+            is_error: tool_result.is_error,
+            duration_ms: tool_result
+                .duration
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            session_id: self.config.session_id,
+            turn_number: turn_idx,
+        };
+        executor.notify_post_tool_use(&ctx);
+    }
+
+    #[cfg(not(feature = "hooks"))]
+    fn notify_post_tool_use_hooks(
+        &self,
+        _tc: &ToolCall,
+        _tool_result: &ToolDispatchResult,
+        _turn_idx: usize,
+    ) {
     }
 
     /// Record tool health (success or failure) in the health registry.
-    ///
-    /// *Requires `tool_health` feature; no-op otherwise.*
-    #[allow(clippy::unused_self)]
+    #[cfg(feature = "tool_health")]
     fn record_tool_health(&self, tool_name: &str, tool_result: &ToolDispatchResult) {
-        #[cfg(feature = "tool_health")]
-        if let Some(health) = self.managers.health_registry() {
-            if tool_result.is_error {
-                health.record_failure(tool_name, tool_result.duration);
-            } else {
-                health.record_success(tool_name, tool_result.duration);
-            }
-        }
-        #[cfg(not(feature = "tool_health"))]
-        {
-            let _ = (tool_name, tool_result);
+        let Some(health) = self.managers.health_registry() else {
+            return;
+        };
+        if tool_result.is_error {
+            health.record_failure(tool_name, tool_result.duration);
+        } else {
+            health.record_success(tool_name, tool_result.duration);
         }
     }
 
+    #[cfg(not(feature = "tool_health"))]
+    fn record_tool_health(&self, _tool_name: &str, _tool_result: &ToolDispatchResult) {}
+
     /// Dispatch a tool call through the middleware pipeline.
     ///
-    /// Builds a [`ToolDispatchContext`] from the tool call info, delegates
-    /// to the pipeline's middleware chain, and converts the
-    /// [`ToolDispatchResult`] back to a [`ToolDispatchResult`].
-    /// Observer notification is handled by the caller
-    /// ([`dispatch_tool_with_recovery`]).
+    /// Dispatch a tool call through the middleware pipeline.
+    ///
+    /// Builds a [`ToolDispatchContext`] and delegates to the pipeline's
+    /// middleware chain (timeout, permissions, output limits, etc.).
+    ///
+    /// Observer notifications are handled by the caller
+    /// ([`dispatch_tool_with_recovery`](Self::dispatch_tool_with_recovery)).
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::Cancelled`] if the cancel signal fires
-    /// during pipeline dispatch.
+    /// Never returns an error — pipeline dispatch always produces a result
+    /// (soft errors are returned as `Ok` with `is_error: true`).
     async fn dispatch_via_pipeline(
         &self,
         pipeline: &ToolPipeline,
@@ -506,20 +476,7 @@ impl<C: ApiClient> BareLoop<C> {
             permission: PermissionCheck::Allow,
             tool_context: tool_context.clone(),
         };
-        let cancel = Arc::clone(&self.cancelled);
-        let dispatch_result = tokio::select! {
-            r = pipeline.invoke(ctx) => r,
-            () = cancel.notified() => {
-                return Err(LoopError::Cancelled);
-            }
-        };
-        // Guard against a late-arriving cancellation that races with the
-        // pipeline future resolving first. Without this check the result
-        // would be treated as a soft tool error by ToolCallMiddleware
-        // instead of a hard cancellation.
-        if cancel.is_cancelled() {
-            return Err(LoopError::Cancelled);
-        }
+        let dispatch_result = pipeline.invoke(ctx).await;
         Ok(ToolDispatchResult {
             tool_call_id: if dispatch_result.tool_call_id.is_empty() {
                 tc.id.clone()
@@ -535,13 +492,14 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Analyse a tool error and decide on a recovery action.
     ///
-    /// Calls [`Reflector::analyze()`] and then [`RecoveryStrategy::decide()`].
-    /// If the reflector itself fails, logs the error and returns
-    /// [`RecoveryAction::Fail`] (conservative default).
+    /// Calls [`Reflector::analyze`](crate::reflection::Reflector::analyze) to
+    /// classify the failure, then
+    /// [`RecoveryStrategy::decide`](crate::reflection::RecoveryStrategy::decide)
+    /// to choose the action. If the reflector itself fails, conservatively
+    /// returns [`RecoveryAction::Fail`].
     ///
-    /// Returns the [`RecoveryAction`] alongside the [`Correction`] (if any)
-    /// produced by the reflector. The correction is threaded through so the
-    /// retry loop can apply it before re-dispatching.
+    /// Returns the [`RecoveryAction`] and an optional [`Correction`] that the
+    /// retry loop applies to the tool input before re-dispatching.
     async fn recover_tool_error(
         &self,
         tc: &ToolCall,

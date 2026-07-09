@@ -1,8 +1,8 @@
-//! Message construction and extraction helpers.
+//! Message construction and extraction.
 //!
-//! Pure functions and `&self` methods that build or extract data from
-//! [`Message`] instances. Extracted from [`BareLoop`] so the main loop
-//! file focuses on orchestration rather than message wrangling.
+//! Pure functions that build or extract data from [`Message`] instances —
+//! assembling tool-result messages, extracting text or tool calls from an
+//! assistant response, and computing token counts.
 
 use super::{
     ApiClient, BareLoop, Message, MessagePart, Role, ToolCall, ToolContext, ToolDispatchResult,

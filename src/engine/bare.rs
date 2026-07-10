@@ -841,7 +841,11 @@ impl<C: ApiClient> BareLoop<C> {
                 Ok((msg, usage, stop))
             }
             Err(e) => {
-                let tripped = self.managers.fallback.record_api_failure();
+                let tripped = if matches!(e, LoopError::RateLimitEscalation { .. }) {
+                    self.managers.fallback.record_model_failure()
+                } else {
+                    self.managers.fallback.record_api_failure()
+                };
                 if tripped {
                     let from = self.client.model();
                     if let Some(to) = self.managers.fallback.fallback_model() {
@@ -3679,6 +3683,82 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "cancel during recovery backoff should return fast, not wait 60s; elapsed {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_escalation_feeds_circuit_breaker() {
+        use crate::fallback::FallbackManager;
+        use crate::runtime::LoopRuntime;
+        use crate::stream::handler::{
+            RateLimitConfig, StreamHandler, StreamRetryConfig, StreamTimeoutConfig,
+        };
+
+        // Every stream attempt is rate-limited, so the handler escalates on the
+        // first 429 (fallback_after_retries = 0).
+        struct AlwaysRateLimitClient;
+        impl ApiClient for AlwaysRateLimitClient {
+            fn model(&self) -> String {
+                "primary-model".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+            {
+                Box::pin(futures::stream::once(async {
+                    Err(ApiError::RateLimit {
+                        retry_after: None,
+                        message: "slow down".into(),
+                    })
+                }))
+            }
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+                Box::pin(async { Ok(json!({})) })
+            }
+        }
+
+        let handler = StreamHandler::new()
+            .with_config(
+                StreamTimeoutConfig {
+                    fallback_to_non_streaming: false,
+                    ..Default::default()
+                },
+                StreamRetryConfig::default(),
+            )
+            .with_rate_limit_config(RateLimitConfig {
+                fallback_after_retries: 0,
+                default_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                ..Default::default()
+            });
+
+        // Circuit breaker: trips on a single model failure (threshold = 1) and
+        // has a fallback model configured.
+        let mut runtime = LoopRuntime::new();
+        runtime.fallback = FallbackManager::new_with_fallback("primary-model".to_string(), 1);
+        runtime.fallback.set_fallback_model("fallback-model");
+        runtime.set_stream_handler(handler);
+
+        let config = make_config();
+        let client = Arc::new(AlwaysRateLimitClient);
+        let mut agent = BareLoop::new_with_managers(client, ToolRegistry::new(), config, runtime);
+
+        let result = agent.run("Hi").await;
+        assert!(result.is_err(), "rate-limited turn should fail");
+
+        // The escalation arm called record_model_failure(); with threshold 1 the
+        // breaker tripped into Fallback state.
+        assert!(
+            agent.managers.fallback.is_using_fallback(),
+            "escalation should trip the circuit breaker to the fallback model"
         );
     }
 }

@@ -3605,6 +3605,11 @@ mod tests {
             1,
             "on_turn_end(false) must fire on cancel during dispatch",
         );
+        assert_eq!(
+            observer.session_ends.load(Ordering::SeqCst),
+            1,
+            "on_session_end must fire via finalize after cancel",
+        );
     }
 
     #[tokio::test]

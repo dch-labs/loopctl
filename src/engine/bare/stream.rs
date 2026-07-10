@@ -40,8 +40,12 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::Api`] if any stream event is an error.
-    /// Returns [`LoopError::Cancelled`] if the cancellation signal fires mid-stream.
+    /// Returns [`LoopError::Api`] if any stream event is an error. When a
+    /// [`StreamHandler`](crate::stream::handler::StreamHandler) is configured,
+    /// may also return [`LoopError::Cancelled`] if the handler's cancel-aware
+    /// `select!` fires mid-stream. The inline path does not check cancellation
+    /// itself — that is handled by the `select!` in `process_turn`, which drops
+    /// this future if cancelled.
     pub(super) async fn stream_turn(
         &self,
     ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {

@@ -1,8 +1,8 @@
-//! Context compaction phase — check and compact the conversation when needed.
+//! Context compaction for agent conversations.
 //!
-//! Extracted from [`BareLoop`] to isolate the compaction concern.
-//! When a [`ContextManager`] is configured, checks token usage after each
-//! tool dispatch and triggers compaction if usage exceeds the threshold.
+//! When a [`ContextManager`](crate::compact::ContextManager) is configured,
+//! checks token usage after each tool dispatch and triggers compaction if the
+//! conversation exceeds the context window threshold.
 
 use super::{ApiClient, BareLoop, Instant, LoopError};
 #[cfg(feature = "hooks")]
@@ -34,66 +34,32 @@ impl<C: ApiClient> BareLoop<C> {
             return Ok(());
         };
 
-        #[cfg(feature = "hooks")]
-        let messages_before = self.conversation.len();
-
-        // Pre-compact hook check
-        #[cfg(feature = "hooks")]
-        if let Some(executor) = self.managers.hook_executor() {
-            let tokens_before =
-                crate::compact::CompactionOutcome::estimate_tokens(&self.conversation);
-            let ctx = PreCompactContext {
-                trigger: CompactTrigger::Auto,
-                custom_instructions: None,
-                message_count: messages_before,
-                tokens_before,
-                context_window: self.config.context_window,
-                session_id: self.config.session_id,
-            };
-            let hook_result = executor.check_pre_compact(&ctx);
-            if hook_result.abort {
-                // Hook aborted compaction — return Ok, conversation unchanged.
-                return Ok(());
-            }
-            // Note: hook_result.new_instructions and hook_result.additional_context
-            // are available for future use with a hook-aware compactor.
+        if self.pre_compact_hook_aborts() {
+            return Ok(());
         }
 
+        let messages_before = self.conversation.len();
         let compact_start = Instant::now();
-        let result = ctx_manager
-            .ensure_context_fits(std::mem::take(&mut self.conversation), turn)
-            .await;
-        #[cfg(feature = "hooks")]
-        let compact_duration_ms = u64::try_from(compact_start.elapsed().as_millis()).unwrap_or(0);
-        #[cfg(not(feature = "hooks"))]
-        let _ = compact_start;
+        let conversation = self.conversation.clone();
+        let result = ctx_manager.ensure_context_fits(conversation, turn).await;
+
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
+                let tokens_after = outcome.tokens_after;
+                let tokens_saved = outcome.tokens_saved;
                 self.conversation = outcome.messages;
-                #[cfg(feature = "hooks")]
-                let messages_after = self.conversation.len();
-                let tokens_before = outcome.tokens_after.saturating_add(outcome.tokens_saved);
+                let tokens_before = tokens_after.saturating_add(tokens_saved);
                 self.managers.observers().on_compaction(&CompactedContext {
                     tokens_before,
-                    tokens_after: outcome.tokens_after,
-                    tokens_saved: outcome.tokens_saved,
+                    tokens_after,
+                    tokens_saved,
                 });
-
-                // Post-compact hook notification
-                #[cfg(feature = "hooks")]
-                if let Some(executor) = self.managers.hook_executor() {
-                    let messages_compacted = messages_before.saturating_sub(messages_after);
-                    let ctx = PostCompactContext {
-                        trigger: CompactTrigger::Auto,
-                        messages_compacted,
-                        tokens_saved: outcome.tokens_saved,
-                        tokens_after: outcome.tokens_after,
-                        duration_ms: compact_duration_ms,
-                        session_id: self.config.session_id,
-                    };
-                    executor.notify_post_compact(&ctx);
-                }
-
+                self.notify_post_compact_hook(
+                    messages_before,
+                    tokens_after,
+                    tokens_saved,
+                    compact_start.elapsed(),
+                );
                 Ok(())
             }
             Ok(EnsureContextResult::NoAction(messages)) => {
@@ -105,5 +71,62 @@ impl<C: ApiClient> BareLoop<C> {
                 limit: overflow.context_window,
             }),
         }
+    }
+
+    /// Run the pre-compact hook. Returns `true` if the hook aborts compaction.
+    #[cfg(feature = "hooks")]
+    fn pre_compact_hook_aborts(&self) -> bool {
+        let Some(executor) = self.managers.hook_executor() else {
+            return false;
+        };
+        let tokens_before = crate::compact::CompactionOutcome::estimate_tokens(&self.conversation);
+        let ctx = PreCompactContext {
+            trigger: CompactTrigger::Auto,
+            custom_instructions: None,
+            message_count: self.conversation.len(),
+            tokens_before,
+            context_window: self.config.context_window,
+            session_id: self.config.session_id,
+        };
+        executor.check_pre_compact(&ctx).abort
+    }
+
+    #[cfg(not(feature = "hooks"))]
+    fn pre_compact_hook_aborts(&self) -> bool {
+        false
+    }
+
+    /// Notify the post-compact hook that compaction completed.
+    #[cfg(feature = "hooks")]
+    fn notify_post_compact_hook(
+        &self,
+        messages_before: usize,
+        tokens_after: u64,
+        tokens_saved: u64,
+        duration: std::time::Duration,
+    ) {
+        let Some(executor) = self.managers.hook_executor() else {
+            return;
+        };
+        let messages_after = self.conversation.len();
+        let ctx = PostCompactContext {
+            trigger: CompactTrigger::Auto,
+            messages_compacted: messages_before.saturating_sub(messages_after),
+            tokens_saved,
+            tokens_after,
+            duration_ms: u64::try_from(duration.as_millis()).unwrap_or(0),
+            session_id: self.config.session_id,
+        };
+        executor.notify_post_compact(&ctx);
+    }
+
+    #[cfg(not(feature = "hooks"))]
+    fn notify_post_compact_hook(
+        &self,
+        _messages_before: usize,
+        _tokens_after: u64,
+        _tokens_saved: u64,
+        _duration: std::time::Duration,
+    ) {
     }
 }

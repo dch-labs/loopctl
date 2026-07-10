@@ -1,8 +1,8 @@
-//! Streaming phase — send conversation to the LLM API and accumulate the response.
+//! Streaming — send the conversation to the LLM API and accumulate the response.
 //!
-//! Extracted from [`BareLoop`] to isolate the streaming concern. When a
-//! [`StreamHandler`] is configured, delegates to it for resilient streaming
-//! (retry, timeout, fallback). Otherwise, uses basic inline logic.
+//! When a [`StreamHandler`](crate::stream::handler::StreamHandler) is configured,
+//! delegates to it for resilient streaming (retry, timeout, fallback). Otherwise,
+//! uses basic inline logic.
 
 use super::{
     ApiClient, BareLoop, LoopError, Message, StreamAccumulator, StreamEvent, StreamStopReason,
@@ -40,8 +40,12 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::Api`] if any stream event is an error.
-    /// Returns [`LoopError::Cancelled`] if the cancellation signal fires mid-stream.
+    /// Returns [`LoopError::Api`] if any stream event is an error. When a
+    /// [`StreamHandler`](crate::stream::handler::StreamHandler) is configured,
+    /// may also return [`LoopError::Cancelled`] if the handler's cancel-aware
+    /// `select!` fires mid-stream. The inline path does not check cancellation
+    /// itself — that is handled by the `select!` in `process_turn`, which drops
+    /// this future if cancelled.
     pub(super) async fn stream_turn(
         &self,
     ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
@@ -66,12 +70,7 @@ impl<C: ApiClient> BareLoop<C> {
         let mut accumulator = StreamAccumulator::new();
         let mut stop_reason = StreamStopReason::EndTurn;
         loop {
-            let event_result = tokio::select! {
-                event = stream.next() => event,
-                () = self.cancelled.notified() => {
-                    return Err(LoopError::Cancelled);
-                }
-            };
+            let event_result = stream.next().await;
 
             match event_result {
                 Some(Ok(event)) => {

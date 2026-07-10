@@ -1171,9 +1171,9 @@ impl StreamHandler {
                 .unwrap_or(Instant::now()),
         );
         let max_attempts = self.retry_config.max_retries.saturating_add(1);
-        let mut last_stream_outcome: Option<StreamOutcome> = None;
         let mut rate_limit_retries: u32 = 0;
-        for attempt in 0..max_attempts {
+        let mut transport_attempts: u32 = 0;
+        loop {
             if let Some(deadline) = total_deadline {
                 if Instant::now() >= deadline {
                     return Err(StreamHandlerError::InitFailed(
@@ -1201,8 +1201,12 @@ impl StreamHandler {
                     return Err(StreamHandlerError::Cancelled);
                 }
                 Err(e) => {
-                    last_stream_outcome = carried_outcome(&e);
+                    let last_stream_outcome = carried_outcome(&e);
 
+                    // Rate-limit retries draw on their own budget
+                    // (RateLimitConfig), independent of the transport retry
+                    // budget below — a rate-limit storm must not exhaust
+                    // transport retries (nor vice versa).
                     if let Some(StreamOutcome::RateLimited { detail, .. }) = &last_stream_outcome {
                         match self.rate_limit_retry(detail, &mut rate_limit_retries, total_deadline)
                         {
@@ -1230,9 +1234,8 @@ impl StreamHandler {
                         }
                     }
 
-                    // Non-rate-limit errors: exponential backoff, then optionally
-                    // the same-model non-streaming fallback.
-                    if attempt >= max_attempts.saturating_sub(1) {
+                    // Non-rate-limit errors consume the transport retry budget.
+                    if transport_attempts >= max_attempts.saturating_sub(1) {
                         if self.timeout_config.fallback_to_non_streaming {
                             return self
                                 .fallback_non_streaming(
@@ -1247,18 +1250,12 @@ impl StreamHandler {
                         }
                         return Err(e);
                     }
-                    sleep_cancellable(self.retry_config.base_delay(attempt), cancel).await?;
+                    let delay = self.retry_config.base_delay(transport_attempts);
+                    transport_attempts = transport_attempts.saturating_add(1);
+                    sleep_cancellable(delay, cancel).await?;
                 }
             }
         }
-
-        // Should not reach here, but handle it gracefully.
-        Err(StreamHandlerError::InitFailed(
-            last_stream_outcome.unwrap_or(StreamOutcome::InitFailed {
-                attempts: self.retry_config.max_retries,
-                last_error: "all attempts failed".to_string(),
-            }),
-        ))
     }
 
     /// Decide how to handle a rate-limit failure on the current model.
@@ -3074,6 +3071,96 @@ mod tests {
                     }
                     other => panic!("prior should be RateLimited, got {other:?}"),
                 }
+            }
+            other => panic!("expected RateLimitEscalation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_turn_rate_limit_budget_independent_of_transport() {
+        // Transport retry budget is tiny (max_retries = 1 -> 2 attempts), but
+        // fallback_after_retries = 3. A leading transport error must NOT consume
+        // the rate-limit budget: after the one transport failure, three
+        // rate-limit retries must still be honored before escalating. Under the
+        // old shared-counter loop this would exhaust the transport budget first
+        // and fall through to non-streaming fallback instead of escalating.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TransportThenRateLimitMock {
+            calls: AtomicUsize,
+        }
+        impl ApiClient for TransportThenRateLimitMock {
+            fn model(&self) -> String {
+                "test-model".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let result = if n == 0 {
+                    Err(ApiError::api("connection refused"))
+                } else {
+                    Err(ApiError::RateLimit {
+                        retry_after: Some(Duration::from_millis(1)),
+                        message: "slow down".into(),
+                    })
+                };
+                Box::pin(futures::stream::once(async { result }))
+            }
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::json!({})) })
+            }
+        }
+
+        let handler = StreamHandler::new()
+            .with_config(
+                StreamTimeoutConfig {
+                    fallback_to_non_streaming: false,
+                    ..Default::default()
+                },
+                StreamRetryConfig {
+                    max_retries: 1,
+                    base_delay_ms: 1,
+                    ..Default::default()
+                },
+            )
+            .with_rate_limit_config(RateLimitConfig {
+                fallback_after_retries: 3,
+                default_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                ..Default::default()
+            });
+
+        let client = TransportThenRateLimitMock {
+            calls: AtomicUsize::new(0),
+        };
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .stream_turn(&client, vec![], None, None, &cancel)
+            .await
+            .expect_err("should escalate after the rate-limit budget, not fall through");
+        match err {
+            StreamHandlerError::RateLimitEscalation { attempts, .. } => {
+                // One transport failure (not counted) + 3 rate-limit retries,
+                // escalation on the 4th rate-limit hit.
+                assert_eq!(attempts, 4);
             }
             other => panic!("expected RateLimitEscalation, got {other:?}"),
         }

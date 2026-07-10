@@ -128,6 +128,8 @@ impl<C: ApiClient> BareLoop<C> {
     /// - [`InitFailed`](StreamHandlerError::InitFailed) → [`LoopError::Api`]
     /// - [`StreamFailed`](StreamHandlerError::StreamFailed) → [`LoopError::Api`]
     /// - [`FallbackFailed`](StreamHandlerError::FallbackFailed) → [`LoopError::Api`]
+    /// - [`RateLimitEscalation`](StreamHandlerError::RateLimitEscalation) →
+    ///   [`LoopError::RateLimitEscalation`]
     async fn stream_turn_via_handler(
         &self,
         handler: &StreamHandler,
@@ -168,6 +170,78 @@ impl<C: ApiClient> BareLoop<C> {
             } => LoopError::Api(format!(
                 "stream ({stream_outcome}) and fallback failed: {fallback_error}"
             )),
+            StreamHandlerError::RateLimitEscalation {
+                attempts,
+                retry_after,
+                prior: _,
+            } => LoopError::RateLimitEscalation {
+                attempts,
+                retry_after,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::error::ApiError;
+    use crate::stream::handler::{DetectedRateLimit, RateLimitKind, StreamOutcome};
+
+    // Minimal ApiClient so the `BareLoop<C>` associated fn is callable.
+    struct StubClient;
+    impl ApiClient for StubClient {
+        fn model(&self) -> String {
+            "stub".to_string()
+        }
+        fn stream_messages(
+            &self,
+            _messages: Vec<Message>,
+            _system: Option<String>,
+            _tools: Option<Vec<crate::tool::ToolSchema>>,
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+        fn create_message(
+            &self,
+            _messages: Vec<Message>,
+            _system: Option<String>,
+            _tools: Option<Vec<crate::tool::ToolSchema>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(serde_json::json!({})) })
+        }
+    }
+
+    #[test]
+    fn map_handler_error_escalation() {
+        let prior = StreamOutcome::RateLimited {
+            detail: DetectedRateLimit {
+                kind: RateLimitKind::RateLimited,
+                retry_after: Some(std::time::Duration::from_secs(12)),
+                message: "slow down".to_string(),
+            },
+            has_partial_data: false,
+            events_processed: 0,
+        };
+        let mapped =
+            BareLoop::<StubClient>::map_handler_error(StreamHandlerError::RateLimitEscalation {
+                attempts: 3,
+                retry_after: Some(std::time::Duration::from_secs(12)),
+                prior,
+            });
+        match mapped {
+            LoopError::RateLimitEscalation {
+                attempts,
+                retry_after,
+            } => {
+                assert_eq!(attempts, 3);
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(12)));
+            }
+            other => panic!("expected RateLimitEscalation, got {other:?}"),
         }
     }
 }

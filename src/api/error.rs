@@ -991,6 +991,39 @@ impl ApiError {
         Self::Api("Rate limit exceeded, please retry after a moment".into())
     }
 
+    /// Build a structured rate-limit error carrying a parsed `Retry-After` hint.
+    ///
+    /// Unlike [`api_rate_limited`](Self::api_rate_limited), which builds the generic
+    /// [`Api`](Self::Api) variant, this constructs the structured
+    /// [`RateLimit`](Self::RateLimit) variant so downstream layers (the stream handler,
+    /// the fallback manager) recover the server-advised delay without re-parsing a
+    /// message string. `retry_after` is `None` when the provider sent no header or it
+    /// failed to parse.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use loopctl::api::error::{ApiError, ErrorCode};
+    ///
+    /// let err = ApiError::rate_limited("too many requests", Some(Duration::from_secs(30)));
+    /// assert_eq!(err.code(), ErrorCode::ApiRateLimited);
+    /// assert!(err.is_retryable());
+    ///
+    /// let no_hint = ApiError::rate_limited("slow down", None);
+    /// assert_eq!(no_hint.code(), ErrorCode::ApiRateLimited);
+    /// ```
+    #[must_use]
+    pub fn rate_limited(
+        message: impl Into<String>,
+        retry_after: Option<std::time::Duration>,
+    ) -> Self {
+        Self::RateLimit {
+            message: message.into(),
+            retry_after,
+        }
+    }
+
     /// Create an [`ApiError::Api`] variant for an SSE stream error.
     ///
     /// Formats the message as `"Stream error: {msg}"` so that
@@ -1286,12 +1319,27 @@ mod tests {
     fn test_retryable_errors() {
         assert!(ApiError::api_timeout("timed out").is_retryable());
         assert!(ApiError::api_rate_limited().is_retryable());
+        assert!(ApiError::rate_limited("too many requests", None).is_retryable());
         assert!(ApiError::http("connection failed").is_retryable());
         // HttpResponseError (5xx) and HttpRequestError (4xx) are retryable
         assert!(ApiError::http_with_status(503, "unavailable").is_retryable());
         assert!(ApiError::http_with_status(429, "too many requests").is_retryable());
         assert!(!ApiError::auth("invalid key").is_retryable());
         assert!(!ApiError::tool("not found").is_retryable());
+    }
+
+    #[test]
+    fn test_rate_limited_carrier_code() {
+        let with_hint = ApiError::rate_limited(
+            "429 too many requests",
+            Some(std::time::Duration::from_secs(12)),
+        );
+        assert_eq!(with_hint.code(), ErrorCode::ApiRateLimited);
+        assert!(with_hint.is_retryable());
+        let no_hint = ApiError::rate_limited("slow down", None);
+        assert_eq!(no_hint.code(), ErrorCode::ApiRateLimited);
+        assert!(no_hint.is_retryable());
+        assert!(no_hint.is_rate_limited());
     }
 
     #[test]

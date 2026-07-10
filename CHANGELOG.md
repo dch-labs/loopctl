@@ -3,7 +3,27 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- `ApiError::rate_limited(message, retry_after)` constructor for the structured
+  rate-limit carrier variant.
+- `LoopError::RateLimitEscalation { attempts, retry_after }` variant,
+  recoverable, raised when the stream handler exhausts rate-limit retries on a
+  model and escalates to the circuit breaker.
+- `StreamHandlerError::RateLimitEscalation { attempts, retry_after, prior }`
+  variant. After `RateLimitConfig::fallback_after_retries` rate-limit retries,
+  `stream_turn` returns this instead of looping indefinitely or falling back to
+  the same model's non-streaming endpoint.
+- Rate-limit backoff sleeps are now clamped to the turn's `total_stream_timeout`
+  so a large `Retry-After` cannot overrun the turn budget.
+- The engine routes `RateLimitEscalation` to
+  `FallbackManager::record_model_failure`, so a sustained rate limit on one
+  model trips the circuit breaker and subsequent turns route to the fallback
+  model.
 
 ## [0.1.0] - 2025-07-01
 

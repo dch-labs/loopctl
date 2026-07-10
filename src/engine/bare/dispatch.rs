@@ -448,8 +448,6 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Dispatch a tool call through the middleware pipeline.
     ///
-    /// Dispatch a tool call through the middleware pipeline.
-    ///
     /// Builds a [`ToolDispatchContext`] and delegates to the pipeline's
     /// middleware chain (timeout, permissions, output limits, etc.).
     ///

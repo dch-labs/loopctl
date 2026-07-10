@@ -6,29 +6,12 @@
 //!
 //! # Architecture
 //!
-//! The design separates **when to compact** from **how to compact**:
+//! The design separates when to compact from how to compact:
 //!
-//! - [`ContextManager`] — a concrete struct that monitors token usage,
-//!   checks thresholds, and decides when to trigger compaction.
-//! - [`ContextCompactor`] — a trait that defines the compaction strategy.
-//!   Plug in truncation, summarization, Q&A extraction, or any custom
-//!   approach.
-//!
-//! ```text
-//! ┌────────────────────────────┐
-//! │       ContextManager       │
-//! │                            │
-//! │     estimate_tokens()      │
-//! │     should_compact()       │
-//! │     ensure_context_fits()  │
-//! │             │              │
-//! │             ▼              │
-//! │  ┌──────────────────────┐  │
-//! │  │  dyn ContextCompactor│  │
-//! │  │  .compact()          │  │
-//! │  └──────────────────────┘  │
-//! └────────────────────────────┘
-//! ```
+//! 1. [`ContextManager`] monitors token usage, checks thresholds, and
+//!    decides when to trigger compaction.
+//! 2. [`ContextCompactor`] is the trait that defines the compaction
+//!    strategy. Plug in truncation, summarization, or any custom approach.
 //!
 //! # Provided Compactors
 //!

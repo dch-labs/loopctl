@@ -1,12 +1,8 @@
-//! Session lifecycle notifications.
+//! Session lifecycle notifications — start and end events.
 //!
-//! Split from [`BareLoop`] for clarity — these methods dispatch to
-//! the [`ObserverHost`](crate::observer::ObserverHost) and the hook executor.
-//!
-//! Only session start/end live here because they do *two* things:
-//! observer notification + hook dispatch. All other observer notifications
-//! are called directly at their call sites via
-//! `self.managers.observers().on_*()`.
+//! Fires observer callbacks and hook notifications when a session begins and
+//! ends. Other observer events (`on_turn_start`, `on_response`, etc.) are fired
+//! directly at their call sites in `process_turn`.
 
 use super::{ApiClient, BareLoop, Duration, SessionResult};
 #[cfg(feature = "hooks")]
@@ -30,18 +26,7 @@ impl<C: ApiClient> BareLoop<C> {
             .on_session_start(&SessionStartContext {
                 session_id: self.config.session_id,
             });
-
-        #[cfg(feature = "hooks")]
-        if let Some(executor) = self.managers.hook_executor() {
-            let ctx = HookSessionStartContext {
-                session_id: self.config.session_id,
-                model: self.config.model.clone(),
-                working_directory: std::env::current_dir()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            };
-            executor.notify_session_start(&ctx);
-        }
+        self.notify_session_start_hook();
     }
 
     /// Notify all observers and hooks that the session has ended.
@@ -54,19 +39,7 @@ impl<C: ApiClient> BareLoop<C> {
                 total_turns: result.total_turns,
                 duration_ms: Self::millis_u64(duration),
             });
-
-        #[cfg(feature = "hooks")]
-        if let Some(executor) = self.managers.hook_executor() {
-            let reason = self.session_end_reason(result.success);
-            let ctx = HookSessionEndContext {
-                session_id: result.session_id,
-                reason,
-                total_turns: result.total_turns,
-                total_tokens: result.input_tokens.saturating_add(result.output_tokens),
-                duration_secs: duration.as_secs(),
-            };
-            executor.notify_session_end(&ctx);
-        }
+        self.notify_session_end_hook(result, duration);
     }
 
     /// Derive the structured [`SessionEndReason`] from the loop's
@@ -76,9 +49,9 @@ impl<C: ApiClient> BareLoop<C> {
     /// cancellation, max-turns exhaustion, and context overflow.
     #[cfg(feature = "hooks")]
     fn session_end_reason(&self, success: bool) -> SessionEndReason {
-        if !success {
-            // Context overflow is a specific failure mode distinguishable
-            // from a generic error by its message.
+        if self.is_cancelled() {
+            SessionEndReason::Cancelled
+        } else if !success {
             if self
                 .budget
                 .error
@@ -89,14 +62,49 @@ impl<C: ApiClient> BareLoop<C> {
             } else {
                 SessionEndReason::Error
             }
-        } else if self.is_cancelled() {
-            SessionEndReason::Cancelled
         } else if self.budget.total_turns >= self.config.max_turns {
             SessionEndReason::MaxTurns
         } else {
             SessionEndReason::Complete
         }
     }
+
+    #[cfg(feature = "hooks")]
+    fn notify_session_start_hook(&self) {
+        let Some(executor) = self.managers.hook_executor() else {
+            return;
+        };
+        let ctx = HookSessionStartContext {
+            session_id: self.config.session_id,
+            model: self.config.model.clone(),
+            working_directory: std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
+        executor.notify_session_start(&ctx);
+    }
+
+    #[cfg(not(feature = "hooks"))]
+    fn notify_session_start_hook(&self) {}
+
+    #[cfg(feature = "hooks")]
+    fn notify_session_end_hook(&self, result: &SessionResult, duration: Duration) {
+        let Some(executor) = self.managers.hook_executor() else {
+            return;
+        };
+        let reason = self.session_end_reason(result.success);
+        let ctx = HookSessionEndContext {
+            session_id: result.session_id,
+            reason,
+            total_turns: result.total_turns,
+            total_tokens: result.input_tokens.saturating_add(result.output_tokens),
+            duration_secs: duration.as_secs(),
+        };
+        executor.notify_session_end(&ctx);
+    }
+
+    #[cfg(not(feature = "hooks"))]
+    fn notify_session_end_hook(&self, _result: &SessionResult, _duration: Duration) {}
 
     /// Convert a [`Duration`] to milliseconds as `u64`.
     pub(super) fn millis_u64(duration: Duration) -> u64 {

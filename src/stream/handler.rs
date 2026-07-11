@@ -1186,7 +1186,7 @@ impl StreamHandler {
                 }
             }
             match self
-                .try_stream_once(
+                .try_stream(
                     client,
                     conversation.clone(),
                     system.clone(),
@@ -1297,7 +1297,7 @@ impl StreamHandler {
     /// # Errors
     ///
     /// Returns [`StreamHandlerError`] if the stream fails or times out.
-    async fn try_stream_once<C: ApiClient>(
+    async fn try_stream<C: ApiClient>(
         &self,
         client: &C,
         conversation: Vec<Message>,
@@ -1362,6 +1362,7 @@ impl StreamHandler {
         let usage = accumulator.usage().copied();
         let message = accumulator.build();
         let elapsed = stream_start.elapsed();
+
         Ok(StreamTurnResult {
             message,
             usage,
@@ -1405,13 +1406,15 @@ impl StreamHandler {
             if cancel.is_cancelled() {
                 return Err(StreamHandlerError::Cancelled);
             }
-            let event_deadline = Instant::now()
-                .checked_add(self.timeout_config.per_event_timeout)
-                .unwrap_or(Instant::now());
+
+            let event_deadline = self.event_deadline(diagnostics.events_processed);
             let event_result = tokio::select! {
-                () = cancel.notified() => return Err(StreamHandlerError::Cancelled),
                 event = stream.next() => EventPoll::Next(event),
+                () = cancel.notified() => return Err(StreamHandlerError::Cancelled),
                 () = tokio::time::sleep_until(event_deadline.into()) => EventPoll::TimedOut,
+                () = Self::total_deadline_future(total_deadline) => {
+                    return Err(StreamHandlerError::StreamFailed(diagnostics.total_timeout()));
+                }
             };
             match event_result {
                 EventPoll::TimedOut => {
@@ -1432,11 +1435,45 @@ impl StreamHandler {
         }
     }
 
+    /// The deadline for the next stream event.
+    ///
+    /// Uses [`initial_event_timeout`](StreamTimeoutConfig::initial_event_timeout)
+    /// before any event has arrived (the model may need time to begin
+    /// generating), then switches to
+    /// [`per_event_timeout`](StreamTimeoutConfig::per_event_timeout) once events
+    /// are flowing. Falls back to "now" if the addition overflows.
+    fn event_deadline(&self, events_processed: u64) -> Instant {
+        let base_timeout = if events_processed == 0 {
+            self.timeout_config.initial_event_timeout
+        } else {
+            self.timeout_config.per_event_timeout
+        };
+
+        Instant::now()
+            .checked_add(base_timeout)
+            .unwrap_or(Instant::now())
+    }
+
     /// Whether the total-stream deadline has already passed.
     fn deadline_exceeded(total_deadline: Option<Instant>) -> bool {
         match total_deadline {
             Some(deadline) => Instant::now() >= deadline,
             None => false,
+        }
+    }
+
+    /// A future that completes when the overall total-stream deadline elapses.
+    ///
+    /// Returns a future that never resolves when there is no total deadline,
+    /// so the `tokio::select!` branch stays inert in that case.
+    async fn total_deadline_future(total_deadline: Option<Instant>) {
+        match total_deadline {
+            Some(deadline) => {
+                if let Some(duration) = deadline.checked_duration_since(Instant::now()) {
+                    tokio::time::sleep(duration).await;
+                }
+            }
+            None => std::future::pending::<()>().await,
         }
     }
 

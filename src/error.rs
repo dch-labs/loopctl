@@ -80,6 +80,9 @@
 ///   while processing a streaming response from the LLM.
 /// - [`Config`](LoopError::Config) — Configuration validation
 ///   failed (missing fields, invalid values).
+/// - [`RateLimitEscalation`](LoopError::RateLimitEscalation) —
+///   Rate-limit retries on the current model were exhausted and the
+///   engine escalated to the model circuit breaker.
 /// - [`Internal`](LoopError::Internal) — A catch-all for unexpected
 ///   or infrastructure-level errors.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -263,6 +266,22 @@ pub enum LoopError {
     /// mutex, an allocation failure).
     #[error("{0}")]
     Internal(String),
+
+    /// Rate-limit retries on the current model were exhausted.
+    ///
+    /// The stream handler honored the provider's `Retry-After` up to the
+    /// configured `fallback_after_retries` ceiling and could not make
+    /// progress on this model. The engine feeds this into the model
+    /// circuit breaker so a subsequent turn can route to a fallback model.
+    /// Recoverable — the failure is model-scoped, not a permanent fault.
+    #[error("Rate-limit escalation after {attempts} retries (retry-after {retry_after:?})")]
+    RateLimitEscalation {
+        /// Number of rate-limit retries honored before escalating.
+        attempts: u32,
+        /// Last server-advised `Retry-After` hint, after clamping. Used for
+        /// diagnostics; `None` when the provider sent no header.
+        retry_after: Option<std::time::Duration>,
+    },
 }
 
 impl LoopError {
@@ -331,6 +350,7 @@ impl LoopError {
                 | Self::Api(_)
                 | Self::ContextExceeded { .. }
                 | Self::Reflection(_)
+                | Self::RateLimitEscalation { .. }
         )
     }
 
@@ -438,6 +458,15 @@ mod tests {
     #[test]
     fn is_recoverable_true_for_reflection() {
         let err = LoopError::Reflection("need to rethink".into());
+        assert!(err.is_recoverable());
+    }
+
+    #[test]
+    fn is_recoverable_true_for_rate_limit_escalation() {
+        let err = LoopError::RateLimitEscalation {
+            attempts: 3,
+            retry_after: Some(std::time::Duration::from_secs(5)),
+        };
         assert!(err.is_recoverable());
     }
 

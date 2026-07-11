@@ -558,6 +558,123 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
     None
 }
 
+/// Clamp a rate-limit backoff so it cannot sleep past the turn's `total_deadline`.
+///
+/// `None` passes the delay through unchanged. When the remaining time to the
+/// deadline is smaller than `delay`, the remaining time is returned (zero once
+/// the deadline has passed). All arithmetic is checked; the worst case is
+/// `Duration::ZERO`, never a panic.
+fn clamp_delay_to_deadline(delay: Duration, deadline: Option<Instant>) -> Duration {
+    let Some(deadline) = deadline else {
+        return delay;
+    };
+    let now = Instant::now();
+    let Some(remaining) = deadline.checked_duration_since(now) else {
+        return Duration::ZERO;
+    };
+    delay.min(remaining)
+}
+
+/// Outcome of a rate-limit retry decision (see [`StreamHandler::rate_limit_retry`]).
+#[derive(Debug)]
+enum RateLimitRetry {
+    /// Escalate to the model circuit breaker.
+    Escalate {
+        /// Number of rate-limit retries honored before escalating.
+        attempts: u32,
+        /// Last server-advised hint, after clamping.
+        retry_after: Option<Duration>,
+    },
+    /// Give up on the current model without escalating.
+    HardStop,
+    /// Sleep `delay` then retry the current model.
+    Retry(Duration),
+}
+
+/// Pull the carried [`StreamOutcome`] out of a [`StreamHandlerError`], if any.
+fn carried_outcome(error: &StreamHandlerError) -> Option<StreamOutcome> {
+    match error {
+        StreamHandlerError::InitFailed(o) | StreamHandlerError::StreamFailed(o) => {
+            Some(o.to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Sleep for `delay`, or return [`StreamHandlerError::Cancelled`] if the cancel
+/// signal fires first.
+///
+/// # Errors
+///
+/// Returns [`StreamHandlerError::Cancelled`] if `cancel` is signalled before the
+/// sleep elapses.
+async fn sleep_cancellable(
+    delay: Duration,
+    cancel: &Arc<CancelSignal>,
+) -> Result<(), StreamHandlerError> {
+    tokio::select! {
+        () = tokio::time::sleep(delay) => Ok(()),
+        () = cancel.notified() => Err(StreamHandlerError::Cancelled),
+    }
+}
+
+/// Result of polling the stream once inside [`StreamHandler::next_event`].
+enum EventPoll {
+    /// The stream produced an item (`None` means the stream ended).
+    Next(Option<Result<crate::stream::StreamEvent, crate::api::error::ApiError>>),
+    /// The per-event timeout fired before any item arrived.
+    TimedOut,
+}
+
+/// Read-only diagnostic context used to build timeout and error outcomes.
+///
+/// Snapshotted once per loop iteration in [`StreamHandler::process_events`] and
+/// handed to [`StreamHandler::next_event`], which needs progress/elapsed data to
+/// populate [`StreamOutcome`] fields when it short-circuits.
+struct EventDiagnostics {
+    /// Events processed so far this turn.
+    events_processed: u64,
+    /// When the stream started, for elapsed-duration outcomes.
+    stream_start: Instant,
+    /// Whether partial content has been accumulated.
+    has_partial_data: bool,
+}
+
+impl EventDiagnostics {
+    /// Build the [`StreamOutcome::TotalTimeout`] for this point in the stream.
+    fn total_timeout(&self) -> StreamOutcome {
+        StreamOutcome::TotalTimeout {
+            has_partial_data: self.has_partial_data,
+            events_processed: self.events_processed,
+            duration: self.stream_start.elapsed(),
+        }
+    }
+
+    /// Build the [`StreamOutcome::EventTimeout`] for this point in the stream.
+    fn event_timeout(&self, consecutive_timeouts: u32) -> StreamOutcome {
+        StreamOutcome::EventTimeout {
+            has_partial_data: self.has_partial_data,
+            consecutive_timeouts,
+        }
+    }
+
+    /// Map a stream API error to the matching outcome: rate-limit when detected,
+    /// otherwise a generic init failure.
+    fn api_error_outcome(&self, error: &crate::api::error::ApiError) -> StreamHandlerError {
+        if let Some(detail) = DetectedRateLimit::detect(error) {
+            return StreamHandlerError::StreamFailed(StreamOutcome::RateLimited {
+                detail,
+                has_partial_data: self.has_partial_data,
+                events_processed: self.events_processed,
+            });
+        }
+        StreamHandlerError::StreamFailed(StreamOutcome::InitFailed {
+            attempts: 1,
+            last_error: error.to_string(),
+        })
+    }
+}
+
 // ===================================================
 // StreamOutcome
 // ===================================================
@@ -774,6 +891,22 @@ pub enum StreamHandlerError {
     /// The [`CancelSignal`] was triggered
     /// before the stream completed. Partial data may be available.
     Cancelled,
+
+    /// Rate-limit retries on the current model were exhausted.
+    ///
+    /// The handler honored the provider's `Retry-After` up to the configured
+    /// [`RateLimitConfig::fallback_after_retries`] ceiling and could not make
+    /// progress on this model. The caller should escalate to the model circuit
+    /// breaker ([`FallbackManager`](crate::fallback::FallbackManager)), not the
+    /// same-model non-streaming fallback.
+    RateLimitEscalation {
+        /// Number of rate-limit retries honored before escalating.
+        attempts: u32,
+        /// Last server-advised `Retry-After` hint, after clamping. `None` when no header sent.
+        retry_after: Option<Duration>,
+        /// The rate-limit outcome that triggered escalation.
+        prior: StreamOutcome,
+    },
 }
 
 impl fmt::Display for StreamHandlerError {
@@ -791,6 +924,14 @@ impl fmt::Display for StreamHandlerError {
                 )
             }
             Self::Cancelled => write!(f, "cancelled"),
+            Self::RateLimitEscalation {
+                attempts,
+                retry_after,
+                prior: _,
+            } => write!(
+                f,
+                "rate-limit escalation after {attempts} retries (retry-after {retry_after:?})"
+            ),
         }
     }
 }
@@ -1011,6 +1152,9 @@ impl StreamHandler {
     ///   failed mid-event with a timeout or API error.
     /// - [`FallbackFailed`](StreamHandlerError::FallbackFailed) — both
     ///   streaming and non-streaming fallback failed.
+    /// - [`RateLimitEscalation`](StreamHandlerError::RateLimitEscalation) —
+    ///   rate-limit retries on this model were exhausted; escalate to a
+    ///   fallback model.
     /// - [`Cancelled`](StreamHandlerError::Cancelled) — cancellation
     ///   signal fired.
     pub async fn stream_turn<C: ApiClient>(
@@ -1027,8 +1171,9 @@ impl StreamHandler {
                 .unwrap_or(Instant::now()),
         );
         let max_attempts = self.retry_config.max_retries.saturating_add(1);
-        let mut last_stream_outcome: Option<StreamOutcome> = None;
-        for attempt in 0..max_attempts {
+        let mut rate_limit_retries: u32 = 0;
+        let mut transport_attempts: u32 = 0;
+        loop {
             if let Some(deadline) = total_deadline {
                 if Instant::now() >= deadline {
                     return Err(StreamHandlerError::InitFailed(
@@ -1041,7 +1186,7 @@ impl StreamHandler {
                 }
             }
             match self
-                .try_stream_once(
+                .try_stream(
                     client,
                     conversation.clone(),
                     system.clone(),
@@ -1056,15 +1201,41 @@ impl StreamHandler {
                     return Err(StreamHandlerError::Cancelled);
                 }
                 Err(e) => {
-                    let outcome = match &e {
-                        StreamHandlerError::InitFailed(o) | StreamHandlerError::StreamFailed(o) => {
-                            Some(o.clone())
+                    let last_stream_outcome = carried_outcome(&e);
+
+                    // Rate-limit retries draw on their own budget
+                    // (RateLimitConfig), independent of the transport retry
+                    // budget below — a rate-limit storm must not exhaust
+                    // transport retries (nor vice versa).
+                    if let Some(StreamOutcome::RateLimited { detail, .. }) = &last_stream_outcome {
+                        match self.rate_limit_retry(detail, &mut rate_limit_retries, total_deadline)
+                        {
+                            RateLimitRetry::Escalate {
+                                attempts,
+                                retry_after,
+                            } => {
+                                return Err(StreamHandlerError::RateLimitEscalation {
+                                    attempts,
+                                    retry_after,
+                                    prior: last_stream_outcome.clone().unwrap_or(
+                                        StreamOutcome::RateLimited {
+                                            detail: detail.clone(),
+                                            has_partial_data: false,
+                                            events_processed: 0,
+                                        },
+                                    ),
+                                });
+                            }
+                            RateLimitRetry::HardStop => return Err(e),
+                            RateLimitRetry::Retry(delay) => {
+                                sleep_cancellable(delay, cancel).await?;
+                                continue;
+                            }
                         }
-                        _ => None,
-                    };
-                    last_stream_outcome = outcome;
-                    if attempt >= max_attempts.saturating_sub(1) {
-                        // All retries exhausted — try fallback if enabled.
+                    }
+
+                    // Non-rate-limit errors consume the transport retry budget.
+                    if transport_attempts >= max_attempts.saturating_sub(1) {
                         if self.timeout_config.fallback_to_non_streaming {
                             return self
                                 .fallback_non_streaming(
@@ -1079,27 +1250,43 @@ impl StreamHandler {
                         }
                         return Err(e);
                     }
-                    let delay = match &last_stream_outcome {
-                        Some(StreamOutcome::RateLimited { detail, .. }) => {
-                            self.rate_limit_config.backoff(detail.retry_after)
-                        }
-                        _ => self.retry_config.base_delay(attempt),
-                    };
-                    tokio::select! {
-                        () = tokio::time::sleep(delay) => {}
-                        () = cancel.notified() => return Err(StreamHandlerError::Cancelled),
-                    }
+                    let delay = self.retry_config.base_delay(transport_attempts);
+                    transport_attempts = transport_attempts.saturating_add(1);
+                    sleep_cancellable(delay, cancel).await?;
                 }
             }
         }
+    }
 
-        // Should not reach here, but handle it gracefully.
-        Err(StreamHandlerError::InitFailed(
-            last_stream_outcome.unwrap_or(StreamOutcome::InitFailed {
-                attempts: self.retry_config.max_retries,
-                last_error: "all attempts failed".to_string(),
-            }),
-        ))
+    /// Decide how to handle a rate-limit failure on the current model.
+    ///
+    /// Bumps `count` and returns one of:
+    /// - [`RateLimitRetry::Escalate`] once `count` exceeds
+    ///   [`fallback_after_retries`](RateLimitConfig::fallback_after_retries) — the
+    ///   caller escalates to the model circuit breaker;
+    /// - [`RateLimitRetry::HardStop`] once `count` exceeds
+    ///   [`max_retries`](RateLimitConfig::max_retries) — for when escalation is
+    ///   unavailable (e.g. no fallback model configured);
+    /// - [`RateLimitRetry::Retry`] with the deadline-clamped backoff otherwise.
+    fn rate_limit_retry(
+        &self,
+        detail: &DetectedRateLimit,
+        count: &mut u32,
+        deadline: Option<Instant>,
+    ) -> RateLimitRetry {
+        *count = count.saturating_add(1);
+        if *count > self.rate_limit_config.fallback_after_retries {
+            return RateLimitRetry::Escalate {
+                attempts: *count,
+                retry_after: detail.retry_after,
+            };
+        }
+        if *count > self.rate_limit_config.max_retries {
+            return RateLimitRetry::HardStop;
+        }
+        let delay =
+            clamp_delay_to_deadline(self.rate_limit_config.backoff(detail.retry_after), deadline);
+        RateLimitRetry::Retry(delay)
     }
 
     /// Attempt a single streaming pass.
@@ -1110,7 +1297,7 @@ impl StreamHandler {
     /// # Errors
     ///
     /// Returns [`StreamHandlerError`] if the stream fails or times out.
-    async fn try_stream_once<C: ApiClient>(
+    async fn try_stream<C: ApiClient>(
         &self,
         client: &C,
         conversation: Vec<Message>,
@@ -1150,87 +1337,32 @@ impl StreamHandler {
         let stream_start = Instant::now();
 
         loop {
-            if let Some(deadline) = total_deadline {
-                if Instant::now() >= deadline {
-                    let has_partial_data = !accumulator.peek_parts().is_empty();
-                    return Err(StreamHandlerError::StreamFailed(
-                        StreamOutcome::TotalTimeout {
-                            has_partial_data,
-                            events_processed,
-                            duration: stream_start.elapsed(),
-                        },
-                    ));
-                }
-            }
-            let per_event_timeout = self.timeout_config.per_event_timeout;
-            let event_deadline = Instant::now()
-                .checked_add(per_event_timeout)
-                .unwrap_or(Instant::now());
-            let event_result = tokio::select! {
-                event = stream.next() => event,
-                () = cancel.notified() => {
-                    return Err(StreamHandlerError::Cancelled);
-                }
-                () = tokio::time::sleep_until(event_deadline.into()) => {
-                    consecutive_timeouts = consecutive_timeouts.saturating_add(1);
-                    let max_consecutive = self.timeout_config.max_consecutive_timeouts as usize;
-                    if consecutive_timeouts >= max_consecutive {
-                        let has_partial_data = !accumulator.peek_parts().is_empty();
-                        return Err(StreamHandlerError::StreamFailed(
-                            StreamOutcome::EventTimeout {
-                                has_partial_data,
-                                consecutive_timeouts: u32::try_from(consecutive_timeouts).unwrap_or(u32::MAX),
-                            },
-                        ));
-                    }
-                    continue;
-                }
+            let diagnostics = EventDiagnostics {
+                events_processed,
+                stream_start,
+                has_partial_data: !accumulator.peek_parts().is_empty(),
             };
-
-            match event_result {
-                Some(Ok(event)) => {
-                    consecutive_timeouts = 0;
-                    events_processed = events_processed.saturating_add(1);
-                    if let StreamEvent::MessageDelta(delta) = &event {
-                        if let Some(ref reason_str) = delta.delta.stop_reason {
-                            stop_reason =
-                                StreamStopReason::from_api_str(reason_str).unwrap_or(stop_reason);
-                        }
-                    }
-                    if let Err(e) = accumulator.process(&event) {
-                        return Err(StreamHandlerError::StreamFailed(
-                            StreamOutcome::InitFailed {
-                                attempts: 1,
-                                last_error: e.to_string(),
-                            },
-                        ));
-                    }
-                }
-                Some(Err(api_error)) => {
-                    if let Some(detail) = DetectedRateLimit::detect(&api_error) {
-                        let has_partial_data = !accumulator.peek_parts().is_empty();
-                        return Err(StreamHandlerError::StreamFailed(
-                            StreamOutcome::RateLimited {
-                                detail,
-                                has_partial_data,
-                                events_processed,
-                            },
-                        ));
-                    }
-                    return Err(StreamHandlerError::StreamFailed(
-                        StreamOutcome::InitFailed {
-                            attempts: 1,
-                            last_error: api_error.to_string(),
-                        },
-                    ));
-                }
-                None => break,
-            }
+            let Some(event) = self
+                .next_event(
+                    &mut stream,
+                    cancel,
+                    &mut consecutive_timeouts,
+                    total_deadline,
+                    &diagnostics,
+                )
+                .await?
+            else {
+                break;
+            };
+            events_processed = events_processed.saturating_add(1);
+            consecutive_timeouts = 0;
+            Self::apply_event(&event, &mut accumulator, &mut stop_reason)?;
         }
 
         let usage = accumulator.usage().copied();
         let message = accumulator.build();
         let elapsed = stream_start.elapsed();
+
         Ok(StreamTurnResult {
             message,
             usage,
@@ -1238,6 +1370,138 @@ impl StreamHandler {
             from_fallback: false,
             elapsed,
         })
+    }
+
+    /// Wait for the next stream event, enforcing the total deadline and
+    /// per-event timeout.
+    ///
+    /// Returns `Ok(None)` when the stream ends. On a per-event timeout the
+    /// consecutive-timeout counter is bumped; once it reaches
+    /// [`max_consecutive_timeouts`](StreamTimeoutConfig::max_consecutive_timeouts)
+    /// the turn fails with [`StreamOutcome::EventTimeout`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamHandlerError::Cancelled`] if the cancel signal fires, or
+    /// [`StreamHandlerError::StreamFailed`] on total/per-event timeout or an API
+    /// error.
+    async fn next_event<S>(
+        &self,
+        stream: &mut S,
+        cancel: &Arc<CancelSignal>,
+        consecutive_timeouts: &mut usize,
+        total_deadline: Option<Instant>,
+        diagnostics: &EventDiagnostics,
+    ) -> Result<Option<StreamEvent>, StreamHandlerError>
+    where
+        S: futures::Stream<Item = Result<crate::stream::StreamEvent, crate::api::error::ApiError>>
+            + Unpin,
+    {
+        loop {
+            if Self::deadline_exceeded(total_deadline) {
+                return Err(StreamHandlerError::StreamFailed(
+                    diagnostics.total_timeout(),
+                ));
+            }
+            if cancel.is_cancelled() {
+                return Err(StreamHandlerError::Cancelled);
+            }
+
+            let event_deadline = self.event_deadline(diagnostics.events_processed);
+            let event_result = tokio::select! {
+                event = stream.next() => EventPoll::Next(event),
+                () = cancel.notified() => return Err(StreamHandlerError::Cancelled),
+                () = tokio::time::sleep_until(event_deadline.into()) => EventPoll::TimedOut,
+                () = Self::total_deadline_future(total_deadline) => {
+                    return Err(StreamHandlerError::StreamFailed(diagnostics.total_timeout()));
+                }
+            };
+            match event_result {
+                EventPoll::TimedOut => {
+                    *consecutive_timeouts = consecutive_timeouts.saturating_add(1);
+                    let max_consecutive = self.timeout_config.max_consecutive_timeouts as usize;
+                    if *consecutive_timeouts >= max_consecutive {
+                        return Err(StreamHandlerError::StreamFailed(diagnostics.event_timeout(
+                            u32::try_from(*consecutive_timeouts).unwrap_or(u32::MAX),
+                        )));
+                    }
+                }
+                EventPoll::Next(Some(Ok(event))) => return Ok(Some(event)),
+                EventPoll::Next(Some(Err(api_error))) => {
+                    return Err(diagnostics.api_error_outcome(&api_error));
+                }
+                EventPoll::Next(None) => return Ok(None),
+            }
+        }
+    }
+
+    /// The deadline for the next stream event.
+    ///
+    /// Uses [`initial_event_timeout`](StreamTimeoutConfig::initial_event_timeout)
+    /// before any event has arrived (the model may need time to begin
+    /// generating), then switches to
+    /// [`per_event_timeout`](StreamTimeoutConfig::per_event_timeout) once events
+    /// are flowing. Falls back to "now" if the addition overflows.
+    fn event_deadline(&self, events_processed: u64) -> Instant {
+        let base_timeout = if events_processed == 0 {
+            self.timeout_config.initial_event_timeout
+        } else {
+            self.timeout_config.per_event_timeout
+        };
+
+        Instant::now()
+            .checked_add(base_timeout)
+            .unwrap_or(Instant::now())
+    }
+
+    /// Whether the total-stream deadline has already passed.
+    fn deadline_exceeded(total_deadline: Option<Instant>) -> bool {
+        match total_deadline {
+            Some(deadline) => Instant::now() >= deadline,
+            None => false,
+        }
+    }
+
+    /// A future that completes when the overall total-stream deadline elapses.
+    ///
+    /// Returns a future that never resolves when there is no total deadline,
+    /// so the `tokio::select!` branch stays inert in that case.
+    async fn total_deadline_future(total_deadline: Option<Instant>) {
+        match total_deadline {
+            Some(deadline) => {
+                if let Some(duration) = deadline.checked_duration_since(Instant::now()) {
+                    tokio::time::sleep(duration).await;
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    /// Fold one event into the accumulator, tracking stop reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamHandlerError::StreamFailed`] if the event cannot be
+    /// accumulated.
+    fn apply_event(
+        event: &StreamEvent,
+        accumulator: &mut StreamAccumulator,
+        stop_reason: &mut StreamStopReason,
+    ) -> Result<(), StreamHandlerError> {
+        if let StreamEvent::MessageDelta(delta) = event {
+            if let Some(ref reason_str) = delta.delta.stop_reason {
+                *stop_reason = StreamStopReason::from_api_str(reason_str).unwrap_or(*stop_reason);
+            }
+        }
+        if let Err(e) = accumulator.process(event) {
+            return Err(StreamHandlerError::StreamFailed(
+                StreamOutcome::InitFailed {
+                    attempts: 1,
+                    last_error: e.to_string(),
+                },
+            ));
+        }
+        Ok(())
     }
 
     /// Fall back to non-streaming message creation.
@@ -1499,6 +1763,31 @@ mod tests {
     fn error_cancelled_display() {
         let err = StreamHandlerError::Cancelled;
         assert_eq!(err.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn error_rate_limit_escalation_display() {
+        let prior = StreamOutcome::RateLimited {
+            detail: DetectedRateLimit {
+                kind: RateLimitKind::RateLimited,
+                retry_after: Some(Duration::from_secs(5)),
+                message: "slow down".to_string(),
+            },
+            has_partial_data: false,
+            events_processed: 0,
+        };
+        let err = StreamHandlerError::RateLimitEscalation {
+            attempts: 4,
+            retry_after: Some(Duration::from_secs(5)),
+            prior,
+        };
+        let s = err.to_string();
+        assert!(s.contains("rate-limit escalation"), "got: {s}");
+        assert!(s.contains("4 retries"), "got: {s}");
+        assert!(
+            s.contains("5s"),
+            "should render the retry-after duration, got: {s}"
+        );
     }
 
     #[test]
@@ -2271,6 +2560,196 @@ mod tests {
     }
 
     #[test]
+    fn clamp_delay_to_deadline_none_deadline_returns_delay_unchanged() {
+        let delay = Duration::from_secs(600);
+        assert_eq!(clamp_delay_to_deadline(delay, None), delay);
+    }
+
+    #[test]
+    fn clamp_delay_to_deadline_future_deadline_fits() {
+        let delay = Duration::from_millis(10);
+        let deadline = Some(Instant::now() + Duration::from_secs(60));
+        assert_eq!(clamp_delay_to_deadline(delay, deadline), delay);
+    }
+
+    #[test]
+    fn clamp_delay_to_deadline_exceeds_remaining() {
+        let delay = Duration::from_secs(600);
+        let remaining = Duration::from_millis(50);
+        let deadline = Some(Instant::now() + remaining);
+        let clamped = clamp_delay_to_deadline(delay, deadline);
+        assert!(
+            clamped <= remaining,
+            "clamped {clamped:?} must not exceed remaining {remaining:?}"
+        );
+        assert!(
+            !clamped.is_zero(),
+            "deadline still in the future, so sleep should be positive"
+        );
+    }
+
+    #[test]
+    fn clamp_delay_to_deadline_past_deadline_zero() {
+        let delay = Duration::from_secs(600);
+        let deadline = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
+        assert_eq!(clamp_delay_to_deadline(delay, deadline), Duration::ZERO);
+    }
+
+    #[test]
+    fn backoff_clamps_huge_hint_to_max_delay() {
+        let cfg = RateLimitConfig {
+            max_delay: Duration::from_secs(60),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.backoff(Some(Duration::from_secs(9_999_999))),
+            Duration::from_secs(60)
+        );
+    }
+
+    fn detected_limit(retry_after: Option<Duration>) -> DetectedRateLimit {
+        DetectedRateLimit {
+            kind: RateLimitKind::RateLimited,
+            retry_after,
+            message: "slow down".to_string(),
+        }
+    }
+
+    #[test]
+    fn rate_limit_retry_returns_clamped_delay_below_ceilings() {
+        let handler = StreamHandler::new().with_rate_limit_config(RateLimitConfig {
+            fallback_after_retries: 3,
+            max_retries: 5,
+            default_delay: Duration::from_millis(1),
+            max_delay: Duration::from_secs(60),
+            ..Default::default()
+        });
+        let mut count = 0u32;
+        let detail = detected_limit(Some(Duration::from_secs(600)));
+
+        // Below both ceilings: retry with the hint clamped to max_delay.
+        let decision = handler.rate_limit_retry(&detail, &mut count, None);
+        assert_eq!(count, 1);
+        match decision {
+            RateLimitRetry::Retry(delay) => assert_eq!(delay, Duration::from_secs(60)),
+            other => panic!("expected Retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_retry_escalates_after_fallback_ceiling() {
+        let handler = StreamHandler::new().with_rate_limit_config(RateLimitConfig {
+            fallback_after_retries: 2,
+            max_retries: 5,
+            ..Default::default()
+        });
+        let mut count = 0u32;
+        let detail = detected_limit(Some(Duration::from_millis(5)));
+
+        // Two retries are honored, then the next hit escalates.
+        let _ = handler.rate_limit_retry(&detail, &mut count, None);
+        let _ = handler.rate_limit_retry(&detail, &mut count, None);
+        assert_eq!(count, 2);
+        let decision = handler.rate_limit_retry(&detail, &mut count, None);
+        assert_eq!(count, 3);
+        match decision {
+            RateLimitRetry::Escalate {
+                attempts,
+                retry_after,
+            } => {
+                assert_eq!(attempts, 3);
+                assert_eq!(retry_after, Some(Duration::from_millis(5)));
+            }
+            other => panic!("expected Escalate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limit_retry_hard_stops_after_max_retries() {
+        // fallback_after_retries high so escalation never fires; the hard-stop
+        // backstop kicks in once max_retries is exceeded.
+        let handler = StreamHandler::new().with_rate_limit_config(RateLimitConfig {
+            fallback_after_retries: 100,
+            max_retries: 2,
+            ..Default::default()
+        });
+        let mut count = 0u32;
+        let detail = detected_limit(None);
+
+        let _ = handler.rate_limit_retry(&detail, &mut count, None);
+        let _ = handler.rate_limit_retry(&detail, &mut count, None);
+        assert_eq!(count, 2);
+        assert!(matches!(
+            handler.rate_limit_retry(&detail, &mut count, None),
+            RateLimitRetry::HardStop
+        ));
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn apply_event_extracts_stop_reason_and_accumulates() {
+        let mut accumulator = StreamAccumulator::new();
+        let mut stop_reason = StreamStopReason::EndTurn;
+
+        StreamHandler::apply_event(
+            &StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg".to_string(),
+                    role: "assistant".to_string(),
+                    model: "m".to_string(),
+                },
+            }),
+            &mut accumulator,
+            &mut stop_reason,
+        )
+        .expect("MessageStart should accumulate");
+        StreamHandler::apply_event(
+            &StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(crate::stream::MessagePart::text("")),
+            }),
+            &mut accumulator,
+            &mut stop_reason,
+        )
+        .expect("PartStart should accumulate");
+
+        let result = StreamHandler::apply_event(
+            &StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".to_string()),
+                },
+                usage: None,
+            }),
+            &mut accumulator,
+            &mut stop_reason,
+        );
+        assert!(result.is_ok());
+        assert_eq!(stop_reason, StreamStopReason::EndTurn);
+
+        let message = accumulator.build();
+        assert_eq!(message.role, crate::message::Role::Assistant);
+    }
+
+    #[test]
+    fn apply_event_unknown_stop_reason_keeps_prior() {
+        let mut accumulator = StreamAccumulator::new();
+        let mut stop_reason = StreamStopReason::ToolCall;
+
+        StreamHandler::apply_event(
+            &StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("not_a_real_reason".to_string()),
+                },
+                usage: None,
+            }),
+            &mut accumulator,
+            &mut stop_reason,
+        )
+        .expect("apply_event should not error on an out-of-context delta");
+        assert_eq!(stop_reason, StreamStopReason::ToolCall);
+    }
+
+    #[test]
     fn detected_rate_limit_from_structured_variant() {
         let err = ApiError::RateLimit {
             retry_after: Some(Duration::from_secs(7)),
@@ -2557,6 +3036,454 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(1),
             "rate-limit retry should use RateLimitConfig delay, not the 2s transport delay; elapsed {elapsed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_turn_escalates_after_rate_limit_threshold() {
+        // Every attempt is rate-limited, so the loop must escalate rather than
+        // exhaust the generic transport budget.
+        struct AlwaysRateLimitMock;
+        impl ApiClient for AlwaysRateLimitMock {
+            fn model(&self) -> String {
+                "test-model".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                Box::pin(futures::stream::once(async {
+                    Err(ApiError::RateLimit {
+                        retry_after: Some(Duration::from_millis(1)),
+                        message: "slow down".into(),
+                    })
+                }))
+            }
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::json!({})) })
+            }
+        }
+
+        let handler = StreamHandler::new().with_rate_limit_config(RateLimitConfig {
+            fallback_after_retries: 2,
+            default_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            ..Default::default()
+        });
+        let client = AlwaysRateLimitMock;
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .stream_turn(&client, vec![], None, None, &cancel)
+            .await
+            .expect_err("should escalate, not succeed");
+        match err {
+            StreamHandlerError::RateLimitEscalation {
+                attempts,
+                retry_after,
+                prior,
+            } => {
+                // fallback_after_retries == 2, so escalation fires on the 3rd hit.
+                assert_eq!(attempts, 3);
+                assert_eq!(retry_after, Some(Duration::from_millis(1)));
+                match prior {
+                    StreamOutcome::RateLimited { detail, .. } => {
+                        assert_eq!(detail.kind, RateLimitKind::RateLimited);
+                        assert_eq!(detail.retry_after, Some(Duration::from_millis(1)));
+                    }
+                    other => panic!("prior should be RateLimited, got {other:?}"),
+                }
+            }
+            other => panic!("expected RateLimitEscalation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_turn_rate_limit_budget_independent_of_transport() {
+        // Transport retry budget is tiny (max_retries = 1 -> 2 attempts), but
+        // fallback_after_retries = 3. A leading transport error must NOT consume
+        // the rate-limit budget: after the one transport failure, three
+        // rate-limit retries must still be honored before escalating. Under the
+        // old shared-counter loop this would exhaust the transport budget first
+        // and fall through to non-streaming fallback instead of escalating.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TransportThenRateLimitMock {
+            calls: AtomicUsize,
+        }
+        impl ApiClient for TransportThenRateLimitMock {
+            fn model(&self) -> String {
+                "test-model".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let result = if n == 0 {
+                    Err(ApiError::api("connection refused"))
+                } else {
+                    Err(ApiError::RateLimit {
+                        retry_after: Some(Duration::from_millis(1)),
+                        message: "slow down".into(),
+                    })
+                };
+                Box::pin(futures::stream::once(async { result }))
+            }
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::json!({})) })
+            }
+        }
+
+        let handler = StreamHandler::new()
+            .with_config(
+                StreamTimeoutConfig {
+                    fallback_to_non_streaming: false,
+                    ..Default::default()
+                },
+                StreamRetryConfig {
+                    max_retries: 1,
+                    base_delay_ms: 1,
+                    ..Default::default()
+                },
+            )
+            .with_rate_limit_config(RateLimitConfig {
+                fallback_after_retries: 3,
+                default_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                ..Default::default()
+            });
+
+        let client = TransportThenRateLimitMock {
+            calls: AtomicUsize::new(0),
+        };
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .stream_turn(&client, vec![], None, None, &cancel)
+            .await
+            .expect_err("should escalate after the rate-limit budget, not fall through");
+        match err {
+            StreamHandlerError::RateLimitEscalation { attempts, .. } => {
+                // One transport failure (not counted) + 3 rate-limit retries,
+                // escalation on the 4th rate-limit hit.
+                assert_eq!(attempts, 4);
+            }
+            other => panic!("expected RateLimitEscalation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_turn_rate_limit_hard_stop_after_max_retries() {
+        // fallback_after_retries high so escalation never fires; max_retries low so
+        // the hard-stop backstop returns the underlying rate-limit outcome.
+        struct AlwaysRateLimitMock;
+        impl ApiClient for AlwaysRateLimitMock {
+            fn model(&self) -> String {
+                "test-model".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                Box::pin(futures::stream::once(async {
+                    Err(ApiError::RateLimit {
+                        retry_after: None,
+                        message: "slow down".into(),
+                    })
+                }))
+            }
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::json!({})) })
+            }
+        }
+
+        let handler = StreamHandler::new().with_rate_limit_config(RateLimitConfig {
+            fallback_after_retries: 100,
+            max_retries: 2,
+            default_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            ..Default::default()
+        });
+        let client = AlwaysRateLimitMock;
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .stream_turn(&client, vec![], None, None, &cancel)
+            .await
+            .expect_err("hard-stop should fail the turn");
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::RateLimited { .. })
+            | StreamHandlerError::InitFailed(StreamOutcome::RateLimited { .. }) => {}
+            StreamHandlerError::RateLimitEscalation { .. } => {
+                panic!("escalation must not fire when max_retries < fallback_after_retries")
+            }
+            other => panic!("expected rate-limit outcome, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_turn_rate_limit_counter_does_not_leak_across_calls() {
+        // The rate_limit_retries counter is a per-call local, so two independent
+        // stream_turn calls on the same handler must each start fresh.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RateLimitOnceMock {
+            attempts: AtomicUsize,
+        }
+        impl ApiClient for RateLimitOnceMock {
+            fn model(&self) -> String {
+                "test-model".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Box::pin(futures::stream::once(async {
+                        Err(ApiError::RateLimit {
+                            retry_after: None,
+                            message: "slow down".into(),
+                        })
+                    }))
+                } else {
+                    Box::pin(futures::stream::iter(happy_stream_events()))
+                }
+            }
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::json!({})) })
+            }
+        }
+
+        let handler = StreamHandler::new().with_rate_limit_config(RateLimitConfig {
+            default_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            ..Default::default()
+        });
+
+        // First call: one rate-limit, then success.
+        let client = RateLimitOnceMock {
+            attempts: AtomicUsize::new(0),
+        };
+        let cancel = Arc::new(CancelSignal::new());
+        handler
+            .stream_turn(&client, vec![], None, None, &cancel)
+            .await
+            .expect("first call should succeed after one rate-limit retry");
+
+        // Second call on the SAME handler: fresh counter, so it must succeed too
+        // rather than escalating on a leaked count.
+        let client2 = RateLimitOnceMock {
+            attempts: AtomicUsize::new(0),
+        };
+        handler
+            .stream_turn(&client2, vec![], None, None, &cancel)
+            .await
+            .expect("second call should not see leaked rate-limit state");
+    }
+
+    #[tokio::test]
+    async fn stream_turn_non_rate_limit_error_path_unchanged() {
+        // Regression guard: a plain transport error still follows the generic
+        // exponential-backoff path and returns StreamFailed, never escalation.
+        struct AlwaysFailingMock;
+        impl ApiClient for AlwaysFailingMock {
+            fn model(&self) -> String {
+                "test-model".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                Box::pin(futures::stream::once(async {
+                    Err(ApiError::api("connection refused"))
+                }))
+            }
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::json!({})) })
+            }
+        }
+
+        let handler = StreamHandler::new().with_config(
+            StreamTimeoutConfig {
+                fallback_to_non_streaming: false,
+                ..Default::default()
+            },
+            StreamRetryConfig {
+                max_retries: 1,
+                base_delay_ms: 1,
+                ..Default::default()
+            },
+        );
+        let client = AlwaysFailingMock;
+        let cancel = Arc::new(CancelSignal::new());
+
+        let err = handler
+            .stream_turn(&client, vec![], None, None, &cancel)
+            .await
+            .expect_err("transport errors should fail");
+        assert!(
+            !matches!(err, StreamHandlerError::RateLimitEscalation { .. }),
+            "non-rate-limit errors must not escalate"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_turn_rate_limit_delay_clamped_to_total_timeout() {
+        // A huge Retry-After against a tight total_stream_timeout must fail
+        // promptly (TotalTimeout), not sleep for the full hint.
+        struct AlwaysRateLimitMock;
+        impl ApiClient for AlwaysRateLimitMock {
+            fn model(&self) -> String {
+                "test-model".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                Box::pin(futures::stream::once(async {
+                    Err(ApiError::RateLimit {
+                        retry_after: Some(Duration::from_secs(600)),
+                        message: "slow down".into(),
+                    })
+                }))
+            }
+            fn create_message(
+                &self,
+                _messages: Vec<Message>,
+                _system: Option<String>,
+                _tools: Option<Vec<ToolSchema>>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::json!({})) })
+            }
+        }
+
+        let handler = StreamHandler::new()
+            .with_config(
+                StreamTimeoutConfig {
+                    total_stream_timeout: Duration::from_millis(80),
+                    ..Default::default()
+                },
+                StreamRetryConfig {
+                    max_retries: 10,
+                    base_delay_ms: 1,
+                    ..Default::default()
+                },
+            )
+            .with_rate_limit_config(RateLimitConfig {
+                // Honour the hint, but max_delay lets the 600s through so the
+                // deadline clamp is what must bound the sleep.
+                max_delay: Duration::from_secs(600),
+                default_delay: Duration::from_millis(1),
+                fallback_after_retries: 100,
+                max_retries: 100,
+                ..Default::default()
+            });
+        let client = AlwaysRateLimitMock;
+        let cancel = Arc::new(CancelSignal::new());
+
+        let start = Instant::now();
+        let err = handler
+            .stream_turn(&client, vec![], None, None, &cancel)
+            .await
+            .expect_err("tight total timeout should fail the turn");
+        let elapsed = start.elapsed();
+        // The clamp keeps the sleep inside the ~80ms budget, so the whole turn
+        // resolves well under the 600s hint. Allow generous slack for scheduling.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "deadline clamp should prevent a 600s sleep; elapsed {elapsed:?}",
+        );
+        // No escalation: the deadline tripped before the counter ceiling.
+        assert!(
+            !matches!(err, StreamHandlerError::RateLimitEscalation { .. }),
+            "timeout should fire before escalation"
         );
     }
 

@@ -370,11 +370,16 @@ pub struct RateLimitConfig {
     /// stall the agent indefinitely.
     pub max_delay: Duration,
 
-    /// Local request ceiling in requests per minute (0 = disabled).
+    /// Advisory per-minute request ceiling for proactive throttling (0 = unset).
     ///
-    /// Set above zero to proactively throttle outgoing requests before the
-    /// server returns a 429. Zero means no local throttling — the config only
-    /// governs reactive handling of server-returned rate limits.
+    /// This field is **not read at runtime** by the reactive rate-limit handler
+    /// — it does not throttle on its own. It is the value a caller feeds to
+    /// [`RateLimiter::new`](crate::stream::rate_limit::RateLimiter::new) when
+    /// attaching a proactive limiter via
+    /// [`StreamHandler::with_rate_limiter`](crate::stream::handler::StreamHandler::with_rate_limiter).
+    /// Zero (the default) means no proactive throttling is configured; reactive handling
+    /// of server-returned 429/503 responses is unaffected and governed by the
+    /// other fields below.
     pub requests_per_minute: u32,
 
     /// Number of rate-limit retries before switching to a fallback model.
@@ -1010,6 +1015,8 @@ pub struct StreamHandler {
     retry_config: StreamRetryConfig,
     /// Rate-limit detection + backoff policy.
     rate_limit_config: RateLimitConfig,
+    /// Optional proactive per-provider rate limiter (token bucket).
+    rate_limiter: Option<Arc<crate::stream::rate_limit::RateLimiter>>,
 }
 
 impl fmt::Debug for StreamHandler {
@@ -1018,6 +1025,7 @@ impl fmt::Debug for StreamHandler {
             .field("timeout_config", &self.timeout_config)
             .field("retry_config", &self.retry_config)
             .field("rate_limit_config", &self.rate_limit_config)
+            .field("rate_limiter", &self.rate_limiter)
             .finish()
     }
 }
@@ -1050,6 +1058,7 @@ impl StreamHandler {
             timeout_config: StreamTimeoutConfig::default(),
             retry_config: StreamRetryConfig::default(),
             rate_limit_config: RateLimitConfig::default(),
+            rate_limiter: None,
         }
     }
 
@@ -1114,6 +1123,32 @@ impl StreamHandler {
     #[must_use]
     pub fn rate_limit_config(&self) -> &RateLimitConfig {
         &self.rate_limit_config
+    }
+
+    /// Attach a per-provider rate limiter (proactive throttle).
+    ///
+    /// When set, every `stream_turn` attempt waits for a token before opening
+    /// the stream, spacing requests to the limiter's `requests_per_minute`
+    /// ceiling. `None` (the default) disables proactive throttling — the
+    /// handler then relies purely on the reactive 429 handling.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    /// use loopctl::stream::handler::StreamHandler;
+    /// use loopctl::stream::rate_limit::RateLimiter;
+    ///
+    /// let handler = StreamHandler::new()
+    ///     .with_rate_limiter(Arc::new(RateLimiter::new(60)));
+    /// ```
+    #[must_use]
+    pub fn with_rate_limiter(
+        mut self,
+        limiter: Arc<crate::stream::rate_limit::RateLimiter>,
+    ) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
     }
 
     // ==================================================
@@ -1306,8 +1341,71 @@ impl StreamHandler {
         cancel: &Arc<CancelSignal>,
         total_deadline: Option<Instant>,
     ) -> Result<StreamTurnResult, StreamHandlerError> {
+        self.gate_on_rate_limit(client, cancel, total_deadline)
+            .await?;
         let stream = client.stream_messages(conversation, system, tool_schemas);
         self.process_events(stream, cancel, total_deadline).await
+    }
+
+    /// Wait for a rate-limit token before opening the stream.
+    ///
+    /// When a [`RateLimiter`](crate::stream::rate_limit::RateLimiter) is
+    /// attached, this acquires one token from the bucket keyed by the client's
+    /// [`base_url`](ApiClient::base_url), sleeping as needed until either a
+    /// token is available, the cumulative wait reaches the limiter's `max_wait`
+    /// (better to risk a 429 than hang the agent). Each wait is also clamped to
+    /// the turn's remaining `total_deadline` so the gate cannot overrun the
+    /// turn budget; if the deadline has already elapsed the gate proceeds
+    /// rather than sleeping (the downstream per-event/total-timeout checks in
+    /// [`process_events`](Self::process_events) report the expiry). A no-op
+    /// when no limiter is attached.
+    ///
+    /// Fires per attempt (called from [`try_stream`](Self::try_stream), which
+    /// runs inside the retry loop), so a retried 429 re-respects the budget.
+    /// Cancel-safe: a turn stuck waiting for tokens is still user-cancellable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamHandlerError::Cancelled`] if the cancel signal fires
+    /// during the wait.
+    async fn gate_on_rate_limit<C: ApiClient>(
+        &self,
+        client: &C,
+        cancel: &Arc<CancelSignal>,
+        total_deadline: Option<Instant>,
+    ) -> Result<(), StreamHandlerError> {
+        let Some(limiter) = &self.rate_limiter else {
+            return Ok(());
+        };
+        let key = client.base_url();
+        let max_wait = limiter.max_wait();
+        let mut waited = Duration::ZERO;
+        loop {
+            match limiter.acquire(&key) {
+                Ok(()) => return Ok(()),
+                Err(wait) => {
+                    if waited >= max_wait {
+                        return Ok(());
+                    }
+                    let max_wait_remaining = max_wait.checked_sub(waited).unwrap_or(Duration::ZERO);
+                    let total_deadline_remaining = match total_deadline {
+                        None => max_wait_remaining,
+                        Some(deadline) => deadline
+                            .checked_duration_since(Instant::now())
+                            .unwrap_or(Duration::ZERO),
+                    };
+                    let capped = wait.min(max_wait_remaining).min(total_deadline_remaining);
+                    if capped.is_zero() {
+                        return Ok(());
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(capped) => {}
+                        () = cancel.notified() => return Err(StreamHandlerError::Cancelled),
+                    }
+                    waited = waited.saturating_add(capped);
+                }
+            }
+        }
     }
 
     /// Process events from an open stream with per-event and total timeouts.
@@ -2955,6 +3053,242 @@ mod tests {
         assert_eq!(
             handler.rate_limit_config().default_delay,
             Duration::from_secs(1)
+        );
+    }
+
+    struct GateMock {
+        url: &'static str,
+    }
+
+    impl ApiClient for GateMock {
+        fn model(&self) -> String {
+            "gate-model".to_string()
+        }
+        fn base_url(&self) -> String {
+            self.url.to_string()
+        }
+        fn stream_messages(
+            &self,
+            _messages: Vec<Message>,
+            _system: Option<String>,
+            _tools: Option<Vec<ToolSchema>>,
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+        > {
+            Box::pin(futures::stream::iter(happy_stream_events()))
+        }
+        fn create_message(
+            &self,
+            _messages: Vec<Message>,
+            _system: Option<String>,
+            _tools: Option<Vec<ToolSchema>>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(serde_json::json!({})) })
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_on_rate_limit_noop_without_limiter() {
+        // Default handler has no limiter — the gate must return Ok immediately
+        // and never touch a bucket.
+        let handler = StreamHandler::new();
+        let client = GateMock { url: "openai" };
+        let cancel = Arc::new(CancelSignal::new());
+        let result = handler.gate_on_rate_limit(&client, &cancel, None).await;
+        assert!(result.is_ok(), "no limiter => gate is a no-op");
+    }
+
+    #[tokio::test]
+    async fn gate_on_rate_limit_full_bucket_acquires_immediately() {
+        // A fresh bucket is full, so the first acquire should return Ok without
+        // any observable wait.
+        use crate::stream::rate_limit::RateLimiter;
+        let limiter = Arc::new(RateLimiter::new(60));
+        let handler = StreamHandler::new().with_rate_limiter(Arc::clone(&limiter));
+        let client = GateMock { url: "openai" };
+        let cancel = Arc::new(CancelSignal::new());
+
+        let start = Instant::now();
+        handler
+            .gate_on_rate_limit(&client, &cancel, None)
+            .await
+            .expect("full bucket should acquire");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "full bucket should not wait; elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_on_rate_limit_respects_total_deadline() {
+        // A 1-RPM limiter with a generous max_wait (120s), so max_wait does NOT
+        // fire first. Drain the single token, then call the gate with a
+        // total_deadline already in the past: it must proceed immediately
+        // (return Ok) rather than sleeping or spinning. The downstream
+        // process_events deadline checks report the actual TotalTimeout — the
+        // gate's job is just to not overrun the budget.
+        use crate::stream::rate_limit::RateLimiter;
+        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_secs(120)));
+        let handler = StreamHandler::new().with_rate_limiter(Arc::clone(&limiter));
+        let client = GateMock { url: "openai" };
+        let cancel = Arc::new(CancelSignal::new());
+
+        // First acquire drains the only token.
+        handler
+            .gate_on_rate_limit(&client, &cancel, None)
+            .await
+            .expect("first acquire should succeed (full bucket)");
+
+        // Expired total deadline → proceed immediately, no overrun.
+        let expired = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or(Instant::now()),
+        );
+        let start = Instant::now();
+        handler
+            .gate_on_rate_limit(&client, &cancel, expired)
+            .await
+            .expect("gate should proceed on an expired deadline, not hang or spin");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "gate should proceed immediately on an expired deadline; elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_on_rate_limit_clamps_sleep_to_remaining_deadline() {
+        // 1-RPM limiter (raw wait ~60s for a refill), max_wait 120s (so it does
+        // NOT bind), but a total_deadline only ~80ms in the future. The gate
+        // must clamp the sleep to the remaining deadline budget and proceed
+        // after ~80ms — proving it honors the turn ceiling rather than the
+        // 60s refill wait or the 120s max_wait.
+        use crate::stream::rate_limit::RateLimiter;
+        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_secs(120)));
+        let handler = StreamHandler::new().with_rate_limiter(Arc::clone(&limiter));
+        let client = GateMock { url: "openai" };
+        let cancel = Arc::new(CancelSignal::new());
+
+        // First acquire drains the only token.
+        handler
+            .gate_on_rate_limit(&client, &cancel, None)
+            .await
+            .expect("first acquire should succeed (full bucket)");
+
+        // Tight-but-not-expired deadline: ~80ms remaining.
+        let near_deadline = Some(
+            Instant::now()
+                .checked_add(Duration::from_millis(80))
+                .unwrap_or(Instant::now()),
+        );
+        let start = Instant::now();
+        handler
+            .gate_on_rate_limit(&client, &cancel, near_deadline)
+            .await
+            .expect("gate should proceed after clamping to the deadline");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "gate should proceed within the ~80ms deadline window, not wait 60s; elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_throttle_slows_burst() {
+        // 60 RPM → refill 1 token/sec, burst capacity 60. Fire 3 turns
+        // back-to-back through stream_turn (end-to-end wiring).
+        use crate::stream::rate_limit::RateLimiter;
+        let limiter = Arc::new(RateLimiter::new(60));
+        let handler = StreamHandler::new().with_rate_limiter(Arc::clone(&limiter));
+        let client = GateMock { url: "openai" };
+        let cancel = Arc::new(CancelSignal::new());
+
+        let start = Instant::now();
+        for _ in 0..3 {
+            handler
+                .stream_turn(&client, vec![], None, None, &cancel)
+                .await
+                .expect("turn should succeed");
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "three turns from a 60-burst should be fast; elapsed {elapsed:?}"
+        );
+        assert!(limiter.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn proactive_throttle_cancel_interrupts_wait() {
+        // 1 RPM → after the first turn drains the single-token bucket, the
+        // second turn must wait ~60s. Cancelling during that wait should return
+        // promptly.
+        use crate::stream::rate_limit::RateLimiter;
+        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_secs(120)));
+        let handler = StreamHandler::new().with_rate_limiter(limiter);
+        let client = GateMock { url: "openai" };
+
+        // First turn consumes the only token.
+        let cancel = Arc::new(CancelSignal::new());
+        handler
+            .stream_turn(&client, vec![], None, None, &cancel)
+            .await
+            .expect("first turn should succeed");
+
+        // Cancel before the second turn — it will need to wait ~60s for a token.
+        let cancel2 = Arc::new(CancelSignal::new());
+        cancel2.cancel();
+        let start = Instant::now();
+        let err = handler
+            .stream_turn(&client, vec![], None, None, &cancel2)
+            .await
+            .expect_err("should be cancelled, not hang for 60s");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(err, StreamHandlerError::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancel should interrupt the wait promptly; elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_throttle_max_wait_clamp_degrades_to_reactive() {
+        // 1 RPM but max_wait = 50ms. The second turn must wait ~60s for a token,
+        // but the clamp caps the cumulative wait at 50ms, so the turn proceeds.
+        use crate::stream::rate_limit::RateLimiter;
+        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_millis(50)));
+        let handler = StreamHandler::new().with_rate_limiter(limiter);
+        let client = GateMock { url: "openai" };
+        let cancel = Arc::new(CancelSignal::new());
+
+        // First turn consumes the only token.
+        handler
+            .stream_turn(&client, vec![], None, None, &cancel)
+            .await
+            .expect("first turn should succeed");
+
+        // Second turn: bucket empty, wait capped at 50ms, then proceeds.
+        let start = Instant::now();
+        let result = handler
+            .stream_turn(&client, vec![], None, None, &cancel)
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "max_wait clamp should let the turn proceed, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "should proceed after ~50ms, not wait 60s; elapsed {elapsed:?}"
         );
     }
 

@@ -103,6 +103,8 @@ impl TokenBucket {
         if refill >= 1.0 {
             state.tokens = refill - 1.0;
             Ok(())
+        } else if self.refill_per_sec <= 0.0 {
+            Err(Duration::MAX)
         } else {
             let wait_secs = (1.0 - refill) / self.refill_per_sec;
             Err(Duration::from_secs_f64(wait_secs))
@@ -346,5 +348,14 @@ mod tests {
             limiter.acquire("ollama").is_ok(),
             "ollama bucket must be independent"
         );
+    }
+
+    #[test]
+    fn zero_capacity_bucket_does_not_panic() {
+        // A zero-capacity bucket can never refill. take() must return Err
+        // (not panic by dividing by zero / passing inf to from_secs_f64).
+        let bucket = TokenBucket::new(0);
+        let result = bucket.take();
+        assert!(result.is_err(), "empty bucket should return Err");
     }
 }

@@ -160,6 +160,10 @@ impl ApiClient for OpenAiClient {
         self.model.lock().clone()
     }
 
+    fn base_url(&self) -> String {
+        self.base_url.clone()
+    }
+
     fn set_model(&self, model: &str) -> bool {
         if model.trim().is_empty() {
             return false;

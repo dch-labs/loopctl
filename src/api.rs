@@ -106,6 +106,16 @@ pub trait ApiClient: Send + Sync {
         false
     }
 
+    /// The provider's base URL, used as the per-provider rate-limit bucket key.
+    ///
+    /// Provider implementations override this to return their configured
+    /// endpoint so that [`RateLimiter`](crate::stream::rate_limit::RateLimiter)
+    /// can keep an independent budget per distinct endpoint. The default empty
+    /// string suits test clients that have no notion of a URL.
+    fn base_url(&self) -> String {
+        String::new()
+    }
+
     /// Stream messages from the LLM provider.
     ///
     /// Sends the conversation history (`messages`), an optional

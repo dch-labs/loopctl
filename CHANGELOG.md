@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   `FallbackManager::record_model_failure`, so a sustained rate limit on one
   model trips the circuit breaker and subsequent turns route to the fallback
   model.
+- `TokenBucket` and `RateLimiter` (`stream::rate_limit`): a proactive
+  client-side token-bucket rate limiter, one bucket per provider `base_url`.
+  Attaches to `StreamHandler` via `with_rate_limiter`; gates each stream
+  attempt before it fires, with a `max_wait` ceiling that degrades to reactive
+  (proceed, risk the 429) rather than hang.
+- `ApiClient::base_url()` trait method (default `""`), overridden by the
+  OpenAI, Anthropic, and Gemini clients to expose their configured endpoint for
+  per-provider bucket keying.
 
 ## [0.1.0] - 2025-07-01
 

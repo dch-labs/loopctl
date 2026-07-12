@@ -62,8 +62,10 @@ use std::fmt;
 
 pub mod handler;
 pub mod heartbeat;
+pub mod rate_limit;
 
 pub use handler::{DetectedRateLimit, RateLimitConfig, RateLimitKind};
+pub use rate_limit::{RateLimiter, TokenBucket};
 
 // ==================================================
 // StreamError

@@ -32,6 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 - `ApiClient::base_url()` trait method (default `""`), overridden by the
   OpenAI, Anthropic, and Gemini clients to expose their configured endpoint for
   per-provider bucket keying.
+- `ParallelMode` + `ParallelDispatchConfig` in `config.rs`: opt-in parallel
+  tool dispatch for independent, concurrency-safe calls within a single turn.
+  `LoopConfig` is now `#[non_exhaustive]`; the new `parallel_tool_dispatch`
+  field defaults to `Sequential` (v0.1.0 behaviour unchanged).
+- `Tool::resource_key(&self, &Value) -> Option<String>` trait method (default
+  `None`) for parallel-dispatch resource-conflict detection, plus the
+  `FnTool::with_resource_key` builder.
+- `MockTool::with_delay(Duration)` builder for timing-sensitive tests.
+
+### Changed
+
+- Both sequential and parallel tool dispatch now check the cancel signal
+  between calls. Previously, a Ctrl-C during a multi-tool batch was only
+  honored at the next turn boundary; now it aborts the remaining calls in the
+  batch.
 
 ## [0.1.0] - 2025-07-01
 

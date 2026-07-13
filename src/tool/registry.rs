@@ -251,6 +251,16 @@ pub type ToolFn =
 /// on a per-call basis.
 pub type ConcurrencyCheckFn = fn(&Value) -> bool;
 
+/// Type alias for a dynamic resource-key extraction function.
+///
+/// Takes a reference to the tool input [`Value`] and returns an optional
+/// resource identifier (e.g. a file path, working directory, or job id).
+/// Used by [`FnTool::with_resource_key`] to override the default
+/// [`Tool::resource_key`] (which returns `None`) on a per-call basis.
+/// Two parallelizable calls whose keys are equal `Some(_)` are serialized
+/// into separate waves during parallel dispatch.
+pub type ResourceKeyFn = fn(&Value) -> Option<String>;
+
 /// Adapter that wraps a function pointer as a [`Tool`] trait implementation.
 ///
 /// Use [`FnTool`] when you have a standalone async function that implements
@@ -297,22 +307,70 @@ pub type ConcurrencyCheckFn = fn(&Value) -> bool;
 /// registry.register(tool);
 /// ```
 pub struct FnTool {
-    /// Must match the name used in [`ToolSchema`] and [`ToolRegistry`] lookup.
+    /// The tool's unique name.
+    ///
+    /// Must match the name used in [`ToolSchema`] and the key the
+    /// [`ToolRegistry`] stores it under. The model references tools by this
+    /// name in its tool-call requests.
     pub name: String,
-    /// Sent to the LLM as part of the [`ToolSchema`].
+
+    /// Human-readable description sent to the LLM.
+    ///
+    /// Included in the [`ToolSchema`] alongside the input schema so the model
+    /// understands what the tool does and when to call it.
     pub description: String,
-    /// Must be a valid JSON Schema object.
+
+    /// JSON Schema describing the tool's expected input.
+    ///
+    /// Must be a valid JSON Schema object. Sent to the model as part of the
+    /// [`ToolSchema`] so it can produce well-formed `input` for the tool's
+    /// [`call`](Tool::call).
     pub input_schema: Value,
-    /// Called by [`Tool::call`] with the LLM-supplied
-    /// input and session's [`ToolContext`].
+
+    /// The async function implementing the tool's logic.
+    ///
+    /// Called by [`Tool::call`] with the LLM-supplied input and the session's
+    /// [`ToolContext`]. The returned [`ToolOutput`] is forwarded to the model
+    /// as the tool result.
     pub tool_fn: ToolFn,
-    /// Set via [`concurrency_safe`](FnTool::concurrency_safe). Defaults to `false`.
+
+    /// Static concurrency-safety flag.
+    ///
+    /// When `true`, the framework may run this tool concurrently with other
+    /// safe tools during parallel dispatch. Set via
+    /// [`concurrency_safe`](FnTool::concurrency_safe). Defaults to `false`.
+    /// For per-input control, use [`concurrency_check_fn`](Self::concurrency_check_fn).
     pub is_concurrency_safe: bool,
-    /// When set, overrides the static [`is_concurrency_safe`](FnTool::is_concurrency_safe) flag.
+
+    /// Optional per-input override of the static concurrency flag.
+    ///
+    /// When set via [`with_concurrency_check`](FnTool::with_concurrency_check),
+    /// the framework calls this function with the call's input to decide
+    /// whether that specific invocation is safe to run concurrently,
+    /// overriding [`is_concurrency_safe`](Self::is_concurrency_safe).
     pub concurrency_check_fn: Option<ConcurrencyCheckFn>,
-    /// Set via [`read_only`](FnTool::read_only). Defaults to `false`.
+
+    /// Optional per-input resource-key extractor for parallel dispatch.
+    ///
+    /// When set via [`with_resource_key`](FnTool::with_resource_key), the
+    /// framework calls this function during parallel-dispatch planning. Two
+    /// calls whose keys are equal `Some(_)` are serialized into separate
+    /// waves. Overrides the default [`Tool::resource_key`] (which returns
+    /// `None`).
+    pub resource_key_fn: Option<ResourceKeyFn>,
+
+    /// Whether this tool only reads data (no side effects).
+    ///
+    /// When `true`, permission gates may auto-approve the tool without user
+    /// confirmation. Set via [`read_only`](FnTool::read_only). Defaults to
+    /// `false`.
     pub is_read_only: bool,
-    /// Set via [`with_system_prompt`](FnTool::with_system_prompt). Defaults to `None`.
+
+    /// Optional extra system prompt injected when this tool is available.
+    ///
+    /// Appended to the agent's system message during session setup so the
+    /// model gets tool-specific guidance. Set via
+    /// [`with_system_prompt`](FnTool::with_system_prompt). Defaults to `None`.
     pub system_prompt: Option<String>,
 }
 
@@ -350,6 +408,7 @@ impl FnTool {
             tool_fn,
             is_concurrency_safe: false,
             concurrency_check_fn: None,
+            resource_key_fn: None,
             is_read_only: false,
             system_prompt: None,
         }
@@ -398,6 +457,27 @@ impl FnTool {
     #[must_use]
     pub fn with_concurrency_check(mut self, check_fn: ConcurrencyCheckFn) -> Self {
         self.concurrency_check_fn = Some(check_fn);
+        self
+    }
+
+    /// Builder: set a resource-key extractor for parallel-dispatch conflict
+    /// detection.
+    ///
+    /// When set, the framework calls `resource_key_fn(&input)` during parallel
+    /// dispatch planning. Two calls whose keys are equal `Some(_)` are
+    /// serialized into separate waves. See [`Tool::resource_key`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// fn path_key(input: &Value) -> Option<String> {
+    ///     input.get("path").and_then(|p| p.as_str()).map(String::from)
+    /// }
+    /// let tool = FnTool::new(/* ... */).with_resource_key(path_key);
+    /// ```
+    #[must_use]
+    pub fn with_resource_key(mut self, key_fn: ResourceKeyFn) -> Self {
+        self.resource_key_fn = Some(key_fn);
         self
     }
 
@@ -498,6 +578,12 @@ impl Tool for FnTool {
     fn is_safe_for_concurrent_execution(&self, input: &Value) -> bool {
         self.concurrency_check_fn
             .map_or(self.is_concurrency_safe, |f| f(input))
+    }
+
+    /// Delegates to [`resource_key_fn`](FnTool::resource_key_fn) when set,
+    /// otherwise returns `None` (no declarable resource).
+    fn resource_key(&self, input: &Value) -> Option<String> {
+        self.resource_key_fn.and_then(|f| f(input))
     }
 
     /// Returns whether this tool only reads data and has no side effects,

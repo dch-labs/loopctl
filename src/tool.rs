@@ -1201,6 +1201,31 @@ pub trait Tool: Send + Sync {
         self.is_concurrency_safe()
     }
 
+    /// A stable key identifying the resource this call touches, for conflict
+    /// detection during parallel dispatch.
+    ///
+    /// Two eligible calls whose `resource_key` returns **equal `Some(_)`** are
+    /// treated as conflicting and serialized (put in different waves). Returning
+    /// `None` (the default) means "no declarable resource — conflict only on the
+    /// static [`is_concurrency_safe`](Tool::is_concurrency_safe) flag."
+    ///
+    /// Implement this for tools that touch a named resource (a file path, a
+    /// shell working directory, a job id). Return the resource identifier, e.g.
+    /// the canonical `path` for a file tool. The framework never calls this for
+    /// a call whose [`is_safe_for_concurrent_execution`](Tool::is_safe_for_concurrent_execution)
+    /// returned `false` — such calls are serialized unconditionally.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// fn resource_key(&self, input: &Value) -> Option<String> {
+    ///     input.get("path").and_then(|p| p.as_str()).map(String::from)
+    /// }
+    /// ```
+    fn resource_key(&self, _input: &Value) -> Option<String> {
+        None
+    }
+
     /// Whether this tool only reads data and has no side effects.
     ///
     /// Read-only tools (e.g., file readers, search tools) can be

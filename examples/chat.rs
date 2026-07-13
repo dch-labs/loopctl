@@ -352,10 +352,7 @@ async fn run_repl<C: ApiClient>(client: Arc<C>) {
     println!("Type a message and press Enter. Type 'quit' to exit.\n");
 
     // Create the agent once — conversation history persists across inputs.
-    let config = LoopConfig {
-        max_turns: 10,
-        ..Default::default()
-    };
+    let config = LoopConfig::default().with_max_turns(10);
     let mut agent = BareLoop::new(client, build_tools(), config);
     agent.register_observer(Arc::new(PrintingObserver));
 

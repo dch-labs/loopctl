@@ -17,20 +17,10 @@
 //! let you configure what the mock returns before passing it to the code
 //! under test.
 //!
-//! ```text
-//! ┌──────────────┐     implements      ┌──────────────┐
-//! │ MockApiClient├────────────────────►│  ApiClient   │
-//! └──────┬───────┘                     └──────────────┘
-//!        │ returns                            ▲
-//!        ▼                                    │
-//! ┌──────────────┐                            │
-//! │ MockResponse │   emitted as StreamEvents  │
-//! └──────────────┘                            │
-//!                                             │
-//! ┌──────────────┐     implements      ┌──────┴───────┐
-//! │   MockTool   ├────────────────────►│    Tool      │
-//! └──────────────┘                     └──────────────┘
-//! ```
+//! [`MockApiClient`] implements [`ApiClient`] and serves canned
+//! [`MockResponse`]s as `StreamEvent`s. Each response can carry text deltas,
+//! tool-call requests, or errors. [`MockTool`] implements [`Tool`] and returns
+//! a fixed result or error when invoked.
 //!
 //! # Available Mocks
 //!
@@ -327,15 +317,19 @@ pub struct MockToolCall {
 ///
 /// # Response lifecycle
 ///
-/// ```text
-/// new(model) → [MockResponse { text: "Hello!", stop: "end_turn" }]
-///   │
-///   ├── with_text_response(...)  → mutate text on front response
-///   ├── with_tool_call(...)      → add tool_call + set stop to "tool_use"
-///   ├── with_stop_reason(...)    → override stop reason
-///   ├── with_responses(...)      → replace entire queue
-///   └── with_error(...)          → force error on every call
-/// ```
+/// [`new`](MockApiClient::new) preloads the client with a single default
+/// response (text `"Hello!"`, stop reason `"end_turn"`). The builder methods
+/// then mutate or replace that queue:
+///
+/// - [`with_text_response`](MockApiClient::with_text_response) mutates the text
+///   on the front response.
+/// - [`with_tool_call`](MockApiClient::with_tool_call) adds a tool call and sets
+///   the stop reason to `"tool_use"`.
+/// - [`with_stop_reason`](MockApiClient::with_stop_reason) overrides the stop
+///   reason.
+/// - [`with_responses`](MockApiClient::with_responses) replaces the entire
+///   response queue.
+/// - [`with_error`](MockApiClient::with_error) forces an error on every call.
 impl MockApiClient {
     /// Create a new mock client with the given model name.
     ///
@@ -870,6 +864,13 @@ pub struct MockTool {
     /// serialising write operations.
     is_read_only: bool,
 
+    /// Artificial delay injected into [`Tool::call`] before it resolves.
+    ///
+    /// Defaults to zero (instant resolution). Set via
+    /// [`MockTool::with_delay`] when testing timing-sensitive behaviour
+    /// such as parallel dispatch overlap or cancellation.
+    delay: std::time::Duration,
+
     /// An optional system prompt injected when the tool is available.
     ///
     /// Returned by [`Tool::system_prompt`]. Defaults to `None`. Set via
@@ -939,6 +940,7 @@ impl MockTool {
             is_error: false,
             is_concurrency_safe: false,
             is_read_only: true,
+            delay: std::time::Duration::ZERO,
             system_prompt: None,
         }
     }
@@ -1030,6 +1032,27 @@ impl MockTool {
     #[must_use]
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.is_read_only = read_only;
+        self
+    }
+
+    /// Inject an artificial delay into [`Tool::call`] before it resolves.
+    ///
+    /// Defaults to zero (instant resolution). Use this when testing
+    /// timing-sensitive behaviour such as parallel-dispatch overlap,
+    /// cancellation-during-execution, or per-event timeouts.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use loopctl::testing::MockTool;
+    ///
+    /// let tool = MockTool::new("slow", "A slow tool")
+    ///     .with_delay(Duration::from_millis(50));
+    /// ```
+    #[must_use]
+    pub fn with_delay(mut self, delay: std::time::Duration) -> Self {
+        self.delay = delay;
         self
     }
 
@@ -1183,7 +1206,11 @@ impl Tool for MockTool {
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
         let result = self.result.clone();
         let is_error = self.is_error;
+        let delay = self.delay;
         Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             if is_error {
                 Err(ToolError::Execution(result))
             } else {

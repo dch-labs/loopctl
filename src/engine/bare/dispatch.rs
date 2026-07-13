@@ -1,7 +1,8 @@
 //! Tool dispatch — execute tool calls requested by the model.
 //!
-//! Sequential tool execution with reflection and recovery on errors, hook
-//! interception, health recording, and middleware pipeline support.
+//! Sequential and parallel tool execution with reflection and recovery on
+//! errors, hook interception, health recording, and middleware pipeline
+//! support.
 
 #[cfg(feature = "hooks")]
 use super::HookAction;
@@ -20,43 +21,478 @@ use crate::capabilities::PipelineAware;
 use crate::detection::loop_detector::{self, Operation};
 use crate::observer::{ToolPostContext, ToolPreContext};
 use crate::reflection::{Correction, CorrectionResult};
+use crate::tool::ToolRegistry;
 
 use futures::FutureExt;
+use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 
 /// Result of deciding what to do after a tool error during recovery.
 ///
-/// Distinguishes between returning a soft-error result (the tool failed,
-/// but the session should continue) and a hard cancellation (the user
-/// cancelled during the backoff sleep).
+/// Distinguishes between returning a soft-error result (the tool failed, but
+/// the session should continue) and a hard cancellation (the user cancelled
+/// during the recovery backoff sleep).
 enum RecoveryOutcome {
-    /// Return this soft-error result to the caller.
+    /// Return this soft-error result to the caller as a successful dispatch.
+    ///
+    /// The result has `is_error: true` — the model sees the failure and can
+    /// decide how to recover.
     SoftError(ToolDispatchResult),
+
+    /// The user cancelled during the recovery backoff sleep.
+    ///
+    /// Propagated as [`LoopError::Cancelled`] so the turn aborts immediately.
+    Cancelled,
+}
+
+// ===================================================
+// Parallel dispatch: dependency graph + dispatch plan
+// ===================================================
+
+/// Analysis of a batch of tool calls, classifying each as parallelizable and
+/// grouping independent calls into waves.
+///
+/// Pure: takes the calls + a `&ToolRegistry` (for concurrency-safety queries)
+/// and produces a [`DispatchPlan`]. No I/O, no async, no side-effects — fully
+/// testable in isolation.
+struct ToolDependencyGraph {
+    /// One node per input call, in input order.
+    ///
+    /// Each entry records the call's index, its concurrency-safety verdict,
+    /// and its declared resource key. The plan is derived by walking this vec
+    /// in order.
+    nodes: Vec<GraphNode>,
+}
+
+/// Per-call analysis node produced by [`ToolDependencyGraph::from_calls`].
+///
+/// Records whether the call may run in parallel and, if so, which resource it
+/// declares (for conflict detection).
+struct GraphNode {
+    /// Index into the original `&[ToolCall]` slice.
+    ///
+    /// Preserved so the plan can refer back to the original call ordering
+    /// even after waves partition the indices into concurrent groups.
+    idx: usize,
+
+    /// Whether the call's tool reported
+    /// [`is_safe_for_concurrent_execution`](crate::tool::Tool::is_safe_for_concurrent_execution)
+    /// as `true` for this input.
+    ///
+    /// When `false`, the call is serialized into its own singleton wave
+    /// regardless of its resource key — it never runs alongside any other
+    /// call.
+    parallelizable: bool,
+
+    /// The resource key the tool declared for this input, if any.
+    ///
+    /// Two parallelizable calls with equal `Some(_)` keys conflict and are
+    /// placed in separate waves. `None` when the tool returned `None` or the
+    /// call is not parallelizable.
+    resource_key: Option<String>,
+}
+
+/// A run plan produced by [`ToolDependencyGraph::plan`].
+///
+/// Each wave is a set of original call indices that may run concurrently.
+/// Waves execute sequentially; within a wave, calls are independent (no shared
+/// resource keys, all parallelizable).
+struct DispatchPlan {
+    /// The set of waves, each holding original call indices that may run
+    /// concurrently.
+    ///
+    /// `waves[w]` is a vec of indices into the original `&[ToolCall]` slice.
+    /// Waves execute sequentially (wave 0 first); within a wave, calls have
+    /// disjoint resource keys and are all parallelizable.
+    waves: Vec<Vec<usize>>,
+}
+
+impl ToolDependencyGraph {
+    /// Build the graph from a batch of calls and a registry.
+    ///
+    /// Looks up each tool in the registry and records its
+    /// [`is_safe_for_concurrent_execution`](crate::tool::Tool::is_safe_for_concurrent_execution)
+    /// verdict and [`resource_key`](crate::tool::Tool::resource_key). Calls whose
+    /// tool is not in the registry are marked non-parallelizable (they produce
+    /// a not-found result in their wave, in order).
+    fn from_calls(calls: &[ToolCall], registry: &ToolRegistry) -> Self {
+        let nodes = calls
+            .iter()
+            .enumerate()
+            .map(|(idx, call)| {
+                let (parallelizable, resource_key) = match registry.get(&call.tool) {
+                    Some(tool) => {
+                        let safe = tool.is_safe_for_concurrent_execution(&call.input);
+                        let key = if safe {
+                            tool.resource_key(&call.input)
+                        } else {
+                            None
+                        };
+                        (safe, key)
+                    }
+                    None => (false, None),
+                };
+                GraphNode {
+                    idx,
+                    parallelizable,
+                    resource_key,
+                }
+            })
+            .collect();
+        Self { nodes }
+    }
+
+    /// Partition into waves.
+    ///
+    /// Rule: two calls conflict if both are parallelizable AND their
+    /// `resource_key`s are equal `Some(_)`, or either is non-parallelizable.
+    /// Non-parallelizable calls each get their own singleton wave. Greedy:
+    /// assign each parallelizable call to the earliest wave whose existing
+    /// members do not share its resource key.
+    fn plan(&self) -> DispatchPlan {
+        let mut waves: Vec<Vec<usize>> = Vec::new();
+        let mut wave_keys: Vec<HashSet<String>> = Vec::new();
+        let mut wave_open: Vec<bool> = Vec::new();
+
+        for node in &self.nodes {
+            if !node.parallelizable {
+                waves.push(vec![node.idx]);
+                wave_keys.push(HashSet::new());
+                wave_open.push(false);
+                continue;
+            }
+            // Find the earliest open wave that doesn't already hold this key.
+            // A call with no resource key (None) can join any open wave.
+            let target_wave_idx = match &node.resource_key {
+                None => wave_open.iter().position(|open| *open),
+                Some(key) => wave_open
+                    .iter()
+                    .enumerate()
+                    .find(|(wave_idx, open)| {
+                        **open
+                            && !wave_keys
+                                .get(*wave_idx)
+                                .is_some_and(|keys| keys.contains(key))
+                    })
+                    .map(|(wave_idx, _)| wave_idx),
+            };
+            let wave_idx = if let Some(wave_idx) = target_wave_idx {
+                wave_idx
+            } else {
+                waves.push(Vec::new());
+                wave_keys.push(HashSet::new());
+                wave_open.push(true);
+                waves.len().saturating_sub(1)
+            };
+            if let Some(wave) = waves.get_mut(wave_idx) {
+                wave.push(node.idx);
+            }
+            if let Some(key) = &node.resource_key
+                && let Some(keys) = wave_keys.get_mut(wave_idx)
+            {
+                keys.insert(key.clone());
+            }
+        }
+        DispatchPlan { waves }
+    }
 }
 
 impl<C: ApiClient> BareLoop<C> {
-    /// Execute tool calls and return results.
+    /// Execute a batch of tool calls and return results in input order.
     ///
-    /// Dispatch a batch of tool calls sequentially.
+    /// Routes to the sequential or parallel path based on
+    /// [`parallel_tool_dispatch`](crate::config::LoopConfig::parallel_tool_dispatch).
+    /// Both paths honour mid-batch cancellation: if the cancel signal fires
+    /// between (or during) calls, the method returns
+    /// [`LoopError::Cancelled`] promptly.
     ///
-    /// Each [`ToolCall`] is executed one at a time via
-    /// [`dispatch_tool_with_recovery`](Self::dispatch_tool_with_recovery).
     /// A tool that is not found in the registry produces a soft error result
     /// (not a hard [`LoopError`]), allowing the model to recover.
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError`] if any tool dispatch fails with a hard error
-    /// (e.g. loop detection forces an abort).
+    /// Returns [`LoopError::Cancelled`] if the cancel signal fires mid-batch,
+    /// [`LoopError::LoopDetected`] if the detection manager signals a hard
+    /// stop, or any hard error propagated from an individual tool dispatch.
     pub(super) async fn dispatch_tools(
         &self,
         tool_calls: &[ToolCall],
         turn_idx: usize,
     ) -> Result<Vec<ToolDispatchResult>, LoopError> {
+        match self.config.parallel_tool_dispatch.mode {
+            crate::config::ParallelMode::Parallel => {
+                self.dispatch_tools_parallel(tool_calls, turn_idx).await
+            }
+            crate::config::ParallelMode::Sequential => {
+                self.dispatch_tools_sequential(tool_calls, turn_idx).await
+            }
+        }
+    }
+
+    /// Dispatch tool calls one at a time.
+    ///
+    /// Each [`ToolCall`] runs to completion via
+    /// [`dispatch_tool_with_recovery`](Self::dispatch_tool_with_recovery)
+    /// before the next begins. Observers see strictly paired
+    /// `on_tool_pre` / `on_tool_post` events per call, in input order. The
+    /// cancel signal is checked between calls so a Ctrl-C mid-batch aborts the
+    /// remaining calls rather than running them all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::Cancelled`] if the cancel signal fires between
+    /// calls, or any hard error from
+    /// [`dispatch_tool_with_recovery`](Self::dispatch_tool_with_recovery).
+    async fn dispatch_tools_sequential(
+        &self,
+        tool_calls: &[ToolCall],
+        turn_idx: usize,
+    ) -> Result<Vec<ToolDispatchResult>, LoopError> {
         let mut results = Vec::with_capacity(tool_calls.len());
-        for tc in tool_calls {
-            let result = self.dispatch_tool_with_recovery(tc, turn_idx).await?;
+        for call in tool_calls {
+            if self.is_cancelled() {
+                return Err(LoopError::Cancelled);
+            }
+            let result = self.dispatch_tool_with_recovery(call, turn_idx).await?;
             results.push(result);
+        }
+        Ok(results)
+    }
+
+    /// Dispatch independent tool calls concurrently, preserving the ordering
+    /// invariant.
+    ///
+    /// The batch flows through five phases:
+    ///
+    /// 1. **PRE** (sequential, input order): for each call — cancel-check,
+    ///    `on_tool_pre`, pre-hooks, pre-detection. Blocked calls get a
+    ///    pre-computed soft-error result and are excluded from parallel
+    ///    execution. A detection hard-stop returns `Err` immediately, before
+    ///    any task spawns.
+    /// 2. **PLAN**: [`ToolDependencyGraph`] partitions eligible calls into
+    ///    waves based on `is_safe_for_concurrent_execution` and
+    ///    `resource_key` conflicts.
+    /// 3. **EXEC** (concurrent): each wave's calls run under a
+    ///    [`Semaphore`](tokio::sync::Semaphore) capped at `max_concurrency`,
+    ///    each racing the shared cancel signal via `tokio::select!`.
+    /// 4. **JOIN**: results are collected indexed by original position so they
+    ///    come home in input order regardless of completion order.
+    /// 5. **POST** (sequential, input order): `post_detection`,
+    ///    `on_tool_post`, post-hooks, `record_tool_health` for each call.
+    ///
+    /// Falls back to the sequential path when parallelism yields no benefit
+    /// (fewer than 2 eligible calls). Soft errors are collected (not fatal);
+    /// the model sees all N results in input order.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Cancelled`] if the cancel signal fires during dispatch
+    /// (either in PRE or inside an EXEC task). [`LoopError::LoopDetected`]
+    /// (propagated from PRE detection) on a hard stop.
+    async fn dispatch_tools_parallel(
+        &self,
+        tool_calls: &[ToolCall],
+        turn_idx: usize,
+    ) -> Result<Vec<ToolDispatchResult>, LoopError> {
+        if tool_calls.len() < 2 {
+            return self.dispatch_tools_sequential(tool_calls, turn_idx).await;
+        }
+
+        let tool_context = self.build_tool_context();
+        let (pre_results, eligible) = self.parallel_pre_phase(tool_calls, turn_idx)?;
+
+        if eligible.len() < 2 {
+            return self
+                .parallel_run_remaining(tool_calls, &pre_results, &tool_context, turn_idx)
+                .await;
+        }
+
+        let exec_results = self
+            .parallel_exec_phase(tool_calls, &eligible, &pre_results, &tool_context, turn_idx)
+            .await?;
+        Ok(self.parallel_post_phase(tool_calls, &pre_results, &exec_results, turn_idx))
+    }
+
+    /// PRE phase: for each call (input order), fire `on_tool_pre`, check
+    /// pre-hooks, run pre-detection. Blocked calls get a pre-computed
+    /// soft-error result stashed in `pre_results`; eligible calls are collected
+    /// into the returned index list.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Cancelled`] if the cancel signal fires, or
+    /// [`LoopError::LoopDetected`] from pre-detection.
+    fn parallel_pre_phase(
+        &self,
+        tool_calls: &[ToolCall],
+        turn_idx: usize,
+    ) -> Result<(Vec<Option<ToolDispatchResult>>, Vec<usize>), LoopError> {
+        let mut pre_results: Vec<Option<ToolDispatchResult>> =
+            (0..tool_calls.len()).map(|_| None).collect();
+        let mut eligible: Vec<usize> = Vec::new();
+
+        for (i, tc) in tool_calls.iter().enumerate() {
+            if self.is_cancelled() {
+                return Err(LoopError::Cancelled);
+            }
+            self.fire_tool_pre(turn_idx, tc);
+
+            if let Some(blocked) = self.check_pre_tool_use_hooks(tc, turn_idx) {
+                self.fire_tool_post(turn_idx, tc, &blocked);
+                if let Some(slot) = pre_results.get_mut(i) {
+                    *slot = Some(blocked);
+                }
+                continue;
+            }
+
+            if let Some(blocked) = self.pre_detection(tc, turn_idx)? {
+                self.fire_tool_post(turn_idx, tc, &blocked);
+                if let Some(slot) = pre_results.get_mut(i) {
+                    *slot = Some(blocked);
+                }
+                continue;
+            }
+            eligible.push(i);
+        }
+        Ok((pre_results, eligible))
+    }
+
+    /// EXEC phase: run eligible calls concurrently in waves under a semaphore.
+    ///
+    /// Each wave's tasks race the cancel signal via `tokio::select!`. Results
+    /// are placed in a position-indexed vec so they land in input order.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Cancelled`] if any task is cancelled, or a hard
+    /// [`LoopError`] propagated from `dispatch_tool`.
+    async fn parallel_exec_phase(
+        &self,
+        tool_calls: &[ToolCall],
+        eligible: &[usize],
+        pre_results: &[Option<ToolDispatchResult>],
+        tool_context: &ToolContext,
+        turn_idx: usize,
+    ) -> Result<Vec<Option<ToolDispatchResult>>, LoopError> {
+        let graph = ToolDependencyGraph::from_calls(tool_calls, &self.tools);
+        let plan = graph.plan();
+        let max_concurrency = self
+            .config
+            .parallel_tool_dispatch
+            .max_concurrency
+            .clamp(1, eligible.len());
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
+        let mut exec_results: Vec<Option<ToolDispatchResult>> =
+            (0..tool_calls.len()).map(|_| None).collect();
+        for wave in &plan.waves {
+            if self.is_cancelled() {
+                return Err(LoopError::Cancelled);
+            }
+            let wave_eligible: Vec<usize> = wave
+                .iter()
+                .copied()
+                .filter(|idx| pre_results.get(*idx).is_some_and(Option::is_none))
+                .collect();
+            if wave_eligible.is_empty() {
+                continue;
+            }
+
+            let mut tasks = Vec::with_capacity(wave_eligible.len());
+            for &idx in &wave_eligible {
+                let tc = tool_calls.get(idx).cloned();
+                let ctx = tool_context.clone();
+                let sem = Arc::clone(&semaphore);
+                let cancel = Arc::clone(&self.cancelled);
+                let turn = turn_idx;
+                tasks.push(async move {
+                    let _permit = sem.acquire_owned().await.ok()?;
+                    self.run_parallel_task(tc?, &ctx, &cancel, turn).await
+                });
+            }
+
+            let outcomes = futures::future::join_all(tasks).await;
+            for (outcome, &idx) in outcomes.into_iter().zip(&wave_eligible) {
+                match outcome {
+                    None => return Err(LoopError::Cancelled),
+                    Some(Ok(result)) => {
+                        if let Some(slot) = exec_results.get_mut(idx) {
+                            *slot = Some(result);
+                        }
+                    }
+                    Some(Err(e)) => return Err(e),
+                }
+            }
+        }
+        Ok(exec_results)
+    }
+
+    /// POST phase: for each call (input order), run `post_detection`,
+    /// `on_tool_post`, post-hooks, and `record_tool_health`. Blocked calls
+    /// (from PRE) emit their stashed soft-error result; executed calls emit
+    /// their exec result.
+    fn parallel_post_phase(
+        &self,
+        tool_calls: &[ToolCall],
+        pre_results: &[Option<ToolDispatchResult>],
+        exec_results: &[Option<ToolDispatchResult>],
+        turn_idx: usize,
+    ) -> Vec<ToolDispatchResult> {
+        let mut results = Vec::with_capacity(tool_calls.len());
+        for (i, tc) in tool_calls.iter().enumerate() {
+            if let Some(Some(pr)) = pre_results.get(i) {
+                results.push(pr.clone());
+            } else if let Some(er) = exec_results.get(i).and_then(|r| r.as_ref()) {
+                self.post_detection(tc, er);
+                self.fire_tool_post(turn_idx, tc, er);
+                self.notify_post_tool_use_hooks(tc, er, turn_idx);
+                self.record_tool_health(tc.tool.as_str(), er);
+                results.push(er.clone());
+            } else {
+                let soft = ToolDispatchResult {
+                    tool_call_id: tc.id.clone(),
+                    output: ToolContent::Text("dispatch produced no result".to_string()),
+                    is_error: true,
+                    duration: Duration::ZERO,
+                    resolved_tool_name: tc.tool.clone(),
+                };
+                results.push(soft);
+            }
+        }
+        results
+    }
+
+    /// Run remaining (non-blocked, non-eligible-for-parallel) calls
+    /// sequentially when there aren't enough to justify concurrency.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Cancelled`] or any hard error from
+    /// [`dispatch_tool`](Self::dispatch_tool).
+    async fn parallel_run_remaining(
+        &self,
+        tool_calls: &[ToolCall],
+        pre_results: &[Option<ToolDispatchResult>],
+        tool_context: &ToolContext,
+        turn_idx: usize,
+    ) -> Result<Vec<ToolDispatchResult>, LoopError> {
+        let mut results = Vec::with_capacity(tool_calls.len());
+        for (i, tc) in tool_calls.iter().enumerate() {
+            if let Some(Some(pr)) = pre_results.get(i) {
+                results.push(pr.clone());
+            } else {
+                if self.is_cancelled() {
+                    return Err(LoopError::Cancelled);
+                }
+                let start = Instant::now();
+                let r = self
+                    .dispatch_tool(tc, tool_context, start, turn_idx)
+                    .await?;
+                self.post_detection(tc, &r);
+                self.fire_tool_post(turn_idx, tc, &r);
+                self.notify_post_tool_use_hooks(tc, &r, turn_idx);
+                self.record_tool_health(tc.tool.as_str(), &r);
+                results.push(r);
+            }
         }
         Ok(results)
     }
@@ -121,12 +557,67 @@ impl<C: ApiClient> BareLoop<C> {
                     Self::apply_correction_if_present(&mut tc, correction, &tool_result);
                 }
                 Err(RecoveryOutcome::SoftError(returned_result)) => return Ok(returned_result),
+                Err(RecoveryOutcome::Cancelled) => return Err(LoopError::Cancelled),
             }
         }
     }
 
-    /// Fire [`on_tool_pre`](crate::observer::LoopObserver::on_tool_pre) for
-    /// the tool call about to be dispatched.
+    /// Execute one parallel-wave task: the retry/recovery loop with cancellation,
+    /// no observer/hook/detection side-effects.
+    ///
+    /// Runs [`dispatch_tool`](Self::dispatch_tool) once, racing the shared
+    /// cancel signal. On error, consults
+    /// [`recovery_wait_or_return`](Self::recovery_wait_or_return) — retrying
+    /// with any correction, returning the soft error, or aborting on cancel.
+    /// The parallel PRE/POST phases own the observer/hook/detection
+    /// side-effects.
+    ///
+    /// Returns `None` if cancelled, `Some(Ok(result))` for success or soft
+    /// error, `Some(Err(e))` for a hard error.
+    async fn run_parallel_task(
+        &self,
+        mut tc: ToolCall,
+        ctx: &ToolContext,
+        cancel: &Arc<crate::cancel::CancelSignal>,
+        turn: usize,
+    ) -> Option<Result<ToolDispatchResult, LoopError>> {
+        let mut attempt: u32 = 0;
+        loop {
+            let start = Instant::now();
+            let result = tokio::select! {
+                biased;
+                () = cancel.notified() => return None,
+                r = self.dispatch_tool(&tc, ctx, start, turn) => r,
+            };
+            let tool_result = match result {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            if !tool_result.is_error {
+                return Some(Ok(tool_result));
+            }
+            match self
+                .recovery_wait_or_return(&tc, &tool_result, attempt)
+                .await
+            {
+                Ok((next_attempt, correction)) => {
+                    attempt = next_attempt;
+                    Self::apply_correction_if_present(&mut tc, correction, &tool_result);
+                }
+                Err(RecoveryOutcome::SoftError(returned_result)) => {
+                    return Some(Ok(returned_result));
+                }
+                Err(RecoveryOutcome::Cancelled) => return None,
+            }
+        }
+    }
+
+    /// Notify observers that a tool call is about to be dispatched.
+    ///
+    /// Fires [`on_tool_pre`](crate::observer::LoopObserver::on_tool_pre) with
+    /// the turn index, tool name, and tool-call ID. Called once per call before
+    /// any hook checks, detection, or execution — observers always see this
+    /// first, regardless of whether the call is later blocked or retried.
     fn fire_tool_pre(&self, turn_idx: usize, tc: &ToolCall) {
         self.managers.observers().on_tool_pre(&ToolPreContext {
             turn: turn_idx,
@@ -135,10 +626,13 @@ impl<C: ApiClient> BareLoop<C> {
         });
     }
 
-    /// Fire [`on_tool_post`](crate::observer::LoopObserver::on_tool_post).
+    /// Notify observers that a tool call has completed (or been blocked).
     ///
-    /// Called for both successful dispatches and blocked paths (hooks,
-    /// detection) so observers always see a complete `pre` / `post` pair.
+    /// Fires [`on_tool_post`](crate::observer::LoopObserver::on_tool_post) with
+    /// a result hash, error flag, and timing. Called for every outcome —
+    /// successful execution, hook block, detection block, or soft error — so
+    /// that every `on_tool_pre` has a matching `on_tool_post`, regardless of
+    /// the path taken. Observers can pair the two by `tool_call_id`.
     fn fire_tool_post(&self, turn_idx: usize, tc: &ToolCall, result: &ToolDispatchResult) {
         self.managers.observers().on_tool_post(&ToolPostContext {
             turn: turn_idx,
@@ -298,9 +792,12 @@ impl<C: ApiClient> BareLoop<C> {
         Ok(tool_result)
     }
 
-    /// Build a soft-error result for a tool that is not in the registry.
+    /// Build a soft-error result for a tool whose name is not in the registry.
     ///
-    /// The error message lists available tool names to help the model recover.
+    /// The result carries `is_error: true` and a human-readable message that
+    /// lists the available tool names, helping the model correct itself on the
+    /// next turn. The duration is zero (no execution occurred). This is a soft
+    /// error — the batch continues and the model sees the result.
     fn tool_not_found(&self, tc: &ToolCall) -> ToolDispatchResult {
         let available: Vec<String> = self.tools.tool_names();
         let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();
@@ -322,12 +819,15 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`Retry`](RecoveryAction::Retry), sleeps for the prescribed delay and
     /// returns the updated attempt count and optional [`Correction`]. On all
     /// other actions (`Skip`, `Fail`, `AskUser`), returns the original error
-    /// result as a soft error.
+    /// result as a soft error. The backoff sleep is cancel-aware: if the
+    /// cancel signal fires during the wait, returns
+    /// [`RecoveryOutcome::Cancelled`].
     ///
     /// # Errors
     ///
-    /// Returns `Err(RecoveryOutcome::SoftError)` when the recovery strategy
-    /// decides not to retry.
+    /// Returns [`Err(RecoveryOutcome::SoftError)`] when the recovery strategy
+    /// decides not to retry, or [`Err(RecoveryOutcome::Cancelled)`] when the
+    /// user cancels during the backoff sleep.
     async fn recovery_wait_or_return(
         &self,
         tc: &ToolCall,
@@ -338,8 +838,10 @@ impl<C: ApiClient> BareLoop<C> {
         match recovery_action {
             RecoveryAction::Retry { delay } => {
                 let next_attempt = attempt.saturating_add(1);
-                tokio::time::sleep(delay).await;
-                Ok((next_attempt, correction))
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => Ok((next_attempt, correction)),
+                    () = self.cancelled.notified() => Err(RecoveryOutcome::Cancelled),
+                }
             }
             RecoveryAction::Skip(_) | RecoveryAction::AskUser(_) | RecoveryAction::Fail(_) => {
                 Err(RecoveryOutcome::SoftError(tool_result.clone()))
@@ -347,11 +849,17 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Check pre-tool-use hooks and return a blocked result if any hook
-    /// blocks or asks.
+    /// Check pre-tool-use hooks before a call executes.
     ///
-    /// Returns `Some(ToolDispatchResult)` with an error result if a hook
-    /// blocked the call, or `None` if the call should proceed.
+    /// Consults the session's [`HookExecutor`](crate::hooks::HookExecutor) (if
+    /// configured) with the tool name, input, and turn number. Returns:
+    ///
+    /// - `None` when no hook is configured or all hooks return `Allow` — the
+    ///   call should proceed to execution.
+    /// - `Some(result)` when a hook returns `Block` or `Ask` — the result is a
+    ///   soft error (`is_error: true`, zero duration) carrying the hook's
+    ///   reason/message. The call is **not** executed; the caller returns this
+    ///   result to the model.
     #[cfg(feature = "hooks")]
     fn check_pre_tool_use_hooks(
         &self,
@@ -384,6 +892,10 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
+    /// Stub for [`check_pre_tool_use_hooks`](Self::check_pre_tool_use_hooks)
+    /// when the `hooks` feature is disabled.
+    ///
+    /// Always returns `None` (no hooks to check) so the call proceeds normally.
     #[cfg(not(feature = "hooks"))]
     fn check_pre_tool_use_hooks(
         &self,
@@ -394,6 +906,15 @@ impl<C: ApiClient> BareLoop<C> {
     }
 
     /// Notify post-tool-use hooks with the execution result.
+    ///
+    /// If a [`HookExecutor`](crate::hooks::HookExecutor) is configured, builds
+    /// a [`PostToolUseContext`] from the tool call and its result (output text,
+    /// error flag, duration) and passes it to `notify_post_tool_use`. This lets
+    /// hooks observe or react to completed executions — e.g. logging, auditing,
+    /// or triggering side-effects based on the result.
+    ///
+    /// Called after every successful or errored dispatch, but not for calls
+    /// blocked in PRE (hooks already saw those).
     #[cfg(feature = "hooks")]
     fn notify_post_tool_use_hooks(
         &self,
@@ -421,6 +942,10 @@ impl<C: ApiClient> BareLoop<C> {
         executor.notify_post_tool_use(&ctx);
     }
 
+    /// Stub for [`notify_post_tool_use_hooks`](Self::notify_post_tool_use_hooks)
+    /// when the `hooks` feature is disabled.
+    ///
+    /// No-op: there are no hooks to notify.
     #[cfg(not(feature = "hooks"))]
     fn notify_post_tool_use_hooks(
         &self,
@@ -430,7 +955,13 @@ impl<C: ApiClient> BareLoop<C> {
     ) {
     }
 
-    /// Record tool health (success or failure) in the health registry.
+    /// Record tool execution health (success or failure) in the health registry.
+    ///
+    /// If a [`ToolHealthRegistry`](crate::tool::health::ToolHealthRegistry) is
+    /// configured, records the outcome and duration so the health system can
+    /// track per-tool success rates, latency, and degraded-state transitions.
+    /// Failures call `record_failure`; successes call `record_success`. Safe to
+    /// call concurrently — the registry uses interior mutability.
     #[cfg(feature = "tool_health")]
     fn record_tool_health(&self, tool_name: &str, tool_result: &ToolDispatchResult) {
         let Some(health) = self.managers.health_registry() else {
@@ -443,6 +974,10 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
+    /// Stub for [`record_tool_health`](Self::record_tool_health) when the
+    /// `tool_health` feature is disabled.
+    ///
+    /// No-op: there is no health registry to record into.
     #[cfg(not(feature = "tool_health"))]
     fn record_tool_health(&self, _tool_name: &str, _tool_result: &ToolDispatchResult) {}
 
@@ -693,5 +1228,403 @@ mod tests {
             ToolContent::Text(text) => assert_eq!(text, "ok"),
             ToolContent::Multipart(_) => panic!("expected Text"),
         }
+    }
+
+    // ----- ToolDependencyGraph unit tests -----
+
+    fn make_call(id: &str, tool: &str, input: Value) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            tool: tool.into(),
+            input,
+        }
+    }
+
+    fn safe_tool(name: &str) -> crate::tool::FnTool {
+        crate::tool::FnTool::new(
+            name.into(),
+            name.into(),
+            Value::Object(serde_json::Map::new()),
+            echo_fn,
+        )
+        .concurrency_safe()
+    }
+
+    fn unsafe_tool(name: &str) -> crate::tool::FnTool {
+        crate::tool::FnTool::new(
+            name.into(),
+            name.into(),
+            Value::Object(serde_json::Map::new()),
+            echo_fn,
+        )
+    }
+
+    fn path_key(input: &Value) -> Option<String> {
+        input.get("path").and_then(|p| p.as_str()).map(String::from)
+    }
+
+    fn safe_tool_with_key(name: &str) -> crate::tool::FnTool {
+        safe_tool(name).with_resource_key(path_key)
+    }
+
+    #[test]
+    fn graph_all_parallelizable_one_wave() {
+        let mut registry = ToolRegistry::new();
+        registry.register(safe_tool("a"));
+        registry.register(safe_tool("b"));
+        let calls = vec![
+            make_call("1", "a", Value::Null),
+            make_call("2", "b", Value::Null),
+        ];
+        let graph = ToolDependencyGraph::from_calls(&calls, &registry);
+        let plan = graph.plan();
+        assert_eq!(plan.waves.len(), 1, "all safe, no resources → 1 wave");
+        assert_eq!(plan.waves[0].len(), 2);
+    }
+
+    #[test]
+    fn graph_non_parallelizable_singleton_wave() {
+        let mut registry = ToolRegistry::new();
+        registry.register(unsafe_tool("unsafe"));
+        registry.register(safe_tool("safe"));
+        let calls = vec![
+            make_call("1", "unsafe", Value::Null),
+            make_call("2", "safe", Value::Null),
+        ];
+        let graph = ToolDependencyGraph::from_calls(&calls, &registry);
+        let plan = graph.plan();
+        // Non-parallelizable call gets its own singleton wave.
+        assert!(
+            plan.waves.iter().any(|w| w == &[0]),
+            "unsafe call should be alone in a wave"
+        );
+        assert!(
+            plan.waves.iter().any(|w| w == &[1]),
+            "safe call should be in its own wave"
+        );
+    }
+
+    #[test]
+    fn graph_same_resource_separate_waves() {
+        let mut registry = ToolRegistry::new();
+        registry.register(safe_tool_with_key("file"));
+        let calls = vec![
+            make_call("1", "file", serde_json::json!({"path": "/a"})),
+            make_call("2", "file", serde_json::json!({"path": "/a"})),
+            make_call("3", "file", serde_json::json!({"path": "/b"})),
+        ];
+        let graph = ToolDependencyGraph::from_calls(&calls, &registry);
+        let plan = graph.plan();
+        // Calls 0 and 1 share "/a" → separate waves. Call 2 ("/b") can share
+        // a wave with either.
+        let wave_of = |idx: usize| {
+            plan.waves
+                .iter()
+                .position(|w| w.contains(&idx))
+                .expect("call must be in a wave")
+        };
+        assert_ne!(wave_of(0), wave_of(1), "same-resource calls must differ");
+        // Call 2 shares a wave with one of them (disjoint key).
+        assert!(
+            wave_of(2) == wave_of(0) || wave_of(2) == wave_of(1),
+            "disjoint-key call should share a wave"
+        );
+    }
+
+    #[test]
+    fn graph_resource_chain() {
+        let mut registry = ToolRegistry::new();
+        registry.register(safe_tool_with_key("file"));
+        // A("/x"), B("/x"), C("/y") → waves [A,C] then [B] (or [C,A] then [B]).
+        let calls = vec![
+            make_call("a", "file", serde_json::json!({"path": "/x"})),
+            make_call("b", "file", serde_json::json!({"path": "/x"})),
+            make_call("c", "file", serde_json::json!({"path": "/y"})),
+        ];
+        let graph = ToolDependencyGraph::from_calls(&calls, &registry);
+        let plan = graph.plan();
+        let wave_of = |idx: usize| {
+            plan.waves
+                .iter()
+                .position(|w| w.contains(&idx))
+                .expect("call must be in a wave")
+        };
+        assert_ne!(wave_of(0), wave_of(1), "A and B share /x");
+        assert_eq!(
+            wave_of(0),
+            wave_of(2),
+            "A and C share a wave (disjoint keys)"
+        );
+    }
+
+    #[test]
+    fn graph_unknown_tool_non_parallelizable() {
+        let mut registry = ToolRegistry::new();
+        registry.register(safe_tool("a"));
+        // "ghost" is not in the registry.
+        let calls = vec![
+            make_call("1", "a", Value::Null),
+            make_call("2", "ghost", Value::Null),
+        ];
+        let graph = ToolDependencyGraph::from_calls(&calls, &registry);
+        let plan = graph.plan();
+        // Unknown tool → non-parallelizable → singleton wave. No panic.
+        assert!(
+            plan.waves.iter().any(|w| w == &[1]),
+            "unknown tool should be a singleton wave"
+        );
+    }
+
+    #[test]
+    fn graph_empty_input() {
+        let registry = ToolRegistry::new();
+        let graph = ToolDependencyGraph::from_calls(&[], &registry);
+        let plan = graph.plan();
+        assert!(plan.waves.is_empty(), "no calls → no waves");
+    }
+
+    #[test]
+    fn graph_order_preservation() {
+        let mut registry = ToolRegistry::new();
+        registry.register(safe_tool("a"));
+        registry.register(safe_tool("b"));
+        registry.register(safe_tool("c"));
+        registry.register(safe_tool("d"));
+        let calls = vec![
+            make_call("1", "a", Value::Null),
+            make_call("2", "b", Value::Null),
+            make_call("3", "c", Value::Null),
+            make_call("4", "d", Value::Null),
+        ];
+        let graph = ToolDependencyGraph::from_calls(&calls, &registry);
+        let plan = graph.plan();
+        // All safe, no resources → one wave with indices in order.
+        assert_eq!(plan.waves.len(), 1);
+        assert_eq!(plan.waves[0], vec![0, 1, 2, 3]);
+    }
+
+    // ----- dispatch_tools_parallel integration tests -----
+
+    fn make_parallel_loop(tools: ToolRegistry) -> BareLoop<MockClient> {
+        let mut config = LoopConfig::default();
+        config.parallel_tool_dispatch.mode = crate::config::ParallelMode::Parallel;
+        let client = Arc::new(MockClient::new("test"));
+        BareLoop::new(client, tools, config)
+    }
+
+    #[tokio::test]
+    async fn parallel_latency_independent_calls_overlap() {
+        use crate::testing::MockTool;
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            MockTool::new("slow", "slow")
+                .with_concurrency_safe(true)
+                .with_delay(std::time::Duration::from_millis(100)),
+        );
+        let bare = make_parallel_loop(registry);
+
+        let calls = vec![
+            make_call("1", "slow", Value::Null),
+            make_call("2", "slow", Value::Null),
+            make_call("3", "slow", Value::Null),
+        ];
+        let start = Instant::now();
+        let results = bare
+            .dispatch_tools(&calls, 0)
+            .await
+            .expect("should succeed");
+        let elapsed = start.elapsed();
+
+        // Sequential would be ~300ms; parallel should be ~100ms. Assert <290ms
+        // (proves overlap with CI scheduling headroom) and all 3 results present.
+        assert!(
+            elapsed < std::time::Duration::from_millis(290),
+            "parallel should overlap 3×100ms calls; elapsed {elapsed:?}"
+        );
+        assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn parallel_result_order_matches_input() {
+        use crate::testing::MockTool;
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            MockTool::new("a", "tool a")
+                .with_concurrency_safe(true)
+                .with_result("result_a"),
+        );
+        registry.register(
+            MockTool::new("b", "tool b")
+                .with_concurrency_safe(true)
+                .with_result("result_b")
+                .with_delay(std::time::Duration::from_millis(20)),
+        );
+        registry.register(
+            MockTool::new("c", "tool c")
+                .with_concurrency_safe(true)
+                .with_result("result_c")
+                .with_delay(std::time::Duration::from_millis(40)),
+        );
+        let bare = make_parallel_loop(registry);
+
+        // Call order: c (slowest), a (fastest), b. Results must come back in
+        // input order [c, a, b], not completion order [a, b, c].
+        let calls = vec![
+            make_call("1", "c", Value::Null),
+            make_call("2", "a", Value::Null),
+            make_call("3", "b", Value::Null),
+        ];
+        let results = bare
+            .dispatch_tools(&calls, 0)
+            .await
+            .expect("should succeed");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].tool_call_id, "1");
+        assert_eq!(results[1].tool_call_id, "2");
+        assert_eq!(results[2].tool_call_id, "3");
+    }
+
+    #[tokio::test]
+    async fn parallel_soft_errors_collected() {
+        use crate::testing::MockTool;
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            MockTool::new("ok", "succeeds")
+                .with_concurrency_safe(true)
+                .with_result("fine"),
+        );
+        registry.register(
+            MockTool::new("bad", "fails")
+                .with_concurrency_safe(true)
+                .with_error(),
+        );
+        let bare = make_parallel_loop(registry);
+
+        let calls = vec![
+            make_call("1", "ok", Value::Null),
+            make_call("2", "bad", Value::Null),
+            make_call("3", "ok", Value::Null),
+        ];
+        let results = bare
+            .dispatch_tools(&calls, 0)
+            .await
+            .expect("soft errors should not fail the batch");
+        assert_eq!(results.len(), 3);
+        assert!(!results[0].is_error, "call 1 should succeed");
+        assert!(results[1].is_error, "call 2 should be a soft error");
+        assert!(!results[2].is_error, "call 3 should succeed");
+    }
+
+    #[tokio::test]
+    async fn parallel_sequential_fallback() {
+        use crate::testing::MockTool;
+        let config = LoopConfig::default();
+        // Default is Sequential — no change needed.
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            MockTool::new("a", "a")
+                .with_concurrency_safe(true)
+                .with_result("ok_a"),
+        );
+        let client = Arc::new(MockClient::new("test"));
+        let bare = BareLoop::new(client, registry, config);
+
+        let calls = vec![
+            make_call("1", "a", Value::Null),
+            make_call("2", "a", Value::Null),
+        ];
+        let results = bare
+            .dispatch_tools(&calls, 0)
+            .await
+            .expect("should succeed");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].tool_call_id, "1");
+        assert_eq!(results[1].tool_call_id, "2");
+    }
+
+    #[tokio::test]
+    async fn recovery_backoff_cancelled_promptly() {
+        use crate::reflection::{
+            FailureAnalysis, FailureSeverity, RecoveryAction, RecoveryStrategy,
+        };
+
+        struct AlwaysRecoverable;
+        impl crate::reflection::Reflector for AlwaysRecoverable {
+            fn analyze(
+                &self,
+                error: &str,
+                tool_name: &str,
+                _tool_input: &Value,
+                _context: &crate::reflection::ReflectionContext,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<FailureAnalysis, crate::reflection::ReflectionError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let error = error.to_string();
+                let tool_name = tool_name.to_string();
+                Box::pin(async move {
+                    Ok(FailureAnalysis {
+                        is_recoverable: true,
+                        root_cause: error,
+                        severity: FailureSeverity::Medium,
+                        correction: None,
+                        context: format!("tool: {tool_name}"),
+                    })
+                })
+            }
+        }
+
+        struct SlowRetry;
+        impl RecoveryStrategy for SlowRetry {
+            fn decide(
+                &self,
+                _analysis: &FailureAnalysis,
+                _attempt: u32,
+                _max_attempts: u32,
+            ) -> Pin<Box<dyn Future<Output = RecoveryAction> + Send + '_>> {
+                Box::pin(async {
+                    RecoveryAction::Retry {
+                        delay: std::time::Duration::from_secs(10),
+                    }
+                })
+            }
+        }
+
+        let error_tool = crate::tool::FnTool::new(
+            "error_tool".into(),
+            "Always errors".into(),
+            Value::Object(serde_json::Map::new()),
+            |_, _| Box::pin(async { Err(ToolError::Execution("boom".to_string())) }),
+        );
+        let mut registry = ToolRegistry::new();
+        registry.register(error_tool);
+
+        let mut bare = make_loop(registry);
+        bare.set_reflector(Arc::new(AlwaysRecoverable));
+        bare.set_recovery_strategy(Arc::new(SlowRetry));
+
+        let cancelled = Arc::clone(&bare.cancelled);
+
+        let calls = vec![make_call("1", "error_tool", Value::Null)];
+        let call_handle = tokio::spawn(async move { bare.dispatch_tools(&calls, 0).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancelled.cancel();
+
+        let start = Instant::now();
+        let result = call_handle.await.expect("task should complete");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(LoopError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "cancel should interrupt the 10s backoff promptly; elapsed {elapsed:?}"
+        );
     }
 }

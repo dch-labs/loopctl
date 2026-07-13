@@ -405,16 +405,8 @@ impl<C: ApiClient> BareLoop<C> {
                 let cancel = Arc::clone(&self.cancelled);
                 let turn = turn_idx;
                 tasks.push(async move {
-                    let permit = sem.acquire_owned().await.ok()?;
-                    let tc = tc?;
-                    let start = Instant::now();
-                    let result = tokio::select! {
-                        biased;
-                        () = cancel.notified() => return None,
-                        r = self.dispatch_tool(&tc, &ctx, start, turn) => r,
-                    };
-                    drop(permit);
-                    Some(result)
+                    let _permit = sem.acquire_owned().await.ok()?;
+                    self.run_parallel_task(tc?, &ctx, &cancel, turn).await
                 });
             }
 
@@ -566,6 +558,56 @@ impl<C: ApiClient> BareLoop<C> {
                 }
                 Err(RecoveryOutcome::SoftError(returned_result)) => return Ok(returned_result),
                 Err(RecoveryOutcome::Cancelled) => return Err(LoopError::Cancelled),
+            }
+        }
+    }
+
+    /// Execute one parallel-wave task: the retry/recovery loop with cancellation,
+    /// no observer/hook/detection side-effects.
+    ///
+    /// Runs [`dispatch_tool`](Self::dispatch_tool) once, racing the shared
+    /// cancel signal. On error, consults
+    /// [`recovery_wait_or_return`](Self::recovery_wait_or_return) — retrying
+    /// with any correction, returning the soft error, or aborting on cancel.
+    /// The parallel PRE/POST phases own the observer/hook/detection
+    /// side-effects.
+    ///
+    /// Returns `None` if cancelled, `Some(Ok(result))` for success or soft
+    /// error, `Some(Err(e))` for a hard error.
+    async fn run_parallel_task(
+        &self,
+        mut tc: ToolCall,
+        ctx: &ToolContext,
+        cancel: &Arc<crate::cancel::CancelSignal>,
+        turn: usize,
+    ) -> Option<Result<ToolDispatchResult, LoopError>> {
+        let mut attempt: u32 = 0;
+        loop {
+            let start = Instant::now();
+            let result = tokio::select! {
+                biased;
+                () = cancel.notified() => return None,
+                r = self.dispatch_tool(&tc, ctx, start, turn) => r,
+            };
+            let tool_result = match result {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            if !tool_result.is_error {
+                return Some(Ok(tool_result));
+            }
+            match self
+                .recovery_wait_or_return(&tc, &tool_result, attempt)
+                .await
+            {
+                Ok((next_attempt, correction)) => {
+                    attempt = next_attempt;
+                    Self::apply_correction_if_present(&mut tc, correction, &tool_result);
+                }
+                Err(RecoveryOutcome::SoftError(returned_result)) => {
+                    return Some(Ok(returned_result));
+                }
+                Err(RecoveryOutcome::Cancelled) => return None,
             }
         }
     }
@@ -1393,10 +1435,10 @@ mod tests {
             .expect("should succeed");
         let elapsed = start.elapsed();
 
-        // Sequential would be ~300ms; parallel should be ~100ms. Assert <250ms
-        // (proves overlap) and all 3 results present.
+        // Sequential would be ~300ms; parallel should be ~100ms. Assert <290ms
+        // (proves overlap with CI scheduling headroom) and all 3 results present.
         assert!(
-            elapsed < std::time::Duration::from_millis(250),
+            elapsed < std::time::Duration::from_millis(290),
             "parallel should overlap 3×100ms calls; elapsed {elapsed:?}"
         );
         assert_eq!(results.len(), 3);

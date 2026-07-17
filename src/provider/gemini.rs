@@ -47,8 +47,6 @@ const TEXT_PART_INDEX: usize = 0;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
-/// Maximum bytes to read from an error response body.  Prevents OOM when a
-/// misconfigured or malicious server returns a multi-GB body on a 4xx/5xx.
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -61,26 +59,70 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Implements [`ApiClient`] by translating between the framework's
 /// [`StreamEvent`] protocol and the Gemini Streaming Generate Content API.
 pub struct GeminiClient {
+    /// The underlying HTTP client (connection-pooled `reqwest::Client`).
+    ///
+    /// Created once at build time with the configured timeouts; reused
+    /// across all requests for connection pooling.
     http: reqwest::Client,
+
+    /// The Gemini API key used for authentication.
+    ///
+    /// Sent as the `x-goog-api-key` header on every request. Set via
+    /// [`GeminiClientBuilder::api_key`].
     api_key: String,
+
+    /// The base URL for API requests.
+    ///
+    /// The streaming endpoint is `{base_url}/models/{model}:streamGenerateContent`
+    /// and the non-streaming endpoint is `{base_url}/models/{model}:generateContent`.
+    /// Defaults to `https://generativelanguage.googleapis.com/v1beta`.
     base_url: String,
+
+    /// The current model identifier, stored behind a mutex for runtime
+    /// hot-swapping.
+    ///
+    /// Changed via [`ApiClient::set_model`] when the
+    /// [`FallbackManager`](crate::fallback::FallbackManager) trips to a
+    /// fallback model.
     model: parking_lot::Mutex<String>,
 }
 
 impl GeminiClient {
     /// Create a builder for configuring a [`GeminiClient`].
+    ///
+    /// Returns a [`GeminiClientBuilder`] with sensible defaults. The only
+    /// required field is `api_key`; everything else has a production-ready
+    /// default. Call `.api_key(...).build()` to finish, or chain additional
+    /// setters for custom configuration.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use loopctl::provider::GeminiClient;
+    ///
+    /// let client = GeminiClient::builder()
+    ///     .api_key("AI...")
+    ///     .model("gemini-2.0-flash")
+    ///     .build()
+    /// .unwrap();
+    /// ```
     #[must_use]
     pub fn builder() -> GeminiClientBuilder {
         GeminiClientBuilder::default()
     }
 
-    /// Create from environment variables.
+    /// Create a client from environment variables.
     ///
-    /// Reads:
-    /// - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — required.
-    /// - `GEMINI_BASE_URL` — optional, defaults to
+    /// Reads the following variables:
+    ///
+    /// - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — **required**. The API key
+    ///   for authentication.
+    /// - `GEMINI_BASE_URL` — optional. Defaults to
     ///   `https://generativelanguage.googleapis.com/v1beta`.
-    /// - `GEMINI_MODEL` — optional, defaults to `gemini-2.0-flash`.
+    /// - `GEMINI_MODEL` — optional. Defaults to `gemini-2.0-flash`.
+    ///
+    /// This is a convenience constructor that delegates to
+    /// [`builder`](Self::builder) with the env vars as setter arguments.
     ///
     /// # Errors
     ///
@@ -101,8 +143,8 @@ impl GeminiClient {
 
     /// Build the streaming Generate Content URL.
     ///
-    /// Gemini puts the model in the URL path and the API key as a query
-    /// parameter rather than using headers.
+    /// Gemini puts the model in the URL path. The API key is sent via
+    /// the `x-goog-api-key` header, not as a query parameter.
     fn stream_url(&self) -> String {
         let model = self.model.lock().clone();
         format!(
@@ -111,7 +153,13 @@ impl GeminiClient {
         )
     }
 
-    /// Build the non-streaming Generate Content URL.
+    /// Build the full URL for the Gemini non-streaming Generate Content
+    /// endpoint.
+    ///
+    /// Constructs `{base_url}/models/{model}:generateContent`. The API key
+    /// is sent via the `x-goog-api-key` header, not in the URL.
+    /// Used by [`ApiClient::create_message`] and its `*_with_options`
+    /// variant.
     fn generate_url(&self) -> String {
         let model = self.model.lock().clone();
         format!("{}/models/{}:generateContent", self.base_url, model)
@@ -177,7 +225,7 @@ impl ApiClient for GeminiClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let body = build_request_body(&messages, system.as_deref(), tools.as_deref());
+        let body = build_request_body(&messages, system.as_deref(), tools.as_deref(), None);
         let url = self.stream_url();
         let http = self.http.clone();
         let api_key = self.api_key.clone();
@@ -206,7 +254,7 @@ impl ApiClient for GeminiClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let body = build_request_body(&messages, system.as_deref(), tools.as_deref());
+        let body = build_request_body(&messages, system.as_deref(), tools.as_deref(), None);
         let url = self.generate_url();
 
         Box::pin(async move {
@@ -225,18 +273,116 @@ impl ApiClient for GeminiClient {
             serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
-}
 
+    fn stream_messages_with_options(
+        &self,
+        messages: Vec<Message>,
+        system: Option<String>,
+        tools: Option<Vec<ToolSchema>>,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let rf = options.response_format.as_ref();
+        let body = build_request_body(&messages, system.as_deref(), tools.as_deref(), rf);
+        let url = self.stream_url();
+        let http = self.http.clone();
+        let api_key = self.api_key.clone();
+
+        Box::pin(async_stream::try_stream! {
+            let resp = Self::post_content(&http, &url, &api_key, &body).await?;
+            let mut sse = SseReader::from_response(resp);
+            let mut emitter = StreamEmitter::default();
+
+            while let Some(data) = sse.next_data().await? {
+                emitter.process_chunk(&data);
+                for ev in emitter.drain() {
+                    yield ev;
+                }
+            }
+
+            for ev in emitter.finish() {
+                yield ev;
+            }
+        })
+    }
+
+    fn create_message_with_options(
+        &self,
+        messages: Vec<Message>,
+        system: Option<String>,
+        tools: Option<Vec<ToolSchema>>,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+        let response_format = options.response_format.as_ref();
+        let body = build_request_body(
+            &messages,
+            system.as_deref(),
+            tools.as_deref(),
+            response_format,
+        );
+        let url = self.generate_url();
+        Box::pin(async move {
+            let resp = Self::post_content(&self.http, &url, &self.api_key, &body).await?;
+            let resp = resp
+                .bytes()
+                .await
+                .map_err(|e| ApiError::http(e.to_string()))?;
+            if resp.len() > MAX_RESPONSE_BODY {
+                return Err(ApiError::http(format!(
+                    "response body too large: {} bytes (max {})",
+                    resp.len(),
+                    MAX_RESPONSE_BODY
+                )));
+            }
+            serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
+        })
+    }
+
+    fn extract_structured(&self, raw: &Value) -> Value {
+        let Some(text) = raw
+            .pointer("/candidates/0/content/parts/0/text")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return raw.clone();
+        };
+        crate::structured::parse_json_lenient(text)
+            .unwrap_or_else(|| Value::String(text.to_string()))
+    }
+}
 // ==================================================
 // Builder
 // ==================================================
 
 /// Builder for [`GeminiClient`].
+///
+/// Created via [`GeminiClientBuilder::default`] or
+/// [`GeminiClient::builder`]. All fields have sensible defaults except
+/// `api_key`, which must be set before [`build`](Self::build).
 pub struct GeminiClientBuilder {
+    /// The Gemini API key for authentication (required).
+    ///
+    /// Must be set before building. Sent as the `x-goog-api-key` header on
+    /// every request.
     api_key: Option<String>,
+
+    /// The base URL for API requests.
+    ///
+    /// Defaults to `https://generativelanguage.googleapis.com/v1beta`.
     base_url: String,
+
+    /// The default model identifier.
+    ///
+    /// Can be changed at runtime via [`GeminiClient::set_model`].
     model: String,
+
+    /// The total HTTP request timeout (connect + response + body).
+    ///
+    /// Bounds the entire request lifecycle. Defaults to 120 seconds.
     timeout: Duration,
+
+    /// The TCP connection establishment timeout (including TLS handshake).
+    ///
+    /// Separate from the total timeout so a slow-connecting server can be
+    /// detected faster. Defaults to 10 seconds.
     connect_timeout: Duration,
 }
 
@@ -253,21 +399,32 @@ impl Default for GeminiClientBuilder {
 }
 
 impl GeminiClientBuilder {
-    /// Set the API key.
+    /// Set the API key for authentication.
+    ///
+    /// Required — [`build`](Self::build) returns an error if this is not set.
+    /// The key is sent as the `x-goog-api-key` header on every request.
     #[must_use]
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
     }
 
-    /// Set the base URL.
+    /// Set the base URL for API requests.
+    ///
+    /// Defaults to `https://generativelanguage.googleapis.com/v1beta`.
+    /// Override when targeting a proxy or Google AI-compatible endpoint.
     #[must_use]
     pub fn base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
     }
 
-    /// Set the model name (e.g. `gemini-2.0-flash`).
+    /// Set the default model identifier.
+    ///
+    /// The model string is embedded in the request URL (e.g.
+    /// `/models/{model}:generateContent`). Can be changed at runtime via
+    /// [`GeminiClient::set_model`] (e.g. when the
+    /// [`FallbackManager`](crate::fallback::FallbackManager) trips).
     #[must_use]
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
@@ -331,6 +488,7 @@ fn build_request_body(
     messages: &[Message],
     system: Option<&str>,
     tools: Option<&[ToolSchema]>,
+    response_format: Option<&crate::structured::ResponseFormat>,
 ) -> Value {
     let contents: Vec<Value> = messages.iter().map(convert_message).collect();
     let mut body = serde_json::json!({ "contents": contents });
@@ -341,10 +499,23 @@ fn build_request_body(
                 serde_json::json!({"parts": [{"text": sys}]}),
             );
         }
-        if let Some(tool_list) = tools {
+
+        if response_format.is_none() {
+            if let Some(tool_list) = tools {
+                obj.insert(
+                    "tools".into(),
+                    serde_json::json!([{"functionDeclarations": convert_tools(tool_list)}]),
+                );
+            }
+        }
+
+        if let Some(rf) = response_format {
             obj.insert(
-                "tools".into(),
-                serde_json::json!([{"functionDeclarations": convert_tools(tool_list)}]),
+                "generationConfig".into(),
+                serde_json::json!({
+                    "responseMimeType": "application/json",
+                    "responseJsonSchema": rf.schema,
+                }),
             );
         }
     }
@@ -389,7 +560,14 @@ fn convert_part(p: &MessagePart) -> Option<Value> {
     }
 }
 
-/// Convert tool schemas into the Gemini `functionDeclarations` array.
+/// Convert framework tool schemas into the Gemini `functionDeclarations`
+/// array shape.
+///
+/// Each [`ToolSchema`] becomes a JSON object with `name`, `description`, and
+/// `parameters` — the fields Gemini's function-calling API expects. When
+/// structured output is active (`response_format` set), this function is not
+/// called — [`build_request_body`] injects `generationConfig.responseJsonSchema`
+/// instead, and `tools` is suppressed.
 fn convert_tools(tools: &[ToolSchema]) -> Vec<Value> {
     tools
         .iter()
@@ -418,7 +596,13 @@ struct SseReader {
 }
 
 impl SseReader {
-    /// Wrap a streaming HTTP response.
+    /// Wrap a streaming HTTP response into an SSE reader.
+    ///
+    /// Takes the response body's byte stream and converts it into a
+    /// line-oriented reader that yields SSE event data. Used by
+    /// [`stream_messages`](crate::api::ApiClient::stream_messages) and its
+    /// `*_with_options` variant to parse Gemini's streaming
+    /// `streamGenerateContent` responses.
     fn from_response(resp: Response) -> Self {
         let bytes = resp.bytes_stream().map(|res| {
             res.map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -474,7 +658,12 @@ impl SseReader {
         }
     }
 
-    /// Pop the first `\n`-terminated line from the buffer, if present.
+    /// Pop the first `\n`-terminated line from the internal buffer.
+    ///
+    /// Returns the line (trimmed) if a newline is present, and removes it
+    /// (plus the newline) from the buffer. Returns `None` if the buffer
+    /// does not yet contain a complete line — the caller should wait for
+    /// more bytes from the HTTP stream.
     fn take_line(&mut self) -> Option<String> {
         let pos = self.buf.find('\n')?;
         let line = self.buf[..pos].trim().to_string();
@@ -504,7 +693,14 @@ struct StreamEmitter {
 }
 
 impl StreamEmitter {
-    /// Process a single Gemini SSE chunk, appending events to the queue.
+    /// Process a single Gemini SSE JSON chunk into stream events.
+    ///
+    /// On the first call, emits [`MessageStart`](StreamEvent::MessageStart).
+    /// Then delegates to the three extractors: [`extract_text`](Self::extract_text)
+    /// for text deltas, [`extract_function_call`](Self::extract_function_call)
+    /// for tool calls, and [`extract_finish_reason`](Self::extract_finish_reason)
+    /// for the terminal stop signal. Events accumulate in the internal queue
+    /// until [`drain`](Self::drain) is called.
     fn process_chunk(&mut self, json: &Value) {
         if !self.started {
             self.started = true;
@@ -522,7 +718,11 @@ impl StreamEmitter {
         self.extract_finish_reason(json);
     }
 
-    /// Extract text delta from `candidates[0].content.parts[0].text`.
+    /// Extract a text delta from the chunk and emit an `IndexedDelta` event.
+    ///
+    /// Reads `candidates[0].content.parts[0].text`. If the text is non-empty,
+    /// pushes a [`DeltaPart::Text`](crate::stream::DeltaPart::Text) event at
+    /// index 0. Does nothing if the path is absent or the text is empty.
     fn extract_text(&mut self, json: &Value) {
         if let Some(text) = json
             .pointer("/candidates/0/content/parts/0/text")
@@ -539,7 +739,15 @@ impl StreamEmitter {
         }
     }
 
-    /// Extract function call from `candidates[0].content.parts[0].functionCall`.
+    /// Extract a function (tool) call from the chunk and emit the
+    /// corresponding part-start and input-json events.
+    ///
+    /// Reads `candidates[0].content.parts[0].functionCall` for the tool
+    /// `name` and `args`. Emits a [`PartStart`](StreamEvent::PartStart)
+    /// with a [`ToolCall`](crate::message::MessagePart::ToolCall) part,
+    /// followed by an [`InputJson`](crate::stream::DeltaPart::InputJson)
+    /// delta carrying the serialized arguments. Does nothing if no function
+    /// call is present in the chunk.
     fn extract_function_call(&mut self, json: &Value) {
         if let Some(func_call) = json.pointer("/candidates/0/content/parts/0/functionCall") {
             let name = func_call
@@ -567,7 +775,12 @@ impl StreamEmitter {
         }
     }
 
-    /// Extract finish reason and emit stop events.
+    /// Extract the finish reason from the chunk and emit stop events.
+    ///
+    /// Reads `candidates[0].finishReason` (e.g. `"STOP"`, `"MAX_TOKENS"`).
+    /// When present, emits [`PartStop`](StreamEvent::PartStop) followed by a
+    /// [`MessageDelta`](StreamEvent::MessageDelta) carrying the mapped
+    /// [`StreamStopReason`]. Does nothing if the chunk has no finish reason.
     fn extract_finish_reason(&mut self, json: &Value) {
         let Some(reason) = json
             .pointer("/candidates/0/finishReason")
@@ -589,12 +802,22 @@ impl StreamEmitter {
         }));
     }
 
-    /// Drain all pending events.
+    /// Drain all pending events from the internal queue.
+    ///
+    /// Returns the accumulated [`StreamEvent`]s and clears the queue.
+    /// Called by the stream loop after each chunk is processed, so events
+    /// are yielded to the consumer promptly rather than buffered until the
+    /// end of the stream.
     fn drain(&mut self) -> Vec<StreamEvent> {
         std::mem::take(&mut self.pending)
     }
 
-    /// Emit the terminal [`MessageStop`] if the stream was started.
+    /// Finalize the stream, emitting the terminal
+    /// [`MessageStop`](StreamEvent::MessageStop) if one was started.
+    ///
+    /// Drains any remaining pending events and appends the stop event.
+    /// Safe to call exactly once at the end of the stream; subsequent calls
+    /// return an empty vec (the `finished` flag guards against double-stop).
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = self.drain();
         if self.started && !self.finished {
@@ -604,6 +827,12 @@ impl StreamEmitter {
         out
     }
 
+    /// Push an event onto the internal pending queue.
+    ///
+    /// Events are held until [`drain`](Self::drain) is called. This is the
+    /// single write point — all extractors (`extract_text`,
+    /// `extract_function_call`, `extract_finish_reason`) and the lifecycle
+    /// methods (`process_chunk`, `finish`) funnel through here.
     fn push(&mut self, ev: StreamEvent) {
         self.pending.push(ev);
     }
@@ -621,7 +850,7 @@ mod tests {
     #[test]
     fn request_body_user_text() {
         let msgs = vec![Message::user("hello")];
-        let body = build_request_body(&msgs, None, None);
+        let body = build_request_body(&msgs, None, None, None);
 
         let contents = body["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 1);
@@ -633,7 +862,7 @@ mod tests {
     #[test]
     fn request_body_includes_system_instruction() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, Some("be brief"), None);
+        let body = build_request_body(&msgs, Some("be brief"), None, None);
 
         let sys = &body["systemInstruction"];
         assert!(sys.is_object());
@@ -643,7 +872,7 @@ mod tests {
     #[test]
     fn request_body_no_system_instruction_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None);
+        let body = build_request_body(&msgs, None, None, None);
         assert!(body.get("systemInstruction").is_none());
     }
 
@@ -653,14 +882,14 @@ mod tests {
             Role::Assistant,
             vec![MessagePart::text("hello")],
         )];
-        let body = build_request_body(&msgs, None, None);
+        let body = build_request_body(&msgs, None, None, None);
         assert_eq!(body["contents"][0]["role"], "model");
     }
 
     #[test]
     fn request_body_user_role() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None);
+        let body = build_request_body(&msgs, None, None, None);
         assert_eq!(body["contents"][0]["role"], "user");
     }
 
@@ -674,7 +903,7 @@ mod tests {
                 input: serde_json::json!({"msg": "hi"}),
             }],
         )];
-        let body = build_request_body(&msgs, None, None);
+        let body = build_request_body(&msgs, None, None, None);
 
         let parts = body["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["functionCall"]["name"], "echo");
@@ -691,7 +920,7 @@ mod tests {
                 is_error: None,
             }],
         )];
-        let body = build_request_body(&msgs, None, None);
+        let body = build_request_body(&msgs, None, None, None);
 
         let parts = body["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["functionResponse"]["name"], "call_1");
@@ -709,7 +938,7 @@ mod tests {
             description: "Search the web".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
-        let body = build_request_body(&msgs, None, Some(&tools));
+        let body = build_request_body(&msgs, None, Some(&tools), None);
 
         let tools_arr = body["tools"].as_array().unwrap();
         assert_eq!(tools_arr.len(), 1);
@@ -722,7 +951,7 @@ mod tests {
     #[test]
     fn request_body_no_tools_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None);
+        let body = build_request_body(&msgs, None, None, None);
         assert!(body.get("tools").is_none());
     }
 
@@ -733,7 +962,7 @@ mod tests {
             Message::new(Role::Assistant, vec![MessagePart::text("hi")]),
             Message::user("bye"),
         ];
-        let body = build_request_body(&msgs, None, None);
+        let body = build_request_body(&msgs, None, None, None);
 
         let contents = body["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 3);
@@ -1134,5 +1363,84 @@ mod tests {
     #[test]
     fn max_response_body_is_ten_mb() {
         assert_eq!(MAX_RESPONSE_BODY, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn request_body_response_format_injects_generation_config() {
+        let msgs = vec![Message::user("hi")];
+        let rf = crate::structured::ResponseFormat::new(
+            "result",
+            serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
+        );
+        let body = build_request_body(&msgs, None, None, Some(&rf));
+
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(
+            body["generationConfig"]["responseJsonSchema"],
+            serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}})
+        );
+    }
+
+    #[test]
+    fn request_body_response_format_absent_when_none() {
+        let msgs = vec![Message::user("hi")];
+        let body = build_request_body(&msgs, None, None, None);
+        assert!(
+            body.get("generationConfig").is_none(),
+            "generationConfig should be absent when no response_format"
+        );
+    }
+
+    #[test]
+    fn request_body_response_format_suppresses_tools() {
+        let msgs = vec![Message::user("hi")];
+        let caller_tool = ToolSchema {
+            tool: "read".into(),
+            description: "Read".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let rf =
+            crate::structured::ResponseFormat::new("result", serde_json::json!({"type": "object"}));
+        let body = build_request_body(&msgs, None, Some(&[caller_tool]), Some(&rf));
+
+        assert!(
+            body.get("tools").is_none(),
+            "tools should be suppressed when response_format is set"
+        );
+        assert!(body.get("generationConfig").is_some());
+    }
+
+    #[test]
+    fn extract_structured_from_text_field() {
+        let client = GeminiClient::builder().api_key("test").build().unwrap();
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": r#"{"tool": "write", "args": {}}"#
+                    }]
+                }
+            }]
+        });
+        let value = client.extract_structured(&raw);
+        assert_eq!(value["tool"], "write");
+    }
+
+    #[test]
+    fn extract_structured_prose_falls_back_to_raw() {
+        let client = GeminiClient::builder().api_key("test").build().unwrap();
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "I cannot produce that."}]
+                }
+            }]
+        });
+        let value = client.extract_structured(&raw);
+        // Prose text not parseable as JSON → falls back to the string value.
+        assert_eq!(value, serde_json::json!("I cannot produce that."));
     }
 }

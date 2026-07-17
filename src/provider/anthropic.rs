@@ -38,6 +38,7 @@ use crate::tool::ToolSchema;
 // ==================================================
 // Constants
 // ==================================================
+
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -48,8 +49,6 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
-/// Maximum bytes to read from an error response body.  Prevents OOM when a
-/// misconfigured or malicious server returns a multi-GB body on a 4xx/5xx.
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -65,30 +64,79 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Also works with Anthropic-compatible endpoints such as `Z.ai`
 /// — use a custom `base_url` via [`AnthropicClientBuilder::base_url`].
 pub struct AnthropicClient {
+    /// The underlying HTTP client (connection-pooled `reqwest::Client`).
+    ///
+    /// Created once at build time with the configured timeouts; reused
+    /// across all requests for connection pooling.
     http: reqwest::Client,
+
+    /// The Anthropic API key used for authentication.
+    ///
+    /// Sent as the `x-api-key` header on every request. Set via
+    /// [`AnthropicClientBuilder::api_key`].
     api_key: String,
+
+    /// The base URL for API requests.
+    ///
+    /// The Messages API endpoint is `{base_url}/v1/messages`. Defaults to
+    /// `https://api.anthropic.com`; override for proxies or
+    /// Anthropic-compatible endpoints.
     base_url: String,
+
+    /// The current model identifier, stored behind a mutex for runtime
+    /// hot-swapping.
+    ///
+    /// Changed via [`ApiClient::set_model`] when the
+    /// [`FallbackManager`](crate::fallback::FallbackManager) trips to a
+    /// fallback model.
     model: parking_lot::Mutex<String>,
+
+    /// The maximum output tokens per response.
+    ///
+    /// Anthropic requires this field on every request. Defaults to 8192.
+    /// Set via [`AnthropicClientBuilder::max_tokens`].
     max_tokens: u32,
 }
 
 impl AnthropicClient {
     /// Create a builder for configuring an [`AnthropicClient`].
+    ///
+    /// Returns an [`AnthropicClientBuilder`] with sensible defaults. The only
+    /// required field is `api_key`; everything else has a production-ready
+    /// default. Call `.api_key(...).build()` to finish, or chain additional
+    /// setters for custom configuration.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use loopctl::provider::AnthropicClient;
+    ///
+    /// let client = AnthropicClient::builder()
+    ///     .api_key("sk-ant-...")
+    ///     .model("claude-sonnet-4-20250514")
+    ///     .build()
+    /// .unwrap();
+    /// ```
     #[must_use]
     pub fn builder() -> AnthropicClientBuilder {
         AnthropicClientBuilder::default()
     }
 
-    /// Create from environment variables.
+    /// Create a client from environment variables.
     ///
-    /// Reads:
-    /// - `ANTHROPIC_API_KEY` — required.
-    /// - `ANTHROPIC_BASE_URL` — optional, defaults to `https://api.anthropic.com`.
-    /// - `ANTHROPIC_MODEL` — optional, defaults to `claude-sonnet-4-20250514`.
+    /// Reads the following variables:
+    ///
+    /// - `ANTHROPIC_API_KEY` — **required**. The API key for authentication.
+    /// - `ANTHROPIC_BASE_URL` — optional. Defaults to `https://api.anthropic.com`.
+    ///   Override when targeting a proxy or Anthropic-compatible endpoint.
+    /// - `ANTHROPIC_MODEL` — optional. Defaults to `claude-sonnet-4-20250514`.
+    ///
+    /// This is a convenience constructor that delegates to
+    /// [`builder`](Self::builder) with the env vars as setter arguments.
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError`] if no API key is found.
+    /// Returns [`ApiError`] if `ANTHROPIC_API_KEY` is not set or is empty.
     pub fn from_env() -> Result<Self, ApiError> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .map_err(|_| ApiError::auth_invalid_key("ANTHROPIC_API_KEY not set"))?;
@@ -103,15 +151,21 @@ impl AnthropicClient {
             .build()
     }
 
-    /// Send a POST request to the Messages endpoint.
+    /// Send a POST request to the Anthropic Messages API endpoint.
     ///
-    /// Shared by both [`ApiClient::stream_messages`] and
-    /// [`ApiClient::create_message`].
+    /// Shared by [`stream_messages`](ApiClient::stream_messages),
+    /// [`create_message`](ApiClient::create_message),
+    /// [`stream_messages_with_options`](ApiClient::stream_messages_with_options),
+    /// and [`create_message_with_options`](ApiClient::create_message_with_options).
+    /// Sends the JSON body with `x-api-key` and `anthropic-version` headers.
+    /// On a non-success status, reads the error body (capped at
+    /// `MAX_ERROR_BODY` bytes) and returns it as an [`ApiError`].
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError`] if the request fails or the server
-    /// responds with a non-success status code.
+    /// Returns [`ApiError::http`] if the HTTP request fails, or
+    /// [`ApiError::http_with_status`] if the server responds with a
+    /// non-success status code.
     async fn post_messages(
         http: &reqwest::Client,
         url: &str,
@@ -140,7 +194,11 @@ impl AnthropicClient {
         }
     }
 
-    /// Build the Messages API URL for this client.
+    /// Build the full URL for the Anthropic Messages API endpoint.
+    ///
+    /// Appends `/v1/messages` to the client's `base_url`. All four
+    /// `ApiClient` methods (`stream_messages`, `create_message`, and their
+    /// `*_with_options` variants) POST to this URL.
     fn messages_url(&self) -> String {
         format!("{}/v1/messages", self.base_url)
     }
@@ -169,7 +227,37 @@ impl ApiClient for AnthropicClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        self.stream_messages_with_options(
+            messages,
+            system,
+            tools,
+            crate::structured::RequestOptions::default(),
+        )
+    }
+
+    fn create_message(
+        &self,
+        messages: Vec<Message>,
+        system: Option<String>,
+        tools: Option<Vec<ToolSchema>>,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+        self.create_message_with_options(
+            messages,
+            system,
+            tools,
+            crate::structured::RequestOptions::default(),
+        )
+    }
+
+    fn stream_messages_with_options(
+        &self,
+        messages: Vec<Message>,
+        system: Option<String>,
+        tools: Option<Vec<ToolSchema>>,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
         let model = self.model.lock().clone();
+        let rf = options.response_format.as_ref();
         let body = build_request_body(
             &model,
             &messages,
@@ -177,6 +265,7 @@ impl ApiClient for AnthropicClient {
             tools.as_deref(),
             true,
             self.max_tokens,
+            rf,
         );
         let url = self.messages_url();
         let api_key = self.api_key.clone();
@@ -200,13 +289,15 @@ impl ApiClient for AnthropicClient {
         })
     }
 
-    fn create_message(
+    fn create_message_with_options(
         &self,
         messages: Vec<Message>,
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
+        options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
         let model = self.model.lock().clone();
+        let rf = options.response_format.as_ref();
         let body = build_request_body(
             &model,
             &messages,
@@ -214,6 +305,7 @@ impl ApiClient for AnthropicClient {
             tools.as_deref(),
             false,
             self.max_tokens,
+            rf,
         );
         let url = self.messages_url();
         Box::pin(async move {
@@ -232,6 +324,21 @@ impl ApiClient for AnthropicClient {
             serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
+
+    fn extract_structured(&self, raw: &Value) -> Value {
+        raw.get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|blocks| {
+                blocks.iter().find_map(|block| {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                        block.get("input").cloned()
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or_else(|| raw.clone())
+    }
 }
 
 // ==================================================
@@ -239,12 +346,44 @@ impl ApiClient for AnthropicClient {
 // ==================================================
 
 /// Builder for [`AnthropicClient`].
+///
+/// Created via [`AnthropicClientBuilder::default`] or
+/// [`AnthropicClient::builder`]. All fields have sensible defaults except
+/// `api_key`, which must be set before [`build`](Self::build).
 pub struct AnthropicClientBuilder {
+    /// The Anthropic API key used for authentication.
+    ///
+    /// Required — [`build`](Self::build) returns an error if this is `None`.
+    /// The key is sent as the `x-api-key` header on every request. Set via
+    /// [`api_key`](Self::api_key) on the builder, or read from
+    /// `ANTHROPIC_API_KEY` via [`AnthropicClient::from_env`].
     api_key: Option<String>,
+
+    /// The base URL for API requests.
+    ///
+    /// Defaults to `https://api.anthropic.com`. Override when targeting a
+    /// proxy, gateway, or Anthropic-compatible endpoint (e.g. Z.AI).
     base_url: String,
+
+    /// The default model identifier (e.g. `claude-sonnet-4-20250514`).
+    ///
+    /// Can be changed at runtime via [`AnthropicClient::set_model`].
     model: String,
+
+    /// The maximum number of output tokens per response.
+    ///
+    /// Anthropic requires this field on every request. Defaults to 8192.
     max_tokens: u32,
+
+    /// The total HTTP request timeout (connect + response + body).
+    ///
+    /// Bounds the entire request lifecycle. Defaults to 120 seconds.
     timeout: Duration,
+
+    /// The TCP connection establishment timeout (including TLS handshake).
+    ///
+    /// Separate from the total timeout so a slow-connecting server can be
+    /// detected faster than a slow-responding one. Defaults to 10 seconds.
     connect_timeout: Duration,
 }
 
@@ -262,30 +401,44 @@ impl Default for AnthropicClientBuilder {
 }
 
 impl AnthropicClientBuilder {
-    /// Set the API key.
+    /// Set the API key for authentication.
+    ///
+    /// Required — [`build`](Self::build) returns an error if this is not set.
+    /// The key is sent as the `x-api-key` header on every request.
     #[must_use]
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
     }
 
-    /// Set the base URL (e.g. `https://api.z.ai/api/anthropic`).
+    /// Set the base URL for API requests.
+    ///
+    /// Defaults to `https://api.anthropic.com`. Override when targeting a
+    /// proxy, gateway, or Anthropic-compatible endpoint (e.g. Z.AI at
+    /// `https://api.z.ai/api/anthropic`).
     #[must_use]
     pub fn base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
     }
 
-    /// Set the model name (e.g. `claude-sonnet-4-20250514`).
+    /// Set the default model identifier.
+    ///
+    /// The model string is sent as the `model` field on every request. Can be
+    /// changed at runtime via [`AnthropicClient::set_model`] (e.g. when the
+    /// [`FallbackManager`](crate::fallback::FallbackManager) trips).
     #[must_use]
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
     }
 
-    /// Set the maximum output tokens per response.
+    /// Set the maximum number of output tokens per response.
     ///
-    /// Anthropic requires this field. Defaults to 8192.
+    /// Anthropic requires this field on every request — unlike OpenAI, which
+    /// defaults it server-side. It bounds the length of a single model
+    /// response. Defaults to 8192. Increase for long-form generation;
+    /// decrease to cap cost on simple queries.
     #[must_use]
     pub fn max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = tokens;
@@ -313,11 +466,15 @@ impl AnthropicClientBuilder {
         self
     }
 
-    /// Build the client.
+    /// Construct the [`AnthropicClient`] from the builder's configuration.
+    ///
+    /// Creates the internal `reqwest::Client` with the configured timeouts,
+    /// and validates that an API key was provided.
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError`] if no API key was set.
+    /// Returns [`ApiError`] if no API key was set via
+    /// [`api_key`](Self::api_key).
     pub fn build(self) -> Result<AnthropicClient, ApiError> {
         let api_key = self
             .api_key
@@ -353,8 +510,23 @@ fn build_request_body(
     tools: Option<&[ToolSchema]>,
     stream: bool,
     max_tokens: u32,
+    response_format: Option<&crate::structured::ResponseFormat>,
 ) -> Value {
     let msgs: Vec<Value> = messages.iter().map(convert_message).collect();
+    let (tools_val, tool_choice) = if let Some(rf) = response_format {
+        let forced_tool = serde_json::json!({
+            "name": rf.name,
+            "description": "Return the result via this tool",
+            "input_schema": rf.schema,
+        });
+        let choice = serde_json::json!({
+            "type": "tool",
+            "name": rf.name,
+        });
+        (Some(vec![forced_tool]), Some(choice))
+    } else {
+        (tools.map(convert_tools), None)
+    };
 
     let mut body = serde_json::json!({
         "model": model,
@@ -362,13 +534,20 @@ fn build_request_body(
         "messages": msgs,
         "system": system.unwrap_or(""),
         "stream": stream,
-        "tools": tools.map(convert_tools),
+        "tools": tools_val,
     });
 
     // Remove `tools` if None so we don't send a null field.
-    if tools.is_none() {
+    if tools_val.is_none() {
         if let Some(obj) = body.as_object_mut() {
             obj.remove("tools");
+        }
+    }
+
+    // Inject tool_choice when forcing a structured-output tool.
+    if let Some(choice) = tool_choice {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("tool_choice".to_string(), choice);
         }
     }
 
@@ -443,7 +622,16 @@ fn convert_message(m: &Message) -> Value {
     }
 }
 
-/// Convert tool schemas into the Anthropic `tools` array shape.
+/// Convert framework tool schemas into the Anthropic `tools` array shape.
+///
+/// Each [`ToolSchema`] becomes a JSON object with `name`, `description`, and
+/// `input_schema` — the three fields Anthropic's tool-use API expects. The
+/// `input_schema` is passed through verbatim from the framework's schema (a
+/// JSON Schema Draft 07 object), since Anthropic validates it server-side.
+///
+/// When structured output is active (`response_format` set), this function is
+/// not called — instead, [`build_request_body`] synthesizes a single forced
+/// tool whose `input_schema` is the target `ResponseFormat::schema`.
 fn convert_tools(tools: &[ToolSchema]) -> Vec<Value> {
     tools
         .iter()
@@ -824,7 +1012,15 @@ mod tests {
     #[test]
     fn request_body_user_text_single_string() {
         let msgs = vec![Message::user("hello")];
-        let body = build_request_body("claude-3", &msgs, None, None, false, DEFAULT_MAX_TOKENS);
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            None,
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+        );
 
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
@@ -842,6 +1038,7 @@ mod tests {
             None,
             false,
             DEFAULT_MAX_TOKENS,
+            None,
         );
         assert_eq!(body["system"], "be brief");
     }
@@ -849,7 +1046,15 @@ mod tests {
     #[test]
     fn request_body_system_empty_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body("claude-3", &msgs, None, None, false, DEFAULT_MAX_TOKENS);
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            None,
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+        );
         assert_eq!(body["system"], "");
     }
 
@@ -863,6 +1068,7 @@ mod tests {
             None,
             false,
             DEFAULT_MAX_TOKENS,
+            None,
         );
         assert_eq!(body["model"], "claude-sonnet-4");
     }
@@ -870,14 +1076,30 @@ mod tests {
     #[test]
     fn request_body_max_tokens() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body("claude-3", &msgs, None, None, false, DEFAULT_MAX_TOKENS);
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            None,
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+        );
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
     }
 
     #[test]
     fn request_body_user_role() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body("claude-3", &msgs, None, None, false, DEFAULT_MAX_TOKENS);
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            None,
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+        );
         assert_eq!(body["messages"][0]["role"], "user");
     }
 
@@ -887,7 +1109,15 @@ mod tests {
             Role::Assistant,
             vec![MessagePart::text("hello")],
         )];
-        let body = build_request_body("claude-3", &msgs, None, None, false, DEFAULT_MAX_TOKENS);
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            None,
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+        );
         assert_eq!(body["messages"][0]["role"], "assistant");
         assert_eq!(body["messages"][0]["content"], "hello");
     }
@@ -902,7 +1132,15 @@ mod tests {
                 input: serde_json::json!({"msg": "hi"}),
             }],
         )];
-        let body = build_request_body("claude-3", &msgs, None, None, false, DEFAULT_MAX_TOKENS);
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            None,
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+        );
 
         let msg = &body["messages"][0];
         assert_eq!(msg["role"], "assistant");
@@ -923,7 +1161,15 @@ mod tests {
                 is_error: None,
             }],
         )];
-        let body = build_request_body("claude-3", &msgs, None, None, false, DEFAULT_MAX_TOKENS);
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            None,
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+        );
 
         let msg = &body["messages"][0];
         assert_eq!(msg["role"], "user");
@@ -948,6 +1194,7 @@ mod tests {
             Some(&tools),
             false,
             DEFAULT_MAX_TOKENS,
+            None,
         );
 
         let tools_arr = body["tools"].as_array().unwrap();
@@ -960,7 +1207,15 @@ mod tests {
     #[test]
     fn request_body_tools_absent_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body("claude-3", &msgs, None, None, false, DEFAULT_MAX_TOKENS);
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            None,
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+        );
         assert!(body.get("tools").is_none());
     }
 
@@ -977,7 +1232,15 @@ mod tests {
                 },
             ],
         )];
-        let body = build_request_body("claude-3", &msgs, None, None, false, DEFAULT_MAX_TOKENS);
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            None,
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+        );
 
         let msg = &body["messages"][0];
         assert_eq!(msg["role"], "assistant");
@@ -994,7 +1257,15 @@ mod tests {
             Message::new(Role::Assistant, vec![MessagePart::text("hi")]),
             Message::user("bye"),
         ];
-        let body = build_request_body("claude-3", &msgs, None, None, false, DEFAULT_MAX_TOKENS);
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            None,
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+        );
 
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
@@ -1337,5 +1608,107 @@ mod tests {
     #[test]
     fn max_response_body_is_ten_mb() {
         assert_eq!(MAX_RESPONSE_BODY, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn request_body_response_format_forces_tool() {
+        let msgs = vec![Message::user("classify this")];
+        let rf = crate::structured::ResponseFormat::new(
+            "action",
+            serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
+        );
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            None,
+            false,
+            DEFAULT_MAX_TOKENS,
+            Some(&rf),
+        );
+
+        // Exactly one forced tool with the schema's name + input_schema.
+        let tools = body["tools"].as_array().expect("tools should be an array");
+        assert_eq!(tools.len(), 1, "should have exactly one forced tool");
+        assert_eq!(tools[0]["name"], "action");
+        assert_eq!(tools[0]["input_schema"], rf.schema);
+
+        // tool_choice forces the named tool.
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "action");
+    }
+
+    #[test]
+    fn request_body_response_format_suppresses_caller_tools() {
+        let msgs = vec![Message::user("hi")];
+        let caller_tool = ToolSchema {
+            tool: "read".into(),
+            description: "Read a file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let rf =
+            crate::structured::ResponseFormat::new("result", serde_json::json!({"type": "object"}));
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            Some(&[caller_tool]),
+            false,
+            DEFAULT_MAX_TOKENS,
+            Some(&rf),
+        );
+
+        // The forced tool replaces the caller's tools — not appended.
+        let tools = body["tools"].as_array().expect("tools should be an array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0]["name"], "result",
+            "caller tools should be suppressed"
+        );
+    }
+
+    #[test]
+    fn request_body_no_response_format_has_no_tool_choice() {
+        let msgs = vec![Message::user("hi")];
+        let body = build_request_body(
+            "claude-3",
+            &msgs,
+            None,
+            None,
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+        );
+        assert!(
+            body.get("tool_choice").is_none(),
+            "tool_choice should only appear with response_format"
+        );
+    }
+
+    #[test]
+    fn extract_structured_from_tool_use_input() {
+        let client = AnthropicClient::builder().api_key("test").build().unwrap();
+        let raw = serde_json::json!({
+            "content": [{
+                "type": "tool_use",
+                "name": "action",
+                "input": {"tool": "write", "args": {}}
+            }]
+        });
+        let value = client.extract_structured(&raw);
+        assert_eq!(value["tool"], "write");
+    }
+
+    #[test]
+    fn extract_structured_text_only_falls_back_to_raw() {
+        let client = AnthropicClient::builder().api_key("test").build().unwrap();
+        let raw = serde_json::json!({
+            "id": "msg_1",
+            "model": "claude-3",
+            "content": [{"type": "text", "text": "I cannot do that."}]
+        });
+        let value = client.extract_structured(&raw);
+        // No tool_use block → returns the raw envelope; T::from_value fails.
+        assert_eq!(value["id"], "msg_1");
     }
 }

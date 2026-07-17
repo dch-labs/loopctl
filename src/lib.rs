@@ -83,6 +83,7 @@ pub mod provider;
 pub mod reflection;
 pub mod runtime;
 pub mod stream;
+pub mod structured;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod tool;

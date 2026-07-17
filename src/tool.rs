@@ -65,7 +65,7 @@ pub mod health;
 #[cfg(feature = "tool_shield")]
 pub mod shield;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
@@ -359,6 +359,74 @@ impl ToolOutput {
                     .join("\n")
             }
         }
+    }
+
+    /// Construct a successful result from any serializable value.
+    ///
+    /// The value is JSON-serialized into the
+    /// [`ToolContent::Text`](crate::message::ToolContent::Text) payload and
+    /// flagged so [`structured_value`](Self::structured_value) can recover it.
+    /// `T` need not implement [`StructuredOutput`](crate::structured::StructuredOutput)
+    /// — any `Serialize` works —
+    /// but types that *do* get a round-trippable accessor via
+    /// [`structured_as`](Self::structured_as).
+    ///
+    /// If serialization fails (should not happen for normal structs), returns
+    /// an error result rather than panicking.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::tool::ToolOutput;
+    /// use serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct Data { count: u32 }
+    ///
+    /// let out = ToolOutput::structured(&Data { count: 42 });
+    /// assert!(!out.is_error);
+    /// assert!(out.structured_value().is_some());
+    /// ```
+    pub fn structured<T: serde::Serialize>(value: &T) -> Self {
+        match serde_json::to_string(value) {
+            Ok(json) => Self::success(json),
+            Err(e) => Self::error_text(format!("structured serialization failed: {e}")),
+        }
+    }
+
+    /// Parse the payload back into a [`serde_json::Value`], if it is valid JSON.
+    ///
+    /// Returns `None` for multipart payloads or non-JSON text. Use this when
+    /// the consumer does not know the concrete type at compile time (e.g. an
+    /// observer that re-serializes for a TUI).
+    #[must_use]
+    pub fn structured_value(&self) -> Option<serde_json::Value> {
+        let MessageToolContent::Text(s) = &self.payload else {
+            return None;
+        };
+        serde_json::from_str(s).ok()
+    }
+
+    /// Parse the payload into a concrete `T: StructuredOutput`.
+    ///
+    /// Round-trips a value produced by [`structured`](Self::structured) or any
+    /// tool whose text output happens to conform to `T`'s schema. Returns
+    /// `None` if the payload is not valid JSON for `T`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::tool::ToolOutput;
+    /// use loopctl::structured::StructuredOutput;
+    ///
+    /// let out = ToolOutput::structured(&action);
+    /// let back: Action = out.structured_as().unwrap();
+    /// ```
+    #[must_use]
+    pub fn structured_as<T: crate::structured::StructuredOutput + DeserializeOwned>(
+        &self,
+    ) -> Option<T> {
+        self.structured_value().and_then(|v| T::from_value(v).ok())
     }
 }
 
@@ -1522,5 +1590,107 @@ mod tests {
     fn test_tool_trait_system_prompt_default() {
         let tool = EchoTool;
         assert!(tool.system_prompt().is_none());
+    }
+
+    #[test]
+    fn tool_output_structured_round_trip() {
+        use crate::structured::StructuredOutput;
+
+        #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+        struct Action {
+            tool: String,
+            args: serde_json::Value,
+        }
+
+        impl StructuredOutput for Action {
+            fn name() -> &'static str {
+                "action"
+            }
+            fn schema() -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tool": { "type": "string" },
+                        "args": {}
+                    },
+                    "required": ["tool", "args"]
+                })
+            }
+        }
+
+        let action = Action {
+            tool: "write".to_string(),
+            args: serde_json::json!({"path": "/a"}),
+        };
+        let out = ToolOutput::structured(&action);
+        assert!(!out.is_error);
+        assert!(out.structured_value().is_some());
+        let back: Action = out.structured_as().expect("should round-trip");
+        assert_eq!(back, action);
+    }
+
+    #[test]
+    fn tool_output_structured_value_none_for_non_json() {
+        let out = ToolOutput::text("not json");
+        assert!(out.structured_value().is_none());
+    }
+
+    #[test]
+    fn tool_output_structured_with_plain_serialize() {
+        // structured works with any Serialize type, not just StructuredOutput.
+        #[derive(serde::Serialize)]
+        struct Count {
+            n: u32,
+        }
+
+        let out = ToolOutput::structured(&Count { n: 7 });
+        assert!(!out.is_error);
+        let v = out.structured_value().expect("should be valid JSON");
+        assert_eq!(v["n"], 7);
+    }
+
+    #[test]
+    fn tool_output_structured_primitive() {
+        let out = ToolOutput::structured(&42u32);
+        assert!(!out.is_error);
+        let v = out.structured_value().expect("should parse");
+        assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn tool_output_structured_value_for_multipart_is_none() {
+        use crate::message::{ToolContent, ToolContentPart};
+        let out = ToolOutput::success(ToolContent::Multipart(vec![ToolContentPart::Text {
+            text: "a".into(),
+        }]));
+        assert!(out.structured_value().is_none());
+    }
+
+    #[test]
+    fn tool_output_structured_as_returns_none_when_type_mismatches() {
+        use crate::structured::StructuredOutput;
+
+        #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+        struct Target {
+            name: String,
+        }
+
+        impl StructuredOutput for Target {
+            fn name() -> &'static str {
+                "target"
+            }
+            fn schema() -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } },
+                    "required": ["name"]
+                })
+            }
+        }
+
+        // Feed JSON that has a different shape than Target expects.
+        let out = ToolOutput::text(r#"{"count": 5}"#);
+        let result: Option<Target> = out.structured_as();
+        assert!(result.is_none(), "mismatched shape should not deserialize");
     }
 }

@@ -186,6 +186,57 @@ pub trait ApiClient: Send + Sync {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>;
+
+    /// Streaming variant that honors [`RequestOptions`](crate::structured::RequestOptions).
+    ///
+    /// Default implementation ignores `options` and delegates to
+    /// [`stream_messages`](ApiClient::stream_messages) — so a provider that
+    /// does not support structured output still compiles and behaves as
+    /// before. `OpenAiClient`, `AnthropicClient`, and `GeminiClient` override
+    /// this to inject the schema.
+    fn stream_messages_with_options(
+        &self,
+        messages: Vec<Message>,
+        system: Option<String>,
+        tools: Option<Vec<ToolSchema>>,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let _ = options;
+        self.stream_messages(messages, system, tools)
+    }
+
+    /// Non-streaming variant that honors [`RequestOptions`](crate::structured::RequestOptions).
+    ///
+    /// Same default-delegates story as
+    /// [`stream_messages_with_options`](ApiClient::stream_messages_with_options).
+    /// This is the primary path for structured output — a complete JSON
+    /// document must be present before deserialization, so callers that need
+    /// a typed `T` should use `create_message_with_options` and then
+    /// [`StructuredOutput::from_value`](crate::structured::StructuredOutput::from_value)
+    /// on the extracted payload.
+    fn create_message_with_options(
+        &self,
+        messages: Vec<Message>,
+        system: Option<String>,
+        tools: Option<Vec<ToolSchema>>,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>> {
+        let _ = options;
+        self.create_message(messages, system, tools)
+    }
+
+    /// Extract the structured-output payload from a provider response.
+    ///
+    /// Each provider knows its own response envelope shape. This method pulls
+    /// the inner JSON value that should be fed to
+    /// [`StructuredOutput::from_value`](crate::structured::StructuredOutput::from_value).
+    /// The default implementation returns the raw value as-is (for mock
+    /// clients and custom providers that already return the structured value
+    /// without an envelope). `OpenAiClient`, `AnthropicClient`, and
+    /// `GeminiClient` override this to navigate their respective envelopes.
+    fn extract_structured(&self, raw: &serde_json::Value) -> serde_json::Value {
+        raw.clone()
+    }
 }
 
 /// Owned, single-threaded API client handle.

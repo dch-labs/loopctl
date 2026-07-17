@@ -50,8 +50,6 @@ const TEXT_PART_INDEX: usize = 0;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
-/// Maximum bytes to read from an error response body.  Prevents OOM when a
-/// misconfigured or malicious server returns a multi-GB body on a 4xx/5xx.
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -67,26 +65,70 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Works with any OpenAI-compatible endpoint. Use a custom `base_url`
 /// to target `DeepSeek`, `Grok`, Ollama, `vLLM`, or other compatible APIs.
 pub struct OpenAiClient {
+    /// The underlying HTTP client (connection-pooled `reqwest::Client`).
+    ///
+    /// Created once at build time with the configured timeouts; reused
+    /// across all requests for connection pooling.
     http: reqwest::Client,
+
+    /// The API key used for authentication.
+    ///
+    /// Sent as the `Authorization: Bearer <key>` header on every request.
+    /// Set via [`OpenAiClientBuilder::api_key`].
     api_key: String,
+
+    /// The base URL for API requests.
+    ///
+    /// The chat-completions endpoint is `{base_url}/chat/completions`.
+    /// Defaults to `https://api.openai.com/v1`; override for
+    /// `DeepSeek`, `Grok`, `Ollama`, `vLLM`, or other compatible endpoints.
     base_url: String,
+
+    /// The current model identifier, stored behind a mutex for runtime
+    /// hot-swapping.
+    ///
+    /// Changed via [`ApiClient::set_model`] when the
+    /// [`FallbackManager`](crate::fallback::FallbackManager) trips to a
+    /// fallback model.
     model: parking_lot::Mutex<String>,
 }
 
 impl OpenAiClient {
     /// Create a builder for configuring an [`OpenAiClient`].
+    ///
+    /// Returns an [`OpenAiClientBuilder`] with sensible defaults. The only
+    /// required field is `api_key`; everything else has a production-ready
+    /// default. Call `.api_key(...).build()` to finish, or chain additional
+    /// setters for custom configuration.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use loopctl::provider::OpenAiClient;
+    ///
+    /// let client = OpenAiClient::builder()
+    ///     .api_key("sk-...")
+    ///     .model("gpt-4o")
+    ///     .build()
+    /// .unwrap();
+    /// ```
     #[must_use]
     pub fn builder() -> OpenAiClientBuilder {
         OpenAiClientBuilder::default()
     }
 
-    /// Create from environment variables.
+    /// Create a client from environment variables.
     ///
-    /// Reads:
-    /// - `OPENAI_API_KEY` (or `API_KEY`) — required.
-    /// - `OPENAI_BASE_URL` (or `BASE_URL`) — optional, defaults to
-    ///   `https://api.openai.com/v1`.
-    /// - `OPENAI_MODEL` (or `MODEL`) — optional, defaults to `gpt-4o`.
+    /// Reads the following variables:
+    ///
+    /// - `OPENAI_API_KEY` (or `API_KEY`) — **required**. The API key for
+    ///   authentication.
+    /// - `OPENAI_BASE_URL` (or `BASE_URL`) — optional. Defaults to
+    ///   `https://api.openai.com/v1`. Override for OpenAI-compatible endpoints.
+    /// - `OPENAI_MODEL` (or `MODEL`) — optional. Defaults to `gpt-4o`.
+    ///
+    /// This is a convenience constructor that delegates to
+    /// [`builder`](Self::builder) with the env vars as setter arguments.
     ///
     /// # Errors
     ///
@@ -111,7 +153,11 @@ impl OpenAiClient {
             .build()
     }
 
-    /// Build the chat-completions URL for this client.
+    /// Build the full URL for the OpenAI chat-completions endpoint.
+    ///
+    /// Appends `/chat/completions` to the client's `base_url`. All four
+    /// `ApiClient` methods (`stream_messages`, `create_message`, and their
+    /// `*_with_options` variants) POST to this URL.
     fn completions_url(&self) -> String {
         format!("{}/chat/completions", self.base_url)
     }
@@ -179,7 +225,7 @@ impl ApiClient for OpenAiClient {
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
         let model = self.model.lock().clone();
-        let body = RequestBody::build(&model, &messages, system.as_deref(), tools.as_deref());
+        let body = RequestBody::build(&model, &messages, system.as_deref(), tools.as_deref(), None);
         let url = self.completions_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
@@ -212,7 +258,7 @@ impl ApiClient for OpenAiClient {
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
         let model = self.model.lock().clone();
-        let body = RequestBody::build(&model, &messages, system.as_deref(), tools.as_deref());
+        let body = RequestBody::build(&model, &messages, system.as_deref(), tools.as_deref(), None);
         let url = self.completions_url();
 
         Box::pin(async move {
@@ -233,18 +279,126 @@ impl ApiClient for OpenAiClient {
             serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
-}
 
+    fn stream_messages_with_options(
+        &self,
+        messages: Vec<Message>,
+        system: Option<String>,
+        tools: Option<Vec<ToolSchema>>,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let model = self.model.lock().clone();
+        let rf = options.response_format.as_ref();
+        let body = RequestBody::build(&model, &messages, system.as_deref(), tools.as_deref(), rf);
+        let url = self.completions_url();
+        let api_key = self.api_key.clone();
+        let http = self.http.clone();
+
+        Box::pin(async_stream::try_stream! {
+            let resp = Self::post_completions(&http, &url, &api_key, &body.to_json(true)).await?;
+            let mut sse = SseReader::from_response(resp);
+            let mut emitter = StreamEmitter::default();
+
+            while let Some(data) = sse.next_data().await? {
+                let Some(chunk) = OpenAiChunk::parse(&data) else {
+                    continue;
+                };
+                emitter.process_chunk(&chunk);
+                for ev in emitter.drain() {
+                    yield ev;
+                }
+            }
+
+            for ev in emitter.finish() {
+                yield ev;
+            }
+        })
+    }
+
+    fn create_message_with_options(
+        &self,
+        messages: Vec<Message>,
+        system: Option<String>,
+        tools: Option<Vec<ToolSchema>>,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+        let model = self.model.lock().clone();
+        let rf = options.response_format.as_ref();
+        let body = RequestBody::build(&model, &messages, system.as_deref(), tools.as_deref(), rf);
+        let url = self.completions_url();
+
+        Box::pin(async move {
+            let resp =
+                Self::post_completions(&self.http, &url, &self.api_key, &body.to_json(false))
+                    .await?;
+            let resp = resp
+                .bytes()
+                .await
+                .map_err(|e| ApiError::http(e.to_string()))?;
+            if resp.len() > MAX_RESPONSE_BODY {
+                return Err(ApiError::http(format!(
+                    "response body too large: {} bytes (max {})",
+                    resp.len(),
+                    MAX_RESPONSE_BODY
+                )));
+            }
+            serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
+        })
+    }
+
+    fn extract_structured(&self, raw: &Value) -> Value {
+        let Some(content) = raw
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+        else {
+            return raw.clone();
+        };
+        if let Some(text) = content.as_str() {
+            crate::structured::parse_json_lenient(text)
+                .unwrap_or_else(|| Value::String(text.to_string()))
+        } else {
+            content.clone()
+        }
+    }
+}
 // ==================================================
 // Builder
 // ==================================================
 
 /// Builder for [`OpenAiClient`].
+///
+/// Created via [`OpenAiClientBuilder::default`] or
+/// [`OpenAiClient::builder`]. All fields have sensible defaults except
+/// `api_key`, which must be set before [`build`](Self::build).
 pub struct OpenAiClientBuilder {
+    /// The API key for authentication (required).
+    ///
+    /// Must be set before building. Sent as the `Authorization: Bearer`
+    /// header on every request.
     api_key: Option<String>,
+
+    /// The base URL for API requests.
+    ///
+    /// Defaults to `https://api.openai.com/v1`. Override for
+    /// `DeepSeek`, `Grok`, `Ollama`, `vLLM`, or other OpenAI-compatible endpoints.
     base_url: String,
+
+    /// The default model identifier.
+    ///
+    /// Can be changed at runtime via [`OpenAiClient::set_model`].
     model: String,
+
+    /// The total HTTP request timeout (connect + response + body).
+    ///
+    /// Bounds the entire request lifecycle. Defaults to 120 seconds.
     timeout: Duration,
+
+    /// The TCP connection establishment timeout (including TLS handshake).
+    ///
+    /// Separate from the total timeout so a slow-connecting server can be
+    /// detected faster. Defaults to 10 seconds.
     connect_timeout: Duration,
 }
 
@@ -261,21 +415,33 @@ impl Default for OpenAiClientBuilder {
 }
 
 impl OpenAiClientBuilder {
-    /// Set the API key.
+    /// Set the API key for authentication.
+    ///
+    /// Required — [`build`](Self::build) returns an error if this is not set.
+    /// The key is sent as the `Authorization: Bearer <key>` header on every
+    /// request.
     #[must_use]
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
     }
 
-    /// Set the base URL (e.g. `https://api.deepseek.com/v1`).
+    /// Set the base URL for API requests.
+    ///
+    /// Defaults to `https://api.openai.com/v1`. Override when targeting an
+    /// OpenAI-compatible endpoint (e.g. `https://api.deepseek.com/v1`,
+    /// `http://localhost:11434/v1` for Ollama, or a vLLM server).
     #[must_use]
     pub fn base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
     }
 
-    /// Set the model name (e.g. `gpt-4o`, `deepseek-chat`).
+    /// Set the default model identifier.
+    ///
+    /// The model string is sent as the `model` field on every request. Can be
+    /// changed at runtime via [`OpenAiClient::set_model`] (e.g. when the
+    /// [`FallbackManager`](crate::fallback::FallbackManager) trips).
     #[must_use]
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
@@ -338,19 +504,48 @@ impl OpenAiClientBuilder {
 /// body for both streaming and non-streaming requests, toggling only
 /// the `stream` flag via [`to_json`](Self::to_json).
 struct RequestBody {
+    /// The model identifier sent as the `model` field on every request.
+    ///
+    /// Copied from [`OpenAiClient`]'s model field (which is mutable at
+    /// runtime via [`ApiClient::set_model`]). Each request carries it so
+    /// the provider knows which model to invoke.
     model: String,
+
+    /// The conversation messages converted to OpenAI's JSON format.
+    ///
+    /// Each message is an object with `role` (`"system"`, `"user"`, or
+    /// `"assistant"`) and `content` (text string, tool-call array, or tool
+    /// result). Built by [`RequestBody::build`] from the framework's
+    /// [`Message`] list via [`convert_message`].
     messages: Vec<Value>,
+
+    /// The registered tools in OpenAI function-calling format, or `None`
+    /// when no tools are registered or when `response_format` is set
+    /// (mutual exclusion).
     tools: Option<Vec<Value>>,
+
+    /// The structured-output `response_format` JSON object, or `None`
+    /// when structured output is not requested. When `Some`, the field is
+    /// emitted as `response_format: { type: "json_schema", ... }` and
+    /// `tools` is suppressed.
+    response_format: Option<Value>,
 }
 
 impl RequestBody {
-    /// Translate the framework's [`Message`] list into the OpenAI
-    /// Chat Completions request shape.
+    /// Translate the framework's [`Message`] list into the OpenAI Chat
+    /// Completions request shape.
+    ///
+    /// Converts messages to OpenAI's `role`/`content` JSON format, wraps
+    /// tool schemas in the `function` envelope, and — when
+    /// `response_format` is set — suppresses `tools` (OpenAI's structured
+    /// output and free-form tool-calling are mutually exclusive) and emits
+    /// the `response_format: json_schema` object.
     fn build(
         model: &str,
         messages: &[Message],
         system: Option<&str>,
         tools: Option<&[ToolSchema]>,
+        response_format: Option<&crate::structured::ResponseFormat>,
     ) -> Self {
         let mut msgs = Vec::with_capacity(messages.len().saturating_add(1));
 
@@ -362,22 +557,51 @@ impl RequestBody {
             msgs.push(convert_message(m));
         }
 
+        let tools = if response_format.is_some() {
+            None
+        } else {
+            tools.map(convert_tools)
+        };
+
+        let rf = response_format.map(|rf| {
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": rf.name,
+                    "schema": rf.schema,
+                    "strict": rf.strict
+                }
+            })
+        });
+
         Self {
             model: model.into(),
             messages: msgs,
-            tools: tools.map(convert_tools),
+            tools,
+            response_format: rf,
         }
     }
 
-    /// Serialize to a [`serde_json::Value`] with the `stream` flag
-    /// set as requested.
+    /// Serialize to a [`serde_json::Value`] for the HTTP request body.
+    ///
+    /// Emits `model`, `messages`, `stream` (toggled by the parameter),
+    /// and `tools`. When `response_format` is set, appends the
+    /// `response_format` key; otherwise omits it entirely (not `null`).
     fn to_json(&self, stream: bool) -> Value {
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "messages": self.messages,
             "stream": stream,
-            "tools": self.tools,
-        })
+        });
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(tools) = &self.tools {
+                obj.insert("tools".to_string(), Value::Array(tools.clone()));
+            }
+            if let Some(rf) = &self.response_format {
+                obj.insert("response_format".to_string(), rf.clone());
+            }
+        }
+        body
     }
 }
 
@@ -432,7 +656,13 @@ fn convert_message(m: &Message) -> Value {
     }
 }
 
-/// Build an assistant message JSON that includes `tool_calls`.
+/// Build an assistant message JSON object that includes `tool_calls`.
+///
+/// Constructs the OpenAI-shaped `{ role, content, tool_calls }` object from
+/// the accumulated text parts and tool-call entries. When there is no text
+/// (pure tool-call turn), `content` is set to `null` — OpenAI's convention
+/// for tool-call-only assistant messages. The `tool_calls` array carries the
+/// converted tool-call entries produced by [`convert_message`].
 fn build_assistant_message(role: &str, tool_calls: &[Value], text_parts: &[&str]) -> Value {
     let text = text_parts.join("");
     let content = if text.is_empty() {
@@ -459,7 +689,13 @@ fn merge_tool_results(results: &[Value]) -> Value {
     }
 }
 
-/// Convert tool schemas into the OpenAI `tools` array shape.
+/// Convert framework tool schemas into the OpenAI `tools` array shape.
+///
+/// Each [`ToolSchema`] becomes a JSON object with `type: "function"` and a
+/// nested `function` object carrying `name`, `description`, and `parameters`
+/// (the framework's `input_schema`). When structured output is active
+/// (`response_format` set), this function is not called — `tools` is
+/// suppressed entirely.
 fn convert_tools(tools: &[ToolSchema]) -> Vec<Value> {
     tools
         .iter()
@@ -555,7 +791,12 @@ impl SseReader {
         }
     }
 
-    /// Pop the first `\n`-terminated line from the buffer, if present.
+    /// Pop the first `\n`-terminated line from the internal buffer.
+    ///
+    /// Returns the trimmed line if a newline is present, and removes it
+    /// (plus the newline) from the buffer. Returns `None` if the buffer
+    /// does not yet contain a complete line — the caller should wait for
+    /// more bytes from the HTTP stream.
     fn take_line(&mut self) -> Option<String> {
         let pos = self.buf.find('\n')?;
         let line = self.buf[..pos].trim().to_string();
@@ -647,8 +888,14 @@ struct StreamEmitter {
 }
 
 impl StreamEmitter {
-    /// Process a single parsed chunk, appending events to the
-    /// internal pending queue.
+    /// Process a single parsed OpenAI SSE chunk into stream events.
+    ///
+    /// On the first call, emits [`MessageStart`](StreamEvent::MessageStart)
+    /// with the chunk's message ID and model. Then delegates to
+    /// [`process_delta`](Self::process_delta) for text/tool-call deltas and
+    /// [`process_finish`](Self::process_finish) for the terminal finish
+    /// reason. Events accumulate in the internal queue until
+    /// [`drain`](Self::drain) is called.
     fn process_chunk(&mut self, chunk: &OpenAiChunk) {
         if !self.started {
             self.started = true;
@@ -674,7 +921,12 @@ impl StreamEmitter {
         }
     }
 
-    /// Translate a delta into text/tool-call events.
+    /// Translate a single delta object into text and/or tool-call events.
+    ///
+    /// If the delta carries non-empty `content`, emits a `PartStart` (on the
+    /// first text delta) followed by `IndexedDelta(Text)` events. If it
+    /// carries `tool_calls`, delegates each to
+    /// [`process_tool_call`](Self::process_tool_call).
     fn process_delta(&mut self, delta: &OpenAiDelta) {
         if let Some(text) = &delta.content
             && !text.is_empty()
@@ -699,7 +951,14 @@ impl StreamEmitter {
         }
     }
 
-    /// Handle a single tool-call delta.
+    /// Handle a single tool-call delta from the stream.
+    ///
+    /// On the first delta for a tool call (when `function` is present),
+    /// emits a [`PartStart`](StreamEvent::PartStart) with a
+    /// [`ToolCall`](crate::message::MessagePart::ToolCall) part carrying the
+    /// tool ID and name. Subsequent deltas carrying `function.arguments`
+    /// fragments emit [`InputJson`](crate::stream::DeltaPart::InputJson)
+    /// events so the caller can accumulate the full JSON input.
     fn process_tool_call(&mut self, tc: &OpenAiToolCallDelta) {
         if tc.function.is_some() {
             // New tool call — emit PartStart.
@@ -732,6 +991,14 @@ impl StreamEmitter {
     }
 
     /// Handle a finish reason, emitting the appropriate stop events.
+    ///
+    /// Closes any open text parts and tool-call parts with
+    /// [`PartStop`](StreamEvent::PartStop), then emits a
+    /// [`MessageDelta`](StreamEvent::MessageDelta) carrying the mapped
+    /// [`StreamStopReason`]. Maps `"tool_calls"` →
+    /// [`ToolCall`](StreamStopReason::ToolCall), `"length"` →
+    /// [`MaxTokens`](StreamStopReason::MaxTokens), and anything else via
+    /// [`StreamStopReason::from_api_str`]. No-ops if already finished.
     fn process_finish(&mut self, reason: &str) {
         if self.finished {
             return;
@@ -762,8 +1029,11 @@ impl StreamEmitter {
         }));
     }
 
-    /// Emit the terminal [`MessageStop`] if the stream was started,
-    /// returning all remaining events.
+    /// Finalize the stream, emitting the terminal
+    /// [`MessageStop`](StreamEvent::MessageStop) if one was started.
+    ///
+    /// Drains any remaining pending events and appends the stop event.
+    /// Called exactly once at the end of the SSE stream.
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = self.drain();
         if self.started {
@@ -772,11 +1042,20 @@ impl StreamEmitter {
         out
     }
 
-    /// Drain all pending events.
+    /// Drain all pending events from the internal queue.
+    ///
+    /// Returns the accumulated [`StreamEvent`]s and clears the queue.
+    /// Called by the stream loop after each chunk is processed so events
+    /// are yielded promptly rather than buffered until stream end.
     fn drain(&mut self) -> Vec<StreamEvent> {
         std::mem::take(&mut self.pending)
     }
 
+    /// Push an event onto the internal pending queue.
+    ///
+    /// The single write point — all methods (`process_delta`,
+    /// `process_tool_call`, `process_finish`, `process_chunk`) funnel
+    /// through here. Events are held until [`drain`](Self::drain) is called.
     fn push(&mut self, ev: StreamEvent) {
         self.pending.push(ev);
     }
@@ -795,7 +1074,7 @@ mod tests {
     #[test]
     fn request_body_includes_system_message_first() {
         let msgs = vec![Message::user("hello")];
-        let body = RequestBody::build("gpt-4o", &msgs, Some("be brief"), None);
+        let body = RequestBody::build("gpt-4o", &msgs, Some("be brief"), None, None);
         let json = body.to_json(true);
 
         let messages = json["messages"].as_array().unwrap();
@@ -808,7 +1087,7 @@ mod tests {
     #[test]
     fn request_body_without_system() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None);
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None);
         let json = body.to_json(false);
 
         let messages = json["messages"].as_array().unwrap();
@@ -819,7 +1098,7 @@ mod tests {
     #[test]
     fn request_body_stream_flag_toggles() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None);
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None);
 
         assert_eq!(body.to_json(true)["stream"], true);
         assert_eq!(body.to_json(false)["stream"], false);
@@ -833,7 +1112,7 @@ mod tests {
             description: "Echo".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
-        let body = RequestBody::build("my-model", &msgs, None, Some(&tools));
+        let body = RequestBody::build("my-model", &msgs, None, Some(&tools), None);
         let json = body.to_json(true);
 
         assert_eq!(json["model"], "my-model");
@@ -844,11 +1123,14 @@ mod tests {
     }
 
     #[test]
-    fn request_body_tools_null_when_none() {
+    fn request_body_tools_absent_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None);
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None);
         let json = body.to_json(false);
-        assert!(json["tools"].is_null());
+        assert!(
+            json.get("tools").is_none(),
+            "tools key should be absent when no tools are set"
+        );
     }
 
     #[test]
@@ -1399,5 +1681,97 @@ mod tests {
     fn body_size_check_accepts_within_limit() {
         let within = MAX_RESPONSE_BODY;
         assert!(within <= MAX_RESPONSE_BODY);
+    }
+
+    #[test]
+    fn request_body_response_format_emitted() {
+        let msgs = vec![Message::user("hi")];
+        let rf =
+            crate::structured::ResponseFormat::new("action", serde_json::json!({"type": "object"}));
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, Some(&rf));
+        let json = body.to_json(false);
+
+        assert_eq!(json["response_format"]["type"], "json_schema");
+        assert_eq!(json["response_format"]["json_schema"]["name"], "action");
+        assert_eq!(
+            json["response_format"]["json_schema"]["schema"],
+            serde_json::json!({"type": "object"})
+        );
+        assert_eq!(json["response_format"]["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn request_body_response_format_absent_when_none() {
+        let msgs = vec![Message::user("hi")];
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None);
+        let json = body.to_json(false);
+        assert!(
+            json.get("response_format").is_none(),
+            "response_format should be absent (not null) when not set"
+        );
+    }
+
+    #[test]
+    fn request_body_response_format_suppresses_tools() {
+        let msgs = vec![Message::user("hi")];
+        let caller_tool = ToolSchema {
+            tool: "read".into(),
+            description: "Read".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let rf =
+            crate::structured::ResponseFormat::new("result", serde_json::json!({"type": "object"}));
+        let body = RequestBody::build("gpt-4o", &msgs, None, Some(&[caller_tool]), Some(&rf));
+        let json = body.to_json(false);
+
+        assert!(
+            json.get("tools").is_none(),
+            "tools key should be absent when response_format is set"
+        );
+        assert!(json.get("response_format").is_some());
+    }
+
+    #[test]
+    fn extract_structured_from_string_content() {
+        let client = OpenAiClient::builder().api_key("test").build().unwrap();
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": r#"{"tool": "write", "args": {}}"#
+                }
+            }]
+        });
+        let value = client.extract_structured(&raw);
+        assert_eq!(value["tool"], "write");
+    }
+
+    #[test]
+    fn extract_structured_from_object_content() {
+        let client = OpenAiClient::builder().api_key("test").build().unwrap();
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": {"tool": "read", "args": {}}
+                }
+            }]
+        });
+        let value = client.extract_structured(&raw);
+        assert_eq!(value["tool"], "read");
+    }
+
+    #[test]
+    fn extract_structured_prose_falls_back_to_raw() {
+        let client = OpenAiClient::builder().api_key("test").build().unwrap();
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "I cannot produce that."
+                }
+            }]
+        });
+        let value = client.extract_structured(&raw);
+        // When content is prose (not parseable JSON), falls back to the
+        // string value; T::from_value will then fail with Deserialize.
+        assert_eq!(value, serde_json::json!("I cannot produce that."));
     }
 }

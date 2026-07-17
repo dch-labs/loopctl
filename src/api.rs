@@ -186,6 +186,74 @@ pub trait ApiClient: Send + Sync {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>;
+
+    /// Streaming variant that honors [`RequestOptions`](crate::structured::RequestOptions).
+    ///
+    /// When `options` is empty (the default), delegates to
+    /// [`stream_messages`](ApiClient::stream_messages). When `options`
+    /// contains fields the client does not support (e.g. `response_format`
+    /// on a client that has not overridden this method), yields an
+    /// [`ApiError::config`] error as the first stream item.
+    /// `OpenAiClient`, `AnthropicClient`, and `GeminiClient` override
+    /// this to inject the schema.
+    fn stream_messages_with_options(
+        &self,
+        messages: Vec<Message>,
+        system: Option<String>,
+        tools: Option<Vec<ToolSchema>>,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        if options.response_format.is_none() {
+            return self.stream_messages(messages, system, tools);
+        }
+        Box::pin(futures::stream::once(async {
+            Err(ApiError::config(
+                "this client does not support structured output (response_format)",
+            ))
+        }))
+    }
+
+    /// Non-streaming variant that honors [`RequestOptions`](crate::structured::RequestOptions).
+    ///
+    /// When `options` is empty (the default), delegates to
+    /// [`create_message`](ApiClient::create_message). When `options`
+    /// contains fields the client does not support (e.g. `response_format`
+    /// on a client that has not overridden this method), returns an
+    /// [`ApiError::config`] error. This is the primary path for structured
+    /// output — a complete JSON document must be present before
+    /// deserialization, so callers that need a typed `T` should use this
+    /// method and then
+    /// [`StructuredOutput::from_value`](crate::structured::StructuredOutput::from_value)
+    /// on the extracted payload.
+    fn create_message_with_options(
+        &self,
+        messages: Vec<Message>,
+        system: Option<String>,
+        tools: Option<Vec<ToolSchema>>,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>> {
+        if options.response_format.is_none() {
+            return self.create_message(messages, system, tools);
+        }
+        Box::pin(async {
+            Err(ApiError::config(
+                "this client does not support structured output (response_format)",
+            ))
+        })
+    }
+
+    /// Extract the structured-output payload from a provider response.
+    ///
+    /// Each provider knows its own response envelope shape. This method pulls
+    /// the inner JSON value that should be fed to
+    /// [`StructuredOutput::from_value`](crate::structured::StructuredOutput::from_value).
+    /// The default implementation returns the raw value as-is (for mock
+    /// clients and custom providers that already return the structured value
+    /// without an envelope). `OpenAiClient`, `AnthropicClient`, and
+    /// `GeminiClient` override this to navigate their respective envelopes.
+    fn extract_structured(&self, raw: &serde_json::Value) -> serde_json::Value {
+        raw.clone()
+    }
 }
 
 /// Owned, single-threaded API client handle.

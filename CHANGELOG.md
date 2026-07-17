@@ -40,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   `None`) for parallel-dispatch resource-conflict detection, plus the
   `FnTool::with_resource_key` builder.
 - `MockTool::with_delay(Duration)` builder for timing-sensitive tests.
+- `StructuredOutput` trait, `ResponseFormat`, `RequestOptions`, and
+  `StructuredError` (`structured` module): request guaranteed-schema JSON
+  responses from the model. Includes a lenient JSON extraction helper (handles
+  markdown fences/prose prefixes) and a `request_structured::<T>()`
+  convenience function.
+- `ApiClient::stream_messages_with_options` and
+  `create_message_with_options` default methods (additive — existing impls
+  compile unchanged). `OpenAiClient`, `AnthropicClient`, and `GeminiClient`
+  override both to inject the schema (OpenAI via native `response_format`,
+  Anthropic via forced-tool tool-forcing, Gemini via `generationConfig`
+  `responseMimeType` + `responseSchema`).
+- `ToolOutput::structured<T>`, `structured_value()`, and
+  `structured_as::<T>()` for typed tool results that round-trip through JSON.
 
 ### Changed
 

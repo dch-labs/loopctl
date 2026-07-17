@@ -315,13 +315,19 @@ pub(crate) fn extract_json_substring(text: &str) -> Option<serde_json::Value> {
             }
             b'}' | b']' => {
                 if let Some(s) = start {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 && byte == close {
-                        let slice = text.get(s..=i).unwrap_or(text);
-                        if let Ok(v) = serde_json::from_str(slice) {
-                            return Some(v);
+                    if byte == close {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            let slice = text.get(s..=i).unwrap_or(text);
+                            if let Ok(v) = serde_json::from_str(slice) {
+                                return Some(v);
+                            }
+                            start = None;
                         }
+                    } else {
+                        // Mismatched closing delimiter — not valid JSON.
                         start = None;
+                        depth = 0;
                     }
                 }
             }
@@ -480,6 +486,12 @@ mod tests {
     fn parse_json_lenient_nested_objects_in_prose() {
         let v = parse_json_lenient(r#"result: {"outer": {"inner": 42}}"#).unwrap();
         assert_eq!(v["outer"]["inner"], 42);
+    }
+
+    #[test]
+    fn parse_json_lenient_mismatched_delimiter_then_valid() {
+        let v = parse_json_lenient(r#"{oops] then {"a":1}"#).unwrap();
+        assert_eq!(v["a"], 1);
     }
 
     struct PlainMockClient;

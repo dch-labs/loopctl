@@ -592,10 +592,12 @@ impl RequestBody {
             "model": self.model,
             "messages": self.messages,
             "stream": stream,
-            "tools": self.tools,
         });
-        if let Some(rf) = &self.response_format {
-            if let Some(obj) = body.as_object_mut() {
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(tools) = &self.tools {
+                obj.insert("tools".to_string(), Value::Array(tools.clone()));
+            }
+            if let Some(rf) = &self.response_format {
                 obj.insert("response_format".to_string(), rf.clone());
             }
         }
@@ -1121,11 +1123,14 @@ mod tests {
     }
 
     #[test]
-    fn request_body_tools_null_when_none() {
+    fn request_body_tools_absent_when_none() {
         let msgs = vec![Message::user("hi")];
         let body = RequestBody::build("gpt-4o", &msgs, None, None, None);
         let json = body.to_json(false);
-        assert!(json["tools"].is_null());
+        assert!(
+            json.get("tools").is_none(),
+            "tools key should be absent when no tools are set"
+        );
     }
 
     #[test]
@@ -1720,8 +1725,8 @@ mod tests {
         let json = body.to_json(false);
 
         assert!(
-            json["tools"].is_null(),
-            "tools should be suppressed when response_format is set"
+            json.get("tools").is_none(),
+            "tools key should be absent when response_format is set"
         );
         assert!(json.get("response_format").is_some());
     }

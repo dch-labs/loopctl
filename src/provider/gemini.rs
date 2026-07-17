@@ -514,7 +514,7 @@ fn build_request_body(
                 "generationConfig".into(),
                 serde_json::json!({
                     "responseMimeType": "application/json",
-                    "responseSchema": rf.schema,
+                    "responseJsonSchema": rf.schema,
                 }),
             );
         }
@@ -566,7 +566,7 @@ fn convert_part(p: &MessagePart) -> Option<Value> {
 /// Each [`ToolSchema`] becomes a JSON object with `name`, `description`, and
 /// `parameters` — the fields Gemini's function-calling API expects. When
 /// structured output is active (`response_format` set), this function is not
-/// called — [`build_request_body`] injects `generationConfig.responseSchema`
+/// called — [`build_request_body`] injects `generationConfig.responseJsonSchema`
 /// instead, and `tools` is suppressed.
 fn convert_tools(tools: &[ToolSchema]) -> Vec<Value> {
     tools
@@ -1379,7 +1379,7 @@ mod tests {
             "application/json"
         );
         assert_eq!(
-            body["generationConfig"]["responseSchema"],
+            body["generationConfig"]["responseJsonSchema"],
             serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}})
         );
     }

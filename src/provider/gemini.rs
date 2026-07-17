@@ -67,7 +67,7 @@ pub struct GeminiClient {
 
     /// The Gemini API key used for authentication.
     ///
-    /// Sent as the `key` query parameter on every request. Set via
+    /// Sent as the `x-goog-api-key` header on every request. Set via
     /// [`GeminiClientBuilder::api_key`].
     api_key: String,
 
@@ -143,8 +143,8 @@ impl GeminiClient {
 
     /// Build the streaming Generate Content URL.
     ///
-    /// Gemini puts the model in the URL path and the API key as a query
-    /// parameter rather than using headers.
+    /// Gemini puts the model in the URL path. The API key is sent via
+    /// the `x-goog-api-key` header, not as a query parameter.
     fn stream_url(&self) -> String {
         let model = self.model.lock().clone();
         format!(
@@ -156,7 +156,8 @@ impl GeminiClient {
     /// Build the full URL for the Gemini non-streaming Generate Content
     /// endpoint.
     ///
-    /// Constructs `{base_url}/models/{model}:generateContent?key={api_key}`.
+    /// Constructs `{base_url}/models/{model}:generateContent`. The API key
+    /// is sent via the `x-goog-api-key` header, not in the URL.
     /// Used by [`ApiClient::create_message`] and its `*_with_options`
     /// variant.
     fn generate_url(&self) -> String {
@@ -359,7 +360,7 @@ impl ApiClient for GeminiClient {
 pub struct GeminiClientBuilder {
     /// The Gemini API key for authentication (required).
     ///
-    /// Must be set before building. Sent as the `key` query parameter on
+    /// Must be set before building. Sent as the `x-goog-api-key` header on
     /// every request.
     api_key: Option<String>,
 
@@ -401,7 +402,7 @@ impl GeminiClientBuilder {
     /// Set the API key for authentication.
     ///
     /// Required — [`build`](Self::build) returns an error if this is not set.
-    /// The key is sent as the `key` query parameter on every request.
+    /// The key is sent as the `x-goog-api-key` header on every request.
     #[must_use]
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());

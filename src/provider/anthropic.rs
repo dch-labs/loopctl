@@ -227,36 +227,12 @@ impl ApiClient for AnthropicClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let model = self.model.lock().clone();
-        let body = build_request_body(
-            &model,
-            &messages,
-            system.as_deref(),
-            tools.as_deref(),
-            true,
-            self.max_tokens,
-            None,
-        );
-        let url = self.messages_url();
-        let api_key = self.api_key.clone();
-        let http = self.http.clone();
-
-        Box::pin(async_stream::try_stream! {
-            let resp = Self::post_messages(&http, &url, &api_key, &body).await?;
-            let mut sse = SseReader::from_response(resp);
-            let mut emitter = StreamEmitter::default();
-
-            while let Some((event_type, data)) = sse.next_event().await? {
-                emitter.process_event(&event_type, data);
-                for ev in emitter.drain() {
-                    yield ev;
-                }
-            }
-
-            for ev in emitter.finish() {
-                yield ev;
-            }
-        })
+        self.stream_messages_with_options(
+            messages,
+            system,
+            tools,
+            crate::structured::RequestOptions::default(),
+        )
     }
 
     fn create_message(
@@ -265,32 +241,12 @@ impl ApiClient for AnthropicClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let model = self.model.lock().clone();
-        let body = build_request_body(
-            &model,
-            &messages,
-            system.as_deref(),
-            tools.as_deref(),
-            false,
-            self.max_tokens,
-            None,
-        );
-        let url = self.messages_url();
-        Box::pin(async move {
-            let resp = Self::post_messages(&self.http, &url, &self.api_key, &body).await?;
-            let resp = resp
-                .bytes()
-                .await
-                .map_err(|e| ApiError::http(e.to_string()))?;
-            if resp.len() > MAX_RESPONSE_BODY {
-                return Err(ApiError::http(format!(
-                    "response body too large: {} bytes (max {})",
-                    resp.len(),
-                    MAX_RESPONSE_BODY
-                )));
-            }
-            serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
-        })
+        self.create_message_with_options(
+            messages,
+            system,
+            tools,
+            crate::structured::RequestOptions::default(),
+        )
     }
 
     fn stream_messages_with_options(

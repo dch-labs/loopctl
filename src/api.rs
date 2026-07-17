@@ -189,10 +189,12 @@ pub trait ApiClient: Send + Sync {
 
     /// Streaming variant that honors [`RequestOptions`](crate::structured::RequestOptions).
     ///
-    /// Default implementation ignores `options` and delegates to
-    /// [`stream_messages`](ApiClient::stream_messages) — so a provider that
-    /// does not support structured output still compiles and behaves as
-    /// before. `OpenAiClient`, `AnthropicClient`, and `GeminiClient` override
+    /// When `options` is empty (the default), delegates to
+    /// [`stream_messages`](ApiClient::stream_messages). When `options`
+    /// contains fields the client does not support (e.g. `response_format`
+    /// on a client that has not overridden this method), yields an
+    /// [`ApiError::config`] error as the first stream item.
+    /// `OpenAiClient`, `AnthropicClient`, and `GeminiClient` override
     /// this to inject the schema.
     fn stream_messages_with_options(
         &self,
@@ -201,17 +203,26 @@ pub trait ApiClient: Send + Sync {
         tools: Option<Vec<ToolSchema>>,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let _ = options;
-        self.stream_messages(messages, system, tools)
+        if options.response_format.is_none() {
+            return self.stream_messages(messages, system, tools);
+        }
+        Box::pin(futures::stream::once(async {
+            Err(ApiError::config(
+                "this client does not support structured output (response_format)",
+            ))
+        }))
     }
 
     /// Non-streaming variant that honors [`RequestOptions`](crate::structured::RequestOptions).
     ///
-    /// Same default-delegates story as
-    /// [`stream_messages_with_options`](ApiClient::stream_messages_with_options).
-    /// This is the primary path for structured output — a complete JSON
-    /// document must be present before deserialization, so callers that need
-    /// a typed `T` should use `create_message_with_options` and then
+    /// When `options` is empty (the default), delegates to
+    /// [`create_message`](ApiClient::create_message). When `options`
+    /// contains fields the client does not support (e.g. `response_format`
+    /// on a client that has not overridden this method), returns an
+    /// [`ApiError::config`] error. This is the primary path for structured
+    /// output — a complete JSON document must be present before
+    /// deserialization, so callers that need a typed `T` should use this
+    /// method and then
     /// [`StructuredOutput::from_value`](crate::structured::StructuredOutput::from_value)
     /// on the extracted payload.
     fn create_message_with_options(
@@ -221,8 +232,14 @@ pub trait ApiClient: Send + Sync {
         tools: Option<Vec<ToolSchema>>,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>> {
-        let _ = options;
-        self.create_message(messages, system, tools)
+        if options.response_format.is_none() {
+            return self.create_message(messages, system, tools);
+        }
+        Box::pin(async {
+            Err(ApiError::config(
+                "this client does not support structured output (response_format)",
+            ))
+        })
     }
 
     /// Extract the structured-output payload from a provider response.

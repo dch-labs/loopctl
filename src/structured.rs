@@ -519,13 +519,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_client_delegates_with_options() {
+    async fn default_client_rejects_response_format() {
         let client = PlainMockClient;
         let opts = RequestOptions::new().response_format(ResponseFormat::from_type::<Action>());
         let result = client
             .create_message_with_options(vec![], None, None, opts)
             .await;
-        assert!(result.is_ok(), "default delegation should succeed");
+        assert!(
+            result.is_err(),
+            "client without structured-output support should reject response_format"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not support structured output"),
+            "error should explain why: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_client_delegates_empty_options() {
+        let client = PlainMockClient;
+        let opts = RequestOptions::new();
+        let result = client
+            .create_message_with_options(vec![], None, None, opts)
+            .await;
+        assert!(result.is_ok(), "empty options should delegate normally");
     }
 
     struct StructuredMockClient;

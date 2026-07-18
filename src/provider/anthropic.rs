@@ -1139,9 +1139,12 @@ impl StreamEmitter {
     /// unrecognized value) and `/usage/input_tokens` +
     /// `/usage/output_tokens` (defaulting to 0; the usage event is only
     /// attached when at least one is non-zero). Emits a single
-    /// [`StreamEvent::MessageDelta`] with both. No-ops if a finish has
-    /// already been recorded, so a stream that delivers `message_delta`
-    /// followed by `message_stop` does not double-terminate.
+    /// [`StreamEvent::MessageDelta`] with both.
+    ///
+    /// This handler does not mark the stream finished — that is the job of
+    /// [`on_message_stop`](Self::on_message_stop), which Anthropic sends
+    /// after `message_delta`. The `finished` guard here only defends
+    /// against an out-of-order stream where `message_stop` arrived first.
     ///
     /// [`StreamStopReason::from_api_str`]: crate::stream::StreamStopReason::from_api_str
     fn on_message_delta(&mut self, data: Option<Value>) {
@@ -1181,11 +1184,18 @@ impl StreamEmitter {
 
     /// Handle a `message_stop` event.
     ///
-    /// Marks the stream finished and closes any content blocks still
-    /// marked open: emits one [`StreamEvent::PartStop`] for an open text
-    /// block, then one per open tool block, and resets both counters.
-    /// Guards against unterminated blocks when Anthropic ends the stream
-    /// without paired `content_block_stop` events.
+    /// Marks the stream finished, closes any content blocks still marked
+    /// open (one [`StreamEvent::PartStop`] for an open text block, then
+    /// one per open tool block, with both counters reset), and emits the
+    /// terminal [`StreamEvent::MessageStop`] that consumers rely on to
+    /// know the stream is complete. The closing `PartStop`s are pushed
+    /// first so the event order matches the documented protocol
+    /// (`PartStop* → MessageStop`).
+    ///
+    /// Setting `finished` here is what suppresses the synthetic
+    /// [`StreamEvent::MessageStop`] in [`finish`](Self::finish), so a
+    /// stream that delivered `message_stop` does not get a second
+    /// terminal event appended after the SSE stream ends.
     fn on_message_stop(&mut self) {
         self.finished = true;
         if self.text_part_open {
@@ -1196,16 +1206,18 @@ impl StreamEmitter {
         }
         self.tool_parts_open = 0;
         self.text_part_open = false;
+        self.push(StreamEvent::MessageStop);
     }
 
     /// Finalize the stream and return any remaining events.
     ///
     /// Drains the pending queue, then appends a single
     /// [`StreamEvent::MessageStop`] when the stream was started but no
-    /// `message_delta` / `message_stop` event has already marked it
-    /// finished. This covers streams that end without an explicit
-    /// terminal event; when one was already processed, the `finished`
-    /// flag suppresses the duplicate.
+    /// `message_stop` event has already emitted one (tracked by the
+    /// `finished` flag). This covers streams that end without an explicit
+    /// terminal event; when `message_stop` was processed, the synthetic
+    /// terminal is suppressed so the consumer sees exactly one
+    /// `MessageStop`.
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = self.drain();
         if self.started && !self.finished {
@@ -1678,9 +1690,37 @@ mod tests {
 
         em.on_message_stop();
         let events = em.drain();
-        // 1 for text + 2 for tools
-        assert_eq!(events.len(), 3);
-        assert!(events.iter().all(|e| matches!(e, StreamEvent::PartStop)));
+        // 1 PartStop for text + 2 for tools, then the terminal MessageStop.
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], StreamEvent::PartStop));
+        assert!(matches!(events[1], StreamEvent::PartStop));
+        assert!(matches!(events[2], StreamEvent::PartStop));
+        assert!(
+            matches!(events.last(), Some(StreamEvent::MessageStop)),
+            "message_stop must emit the terminal MessageStop after the PartStops: {events:?}"
+        );
+    }
+
+    #[test]
+    fn emitter_message_stop_then_finish_no_duplicate() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+
+        em.on_message_stop();
+        let after_stop = em.drain();
+        assert!(
+            after_stop
+                .iter()
+                .any(|e| matches!(e, StreamEvent::MessageStop))
+        );
+
+        let after_finish = em.finish();
+        assert!(
+            after_finish
+                .iter()
+                .all(|e| !matches!(e, StreamEvent::MessageStop)),
+            "finish() must not emit a second MessageStop after on_message_stop: {after_finish:?}"
+        );
     }
 
     #[test]

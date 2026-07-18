@@ -477,10 +477,13 @@ pub(crate) fn tighten_json_schema(schema: &serde_json::Value) -> serde_json::Val
 /// The walk descends into:
 /// - each value of an object's `properties` map (child object schemas),
 /// - an array schema's `items` subschema,
-/// - each member of `allOf` / `anyOf` / `oneOf` combinator arrays.
+/// - each member of `allOf` / `anyOf` / `oneOf` combinator arrays,
+/// - each named definition in a local `$defs` / `definitions` map.
 ///
 /// It does **not** descend into or rewrite:
-/// - `$ref` targets (not resolved — would need a registry),
+/// - `$ref` references themselves (not followed — would need a registry;
+///   but the definitions they point to under `$defs` / `definitions` *are*
+///   visited, so a local reference's target still gets tightened),
 /// - `if` / `then` / `else` conditional subschemas,
 /// - non-object typed schemas (`string`, `number`, `boolean`, …), which
 ///   are returned unchanged.
@@ -510,6 +513,18 @@ fn tighten_in_place(schema: &mut serde_json::Value) {
     for key in ["allOf", "anyOf", "oneOf"] {
         if let Some(arr) = obj.get_mut(key).and_then(serde_json::Value::as_array_mut) {
             for child in arr {
+                tighten_in_place(child);
+            }
+        }
+    }
+
+    // Recurse into local named definitions so a `$ref: "#/$defs/..."`
+    // target receives the same tightening. `$defs` is the Draft 2019-09+
+    // keyword; `definitions` is the older Draft 07 keyword. Both are
+    // object maps of subschemas keyed by definition name.
+    for key in ["$defs", "definitions"] {
+        if let Some(defs) = obj.get_mut(key).and_then(serde_json::Value::as_object_mut) {
+            for child in defs.values_mut() {
                 tighten_in_place(child);
             }
         }
@@ -1012,5 +1027,65 @@ mod tests {
         assert_eq!(tightened["additionalProperties"], false);
         // `required` becomes an empty array, not absent.
         assert_eq!(tightened["required"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn tighten_recurses_into_local_defs() {
+        // A property that $refs a local definition: the reference itself
+        // is not followed, but the definition under $defs must still be
+        // tightened so a strict-mode server accepts it.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "filter": {"$ref": "#/$defs/Filter"}
+            },
+            "$defs": {
+                "Filter": {
+                    "type": "object",
+                    "properties": {
+                        "lang": {"type": "string"},
+                        "limit": {"type": "number"}
+                    }
+                }
+            }
+        });
+        let tightened = tighten_json_schema(&schema);
+
+        // Top-level object: closed and fully required.
+        assert_eq!(tightened["additionalProperties"], false);
+        assert_eq!(tightened["required"], serde_json::json!(["filter"]));
+
+        // The $defs/Filter definition is tightened: closed, and its
+        // nested arguments are all required.
+        let filter = &tightened["$defs"]["Filter"];
+        assert_eq!(filter["additionalProperties"], false);
+        let required = filter["required"].as_array().unwrap();
+        assert_eq!(required.len(), 2);
+        let keys: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(keys.contains(&"lang"));
+        assert!(keys.contains(&"limit"));
+
+        // The $ref reference itself is left in place (not rewritten).
+        assert_eq!(tightened["properties"]["filter"]["$ref"], "#/$defs/Filter");
+    }
+
+    #[test]
+    fn tighten_recurses_into_legacy_definitions() {
+        // The Draft 07 keyword `definitions` should be walked the same way
+        // as `$defs`.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"$ref": "#/definitions/X"}},
+            "definitions": {
+                "X": {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}}
+                }
+            }
+        });
+        let tightened = tighten_json_schema(&schema);
+        let def = &tightened["definitions"]["X"];
+        assert_eq!(def["additionalProperties"], false);
+        assert_eq!(def["required"].as_array().unwrap().len(), 1);
     }
 }

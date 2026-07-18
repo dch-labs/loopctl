@@ -610,7 +610,11 @@ impl RequestBody {
                 ToolConstraint::Strict => (tools.map(convert_tools_strict), None),
                 #[cfg(feature = "grammar")]
                 ToolConstraint::Grammar(provider) => {
-                    (tools.map(convert_tools), Some(provider.grammar().to_string()))
+                    let has_tools = tools.is_some_and(|t| !t.is_empty());
+                    (
+                        tools.map(convert_tools),
+                        has_tools.then(|| provider.grammar().to_string()),
+                    )
                 }
             }
         };
@@ -672,8 +676,6 @@ fn convert_message(m: &Message) -> Value {
         Role::User => "user",
         Role::Assistant => "assistant",
     };
-
-    // Bucket parts by OpenAI category.
     let mut text_parts: Vec<&str> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
@@ -2053,5 +2055,37 @@ mod tests {
         // Under Grammar, no `strict: true` is emitted (that's Strict's path).
         let tools_arr = json["tools"].as_array().unwrap();
         assert!(tools_arr[0]["function"].get("strict").is_none());
+    }
+
+    #[cfg(feature = "grammar")]
+    #[test]
+    fn openai_grammar_without_tools_omits_guided_json() {
+        use crate::provider::grammar::JsonSchemaGrammar;
+        use crate::structured::ToolConstraint;
+
+        let msgs = vec![Message::user("hi")];
+        let grammar = std::sync::Arc::new(JsonSchemaGrammar::from_schemas(&[]));
+        let constraint = ToolConstraint::Grammar(grammar);
+
+        // No tools registered: guided_json must be absent so the model's
+        // free-text output is not forced into the (empty) tool grammar.
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &constraint);
+        let json = body.to_json(false);
+        assert!(
+            json.get("guided_json").is_none(),
+            "guided_json must be absent when no tools are registered"
+        );
+        assert!(
+            json.get("tools").is_none(),
+            "tools must be absent when none were supplied"
+        );
+
+        // Empty tool slice: same outcome — no guided_json, no tools.
+        let body = RequestBody::build("gpt-4o", &msgs, None, Some(&[]), None, &constraint);
+        let json = body.to_json(false);
+        assert!(
+            json.get("guided_json").is_none(),
+            "guided_json must be absent for an empty tool slice"
+        );
     }
 }

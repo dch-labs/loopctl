@@ -100,14 +100,26 @@ mod tests {
     #[test]
     fn json_schema_grammar_contains_each_tool_name() {
         let grammar = JsonSchemaGrammar::from_schemas(&sample_schemas());
-        let s = grammar.grammar();
+        let parsed: serde_json::Value =
+            serde_json::from_str(grammar.grammar()).expect("grammar must be valid JSON");
+
+        assert_eq!(parsed["type"], "object", "top-level must be an object");
+        assert_eq!(
+            parsed["additionalProperties"], false,
+            "top-level must reject unknown tools"
+        );
+
+        let properties = parsed["properties"]
+            .as_object()
+            .expect("top-level must have a properties map");
+        let keys: Vec<&str> = properties.keys().map(String::as_str).collect();
         assert!(
-            s.contains("search"),
-            "grammar should reference the search tool: {s}"
+            keys.contains(&"search"),
+            "tool names must be keys of the properties map, got: {keys:?}"
         );
         assert!(
-            s.contains("calc"),
-            "grammar should reference the calc tool: {s}"
+            keys.contains(&"calc"),
+            "tool names must be keys of the properties map, got: {keys:?}"
         );
     }
 

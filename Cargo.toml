@@ -52,6 +52,7 @@ deepseek = ["providers", "openai"]
 grok = ["providers", "openai"]
 gemini = ["providers"]
 zai = ["providers", "anthropic"]
+grammar = ["providers"]
 
 [[example]]
 name = "hello-cli"

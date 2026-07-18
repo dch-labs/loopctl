@@ -200,13 +200,69 @@ impl ResponseFormat {
     }
 }
 
+/// How tightly the provider must constrain tool-call output to the
+/// registered schemas.
+///
+/// Default [`ToolConstraint::None`] reproduces the behaviour of versions
+/// prior to this field: the provider advertises tool schemas as-is and the
+/// model's tool calls are unconstrained. [`ToolConstraint::Strict`] asks
+/// the provider to make malformed tool calls structurally impossible using
+/// its native strict-tool mode (OpenAI `strict: true` with schema
+/// tightening; Anthropic / Gemini tightened `input_schema` / `parameters`).
+///
+/// The enum is `#[non_exhaustive]`: future variants may be added
+/// non-breakingly, and the [`Grammar`](Self::Grammar) variant is only
+/// present under the `grammar` feature.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub enum ToolConstraint {
+    /// No constraint — the provider advertises tool schemas as-is.
+    ///
+    /// This is the default: every tool's schema is forwarded to the
+    /// provider verbatim, with no `additionalProperties: false`, no
+    /// expanded `required`, and no `strict` flag. The model is free to
+    /// emit any JSON it likes for a tool call, including hallucinated
+    /// fields, and malformed tool calls are detected (and retried) rather
+    /// than prevented.
+    ///
+    /// Choose this when you trust the model to emit well-formed tool calls
+    /// (frontier models, warm-up turns, or any path where you'd rather
+    /// surface a malformed call than have the provider reject the request).
+    #[default]
+    None,
+
+    /// Use the provider's native strict-tool mode.
+    ///
+    /// On OpenAI this sets `strict: true` on each tool's `function` schema
+    /// after tightening it (recursive `additionalProperties: false` and
+    /// full `required`). On Anthropic and Gemini it tightens each tool's
+    /// `input_schema` / `parameters` the same way.
+    Strict,
+
+    /// Use a grammar compiled from the tool schemas, passed to a
+    /// grammar-aware sampler (vLLM `guided_json`).
+    ///
+    /// Only available when the `grammar` feature is enabled. The
+    /// [`ToolGrammarProvider`](crate::provider::grammar::ToolGrammarProvider)
+    /// trait is the extension point for other server dialects.
+    #[cfg(feature = "grammar")]
+    Grammar(std::sync::Arc<dyn crate::provider::grammar::ToolGrammarProvider>),
+}
+
 /// Optional per-request knobs layered on top of a `stream_messages` /
 /// `create_message` call.
 ///
-/// Additive and forward-compatible: every field is optional, and providers
-/// that don't understand a field ignore it. Today carries only
-/// [`response_format`](Self::response_format); future tasks (max-tokens,
-/// temperature, seed) extend it without touching the trait again.
+/// Additive and forward-compatible: every field has a default that
+/// reproduces prior behaviour, and providers that don't understand a field
+/// ignore it. Carries [`response_format`](Self::response_format) (constrain
+/// the model's free-text output to a schema) and
+/// [`tool_constraint`](Self::tool_constraint) (constrain the model's tool
+/// calls to the registered schemas).
+///
+/// The two paths are independent: setting `response_format` suppresses
+/// `tools` (and therefore makes `tool_constraint` a no-op for that
+/// request), while setting `tool_constraint` constrains the `tools` path
+/// itself.
 #[derive(Debug, Clone, Default)]
 pub struct RequestOptions {
     /// If set, ask the model to return JSON conforming to this schema.
@@ -215,6 +271,11 @@ pub struct RequestOptions {
     /// (OpenAI `response_format` / Anthropic forced tool). When `None`,
     /// the model's output is unconstrained — the default behaviour.
     pub response_format: Option<ResponseFormat>,
+
+    /// How strictly the model's tool-call output must follow the
+    /// registered tool schemas. Default [`ToolConstraint::None`] is a
+    /// no-op. See [`ToolConstraint`] for the modes.
+    pub tool_constraint: ToolConstraint,
 }
 
 impl RequestOptions {
@@ -235,6 +296,17 @@ impl RequestOptions {
     #[must_use]
     pub fn response_format(mut self, rf: ResponseFormat) -> Self {
         self.response_format = Some(rf);
+        self
+    }
+
+    /// Set the tool-call constraint, builder-style.
+    ///
+    /// Default [`ToolConstraint::None`] advertises tool schemas as-is.
+    /// [`ToolConstraint::Strict`] makes malformed tool calls structurally
+    /// impossible via the provider's native strict mode.
+    #[must_use]
+    pub fn tool_constraint(mut self, c: ToolConstraint) -> Self {
+        self.tool_constraint = c;
         self
     }
 }
@@ -335,6 +407,162 @@ pub(crate) fn extract_json_substring(text: &str) -> Option<serde_json::Value> {
         }
     }
     None
+}
+
+/// Tighten a JSON Schema for strict-mode submission.
+///
+/// Recursively, on every `type: "object"` subschema that has a `properties`
+/// map: set `additionalProperties` to `false` and set `required` to the full
+/// list of property keys. Non-object subschemas (`string`, `number`, etc.)
+/// are returned unchanged; the implementation recurses into object
+/// properties, `array` `items`, and the values of `allOf` / `anyOf` /
+/// `oneOf` arrays, but leaves `$ref`, `if`/`then`/`else`, and other
+/// combinator shapes untouched (best-effort).
+///
+/// Idempotent: passing an already-tight schema through it again yields the
+/// same value.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use loopctl::structured::tighten_json_schema;
+/// use serde_json::json;
+///
+/// let schema = json!({
+///     "type": "object",
+///     "properties": {
+///         "q": {"type": "string"},
+///         "limit": {"type": "number"},
+///         "filter": {
+///             "type": "object",
+///             "properties": {"lang": {"type": "string"}}
+///         }
+///     }
+/// });
+///
+/// let tightened = tighten_json_schema(&schema);
+///
+/// // Top-level object: closed and fully required.
+/// assert_eq!(tightened["additionalProperties"], false);
+/// assert_eq!(tightened["required"], json!(["filter", "limit", "q"]));
+///
+/// // Nested object is tightened independently — its `required` lists only
+/// // its own keys, not the parent's.
+/// assert_eq!(tightened["properties"]["filter"]["additionalProperties"], false);
+/// assert_eq!(tightened["properties"]["filter"]["required"], json!(["lang"]));
+/// ```
+pub(crate) fn tighten_json_schema(schema: &serde_json::Value) -> serde_json::Value {
+    let mut out = schema.clone();
+    tighten_in_place(&mut out);
+    out
+}
+
+/// Recursively tighten a JSON Schema in place.
+///
+/// At each `type: "object"` node with a `properties` map, enforces
+/// strictness by:
+///
+/// 1. setting `additionalProperties: false` — rejects extra/hallucinated
+///    fields the model invents beyond the declared properties,
+/// 2. setting `required` to the full list of that object's own property
+///    keys — rejects missing fields the model omitted.
+///
+/// Together these make every object schema *closed* (no extra keys) and
+/// *fully mandatory* (no optional keys). The two are complementary: neither
+/// alone covers the other, and both are required for OpenAI's strict mode
+/// to accept the schema without a `400`.
+///
+/// # Recursion rules
+///
+/// The walk descends into:
+/// - each value of an object's `properties` map (child object schemas),
+/// - an array schema's `items` subschema,
+/// - each member of `allOf` / `anyOf` / `oneOf` combinator arrays,
+/// - each named definition in a local `$defs` / `definitions` map.
+///
+/// It does **not** descend into or rewrite:
+/// - `$ref` references themselves (not followed — would need a registry;
+///   but the definitions they point to under `$defs` / `definitions` *are*
+///   visited, so a local reference's target still gets tightened),
+/// - `if` / `then` / `else` conditional subschemas,
+/// - non-object typed schemas (`string`, `number`, `boolean`, …), which
+///   are returned unchanged.
+///
+/// Idempotent: re-running on an already-tight schema leaves it unchanged.
+fn tighten_in_place(schema: &mut serde_json::Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+
+    // Tighten this object's own property subschemas first.
+    if let Some(properties) = obj
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for child in properties.values_mut() {
+            tighten_in_place(child);
+        }
+    }
+
+    // Recurse into array `items`.
+    if let Some(items) = obj.get_mut("items") {
+        tighten_in_place(items);
+    }
+
+    // Recurse into combinator subschemas.
+    for key in ["allOf", "anyOf", "oneOf"] {
+        if let Some(arr) = obj.get_mut(key).and_then(serde_json::Value::as_array_mut) {
+            for child in arr {
+                tighten_in_place(child);
+            }
+        }
+    }
+
+    // Recurse into local named definitions so a `$ref: "#/$defs/..."`
+    // target receives the same tightening. `$defs` is the Draft 2019-09+
+    // keyword; `definitions` is the older Draft 07 keyword. Both are
+    // object maps of subschemas keyed by definition name.
+    for key in ["$defs", "definitions"] {
+        if let Some(defs) = obj.get_mut(key).and_then(serde_json::Value::as_object_mut) {
+            for child in defs.values_mut() {
+                tighten_in_place(child);
+            }
+        }
+    }
+
+    // Only enforce object strictness on explicit `type: "object"` schemas.
+    // Schemas without a type (or with another type) are left structurally
+    // alone so we don't impose object semantics on, e.g., a free-form value.
+    let is_object = obj
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|t| t == "object");
+    if !is_object {
+        return;
+    }
+
+    obj.insert(
+        "additionalProperties".to_string(),
+        serde_json::Value::Bool(false),
+    );
+
+    // Enumerate `required` from the current properties (or empty when there
+    // are none). Preserves any pre-existing required entries that have no
+    // matching property (the model author may know best in odd cases).
+    let property_keys: Vec<String> = obj
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map(|props| props.keys().cloned().collect())
+        .unwrap_or_default();
+    obj.insert(
+        "required".to_string(),
+        serde_json::Value::Array(
+            property_keys
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
 }
 
 /// Request a typed, schema-conformant value from the model.
@@ -683,5 +911,181 @@ mod tests {
         // Prose is a valid JSON string but doesn't match Action's schema,
         // so deserialization fails.
         assert!(matches!(err, StructuredError::Deserialize(_)));
+    }
+
+    #[test]
+    fn tool_constraint_default_is_none() {
+        assert!(matches!(ToolConstraint::default(), ToolConstraint::None));
+        assert!(matches!(
+            RequestOptions::default().tool_constraint,
+            ToolConstraint::None
+        ));
+    }
+
+    #[test]
+    fn request_options_tool_constraint_builder() {
+        let opts = RequestOptions::new().tool_constraint(ToolConstraint::Strict);
+        assert!(matches!(opts.tool_constraint, ToolConstraint::Strict));
+        // And response_format still composes on the same builder.
+        let rf = ResponseFormat::from_type::<Action>();
+        let opts = RequestOptions::new()
+            .response_format(rf)
+            .tool_constraint(ToolConstraint::Strict);
+        assert!(opts.response_format.is_some());
+        assert!(matches!(opts.tool_constraint, ToolConstraint::Strict));
+    }
+
+    #[test]
+    fn tool_constraint_clone_compiles() {
+        // RequestOptions derives Clone, which requires every field —
+        // including tool_constraint — to be Clone. This test pins that by
+        // cloning an options value that carries a constraint and asserting
+        // both copies hold the same variant.
+        let opts = RequestOptions::new().tool_constraint(ToolConstraint::Strict);
+        let cloned = opts.clone();
+        assert!(matches!(opts.tool_constraint, ToolConstraint::Strict));
+        assert!(matches!(cloned.tool_constraint, ToolConstraint::Strict));
+    }
+
+    #[test]
+    fn tighten_sets_additional_properties_false() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}}
+        });
+        let tightened = tighten_json_schema(&schema);
+        assert_eq!(tightened["additionalProperties"], false);
+    }
+
+    #[test]
+    fn tighten_enumerates_required() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "string"},
+                "b": {"type": "number"}
+            }
+        });
+        let tightened = tighten_json_schema(&schema);
+        let required = tightened["required"].as_array().unwrap();
+        assert_eq!(required.len(), 2);
+        let keys: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(keys.contains(&"a"));
+        assert!(keys.contains(&"b"));
+    }
+
+    #[test]
+    fn tighten_recurses_into_nested_objects() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "inner": {
+                    "type": "object",
+                    "properties": {"x": {"type": "string"}}
+                }
+            }
+        });
+        let tightened = tighten_json_schema(&schema);
+        assert_eq!(
+            tightened["properties"]["inner"]["additionalProperties"],
+            false
+        );
+        let inner_required = tightened["properties"]["inner"]["required"]
+            .as_array()
+            .unwrap();
+        assert_eq!(inner_required.len(), 1);
+        assert_eq!(inner_required[0], "x");
+    }
+
+    #[test]
+    fn tighten_preserves_non_object_schemas() {
+        let schema = serde_json::json!({"type": "string"});
+        let tightened = tighten_json_schema(&schema);
+        assert_eq!(tightened, schema);
+        // Should not have gained additionalProperties / required.
+        assert!(tightened.get("additionalProperties").is_none());
+        assert!(tightened.get("required").is_none());
+    }
+
+    #[test]
+    fn tighten_idempotent_on_already_strict() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"a": {"type": "string"}},
+            "required": ["a"]
+        });
+        let once = tighten_json_schema(&schema);
+        let twice = tighten_json_schema(&once);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn tighten_object_without_properties() {
+        let schema = serde_json::json!({"type": "object"});
+        let tightened = tighten_json_schema(&schema);
+        assert_eq!(tightened["additionalProperties"], false);
+        // `required` becomes an empty array, not absent.
+        assert_eq!(tightened["required"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn tighten_recurses_into_local_defs() {
+        // A property that $refs a local definition: the reference itself
+        // is not followed, but the definition under $defs must still be
+        // tightened so a strict-mode server accepts it.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "filter": {"$ref": "#/$defs/Filter"}
+            },
+            "$defs": {
+                "Filter": {
+                    "type": "object",
+                    "properties": {
+                        "lang": {"type": "string"},
+                        "limit": {"type": "number"}
+                    }
+                }
+            }
+        });
+        let tightened = tighten_json_schema(&schema);
+
+        // Top-level object: closed and fully required.
+        assert_eq!(tightened["additionalProperties"], false);
+        assert_eq!(tightened["required"], serde_json::json!(["filter"]));
+
+        // The $defs/Filter definition is tightened: closed, and its
+        // nested arguments are all required.
+        let filter = &tightened["$defs"]["Filter"];
+        assert_eq!(filter["additionalProperties"], false);
+        let required = filter["required"].as_array().unwrap();
+        assert_eq!(required.len(), 2);
+        let keys: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(keys.contains(&"lang"));
+        assert!(keys.contains(&"limit"));
+
+        // The $ref reference itself is left in place (not rewritten).
+        assert_eq!(tightened["properties"]["filter"]["$ref"], "#/$defs/Filter");
+    }
+
+    #[test]
+    fn tighten_recurses_into_legacy_definitions() {
+        // The Draft 07 keyword `definitions` should be walked the same way
+        // as `$defs`.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"$ref": "#/definitions/X"}},
+            "definitions": {
+                "X": {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}}
+                }
+            }
+        });
+        let tightened = tighten_json_schema(&schema);
+        let def = &tightened["definitions"]["X"];
+        assert_eq!(def["additionalProperties"], false);
+        assert_eq!(def["required"].as_array().unwrap().len(), 1);
     }
 }

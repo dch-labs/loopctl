@@ -53,9 +53,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   `responseMimeType` + `responseSchema`).
 - `ToolOutput::structured<T>`, `structured_value()`, and
   `structured_as::<T>()` for typed tool results that round-trip through JSON.
+- `ToolConstraint` enum (`structured` module, `#[non_exhaustive]`,
+  default `None`) and `RequestOptions::tool_constraint` field + builder for
+  constraining the model's tool-call output to the registered tool schemas.
+  `ToolConstraint::Strict` makes malformed tool calls structurally impossible
+  via the provider's native strict-tool mode; `ToolConstraint::Grammar`
+  (requires the new `grammar` feature) compiles the schemas into a grammar
+  for a grammar-aware sampler (vLLM `guided_json`).
+- `ToolGrammarProvider` trait and `JsonSchemaGrammar` default impl
+  (`provider::grammar` module, `grammar` feature): the extension point for
+  compiling a tool registry's schemas into a sampler grammar.
+- `grammar` feature flag (depends on `providers`): opt-in grammar / sampler
+  support for the `Grammar` mode of `ToolConstraint`.
 
 ### Changed
 
+- `OpenAiClient`, `AnthropicClient`, and `GeminiClient` now honor
+  `RequestOptions::tool_constraint`. Under `Strict`, each tool's schema is
+  tightened (recursive `additionalProperties: false` and full `required`);
+  OpenAI additionally sets `strict: true` on each `function` entry. Under
+  `Grammar`, the OpenAI client injects `guided_json` for vLLM-style
+  grammar-aware samplers. Default `ToolConstraint::None` reproduces prior
+  behaviour exactly; when `response_format` is also set, it wins and
+  `tool_constraint` is ignored.
 - Both sequential and parallel tool dispatch now check the cancel signal
   between calls. Previously, a Ctrl-C during a multi-tool batch was only
   honored at the next turn boundary; now it aborts the remaining calls in the

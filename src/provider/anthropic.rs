@@ -33,6 +33,8 @@ use crate::stream::{
     DeltaPart, IndexedDelta, MessageDelta, MessageDeltaPayload, MessageMetadata, MessageStart,
     PartStart, StreamEvent, StreamStopReason, Usage,
 };
+use crate::structured::ToolConstraint;
+use crate::structured::tighten_json_schema;
 use crate::tool::ToolSchema;
 
 // ==================================================
@@ -259,13 +261,16 @@ impl ApiClient for AnthropicClient {
         let model = self.model.lock().clone();
         let rf = options.response_format.as_ref();
         let body = build_request_body(
-            &model,
-            &messages,
-            system.as_deref(),
-            tools.as_deref(),
+            &RequestBodySpec {
+                model: &model,
+                messages: &messages,
+                system: system.as_deref(),
+                tools: tools.as_deref(),
+                response_format: rf,
+                tool_constraint: &options.tool_constraint,
+            },
             true,
             self.max_tokens,
-            rf,
         );
         let url = self.messages_url();
         let api_key = self.api_key.clone();
@@ -299,13 +304,16 @@ impl ApiClient for AnthropicClient {
         let model = self.model.lock().clone();
         let rf = options.response_format.as_ref();
         let body = build_request_body(
-            &model,
-            &messages,
-            system.as_deref(),
-            tools.as_deref(),
+            &RequestBodySpec {
+                model: &model,
+                messages: &messages,
+                system: system.as_deref(),
+                tools: tools.as_deref(),
+                response_format: rf,
+                tool_constraint: &options.tool_constraint,
+            },
             false,
             self.max_tokens,
-            rf,
         );
         let url = self.messages_url();
         Box::pin(async move {
@@ -499,19 +507,104 @@ impl AnthropicClientBuilder {
 // Request body construction
 // ==================================================
 
+/// The per-request inputs to [`build_request_body`].
+///
+/// Carries the request-shape knobs: the model, conversation, tools, and
+/// the structured-output / tool-call constraints. `stream` and `max_tokens`
+/// are passed separately because they are per-call / per-client rather
+/// than per-request-shape.
+struct RequestBodySpec<'a> {
+    /// The model identifier sent as the top-level `model` field of the
+    /// Messages API request body.
+    ///
+    /// Copied from the client's current model (which may be hot-swapped at
+    /// runtime via [`ApiClient::set_model`]). Anthropic uses this to
+    /// dispatch to the correct model; it is echoed back on the response.
+    ///
+    /// [`ApiClient::set_model`]: crate::api::ApiClient::set_model
+    model: &'a str,
+
+    /// The conversation history, serialized into the top-level `messages`
+    /// array via [`convert_message`].
+    ///
+    /// Each [`Message`] becomes an object with `role` (`"user"` or
+    /// `"assistant"`) and `content` (a plain string for single-text
+    /// messages, or an array of `text` / `tool_use` / `tool_result`
+    /// blocks for mixed content).
+    messages: &'a [Message],
+
+    /// An optional system prompt, emitted as the top-level `system`
+    /// string field (not a `system` role message — Anthropic keeps
+    /// system context separate from the `messages` array).
+    ///
+    /// When `None`, the field is set to an empty string rather than
+    /// omitted, matching Anthropic's expectation of a present `system`
+    /// field.
+    system: Option<&'a str>,
+
+    /// The registered tool schemas the model may invoke.
+    ///
+    /// When `Some`, each [`ToolSchema`] becomes a `tools` array entry
+    /// carrying `name`, `description`, and `input_schema`. When
+    /// `tool_constraint` is `Strict`, each `input_schema` is tightened
+    /// before submission. When `None`, the `tools` field is omitted from
+    /// the body entirely (not sent as `null`).
+    ///
+    /// Suppressed when `response_format` is set; see that field.
+    tools: Option<&'a [ToolSchema]>,
+
+    /// If set, requests a schema-conformant *result* rather than free-form
+    /// tool use.
+    ///
+    /// Anthropic has no native `response_format`; the structured-output
+    /// path is implemented by synthesizing a single forced tool whose
+    /// `input_schema` is `response_format.schema`, and emitting
+    /// `tool_choice: { type: "tool", name: <rf.name> }` so the model
+    /// must fill in that tool. The model's structured payload then lands
+    /// in the assistant `tool_use` block's `input` field.
+    ///
+    /// When set, `tools` is replaced by this single forced tool — caller-
+    /// supplied tools are not sent — and `tool_constraint` has no effect.
+    response_format: Option<&'a crate::structured::ResponseFormat>,
+
+    /// How strictly the model's tool-call output must follow the schemas.
+    ///
+    /// [`ToolConstraint::None`] forwards each tool's `input_schema`
+    /// verbatim. [`ToolConstraint::Strict`] tightens each `input_schema`
+    /// (recursive `additionalProperties: false` and full `required`)
+    /// before submission; no `tool_choice` is emitted, so the model is
+    /// free to choose whether to call a tool — only the *shape* of any
+    /// call is constrained.
+    ///
+    /// Has no effect when `response_format` is set.
+    ///
+    /// [`ToolConstraint::None`]: crate::structured::ToolConstraint::None
+    /// [`ToolConstraint::Strict`]: crate::structured::ToolConstraint::Strict
+    tool_constraint: &'a ToolConstraint,
+}
+
 /// Build the JSON request body for the Anthropic Messages API.
 ///
 /// Each [`Message`] is serialized via [`convert_message`], then assembled
 /// with the model, `max_tokens`, system prompt, and optional tools.
-fn build_request_body(
-    model: &str,
-    messages: &[Message],
-    system: Option<&str>,
-    tools: Option<&[ToolSchema]>,
-    stream: bool,
-    max_tokens: u32,
-    response_format: Option<&crate::structured::ResponseFormat>,
-) -> Value {
+///
+/// Tool-call constraint:
+/// - When `response_format` is set, synthesizes a single forced tool
+///   (`tool_choice` forced); `tool_constraint` is ignored in that case.
+/// - Otherwise, when `tool_constraint` is `Strict`, each tool's
+///   `input_schema` is tightened (`additionalProperties: false` and full
+///   `required`) via [`convert_tools`] before submission. No `tool_choice`
+///   is emitted — `Strict` constrains the call's shape, not its selection.
+fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32) -> Value {
+    let RequestBodySpec {
+        model,
+        messages,
+        system,
+        tools,
+        response_format,
+        tool_constraint,
+    } = spec;
+
     let msgs: Vec<Value> = messages.iter().map(convert_message).collect();
     let (tools_val, tool_choice) = if let Some(rf) = response_format {
         let forced_tool = serde_json::json!({
@@ -525,7 +618,8 @@ fn build_request_body(
         });
         (Some(vec![forced_tool]), Some(choice))
     } else {
-        (tools.map(convert_tools), None)
+        let strict = matches!(tool_constraint, ToolConstraint::Strict);
+        (tools.map(|t| convert_tools(t, strict)), None)
     };
 
     let mut body = serde_json::json!({
@@ -537,14 +631,12 @@ fn build_request_body(
         "tools": tools_val,
     });
 
-    // Remove `tools` if None so we don't send a null field.
     if tools_val.is_none() {
         if let Some(obj) = body.as_object_mut() {
             obj.remove("tools");
         }
     }
 
-    // Inject tool_choice when forcing a structured-output tool.
     if let Some(choice) = tool_choice {
         if let Some(obj) = body.as_object_mut() {
             obj.insert("tool_choice".to_string(), choice);
@@ -629,17 +721,28 @@ fn convert_message(m: &Message) -> Value {
 /// `input_schema` is passed through verbatim from the framework's schema (a
 /// JSON Schema Draft 07 object), since Anthropic validates it server-side.
 ///
+/// When `strict` is `true`, each `input_schema` is first tightened
+/// (recursive `additionalProperties: false` and full `required`) so the
+/// server-side validation enforces the strict shape. This is the
+/// [`ToolConstraint::Strict`] path for Anthropic, which has no native
+/// per-tool strict flag.
+///
 /// When structured output is active (`response_format` set), this function is
 /// not called — instead, [`build_request_body`] synthesizes a single forced
 /// tool whose `input_schema` is the target `ResponseFormat::schema`.
-fn convert_tools(tools: &[ToolSchema]) -> Vec<Value> {
+fn convert_tools(tools: &[ToolSchema], strict: bool) -> Vec<Value> {
     tools
         .iter()
         .map(|t| {
+            let input_schema = if strict {
+                tighten_json_schema(&t.input_schema)
+            } else {
+                t.input_schema.clone()
+            };
             serde_json::json!({
                 "name": t.tool,
                 "description": &t.description,
-                "input_schema": t.input_schema.clone(),
+                "input_schema": input_schema,
             })
         })
         .collect()
@@ -789,17 +892,70 @@ impl SseReader {
 /// - Emitting the final [`MessageDelta`] with stop reason and usage.
 #[derive(Default)]
 struct StreamEmitter {
+    /// Whether [`MessageStart`] has been emitted for the current stream.
+    ///
+    /// The Anthropic stream opens with one `message_start` event; the
+    /// emitter forwards it once as a [`StreamEvent::MessageStart`] and
+    /// ignores any subsequent duplicates.
     started: bool,
+
+    /// Whether a text content block is currently open.
+    ///
+    /// Anthropic signals the start of a text block with
+    /// `content_block_start` (`type: "text"`) and its end with
+    /// `content_block_stop`. This flag tracks the open state so the
+    /// matching `content_block_stop` emits exactly one
+    /// [`StreamEvent::PartStop`].
     text_part_open: bool,
+
+    /// Number of tool-use content blocks currently open.
+    ///
+    /// Anthropic opens a tool block with `content_block_start`
+    /// (`type: "tool_use"`) and closes it with `content_block_stop`.
+    /// Multiple tool blocks may be open in sequence; this counter drives
+    /// the matching `PartStop` emissions (one per open block) on
+    /// `message_stop`.
     tool_parts_open: usize,
-    /// Index of the currently open tool block (from the API's `content_block_start`).
+
+    /// Index of the tool block most recently opened by
+    /// `content_block_start`, used to route subsequent
+    /// `input_json_delta` fragments.
+    ///
+    /// The deltas themselves do not carry an index, so the emitter
+    /// remembers the index from the surrounding block-start event and
+    /// emits each [`DeltaPart::InputJson`] at that index. Falls back to
+    /// the text index when no tool block is open (defensive — should not
+    /// happen on a well-formed stream).
+    ///
+    /// [`DeltaPart::InputJson`]: crate::stream::DeltaPart::InputJson
     current_tool_index: Option<usize>,
+
+    /// Whether the terminal stop signal has been processed.
+    ///
+    /// Set by either `message_delta` (which carries the stop reason and
+    /// usage) or `message_stop`. Guards against emitting the final
+    /// [`StreamEvent::MessageDelta`] twice when both events arrive, and
+    /// against `finish` appending a spurious [`StreamEvent::MessageStop`]
+    /// after the stream already terminated.
     finished: bool,
+
+    /// Buffered [`StreamEvent`]s waiting to be yielded to the consumer.
+    ///
+    /// All `on_*` handlers push onto this queue; the stream loop drains it
+    /// after each SSE event so events are yielded promptly rather than
+    /// held until stream end. Drained by [`drain`](Self::drain).
     pending: Vec<StreamEvent>,
 }
 
 impl StreamEmitter {
-    /// Process a single SSE event, appending events to the internal queue.
+    /// Dispatch a single SSE event to the matching handler by type.
+    ///
+    /// `event_type` is the value of the Anthropic `event:` line
+    /// (`message_start`, `content_block_start`, `content_block_delta`,
+    /// `content_block_stop`, `message_delta`, `message_stop`); `data` is
+    /// the parsed JSON payload of the paired `data:` line, or `None` when
+    /// the payload was absent or failed to parse. Unknown event types are
+    /// ignored. Any events produced are appended to the pending queue.
     fn process_event(&mut self, event_type: &str, data: Option<Value>) {
         match event_type {
             "message_start" => self.on_message_start(data.as_ref()),
@@ -812,6 +968,14 @@ impl StreamEmitter {
         }
     }
 
+    /// Handle a `message_start` event.
+    ///
+    /// On the first call, reads the message `id` and `model` from
+    /// `/message/id` and `/message/model` and emits a
+    /// [`StreamEvent::MessageStart`]. No-ops on subsequent calls (the
+    /// `started` flag guards against duplicate emissions). Missing fields
+    /// default to empty strings rather than erroring, so a malformed
+    /// `message_start` still produces a usable event.
     fn on_message_start(&mut self, data: Option<&Value>) {
         if self.started {
             return;
@@ -841,6 +1005,19 @@ impl StreamEmitter {
         }));
     }
 
+    /// Handle a `content_block_start` event.
+    ///
+    /// Reads the block `type` at `/content_block/type` and the block
+    /// `index` at `/index` (defaulting to 0 when absent or non-numeric).
+    /// For a `tool_use` block, emits a [`StreamEvent::PartStart`] carrying
+    /// a [`MessagePart::ToolCall`] (with `id` and `name` from
+    /// `/content_block/id` and `/content_block/name`, `input` left null
+    /// until the deltas arrive), records the block's index as the current
+    /// tool index, and increments the open-tool counter. For a `text`
+    /// block, marks the text part open and emits a `PartStart` at the text
+    /// index. Other block types are ignored.
+    ///
+    /// [`MessagePart::ToolCall`]: crate::message::MessagePart::ToolCall
     fn on_block_start(&mut self, data: Option<Value>) {
         let Some(v) = data else { return };
         let block_type = v.pointer("/content_block/type").and_then(Value::as_str);
@@ -885,6 +1062,18 @@ impl StreamEmitter {
         }
     }
 
+    /// Handle a `content_block_delta` event.
+    ///
+    /// Dispatches on `/delta/type`. A `text_delta` emits a
+    /// [`DeltaPart::Text`] at the text index (skipped when the text
+    /// fragment is empty). An `input_json_delta` emits a
+    /// [`DeltaPart::InputJson`] at the current tool index carrying the
+    /// `/delta/partial_json` fragment, so the caller can accumulate the
+    /// full tool-call arguments across deltas. Empty fragments are
+    /// skipped. Other delta types are ignored.
+    ///
+    /// [`DeltaPart::Text`]: crate::stream::DeltaPart::Text
+    /// [`DeltaPart::InputJson`]: crate::stream::DeltaPart::InputJson
     fn on_block_delta(&mut self, data: Option<Value>) {
         let Some(v) = data else { return };
         let delta_type = v.pointer("/delta/type").and_then(Value::as_str);
@@ -922,6 +1111,15 @@ impl StreamEmitter {
         }
     }
 
+    /// Handle a `content_block_stop` event.
+    ///
+    /// Closes the currently open content block. If a text block is open,
+    /// clears the flag and emits a [`StreamEvent::PartStop`]. Otherwise,
+    /// if one or more tool blocks are open, decrements the counter,
+    /// clears the current tool index, and emits a single `PartStop` for
+    /// the block that just closed. The `data` payload is unused (Anthropic
+    /// does not carry useful information on this event beyond the
+    /// implicit close).
     fn on_block_stop(&mut self, _data: Option<Value>) {
         if self.text_part_open {
             self.text_part_open = false;
@@ -933,6 +1131,22 @@ impl StreamEmitter {
         }
     }
 
+    /// Handle a `message_delta` event carrying the terminal stop reason
+    /// and usage.
+    ///
+    /// Reads `/delta/stop_reason` (mapped via
+    /// [`StreamStopReason::from_api_str`], defaulting to `EndTurn` on an
+    /// unrecognized value) and `/usage/input_tokens` +
+    /// `/usage/output_tokens` (defaulting to 0; the usage event is only
+    /// attached when at least one is non-zero). Emits a single
+    /// [`StreamEvent::MessageDelta`] with both.
+    ///
+    /// This handler does not mark the stream finished — that is the job of
+    /// [`on_message_stop`](Self::on_message_stop), which Anthropic sends
+    /// after `message_delta`. The `finished` guard here only defends
+    /// against an out-of-order stream where `message_stop` arrived first.
+    ///
+    /// [`StreamStopReason::from_api_str`]: crate::stream::StreamStopReason::from_api_str
     fn on_message_delta(&mut self, data: Option<Value>) {
         if self.finished {
             return;
@@ -968,9 +1182,22 @@ impl StreamEmitter {
         }));
     }
 
+    /// Handle a `message_stop` event.
+    ///
+    /// Marks the stream finished, closes any content blocks still marked
+    /// open (one [`StreamEvent::PartStop`] for an open text block, then
+    /// one per open tool block, with both counters reset), and emits the
+    /// terminal [`StreamEvent::MessageStop`] that consumers rely on to
+    /// know the stream is complete. The closing `PartStop`s are pushed
+    /// first so the event order matches the documented protocol
+    /// (`PartStop* → MessageStop`).
+    ///
+    /// Setting `finished` here is what suppresses the synthetic
+    /// [`StreamEvent::MessageStop`] in [`finish`](Self::finish), so a
+    /// stream that delivered `message_stop` does not get a second
+    /// terminal event appended after the SSE stream ends.
     fn on_message_stop(&mut self) {
         self.finished = true;
-        // Close any remaining open parts.
         if self.text_part_open {
             self.push(StreamEvent::PartStop);
         }
@@ -979,9 +1206,18 @@ impl StreamEmitter {
         }
         self.tool_parts_open = 0;
         self.text_part_open = false;
+        self.push(StreamEvent::MessageStop);
     }
 
-    /// Emit the terminal [`MessageStop`] if the stream was started.
+    /// Finalize the stream and return any remaining events.
+    ///
+    /// Drains the pending queue, then appends a single
+    /// [`StreamEvent::MessageStop`] when the stream was started but no
+    /// `message_stop` event has already emitted one (tracked by the
+    /// `finished` flag). This covers streams that end without an explicit
+    /// terminal event; when `message_stop` was processed, the synthetic
+    /// terminal is suppressed so the consumer sees exactly one
+    /// `MessageStop`.
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = self.drain();
         if self.started && !self.finished {
@@ -995,6 +1231,11 @@ impl StreamEmitter {
         std::mem::take(&mut self.pending)
     }
 
+    /// Append an event to the pending queue.
+    ///
+    /// Single write point: every `on_*` handler routes through here so the
+    /// queue is the only place events accumulate. The stream loop reads
+    /// them back via [`drain`](Self::drain).
     fn push(&mut self, ev: StreamEvent) {
         self.pending.push(ev);
     }
@@ -1013,13 +1254,16 @@ mod tests {
     fn request_body_user_text_single_string() {
         let msgs = vec![Message::user("hello")];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
 
         let messages = body["messages"].as_array().unwrap();
@@ -1032,13 +1276,16 @@ mod tests {
     fn request_body_includes_system() {
         let msgs = vec![Message::user("hi")];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            Some("be brief"),
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: Some("be brief"),
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
         assert_eq!(body["system"], "be brief");
     }
@@ -1047,13 +1294,16 @@ mod tests {
     fn request_body_system_empty_when_none() {
         let msgs = vec![Message::user("hi")];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
         assert_eq!(body["system"], "");
     }
@@ -1062,13 +1312,16 @@ mod tests {
     fn request_body_model() {
         let msgs = vec![Message::user("hi")];
         let body = build_request_body(
-            "claude-sonnet-4",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-sonnet-4",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
         assert_eq!(body["model"], "claude-sonnet-4");
     }
@@ -1077,13 +1330,16 @@ mod tests {
     fn request_body_max_tokens() {
         let msgs = vec![Message::user("hi")];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
     }
@@ -1092,13 +1348,16 @@ mod tests {
     fn request_body_user_role() {
         let msgs = vec![Message::user("hi")];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
         assert_eq!(body["messages"][0]["role"], "user");
     }
@@ -1110,13 +1369,16 @@ mod tests {
             vec![MessagePart::text("hello")],
         )];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
         assert_eq!(body["messages"][0]["role"], "assistant");
         assert_eq!(body["messages"][0]["content"], "hello");
@@ -1133,13 +1395,16 @@ mod tests {
             }],
         )];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
 
         let msg = &body["messages"][0];
@@ -1162,13 +1427,16 @@ mod tests {
             }],
         )];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
 
         let msg = &body["messages"][0];
@@ -1188,13 +1456,16 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
         }];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            Some(&tools),
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: Some(&tools),
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
 
         let tools_arr = body["tools"].as_array().unwrap();
@@ -1208,13 +1479,16 @@ mod tests {
     fn request_body_tools_absent_when_none() {
         let msgs = vec![Message::user("hi")];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
         assert!(body.get("tools").is_none());
     }
@@ -1233,13 +1507,16 @@ mod tests {
             ],
         )];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
 
         let msg = &body["messages"][0];
@@ -1258,13 +1535,16 @@ mod tests {
             Message::user("bye"),
         ];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
 
         let messages = body["messages"].as_array().unwrap();
@@ -1281,7 +1561,7 @@ mod tests {
             description: "Calculate".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
-        let out = convert_tools(&tools);
+        let out = convert_tools(&tools, false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["name"], "calc");
         assert_eq!(out[0]["description"], "Calculate");
@@ -1410,9 +1690,37 @@ mod tests {
 
         em.on_message_stop();
         let events = em.drain();
-        // 1 for text + 2 for tools
-        assert_eq!(events.len(), 3);
-        assert!(events.iter().all(|e| matches!(e, StreamEvent::PartStop)));
+        // 1 PartStop for text + 2 for tools, then the terminal MessageStop.
+        assert_eq!(events.len(), 4);
+        assert!(matches!(events[0], StreamEvent::PartStop));
+        assert!(matches!(events[1], StreamEvent::PartStop));
+        assert!(matches!(events[2], StreamEvent::PartStop));
+        assert!(
+            matches!(events.last(), Some(StreamEvent::MessageStop)),
+            "message_stop must emit the terminal MessageStop after the PartStops: {events:?}"
+        );
+    }
+
+    #[test]
+    fn emitter_message_stop_then_finish_no_duplicate() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+
+        em.on_message_stop();
+        let after_stop = em.drain();
+        assert!(
+            after_stop
+                .iter()
+                .any(|e| matches!(e, StreamEvent::MessageStop))
+        );
+
+        let after_finish = em.finish();
+        assert!(
+            after_finish
+                .iter()
+                .all(|e| !matches!(e, StreamEvent::MessageStop)),
+            "finish() must not emit a second MessageStop after on_message_stop: {after_finish:?}"
+        );
     }
 
     #[test]
@@ -1618,13 +1926,16 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
         );
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: Some(&rf),
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            Some(&rf),
         );
 
         // Exactly one forced tool with the schema's name + input_schema.
@@ -1649,13 +1960,16 @@ mod tests {
         let rf =
             crate::structured::ResponseFormat::new("result", serde_json::json!({"type": "object"}));
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            Some(&[caller_tool]),
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: Some(&[caller_tool]),
+                response_format: Some(&rf),
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            Some(&rf),
         );
 
         // The forced tool replaces the caller's tools — not appended.
@@ -1671,13 +1985,16 @@ mod tests {
     fn request_body_no_response_format_has_no_tool_choice() {
         let msgs = vec![Message::user("hi")];
         let body = build_request_body(
-            "claude-3",
-            &msgs,
-            None,
-            None,
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
             false,
             DEFAULT_MAX_TOKENS,
-            None,
         );
         assert!(
             body.get("tool_choice").is_none(),
@@ -1710,5 +2027,137 @@ mod tests {
         let value = client.extract_structured(&raw);
         // No tool_use block → returns the raw envelope; T::from_value fails.
         assert_eq!(value["id"], "msg_1");
+    }
+
+    #[test]
+    fn anthropic_strict_tightens_input_schema() {
+        let msgs = vec![Message::user("hi")];
+        let tools = vec![ToolSchema {
+            tool: "echo".into(),
+            description: "Echo".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"msg": {"type": "string"}}
+            }),
+        }];
+        let body = build_request_body(
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: Some(&tools),
+                response_format: None,
+                tool_constraint: &ToolConstraint::Strict,
+            },
+            false,
+            DEFAULT_MAX_TOKENS,
+        );
+
+        let tools_arr = body["tools"].as_array().unwrap();
+        assert_eq!(tools_arr.len(), 1);
+        let input_schema = &tools_arr[0]["input_schema"];
+        assert_eq!(input_schema["additionalProperties"], false);
+        let required = input_schema["required"].as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0], "msg");
+    }
+
+    #[test]
+    fn anthropic_none_constraint_unchanged_shape() {
+        // Default None: convert_tools path unchanged (no tightening).
+        let msgs = vec![Message::user("hi")];
+        let tools = vec![ToolSchema {
+            tool: "echo".into(),
+            description: "Echo".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let body = build_request_body(
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: Some(&tools),
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
+            false,
+            DEFAULT_MAX_TOKENS,
+        );
+
+        let tools_arr = body["tools"].as_array().unwrap();
+        // input_schema is passed through verbatim (no additionalProperties).
+        assert_eq!(
+            tools_arr[0]["input_schema"],
+            serde_json::json!({"type": "object"})
+        );
+        assert!(
+            tools_arr[0]["input_schema"]
+                .get("additionalProperties")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn anthropic_strict_does_not_emit_tool_choice() {
+        // Strict constrains the call's shape, not its selection. tool_choice
+        // must not appear (only response_format forces it).
+        let msgs = vec![Message::user("hi")];
+        let tools = vec![ToolSchema {
+            tool: "echo".into(),
+            description: "Echo".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let body = build_request_body(
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: Some(&tools),
+                response_format: None,
+                tool_constraint: &ToolConstraint::Strict,
+            },
+            false,
+            DEFAULT_MAX_TOKENS,
+        );
+
+        assert!(
+            body.get("tool_choice").is_none(),
+            "tool_choice must not appear under Strict"
+        );
+    }
+
+    #[test]
+    fn anthropic_strict_suppressed_when_response_format_set() {
+        // With response_format set, the forced-tool path runs and caller
+        // tools are not tightened.
+        let msgs = vec![Message::user("hi")];
+        let caller_tool = ToolSchema {
+            tool: "read".into(),
+            description: "Read a file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let rf =
+            crate::structured::ResponseFormat::new("result", serde_json::json!({"type": "object"}));
+        let body = build_request_body(
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: Some(&[caller_tool]),
+                response_format: Some(&rf),
+                tool_constraint: &ToolConstraint::Strict,
+            },
+            false,
+            DEFAULT_MAX_TOKENS,
+        );
+
+        // The forced tool replaces the caller's tools — exactly one tool
+        // named "result", tool_choice forced. No tightening applied to
+        // caller_tool (it was dropped).
+        let tools = body["tools"].as_array().expect("tools should be an array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "result");
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "result");
     }
 }

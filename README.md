@@ -157,6 +157,7 @@ let agent = BareLoop::new(
 | `grok` | No | `providers`, `openai` | Grok (xAI) API client (OpenAI-compatible) |
 | `gemini` | No | `providers` | Google Gemini API client (`provider::gemini`) |
 | `zai` | No | `providers`, `anthropic` | Z.AI API client (Anthropic-compatible) |
+| `grammar` | No | `providers` | Tool-call grammar providers for grammar-aware samplers (vLLM `guided_json`); enables the `Grammar` mode of `ToolConstraint` |
 
 ## Architecture
 

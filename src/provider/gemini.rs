@@ -34,6 +34,8 @@ use crate::stream::{
     DeltaPart, IndexedDelta, MessageDelta, MessageDeltaPayload, MessageMetadata, MessageStart,
     PartStart, StreamEvent, StreamStopReason,
 };
+use crate::structured::ToolConstraint;
+use crate::structured::tighten_json_schema;
 use crate::tool::ToolSchema;
 
 // ==================================================
@@ -225,7 +227,13 @@ impl ApiClient for GeminiClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let body = build_request_body(&messages, system.as_deref(), tools.as_deref(), None);
+        let body = build_request_body(
+            &messages,
+            system.as_deref(),
+            tools.as_deref(),
+            None,
+            &ToolConstraint::None,
+        );
         let url = self.stream_url();
         let http = self.http.clone();
         let api_key = self.api_key.clone();
@@ -254,7 +262,13 @@ impl ApiClient for GeminiClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let body = build_request_body(&messages, system.as_deref(), tools.as_deref(), None);
+        let body = build_request_body(
+            &messages,
+            system.as_deref(),
+            tools.as_deref(),
+            None,
+            &ToolConstraint::None,
+        );
         let url = self.generate_url();
 
         Box::pin(async move {
@@ -282,7 +296,13 @@ impl ApiClient for GeminiClient {
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
         let rf = options.response_format.as_ref();
-        let body = build_request_body(&messages, system.as_deref(), tools.as_deref(), rf);
+        let body = build_request_body(
+            &messages,
+            system.as_deref(),
+            tools.as_deref(),
+            rf,
+            &options.tool_constraint,
+        );
         let url = self.stream_url();
         let http = self.http.clone();
         let api_key = self.api_key.clone();
@@ -318,6 +338,7 @@ impl ApiClient for GeminiClient {
             system.as_deref(),
             tools.as_deref(),
             response_format,
+            &options.tool_constraint,
         );
         let url = self.generate_url();
         Box::pin(async move {
@@ -484,11 +505,22 @@ impl GeminiClientBuilder {
 ///
 /// Unlike OpenAI/Anthropic, Gemini puts the model in the URL, not the
 /// request body. Each [`Message`] is serialized via [`convert_message`].
+///
+/// Tool-call constraint:
+/// - When `response_format` is set, injects `generationConfig` for the
+///   structured-output path and suppresses `tools`; `tool_constraint` is
+///   ignored in that case.
+/// - Otherwise, when `tool_constraint` is `Strict`, each
+///   `functionDeclaration`'s `parameters` is tightened
+///   (`additionalProperties: false`, full `required`) via [`convert_tools`].
+///   No `toolConfig.functionCallingConfig` is injected — Strict constrains
+///   the call's shape, not its selection.
 fn build_request_body(
     messages: &[Message],
     system: Option<&str>,
     tools: Option<&[ToolSchema]>,
     response_format: Option<&crate::structured::ResponseFormat>,
+    tool_constraint: &ToolConstraint,
 ) -> Value {
     let contents: Vec<Value> = messages.iter().map(convert_message).collect();
     let mut body = serde_json::json!({ "contents": contents });
@@ -502,9 +534,10 @@ fn build_request_body(
 
         if response_format.is_none() {
             if let Some(tool_list) = tools {
+                let strict = matches!(tool_constraint, ToolConstraint::Strict);
                 obj.insert(
                     "tools".into(),
-                    serde_json::json!([{"functionDeclarations": convert_tools(tool_list)}]),
+                    serde_json::json!([{"functionDeclarations": convert_tools(tool_list, strict)}]),
                 );
             }
         }
@@ -565,17 +598,27 @@ fn convert_part(p: &MessagePart) -> Option<Value> {
 ///
 /// Each [`ToolSchema`] becomes a JSON object with `name`, `description`, and
 /// `parameters` — the fields Gemini's function-calling API expects. When
-/// structured output is active (`response_format` set), this function is not
+/// `strict` is `true`, each `parameters` is first tightened (recursive
+/// `additionalProperties: false` and full `required`) — Gemini has no native
+/// per-function strict flag, so the tightening is the structural constraint
+/// behind [`ToolConstraint::Strict`].
+///
+/// When structured output is active (`response_format` set), this function is not
 /// called — [`build_request_body`] injects `generationConfig.responseJsonSchema`
 /// instead, and `tools` is suppressed.
-fn convert_tools(tools: &[ToolSchema]) -> Vec<Value> {
+fn convert_tools(tools: &[ToolSchema], strict: bool) -> Vec<Value> {
     tools
         .iter()
         .map(|t| {
+            let parameters = if strict {
+                tighten_json_schema(&t.input_schema)
+            } else {
+                t.input_schema.clone()
+            };
             serde_json::json!({
                 "name": t.tool,
                 "description": &t.description,
-                "parameters": t.input_schema.clone(),
+                "parameters": parameters,
             })
         })
         .collect()
@@ -687,8 +730,32 @@ impl SseReader {
 /// stop reason.
 #[derive(Default)]
 struct StreamEmitter {
+    /// Whether [`StreamEvent::MessageStart`] has been emitted for the
+    /// current stream.
+    ///
+    /// Gemini does not send a dedicated message-start event; the emitter
+    /// synthesizes one on the first chunk (with empty `id` and `model`,
+    /// since Gemini's streaming chunks don't carry them) and treats later
+    /// chunks as content only.
     started: bool,
+
+    /// Whether the terminal stop signal has been processed.
+    ///
+    /// Set by [`finish`](Self::finish) when it appends the synthetic
+    /// [`StreamEvent::MessageStop`]. Guards against emitting a second
+    /// `MessageStop` if `finish` is called again after the stream ends.
+    /// (Note: unlike the OpenAI/Anthropic emitters, Gemini's finish
+    /// reason arrives inside a regular data chunk and is handled by
+    /// [`extract_finish_reason`](Self::extract_finish_reason); this flag
+    /// only governs the final `MessageStop` synthesis.)
     finished: bool,
+
+    /// Buffered [`StreamEvent`]s waiting to be yielded to the consumer.
+    ///
+    /// All event-producing methods push onto this queue via
+    /// [`push`](Self::push); the stream loop reads them back through
+    /// [`drain`](Self::drain) after each chunk so events are yielded
+    /// promptly rather than buffered until stream end.
     pending: Vec<StreamEvent>,
 }
 
@@ -850,7 +917,7 @@ mod tests {
     #[test]
     fn request_body_user_text() {
         let msgs = vec![Message::user("hello")];
-        let body = build_request_body(&msgs, None, None, None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
 
         let contents = body["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 1);
@@ -862,7 +929,7 @@ mod tests {
     #[test]
     fn request_body_includes_system_instruction() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, Some("be brief"), None, None);
+        let body = build_request_body(&msgs, Some("be brief"), None, None, &ToolConstraint::None);
 
         let sys = &body["systemInstruction"];
         assert!(sys.is_object());
@@ -872,7 +939,7 @@ mod tests {
     #[test]
     fn request_body_no_system_instruction_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
         assert!(body.get("systemInstruction").is_none());
     }
 
@@ -882,14 +949,14 @@ mod tests {
             Role::Assistant,
             vec![MessagePart::text("hello")],
         )];
-        let body = build_request_body(&msgs, None, None, None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
         assert_eq!(body["contents"][0]["role"], "model");
     }
 
     #[test]
     fn request_body_user_role() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
         assert_eq!(body["contents"][0]["role"], "user");
     }
 
@@ -903,7 +970,7 @@ mod tests {
                 input: serde_json::json!({"msg": "hi"}),
             }],
         )];
-        let body = build_request_body(&msgs, None, None, None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
 
         let parts = body["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["functionCall"]["name"], "echo");
@@ -920,7 +987,7 @@ mod tests {
                 is_error: None,
             }],
         )];
-        let body = build_request_body(&msgs, None, None, None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
 
         let parts = body["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["functionResponse"]["name"], "call_1");
@@ -938,7 +1005,7 @@ mod tests {
             description: "Search the web".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
-        let body = build_request_body(&msgs, None, Some(&tools), None);
+        let body = build_request_body(&msgs, None, Some(&tools), None, &ToolConstraint::None);
 
         let tools_arr = body["tools"].as_array().unwrap();
         assert_eq!(tools_arr.len(), 1);
@@ -951,7 +1018,7 @@ mod tests {
     #[test]
     fn request_body_no_tools_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
         assert!(body.get("tools").is_none());
     }
 
@@ -962,7 +1029,7 @@ mod tests {
             Message::new(Role::Assistant, vec![MessagePart::text("hi")]),
             Message::user("bye"),
         ];
-        let body = build_request_body(&msgs, None, None, None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
 
         let contents = body["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 3);
@@ -978,7 +1045,7 @@ mod tests {
             description: "Calculate".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
-        let out = convert_tools(&tools);
+        let out = convert_tools(&tools, false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["name"], "calc");
         assert_eq!(out[0]["description"], "Calculate");
@@ -1372,7 +1439,7 @@ mod tests {
             "result",
             serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
         );
-        let body = build_request_body(&msgs, None, None, Some(&rf));
+        let body = build_request_body(&msgs, None, None, Some(&rf), &ToolConstraint::None);
 
         assert_eq!(
             body["generationConfig"]["responseMimeType"],
@@ -1387,7 +1454,7 @@ mod tests {
     #[test]
     fn request_body_response_format_absent_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
         assert!(
             body.get("generationConfig").is_none(),
             "generationConfig should be absent when no response_format"
@@ -1404,7 +1471,13 @@ mod tests {
         };
         let rf =
             crate::structured::ResponseFormat::new("result", serde_json::json!({"type": "object"}));
-        let body = build_request_body(&msgs, None, Some(&[caller_tool]), Some(&rf));
+        let body = build_request_body(
+            &msgs,
+            None,
+            Some(&[caller_tool]),
+            Some(&rf),
+            &ToolConstraint::None,
+        );
 
         assert!(
             body.get("tools").is_none(),
@@ -1442,5 +1515,91 @@ mod tests {
         let value = client.extract_structured(&raw);
         // Prose text not parseable as JSON → falls back to the string value.
         assert_eq!(value, serde_json::json!("I cannot produce that."));
+    }
+
+    #[test]
+    fn gemini_strict_tightens_parameters() {
+        let msgs = vec![Message::user("hi")];
+        let tools = vec![ToolSchema {
+            tool: "echo".into(),
+            description: "Echo".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"msg": {"type": "string"}}
+            }),
+        }];
+        let body = build_request_body(&msgs, None, Some(&tools), None, &ToolConstraint::Strict);
+
+        let decls = body["tools"][0]["functionDeclarations"].as_array().unwrap();
+        assert_eq!(decls.len(), 1);
+        let params = &decls[0]["parameters"];
+        assert_eq!(params["additionalProperties"], false);
+        let required = params["required"].as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0], "msg");
+    }
+
+    #[test]
+    fn gemini_none_constraint_unchanged_shape() {
+        // Default None: tools emitted as before (no tightening).
+        let msgs = vec![Message::user("hi")];
+        let tools = vec![ToolSchema {
+            tool: "echo".into(),
+            description: "Echo".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let body = build_request_body(&msgs, None, Some(&tools), None, &ToolConstraint::None);
+
+        let decls = body["tools"][0]["functionDeclarations"].as_array().unwrap();
+        assert_eq!(
+            decls[0]["parameters"],
+            serde_json::json!({"type": "object"})
+        );
+        assert!(decls[0]["parameters"].get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn gemini_strict_suppressed_when_response_format_set() {
+        // With response_format set, the generationConfig path runs, tools
+        // are absent, no tightening.
+        let msgs = vec![Message::user("hi")];
+        let caller_tool = ToolSchema {
+            tool: "read".into(),
+            description: "Read".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let rf =
+            crate::structured::ResponseFormat::new("result", serde_json::json!({"type": "object"}));
+        let body = build_request_body(
+            &msgs,
+            None,
+            Some(&[caller_tool]),
+            Some(&rf),
+            &ToolConstraint::Strict,
+        );
+
+        assert!(
+            body.get("tools").is_none(),
+            "tools must be suppressed when response_format is set"
+        );
+        assert!(body.get("generationConfig").is_some());
+    }
+
+    #[test]
+    fn gemini_strict_does_not_emit_tool_config() {
+        // Strict constrains shape, not selection — toolConfig must not
+        // appear under Strict.
+        let msgs = vec![Message::user("hi")];
+        let tools = vec![ToolSchema {
+            tool: "echo".into(),
+            description: "Echo".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let body = build_request_body(&msgs, None, Some(&tools), None, &ToolConstraint::Strict);
+
+        assert!(
+            body.get("toolConfig").is_none(),
+            "toolConfig must not appear under Strict"
+        );
     }
 }

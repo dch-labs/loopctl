@@ -31,6 +31,7 @@ parking_lot = "0.12"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"], optional = true }
 async-stream = { version = "0.3", optional = true }
 httpdate = { version = "1", optional = true }
+jsonschema = { version = "0.30", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
@@ -53,6 +54,7 @@ grok = ["providers", "openai"]
 gemini = ["providers"]
 zai = ["providers", "anthropic"]
 grammar = ["providers"]
+schema_validation = ["dep:jsonschema"]
 
 [[example]]
 name = "hello-cli"

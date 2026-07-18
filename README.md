@@ -158,6 +158,7 @@ let agent = BareLoop::new(
 | `gemini` | No | `providers` | Google Gemini API client (`provider::gemini`) |
 | `zai` | No | `providers`, `anthropic` | Z.AI API client (Anthropic-compatible) |
 | `grammar` | No | `providers` | Tool-call grammar providers for grammar-aware samplers (vLLM `guided_json`); enables the `Grammar` mode of `ToolConstraint` |
+| `schema_validation` | No | — | JSON Schema validation of `Correction::modified_input` in `LlmReflector` (pulls `jsonschema`); when off, validation is skipped |
 
 ## Architecture
 

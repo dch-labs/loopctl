@@ -1049,12 +1049,18 @@ impl<C: ApiClient> BareLoop<C> {
             max_attempts: Self::MAX_RECOVERY_ATTEMPTS,
         };
 
+        let tool_schema = self.tools.get(&tc.tool).map(crate::tool::Tool::schema);
         let Ok(analysis) = self
             .reflector
-            .analyze(&error_msg, &tc.tool, &tc.input, &context)
+            .analyze(
+                &error_msg,
+                &tc.tool,
+                &tc.input,
+                tool_schema.as_ref(),
+                &context,
+            )
             .await
         else {
-            // Reflector failed — conservatively fail.
             return (RecoveryAction::Fail(error_msg), None);
         };
 
@@ -1555,6 +1561,7 @@ mod tests {
                 error: &str,
                 tool_name: &str,
                 _tool_input: &Value,
+                _tool_schema: Option<&crate::tool::ToolSchema>,
                 _context: &crate::reflection::ReflectionContext,
             ) -> Pin<
                 Box<

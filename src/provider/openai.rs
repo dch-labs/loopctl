@@ -36,6 +36,8 @@ use crate::stream::{
     DeltaPart, IndexedDelta, MessageDelta, MessageDeltaPayload, MessageMetadata, MessageStart,
     PartStart, StreamEvent, StreamStopReason,
 };
+use crate::structured::ToolConstraint;
+use crate::structured::tighten_json_schema;
 use crate::tool::ToolSchema;
 
 // ==================================================
@@ -225,7 +227,14 @@ impl ApiClient for OpenAiClient {
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
         let model = self.model.lock().clone();
-        let body = RequestBody::build(&model, &messages, system.as_deref(), tools.as_deref(), None);
+        let body = RequestBody::build(
+            &model,
+            &messages,
+            system.as_deref(),
+            tools.as_deref(),
+            None,
+            &ToolConstraint::None,
+        );
         let url = self.completions_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
@@ -258,7 +267,14 @@ impl ApiClient for OpenAiClient {
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
         let model = self.model.lock().clone();
-        let body = RequestBody::build(&model, &messages, system.as_deref(), tools.as_deref(), None);
+        let body = RequestBody::build(
+            &model,
+            &messages,
+            system.as_deref(),
+            tools.as_deref(),
+            None,
+            &ToolConstraint::None,
+        );
         let url = self.completions_url();
 
         Box::pin(async move {
@@ -289,7 +305,14 @@ impl ApiClient for OpenAiClient {
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
         let model = self.model.lock().clone();
         let rf = options.response_format.as_ref();
-        let body = RequestBody::build(&model, &messages, system.as_deref(), tools.as_deref(), rf);
+        let body = RequestBody::build(
+            &model,
+            &messages,
+            system.as_deref(),
+            tools.as_deref(),
+            rf,
+            &options.tool_constraint,
+        );
         let url = self.completions_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
@@ -324,7 +347,14 @@ impl ApiClient for OpenAiClient {
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
         let model = self.model.lock().clone();
         let rf = options.response_format.as_ref();
-        let body = RequestBody::build(&model, &messages, system.as_deref(), tools.as_deref(), rf);
+        let body = RequestBody::build(
+            &model,
+            &messages,
+            system.as_deref(),
+            tools.as_deref(),
+            rf,
+            &options.tool_constraint,
+        );
         let url = self.completions_url();
 
         Box::pin(async move {
@@ -529,6 +559,13 @@ struct RequestBody {
     /// emitted as `response_format: { type: "json_schema", ... }` and
     /// `tools` is suppressed.
     response_format: Option<Value>,
+
+    /// Grammar to pass through as `guided_json` for vLLM-style grammar-aware
+    /// samplers. `None` unless the caller set
+    /// [`ToolConstraint::Grammar`](crate::structured::ToolConstraint::Grammar)
+    /// and no `response_format` was set. Stored as a string so the body is
+    /// serializable without re-borrowing the trait object.
+    guided_json: Option<String>,
 }
 
 impl RequestBody {
@@ -536,16 +573,24 @@ impl RequestBody {
     /// Completions request shape.
     ///
     /// Converts messages to OpenAI's `role`/`content` JSON format, wraps
-    /// tool schemas in the `function` envelope, and — when
-    /// `response_format` is set — suppresses `tools` (OpenAI's structured
-    /// output and free-form tool-calling are mutually exclusive) and emits
-    /// the `response_format: json_schema` object.
+    /// tool schemas in the `function` envelope, and applies the
+    /// tool-call constraint:
+    /// - When `response_format` is set, suppresses `tools` (OpenAI's
+    ///   structured output and free-form tool-calling are mutually
+    ///   exclusive) and emits the `response_format: json_schema` object.
+    ///   Any `tool_constraint` is ignored in this case.
+    /// - Otherwise, when `tool_constraint` is `Strict`, wraps each tool
+    ///   via [`convert_tools_strict`] (tightens the schema and sets
+    ///   `strict: true`).
+    /// - When `tool_constraint` is `Grammar(g)`, captures the grammar
+    ///   string for `guided_json` emission in [`to_json`](Self::to_json).
     fn build(
         model: &str,
         messages: &[Message],
         system: Option<&str>,
         tools: Option<&[ToolSchema]>,
         response_format: Option<&crate::structured::ResponseFormat>,
+        tool_constraint: &ToolConstraint,
     ) -> Self {
         let mut msgs = Vec::with_capacity(messages.len().saturating_add(1));
 
@@ -557,10 +602,17 @@ impl RequestBody {
             msgs.push(convert_message(m));
         }
 
-        let tools = if response_format.is_some() {
-            None
+        let (tools, guided_json) = if response_format.is_some() {
+            (None, None)
         } else {
-            tools.map(convert_tools)
+            match tool_constraint {
+                ToolConstraint::None => (tools.map(convert_tools), None),
+                ToolConstraint::Strict => (tools.map(convert_tools_strict), None),
+                #[cfg(feature = "grammar")]
+                ToolConstraint::Grammar(provider) => {
+                    (tools.map(convert_tools), Some(provider.grammar().to_string()))
+                }
+            }
         };
 
         let rf = response_format.map(|rf| {
@@ -579,6 +631,7 @@ impl RequestBody {
             messages: msgs,
             tools,
             response_format: rf,
+            guided_json,
         }
     }
 
@@ -587,6 +640,7 @@ impl RequestBody {
     /// Emits `model`, `messages`, `stream` (toggled by the parameter),
     /// and `tools`. When `response_format` is set, appends the
     /// `response_format` key; otherwise omits it entirely (not `null`).
+    /// When a grammar was captured, appends `guided_json`.
     fn to_json(&self, stream: bool) -> Value {
         let mut body = serde_json::json!({
             "model": self.model,
@@ -599,6 +653,9 @@ impl RequestBody {
             }
             if let Some(rf) = &self.response_format {
                 obj.insert("response_format".to_string(), rf.clone());
+            }
+            if let Some(grammar) = &self.guided_json {
+                obj.insert("guided_json".to_string(), Value::String(grammar.clone()));
             }
         }
         body
@@ -706,6 +763,33 @@ fn convert_tools(tools: &[ToolSchema]) -> Vec<Value> {
                     "name": t.tool,
                     "description": &t.description,
                     "parameters": t.input_schema.clone(),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Convert framework tool schemas into the OpenAI `tools` array shape with
+/// strict mode enabled.
+///
+/// Like [`convert_tools`], but tightens each tool's `parameters`
+/// (recursive `additionalProperties: false` and full `required`) and sets
+/// `strict: true` on each `function` entry. This is the
+/// [`ToolConstraint::Strict`] path: OpenAI rejects a strict tool whose
+/// schema isn't already tightened, so the tightening is done here rather
+/// than left to the tool author.
+fn convert_tools_strict(tools: &[ToolSchema]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            let parameters = tighten_json_schema(&t.input_schema);
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.tool,
+                    "description": &t.description,
+                    "parameters": parameters,
+                    "strict": true,
                 }
             })
         })
@@ -880,10 +964,46 @@ struct OpenAiToolCallFunction {
 /// translation logic testable without a live network connection.
 #[derive(Default)]
 struct StreamEmitter {
+    /// Whether [`StreamEvent::MessageStart`] has been emitted for the
+    /// current stream.
+    ///
+    /// The first chunk carries the message `id` and `model`; the emitter
+    /// forwards these once as a `MessageStart` and never again, so chunks
+    /// arriving later in the stream are treated as content only.
     started: bool,
+
+    /// Whether the text content part is currently open.
+    ///
+    /// OpenAI streams assistant text as a sequence of `delta.content`
+    /// fragments on the first choice. The emitter opens a text part with
+    /// [`StreamEvent::PartStart`] on the first non-empty fragment and
+    /// tracks the open state so [`process_finish`](Self::process_finish)
+    /// emits exactly one [`StreamEvent::PartStop`] to close it.
     text_part_open: bool,
+
+    /// Number of tool-call parts currently open.
+    ///
+    /// Each `delta.tool_calls` entry with a `function` field opens a new
+    /// tool part via [`StreamEvent::PartStart`]. The counter drives the
+    /// matching batch of `PartStop` emissions on finish (one per open
+    /// tool) so callers see balanced part lifecycles.
     open_tool_count: usize,
+
+    /// Whether the terminal stop signal has been processed.
+    ///
+    /// Set by [`process_finish`](Self::process_finish) when a
+    /// `finish_reason` arrives. Guards against emitting a second
+    /// [`StreamEvent::MessageDelta`] if the stream delivers a duplicate
+    /// finish chunk, and against `finish` appending a spurious
+    /// [`StreamEvent::MessageStop`] after the stream already terminated.
     finished: bool,
+
+    /// Buffered [`StreamEvent`]s waiting to be yielded to the consumer.
+    ///
+    /// All event-producing methods push onto this queue via
+    /// [`push`](Self::push); the stream loop reads them back through
+    /// [`drain`](Self::drain) after each chunk so events are yielded
+    /// promptly rather than buffered until stream end.
     pending: Vec<StreamEvent>,
 }
 
@@ -1074,7 +1194,14 @@ mod tests {
     #[test]
     fn request_body_includes_system_message_first() {
         let msgs = vec![Message::user("hello")];
-        let body = RequestBody::build("gpt-4o", &msgs, Some("be brief"), None, None);
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            Some("be brief"),
+            None,
+            None,
+            &ToolConstraint::None,
+        );
         let json = body.to_json(true);
 
         let messages = json["messages"].as_array().unwrap();
@@ -1087,7 +1214,7 @@ mod tests {
     #[test]
     fn request_body_without_system() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, None);
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None);
         let json = body.to_json(false);
 
         let messages = json["messages"].as_array().unwrap();
@@ -1098,7 +1225,7 @@ mod tests {
     #[test]
     fn request_body_stream_flag_toggles() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, None);
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None);
 
         assert_eq!(body.to_json(true)["stream"], true);
         assert_eq!(body.to_json(false)["stream"], false);
@@ -1112,7 +1239,14 @@ mod tests {
             description: "Echo".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
-        let body = RequestBody::build("my-model", &msgs, None, Some(&tools), None);
+        let body = RequestBody::build(
+            "my-model",
+            &msgs,
+            None,
+            Some(&tools),
+            None,
+            &ToolConstraint::None,
+        );
         let json = body.to_json(true);
 
         assert_eq!(json["model"], "my-model");
@@ -1125,7 +1259,7 @@ mod tests {
     #[test]
     fn request_body_tools_absent_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, None);
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None);
         let json = body.to_json(false);
         assert!(
             json.get("tools").is_none(),
@@ -1688,7 +1822,14 @@ mod tests {
         let msgs = vec![Message::user("hi")];
         let rf =
             crate::structured::ResponseFormat::new("action", serde_json::json!({"type": "object"}));
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, Some(&rf));
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            None,
+            Some(&rf),
+            &ToolConstraint::None,
+        );
         let json = body.to_json(false);
 
         assert_eq!(json["response_format"]["type"], "json_schema");
@@ -1703,7 +1844,7 @@ mod tests {
     #[test]
     fn request_body_response_format_absent_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, None);
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None);
         let json = body.to_json(false);
         assert!(
             json.get("response_format").is_none(),
@@ -1721,7 +1862,14 @@ mod tests {
         };
         let rf =
             crate::structured::ResponseFormat::new("result", serde_json::json!({"type": "object"}));
-        let body = RequestBody::build("gpt-4o", &msgs, None, Some(&[caller_tool]), Some(&rf));
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            Some(&[caller_tool]),
+            Some(&rf),
+            &ToolConstraint::None,
+        );
         let json = body.to_json(false);
 
         assert!(
@@ -1773,5 +1921,137 @@ mod tests {
         // When content is prose (not parseable JSON), falls back to the
         // string value; T::from_value will then fail with Deserialize.
         assert_eq!(value, serde_json::json!("I cannot produce that."));
+    }
+
+    #[test]
+    fn openai_strict_sets_flag_and_tightens() {
+        let msgs = vec![Message::user("hi")];
+        let tools = vec![ToolSchema {
+            tool: "echo".into(),
+            description: "Echo".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"msg": {"type": "string"}}
+            }),
+        }];
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            Some(&tools),
+            None,
+            &ToolConstraint::Strict,
+        );
+        let json = body.to_json(false);
+
+        let tools_arr = json["tools"].as_array().unwrap();
+        assert_eq!(tools_arr.len(), 1);
+        assert_eq!(tools_arr[0]["function"]["strict"], true);
+        // Schema tightened: additionalProperties false, required enumerated.
+        let params = &tools_arr[0]["function"]["parameters"];
+        assert_eq!(params["additionalProperties"], false);
+        let required = params["required"].as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0], "msg");
+    }
+
+    #[test]
+    fn openai_none_constraint_unchanged_shape() {
+        // Default None must produce a plain body: no `strict` field, no
+        // tightening, no guided_json.
+        let msgs = vec![Message::user("hi")];
+        let tools = vec![ToolSchema {
+            tool: "echo".into(),
+            description: "Echo".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            Some(&tools),
+            None,
+            &ToolConstraint::None,
+        );
+        let json = body.to_json(false);
+
+        let tools_arr = json["tools"].as_array().unwrap();
+        // No `strict` field on the function entry under None.
+        assert!(
+            tools_arr[0]["function"].get("strict").is_none(),
+            "strict must not appear under ToolConstraint::None"
+        );
+        assert!(
+            json.get("guided_json").is_none(),
+            "guided_json must not appear under ToolConstraint::None"
+        );
+        // input_schema is passed through unchanged (no tightening).
+        assert_eq!(
+            tools_arr[0]["function"]["parameters"],
+            serde_json::json!({"type": "object"})
+        );
+    }
+
+    #[test]
+    fn openai_strict_suppressed_when_response_format_set() {
+        // With both set, tools is absent and no strict emission happens.
+        let msgs = vec![Message::user("hi")];
+        let caller_tool = ToolSchema {
+            tool: "read".into(),
+            description: "Read".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let rf =
+            crate::structured::ResponseFormat::new("result", serde_json::json!({"type": "object"}));
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            Some(&[caller_tool]),
+            Some(&rf),
+            &ToolConstraint::Strict,
+        );
+        let json = body.to_json(false);
+
+        assert!(
+            json.get("tools").is_none(),
+            "tools must be absent when response_format is set"
+        );
+        assert!(
+            json.get("guided_json").is_none(),
+            "guided_json must be absent when response_format is set"
+        );
+        assert!(json.get("response_format").is_some());
+    }
+
+    #[cfg(feature = "grammar")]
+    #[test]
+    fn openai_grammar_injects_guided_json() {
+        use crate::provider::grammar::JsonSchemaGrammar;
+        use crate::structured::ToolConstraint;
+
+        let msgs = vec![Message::user("hi")];
+        let tools = vec![ToolSchema {
+            tool: "echo".into(),
+            description: "Echo".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let grammar = std::sync::Arc::new(JsonSchemaGrammar::from_schemas(&tools));
+        let constraint = ToolConstraint::Grammar(grammar);
+        let body = RequestBody::build("gpt-4o", &msgs, None, Some(&tools), None, &constraint);
+        let json = body.to_json(false);
+
+        // guided_json carries the compiled grammar string.
+        let guided = json["guided_json"].as_str().unwrap();
+        assert!(
+            guided.contains("echo"),
+            "guided_json should reference the tool: {guided}"
+        );
+        // Tools are still advertised (Grammar is about the sampler, not
+        // tool visibility).
+        assert!(json.get("tools").is_some());
+        // Under Grammar, no `strict: true` is emitted (that's Strict's path).
+        let tools_arr = json["tools"].as_array().unwrap();
+        assert!(tools_arr[0]["function"].get("strict").is_none());
     }
 }

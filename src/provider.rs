@@ -65,6 +65,9 @@ pub mod anthropic;
 #[cfg(feature = "gemini")]
 pub mod gemini;
 
+#[cfg(feature = "grammar")]
+pub mod grammar;
+
 #[cfg(feature = "openai")]
 pub use openai::OpenAiClient;
 
@@ -73,6 +76,9 @@ pub use anthropic::AnthropicClient;
 
 #[cfg(feature = "gemini")]
 pub use gemini::GeminiClient;
+
+#[cfg(feature = "grammar")]
+pub use grammar::{JsonSchemaGrammar, ToolGrammarProvider};
 
 // =======================================================
 // Default endpoints / models for convenience constructors

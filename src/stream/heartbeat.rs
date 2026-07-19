@@ -13,18 +13,19 @@
 //!
 //! # Architecture
 //!
-//! ```text
-//! ┌────────────────────────────────────┐
-//! │        HeartbeatStream<S>          │
-//! │                                    │
-//! │  poll_next():                      │
-//! │    1. Check heartbeat interval     │
-//! │       └─ fire callback if elapsed  │
-//! │    2. Check hard timeout           │
-//! │       └─ return ApiError if hit    │
-//! │    3. Delegate to inner stream     │
-//! └────────────────────────────────────┘
-//! ```
+//! On each `poll_next`, `HeartbeatStream` runs three checks in order before
+//! delegating to the inner stream:
+//!
+//! 1. **Heartbeat interval** — if the configured interval has elapsed
+//!    since the last beat, fire the heartbeat callback with the elapsed
+//!    time and current timeout status.
+//! 2. **Hard timeout** — if the total elapsed time has exceeded the
+//!    configured maximum, return an [`ApiError`] without consulting the
+//!    inner stream.
+//! 3. **Delegate** — otherwise, forward to the inner stream's `poll_next`
+//!    and pass through its result.
+//!
+//! [`ApiError`]: crate::api::error::ApiError
 //!
 //! # Quick Start
 //!
@@ -59,7 +60,10 @@ use std::time::{Duration, Instant};
 /// Data emitted on each heartbeat callback.
 ///
 /// Passed to the callback registered in [`HeartbeatConfig`] at each
-/// heartbeat interval.
+/// heartbeat interval. Carries a snapshot of how long the stream has
+/// been running and whether it has crossed its configured hard-timeout
+/// deadline, so a UI or metrics collector can render progress without
+/// owning a clock itself.
 ///
 /// # Example
 ///
@@ -75,9 +79,25 @@ use std::time::{Duration, Instant};
 /// ```
 #[derive(Debug, Clone)]
 pub struct HeartbeatData {
-    /// Time elapsed since stream start.
+    /// Time elapsed since the wrapped stream was constructed.
+    ///
+    /// Monotonic — measured from the [`Instant`] captured in
+    /// [`HeartbeatStream::new`], not wall-clock time. Useful for
+    /// progress UIs ("streaming for 45s"), metrics, and detecting
+    /// stalls without each consumer holding its own start instant.
+    ///
+    /// [`Instant`]: std::time::Instant
     pub elapsed: Duration,
-    /// Whether the stream has exceeded its configured timeout.
+
+    /// Whether the stream has exceeded its configured hard timeout.
+    ///
+    /// Set to `elapsed > config.timeout` at the moment the heartbeat
+    /// fires. Note this is *advisory*: the heartbeat may observe
+    /// `is_timeout == true` a beat after the deadline actually crossed,
+    /// because callbacks only fire on `poll_next`. The next
+    /// [`HeartbeatStream::poll_next`] after the deadline will return
+    /// the hard-timeout error regardless of when the callback last
+    /// fired.
     pub is_timeout: bool,
 }
 
@@ -116,10 +136,30 @@ pub type HeartbeatCallback = Box<dyn Fn(HeartbeatData) + Send + Sync>;
 /// ```
 pub struct HeartbeatConfig {
     /// Interval between heartbeat callbacks.
+    ///
+    /// Checked on every `poll_next`: when `last_heartbeat.elapsed()`
+    /// reaches this value, the callback fires and `last_heartbeat` is
+    /// reset. There is no background timer — heartbeats only fire while
+    /// the stream is actively being polled.
     heartbeat_interval: Duration,
+
     /// Maximum total stream duration before triggering a hard timeout.
+    ///
+    /// Once `start.elapsed()` exceeds this value, the next `poll_next`
+    /// returns an [`ApiError`] instead of delegating to the inner
+    /// stream. Choose a value comfortably above the expected p99
+    /// response time so transient slowness doesn't trip it.
+    ///
+    /// [`ApiError`]: crate::api::error::ApiError
     timeout: Duration,
-    /// Callback fired at each heartbeat interval.
+
+    /// Callback invoked at each heartbeat interval.
+    ///
+    /// A `Box<dyn Fn(HeartbeatData) + Send + Sync>` so it can be shared
+    /// across the runtime and mutate captured state (typically an
+    /// `Arc<Mutex<…>>`-protected metrics struct or channel sender).
+    /// Called synchronously from `poll_next` — keep the body cheap to
+    /// avoid stalling the stream's task.
     on_heartbeat: HeartbeatCallback,
 }
 
@@ -169,12 +209,19 @@ impl HeartbeatConfig {
     }
 
     /// Returns the configured heartbeat interval.
+    ///
+    /// Exposed so callers (e.g. a metrics reporter that wants to align
+    /// its own cadence with the heartbeat) can read the value the
+    /// stream was constructed with.
     #[must_use]
     pub fn heartbeat_interval(&self) -> Duration {
         self.heartbeat_interval
     }
 
     /// Returns the configured hard timeout.
+    ///
+    /// Exposed so callers can render the deadline ("stream will time out
+    /// after 600s") or compute remaining budget from the elapsed time.
     #[must_use]
     pub fn timeout(&self) -> Duration {
         self.timeout
@@ -219,26 +266,62 @@ impl HeartbeatConfig {
 /// ```
 pub struct HeartbeatStream<S> {
     /// The inner stream being wrapped.
+    ///
+    /// All `poll_next` calls that survive the heartbeat check and the
+    /// hard-timeout check are delegated to this stream. The wrapper
+    /// does not buffer or transform items — it passes them through
+    /// verbatim, including errors from the inner stream.
     inner: S,
+
     /// Heartbeat and timeout configuration.
+    ///
+    /// Holds the interval, the timeout, and the callback. Owned by
+    /// the stream (not shared) so the wrapper can call the callback
+    /// without synchronization.
     config: HeartbeatConfig,
+
     /// Time of the last heartbeat callback.
+    ///
+    /// Compared against `Instant::now()` on every `poll_next` to
+    /// decide whether the interval has elapsed. Reset to `Instant::now()`
+    /// (not `start + n*interval`) after each fire so drift from
+    /// irregular polling doesn't accumulate.
     last_heartbeat: Instant,
+
     /// Time the stream was created.
+    ///
+    /// The reference for all `elapsed` calculations — heartbeat
+    /// `elapsed`, and the hard-timeout comparison. Captured once in
+    /// [`new`](Self::new) and never mutated for the life of the stream.
     start: Instant,
-    /// A Sleep that fires at the hard timeout deadline.
+
+    /// A `Sleep` future that fires at the hard-timeout deadline.
     ///
     /// Ensures the runtime wakes this task when the timeout expires,
-    /// even if the inner stream is Pending and nobody re-polls.
+    /// even if the inner stream is `Pending` and nobody re-polls.
+    /// Polled proactively in `poll_next` so a ready `Sleep` short-
+    /// circuits to the timeout error without delegating to the inner
+    /// stream first.
     timeout_sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
 }
 
 impl<S> HeartbeatStream<S> {
     /// Create a new heartbeat stream wrapping the given inner stream.
     ///
-    /// The heartbeat timer starts immediately upon construction.
+    /// The heartbeat timer starts immediately upon construction: `start`
+    /// and `last_heartbeat` are captured at this moment, and the
+    /// hard-timeout `Sleep` is armed against `start + config.timeout`.
     /// The first heartbeat callback fires after `heartbeat_interval`
-    /// elapses (checked on each `poll_next`).
+    /// elapses (checked on each `poll_next` — there is no background
+    /// timer).
+    ///
+    /// # Timeout overflow
+    ///
+    /// `start + config.timeout` is computed via `checked_add`. For any
+    /// realistic `Duration` this always succeeds; the fallback (a
+    /// deadline 30 years in the future) only triggers for extreme values
+    /// near `Duration::MAX`, where the deadline is effectively "never"
+    /// either way.
     ///
     /// # Example
     ///

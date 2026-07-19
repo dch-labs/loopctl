@@ -22,21 +22,16 @@
 //!
 //! # Architecture
 //!
-//! ```text
-//! ┌────────────────────────────────────────────┐
-//! │          Agent Loop (middleware)            │
-//! │                                            │
-//! │  tool_call ──▶ ToolSafetyShield::evaluate()│
-//! │                     │                      │
-//! │            ┌────────┴────────┐             │
-//! │            │  SafetyDecision │             │
-//! │            │  Allow / Warn / │             │
-//! │            │  Block          │             │
-//! │            └────────┬────────┘             │
-//! │                     │                      │
-//! │  tool_result ──▶ record_invocation()       │
-//! └────────────────────────────────────────────┘
-//! ```
+//! The shield sits in the agent-loop middleware path and is consulted twice
+//! per tool call:
+//!
+//! 1. **Before dispatch** —
+//!    [`ToolSafetyShield::evaluate()`] inspects the `tool_call` and returns
+//!    a [`SafetyDecision`] of `Allow`, `Warn`, or `Block`, which the loop
+//!    honors before running the tool.
+//! 2. **After dispatch** — `record_invocation()` is fed the `tool_result`
+//!    so the shield can update its multi-turn state (call history,
+//!    combination tracking) for future `evaluate()` calls.
 //!
 //! # Provided Implementations
 //!
@@ -79,18 +74,61 @@ use serde_json::Value;
 ///
 /// Each dimension of the shield (single-turn, multi-turn, combination)
 /// scores into a float in `[0.0, 1.0]`. The aggregate score is then
-/// mapped to a [`RiskLevel`] using configurable thresholds.
+/// mapped to a [`RiskLevel`] using configurable thresholds
+/// (`warn_threshold`, `block_threshold`) on [`UnixShield`].
+///
+/// # Ordering
+///
+/// Variants are written in increasing severity. There is intentionally no
+/// `Ord` derive — risk levels are labels produced by threshold
+/// comparisons, not a totally-ordered set; `RiskLevel::Medium` is not
+/// "less than" `RiskLevel::High` in any numeric sense callers should rely
+/// on. Compare the underlying aggregate score if you need ordering.
+///
+/// [`UnixShield`]: crate::tool::shield::UnixShield
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RiskLevel {
-    /// No risk detected. Aggregate score < 0.2.
+    /// No risk detected.
+    ///
+    /// Aggregate score below `0.2`. The default decision mapping for
+    /// `Safe` is [`SafetyAction::Allow`] with no warning.
     Safe,
-    /// Low risk. Aggregate score in [0.2, `warn_threshold`).
+
+    /// Low risk — below the warn threshold but not negligible.
+    ///
+    /// Aggregate score in `[0.2, warn_threshold)`. Like [`Safe`], this
+    /// maps to [`SafetyAction::Allow`]; the level exists so callers
+    /// inspecting a [`SafetyDecision`] can distinguish "nothing matched"
+    /// from "minor patterns matched, but below the warn bar."
+    ///
+    /// [`Safe`]: Self::Safe
+    /// [`SafetyAction::Allow`]: crate::tool::shield::SafetyAction::Allow
     Low,
-    /// Moderate risk. Aggregate score in [`warn_threshold`, `block_threshold`).
+
+    /// Moderate risk — at or above the warn threshold.
+    ///
+    /// Aggregate score in `[warn_threshold, block_threshold)`. Maps to
+    /// [`SafetyAction::Warn`]: the call proceeds, but the middleware
+    /// surfaces a reason and category to observers / logs.
+    ///
+    /// [`SafetyAction::Warn`]: crate::tool::shield::SafetyAction::Warn
     Medium,
-    /// High risk. Aggregate score in [`block_threshold`, 0.9).
+
+    /// High risk — at or above the block threshold.
+    ///
+    /// Aggregate score in `[block_threshold, 0.9)`. Maps to
+    /// [`SafetyAction::Block`]: the call does not proceed.
+    ///
+    /// [`SafetyAction::Block`]: crate::tool::shield::SafetyAction::Block
     High,
-    /// Critical risk. Aggregate score ≥ 0.9.
+
+    /// Critical risk — the most dangerous category.
+    ///
+    /// Aggregate score at or above `0.9`. Reserved for patterns the
+    /// shield treats as maximally dangerous (e.g. `rm -rf /`, `curl … |
+    /// sh`). Maps to [`SafetyAction::Block`].
+    ///
+    /// [`SafetyAction::Block`]: crate::tool::shield::SafetyAction::Block
     Critical,
 }
 
@@ -110,14 +148,49 @@ impl std::fmt::Display for RiskLevel {
 // SafetyAction
 // ===================================================
 
-/// The action the shield recommends.
+/// The action the shield recommends for a tool call.
+///
+/// Produced as the [`SafetyDecision::action`] field. The middleware is
+/// expected to honor it: proceed on [`Allow`], proceed-and-log on
+/// [`Warn`], refuse to dispatch on [`Block`].
+///
+/// There is intentionally no `Ord` derive — these are categorical
+/// recommendations, not an ordered severity scale. Use [`RiskLevel`] for
+/// severity comparisons.
+///
+/// [`Allow`]: Self::Allow
+/// [`Warn`]: Self::Warn
+/// [`Block`]: Self::Block
+/// [`SafetyDecision::action`]: crate::tool::shield::SafetyDecision::action
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SafetyAction {
     /// Allow the tool call to proceed.
+    ///
+    /// The shield found no concerning patterns, or every pattern it found
+    /// scored below the warn threshold. No metadata is required on the
+    /// accompanying [`SafetyDecision`].
+    ///
+    /// [`SafetyDecision`]: crate::tool::shield::SafetyDecision
     Allow,
-    /// Allow but emit a warning.
+
+    /// Allow the tool call to proceed, but emit a warning.
+    ///
+    /// The shield detected moderate risk (score in the warn band). The
+    /// call is permitted to run — warnings are advisory, not blocking —
+    /// but the [`SafetyDecision`] carries a human-readable `reason` and
+    /// a machine-readable `category` for observers, logs, and TUIs.
+    ///
+    /// [`SafetyDecision`]: crate::tool::shield::SafetyDecision
     Warn,
+
     /// Block the tool call entirely.
+    ///
+    /// The shield detected high or critical risk (score at or above the
+    /// block threshold). The middleware must refuse to dispatch the call;
+    /// the [`SafetyDecision`] carries a `reason` and `category`
+    /// describing what was matched, for surfacing to the user.
+    ///
+    /// [`SafetyDecision`]: crate::tool::shield::SafetyDecision
     Block,
 }
 
@@ -127,20 +200,48 @@ pub enum SafetyAction {
 
 /// The shield's decision for a single tool invocation.
 ///
-/// Produced by [`ToolSafetyShield::evaluate`]. Carries the action, an
-/// optional human-readable reason, and a machine-readable category tag.
+/// Produced by [`ToolSafetyShield::evaluate`]. Carries the action the
+/// middleware should take, an optional human-readable reason explaining
+/// the decision, and an optional machine-readable category tag for
+/// programmatic handling / filtering in logs.
+///
+/// # Construction
+///
+/// Use the [`allow`](Self::allow), [`warn`](Self::warn), and
+/// [`block`](Self::block) constructors rather than building the struct
+/// directly — they keep the reason/category fields consistent with the
+/// chosen action (e.g. `allow` always has `None` for both).
 #[derive(Debug, Clone)]
 pub struct SafetyDecision {
-    /// The recommended action.
+    /// The recommended action for this tool call.
+    ///
+    /// Always set. See [`SafetyAction`] for the three variants and the
+    /// middleware's responsibility for each.
     pub action: SafetyAction,
-    /// Human-readable explanation (set for `Warn` and `Block`).
+
+    /// Human-readable explanation of the decision.
+    ///
+    /// Set for [`SafetyAction::Warn`] and [`SafetyAction::Block`]
+    /// decisions (the constructors populate it from the caller-supplied
+    /// string); `None` for [`SafetyAction::Allow`]. Suitable for
+    /// surfacing to a user or writing to a log line.
     pub reason: Option<String>,
-    /// Machine-readable category (e.g. `"safety_evaluation"`, `"pattern_match"`).
+
+    /// Machine-readable category tag for the decision.
+    ///
+    /// Set for `Warn` and `Block`; `None` for `Allow`. Free-form but
+    /// conventionally a stable identifier like `"safety_evaluation"` or
+    /// `"pattern_match"` so downstream consumers can route on it without
+    /// parsing the `reason` text.
     pub category: Option<String>,
 }
 
 impl SafetyDecision {
-    /// Create an `Allow` decision with no attached metadata.
+    /// Create an [`SafetyAction::Allow`] decision with no attached
+    /// metadata.
+    ///
+    /// Both `reason` and `category` are `None` — an allowed call has
+    /// nothing to warn or block about.
     #[must_use]
     pub fn allow() -> Self {
         Self {
@@ -150,7 +251,12 @@ impl SafetyDecision {
         }
     }
 
-    /// Create a `Warn` decision with reason and category.
+    /// Create a [`SafetyAction::Warn`] decision with a reason and
+    /// category.
+    ///
+    /// The call proceeds, but the middleware should surface `reason` to
+    /// observers / logs. `category` should be a stable machine-readable
+    /// identifier consumers can filter on.
     #[must_use]
     pub fn warn(reason: String, category: &str) -> Self {
         Self {
@@ -160,7 +266,12 @@ impl SafetyDecision {
         }
     }
 
-    /// Create a `Block` decision with reason and category.
+    /// Create a [`SafetyAction::Block`] decision with a reason and
+    /// category.
+    ///
+    /// The middleware must refuse to dispatch the call. `reason` should
+    /// explain what was matched so the user can understand why; `category`
+    /// should be a stable identifier for programmatic routing.
     #[must_use]
     pub fn block(reason: String, category: &str) -> Self {
         Self {
@@ -170,19 +281,31 @@ impl SafetyDecision {
         }
     }
 
-    /// Whether the decision is `Allow`.
+    /// Returns `true` if the decision's action is
+    /// [`SafetyAction::Allow`].
+    ///
+    /// Convenience predicate for middleware that wants to short-circuit
+    /// "this call is fine, dispatch it" without a full `match`.
     #[must_use]
     pub fn is_allowed(&self) -> bool {
         self.action == SafetyAction::Allow
     }
 
-    /// Whether the decision is `Block`.
+    /// Returns `true` if the decision's action is
+    /// [`SafetyAction::Block`].
+    ///
+    /// Convenience predicate for middleware that wants to short-circuit
+    /// "refuse this call" without a full `match`.
     #[must_use]
     pub fn is_blocked(&self) -> bool {
         self.action == SafetyAction::Block
     }
 
-    /// Whether the decision is `Warn`.
+    /// Returns `true` if the decision's action is
+    /// [`SafetyAction::Warn`].
+    ///
+    /// Convenience predicate for middleware that wants to branch on
+    /// "proceed but log" without a full `match`.
     #[must_use]
     pub fn is_warn(&self) -> bool {
         self.action == SafetyAction::Warn
@@ -195,17 +318,53 @@ impl SafetyDecision {
 
 /// Context provided to the shield for evaluation.
 ///
-/// Constructed by the middleware before each tool call. The shield uses
-/// this to evaluate single-turn risk and multi-turn patterns.
+/// Constructed by the middleware before each tool call. Carries what the
+/// shield needs to evaluate both single-turn risk (the current call in
+/// isolation) and multi-turn / combination risk (the current call in the
+/// context of the recent call history).
+///
+/// # Lifecycle
+///
+/// A fresh `ShieldContext` is built per tool invocation and passed by
+/// reference to [`ToolSafetyShield::evaluate`]. It is not stored across
+/// calls — shields that need persistent history keep their own
+/// (typically `Mutex<Vec<…>>`-protected) state, updated in
+/// [`ToolSafetyShield::record_invocation`].
 #[derive(Debug, Clone)]
 pub struct ShieldContext {
     /// Name of the tool being invoked.
+    ///
+    /// Matches the registry key the engine used to dispatch the call.
+    /// Single-turn risk patterns are looked up under this name, so a
+    /// tool's risk configuration is keyed off the same identifier the
+    /// agent uses to call it.
     pub tool_name: String,
-    /// The JSON input to the tool.
+
+    /// The JSON input passed to the tool.
+    ///
+    /// Shield patterns operate on the stringified form of this value
+    /// (substring matching), so any JSON-shaped input is admissible —
+    /// objects, arrays, primitives. The same value is later handed to
+    /// [`ToolSafetyShield::record_invocation`] so the shield can store
+    /// it for combination-rule matching.
     pub input: Value,
-    /// Current turn number in the agent session (0-indexed).
+
+    /// Current turn number in the agent session, 0-indexed.
+    ///
+    /// Lets the shield factor recency into its scoring (e.g. weight
+    /// recent calls more heavily) and lets logs correlate shield
+    /// decisions with the turn that produced them.
     pub turn: usize,
-    /// Recent tool invocations in this session (tool name, turn).
+
+    /// Recent tool invocations in this session, as `(tool_name, turn)`
+    /// pairs.
+    ///
+    /// A read-only snapshot provided by the middleware for shields that
+    /// prefer not to maintain their own history. Shields that *do*
+    /// maintain their own history (like [`UnixShield`]) can ignore this
+    /// field and consult their internal state instead.
+    ///
+    /// [`UnixShield`]: crate::tool::shield::UnixShield
     pub recent_calls: Vec<(String, usize)>,
 }
 
@@ -213,18 +372,45 @@ pub struct ShieldContext {
 // RiskPattern
 // ===================================================
 
-/// A named risk pattern matched against tool input.
+/// A named risk pattern matched against a tool's input.
 ///
 /// Patterns are stored per tool name. When a tool call is evaluated,
 /// its stringified JSON input is checked against every pattern
-/// registered for that tool name.
+/// registered for that tool name; any pattern whose `pattern` substring
+/// appears contributes its `score` to the single-turn risk dimension.
+///
+/// # Matching
+///
+/// Matching is plain substring search on `input.to_string()` — there is
+/// no regex, word-boundary, or JSON-aware path matching. Patterns must
+/// be chosen so that a substring match implies the intended risk (e.g.
+/// `"rm -rf"` is distinctive enough; a bare `"rm"` would over-match).
 #[derive(Clone)]
 pub struct RiskPattern {
     /// Human-readable name for diagnostics and log messages.
+    ///
+    /// Appears in shield output and logs when this pattern is the
+    /// matched one. Should be unique within a tool's pattern list and
+    /// descriptive enough to identify the risk at a glance (e.g.
+    /// `"recursive_delete"`, `"write_ssh"`, `"curl_pipe_sh"`).
     pub name: &'static str,
-    /// Score contribution if matched, in `[0.0, 1.0]`.
+
+    /// Score contributed to the single-turn dimension if this pattern
+    /// matches, in `[0.0, 1.0]`.
+    ///
+    /// When multiple patterns match a single input, the highest score
+    /// wins ([`UnixShield::assess_single_tool_risk`] takes the `max`).
+    /// Convention: `0.9` for critical patterns (`rm -rf`, `curl | sh`),
+    /// `0.5`–`0.8` for serious patterns, `< 0.5` for minor ones.
+    ///
+    /// [`UnixShield::assess_single_tool_risk`]: crate::tool::shield::UnixShield::assess_single_tool_risk
     pub score: f32,
+
     /// Substring to search for in the stringified input.
+    ///
+    /// Matched verbatim (no regex, no case folding). Picked so that a
+    /// substring hit reliably indicates the intended risk — see the
+    /// type-level docs on matching.
     pub pattern: &'static str,
 }
 
@@ -234,17 +420,49 @@ pub struct RiskPattern {
 
 /// A rule that scores a dangerous *sequence* of tool calls.
 ///
-/// A combination rule triggers when **all** of its [`triggers`](CombinationRule::triggers)
-/// appear in recent history or the current call. Each trigger is a
-/// `(tool_name, optional_substring)` pair.
+/// A combination rule triggers when **all** of its [`triggers`](Self::triggers)
+/// appear in recent history or the current call, in the order specified.
+/// Each trigger is a `(tool_name, optional_substring)` pair: the
+/// `tool_name` must match exactly, and when the substring is present the
+/// trigger only fires if that substring is in the call's stringified
+/// input.
+///
+/// # Example
+///
+/// A rule with triggers `&[("Bash", Some("curl")), ("Bash", Some("| sh"))]`
+/// fires only when a `curl` call is followed by a `| sh` call in the
+/// session — catching the classic "download and execute" pattern that
+/// neither call would flag in isolation.
 #[derive(Clone)]
 pub struct CombinationRule {
     /// Human-readable description for diagnostics and log messages.
+    ///
+    /// Surfaces in shield output when the rule fires. Should name the
+    /// dangerous sequence (e.g. `"download then execute"`,
+    /// `"write then chmod +x"`) so a user reading the warning
+    /// understands what the shield saw.
     pub description: &'static str,
-    /// Score contribution if matched.
+
+    /// Score contributed to the combination dimension if this rule
+    /// triggers, in `[0.0, 1.0]`.
+    ///
+    /// When multiple rules fire on the same call, the highest score
+    /// wins ([`UnixShield::assess_combination`] takes the `max`).
+    /// Convention: `0.8+` for sequences that are almost always
+    /// adversarial; `0.5`–`0.7` for suspicious-but-defensible ones.
+    ///
+    /// [`UnixShield::assess_combination`]: crate::tool::shield::UnixShield::assess_combination
     pub score: f32,
-    /// Pairs of `(tool_name, optional_substring)` that must all appear
-    /// for the rule to trigger.
+
+    /// Pairs of `(tool_name, optional_substring)` that must all appear,
+    /// in order, for the rule to trigger.
+    ///
+    /// The match is chronological against the candidate sequence
+    /// (recorded history followed by the current call). Each trigger
+    /// advances only when both the tool name matches and, if a
+    /// substring is supplied, that substring appears in the call's
+    /// stringified input. A `None` substring means "any call to this
+    /// tool".
     pub triggers: &'static [(&'static str, Option<&'static str>)],
 }
 
@@ -276,20 +494,40 @@ pub struct CombinationRule {
 pub trait ToolSafetyShield: Send + Sync {
     /// Evaluate whether the tool call described by `ctx` should be
     /// allowed, warned about, or blocked.
+    ///
+    /// Called by the middleware before dispatch. The shield inspects the
+    /// call (and, if it maintains its own history, prior calls) and
+    /// returns a [`SafetyDecision`] naming the action to take, with a
+    /// reason/category populated for `Warn` and `Block`.
+    ///
+    /// Implementations must be deterministic for a given `(self, ctx)`
+    /// pair so that replaying the same call produces the same decision;
+    /// non-determinism breaks the VCR / cassette test path.
     fn evaluate(&self, ctx: &ShieldContext) -> SafetyDecision;
 
-    /// Called after the tool executes. Allows the shield to update
-    /// internal state (e.g. call history for multi-turn analysis).
+    /// Called after the tool executes so the shield can update internal
+    /// state for multi-turn / combination analysis.
     ///
-    /// The `input` is the same [`Value`] passed to [`evaluate`](ToolSafetyShield::evaluate),
-    /// so the shield can store it for later combination-rule matching.
+    /// The middleware calls this with the same `input` [`Value`] passed
+    /// to [`evaluate`](Self::evaluate), plus a `success` flag indicating
+    /// whether the tool returned an error. Shields that maintain call
+    /// history (e.g. [`UnixShield`]) append to it here; shields with no
+    /// multi-turn state (e.g. [`NullShield`]) no-op.
+    ///
+    /// [`UnixShield`]: crate::tool::shield::UnixShield
+    /// [`NullShield`]: crate::tool::shield::NullShield
     fn record_invocation(&self, tool_name: &str, input: &Value, success: bool);
 
     /// Return the set of tool names this shield wants to inspect.
     ///
-    /// Optimization: if the shield returns an empty set, the middleware
-    /// can skip calling [`evaluate()`](ToolSafetyShield::evaluate) for
-    /// tools that the shield has no rules for.
+    /// Optimization: the middleware consults this before calling
+    /// [`evaluate`](Self::evaluate) and skips evaluation for tools not
+    /// in the set. Shields should return the keys of their per-tool
+    /// pattern database. An empty set means "no tools watched" and
+    /// causes the middleware to skip evaluation entirely (used by
+    /// [`NullShield`] to be truly zero-cost).
+    ///
+    /// [`NullShield`]: crate::tool::shield::NullShield
     fn watched_tools(&self) -> HashSet<String>;
 }
 
@@ -328,15 +566,42 @@ pub trait ToolSafetyShield: Send + Sync {
 /// [`assess_multi_turn`]: UnixShield::assess_multi_turn
 /// [`assess_combination`]: UnixShield::assess_combination
 pub struct UnixShield {
-    /// Score at which [`SafetyAction::Warn`] is returned.
+    /// Aggregate score at or above which [`SafetyAction::Warn`] is
+    /// returned.
+    ///
+    /// Configurable via [`with_thresholds`](Self::with_thresholds) or the
+    /// builder; defaults to `0.4`. Clamped to `[0.0, 1.0]` on
+    /// construction.
     warn_threshold: f32,
-    /// Score at which [`SafetyAction::Block`] is returned.
+
+    /// Aggregate score at or above which [`SafetyAction::Block`] is
+    /// returned.
+    ///
+    /// Must be `>= warn_threshold` for sensible behavior; the shield does
+    /// not enforce this at construction time, so a misconfigured builder
+    /// can produce surprising results. Defaults to `0.7`.
     block_threshold: f32,
-    /// Per-turn invocation history: `(tool_name, input_string)`.
+
+    /// Per-invocation call history: `(tool_name, stringified_input)`.
+    ///
+    /// Mutex-protected because [`ToolSafetyShield`] requires `Send +
+    /// Sync` and `evaluate`/`record_invocation` are `&self` methods.
+    /// Trimmed to the last 20 entries on each `record_invocation` to
+    /// bound memory growth in long sessions.
     turn_history: Mutex<Vec<(String, String)>>,
-    /// Per-tool single-turn risk patterns.
+
+    /// Per-tool single-turn risk patterns, keyed by tool name.
+    ///
+    /// Populated from [`unix_patterns`](Self::unix_patterns) by default
+    /// (`Bash`, `Write`, `Edit`); extendable via the builder. The keyset
+    /// also defines [`watched_tools`](ToolSafetyShield::watched_tools).
     patterns: HashMap<&'static str, Vec<RiskPattern>>,
+
     /// Combination rules for dangerous sequences.
+    ///
+    /// Populated from [`unix_combination_rules`](Self::unix_combination_rules)
+    /// by default (write→execute, download→execute, chmod→write);
+    /// extendable via the builder.
     combination_rules: Vec<CombinationRule>,
 }
 
@@ -356,9 +621,13 @@ impl UnixShield {
         }
     }
 
-    /// Set custom warn and block thresholds.
+    /// Override the default warn and block thresholds, builder-style.
     ///
-    /// Values are clamped to `[0.0, 1.0]`.
+    /// Both values are clamped to `[0.0, 1.0]` so an out-of-range
+    /// configuration cannot produce a shield that never warns or never
+    /// blocks. The shield does not enforce `block >= warn`; passing an
+    /// inverted pair will produce surprising decisions, so callers
+    /// should validate their own inputs.
     #[must_use]
     pub fn with_thresholds(mut self, warn: f32, block: f32) -> Self {
         self.warn_threshold = warn.clamp(0.0, 1.0);
@@ -376,11 +645,18 @@ impl UnixShield {
         UnixShieldBuilder::new()
     }
 
-    /// Assess single-turn risk: match the tool input against known
-    /// dangerous patterns for that tool.
+    /// Assess single-turn risk by matching the tool input against the
+    /// patterns registered for that tool.
     ///
-    /// Returns the highest score among all matched patterns, or `0.0`
-    /// if the tool has no registered patterns or none matched.
+    /// Stringifies `input` and substring-matches it against every
+    /// [`RiskPattern`] keyed under `tool_name`. When multiple patterns
+    /// match, the highest `score` among them is returned (a single
+    /// dangerous pattern dominates several minor ones). Returns `0.0`
+    /// when the tool has no registered patterns or none of them match.
+    ///
+    /// This is the single-turn contribution to the aggregate score;
+    /// [`evaluate`](ToolSafetyShield::evaluate) weights it at `1.0`
+    /// (the highest-weighted dimension).
     pub fn assess_single_tool_risk(&self, tool_name: &str, input: &Value) -> f32 {
         let Some(patterns) = self.patterns.get(tool_name) else {
             return 0.0;
@@ -395,11 +671,16 @@ impl UnixShield {
         max_score
     }
 
-    /// Assess multi-turn risk: look for repeated calls to the same
-    /// tool across recent turns.
+    /// Assess multi-turn risk by counting prior calls to the same tool
+    /// in the recorded history.
     ///
-    /// The score graduates with repetition: 0 calls → 0.0, 1 → 0.1,
-    /// 2 → 0.3, 3+ → 0.6.
+    /// The score graduates with repetition so that a single repeat is
+    /// mild but a long run of the same tool flags as suspicious:
+    /// Graduated: 0 calls = 0.0, 1 = 0.1, 2 = 0.3, 3+ = 0.6
+    /// [`evaluate`](ToolSafetyShield::evaluate) weights this at `0.5`,
+    /// so even at the saturated `0.6` it cannot alone push the
+    /// aggregate past the warn threshold — but combined with a
+    /// single-turn hit it adds up.
     pub fn assess_multi_turn(&self, ctx: &ShieldContext) -> f32 {
         let history = self
             .turn_history
@@ -409,7 +690,6 @@ impl UnixShield {
             .iter()
             .filter(|(name, _)| name == &ctx.tool_name)
             .count();
-        // Graduated: 0 calls = 0.0, 1 = 0.1, 2 = 0.3, 3+ = 0.6
         match same_tool_count {
             0 => 0.0,
             1 => 0.1,
@@ -418,13 +698,23 @@ impl UnixShield {
         }
     }
 
-    /// Assess combination risk: detect dangerous tool sequences in
-    /// recent history.
+    /// Assess combination risk by detecting dangerous sequences of
+    /// tool calls in recorded history plus the current call.
     ///
-    /// Each [`CombinationRule`] specifies an ordered sequence of triggers.
-    /// The match is chronological — triggers must appear in the order
-    /// specified, either in recorded history or the current call.
-    /// Returns the highest score among all matched rules.
+    /// Each [`CombinationRule`] specifies an ordered sequence of
+    /// triggers (`(tool_name, optional_substring)` pairs). The match
+    /// walks the candidate sequence — recorded history followed by the
+    /// current call — and advances a per-rule trigger pointer only
+    /// when both the tool name matches and, if a substring is
+    /// supplied, that substring appears in the call's stringified
+    /// input. A rule fires when its pointer reaches the end of its
+    /// trigger list, contributing its `score`.
+    ///
+    /// When multiple rules fire, the highest score wins. Returns `0.0`
+    /// if no rule triggers. [`evaluate`](ToolSafetyShield::evaluate)
+    /// weights this dimension at `0.3` — the lowest-weighted, but the
+    /// only one that can detect adversarial *sequences* (download →
+    /// execute, write → chmod +x).
     pub fn assess_combination(&self, ctx: &ShieldContext) -> f32 {
         let history = self
             .turn_history
@@ -463,6 +753,18 @@ impl UnixShield {
         max_risk
     }
 
+    /// Map an aggregate risk score to a [`RiskLevel`] using this
+    /// shield's configured thresholds.
+    ///
+    /// Bands (default thresholds): `< 0.2` → [`Safe`](RiskLevel::Safe),
+    /// `[0.2, 0.4)` → [`Low`](RiskLevel::Low),
+    /// `[warn_threshold, block_threshold)` →
+    /// [`Medium`](RiskLevel::Medium),
+    /// `[block_threshold, 0.9)` → [`High`](RiskLevel::High),
+    /// `>= 0.9` → [`Critical`](RiskLevel::Critical).
+    /// `0.9` is hardcoded for `Critical` so the most dangerous patterns
+    /// always land in their own bucket regardless of threshold
+    /// configuration.
     fn score_to_level(&self, score: f32) -> RiskLevel {
         if score >= 0.9 {
             RiskLevel::Critical
@@ -662,9 +964,30 @@ impl ToolSafetyShield for UnixShield {
 ///     .build();
 /// ```
 pub struct UnixShieldBuilder {
+    /// Aggregate score at or above which the built shield will return
+    /// [`SafetyAction::Warn`]. Defaults to `0.4`; override via
+    /// [`warn_threshold`](Self::warn_threshold).
     warn_threshold: f32,
+
+    /// Aggregate score at or above which the built shield will return
+    /// [`SafetyAction::Block`]. Defaults to `0.7`; override via
+    /// [`block_threshold`](Self::block_threshold).
     block_threshold: f32,
+
+    /// Per-tool single-turn risk patterns, keyed by tool name.
+    ///
+    /// Populated from [`UnixShield::unix_patterns`] by
+    /// [`new`](Self::new); empty under [`blank`](Self::blank); extended
+    /// via [`pattern`](Self::pattern).
     patterns: HashMap<&'static str, Vec<RiskPattern>>,
+
+    /// Combination rules for dangerous sequences.
+    ///
+    /// Populated from [`UnixShield::unix_combination_rules`] by
+    /// [`new`](Self::new); empty under [`blank`](Self::blank); extended
+    /// via [`combination_rule`](Self::combination_rule).
+    ///
+    /// [`UnixShield::unix_combination_rules`]: crate::tool::shield::UnixShield::unix_combination_rules
     combination_rules: Vec<CombinationRule>,
 }
 
@@ -718,19 +1041,29 @@ impl UnixShieldBuilder {
         self
     }
 
-    /// Register single-turn risk patterns for a tool.
+    /// Register single-turn risk patterns for a tool, builder-style.
     ///
-    /// Appends to any existing patterns for that tool name.
+    /// Appends to any patterns already registered for `tool_name`
+    /// rather than replacing them — call repeatedly to assemble a
+    /// tool's risk profile across multiple additions. The first call
+    /// for a given `tool_name` also adds it to the built shield's
+    /// [`watched_tools`](ToolSafetyShield::watched_tools) set.
     #[must_use]
     pub fn pattern(mut self, tool_name: &'static str, patterns: Vec<RiskPattern>) -> Self {
         self.patterns.entry(tool_name).or_default().extend(patterns);
         self
     }
 
-    /// Register a combination rule.
+    /// Register a combination rule for dangerous tool sequences,
+    /// builder-style.
     ///
-    /// The rule is evaluated on every call to [`UnixShield::evaluate`]
-    /// and fires when all of its triggers appear in the session history.
+    /// The rule is evaluated on every call to
+    /// [`UnixShield::evaluate`] and fires when all of its triggers
+    /// appear in the session history in order. Call repeatedly to add
+    /// multiple rules; rules are independent (the highest score among
+    /// triggered rules wins).
+    ///
+    /// [`UnixShield::evaluate`]: crate::tool::shield::UnixShield::evaluate
     #[must_use]
     pub fn combination_rule(mut self, rule: CombinationRule) -> Self {
         self.combination_rules.push(rule);
@@ -764,11 +1097,23 @@ impl Default for UnixShieldBuilder {
 // NullShield
 // ===================================================
 
-/// A no-op shield that allows everything.
+/// A no-op [`ToolSafetyShield`] that allows every call and watches no
+/// tools.
 ///
-/// Used when the `tool_shield` feature is disabled. Because all methods
-/// return constants with no field access, the compiler can inline and
-/// eliminate all calls to this type, making it truly zero-cost.
+/// Used as the default shield type when the `tool_shield` feature is
+/// disabled, so engine code that holds `Arc<dyn ToolSafetyShield>`
+/// compiles and runs without forcing the feature on downstream
+/// consumers.
+///
+/// # Zero-cost
+///
+/// All three trait methods return constants with no field access
+/// (`evaluate` returns a pre-built [`SafetyDecision::allow`],
+/// `record_invocation` no-ops, `watched_tools` returns an empty
+/// [`HashSet`]). Because the middleware short-circuits evaluation
+/// entirely when `watched_tools` is empty, an installed `NullShield`
+/// costs nothing at runtime — and the compiler can inline and elide
+/// the constant returns.
 pub struct NullShield;
 
 impl ToolSafetyShield for NullShield {

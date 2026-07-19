@@ -40,7 +40,7 @@
 use crate::error::LoopError;
 use crate::memory::{ConsolidationStats, LoopMemory, MemoryEntry};
 use std::future::Future;
-use std::sync::{PoisonError, RwLock};
+use std::sync::RwLock;
 
 /// A simple in-memory store for loop memory entries.
 ///
@@ -166,7 +166,7 @@ impl InMemoryStore {
     /// ```
     #[must_use]
     pub fn with_entries(self, entries: Vec<MemoryEntry>) -> Self {
-        *self.entries.write().unwrap_or_else(PoisonError::into_inner) = entries;
+        *crate::error::recover_guard(self.entries.write()) = entries;
         self
     }
 }
@@ -194,10 +194,7 @@ impl LoopMemory for InMemoryStore {
     /// This implementation never returns an error.
     fn store(&self, entry: MemoryEntry) -> impl Future<Output = Result<(), LoopError>> + Send {
         async move {
-            self.entries
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(entry);
+            crate::error::recover_guard(self.entries.write()).push(entry);
             Ok(())
         }
     }
@@ -247,7 +244,7 @@ impl LoopMemory for InMemoryStore {
             let query_lower = query.to_lowercase();
             let query_words: Vec<&str> = query_lower.split_whitespace().collect();
 
-            let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
+            let entries = crate::error::recover_guard(self.entries.read());
             let snapshot: Vec<MemoryEntry> = entries.iter().cloned().collect();
             drop(entries);
             let mut scored: Vec<(f32, MemoryEntry)> = snapshot
@@ -310,7 +307,7 @@ impl LoopMemory for InMemoryStore {
     /// ```
     fn consolidate(&self) -> impl Future<Output = Result<ConsolidationStats, LoopError>> + Send {
         async move {
-            let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+            let mut entries = crate::error::recover_guard(self.entries.write());
             let entries_before = entries.len();
             entries.retain(|e| e.relevance >= 0.05);
             let pruned = entries_before.saturating_sub(entries.len());
@@ -329,10 +326,7 @@ impl LoopMemory for InMemoryStore {
     /// Used by the framework to monitor memory usage and by the
     /// [`is_empty`](LoopMemory::is_empty) provided method.
     fn len(&self) -> usize {
-        self.entries
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len()
+        crate::error::recover_guard(self.entries.read()).len()
     }
 }
 

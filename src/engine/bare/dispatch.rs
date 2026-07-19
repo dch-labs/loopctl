@@ -1101,7 +1101,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use parking_lot::Mutex;
+    use std::sync::Mutex;
 
     use super::*;
 
@@ -1119,13 +1119,13 @@ mod tests {
 
     impl ApiClient for MockClient {
         fn model(&self) -> String {
-            self.model_name.lock().clone()
+            crate::error::recover_guard(self.model_name.lock()).clone()
         }
         fn set_model(&self, model: &str) -> bool {
             if model.trim().is_empty() {
                 return false;
             }
-            *self.model_name.lock() = model.to_string();
+            *crate::error::recover_guard(self.model_name.lock()) = model.to_string();
             true
         }
         fn stream_messages(

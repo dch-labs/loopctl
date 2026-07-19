@@ -514,15 +514,51 @@ impl From<&str> for ToolOutput {
 /// ```
 #[derive(Debug, Clone)]
 pub struct ToolDispatchResult {
-    /// Set by the engine via [`with_call_id`](Self::with_call_id).
+    /// The ID the model assigned to this tool call.
+    ///
+    /// Copied from the inbound `ToolCall` by the engine so the caller
+    /// can correlate the result back to the request. Set via
+    /// [`with_call_id`](Self::with_call_id) on the builder; empty when
+    /// constructed via [`From<ToolOutput>`](Self#impl-From<ToolOutput>).
     pub tool_call_id: String,
-    /// Preserves multipart and image content on success; wraps error in text on failure.
+
+    /// The content returned by the tool.
+    ///
+    /// A [`ToolContent::Text`](crate::message::ToolContent::Text) on the
+    /// common path (plain-text result or an error message wrapped in
+    /// text). A
+    /// [`ToolContent::Multipart`](crate::message::ToolContent::Multipart)
+    /// when the tool produces mixed content (text + images) or multiple
+    /// text segments. Middlewares may rewrite this post-execution (e.g.
+    /// `OutputLimitMiddleware` truncates, `VerifyMiddleware` appends a
+    /// `[verify]` block).
     pub output: crate::message::ToolContent,
+
     /// Whether the tool dispatch resulted in an error.
+    ///
+    /// `false` on success; `true` when the tool returned an error or the
+    /// dispatch itself failed (timeout, panic caught via `catch_unwind`,
+    /// permission denied). Middlewares and the recovery loop consult
+    /// this flag — for example, `VerifyMiddleware` skips verification
+    /// and `MemoizingMiddleware` skips caching when `is_error` is `true`.
     pub is_error: bool,
-    /// Wall-clock execution time.
+
+    /// Wall-clock execution time of the tool call.
+    ///
+    /// Measured from dispatch start to completion by the engine. Zero on
+    /// cached results returned by `MemoizingMiddleware` (the cached call
+    /// didn't execute this turn). Useful for metrics, slow-tool
+    /// detection, and timeout diagnostics.
     pub duration: Duration,
-    /// May differ from the requested tool name if a routing middleware redirected the call.
+
+    /// The tool name the call actually ran under.
+    ///
+    /// Usually identical to the requested name. May differ when a
+    /// routing middleware redirected the call (e.g. aliasing an
+    /// unknown tool name to the closest match). Middlewares that need
+    /// to reason about *which tool executed* (rather than what the
+    /// model requested) should read this field instead of the
+    /// pre-dispatch `ToolDispatchContext::tool_name`.
     pub resolved_tool_name: String,
 }
 

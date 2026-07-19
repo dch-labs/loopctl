@@ -119,6 +119,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   `.unwrap_or_else(std::sync::PoisonError::into_inner)` recovery pattern.
   The crate now uses a single mutex family with no external lock
   dependency.
+- MSRV bumped from 1.85 to 1.94. The crate uses let-chain syntax
+  (`if x && let Some(y) = ...`) which stabilized in Rust 1.88.
 - Both sequential and parallel tool dispatch now check the cancel signal
   between calls. Previously, a Ctrl-C during a multi-tool batch was only
   honored at the next turn boundary; now it aborts the remaining calls in the

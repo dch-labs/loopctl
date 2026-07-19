@@ -682,10 +682,7 @@ impl UnixShield {
     /// aggregate past the warn threshold — but combined with a
     /// single-turn hit it adds up.
     pub fn assess_multi_turn(&self, ctx: &ShieldContext) -> f32 {
-        let history = self
-            .turn_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let history = crate::error::recover_guard(self.turn_history.lock());
         let same_tool_count = history
             .iter()
             .filter(|(name, _)| name == &ctx.tool_name)
@@ -716,10 +713,7 @@ impl UnixShield {
     /// only one that can detect adversarial *sequences* (download →
     /// execute, write → chmod +x).
     pub fn assess_combination(&self, ctx: &ShieldContext) -> f32 {
-        let history = self
-            .turn_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let history = crate::error::recover_guard(self.turn_history.lock());
         let mut max_risk = 0.0_f32;
 
         // Build a chronological candidate sequence: history entries in
@@ -922,10 +916,7 @@ impl ToolSafetyShield for UnixShield {
     }
 
     fn record_invocation(&self, tool_name: &str, input: &Value, _success: bool) {
-        let mut history = self
-            .turn_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut history = crate::error::recover_guard(self.turn_history.lock());
         history.push((tool_name.to_string(), input.to_string()));
         // Trim to last 20 entries.
         if history.len() > 20 {

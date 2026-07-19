@@ -47,6 +47,7 @@
 //! let result = pipeline.invoke(ctx).await;
 //! ```
 
+pub mod memoize;
 pub mod output_limit;
 pub mod permission;
 pub mod timeout;
@@ -64,6 +65,7 @@ use std::sync::Arc;
 
 pub use crate::tool::ToolDispatchResult;
 
+pub use memoize::{MemoizingMiddleware, PathExtractor};
 pub use output_limit::OutputLimitMiddleware;
 pub use permission::{AskResolverFn, PermissionCheckFn, PermissionMiddleware};
 pub use timeout::{TimeoutConfig, TimeoutMiddleware};

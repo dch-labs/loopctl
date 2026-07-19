@@ -688,7 +688,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// let buf = Arc::clone(&buffer);
     /// agent.set_text_streamer(Arc::new(move |delta| {
     ///     print!("{delta}");
-    ///     crate::error::recover_guard(buf.lock()).push_str(delta);
+    ///     buf.lock().unwrap_or_else(|e| e.into_inner()).push_str(delta);
     /// }));
     /// ```
     pub fn set_text_streamer(&mut self, f: Arc<dyn Fn(&str) + Send + Sync>) {

@@ -79,6 +79,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   `Correction::modified_input` against the failing tool's `input_schema`
   and returns `ReflectionError::Internal` on a mismatch. When disabled,
   validation is skipped.
+- `VerifyMiddleware`, `Verifier` trait, and `VerifyResult`
+  (`middleware::verify` module): opt-in post-execution middleware that
+  runs a caller-supplied verifier after configured write-class tools and
+  appends the pass/fail + diagnostics to the `ToolOutput` so the next
+  turn sees it. The verifier impl (`cargo check`, `tsc`) is
+  domain-specific and supplied by the consumer; loopctl ships only the
+  trait and the middleware.
 
 ### Changed
 

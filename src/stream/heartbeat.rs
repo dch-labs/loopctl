@@ -422,7 +422,7 @@ mod tests {
         let cb = callbacks.clone();
         HeartbeatConfig::new(
             Duration::from_millis(10),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             Box::new(move |data: HeartbeatData| {
                 cb.lock().unwrap().push(data);
             }),
@@ -443,18 +443,18 @@ mod tests {
     fn config_accessors() {
         let config = HeartbeatConfig::new(
             Duration::from_secs(15),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             Box::new(|_| {}),
         );
         assert_eq!(config.heartbeat_interval(), Duration::from_secs(15));
-        assert_eq!(config.timeout(), Duration::from_secs(300));
+        assert_eq!(config.timeout(), Duration::from_mins(5));
     }
 
     #[test]
     fn config_debug() {
         let config = HeartbeatConfig::new(
             Duration::from_secs(30),
-            Duration::from_secs(600),
+            Duration::from_mins(10),
             Box::new(|_| {}),
         );
         let debug = format!("{config:?}");

@@ -23,6 +23,8 @@
 //! ```
 
 mod bare;
+pub mod contributor;
 pub mod loop_core;
 
 pub use bare::*;
+pub use contributor::*;

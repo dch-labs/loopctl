@@ -46,7 +46,7 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta
 const DEFAULT_MODEL: &str = "gemini-2.0-flash";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); // connect + response + body
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(2); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
@@ -522,24 +522,26 @@ fn build_request_body(
     response_format: Option<&crate::structured::ResponseFormat>,
     tool_constraint: &ToolConstraint,
 ) -> Value {
-    let contents: Vec<Value> = messages.iter().map(convert_message).collect();
+    let (non_system, effective_system) = super::fold_system_messages(messages, system);
+    let contents: Vec<Value> = non_system.iter().map(|m| convert_message(m)).collect();
+
     let mut body = serde_json::json!({ "contents": contents });
     if let Some(obj) = body.as_object_mut() {
-        if let Some(sys) = system {
+        if let Some(sys) = effective_system {
             obj.insert(
                 "systemInstruction".into(),
                 serde_json::json!({"parts": [{"text": sys}]}),
             );
         }
 
-        if response_format.is_none() {
-            if let Some(tool_list) = tools {
-                let strict = matches!(tool_constraint, ToolConstraint::Strict);
-                obj.insert(
-                    "tools".into(),
-                    serde_json::json!([{"functionDeclarations": convert_tools(tool_list, strict)}]),
-                );
-            }
+        if response_format.is_none()
+            && let Some(tool_list) = tools
+        {
+            let strict = matches!(tool_constraint, ToolConstraint::Strict);
+            obj.insert(
+                "tools".into(),
+                serde_json::json!([{"functionDeclarations": convert_tools(tool_list, strict)}]),
+            );
         }
 
         if let Some(rf) = response_format {
@@ -561,8 +563,12 @@ fn build_request_body(
 /// Gemini uses `role: "user"` / `role: "model"` (not "assistant") and
 /// a `parts` array for content blocks.
 fn convert_message(m: &Message) -> Value {
+    // System messages are folded into the top-level `systemInstruction` field
+    // by `build_request_body` before this function is reached, so the `System`
+    // pattern below is defensive: if one ever reaches here, route it to `user`
+    // so the text renders rather than being dropped silently.
     let role = match m.role {
-        Role::User => "user",
+        Role::User | Role::System => "user",
         Role::Assistant => "model",
     };
     let parts: Vec<Value> = m.parts.iter().filter_map(convert_part).collect();
@@ -794,15 +800,14 @@ impl StreamEmitter {
         if let Some(text) = json
             .pointer("/candidates/0/content/parts/0/text")
             .and_then(Value::as_str)
+            && !text.is_empty()
         {
-            if !text.is_empty() {
-                self.push(StreamEvent::IndexedDelta(IndexedDelta {
-                    index: TEXT_PART_INDEX,
-                    delta: DeltaPart::Text {
-                        text: text.to_string(),
-                    },
-                }));
-            }
+            self.push(StreamEvent::IndexedDelta(IndexedDelta {
+                index: TEXT_PART_INDEX,
+                delta: DeltaPart::Text {
+                    text: text.to_string(),
+                },
+            }));
         }
     }
 
@@ -1325,7 +1330,7 @@ mod tests {
 
     #[test]
     fn builder_custom_timeout() {
-        let custom = Duration::from_secs(300);
+        let custom = Duration::from_mins(5);
         let builder = GeminiClientBuilder::default().timeout(custom);
         assert_eq!(builder.timeout, custom);
         // connect_timeout should be unchanged.
@@ -1343,7 +1348,7 @@ mod tests {
 
     #[test]
     fn builder_custom_both_timeouts() {
-        let req_timeout = Duration::from_secs(600);
+        let req_timeout = Duration::from_mins(10);
         let conn_timeout = Duration::from_secs(30);
         let builder = GeminiClientBuilder::default()
             .timeout(req_timeout)
@@ -1359,7 +1364,7 @@ mod tests {
         // .build() would return an error.
         let client = GeminiClient::builder()
             .api_key("test-key")
-            .timeout(Duration::from_secs(180))
+            .timeout(Duration::from_mins(3))
             .connect_timeout(Duration::from_secs(15))
             .build();
         assert!(client.is_ok(), "build should succeed with valid timeouts");
@@ -1601,5 +1606,79 @@ mod tests {
             body.get("toolConfig").is_none(),
             "toolConfig must not appear under Strict"
         );
+    }
+
+    fn system_role_msg(text: &str) -> Message {
+        Message::new(Role::System, vec![MessagePart::text(text)])
+    }
+
+    #[test]
+    fn request_body_system_role_folded_into_system_instruction() {
+        // An inline Role::System message must NOT appear in `contents`; its
+        // text must be folded into the top-level `systemInstruction` field.
+        let msgs = vec![
+            Message::user("hello"),
+            system_role_msg("stay on task"),
+            Message::assistant("working"),
+        ];
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+
+        let contents = body["contents"].as_array().expect("contents is an array");
+        assert_eq!(contents.len(), 2, "system-role message is filtered out");
+        for c in contents {
+            assert_ne!(
+                c["role"].as_str().unwrap_or(""),
+                "system",
+                "no inline system-role entry should be emitted"
+            );
+        }
+        let sys_text = body["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .expect("systemInstruction.parts[0].text is a string");
+        assert_eq!(sys_text, "stay on task");
+    }
+
+    #[test]
+    fn request_body_system_role_merges_with_caller_system() {
+        // Both caller `system` and an inline Role::System message present →
+        // systemInstruction carries both (caller prompt first).
+        let msgs = vec![Message::user("hi"), system_role_msg("reminder")];
+        let body = build_request_body(&msgs, Some("be brief"), None, None, &ToolConstraint::None);
+
+        let sys_text = body["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .expect("systemInstruction.parts[0].text is a string");
+        assert!(
+            sys_text.starts_with("be brief"),
+            "caller system prompt comes first: got {sys_text:?}"
+        );
+        assert!(
+            sys_text.contains("reminder"),
+            "folded text is appended: got {sys_text:?}"
+        );
+        assert!(
+            sys_text.contains('\n'),
+            "caller prompt and folded text are newline-separated: got {sys_text:?}"
+        );
+    }
+
+    #[test]
+    fn request_body_system_role_preserves_message_order() {
+        // Folding must not reorder the remaining (non-system) messages.
+        let msgs = vec![
+            Message::user("first"),
+            system_role_msg("mid reminder"),
+            Message::assistant("second"),
+            Message::user("third"),
+        ];
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let contents = body["contents"].as_array().expect("contents is an array");
+        let roles: Vec<&str> = contents
+            .iter()
+            .map(|c| c["role"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(roles, vec!["user", "model", "user"]);
+        assert_eq!(contents[0]["parts"][0]["text"], "first");
+        assert_eq!(contents[2]["parts"][0]["text"], "third");
     }
 }

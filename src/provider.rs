@@ -54,7 +54,10 @@
 //! let result = agent.run("Hello!").await?;
 //! ```
 
-use crate::api::error::ApiError;
+use crate::{
+    api::error::ApiError,
+    message::{MessagePart, Role},
+};
 
 #[cfg(feature = "openai")]
 pub mod openai;
@@ -144,9 +147,49 @@ fn require_api_key(primary: &str, fallback: Option<&str>) -> Result<String, ApiE
     Err(ApiError::auth_invalid_key(format!("{primary} not set")))
 }
 
-// =============================================
-// Constructors for OpenAI-compatible providers
-// =============================================
+/// Separate inline `Role::System` messages from the rest of the history and
+/// fold their text into a single system string.
+///
+/// Providers that reject an inline system role (Anthropic, Gemini) accept
+/// system content only as a top-level request field. This helper pulls every
+/// `Role::System` message out of `messages`, concatenates their text parts
+/// (newline-separated), and merges the result with an optional caller-supplied
+/// system prompt — caller prompt first, folded text appended.
+///
+/// Returns the non-system messages (in original order) and the merged system
+/// string, or `None` when neither a caller prompt nor any system message is
+/// present.
+fn fold_system_messages<'a>(
+    messages: &'a [crate::message::Message],
+    system: Option<&str>,
+) -> (Vec<&'a crate::message::Message>, Option<String>) {
+    let mut folded = String::new();
+    let non_system: Vec<&crate::message::Message> = messages
+        .iter()
+        .filter(|m| {
+            if matches!(m.role, Role::System) {
+                for part in &m.parts {
+                    if let MessagePart::Text { text } = part {
+                        if !folded.is_empty() {
+                            folded.push('\n');
+                        }
+                        folded.push_str(text);
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let effective = match (system, folded.is_empty()) {
+        (Some(s), false) => Some(format!("{s}\n{folded}")),
+        (Some(s), true) => Some(s.to_string()),
+        (None, false) => Some(folded),
+        (None, true) => None,
+    };
+    (non_system, effective)
+}
 
 /// Ollama client — an [`OpenAiClient`] pointed at an Ollama server.
 ///
@@ -477,5 +520,130 @@ mod tests {
         use crate::api::ApiClient;
         let client = self_hosted("http://localhost:8080/v1", "my-model").unwrap();
         assert_eq!(client.model(), "my-model");
+    }
+
+    /// Build a `Role::System` message carrying the given text parts.
+    fn sys_msg(texts: &[&str]) -> crate::message::Message {
+        use crate::message::{MessagePart, Role};
+        let parts: Vec<MessagePart> = texts.iter().map(|t| MessagePart::text(*t)).collect();
+        crate::message::Message::new(Role::System, parts)
+    }
+
+    #[test]
+    fn fold_system_no_system_messages_no_caller_returns_none() {
+        let msgs = [crate::message::Message::user("hi")];
+        let (non_system, system) = fold_system_messages(&msgs, None);
+        assert_eq!(non_system.len(), 1);
+        assert!(system.is_none(), "no system content → None");
+    }
+
+    #[test]
+    fn fold_system_caller_only_passes_through() {
+        let msgs = [crate::message::Message::user("hi")];
+        let (non_system, system) = fold_system_messages(&msgs, Some("be brief"));
+        assert_eq!(non_system.len(), 1);
+        assert_eq!(system.as_deref(), Some("be brief"));
+    }
+
+    #[test]
+    fn fold_system_single_system_message_removed_and_folded() {
+        let msgs = [
+            crate::message::Message::user("hello"),
+            sys_msg(&["stay on task"]),
+            crate::message::Message::assistant("working"),
+        ];
+        let (non_system, system) = fold_system_messages(&msgs, None);
+        assert_eq!(non_system.len(), 2, "system message filtered out");
+        assert_eq!(system.as_deref(), Some("stay on task"));
+    }
+
+    #[test]
+    fn fold_system_caller_prompt_prepended_to_folded() {
+        let msgs = [crate::message::Message::user("hi"), sys_msg(&["reminder"])];
+        let (_non_system, system) = fold_system_messages(&msgs, Some("be brief"));
+        let system = system.expect("merged system is Some");
+        assert!(
+            system.starts_with("be brief"),
+            "caller prompt first: got {system:?}"
+        );
+        assert!(
+            system.contains("reminder"),
+            "folded text appended: got {system:?}"
+        );
+        assert!(
+            system.contains('\n'),
+            "caller and folded are newline-separated: got {system:?}"
+        );
+    }
+
+    #[test]
+    fn fold_system_multiple_system_messages_joined_with_newlines() {
+        let msgs = [
+            sys_msg(&["first reminder"]),
+            crate::message::Message::user("hi"),
+            sys_msg(&["second reminder"]),
+        ];
+        let (non_system, system) = fold_system_messages(&msgs, None);
+        assert_eq!(non_system.len(), 1, "both system messages filtered");
+        let system = system.expect("folded text is Some");
+        assert_eq!(system, "first reminder\nsecond reminder");
+    }
+
+    #[test]
+    fn fold_system_only_text_parts_are_folded() {
+        // A System message carrying a tool-call part (unusual, but defensive):
+        // only the text parts contribute to the fold.
+        use crate::message::{MessagePart, Role};
+        let system_msg = crate::message::Message::new(
+            Role::System,
+            vec![
+                MessagePart::text("keep this"),
+                MessagePart::tool_call("id", "some_tool", serde_json::json!({})),
+            ],
+        );
+        let msgs = [crate::message::Message::user("hi"), system_msg];
+        let (_non_system, system) = fold_system_messages(&msgs, None);
+        assert_eq!(system.as_deref(), Some("keep this"));
+    }
+
+    #[test]
+    fn fold_system_preserves_relative_order_of_non_system_messages() {
+        let msgs = [
+            crate::message::Message::user("first"),
+            sys_msg(&["mid reminder"]),
+            crate::message::Message::assistant("second"),
+            crate::message::Message::user("third"),
+        ];
+        let (non_system, _system) = fold_system_messages(&msgs, None);
+        let texts: Vec<&str> = non_system
+            .iter()
+            .flat_map(|m| {
+                m.parts.iter().filter_map(|p| match p {
+                    crate::message::MessagePart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(texts, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn fold_system_empty_text_part_contributes_nothing() {
+        // A System message whose text is empty: folded string stays empty, so
+        // with no caller prompt the result is None.
+        let msgs = [sys_msg(&[""])];
+        let (non_system, system) = fold_system_messages(&msgs, None);
+        assert!(non_system.is_empty(), "system message still filtered");
+        assert!(
+            system.is_none(),
+            "empty folded text and no caller → None (got {system:?})"
+        );
+    }
+
+    #[test]
+    fn fold_system_multiple_text_parts_in_one_message_joined() {
+        let msgs = [sys_msg(&["part one", "part two"])];
+        let (_non_system, system) = fold_system_messages(&msgs, None);
+        assert_eq!(system.as_deref(), Some("part one\npart two"));
     }
 }

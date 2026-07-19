@@ -20,7 +20,7 @@ pub struct TimeoutConfig {
 impl Default for TimeoutConfig {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(120),
+            timeout: Duration::from_mins(2),
             retry_on_timeout: false,
             max_retries: 0,
         }

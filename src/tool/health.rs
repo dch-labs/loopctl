@@ -1111,7 +1111,7 @@ mod tests {
     fn circuit_breaker_from_config() {
         let config = CircuitBreakerConfig {
             failure_threshold: 5,
-            recovery_duration: Duration::from_secs(60),
+            recovery_duration: Duration::from_mins(1),
         };
         let cb = ToolCircuitBreaker::from_config(&config);
 

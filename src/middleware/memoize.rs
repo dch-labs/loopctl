@@ -780,8 +780,6 @@ mod tests {
         assert_eq!(mw.name(), "memoize");
     }
 
-    // ---- make_key unit tests ----
-
     #[test]
     fn make_key_same_input_same_hash() {
         let k1 = make_key("Read", &serde_json::json!({"path": "foo.rs"}));
@@ -802,8 +800,6 @@ mod tests {
         let k2 = make_key("Read", &serde_json::json!({"path": "bar.rs"}));
         assert_ne!(k1, k2, "different inputs must produce different keys");
     }
-
-    // ---- lookup_fresh unit tests ----
 
     #[test]
     fn lookup_fresh_returns_none_on_miss() {
@@ -869,8 +865,6 @@ mod tests {
         );
     }
 
-    // ---- insert unit tests ----
-
     #[test]
     fn insert_stores_entry_and_replace_overwrites() {
         let cache = Mutex::new(HashMap::new());
@@ -909,8 +903,6 @@ mod tests {
             }
         }
     }
-
-    // ---- invalidate_paths unit tests ----
 
     #[test]
     fn invalidate_paths_removes_overlapping_entries() {
@@ -998,8 +990,6 @@ mod tests {
             "both entries touch shared.rs — both evicted"
         );
     }
-
-    // ---- append_cached_marker unit tests ----
 
     #[test]
     fn append_cached_marker_text() {

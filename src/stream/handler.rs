@@ -121,9 +121,9 @@ pub struct StreamTimeoutConfig {
 impl Default for StreamTimeoutConfig {
     fn default() -> Self {
         Self {
-            initial_event_timeout: Duration::from_secs(120),
-            per_event_timeout: Duration::from_secs(300),
-            total_stream_timeout: Duration::from_secs(900),
+            initial_event_timeout: Duration::from_mins(2),
+            per_event_timeout: Duration::from_mins(5),
+            total_stream_timeout: Duration::from_mins(15),
             max_consecutive_timeouts: 10,
             progress_interval: Duration::from_secs(30),
             fallback_to_non_streaming: true,
@@ -401,7 +401,7 @@ impl Default for RateLimitConfig {
         Self {
             respect_retry_after: true,
             default_delay: Duration::from_secs(5),
-            max_delay: Duration::from_secs(60),
+            max_delay: Duration::from_mins(1),
             requests_per_minute: 0,
             fallback_after_retries: 3,
             max_retries: 5,
@@ -1209,16 +1209,16 @@ impl StreamHandler {
         let mut rate_limit_retries: u32 = 0;
         let mut transport_attempts: u32 = 0;
         loop {
-            if let Some(deadline) = total_deadline {
-                if Instant::now() >= deadline {
-                    return Err(StreamHandlerError::InitFailed(
-                        StreamOutcome::TotalTimeout {
-                            has_partial_data: false,
-                            events_processed: 0,
-                            duration: self.timeout_config.total_stream_timeout,
-                        },
-                    ));
-                }
+            if let Some(deadline) = total_deadline
+                && Instant::now() >= deadline
+            {
+                return Err(StreamHandlerError::InitFailed(
+                    StreamOutcome::TotalTimeout {
+                        has_partial_data: false,
+                        events_processed: 0,
+                        duration: self.timeout_config.total_stream_timeout,
+                    },
+                ));
             }
             match self
                 .try_stream(
@@ -1586,10 +1586,10 @@ impl StreamHandler {
         accumulator: &mut StreamAccumulator,
         stop_reason: &mut StreamStopReason,
     ) -> Result<(), StreamHandlerError> {
-        if let StreamEvent::MessageDelta(delta) = event {
-            if let Some(ref reason_str) = delta.delta.stop_reason {
-                *stop_reason = StreamStopReason::from_api_str(reason_str).unwrap_or(*stop_reason);
-            }
+        if let StreamEvent::MessageDelta(delta) = event
+            && let Some(ref reason_str) = delta.delta.stop_reason
+        {
+            *stop_reason = StreamStopReason::from_api_str(reason_str).unwrap_or(*stop_reason);
         }
         if let Err(e) = accumulator.process(event) {
             return Err(StreamHandlerError::StreamFailed(
@@ -1710,9 +1710,9 @@ mod tests {
     #[test]
     fn timeout_config_default_values() {
         let config = StreamTimeoutConfig::default();
-        assert_eq!(config.initial_event_timeout, Duration::from_secs(120));
-        assert_eq!(config.per_event_timeout, Duration::from_secs(300));
-        assert_eq!(config.total_stream_timeout, Duration::from_secs(900));
+        assert_eq!(config.initial_event_timeout, Duration::from_mins(2));
+        assert_eq!(config.per_event_timeout, Duration::from_mins(5));
+        assert_eq!(config.total_stream_timeout, Duration::from_mins(15));
         assert_eq!(config.max_consecutive_timeouts, 10);
         assert_eq!(config.progress_interval, Duration::from_secs(30));
         assert!(config.fallback_to_non_streaming);
@@ -1722,8 +1722,8 @@ mod tests {
     fn timeout_config_custom_values() {
         let config = StreamTimeoutConfig {
             initial_event_timeout: Duration::from_secs(30),
-            per_event_timeout: Duration::from_secs(60),
-            total_stream_timeout: Duration::from_secs(300),
+            per_event_timeout: Duration::from_mins(1),
+            total_stream_timeout: Duration::from_mins(5),
             max_consecutive_timeouts: 5,
             progress_interval: Duration::from_secs(10),
             fallback_to_non_streaming: false,
@@ -1777,7 +1777,7 @@ mod tests {
         let outcome = StreamOutcome::TotalTimeout {
             has_partial_data: true,
             events_processed: 10,
-            duration: Duration::from_secs(900),
+            duration: Duration::from_mins(15),
         };
         let s = outcome.to_string();
         assert!(s.contains("partial data"));
@@ -1846,7 +1846,7 @@ mod tests {
         let stream_outcome = StreamOutcome::TotalTimeout {
             has_partial_data: false,
             events_processed: 0,
-            duration: Duration::from_secs(900),
+            duration: Duration::from_mins(15),
         };
         let err = StreamHandlerError::FallbackFailed {
             stream_outcome,
@@ -1903,7 +1903,7 @@ mod tests {
         let handler = StreamHandler::new();
         assert_eq!(
             handler.timeout_config().initial_event_timeout,
-            Duration::from_secs(120),
+            Duration::from_mins(2),
         );
         assert_eq!(handler.retry_config().max_retries, 3);
     }
@@ -1912,7 +1912,7 @@ mod tests {
     fn handler_with_config() {
         let handler = StreamHandler::new().with_config(
             StreamTimeoutConfig {
-                initial_event_timeout: Duration::from_secs(60),
+                initial_event_timeout: Duration::from_mins(1),
                 ..Default::default()
             },
             StreamRetryConfig {
@@ -1922,7 +1922,7 @@ mod tests {
         );
         assert_eq!(
             handler.timeout_config().initial_event_timeout,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
         );
         assert_eq!(handler.retry_config().max_retries, 5);
     }
@@ -1932,7 +1932,7 @@ mod tests {
         let handler = StreamHandler::default();
         assert_eq!(
             handler.timeout_config().initial_event_timeout,
-            Duration::from_secs(120),
+            Duration::from_mins(2),
         );
     }
 
@@ -1982,8 +1982,8 @@ mod tests {
     #[test]
     fn timeout_config_validate_total_less_than_initial() {
         let config = StreamTimeoutConfig {
-            initial_event_timeout: Duration::from_secs(120),
-            total_stream_timeout: Duration::from_secs(60),
+            initial_event_timeout: Duration::from_mins(2),
+            total_stream_timeout: Duration::from_mins(1),
             ..Default::default()
         };
         let err = config.validate().unwrap_err();
@@ -2217,8 +2217,8 @@ mod tests {
         let handler = StreamHandler::new().with_config(
             StreamTimeoutConfig {
                 total_stream_timeout: Duration::from_millis(1),
-                per_event_timeout: Duration::from_secs(300),
-                initial_event_timeout: Duration::from_secs(120),
+                per_event_timeout: Duration::from_mins(5),
+                initial_event_timeout: Duration::from_mins(2),
                 max_consecutive_timeouts: 10,
                 progress_interval: Duration::from_secs(30),
                 fallback_to_non_streaming: false,
@@ -2254,7 +2254,7 @@ mod tests {
     async fn process_events_cancelled() {
         let handler = StreamHandler::new().with_config(
             StreamTimeoutConfig {
-                per_event_timeout: Duration::from_secs(300),
+                per_event_timeout: Duration::from_mins(5),
                 ..Default::default()
             },
             StreamRetryConfig::default(),
@@ -2570,7 +2570,7 @@ mod tests {
         let cfg = RateLimitConfig::default();
         assert!(cfg.respect_retry_after);
         assert_eq!(cfg.default_delay, Duration::from_secs(5));
-        assert_eq!(cfg.max_delay, Duration::from_secs(60));
+        assert_eq!(cfg.max_delay, Duration::from_mins(1));
         assert_eq!(cfg.requests_per_minute, 0);
         assert_eq!(cfg.fallback_after_retries, 3);
         assert_eq!(cfg.max_retries, 5);
@@ -2614,7 +2614,7 @@ mod tests {
             Duration::from_secs(12)
         );
         assert_eq!(
-            cfg.backoff(Some(Duration::from_secs(120))),
+            cfg.backoff(Some(Duration::from_mins(2))),
             cfg.max_delay,
             "should cap at max_delay"
         );
@@ -2659,20 +2659,20 @@ mod tests {
 
     #[test]
     fn clamp_delay_to_deadline_none_deadline_returns_delay_unchanged() {
-        let delay = Duration::from_secs(600);
+        let delay = Duration::from_mins(10);
         assert_eq!(clamp_delay_to_deadline(delay, None), delay);
     }
 
     #[test]
     fn clamp_delay_to_deadline_future_deadline_fits() {
         let delay = Duration::from_millis(10);
-        let deadline = Some(Instant::now() + Duration::from_secs(60));
+        let deadline = Some(Instant::now() + Duration::from_mins(1));
         assert_eq!(clamp_delay_to_deadline(delay, deadline), delay);
     }
 
     #[test]
     fn clamp_delay_to_deadline_exceeds_remaining() {
-        let delay = Duration::from_secs(600);
+        let delay = Duration::from_mins(10);
         let remaining = Duration::from_millis(50);
         let deadline = Some(Instant::now() + remaining);
         let clamped = clamp_delay_to_deadline(delay, deadline);
@@ -2688,7 +2688,7 @@ mod tests {
 
     #[test]
     fn clamp_delay_to_deadline_past_deadline_zero() {
-        let delay = Duration::from_secs(600);
+        let delay = Duration::from_mins(10);
         let deadline = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap());
         assert_eq!(clamp_delay_to_deadline(delay, deadline), Duration::ZERO);
     }
@@ -2696,12 +2696,12 @@ mod tests {
     #[test]
     fn backoff_clamps_huge_hint_to_max_delay() {
         let cfg = RateLimitConfig {
-            max_delay: Duration::from_secs(60),
+            max_delay: Duration::from_mins(1),
             ..Default::default()
         };
         assert_eq!(
             cfg.backoff(Some(Duration::from_secs(9_999_999))),
-            Duration::from_secs(60)
+            Duration::from_mins(1)
         );
     }
 
@@ -2719,17 +2719,17 @@ mod tests {
             fallback_after_retries: 3,
             max_retries: 5,
             default_delay: Duration::from_millis(1),
-            max_delay: Duration::from_secs(60),
+            max_delay: Duration::from_mins(1),
             ..Default::default()
         });
         let mut count = 0u32;
-        let detail = detected_limit(Some(Duration::from_secs(600)));
+        let detail = detected_limit(Some(Duration::from_mins(10)));
 
         // Below both ceilings: retry with the hint clamped to max_delay.
         let decision = handler.rate_limit_retry(&detail, &mut count, None);
         assert_eq!(count, 1);
         match decision {
-            RateLimitRetry::Retry(delay) => assert_eq!(delay, Duration::from_secs(60)),
+            RateLimitRetry::Retry(delay) => assert_eq!(delay, Duration::from_mins(1)),
             other => panic!("expected Retry, got {other:?}"),
         }
     }
@@ -3131,7 +3131,7 @@ mod tests {
         // process_events deadline checks report the actual TotalTimeout — the
         // gate's job is just to not overrun the budget.
         use crate::stream::rate_limit::RateLimiter;
-        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_secs(120)));
+        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_mins(2)));
         let handler = StreamHandler::new().with_rate_limiter(Arc::clone(&limiter));
         let client = GateMock { url: "openai" };
         let cancel = Arc::new(CancelSignal::new());
@@ -3168,7 +3168,7 @@ mod tests {
         // after ~80ms — proving it honors the turn ceiling rather than the
         // 60s refill wait or the 120s max_wait.
         use crate::stream::rate_limit::RateLimiter;
-        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_secs(120)));
+        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_mins(2)));
         let handler = StreamHandler::new().with_rate_limiter(Arc::clone(&limiter));
         let client = GateMock { url: "openai" };
         let cancel = Arc::new(CancelSignal::new());
@@ -3228,7 +3228,7 @@ mod tests {
         // second turn must wait ~60s. Cancelling during that wait should return
         // promptly.
         use crate::stream::rate_limit::RateLimiter;
-        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_secs(120)));
+        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_mins(2)));
         let handler = StreamHandler::new().with_rate_limiter(limiter);
         let client = GateMock { url: "openai" };
 
@@ -3757,7 +3757,7 @@ mod tests {
             > {
                 Box::pin(futures::stream::once(async {
                     Err(ApiError::RateLimit {
-                        retry_after: Some(Duration::from_secs(600)),
+                        retry_after: Some(Duration::from_mins(10)),
                         message: "slow down".into(),
                     })
                 }))
@@ -3793,7 +3793,7 @@ mod tests {
             .with_rate_limit_config(RateLimitConfig {
                 // Honour the hint, but max_delay lets the 600s through so the
                 // deadline clamp is what must bound the sleep.
-                max_delay: Duration::from_secs(600),
+                max_delay: Duration::from_mins(10),
                 default_delay: Duration::from_millis(1),
                 fallback_after_retries: 100,
                 max_retries: 100,

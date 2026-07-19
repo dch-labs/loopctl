@@ -2602,6 +2602,7 @@ mod tests {
                 error: &str,
                 tool_name: &str,
                 _tool_input: &serde_json::Value,
+                _tool_schema: Option<&crate::tool::ToolSchema>,
                 _context: &crate::reflection::ReflectionContext,
             ) -> Pin<
                 Box<
@@ -2913,6 +2914,7 @@ mod tests {
                 error: &str,
                 tool_name: &str,
                 _tool_input: &serde_json::Value,
+                _tool_schema: Option<&crate::tool::ToolSchema>,
                 _context: &crate::reflection::ReflectionContext,
             ) -> Pin<
                 Box<
@@ -3625,6 +3627,7 @@ mod tests {
                 error: &str,
                 tool_name: &str,
                 _tool_input: &serde_json::Value,
+                _tool_schema: Option<&crate::tool::ToolSchema>,
                 _context: &crate::reflection::ReflectionContext,
             ) -> Pin<
                 Box<

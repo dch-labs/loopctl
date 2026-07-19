@@ -52,6 +52,7 @@ pub mod permission;
 pub mod timeout;
 pub mod tool_call;
 pub mod unknown_tool;
+pub mod verify;
 
 use crate::cancel::CancelSignal;
 use crate::error::LoopError;
@@ -68,6 +69,7 @@ pub use permission::{AskResolverFn, PermissionCheckFn, PermissionMiddleware};
 pub use timeout::{TimeoutConfig, TimeoutMiddleware};
 pub use tool_call::ToolCallMiddleware;
 pub use unknown_tool::UnknownToolMiddleware;
+pub use verify::{Verifier, VerifyMiddleware, VerifyResult};
 
 // ==================================================
 // Dispatch context

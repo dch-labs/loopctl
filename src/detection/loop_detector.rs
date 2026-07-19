@@ -1218,14 +1218,12 @@ impl LoopDetector {
 
         // Remove stale operations from the sliding window so they don't
         // re-trigger loop detection on the next check_loop() call.
-        if should_clear_history {
-            if let Ok(mut ops) = self.operations.lock() {
-                ops.retain(|op| {
-                    !(op.tool == operation.tool
-                        && op.primary_param == operation.primary_param
-                        && op.result_hash != operation.result_hash)
-                });
-            }
+        if should_clear_history && let Ok(mut ops) = self.operations.lock() {
+            ops.retain(|op| {
+                !(op.tool == operation.tool
+                    && op.primary_param == operation.primary_param
+                    && op.result_hash != operation.result_hash)
+            });
         }
 
         if let Ok(mut ops) = self.operations.lock() {
@@ -1419,10 +1417,8 @@ impl LoopDetector {
             return None;
         }
 
-        if !already_warned {
-            if let Ok(mut warned) = self.warned_operations.lock() {
-                warned.insert(first_op.clone());
-            }
+        if !already_warned && let Ok(mut warned) = self.warned_operations.lock() {
+            warned.insert(first_op.clone());
         }
 
         let stop_msg = if should_stop {

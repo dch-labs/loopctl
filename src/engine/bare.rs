@@ -63,6 +63,7 @@ use crate::config::LoopConfig;
 use crate::error::LoopError;
 
 use crate::engine::loop_core::{LoopState, SessionResult, StopReason, ToolCall, TurnResult};
+use crate::engine::{ContextContributor, ContributorContext};
 #[cfg(all(test, feature = "hooks"))]
 use crate::hooks::Hook;
 #[cfg(feature = "hooks")]
@@ -232,6 +233,15 @@ pub struct BareLoop<C: ApiClient> {
     /// a `Text` payload, enabling real-time token display.
     #[allow(clippy::type_complexity)]
     text_streamer: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+
+    /// Turn-boundary context contributors.
+    ///
+    /// Each registered contributor is consulted at the top of every turn
+    /// (after [`on_turn_start`](crate::observer::LoopObserver::on_turn_start),
+    /// before the model call); any message it returns is appended to the
+    /// conversation in registration order. Register via
+    /// [`add_contributor`](BareLoop::add_contributor).
+    contributors: Vec<Box<dyn ContextContributor>>,
 }
 
 // ==================================================
@@ -282,6 +292,7 @@ impl<C: ApiClient> BareLoop<C> {
             budget: SessionResult::default(),
             session_start: None,
             text_streamer: None,
+            contributors: Vec::new(),
         }
     }
 
@@ -332,6 +343,7 @@ impl<C: ApiClient> BareLoop<C> {
             budget: SessionResult::default(),
             session_start: None,
             text_streamer: None,
+            contributors: Vec::new(),
         }
     }
 
@@ -694,6 +706,37 @@ impl<C: ApiClient> BareLoop<C> {
     pub fn set_text_streamer(&mut self, f: Arc<dyn Fn(&str) + Send + Sync>) {
         self.debug_assert_idle();
         self.text_streamer = Some(f);
+    }
+
+    /// Register a [`ContextContributor`] consulted at the top of every turn.
+    ///
+    /// Contributors are consulted in registration order after
+    /// [`on_turn_start`](crate::observer::LoopObserver::on_turn_start) and
+    /// before the model call. Each contributor that returns [`Some`] message
+    /// has that message appended to the conversation (in registration order)
+    /// so it reaches the model this turn and persists into later turns subject
+    /// to compaction.
+    ///
+    /// With no contributors registered, the loop behaves identically to a loop
+    /// built without any — the turn-top consultation is a single cheap branch.
+    ///
+    /// Must be called before
+    /// [`run`](crate::engine::loop_core::Loop::run).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started
+    /// (i.e., when [`state`](LoopState) is not [`Idle`](LoopState::Idle)).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.add_contributor(Box::new(GoalReminder::new("ship the demo")));
+    /// ```
+    pub fn add_contributor(&mut self, contributor: Box<dyn ContextContributor>) {
+        self.debug_assert_idle();
+        self.contributors.push(contributor);
     }
 
     /// Begin a model switch operation.
@@ -1275,6 +1318,16 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
 
             self.record_user_input(input);
             self.fire_turn_start(current_turn, input);
+
+            if !self.contributors.is_empty() {
+                let ctx = ContributorContext::new(current_turn, &self.conversation);
+                let injected: Vec<Message> = self
+                    .contributors
+                    .iter()
+                    .filter_map(|contributor| contributor.contribute(&ctx))
+                    .collect();
+                self.conversation.extend(injected);
+            }
 
             let cancel = Arc::clone(&self.cancelled);
             tokio::select! {
@@ -3665,7 +3718,7 @@ mod tests {
         agent.set_reflector(Arc::new(AlwaysRecoverable));
         agent.set_recovery_strategy(Arc::new(
             crate::reflection::ExponentialBackoffRecovery::new(5)
-                .with_base_delay(Duration::from_secs(60)),
+                .with_base_delay(Duration::from_mins(1)),
         ));
         let signal = agent.cancel_signal();
 
@@ -3764,5 +3817,436 @@ mod tests {
             agent.managers.fallback.is_using_fallback(),
             "escalation should trip the circuit breaker to the fallback model"
         );
+    }
+
+    // ==========================================================
+    // ContextContributor turn-boundary injection
+    // ==========================================================
+    //
+    // A recording client that snapshots the inbound conversation on every
+    // stream_messages call, so the tests can assert exactly what the model
+    // received (including contributor-injected messages).
+
+    #[derive(Clone)]
+    struct RecordingClient {
+        responses: Arc<Mutex<Vec<Vec<StreamEvent>>>>,
+        seen: Arc<Mutex<Vec<Vec<Message>>>>,
+        model_name: Arc<Mutex<String>>,
+    }
+
+    impl RecordingClient {
+        fn new(model: &str) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(Vec::new())),
+                seen: Arc::new(Mutex::new(Vec::new())),
+                model_name: Arc::new(Mutex::new(model.to_string())),
+            }
+        }
+
+        fn add_text_response(&self, text: &str) {
+            let events = vec![
+                StreamEvent::MessageStart(MessageStart {
+                    message: MessageMetadata {
+                        id: "msg_test".into(),
+                        role: "assistant".into(),
+                        model: crate::error::recover_guard(self.model_name.lock()).clone(),
+                    },
+                }),
+                StreamEvent::PartStart(PartStart {
+                    index: 0,
+                    part: Some(MessagePart::text(text)),
+                }),
+                StreamEvent::IndexedDelta(IndexedDelta {
+                    index: 0,
+                    delta: DeltaPart::Text {
+                        text: text.to_string(),
+                    },
+                }),
+                StreamEvent::PartStop,
+                StreamEvent::MessageDelta(MessageDelta {
+                    delta: MessageDeltaPayload {
+                        stop_reason: Some("end_turn".to_string()),
+                    },
+                    usage: Some(Usage::new(10, 20)),
+                }),
+                StreamEvent::MessageStop,
+            ];
+            crate::error::recover_guard(self.responses.lock()).push(events);
+        }
+
+        fn first_seen(&self) -> Vec<Message> {
+            crate::error::recover_guard(self.seen.lock())
+                .first()
+                .expect("at least one stream_messages call")
+                .clone()
+        }
+
+        fn add_tool_then_text(
+            &self,
+            tool_id: &str,
+            tool_name: &str,
+            tool_input: Value,
+            final_text: &str,
+        ) {
+            let tool_events = vec![
+                StreamEvent::MessageStart(MessageStart {
+                    message: MessageMetadata {
+                        id: "msg_tool".into(),
+                        role: "assistant".into(),
+                        model: crate::error::recover_guard(self.model_name.lock()).clone(),
+                    },
+                }),
+                StreamEvent::PartStart(PartStart {
+                    index: 0,
+                    part: Some(MessagePart::tool_call(tool_id, tool_name, tool_input)),
+                }),
+                StreamEvent::PartStop,
+                StreamEvent::MessageDelta(MessageDelta {
+                    delta: MessageDeltaPayload {
+                        stop_reason: Some("tool_call".to_string()),
+                    },
+                    usage: Some(Usage::new(50, 10)),
+                }),
+                StreamEvent::MessageStop,
+            ];
+            crate::error::recover_guard(self.responses.lock()).push(tool_events);
+
+            let text_events = vec![
+                StreamEvent::MessageStart(MessageStart {
+                    message: MessageMetadata {
+                        id: "msg_final".into(),
+                        role: "assistant".into(),
+                        model: crate::error::recover_guard(self.model_name.lock()).clone(),
+                    },
+                }),
+                StreamEvent::PartStart(PartStart {
+                    index: 0,
+                    part: Some(MessagePart::text(final_text)),
+                }),
+                StreamEvent::IndexedDelta(IndexedDelta {
+                    index: 0,
+                    delta: DeltaPart::Text {
+                        text: final_text.to_string(),
+                    },
+                }),
+                StreamEvent::PartStop,
+                StreamEvent::MessageDelta(MessageDelta {
+                    delta: MessageDeltaPayload {
+                        stop_reason: Some("end_turn".to_string()),
+                    },
+                    usage: Some(Usage::new(30, 15)),
+                }),
+                StreamEvent::MessageStop,
+            ];
+            crate::error::recover_guard(self.responses.lock()).push(text_events);
+        }
+
+        fn call_count(&self) -> usize {
+            crate::error::recover_guard(self.seen.lock()).len()
+        }
+    }
+
+    impl ApiClient for RecordingClient {
+        fn model(&self) -> String {
+            crate::error::recover_guard(self.model_name.lock()).clone()
+        }
+
+        fn set_model(&self, model: &str) -> bool {
+            if model.trim().is_empty() {
+                return false;
+            }
+            *crate::error::recover_guard(self.model_name.lock()) = model.to_string();
+            true
+        }
+
+        fn stream_messages(
+            &self,
+            messages: Vec<Message>,
+            _system: Option<String>,
+            _tools: Option<Vec<ToolSchema>>,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+        {
+            crate::error::recover_guard(self.seen.lock()).push(messages);
+            let mut guard = crate::error::recover_guard(self.responses.lock());
+            if let Some(events) = guard.pop_front() {
+                let events: Vec<Result<StreamEvent, ApiError>> =
+                    events.into_iter().map(Ok).collect();
+                Box::pin(futures::stream::iter(events))
+            } else {
+                let err = ApiError::api("No more mock responses");
+                Box::pin(futures::stream::iter(vec![Err(err)]))
+            }
+        }
+
+        fn create_message(
+            &self,
+            _messages: Vec<Message>,
+            _system: Option<String>,
+            _tools: Option<Vec<ToolSchema>>,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+            Box::pin(async { Ok(json!({"content": []})) })
+        }
+    }
+
+    // A contributor that always returns the same System reminder.
+    struct StaticReminder(String);
+    impl ContextContributor for StaticReminder {
+        fn contribute(&self, _ctx: &ContributorContext<'_>) -> Option<Message> {
+            Some(Message::new(
+                Role::System,
+                vec![MessagePart::text(self.0.clone())],
+            ))
+        }
+    }
+
+    // A contributor that never injects.
+    struct NeverContributor;
+    impl ContextContributor for NeverContributor {
+        fn contribute(&self, _ctx: &ContributorContext<'_>) -> Option<Message> {
+            None
+        }
+    }
+
+    // A contributor that counts how many times it was consulted, injecting
+    // nothing. Shared by the cadence tests.
+    struct CountingContributor {
+        calls: Arc<AtomicUsize>,
+    }
+    impl ContextContributor for CountingContributor {
+        fn contribute(&self, _ctx: &ContributorContext<'_>) -> Option<Message> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    // A contributor that records the turn number it was consulted at.
+    struct CapturingContributor {
+        seen_turns: Arc<Mutex<Vec<usize>>>,
+    }
+    impl ContextContributor for CapturingContributor {
+        fn contribute(&self, ctx: &ContributorContext<'_>) -> Option<Message> {
+            crate::error::recover_guard(self.seen_turns.lock()).push(ctx.turn);
+            None
+        }
+    }
+
+    // A contributor that counts how many times it was consulted.
+    fn contributor_config() -> LoopConfig {
+        LoopConfig {
+            max_turns: 10,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_contributor_message_prepended() {
+        let client = RecordingClient::new("test-model");
+        client.add_text_response("done");
+        let config = contributor_config();
+        let mut agent = BareLoop::new(Arc::new(client.clone()), ToolRegistry::new(), config);
+        agent.add_contributor(Box::new(StaticReminder("stay on task".into())));
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        // The injected message reached the model: it's in the captured inbound
+        // conversation after the user message.
+        let seen = client.first_seen();
+        let texts: Vec<&str> = seen
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .flat_map(|m| {
+                m.parts.iter().filter_map(|p| match p {
+                    MessagePart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("stay on task")));
+
+        // And it persists in the loop's own conversation history.
+        let persisted = agent.conversation();
+        assert!(persisted.iter().any(|m| m.role == Role::System
+            && m.parts.iter().any(
+                |p| matches!(p, MessagePart::Text { text } if text.contains("stay on task"))
+            )));
+    }
+
+    #[tokio::test]
+    async fn test_no_contributors_no_change() {
+        let client = RecordingClient::new("test-model");
+        client.add_text_response("done");
+        let config = contributor_config();
+        let mut agent = BareLoop::new(Arc::new(client.clone()), ToolRegistry::new(), config);
+        // No add_contributor call.
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        let seen = client.first_seen();
+        // No System messages reached the model.
+        assert!(
+            !seen.iter().any(|m| m.role == Role::System),
+            "no contributor registered, so no System message should appear"
+        );
+        // Exactly one user message (the "Hi").
+        let user_count = seen.iter().filter(|m| m.role == Role::User).count();
+        assert_eq!(user_count, 1, "baseline conversation has one user message");
+    }
+
+    #[tokio::test]
+    async fn test_contributor_returning_none_injects_nothing() {
+        let client = RecordingClient::new("test-model");
+        client.add_text_response("done");
+        let config = contributor_config();
+        let mut agent = BareLoop::new(Arc::new(client.clone()), ToolRegistry::new(), config);
+        agent.add_contributor(Box::new(NeverContributor));
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        let seen = client.first_seen();
+        assert!(
+            !seen.iter().any(|m| m.role == Role::System),
+            "None-returning contributor must inject nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_contributors_order_preserved() {
+        let client = RecordingClient::new("test-model");
+        client.add_text_response("done");
+        let config = contributor_config();
+        let mut agent = BareLoop::new(Arc::new(client.clone()), ToolRegistry::new(), config);
+        agent.add_contributor(Box::new(StaticReminder("first".into())));
+        agent.add_contributor(Box::new(StaticReminder("second".into())));
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        // Find positions of the two reminders in the persisted history.
+        let persisted = agent.conversation();
+        let pos = |needle: &str| -> Option<usize> {
+            persisted.iter().position(|m| {
+                m.role == Role::System
+                    && m.parts
+                        .iter()
+                        .any(|p| matches!(p, MessagePart::Text { text } if text == needle))
+            })
+        };
+        let first = pos("first").expect("'first' reminder persisted");
+        let second = pos("second").expect("'second' reminder persisted");
+        assert!(first < second, "registration order must be preserved");
+    }
+
+    #[tokio::test]
+    async fn test_contributor_does_not_affect_turn_count() {
+        // Two-turn session: tool call then end_turn.
+        let with_contrib = {
+            let client = RecordingClient::new("test-model");
+            client.add_text_response("done");
+            let config = contributor_config();
+            let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+            agent.add_contributor(Box::new(StaticReminder("remind".into())));
+            agent.run("Hi").await.unwrap().total_turns
+        };
+        let without_contrib = {
+            let client = RecordingClient::new("test-model");
+            client.add_text_response("done");
+            let config = contributor_config();
+            let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+            agent.run("Hi").await.unwrap().total_turns
+        };
+        assert_eq!(
+            with_contrib, without_contrib,
+            "injection must not perturb turn counting"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_contributor_fires_every_turn() {
+        // A single contributor + a single-turn run must show exactly one call.
+        let client = RecordingClient::new("test-model");
+        client.add_text_response("done");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let config = contributor_config();
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let c = Arc::clone(&counter);
+        agent.add_contributor(Box::new(CountingContributor { calls: c }));
+        agent.run("Hi").await.unwrap();
+
+        // One turn ran; the contributor was consulted once.
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        // And the model was called exactly once (proving the single turn).
+        assert_eq!(agent.budget.total_turns, 1);
+    }
+
+    #[tokio::test]
+    async fn test_contributor_fires_across_two_turns() {
+        // Two-turn session via a tool: turn 1 = tool_call, turn 2 = end_turn.
+        // The contributor must be consulted on BOTH turns.
+        let client = RecordingClient::new("test-model");
+        client.add_tool_then_text("t1", "echo", json!({"message": "hi"}), "all done");
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let config = contributor_config();
+        let mut agent = BareLoop::new(Arc::new(client), registry, config);
+        let c = Arc::clone(&counter);
+        agent.add_contributor(Box::new(CountingContributor { calls: c }));
+        let result = agent.run("Echo hi").await.unwrap();
+        assert_eq!(result.total_turns, 2, "tool_call turn + end_turn");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            2,
+            "contributor must fire on every turn"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "configuration setters must be called before run()")]
+    fn test_add_contributor_panics_after_session_start() {
+        let client = MockClient::new("test-model");
+        let config = contributor_config();
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        // initialize() moves the loop out of Idle — subsequent add_contributor
+        // must panic in debug builds (matches set_reflector's contract).
+        let cfg = LoopConfig {
+            max_turns: 10,
+            ..Default::default()
+        };
+        // Box the future so we can drop it without awaiting; initialize is the
+        // state transition under test.
+        {
+            let fut = agent.initialize(&cfg);
+            let mut fut = std::pin::pin!(fut);
+            futures::executor::block_on(fut.as_mut()).unwrap();
+        }
+        agent.add_contributor(Box::new(StaticReminder("late".into())));
+    }
+
+    #[tokio::test]
+    async fn test_contributor_sees_turn_number() {
+        // Assert the ContributorContext.turn matches the engine's turn counter
+        // at consultation time. Captures the value across a 2-turn session.
+        let client = RecordingClient::new("test-model");
+        client.add_tool_then_text("t1", "echo", json!({"message": "x"}), "done");
+        let seen_turns = Arc::new(Mutex::new(Vec::<usize>::new()));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let config = contributor_config();
+        let mut agent = BareLoop::new(Arc::new(client), registry, config);
+        let s = Arc::clone(&seen_turns);
+        agent.add_contributor(Box::new(CapturingContributor { seen_turns: s }));
+        agent.run("go").await.unwrap();
+
+        let turns = crate::error::recover_guard(seen_turns.lock()).clone();
+        assert_eq!(turns, vec![0, 1], "turn numbers are 0-indexed and per-turn");
+    }
+
+    // Suppress unused-warning for RecordingClient::call_count when no test
+    // references it; kept for future diagnostics.
+    #[allow(dead_code)]
+    fn _suppress_recording_client_dead_code(c: &RecordingClient) {
+        let _ = c.call_count();
     }
 }

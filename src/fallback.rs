@@ -573,7 +573,7 @@ impl Default for FallbackConfig {
     fn default() -> Self {
         Self {
             trip_threshold: 3,
-            recovery_timeout: Duration::from_secs(60),
+            recovery_timeout: Duration::from_mins(1),
             recovery_successes_needed: 2,
             max_fail_count: 2,
         }
@@ -705,7 +705,7 @@ impl FallbackManager {
             fallback_state: AtomicU8::new(FallbackState::Primary as u8),
             primary_success_count: AtomicUsize::new(0),
             inner: Mutex::new(FallbackInner::default()),
-            recovery_timeout: Duration::from_secs(60),
+            recovery_timeout: Duration::from_mins(1),
         }
     }
 
@@ -1976,7 +1976,7 @@ mod tests {
             mgr.record_model_failure();
         }
         // Not enough time
-        assert!(!mgr.should_try_resume_primary(Duration::from_secs(3600)));
+        assert!(!mgr.should_try_resume_primary(Duration::from_hours(1)));
         // Enough time (0s timeout)
         assert!(mgr.should_try_resume_primary(Duration::from_secs(0)));
     }

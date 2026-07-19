@@ -66,9 +66,9 @@ use super::{ToolDispatchContext, ToolDispatchResult, ToolMiddleware, ToolPipelin
 /// not just the "primary" one. Over-returning is safe (just causes more
 /// invalidation, never staleness); under-returning risks a stale cache
 /// hit when a write should have invalidated an entry but didn't. For
-/// example, a `Grep` over a directory should return that directory
-/// prefix (or, conservatively, the empty string to force intersection
-/// with any write).
+/// example, a `Grep` over a directory should return every file path
+/// that could be matched, so a write to any of them invalidates the
+/// cached result.
 ///
 /// # Tools that touch no paths
 ///
@@ -279,7 +279,7 @@ impl ToolMiddleware for MemoizingMiddleware {
 
             let result = next.dispatch(ctx).await;
 
-            if is_write {
+            if is_write && !result.is_error {
                 let write_paths = self.path_extractor.paths(&ctx.tool_name, &ctx.input);
                 invalidate_paths(&self.cache, &write_paths);
             } else if is_memoized && !result.is_error {
@@ -437,6 +437,45 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
             let output = self.output.clone();
             let is_error = self.is_error;
+            let count = self.call_count.clone();
+            Box::pin(async move {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ToolDispatchResult {
+                    output,
+                    is_error,
+                    resolved_tool_name: String::new(),
+                    tool_call_id: String::new(),
+                    duration: Duration::ZERO,
+                }
+            })
+        }
+    }
+
+    /// Like `FixedOutputMiddleware`, but returns a different result
+    /// depending on whether the tool is "Read" or "Write". Needed for
+    /// tests that exercise the write-invalidation path in a single
+    /// shared pipeline (shared cache).
+    struct RoutingFixedOutputMiddleware {
+        read_output: ToolContent,
+        write_output: ToolContent,
+        write_is_error: bool,
+        call_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ToolMiddleware for RoutingFixedOutputMiddleware {
+        fn name(&self) -> &'static str {
+            "routing_fixed_output"
+        }
+        fn dispatch<'a>(
+            &'a self,
+            ctx: &'a mut ToolDispatchContext,
+            _next: &'a ToolPipeline,
+        ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
+            let (output, is_error) = if ctx.tool_name == "Write" {
+                (self.write_output.clone(), self.write_is_error)
+            } else {
+                (self.read_output.clone(), false)
+            };
             let count = self.call_count.clone();
             Box::pin(async move {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1004,5 +1043,83 @@ mod tests {
                 panic!("expected Text, got Multipart with {} parts", parts.len())
             }
         }
+    }
+
+    #[tokio::test]
+    async fn failed_write_does_not_invalidate_cache() {
+        // A write that errors (permission denied, disk full) didn't
+        // modify the filesystem, so cached reads are still accurate and
+        // must NOT be invalidated. This uses a shared middleware so the
+        // same cache is consulted across both Read and Write calls.
+        let mw = make_middleware(Arc::new(PathFromInput), 10);
+        let registry = Arc::new(ToolRegistry::new());
+        let pipeline = ToolPipeline::builder()
+            .with(mw)
+            .with(RoutingFixedOutputMiddleware {
+                read_output: ToolContent::from_string("file contents"),
+                write_output: ToolContent::from_string("permission denied"),
+                write_is_error: true,
+                call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+            .core(registry)
+            .build()
+            .expect("pipeline builds");
+
+        // Step 1: Read(foo.rs) — cache it.
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "foo.rs"}), 0);
+        let r1 = pipeline.dispatch(&mut ctx).await;
+        assert!(!r1.is_error);
+
+        // Step 2: Write(foo.rs) fails — should NOT invalidate.
+        let mut ctx = ctx_for("Write", serde_json::json!({"path": "foo.rs"}), 1);
+        let wr = pipeline.dispatch(&mut ctx).await;
+        assert!(wr.is_error, "write should return an error");
+
+        // Step 3: Read(foo.rs) again — should still be cached.
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "foo.rs"}), 2);
+        let r3 = pipeline.dispatch(&mut ctx).await;
+        assert!(
+            r3.output.to_string().contains("[cached]"),
+            "failed write should not invalidate cached read: {}",
+            r3.output
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_write_does_invalidate_cache() {
+        // The counterpart: a successful write to the same path MUST
+        // invalidate the cached read.
+        let mw = make_middleware(Arc::new(PathFromInput), 10);
+        let registry = Arc::new(ToolRegistry::new());
+        let pipeline = ToolPipeline::builder()
+            .with(mw)
+            .with(RoutingFixedOutputMiddleware {
+                read_output: ToolContent::from_string("file contents"),
+                write_output: ToolContent::from_string("wrote"),
+                write_is_error: false,
+                call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+            .core(registry)
+            .build()
+            .expect("pipeline builds");
+
+        // Step 1: Read(foo.rs) — cache it.
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "foo.rs"}), 0);
+        let r1 = pipeline.dispatch(&mut ctx).await;
+        assert!(!r1.is_error);
+
+        // Step 2: Write(foo.rs) succeeds — should invalidate.
+        let mut ctx = ctx_for("Write", serde_json::json!({"path": "foo.rs"}), 1);
+        let wr = pipeline.dispatch(&mut ctx).await;
+        assert!(!wr.is_error, "write should succeed");
+
+        // Step 3: Read(foo.rs) again — should re-run (invalidated).
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "foo.rs"}), 2);
+        let r3 = pipeline.dispatch(&mut ctx).await;
+        assert!(
+            !r3.output.to_string().contains("[cached]"),
+            "successful write should invalidate cached read: {}",
+            r3.output
+        );
     }
 }

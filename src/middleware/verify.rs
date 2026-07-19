@@ -158,12 +158,14 @@ pub struct VerifyMiddleware {
 
     /// Exact-match tool names that trigger verification.
     ///
-    /// A tool not in this list bypasses the verifier entirely (the
-    /// middleware short-circuits before cloning or calling). List
-    /// members are compared verbatim against
-    /// [`ToolDispatchContext::tool_name`](super::ToolDispatchContext::tool_name),
-    /// so a tool must be registered under the same name the model emits
-    /// for the trigger to fire. There is deliberately no glob or regex
+    /// A tool not in this list bypasses the verifier entirely. List
+    /// members are compared verbatim against the tool name the call
+    /// *resolved to* after dispatch
+    /// (`ToolDispatchResult::resolved_tool_name`, falling back to the
+    /// originally requested name when the result was built without one),
+    /// so a routing middleware that redirects a write-class call keeps
+    /// verification working as long as the redirected name is listed.
+    /// There is deliberately no glob or regex
     /// support — callers list tool names explicitly.
     write_tools: Vec<String>,
 }
@@ -205,15 +207,21 @@ impl ToolMiddleware for VerifyMiddleware {
         next: &'a ToolPipeline,
     ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
         let verifier = &self.verifier;
-        let is_write = self.write_tools.iter().any(|t| t == &ctx.tool_name);
+        let write_tools = &self.write_tools;
         Box::pin(async move {
             let mut result = next.dispatch(ctx).await;
+            let resolved = if result.resolved_tool_name.is_empty() {
+                &ctx.tool_name
+            } else {
+                &result.resolved_tool_name
+            };
 
+            let is_write = write_tools.iter().any(|t| t == resolved);
             if !is_write || result.is_error {
                 return result;
             }
 
-            let verify = verifier.verify(&ctx.tool_context, &ctx.tool_name).await;
+            let verify = verifier.verify(&ctx.tool_context, resolved).await;
             append_verify_result(&mut result.output, &verify);
             result
         })

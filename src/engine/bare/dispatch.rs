@@ -1049,12 +1049,30 @@ impl<C: ApiClient> BareLoop<C> {
             max_attempts: Self::MAX_RECOVERY_ATTEMPTS,
         };
 
+        // Resolve the schema under the name a routing middleware may have
+        // redirected the call to, falling back to the requested name when
+        // the resolved name is empty or unknown to the registry.
+        let resolved_tool = if result.resolved_tool_name.is_empty() {
+            &tc.tool
+        } else {
+            &result.resolved_tool_name
+        };
+        let tool_schema = self
+            .tools
+            .get(resolved_tool)
+            .or_else(|| self.tools.get(&tc.tool))
+            .map(crate::tool::Tool::schema);
         let Ok(analysis) = self
             .reflector
-            .analyze(&error_msg, &tc.tool, &tc.input, &context)
+            .analyze(
+                &error_msg,
+                &tc.tool,
+                &tc.input,
+                tool_schema.as_ref(),
+                &context,
+            )
             .await
         else {
-            // Reflector failed — conservatively fail.
             return (RecoveryAction::Fail(error_msg), None);
         };
 
@@ -1230,8 +1248,6 @@ mod tests {
         }
     }
 
-    // ----- ToolDependencyGraph unit tests -----
-
     fn make_call(id: &str, tool: &str, input: Value) -> ToolCall {
         ToolCall {
             id: id.into(),
@@ -1403,8 +1419,6 @@ mod tests {
         assert_eq!(plan.waves[0], vec![0, 1, 2, 3]);
     }
 
-    // ----- dispatch_tools_parallel integration tests -----
-
     fn make_parallel_loop(tools: ToolRegistry) -> BareLoop<MockClient> {
         let mut config = LoopConfig::default();
         config.parallel_tool_dispatch.mode = crate::config::ParallelMode::Parallel;
@@ -1555,6 +1569,7 @@ mod tests {
                 error: &str,
                 tool_name: &str,
                 _tool_input: &Value,
+                _tool_schema: Option<&crate::tool::ToolSchema>,
                 _context: &crate::reflection::ReflectionContext,
             ) -> Pin<
                 Box<

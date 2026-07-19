@@ -65,9 +65,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   compiling a tool registry's schemas into a sampler grammar.
 - `grammar` feature flag (depends on `providers`): opt-in grammar / sampler
   support for the `Grammar` mode of `ToolConstraint`.
+- `LlmReflector` (`reflection::llm` module): a `Reflector` that asks the
+  model to classify failed tool calls and suggest corrections via
+  `request_structured::<FailureAnalysis>`. First in-tree consumer of
+  `StructuredOutput`. Opt-in via `BareLoop::set_reflector`; the default
+  stays `NoopReflector`. Each analyzed failure triggers one model
+  round-trip (see its rustdoc for the latency/cost note).
+- `impl StructuredOutput for FailureAnalysis` (`reflection` module) with a
+  hand-written JSON Schema covering the 5 fields and the nested
+  `CorrectionType` snake_case enum.
+- `schema_validation` feature flag (pulls `jsonschema` as an optional
+  dependency): when enabled, `LlmReflector` validates the model's
+  `Correction::modified_input` against the failing tool's `input_schema`
+  and returns `ReflectionError::Internal` on a mismatch. When disabled,
+  validation is skipped.
 
 ### Changed
 
+- **Breaking:** `Reflector::analyze` gains a new `tool_schema:
+  Option<&ToolSchema>` parameter between `tool_input` and `context`. The
+  engine's call site now resolves the failing tool's schema from the
+  registry (passing `None` when the tool isn't found). Every `Reflector`
+  impl must add the new parameter; `NoopReflector` and the trait-doc
+  example have been updated.
+  Migration: add `_tool_schema: Option<&loopctl::tool::ToolSchema>` to
+  your `analyze` signature. Ignore it if your reflector does not validate
+  suggested corrections; otherwise use it to validate `modified_input`
+  before returning the analysis.
 - `OpenAiClient`, `AnthropicClient`, and `GeminiClient` now honor
   `RequestOptions::tool_constraint`. Under `Strict`, each tool's schema is
   tightened (recursive `additionalProperties: false` and full `required`);

@@ -92,7 +92,7 @@ pub struct OpenAiClient {
     /// Changed via [`ApiClient::set_model`] when the
     /// [`FallbackManager`](crate::fallback::FallbackManager) trips to a
     /// fallback model.
-    model: parking_lot::Mutex<String>,
+    model: std::sync::Mutex<String>,
 }
 
 impl OpenAiClient {
@@ -205,7 +205,7 @@ impl OpenAiClient {
 
 impl ApiClient for OpenAiClient {
     fn model(&self) -> String {
-        self.model.lock().clone()
+        crate::error::recover_guard(self.model.lock()).clone()
     }
 
     fn base_url(&self) -> String {
@@ -216,7 +216,7 @@ impl ApiClient for OpenAiClient {
         if model.trim().is_empty() {
             return false;
         }
-        *self.model.lock() = model.to_string();
+        *crate::error::recover_guard(self.model.lock()) = model.to_string();
         true
     }
 
@@ -226,7 +226,7 @@ impl ApiClient for OpenAiClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let model = self.model.lock().clone();
+        let model = crate::error::recover_guard(self.model.lock()).clone();
         let body = RequestBody::build(
             &model,
             &messages,
@@ -266,7 +266,7 @@ impl ApiClient for OpenAiClient {
         system: Option<String>,
         tools: Option<Vec<ToolSchema>>,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let model = self.model.lock().clone();
+        let model = crate::error::recover_guard(self.model.lock()).clone();
         let body = RequestBody::build(
             &model,
             &messages,
@@ -303,7 +303,7 @@ impl ApiClient for OpenAiClient {
         tools: Option<Vec<ToolSchema>>,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let model = self.model.lock().clone();
+        let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = RequestBody::build(
             &model,
@@ -345,7 +345,7 @@ impl ApiClient for OpenAiClient {
         tools: Option<Vec<ToolSchema>>,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let model = self.model.lock().clone();
+        let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = RequestBody::build(
             &model,
@@ -519,7 +519,7 @@ impl OpenAiClientBuilder {
             http,
             api_key,
             base_url: self.base_url,
-            model: parking_lot::Mutex::new(self.model),
+            model: std::sync::Mutex::new(self.model),
         })
     }
 }

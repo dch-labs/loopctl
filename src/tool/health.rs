@@ -462,10 +462,7 @@ impl ToolCircuitBreaker {
             CircuitState::Closed => true,
             CircuitState::HalfOpen => false,
             CircuitState::Open => {
-                let recovered = self
-                    .last_failure_time
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                let recovered = crate::error::recover_guard(self.last_failure_time.lock())
                     .map(|t| t.elapsed() >= self.recovery_duration)
                     .unwrap_or(false);
                 if recovered {
@@ -657,18 +654,12 @@ impl ToolHealthRegistry {
     /// so the caller can read counters without holding any lock.
     #[must_use]
     pub fn get_stats(&self, tool_name: &str) -> Arc<ToolStats> {
-        let guard = self
-            .stats
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = crate::error::recover_guard(self.stats.lock());
         if let Some(stats) = guard.get(tool_name) {
             return Arc::clone(stats);
         }
         drop(guard);
-        let mut guard = self
-            .stats
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = crate::error::recover_guard(self.stats.lock());
         Arc::clone(
             guard
                 .entry(tool_name.to_string())
@@ -682,18 +673,12 @@ impl ToolHealthRegistry {
     /// registry's [`CircuitBreakerConfig`].
     #[must_use]
     pub fn get_circuit_breaker(&self, tool_name: &str) -> Arc<ToolCircuitBreaker> {
-        let guard = self
-            .breakers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = crate::error::recover_guard(self.breakers.lock());
         if let Some(cb) = guard.get(tool_name) {
             return Arc::clone(cb);
         }
         drop(guard);
-        let mut guard = self
-            .breakers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = crate::error::recover_guard(self.breakers.lock());
         Arc::clone(
             guard
                 .entry(tool_name.to_string())
@@ -767,10 +752,7 @@ impl ToolHealthRegistry {
     #[must_use]
     pub fn health_summary(&self) -> HashMap<String, (HealthStatus, f64)> {
         let entries: Vec<(String, Arc<ToolStats>)> = {
-            let guard = self
-                .stats
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = crate::error::recover_guard(self.stats.lock());
             guard
                 .iter()
                 .map(|(n, s)| (n.clone(), Arc::clone(s)))
@@ -789,10 +771,7 @@ impl ToolHealthRegistry {
     /// Number of distinct tools currently tracked.
     #[must_use]
     pub fn tool_count(&self) -> usize {
-        self.stats
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        crate::error::recover_guard(self.stats.lock()).len()
     }
 }
 

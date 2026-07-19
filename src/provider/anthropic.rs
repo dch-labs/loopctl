@@ -91,7 +91,7 @@ pub struct AnthropicClient {
     /// Changed via [`ApiClient::set_model`] when the
     /// [`FallbackManager`](crate::fallback::FallbackManager) trips to a
     /// fallback model.
-    model: parking_lot::Mutex<String>,
+    model: std::sync::Mutex<String>,
 
     /// The maximum output tokens per response.
     ///
@@ -208,7 +208,7 @@ impl AnthropicClient {
 
 impl ApiClient for AnthropicClient {
     fn model(&self) -> String {
-        self.model.lock().clone()
+        crate::error::recover_guard(self.model.lock()).clone()
     }
 
     fn base_url(&self) -> String {
@@ -219,7 +219,7 @@ impl ApiClient for AnthropicClient {
         if model.trim().is_empty() {
             return false;
         }
-        *self.model.lock() = model.to_string();
+        *crate::error::recover_guard(self.model.lock()) = model.to_string();
         true
     }
 
@@ -258,7 +258,7 @@ impl ApiClient for AnthropicClient {
         tools: Option<Vec<ToolSchema>>,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let model = self.model.lock().clone();
+        let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = build_request_body(
             &RequestBodySpec {
@@ -301,7 +301,7 @@ impl ApiClient for AnthropicClient {
         tools: Option<Vec<ToolSchema>>,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let model = self.model.lock().clone();
+        let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = build_request_body(
             &RequestBodySpec {
@@ -497,7 +497,7 @@ impl AnthropicClientBuilder {
             http,
             api_key,
             base_url: self.base_url,
-            model: parking_lot::Mutex::new(self.model),
+            model: std::sync::Mutex::new(self.model),
             max_tokens: self.max_tokens,
         })
     }

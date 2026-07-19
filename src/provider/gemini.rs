@@ -86,7 +86,7 @@ pub struct GeminiClient {
     /// Changed via [`ApiClient::set_model`] when the
     /// [`FallbackManager`](crate::fallback::FallbackManager) trips to a
     /// fallback model.
-    model: parking_lot::Mutex<String>,
+    model: std::sync::Mutex<String>,
 }
 
 impl GeminiClient {
@@ -148,7 +148,7 @@ impl GeminiClient {
     /// Gemini puts the model in the URL path. The API key is sent via
     /// the `x-goog-api-key` header, not as a query parameter.
     fn stream_url(&self) -> String {
-        let model = self.model.lock().clone();
+        let model = crate::error::recover_guard(self.model.lock()).clone();
         format!(
             "{}/models/{}:streamGenerateContent?alt=sse",
             self.base_url, model
@@ -163,7 +163,7 @@ impl GeminiClient {
     /// Used by [`ApiClient::create_message`] and its `*_with_options`
     /// variant.
     fn generate_url(&self) -> String {
-        let model = self.model.lock().clone();
+        let model = crate::error::recover_guard(self.model.lock()).clone();
         format!("{}/models/{}:generateContent", self.base_url, model)
     }
 
@@ -206,7 +206,7 @@ impl GeminiClient {
 
 impl ApiClient for GeminiClient {
     fn model(&self) -> String {
-        self.model.lock().clone()
+        crate::error::recover_guard(self.model.lock()).clone()
     }
 
     fn base_url(&self) -> String {
@@ -217,7 +217,7 @@ impl ApiClient for GeminiClient {
         if model.trim().is_empty() {
             return false;
         }
-        *self.model.lock() = model.to_string();
+        *crate::error::recover_guard(self.model.lock()) = model.to_string();
         true
     }
 
@@ -492,7 +492,7 @@ impl GeminiClientBuilder {
             http,
             api_key,
             base_url: self.base_url,
-            model: parking_lot::Mutex::new(self.model),
+            model: std::sync::Mutex::new(self.model),
         })
     }
 }

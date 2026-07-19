@@ -86,6 +86,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   turn sees it. The verifier impl (`cargo check`, `tsc`) is
   domain-specific and supplied by the consumer; loopctl ships only the
   trait and the middleware.
+- `MemoizingMiddleware` and `PathExtractor` trait
+  (`middleware::memoize` module): opt-in middleware that caches
+  successful tool-call results keyed on `(tool_name, hash(canonical
+  input))` and returns cached output with a `[cached]` marker on hit.
+  Path-aware invalidation via the caller-supplied `PathExtractor` trait;
+  TTL-based expiry per `ttl_turns`. Default-off; only successful results
+  are cached.
 
 ### Changed
 
@@ -107,6 +114,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   grammar-aware samplers. Default `ToolConstraint::None` reproduces prior
   behaviour exactly; when `response_format` is also set, it wins and
   `tool_constraint` is ignored.
+- Removed `parking_lot` dependency entirely. All `parking_lot::Mutex`
+  usages migrated to `std::sync::Mutex` with the
+  `.unwrap_or_else(std::sync::PoisonError::into_inner)` recovery pattern.
+  The crate now uses a single mutex family with no external lock
+  dependency.
 - Both sequential and parallel tool dispatch now check the cancel signal
   between calls. Previously, a Ctrl-C during a multi-tool batch was only
   honored at the next turn boundary; now it aborts the remaining calls in the

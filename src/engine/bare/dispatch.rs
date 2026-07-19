@@ -1049,12 +1049,18 @@ impl<C: ApiClient> BareLoop<C> {
             max_attempts: Self::MAX_RECOVERY_ATTEMPTS,
         };
 
-        // Look up the schema under the name a routing middleware may have
-        // redirected the call to; `tc.tool` (passed below as `tool_name`)
-        // stays as the originally requested name.
+        // Resolve the schema under the name a routing middleware may have
+        // redirected the call to, falling back to the requested name when
+        // the resolved name is empty or unknown to the registry.
+        let resolved_tool = if result.resolved_tool_name.is_empty() {
+            &tc.tool
+        } else {
+            &result.resolved_tool_name
+        };
         let tool_schema = self
             .tools
-            .get(&result.resolved_tool_name)
+            .get(resolved_tool)
+            .or_else(|| self.tools.get(&tc.tool))
             .map(crate::tool::Tool::schema);
         let Ok(analysis) = self
             .reflector

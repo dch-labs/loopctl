@@ -69,7 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   model to classify failed tool calls and suggest corrections via
   `request_structured::<FailureAnalysis>`. First in-tree consumer of
   `StructuredOutput`. Opt-in via `BareLoop::set_reflector`; the default
-  stays `NoopReflector`. Each analysed failure triggers one model
+  stays `NoopReflector`. Each analyzed failure triggers one model
   round-trip (see its rustdoc for the latency/cost note).
 - `impl StructuredOutput for FailureAnalysis` (`reflection` module) with a
   hand-written JSON Schema covering the 5 fields and the nested

@@ -1049,7 +1049,13 @@ impl<C: ApiClient> BareLoop<C> {
             max_attempts: Self::MAX_RECOVERY_ATTEMPTS,
         };
 
-        let tool_schema = self.tools.get(&tc.tool).map(crate::tool::Tool::schema);
+        // Look up the schema under the name a routing middleware may have
+        // redirected the call to; `tc.tool` (passed below as `tool_name`)
+        // stays as the originally requested name.
+        let tool_schema = self
+            .tools
+            .get(&result.resolved_tool_name)
+            .map(crate::tool::Tool::schema);
         let Ok(analysis) = self
             .reflector
             .analyze(
@@ -1236,8 +1242,6 @@ mod tests {
         }
     }
 
-    // ----- ToolDependencyGraph unit tests -----
-
     fn make_call(id: &str, tool: &str, input: Value) -> ToolCall {
         ToolCall {
             id: id.into(),
@@ -1408,8 +1412,6 @@ mod tests {
         assert_eq!(plan.waves.len(), 1);
         assert_eq!(plan.waves[0], vec![0, 1, 2, 3]);
     }
-
-    // ----- dispatch_tools_parallel integration tests -----
 
     fn make_parallel_loop(tools: ToolRegistry) -> BareLoop<MockClient> {
         let mut config = LoopConfig::default();

@@ -18,7 +18,7 @@
 //!
 //! # Latency and cost
 //!
-//! Each analysed tool failure triggers one model round-trip. The reflector
+//! Each analyzed tool failure triggers one model round-trip. The reflector
 //! is opt-in — the framework's default reflector is
 //! [`NoopReflector`](super::NoopReflector), which performs no I/O. Only
 //! callers that explicitly install an `LlmReflector` pay the per-failure
@@ -144,10 +144,11 @@ impl Reflector for LlmReflector {
         tool_schema: Option<&ToolSchema>,
         context: &ReflectionContext,
     ) -> Pin<Box<dyn Future<Output = Result<FailureAnalysis, ReflectionError>> + Send + '_>> {
-        let user_message = build_user_message(error, tool_name, tool_input, context);
+        let schema_value = tool_schema.map(|s| s.input_schema.clone());
+        let user_message =
+            build_user_message(error, tool_name, tool_input, schema_value.as_ref(), context);
         let system = self.system_prompt.clone();
         let client = std::sync::Arc::clone(&self.client);
-        let schema_value = tool_schema.map(|s| s.input_schema.clone());
 
         Box::pin(async move {
             let analysis = request_structured::<FailureAnalysis>(
@@ -167,22 +168,33 @@ impl Reflector for LlmReflector {
 /// Build the single user message describing the failure.
 ///
 /// Carries the error message, the tool name, the serialized tool input,
-/// and the task description from the reflection context so the model has
-/// everything it needs to produce a typed `FailureAnalysis`.
+/// the tool's input schema (when available), and the task description
+/// from the reflection context so the model has everything it needs to
+/// produce a typed `FailureAnalysis`. The schema block is omitted
+/// entirely when `tool_schema` is `None` (the engine passes `None` when
+/// the tool isn't in the registry) so the model isn't shown a misleading
+/// empty placeholder.
 fn build_user_message(
     error: &str,
     tool_name: &str,
     tool_input: &serde_json::Value,
+    tool_schema: Option<&serde_json::Value>,
     context: &ReflectionContext,
 ) -> String {
+    let schema_line = match tool_schema {
+        Some(schema) => format!("Schema: {schema}\n"),
+        None => String::new(),
+    };
     format!(
         "Tool: {tool_name}\n\
          Input: {tool_input}\n\
+         {schema_line}\
          Error: {error}\n\
          Task: {task}\n\
          Attempt: {attempt} of {max}",
         tool_name = tool_name,
         tool_input = tool_input,
+        schema_line = schema_line,
         error = error,
         task = context.task,
         attempt = context.attempt.saturating_add(1),
@@ -215,9 +227,14 @@ fn validate_modified_input(
     analysis: &FailureAnalysis,
     tool_schema: Option<&serde_json::Value>,
 ) -> Result<(), ReflectionError> {
+    // Without the schema_validation feature, validation never runs — bail
+    // out early so we don't bind `modified_input` / `schema` only to drop
+    // them on the floor. The signature is unchanged; the early return
+    // keeps the function a no-op under the default feature set.
     #[cfg(not(feature = "schema_validation"))]
     {
-        let _ = (modified_input, schema);
+        let _ = (analysis, tool_schema);
+        return Ok(());
     }
 
     let Some(correction) = &analysis.correction else {
@@ -227,6 +244,8 @@ fn validate_modified_input(
         return Ok(());
     };
     let Some(schema) = tool_schema else {
+        // No schema available — the engine couldn't resolve the tool.
+        // Skip validation rather than reject a possibly-correct fix.
         return Ok(());
     };
 
@@ -253,8 +272,6 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
-
-    // ---- Mock clients ----
 
     /// A capture of what the reflector sent to the client, plus the canned
     /// response to return.
@@ -544,6 +561,48 @@ mod tests {
         assert!(user.contains("fix the bug"), "user: {user}");
     }
 
+    #[tokio::test]
+    async fn llm_reflector_user_message_includes_schema() {
+        // When the engine supplies a tool schema, the reflector should
+        // forward it in the user message so the model can produce a
+        // schema-conforming modified_input.
+        let captured = Arc::new(Mutex::new(None));
+        let client = Arc::new(CannedMock {
+            response: fixture_analysis(),
+            captured: captured.clone(),
+        });
+        let reflector = LlmReflector::new(client);
+        let tool_schema = ToolSchema {
+            tool: "read".into(),
+            description: "Read a file".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        };
+        let result = reflector
+            .analyze(
+                "e",
+                "read",
+                &serde_json::json!({"path": "/wrong"}),
+                Some(&tool_schema),
+                &ctx(),
+            )
+            .await;
+        assert!(result.is_ok(), "analyze should succeed: {:?}", result.err());
+        let cap = captured.lock().unwrap().clone().expect("captured");
+        let user = cap.user.expect("user message");
+        assert!(
+            user.contains("Schema:"),
+            "expected the schema to appear in the user message: {user}"
+        );
+        assert!(
+            user.contains("\"required\""),
+            "expected schema content in the user message: {user}"
+        );
+    }
+
     #[cfg(feature = "schema_validation")]
     #[tokio::test]
     async fn llm_reflector_validates_modified_input_pass() {
@@ -724,14 +783,13 @@ mod tests {
         );
     }
 
-    // ---- build_user_message direct unit tests ----
-
     #[test]
     fn build_user_message_contains_all_fields() {
         let msg = build_user_message(
             "the error",
             "the_tool",
             &serde_json::json!({"k": "v"}),
+            None,
             &ReflectionContext {
                 task: "the task".to_string(),
                 attempt: 1,
@@ -752,6 +810,7 @@ mod tests {
             "e",
             "t",
             &serde_json::json!({}),
+            None,
             &ReflectionContext {
                 task: "x".to_string(),
                 attempt: 0,
@@ -771,6 +830,7 @@ mod tests {
             "e",
             "t",
             &serde_json::json!({}),
+            None,
             &ReflectionContext {
                 task: "x".to_string(),
                 attempt: u32::MAX,
@@ -779,5 +839,52 @@ mod tests {
         );
         // Should contain u32::MAX (saturated, not overflowed).
         assert!(msg.contains(&u32::MAX.to_string()));
+    }
+
+    #[test]
+    fn build_user_message_includes_schema_when_present() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        });
+        let msg = build_user_message(
+            "e",
+            "read",
+            &serde_json::json!({"path": "/wrong"}),
+            Some(&schema),
+            &ReflectionContext {
+                task: "x".to_string(),
+                attempt: 0,
+                max_attempts: 3,
+            },
+        );
+        assert!(
+            msg.contains("Schema:"),
+            "expected a Schema: line when schema is supplied: {msg}"
+        );
+        assert!(
+            msg.contains("\"required\""),
+            "schema content missing from message: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_user_message_omits_schema_line_when_none() {
+        let msg = build_user_message(
+            "e",
+            "t",
+            &serde_json::json!({}),
+            None,
+            &ReflectionContext {
+                task: "x".to_string(),
+                attempt: 0,
+                max_attempts: 3,
+            },
+        );
+        assert!(
+            !msg.contains("Schema:"),
+            "no Schema: line expected when schema is None: {msg}"
+        );
     }
 }

@@ -375,6 +375,43 @@ impl LoopError {
     }
 }
 
+// ===================================================
+// Mutex poison recovery helper
+// ===================================================
+
+/// Recover a mutex guard from a `LockResult`, ignoring poison.
+///
+/// Use this at lock sites protecting data where a panic mid-hold
+/// cannot leave the protected value in an inconsistent state (e.g. a
+/// `String`, a `Vec`, a `HashMap`, or any type whose operations are
+/// individually atomic with respect to the type's invariants).
+///
+/// Do **not** use this for locks protecting multi-field structs with
+/// cross-field invariants (e.g. a state machine with `state` +
+/// `failures` + `last_failure`). A panic between field updates
+/// desynchronises the struct; recovering silently means continuing
+/// with inconsistent state. In those cases, propagate the
+/// `PoisonError` via `?` instead.
+///
+/// # When to use this
+///
+/// - `Mutex<String>` — a `.clone()` or `=` assignment is atomic.
+/// - `Mutex<Vec<_>>` / `Mutex<VecDeque<_>>` / `Mutex<HashSet<_>>` —
+///   Rust's collection types maintain their invariants even if an
+///   individual `push`/`insert` panics.
+/// - `Mutex<HashMap<_, _>>` — same; `HashMap`'s internal probing table
+///   is never left half-built.
+///
+/// # When NOT to use this
+///
+/// - `Mutex<MyStruct>` where `MyStruct` has multiple fields that must
+///   agree (e.g. a state machine with `state` + `failures` +
+///   `last_failure`). A panic between field updates desynchronises the
+///   struct; recovering silently continues with inconsistent state.
+pub(crate) fn recover_guard<T>(result: std::sync::LockResult<T>) -> T {
+    result.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +517,30 @@ mod tests {
     fn is_recoverable_false_for_cancelled() {
         let err = LoopError::Cancelled;
         assert!(!err.is_recoverable());
+    }
+
+    #[test]
+    fn recover_guard_returns_value_on_ok() {
+        let mutex = std::sync::Mutex::new(42);
+        let guard = recover_guard(mutex.lock());
+        assert_eq!(*guard, 42);
+    }
+
+    #[test]
+    fn recover_guard_returns_guard_on_poison() {
+        let mutex = std::sync::Mutex::new(42);
+        // Poison the mutex by panicking while holding it.
+        let handle = std::sync::Arc::new(mutex);
+        let h2 = handle.clone();
+        let result = std::thread::spawn(move || {
+            let _guard = h2.lock().unwrap();
+            panic!("intentional");
+        })
+        .join();
+        assert!(result.is_err(), "the panicking thread should have errored");
+        // The mutex is now poisoned. recover_guard must still hand back
+        // the guard so the caller can use the (still-valid) inner value.
+        let guard = recover_guard(handle.lock());
+        assert_eq!(*guard, 42);
     }
 }

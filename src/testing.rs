@@ -104,7 +104,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use std::sync::Mutex;
 use uuid::Uuid;
 
 // ==================================================
@@ -176,7 +176,7 @@ pub struct MockApiClient {
     /// The value is returned verbatim by the [`ApiClient::model`]
     /// implementation. It appears in log messages and
     /// [`MessageMetadata`] fields.
-    model_name: Arc<parking_lot::Mutex<String>>,
+    model_name: Arc<std::sync::Mutex<String>>,
 
     /// The queue of canned responses.
     ///
@@ -364,7 +364,7 @@ impl MockApiClient {
             stop_reason: "end_turn".to_string(),
         };
         Self {
-            model_name: Arc::new(parking_lot::Mutex::new(model.to_string())),
+            model_name: Arc::new(std::sync::Mutex::new(model.to_string())),
             responses: Arc::new(Mutex::new(vec![default_response])),
             error: None,
         }
@@ -390,7 +390,7 @@ impl MockApiClient {
     /// ```
     #[must_use]
     pub fn with_text_response(self, text: &str) -> Self {
-        if let Some(r) = self.responses.lock().first_mut() {
+        if let Some(r) = crate::error::recover_guard(self.responses.lock()).first_mut() {
             r.text = text.to_string();
         }
         self
@@ -418,7 +418,7 @@ impl MockApiClient {
     /// ```
     #[must_use]
     pub fn with_tool_call(self, id: &str, name: &str, input: Value) -> Self {
-        let mut responses = self.responses.lock();
+        let mut responses = crate::error::recover_guard(self.responses.lock());
         if let Some(r) = responses.first_mut() {
             r.tool_call = Some(MockToolCall {
                 id: id.to_string(),
@@ -449,7 +449,7 @@ impl MockApiClient {
     /// ```
     #[must_use]
     pub fn with_stop_reason(self, reason: &str) -> Self {
-        if let Some(r) = self.responses.lock().first_mut() {
+        if let Some(r) = crate::error::recover_guard(self.responses.lock()).first_mut() {
             r.stop_reason = reason.to_string();
         }
         self
@@ -487,7 +487,7 @@ impl MockApiClient {
     #[must_use]
     pub fn with_responses(self, responses: Vec<MockResponse>) -> Self {
         if !responses.is_empty() {
-            *self.responses.lock() = responses;
+            *crate::error::recover_guard(self.responses.lock()) = responses;
         }
         self
     }
@@ -538,7 +538,7 @@ impl MockApiClient {
     /// [R3]          → pop → R3, queue stays   [R3] (cloned)
     /// ```
     fn pop_response(&self) -> MockResponse {
-        let mut guard = self.responses.lock();
+        let mut guard = crate::error::recover_guard(self.responses.lock());
         if guard.len() > 1 {
             guard.remove(0)
         } else {
@@ -595,14 +595,14 @@ impl ApiClient for MockApiClient {
     /// assert_eq!(client.model(), "my-test-model");
     /// ```
     fn model(&self) -> String {
-        self.model_name.lock().clone()
+        crate::error::recover_guard(self.model_name.lock()).clone()
     }
 
     fn set_model(&self, model: &str) -> bool {
         if model.trim().is_empty() {
             return false;
         }
-        *self.model_name.lock() = model.to_string();
+        *crate::error::recover_guard(self.model_name.lock()) = model.to_string();
         true
     }
 
@@ -658,7 +658,7 @@ impl ApiClient for MockApiClient {
         }
 
         let response = self.pop_response();
-        let model = self.model_name.lock().clone();
+        let model = crate::error::recover_guard(self.model_name.lock()).clone();
         let mut events: Vec<Result<StreamEvent, ApiError>> =
             vec![Ok(StreamEvent::MessageStart(MessageStart {
                 message: MessageMetadata {

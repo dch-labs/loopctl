@@ -520,19 +520,20 @@ mod tests {
     #[test]
     fn host_dispatches_model_switched() {
         struct SwitchRecorder {
-            events: parking_lot::Mutex<Vec<(String, String)>>,
+            events: std::sync::Mutex<Vec<(String, String)>>,
         }
         impl LoopObserver for SwitchRecorder {
             fn name(&self) -> &'static str {
                 "switch-recorder"
             }
             fn on_model_switched(&self, ctx: &ModelSwitchedContext) {
-                self.events.lock().push((ctx.from.clone(), ctx.to.clone()));
+                crate::error::recover_guard(self.events.lock())
+                    .push((ctx.from.clone(), ctx.to.clone()));
             }
         }
 
         let obs = Arc::new(SwitchRecorder {
-            events: parking_lot::Mutex::new(Vec::new()),
+            events: std::sync::Mutex::new(Vec::new()),
         });
         let mut host = ObserverHost::new();
         host.register(Arc::clone(&obs) as Arc<dyn LoopObserver>);
@@ -546,7 +547,7 @@ mod tests {
             to: "c".into(),
         });
 
-        let events = obs.events.lock();
+        let events = crate::error::recover_guard(obs.events.lock());
         assert_eq!(events.len(), 2);
         assert_eq!(events[0], ("a".into(), "b".into()));
         assert_eq!(events[1], ("b".into(), "c".into()));
@@ -591,22 +592,22 @@ mod tests {
     #[test]
     fn host_dispatches_on_text_delta_to_all_observers() {
         struct DeltaRecorder {
-            deltas: parking_lot::Mutex<Vec<String>>,
+            deltas: std::sync::Mutex<Vec<String>>,
         }
         impl LoopObserver for DeltaRecorder {
             fn name(&self) -> &'static str {
                 "delta-recorder"
             }
             fn on_text_delta(&self, ctx: &TextDeltaContext) {
-                self.deltas.lock().push(ctx.delta.clone());
+                crate::error::recover_guard(self.deltas.lock()).push(ctx.delta.clone());
             }
         }
 
         let obs1 = Arc::new(DeltaRecorder {
-            deltas: parking_lot::Mutex::new(Vec::new()),
+            deltas: std::sync::Mutex::new(Vec::new()),
         });
         let obs2 = Arc::new(DeltaRecorder {
-            deltas: parking_lot::Mutex::new(Vec::new()),
+            deltas: std::sync::Mutex::new(Vec::new()),
         });
         let mut host = ObserverHost::new();
         host.register(Arc::clone(&obs1) as Arc<dyn LoopObserver>);
@@ -617,8 +618,14 @@ mod tests {
             delta: "x".into(),
         });
 
-        assert_eq!(obs1.deltas.lock().clone(), vec!["x".to_string()]);
-        assert_eq!(obs2.deltas.lock().clone(), vec!["x".to_string()]);
+        assert_eq!(
+            crate::error::recover_guard(obs1.deltas.lock()).clone(),
+            vec!["x".to_string()]
+        );
+        assert_eq!(
+            crate::error::recover_guard(obs2.deltas.lock()).clone(),
+            vec!["x".to_string()]
+        );
     }
 
     #[test]
@@ -653,22 +660,22 @@ mod tests {
     #[test]
     fn host_dispatches_on_tool_call_received_to_all_observers() {
         struct ReceivedRecorder {
-            calls: parking_lot::Mutex<Vec<String>>,
+            calls: std::sync::Mutex<Vec<String>>,
         }
         impl LoopObserver for ReceivedRecorder {
             fn name(&self) -> &'static str {
                 "received-recorder"
             }
             fn on_tool_call_received(&self, ctx: &ToolCallReceivedContext) {
-                self.calls.lock().push(ctx.tool.clone());
+                crate::error::recover_guard(self.calls.lock()).push(ctx.tool.clone());
             }
         }
 
         let obs1 = Arc::new(ReceivedRecorder {
-            calls: parking_lot::Mutex::new(Vec::new()),
+            calls: std::sync::Mutex::new(Vec::new()),
         });
         let obs2 = Arc::new(ReceivedRecorder {
-            calls: parking_lot::Mutex::new(Vec::new()),
+            calls: std::sync::Mutex::new(Vec::new()),
         });
         let mut host = ObserverHost::new();
         host.register(Arc::clone(&obs1) as Arc<dyn LoopObserver>);
@@ -681,8 +688,14 @@ mod tests {
             input: serde_json::Value::Null,
         });
 
-        assert_eq!(obs1.calls.lock().clone(), vec!["edit".to_string()]);
-        assert_eq!(obs2.calls.lock().clone(), vec!["edit".to_string()]);
+        assert_eq!(
+            crate::error::recover_guard(obs1.calls.lock()).clone(),
+            vec!["edit".to_string()]
+        );
+        assert_eq!(
+            crate::error::recover_guard(obs2.calls.lock()).clone(),
+            vec!["edit".to_string()]
+        );
     }
 
     #[test]

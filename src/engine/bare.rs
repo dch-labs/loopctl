@@ -688,7 +688,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// let buf = Arc::clone(&buffer);
     /// agent.set_text_streamer(Arc::new(move |delta| {
     ///     print!("{delta}");
-    ///     buf.lock().push_str(delta);
+    ///     buf.lock().unwrap_or_else(|e| e.into_inner()).push_str(delta);
     /// }));
     /// ```
     pub fn set_text_streamer(&mut self, f: Arc<dyn Fn(&str) + Send + Sync>) {
@@ -1378,20 +1378,20 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use parking_lot::Mutex;
+    use std::sync::Mutex;
 
     #[derive(Clone)]
     struct MockClient {
         responses: Arc<Mutex<Vec<Vec<StreamEvent>>>>,
 
-        model_name: Arc<parking_lot::Mutex<String>>,
+        model_name: Arc<std::sync::Mutex<String>>,
     }
 
     impl MockClient {
         fn new(model: &str) -> Self {
             Self {
                 responses: Arc::new(Mutex::new(Vec::new())),
-                model_name: Arc::new(parking_lot::Mutex::new(model.to_string())),
+                model_name: Arc::new(std::sync::Mutex::new(model.to_string())),
             }
         }
 
@@ -1401,7 +1401,7 @@ mod tests {
                     message: MessageMetadata {
                         id: "msg_test".into(),
                         role: "assistant".into(),
-                        model: self.model_name.lock().clone(),
+                        model: crate::error::recover_guard(self.model_name.lock()).clone(),
                     },
                 }),
                 StreamEvent::PartStart(PartStart {
@@ -1423,11 +1423,11 @@ mod tests {
                 }),
                 StreamEvent::MessageStop,
             ];
-            self.responses.lock().push(events);
+            crate::error::recover_guard(self.responses.lock()).push(events);
         }
 
         fn add_events(&self, events: Vec<StreamEvent>) {
-            self.responses.lock().push(events);
+            crate::error::recover_guard(self.responses.lock()).push(events);
         }
 
         fn add_tool_then_text(
@@ -1443,7 +1443,7 @@ mod tests {
                     message: MessageMetadata {
                         id: "msg_tool".into(),
                         role: "assistant".into(),
-                        model: self.model_name.lock().clone(),
+                        model: crate::error::recover_guard(self.model_name.lock()).clone(),
                     },
                 }),
                 StreamEvent::PartStart(PartStart {
@@ -1459,7 +1459,7 @@ mod tests {
                 }),
                 StreamEvent::MessageStop,
             ];
-            self.responses.lock().push(tool_events);
+            crate::error::recover_guard(self.responses.lock()).push(tool_events);
 
             // Second response: end_turn with text
             let text_events = vec![
@@ -1467,7 +1467,7 @@ mod tests {
                     message: MessageMetadata {
                         id: "msg_final".into(),
                         role: "assistant".into(),
-                        model: self.model_name.lock().clone(),
+                        model: crate::error::recover_guard(self.model_name.lock()).clone(),
                     },
                 }),
                 StreamEvent::PartStart(PartStart {
@@ -1489,7 +1489,7 @@ mod tests {
                 }),
                 StreamEvent::MessageStop,
             ];
-            self.responses.lock().push(text_events);
+            crate::error::recover_guard(self.responses.lock()).push(text_events);
         }
 
         fn add_tool_only_response(&self, tool_id: &str, tool_name: &str, tool_input: Value) {
@@ -1498,7 +1498,7 @@ mod tests {
                     message: MessageMetadata {
                         id: format!("msg_{tool_id}"),
                         role: "assistant".into(),
-                        model: self.model_name.lock().clone(),
+                        model: crate::error::recover_guard(self.model_name.lock()).clone(),
                     },
                 }),
                 StreamEvent::PartStart(PartStart {
@@ -1514,7 +1514,7 @@ mod tests {
                 }),
                 StreamEvent::MessageStop,
             ];
-            self.responses.lock().push(tool_events);
+            crate::error::recover_guard(self.responses.lock()).push(tool_events);
         }
 
         #[expect(dead_code)]
@@ -1525,23 +1525,23 @@ mod tests {
                 message: MessageMetadata {
                     id: "msg_err".into(),
                     role: "assistant".into(),
-                    model: self.model_name.lock().clone(),
+                    model: crate::error::recover_guard(self.model_name.lock()).clone(),
                 },
             })];
-            self.responses.lock().push(events);
+            crate::error::recover_guard(self.responses.lock()).push(events);
         }
     }
 
     impl ApiClient for MockClient {
         fn model(&self) -> String {
-            self.model_name.lock().clone()
+            crate::error::recover_guard(self.model_name.lock()).clone()
         }
 
         fn set_model(&self, model: &str) -> bool {
             if model.trim().is_empty() {
                 return false;
             }
-            *self.model_name.lock() = model.to_string();
+            *crate::error::recover_guard(self.model_name.lock()) = model.to_string();
             true
         }
 
@@ -1552,7 +1552,7 @@ mod tests {
             _tools: Option<Vec<ToolSchema>>,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
-            let mut guard = self.responses.lock();
+            let mut guard = crate::error::recover_guard(self.responses.lock());
             if let Some(events) = guard.pop_front() {
                 let events: Vec<Result<StreamEvent, ApiError>> =
                     events.into_iter().map(Ok).collect();
@@ -2040,7 +2040,7 @@ mod tests {
             }),
             StreamEvent::MessageStop,
         ];
-        client.responses.lock().push(tool_events);
+        crate::error::recover_guard(client.responses.lock()).push(tool_events);
 
         // Second response: end_turn
         client.add_text_response("Both tools executed.");
@@ -2067,13 +2067,13 @@ mod tests {
         let received = Arc::new(Mutex::new(Vec::new()));
         let buf = Arc::clone(&received);
         agent.set_text_streamer(Arc::new(move |delta: &str| {
-            buf.lock().push(delta.to_string());
+            crate::error::recover_guard(buf.lock()).push(delta.to_string());
         }));
 
         let result = agent.run("Hi").await.unwrap();
         assert!(result.success);
 
-        let received = received.lock();
+        let received = crate::error::recover_guard(received.lock());
         assert!(!received.is_empty(), "streamer should have fired");
         assert!(
             received.join("").contains("Hello world"),
@@ -2137,14 +2137,14 @@ mod tests {
         let received = Arc::new(Mutex::new(String::new()));
         let buf = Arc::clone(&received);
         agent.set_text_streamer(Arc::new(move |delta: &str| {
-            buf.lock().push_str(delta);
+            crate::error::recover_guard(buf.lock()).push_str(delta);
         }));
 
         agent.run("Use tool").await.unwrap();
 
         // The InputJson delta should NOT have triggered the streamer.
         // Only the "Done" text response in the second turn should.
-        let received = received.lock();
+        let received = crate::error::recover_guard(received.lock());
         assert_eq!(&*received, "Done", "only text deltas should fire streamer");
     }
 
@@ -2158,7 +2158,7 @@ mod tests {
                 "delta-recorder"
             }
             fn on_text_delta(&self, ctx: &crate::observer::TextDeltaContext) {
-                self.deltas.lock().push((ctx.turn, ctx.delta.clone()));
+                crate::error::recover_guard(self.deltas.lock()).push((ctx.turn, ctx.delta.clone()));
             }
         }
 
@@ -2212,7 +2212,7 @@ mod tests {
         let result = agent.run("Hi").await.unwrap();
         assert!(result.success);
 
-        let captured = captured.lock();
+        let captured = crate::error::recover_guard(captured.lock());
         assert_eq!(captured.len(), 3, "one on_text_delta per SSE text chunk");
         let joined: String = captured.iter().map(|(_, d)| d.as_str()).collect();
         assert_eq!(joined, "Hello world");
@@ -2229,10 +2229,10 @@ mod tests {
                 "turn-recorder"
             }
             fn on_text_delta(&self, ctx: &crate::observer::TextDeltaContext) {
-                self.deltas.lock().push((ctx.turn, ctx.delta.clone()));
+                crate::error::recover_guard(self.deltas.lock()).push((ctx.turn, ctx.delta.clone()));
             }
             fn on_response(&self, ctx: &crate::observer::ResponseContext) {
-                self.response_turns.lock().push(ctx.turn);
+                crate::error::recover_guard(self.response_turns.lock()).push(ctx.turn);
             }
         }
 
@@ -2255,8 +2255,8 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.total_turns, 2);
 
-        let response_turns = response_turns.lock();
-        let deltas = deltas.lock();
+        let response_turns = crate::error::recover_guard(response_turns.lock());
+        let deltas = crate::error::recover_guard(deltas.lock());
 
         assert_eq!(
             response_turns.len(),
@@ -2359,7 +2359,7 @@ mod tests {
                 "delta-recorder"
             }
             fn on_text_delta(&self, ctx: &crate::observer::TextDeltaContext) {
-                self.deltas.lock().push(ctx.delta.clone());
+                crate::error::recover_guard(self.deltas.lock()).push(ctx.delta.clone());
             }
         }
 
@@ -2376,7 +2376,7 @@ mod tests {
         let result = agent.run("Hi").await.unwrap();
         assert!(result.success);
 
-        let captured = captured.lock();
+        let captured = crate::error::recover_guard(captured.lock());
         assert!(
             !captured.is_empty(),
             "observer should receive deltas with no streamer set"
@@ -2395,7 +2395,7 @@ mod tests {
                 "delta-recorder"
             }
             fn on_text_delta(&self, ctx: &crate::observer::TextDeltaContext) {
-                self.deltas.lock().push(ctx.delta.clone());
+                crate::error::recover_guard(self.deltas.lock()).push(ctx.delta.clone());
             }
         }
 
@@ -2407,7 +2407,7 @@ mod tests {
         let streamer_buf = Arc::new(Mutex::new(Vec::new()));
         let buf = Arc::clone(&streamer_buf);
         agent.set_text_streamer(Arc::new(move |delta: &str| {
-            buf.lock().push(delta.to_string());
+            crate::error::recover_guard(buf.lock()).push(delta.to_string());
         }));
 
         let observer_buf = Arc::new(Mutex::new(Vec::new()));
@@ -2419,8 +2419,8 @@ mod tests {
         let result = agent.run("Hi").await.unwrap();
         assert!(result.success);
 
-        let streamer_buf = streamer_buf.lock();
-        let observer_buf = observer_buf.lock();
+        let streamer_buf = crate::error::recover_guard(streamer_buf.lock());
+        let observer_buf = crate::error::recover_guard(observer_buf.lock());
         assert!(!streamer_buf.is_empty(), "streamer should fire");
         assert!(!observer_buf.is_empty(), "observer should fire");
         assert_eq!(
@@ -2494,7 +2494,7 @@ mod tests {
             }),
             StreamEvent::MessageStop,
         ];
-        client.responses.lock().push(tool_events);
+        crate::error::recover_guard(client.responses.lock()).push(tool_events);
         client.add_text_response("All done");
 
         let mut registry = ToolRegistry::new();
@@ -2547,13 +2547,13 @@ mod tests {
                 "turn-capture"
             }
             fn on_response(&self, ctx: &crate::observer::ResponseContext) {
-                self.response_turns.lock().push(ctx.turn);
+                crate::error::recover_guard(self.response_turns.lock()).push(ctx.turn);
             }
             fn on_tool_call_received(&self, ctx: &crate::observer::ToolCallReceivedContext) {
-                self.received_turns.lock().push(ctx.turn);
+                crate::error::recover_guard(self.received_turns.lock()).push(ctx.turn);
             }
             fn on_tool_pre(&self, ctx: &crate::observer::ToolPreContext) {
-                self.pre_turns.lock().push(ctx.turn);
+                crate::error::recover_guard(self.pre_turns.lock()).push(ctx.turn);
             }
         }
 
@@ -2577,9 +2577,9 @@ mod tests {
         let result = agent.run("Use echo").await.unwrap();
         assert!(result.success);
 
-        let received = received.lock();
-        let response = response.lock();
-        let pre = pre.lock();
+        let received = crate::error::recover_guard(received.lock());
+        let response = crate::error::recover_guard(response.lock());
+        let pre = crate::error::recover_guard(pre.lock());
         assert_eq!(received.len(), 1, "one tool call → one received event");
         for turn in received.iter() {
             assert!(
@@ -2756,7 +2756,7 @@ mod tests {
             }),
             StreamEvent::MessageStop,
         ];
-        client.responses.lock().push(tool_events);
+        crate::error::recover_guard(client.responses.lock()).push(tool_events);
 
         // Second response: end_turn after seeing error result
         client.add_text_response("Tool wasn't found, but I'll handle it.");
@@ -2973,7 +2973,7 @@ mod tests {
 
     struct StreamingMockClient {
         model: String,
-        rx: parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<Result<StreamEvent, ApiError>>>>,
+        rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<Result<StreamEvent, ApiError>>>>,
     }
 
     impl StreamingMockClient {
@@ -2987,7 +2987,7 @@ mod tests {
             (
                 Self {
                     model: model.to_string(),
-                    rx: parking_lot::Mutex::new(Some(rx)),
+                    rx: std::sync::Mutex::new(Some(rx)),
                 },
                 tx,
             )
@@ -3010,7 +3010,9 @@ mod tests {
             _tools: Option<Vec<ToolSchema>>,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
-            let rx = self.rx.lock().take().expect("stream_messages called twice");
+            let rx = crate::error::recover_guard(self.rx.lock())
+                .take()
+                .expect("stream_messages called twice");
             Box::pin(ReceiverStream { rx })
         }
 
@@ -3113,7 +3115,7 @@ mod tests {
                 dyn std::future::Future<Output = crate::middleware::ToolDispatchResult> + Send + 'a,
             >,
         > {
-            self.turns.lock().push(ctx.turn_number);
+            crate::error::recover_guard(self.turns.lock()).push(ctx.turn_number);
             next.dispatch(ctx)
         }
     }
@@ -3139,7 +3141,7 @@ mod tests {
         let result = agent.run("test").await;
         assert!(result.is_ok());
 
-        let turns = capture.lock().clone();
+        let turns = crate::error::recover_guard(capture.lock()).clone();
         // Tool was called on turn 0 (first turn) and turn 1 (second turn).
         assert_eq!(
             turns.len(),
@@ -3186,8 +3188,7 @@ mod tests {
             }
 
             fn on_model_switched(&self, ctx: &ModelSwitchedContext) {
-                self.switches
-                    .lock()
+                crate::error::recover_guard(self.switches.lock())
                     .push((ctx.from.clone(), ctx.to.clone()));
             }
         }
@@ -3203,7 +3204,7 @@ mod tests {
         loop_.switch_model("m3").apply().unwrap();
 
         // Observer should have received both switches.
-        let recorded = obs_clone.switches.lock();
+        let recorded = crate::error::recover_guard(obs_clone.switches.lock());
         assert_eq!(recorded.len(), 2, "should have 2 model-switch events");
         assert_eq!(recorded[0], ("default".to_string(), "m2".to_string()));
         assert_eq!(recorded[1], ("m2".to_string(), "m3".to_string()));
@@ -3212,12 +3213,12 @@ mod tests {
     #[tokio::test]
     async fn switch_model_unsupported_client() {
         struct StaticClient {
-            model_name: Arc<parking_lot::Mutex<String>>,
+            model_name: Arc<std::sync::Mutex<String>>,
         }
 
         impl ApiClient for StaticClient {
             fn model(&self) -> String {
-                self.model_name.lock().clone()
+                crate::error::recover_guard(self.model_name.lock()).clone()
             }
             // Uses default set_model which returns false.
 
@@ -3253,7 +3254,7 @@ mod tests {
         }
 
         let client = std::sync::Arc::new(StaticClient {
-            model_name: std::sync::Arc::new(parking_lot::Mutex::new("static".to_string())),
+            model_name: std::sync::Arc::new(std::sync::Mutex::new("static".to_string())),
         });
         let tools = ToolRegistry::new();
         let mut loop_ = BareLoop::new(client, tools, LoopConfig::default());
@@ -3405,7 +3406,7 @@ mod tests {
         }
 
         fn captured(&self) -> Option<SessionEndReason> {
-            *self.reason.lock()
+            *crate::error::recover_guard(self.reason.lock())
         }
     }
 
@@ -3416,7 +3417,7 @@ mod tests {
         }
 
         fn on_session_end(&self, ctx: &HookSessionEndContext) {
-            *self.reason.lock() = Some(ctx.reason);
+            *crate::error::recover_guard(self.reason.lock()) = Some(ctx.reason);
         }
     }
 

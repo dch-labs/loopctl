@@ -372,7 +372,7 @@ pub enum CorrectionResult {
 // FailureAnalysis
 // ===================================================
 
-/// Result of analysing a failure via [`Reflector::analyze()`].
+/// Result of analyzing a failure via [`Reflector::analyze()`].
 ///
 /// Describes what went wrong, how severe it is, whether it's worth
 /// retrying, and optionally provides a [`Correction`] the agent can apply
@@ -547,7 +547,7 @@ impl crate::structured::StructuredOutput for FailureAnalysis {
 /// during analysis.
 #[derive(Debug, thiserror::Error)]
 pub enum ReflectionError {
-    /// The reflector opted out of analysing this failure.
+    /// The reflector opted out of analyzing this failure.
     ///
     /// The framework should fall back to its default error handling.
     #[error("reflection skipped: {0}")]
@@ -555,7 +555,7 @@ pub enum ReflectionError {
 
     /// The reflector itself encountered an error.
     ///
-    /// Distinct from the tool failure being analysed — it means
+    /// Distinct from the tool failure being analyzed — it means
     /// the reflector's own logic broke (e.g., an LLM call for
     /// summarisation failed).
     #[error("reflection internal error: {0}")]
@@ -825,7 +825,7 @@ pub trait Reflector: Send + Sync {
 // RecoveryStrategy trait
 // ===================================================
 
-/// Decides what to do after a failure has been analysed.
+/// Decides what to do after a failure has been analyzed.
 ///
 /// Takes a [`FailureAnalysis`] and the current retry state, returns a
 /// [`RecoveryAction`]. Implement this trait to provide custom recovery
@@ -1102,8 +1102,6 @@ mod tests {
         let debug = format!("{reflector:?}");
         assert!(debug.contains("NoopReflector"));
     }
-
-    // ---- StructuredOutput impl tests (1-4) ----
 
     #[test]
     fn failure_analysis_structured_round_trip() {

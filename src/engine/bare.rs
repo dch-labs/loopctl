@@ -87,6 +87,7 @@ use crate::reflection::{
 use crate::runtime::LoopRuntime;
 use crate::stream::handler::StreamHandler;
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
+use crate::structured::RequestOptions;
 #[cfg(feature = "tool_health")]
 use crate::tool::health::ToolHealthRegistry;
 use crate::tool::{PermissionCheck, ToolContext, ToolDispatchResult, ToolRegistry, ToolSchema};
@@ -215,6 +216,16 @@ pub struct BareLoop<C: ApiClient> {
     cancelled: Arc<CancelSignal>,
 
     /// Current lifecycle state, exposed via the [`Loop`](crate::engine::loop_core::Loop) trait.
+    ///
+    /// Drives the engine's state machine
+    /// (`Idle → Processing → WaitingForTool → Processing → … → Completed` /
+    /// `Failed` / `Cancelled`, plus `Compacting`/`Reflecting` side-states).
+    /// Set throughout the turn loop and read by [`finalize`](crate::engine::loop_core::Loop::finalize)
+    /// to decide success vs. failure and to populate the
+    /// [`SessionResult`](crate::engine::loop_core::SessionResult) fields; also
+    /// returned from [`state`](crate::engine::loop_core::Loop::state) for
+    /// outside observers. The [`Idle`](LoopState::Idle) variant additionally
+    /// gates configuration setters via [`debug_assert_idle`](Self::debug_assert_idle).
     state: LoopState,
 
     /// Session-level accumulator for turn counts, token usage, and tool calls.
@@ -224,6 +235,13 @@ pub struct BareLoop<C: ApiClient> {
     budget: SessionResult,
 
     /// Session start time, set by [`initialize`](crate::engine::loop_core::Loop::initialize).
+    ///
+    /// `None` only before the first `initialize()` call; `Some` thereafter.
+    /// Read in [`finalize`](crate::engine::loop_core::Loop::finalize) to
+    /// compute [`SessionResult::total_duration`](crate::engine::loop_core::SessionResult)
+    /// via `elapsed()`. Captured once per session (not per turn) so the
+    /// reported duration is the wall-clock lifetime of the whole session,
+    /// not a single turn.
     session_start: Option<Instant>,
 
     /// Optional callback invoked for each text delta during streaming.
@@ -242,6 +260,14 @@ pub struct BareLoop<C: ApiClient> {
     /// conversation in registration order. Register via
     /// [`add_contributor`](BareLoop::add_contributor).
     contributors: Vec<Box<dyn ContextContributor>>,
+
+    /// Per-turn `RequestOptions` applied to every provider call.
+    ///
+    /// Carries `tool_constraint` (strict/grammar-constrained tool-call
+    /// decoding). Default is [`RequestOptions::default`], which reproduces
+    /// the prior (unconstrained) behavior. Set via
+    /// [`set_request_options`](BareLoop::set_request_options).
+    request_options: RequestOptions,
 }
 
 // ==================================================
@@ -293,6 +319,7 @@ impl<C: ApiClient> BareLoop<C> {
             session_start: None,
             text_streamer: None,
             contributors: Vec::new(),
+            request_options: RequestOptions::default(),
         }
     }
 
@@ -344,6 +371,7 @@ impl<C: ApiClient> BareLoop<C> {
             session_start: None,
             text_streamer: None,
             contributors: Vec::new(),
+            request_options: RequestOptions::default(),
         }
     }
 
@@ -737,6 +765,36 @@ impl<C: ApiClient> BareLoop<C> {
     pub fn add_contributor(&mut self, contributor: Box<dyn ContextContributor>) {
         self.debug_assert_idle();
         self.contributors.push(contributor);
+    }
+
+    /// Set the per-turn [`RequestOptions`] applied to every provider call.
+    ///
+    /// Carries [`tool_constraint`](crate::structured::ToolConstraint) — set to
+    /// [`ToolConstraint::Strict`](crate::structured::ToolConstraint::Strict)
+    /// for strict tool-call decoding (small-model reliability), or leave at the
+    /// default ([`RequestOptions::default`]) for unconstrained behavior.
+    ///
+    /// Must be called before
+    /// [`run`](crate::engine::loop_core::Loop::run).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started
+    /// (i.e., when [`state`](LoopState) is not [`Idle`](LoopState::Idle)).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::structured::{RequestOptions, ToolConstraint};
+    ///
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_request_options(
+    ///     RequestOptions::new().tool_constraint(ToolConstraint::Strict),
+    /// );
+    /// ```
+    pub fn set_request_options(&mut self, options: RequestOptions) {
+        self.debug_assert_idle();
+        self.request_options = options;
     }
 
     /// Begin a model switch operation.
@@ -3831,6 +3889,7 @@ mod tests {
     struct RecordingClient {
         responses: Arc<Mutex<Vec<Vec<StreamEvent>>>>,
         seen: Arc<Mutex<Vec<Vec<Message>>>>,
+        seen_options: Arc<Mutex<Vec<crate::structured::RequestOptions>>>,
         model_name: Arc<Mutex<String>>,
     }
 
@@ -3839,6 +3898,7 @@ mod tests {
             Self {
                 responses: Arc::new(Mutex::new(Vec::new())),
                 seen: Arc::new(Mutex::new(Vec::new())),
+                seen_options: Arc::new(Mutex::new(Vec::new())),
                 model_name: Arc::new(Mutex::new(model.to_string())),
             }
         }
@@ -3944,6 +4004,13 @@ mod tests {
         fn call_count(&self) -> usize {
             crate::error::recover_guard(self.seen.lock()).len()
         }
+
+        fn first_options(&self) -> crate::structured::RequestOptions {
+            crate::error::recover_guard(self.seen_options.lock())
+                .first()
+                .expect("at least one stream_messages_with_options call")
+                .clone()
+        }
     }
 
     impl ApiClient for RecordingClient {
@@ -3967,6 +4034,27 @@ mod tests {
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
             crate::error::recover_guard(self.seen.lock()).push(messages);
+            let mut guard = crate::error::recover_guard(self.responses.lock());
+            if let Some(events) = guard.pop_front() {
+                let events: Vec<Result<StreamEvent, ApiError>> =
+                    events.into_iter().map(Ok).collect();
+                Box::pin(futures::stream::iter(events))
+            } else {
+                let err = ApiError::api("No more mock responses");
+                Box::pin(futures::stream::iter(vec![Err(err)]))
+            }
+        }
+
+        fn stream_messages_with_options(
+            &self,
+            messages: Vec<Message>,
+            _system: Option<String>,
+            _tools: Option<Vec<ToolSchema>>,
+            options: crate::structured::RequestOptions,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+        {
+            crate::error::recover_guard(self.seen.lock()).push(messages);
+            crate::error::recover_guard(self.seen_options.lock()).push(options);
             let mut guard = crate::error::recover_guard(self.responses.lock());
             if let Some(events) = guard.pop_front() {
                 let events: Vec<Result<StreamEvent, ApiError>> =
@@ -4248,5 +4336,117 @@ mod tests {
     #[allow(dead_code)]
     fn _suppress_recording_client_dead_code(c: &RecordingClient) {
         let _ = c.call_count();
+    }
+
+    // ==========================================================
+    // RequestOptions engine plumbing
+    // ==========================================================
+
+    #[tokio::test]
+    async fn test_request_options_default_is_unconstrained() {
+        // A fresh BareLoop has default RequestOptions — the engine reproduces
+        // v0.1.0 behavior (no tool_constraint).
+        let client = RecordingClient::new("test-model");
+        client.add_text_response("done");
+        let config = contributor_config();
+        let mut agent = BareLoop::new(Arc::new(client.clone()), ToolRegistry::new(), config);
+        // No set_request_options call — default path.
+        agent.run("Hi").await.unwrap();
+
+        let opts = client.first_options();
+        assert!(
+            matches!(
+                opts.tool_constraint,
+                crate::structured::ToolConstraint::None
+            ),
+            "default request options must be unconstrained"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_options_strict_reaches_provider() {
+        // The critical end-to-end proof: a tool_constraint: Strict set on the
+        // loop reaches the provider's stream_messages_with_options call.
+        let client = RecordingClient::new("test-model");
+        client.add_text_response("done");
+        let config = contributor_config();
+        let mut agent = BareLoop::new(Arc::new(client.clone()), ToolRegistry::new(), config);
+        agent.set_request_options(
+            crate::structured::RequestOptions::new()
+                .tool_constraint(crate::structured::ToolConstraint::Strict),
+        );
+        agent.run("Hi").await.unwrap();
+
+        let opts = client.first_options();
+        assert!(
+            matches!(
+                opts.tool_constraint,
+                crate::structured::ToolConstraint::Strict
+            ),
+            "Strict set on the loop must reach the provider"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "configuration setters must be called before run()")]
+    fn test_set_request_options_panics_after_session_start() {
+        let client = MockClient::new("test-model");
+        let config = contributor_config();
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        let cfg = LoopConfig {
+            max_turns: 10,
+            ..Default::default()
+        };
+        {
+            let fut = agent.initialize(&cfg);
+            let mut fut = std::pin::pin!(fut);
+            futures::executor::block_on(fut.as_mut()).unwrap();
+        }
+        agent.set_request_options(crate::structured::RequestOptions::default());
+    }
+
+    // ==========================================================
+    // ConstrainedProfile::apply
+    // ==========================================================
+
+    #[tokio::test]
+    async fn test_constrained_apply_wires_pipeline_and_contributor() {
+        // Apply() sets the small-model pipeline and registers a GoalReminder. To prove
+        // the contributor wiring without driving 5 turns (each turn ends on
+        // end_turn, so reaching turn 5 needs a long tool-call chain), we add
+        // a cadence-1 GoalReminder on top: it fires on turn 1, so a single
+        // tool-then-text session (2 turns) is enough.
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+
+        let client = RecordingClient::new("test-model");
+        client.add_tool_then_text("t1", "echo", json!({"message": "x"}), "done");
+
+        let mut agent = BareLoop::new(Arc::new(client.clone()), registry, contributor_config());
+        // apply() wires the pipeline + a cadence-5 GoalReminder.
+        crate::presets::ConstrainedProfile::apply(&mut agent).unwrap();
+        // Add a cadence-1 reminder so it fires this session.
+        agent.add_contributor(Box::new(crate::presets::GoalReminder::new(1)));
+
+        let result = agent.run("ship the demo goal").await.unwrap();
+        // Tool-call turn + end_turn = 2 turns.
+        assert!(result.total_turns >= 1);
+
+        // The contributor fired: a Role::System message carrying the first
+        // user message text reached the provider on some turn's outbound
+        // conversation. Scan all recorded calls (the reminder fires on turn 1,
+        // not turn 0).
+        let all_seen = crate::error::recover_guard(client.seen.lock()).clone();
+        let has_reminder = all_seen.iter().flatten().any(|m| {
+            m.role == Role::System
+                && m.parts.iter().any(
+                    |p| matches!(p, MessagePart::Text { text } if text.contains("ship the demo goal")),
+                )
+        });
+        assert!(
+            has_reminder,
+            "GoalReminder (cadence 1) should have injected the goal text as a System message"
+        );
     }
 }

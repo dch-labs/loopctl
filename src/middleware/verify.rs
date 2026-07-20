@@ -108,6 +108,44 @@ pub struct VerifyResult {
     pub diagnostics: String,
 }
 
+/// A [`Verifier`] that always passes with empty diagnostics.
+///
+/// Useful as the default verifier when wiring [`VerifyMiddleware`] into a
+/// pipeline that has no real build/lint step to run — the middleware still
+/// registers and appends a `[verify] passed: ` block, but no actual
+/// check happens. Swap in a real verifier (`cargo check`, `tsc`) when one is
+/// available.
+///
+/// Zero-sized; cheap to construct and `Arc`-share.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::Arc;
+/// use loopctl::middleware::{NoopVerifier, Verifier, VerifyMiddleware};
+///
+/// let pipeline = ToolPipeline::builder()
+///     .with(VerifyMiddleware::new(Arc::new(NoopVerifier), vec!["Write".into()]))
+///     .core(registry)
+///     .build()?;
+/// ```
+pub struct NoopVerifier;
+
+impl Verifier for NoopVerifier {
+    fn verify<'a>(
+        &'a self,
+        _ctx: &'a ToolContext,
+        _tool_name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = VerifyResult> + Send + 'a>> {
+        Box::pin(async move {
+            VerifyResult {
+                passed: true,
+                diagnostics: String::new(),
+            }
+        })
+    }
+}
+
 // ===================================================
 // VerifyMiddleware
 // ===================================================
@@ -147,7 +185,7 @@ pub struct VerifyResult {
 pub struct VerifyMiddleware {
     /// The verifier this middleware invokes after write-class tool calls.
     ///
-    /// Held as a shared `Arc<dyn Verifier>` handle (D2) so a single
+    /// Held as a shared `Arc<dyn Verifier>` handle so a single
     /// verifier instance can back multiple middleware layers if a future
     /// composition wants that — e.g. one `cargo check` verifier reused
     /// across parallel pipelines. The handle is cloned cheaply per
@@ -568,5 +606,36 @@ mod tests {
         let debug = format!("{mw:?}");
         assert!(debug.contains("VerifyMiddleware"));
         assert!(debug.contains("write_tools"));
+    }
+
+    #[tokio::test]
+    async fn noop_verifier_always_passes() {
+        let verifier = NoopVerifier;
+        let ctx = ToolContext::default();
+        let result = verifier.verify(&ctx, "Write").await;
+        assert!(result.passed, "NoopVerifier must always pass");
+        assert!(
+            result.diagnostics.is_empty(),
+            "NoopVerifier must produce empty diagnostics"
+        );
+    }
+
+    #[tokio::test]
+    async fn noop_verifier_in_verify_middleware_appends_passed_block() {
+        let mw = VerifyMiddleware::new(Arc::new(NoopVerifier), write_tools());
+        let pipeline = pipeline_with(mw, ToolContent::from_string("wrote 42 bytes"), false);
+
+        let mut ctx = ctx_for("Write");
+        let result = pipeline.dispatch(&mut ctx).await;
+
+        let rendered = result.output.to_string();
+        assert!(
+            rendered.contains("[verify]"),
+            "NoopVerifier still triggers the middleware's append: got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("[verify] passed:"),
+            "appended block reports passed status: got {rendered:?}"
+        );
     }
 }

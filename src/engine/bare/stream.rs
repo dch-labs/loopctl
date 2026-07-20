@@ -64,9 +64,12 @@ impl<C: ApiClient> BareLoop<C> {
         // cost of serialising the messages into an HTTP request body. For
         // very long sessions (>200 turns with large tool outputs), consider
         // enabling auto-compaction to bound the history size.
-        let mut stream =
-            self.client
-                .stream_messages(self.conversation.clone(), system, tool_schemas);
+        let mut stream = self.client.stream_messages_with_options(
+            self.conversation.clone(),
+            system,
+            tool_schemas,
+            self.request_options.clone(),
+        );
         let mut accumulator = StreamAccumulator::new();
         let mut stop_reason = StreamStopReason::EndTurn;
         loop {

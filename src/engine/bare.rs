@@ -4450,4 +4450,158 @@ mod tests {
             "GoalReminder (cadence 1) should have injected the goal text as a System message"
         );
     }
+
+    #[tokio::test]
+    async fn test_on_thinking_delta_fires_per_thinking_delta() {
+        struct ThinkingRecorder {
+            deltas: Arc<Mutex<Vec<(usize, String)>>>,
+        }
+        impl crate::observer::LoopObserver for ThinkingRecorder {
+            fn name(&self) -> &'static str {
+                "thinking-recorder"
+            }
+            fn on_thinking_delta(&self, ctx: &crate::observer::ThinkingDeltaContext) {
+                crate::error::recover_guard(self.deltas.lock()).push((ctx.turn, ctx.delta.clone()));
+            }
+        }
+
+        let client = MockClient::new("test-model");
+        let events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg-1".into(),
+                    role: "assistant".into(),
+                    model: "test-model".into(),
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 1,
+                part: None,
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::Thinking {
+                    text: "First reasoning".into(),
+                },
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::Thinking {
+                    text: " chunk".into(),
+                },
+            }),
+            StreamEvent::PartStop,
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(MessagePart::text("ignored")),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Text {
+                    text: "final answer".into(),
+                },
+            }),
+            StreamEvent::PartStop,
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".into()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        client.add_events(events);
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::new(ThinkingRecorder {
+            deltas: Arc::clone(&captured),
+        });
+        agent.register_observer(recorder as Arc<dyn crate::observer::LoopObserver>);
+
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        let captured = crate::error::recover_guard(captured.lock());
+        assert_eq!(
+            captured.len(),
+            2,
+            "one on_thinking_delta per Thinking delta"
+        );
+        let joined: String = captured.iter().map(|(_, d)| d.as_str()).collect();
+        assert_eq!(joined, "First reasoning chunk");
+        assert_eq!(captured[0].0, 0, "turn number matches budget.total_turns");
+    }
+
+    #[tokio::test]
+    async fn test_on_thinking_delta_independent_of_text_delta() {
+        struct MixedRecorder {
+            text_calls: Arc<Mutex<usize>>,
+            thinking_calls: Arc<Mutex<usize>>,
+        }
+        impl crate::observer::LoopObserver for MixedRecorder {
+            fn name(&self) -> &'static str {
+                "mixed-recorder"
+            }
+            fn on_text_delta(&self, _ctx: &crate::observer::TextDeltaContext) {
+                *crate::error::recover_guard(self.text_calls.lock()) += 1;
+            }
+            fn on_thinking_delta(&self, _ctx: &crate::observer::ThinkingDeltaContext) {
+                *crate::error::recover_guard(self.thinking_calls.lock()) += 1;
+            }
+        }
+
+        let client = MockClient::new("test-model");
+        let events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg-1".into(),
+                    role: "assistant".into(),
+                    model: "test-model".into(),
+                },
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::Thinking {
+                    text: "reasoning".into(),
+                },
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Text {
+                    text: "answer".into(),
+                },
+            }),
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".into()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        client.add_events(events);
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        let text_calls = Arc::new(Mutex::new(0usize));
+        let thinking_calls = Arc::new(Mutex::new(0usize));
+        let recorder = Arc::new(MixedRecorder {
+            text_calls: Arc::clone(&text_calls),
+            thinking_calls: Arc::clone(&thinking_calls),
+        });
+        agent.register_observer(recorder as Arc<dyn crate::observer::LoopObserver>);
+
+        agent.run("Hi").await.unwrap();
+
+        assert_eq!(
+            *crate::error::recover_guard(text_calls.lock()),
+            1,
+            "text callback fires once (for the Text delta)"
+        );
+        assert_eq!(
+            *crate::error::recover_guard(thinking_calls.lock()),
+            1,
+            "thinking callback fires once (for the Thinking delta)"
+        );
+    }
 }

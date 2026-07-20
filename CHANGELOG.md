@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Added
 
+- `DeltaPart::Thinking { text }` variant + `on_thinking_delta` observer event
+  (`ThinkingDeltaContext`): reasoning-model tokens (Claude extended-thinking,
+  DeepSeek-R1, OpenAI o-series, Gemini 2.5+) are now routed as their own
+  stream kind instead of being dropped or misrouted into text. Stream-only —
+  reasoning is not accumulated into the `Message` and does not reach
+  `ResponseContext.text`; consume it via `on_thinking_delta` or the raw
+  `IndexedDelta(Thinking)` stream event. Anthropic parses `thinking_delta`
+  (and emits an empty Thinking delta for `redacted_thinking`); OpenAI parses
+  `reasoning_content` (aliased to `reasoning`); Gemini parses per-part
+  `thought: true` flags (with `includeThoughts: true` injected into the
+  request). An empty `delta` signals redacted reasoning (render a placeholder).
 - `DisplayHint` advisory rendering hint on `ToolOutput` (`with_hint()` builder),
   threaded through `ToolDispatchResult` and `ToolPostContext` so presentation
   layers (TUI, headless console) can render a tool result by the tool's own
@@ -135,6 +146,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Changed
 
+- **Breaking:** `stream::DeltaPart` is now `#[non_exhaustive]`. Every
+  exhaustive `match` on `DeltaPart` in downstream code must add a `_ =>` arm
+  (or a `Thinking =>` arm for the new variant). Same-crate matches are
+  unaffected. Future variant additions (e.g. `Image`, `Audio`) will arrive
+  non-breaking.
 - **Breaking:** `ToolOutput`, `ToolDispatchResult`, and `ToolPostContext` are
   now `#[non_exhaustive]`, matching `DisplayHint`. Downstream code that
   constructs these via struct literal must switch to the named constructors

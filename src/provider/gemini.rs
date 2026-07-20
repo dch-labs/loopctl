@@ -46,6 +46,7 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta
 const DEFAULT_MODEL: &str = "gemini-2.0-flash";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
+const THINKING_PART_INDEX: usize = 1;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(2); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
@@ -506,10 +507,15 @@ impl GeminiClientBuilder {
 /// Unlike OpenAI/Anthropic, Gemini puts the model in the URL, not the
 /// request body. Each [`Message`] is serialized via [`convert_message`].
 ///
+/// `generationConfig` is always injected with
+/// `thinkingConfig.includeThoughts = true` so reasoning-capable models
+/// (Gemini 2.5+) surface thought parts in the streamed response;
+/// non-reasoning models ignore the flag.
+///
 /// Tool-call constraint:
-/// - When `response_format` is set, injects `generationConfig` for the
-///   structured-output path and suppresses `tools`; `tool_constraint` is
-///   ignored in that case.
+/// - When `response_format` is set, injects `responseMimeType` +
+///   `responseJsonSchema` into `generationConfig` and suppresses `tools`;
+///   `tool_constraint` is ignored in that case.
 /// - Otherwise, when `tool_constraint` is `Strict`, each
 ///   `functionDeclaration`'s `parameters` is tightened
 ///   (`additionalProperties: false`, full `required`) via [`convert_tools`].
@@ -544,15 +550,18 @@ fn build_request_body(
             );
         }
 
+        let mut generation_config = serde_json::Map::new();
+        generation_config.insert(
+            "thinkingConfig".into(),
+            serde_json::json!({ "includeThoughts": true }),
+        );
+
         if let Some(rf) = response_format {
-            obj.insert(
-                "generationConfig".into(),
-                serde_json::json!({
-                    "responseMimeType": "application/json",
-                    "responseJsonSchema": rf.schema,
-                }),
-            );
+            generation_config.insert("responseMimeType".into(), "application/json".into());
+            generation_config.insert("responseJsonSchema".into(), rf.schema.clone());
         }
+
+        obj.insert("generationConfig".into(), Value::Object(generation_config));
     }
 
     body
@@ -733,8 +742,11 @@ impl SseReader {
 /// Gemini's SSE format is simpler than Anthropic's: each `data:` line
 /// is a complete JSON object with `candidates[0].content.parts[]` for
 /// text/function-call data and `candidates[0].finishReason` for the
-/// stop reason.
+/// stop reason. Reasoning models (Gemini 2.5+) interleave thought parts
+/// with regular parts in the same `parts[]` array, flagged by a
+/// `thought: true` boolean on each thought part.
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct StreamEmitter {
     /// Whether [`StreamEvent::MessageStart`] has been emitted for the
     /// current stream.
@@ -744,6 +756,22 @@ struct StreamEmitter {
     /// since Gemini's streaming chunks don't carry them) and treats later
     /// chunks as content only.
     started: bool,
+
+    /// Whether the text content part is currently open.
+    ///
+    /// The emitter opens a text part with [`StreamEvent::PartStart`] on the
+    /// first non-empty text fragment and tracks the open state so
+    /// [`extract_finish_reason`](Self::extract_finish_reason) emits exactly
+    /// one [`StreamEvent::PartStop`] to close it.
+    text_part_open: bool,
+
+    /// Whether the reasoning (thinking) content part is currently open.
+    ///
+    /// Reasoning models flag thought parts with `thought: true`. The emitter
+    /// opens a thinking part on the first non-empty thought fragment and
+    /// closes it in [`extract_finish_reason`](Self::extract_finish_reason),
+    /// symmetric to the text lane.
+    thinking_part_open: bool,
 
     /// Whether the terminal stop signal has been processed.
     ///
@@ -786,28 +814,80 @@ impl StreamEmitter {
             }));
         }
 
-        self.extract_text(json);
+        self.extract_parts(json);
         self.extract_function_call(json);
         self.extract_finish_reason(json);
     }
 
-    /// Extract a text delta from the chunk and emit an `IndexedDelta` event.
+    /// Extract text and thought deltas from the chunk, routing by the
+    /// `thought: true` flag on each part.
     ///
-    /// Reads `candidates[0].content.parts[0].text`. If the text is non-empty,
-    /// pushes a [`DeltaPart::Text`](crate::stream::DeltaPart::Text) event at
-    /// index 0. Does nothing if the path is absent or the text is empty.
-    fn extract_text(&mut self, json: &Value) {
-        if let Some(text) = json
-            .pointer("/candidates/0/content/parts/0/text")
-            .and_then(Value::as_str)
-            && !text.is_empty()
-        {
-            self.push(StreamEvent::IndexedDelta(IndexedDelta {
-                index: TEXT_PART_INDEX,
-                delta: DeltaPart::Text {
-                    text: text.to_string(),
-                },
-            }));
+    /// Gemini reasoning models (2.5+) interleave thought parts with regular
+    /// text parts in `candidates[0].content.parts[]`. Each part carries a
+    /// `thought` boolean: `true` for reasoning (routed to
+    /// [`DeltaPart::Thinking`]), absent or `false` for visible text (routed
+    /// to [`DeltaPart::Text`]). Both lanes open a [`PartStart`] on the first
+    /// non-empty fragment and are closed by
+    /// [`extract_finish_reason`](Self::extract_finish_reason).
+    ///
+    /// The `functionCall` part is skipped here — it's handled by
+    /// [`extract_function_call`](Self::extract_function_call).
+    fn extract_parts(&mut self, json: &Value) {
+        let Some(parts) = json
+            .pointer("/candidates/0/content/parts")
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+
+        for part in parts {
+            // Function-call parts are handled by extract_function_call.
+            if part.get("functionCall").is_some() {
+                continue;
+            }
+
+            let Some(text) = part.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+
+            if text.is_empty() {
+                continue;
+            }
+
+            let is_thought = part
+                .get("thought")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+            if is_thought {
+                if !self.thinking_part_open {
+                    self.thinking_part_open = true;
+                    self.push(StreamEvent::PartStart(PartStart {
+                        index: THINKING_PART_INDEX,
+                        part: None,
+                    }));
+                }
+                self.push(StreamEvent::IndexedDelta(IndexedDelta {
+                    index: THINKING_PART_INDEX,
+                    delta: DeltaPart::Thinking {
+                        text: text.to_string(),
+                    },
+                }));
+            } else {
+                if !self.text_part_open {
+                    self.text_part_open = true;
+                    self.push(StreamEvent::PartStart(PartStart {
+                        index: TEXT_PART_INDEX,
+                        part: Some(MessagePart::text("")),
+                    }));
+                }
+                self.push(StreamEvent::IndexedDelta(IndexedDelta {
+                    index: TEXT_PART_INDEX,
+                    delta: DeltaPart::Text {
+                        text: text.to_string(),
+                    },
+                }));
+            }
         }
     }
 
@@ -850,7 +930,8 @@ impl StreamEmitter {
     /// Extract the finish reason from the chunk and emit stop events.
     ///
     /// Reads `candidates[0].finishReason` (e.g. `"STOP"`, `"MAX_TOKENS"`).
-    /// When present, emits [`PartStop`](StreamEvent::PartStop) followed by a
+    /// When present, closes any open thinking part and text part with
+    /// [`PartStop`](StreamEvent::PartStop), then emits a
     /// [`MessageDelta`](StreamEvent::MessageDelta) carrying the mapped
     /// [`StreamStopReason`]. Does nothing if the chunk has no finish reason.
     fn extract_finish_reason(&mut self, json: &Value) {
@@ -865,7 +946,14 @@ impl StreamEmitter {
             _ => StreamStopReason::EndTurn,
         };
 
-        self.push(StreamEvent::PartStop);
+        if self.thinking_part_open {
+            self.push(StreamEvent::PartStop);
+        }
+
+        if self.text_part_open {
+            self.push(StreamEvent::PartStop);
+        }
+
         self.push(StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some(stop.to_api_str().into()),
@@ -1225,9 +1313,233 @@ mod tests {
     }
 
     #[test]
+    fn emitter_thought_part_routes_to_thinking_variant() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "reasoning here",
+                        "thought": true
+                    }]
+                }
+            }]
+        }));
+        let events = em.drain();
+        let delta = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::IndexedDelta(d) => Some(d.clone()),
+                _ => None,
+            })
+            .expect("expected at least one IndexedDelta");
+        assert!(
+            matches!(delta.delta, DeltaPart::Thinking { .. }),
+            "thought:true part must route to Thinking, got {:?}",
+            delta.delta
+        );
+        if let DeltaPart::Thinking { text } = delta.delta {
+            assert_eq!(text, "reasoning here");
+        }
+    }
+
+    #[test]
+    fn emitter_thought_part_emits_part_start_at_thinking_index() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "hmm",
+                        "thought": true
+                    }]
+                }
+            }]
+        }));
+        let events = em.drain();
+        let start = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::PartStart(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("expected a PartStart for the thinking lane");
+        assert_eq!(
+            start.index, THINKING_PART_INDEX,
+            "thought part must open at the thinking index"
+        );
+    }
+
+    #[test]
+    fn emitter_thought_part_does_not_open_text_lane() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "private reasoning",
+                        "thought": true
+                    }]
+                }
+            }]
+        }));
+        let events = em.drain();
+        // No DeltaPart::Text event must appear for a thought:true part.
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::IndexedDelta(IndexedDelta {
+                    delta: DeltaPart::Text { .. },
+                    ..
+                })
+            )),
+            "thought:true part must not produce a Text delta"
+        );
+    }
+
+    #[test]
+    fn emitter_text_part_does_not_open_thinking_lane() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "visible answer"
+                    }]
+                }
+            }]
+        }));
+        let events = em.drain();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::IndexedDelta(IndexedDelta {
+                    delta: DeltaPart::Thinking { .. },
+                    ..
+                })
+            )),
+            "thought field absent must not produce a Thinking delta"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::IndexedDelta(IndexedDelta {
+                    delta: DeltaPart::Text { .. },
+                    ..
+                })
+            )),
+            "plain text part must produce a Text delta"
+        );
+    }
+
+    #[test]
+    fn emitter_thought_and_text_parts_interleave() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "step 1", "thought": true},
+                        {"text": "answer", "thought": false}
+                    ]
+                }
+            }]
+        }));
+        let events = em.drain();
+        let deltas: Vec<&IndexedDelta> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::IndexedDelta(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.len(), 2);
+        assert!(
+            matches!(deltas[0].delta, DeltaPart::Thinking { ref text } if text == "step 1"),
+            "first delta must be the thinking fragment, got {:?}",
+            deltas[0].delta
+        );
+        assert_eq!(deltas[0].index, THINKING_PART_INDEX);
+        assert!(
+            matches!(deltas[1].delta, DeltaPart::Text { ref text } if text == "answer"),
+            "second delta must be the text fragment, got {:?}",
+            deltas[1].delta
+        );
+        assert_eq!(deltas[1].index, TEXT_PART_INDEX);
+    }
+
+    #[test]
+    fn emitter_finish_closes_thinking_lane() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "thinking…", "thought": true}]
+                }
+            }]
+        }));
+        em.drain();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let events = em.drain();
+        // The thinking lane was open; finish must close it with a PartStop.
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::PartStop)),
+            "finish must emit PartStop for the open thinking lane"
+        );
+    }
+
+    #[test]
+    fn request_body_includes_thinking_config() {
+        let msgs = vec![Message::user("hi")];
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["includeThoughts"], true,
+            "includeThoughts must be injected into generationConfig"
+        );
+    }
+
+    #[test]
+    fn request_body_thinking_config_composes_with_response_format() {
+        // Both thinkingConfig and responseJsonSchema land under generationConfig.
+        let msgs = vec![Message::user("hi")];
+        let rf = crate::structured::ResponseFormat::new(
+            "result",
+            serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
+        );
+        let body = build_request_body(&msgs, None, None, Some(&rf), &ToolConstraint::None);
+
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(
+            body["generationConfig"]["responseJsonSchema"],
+            serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}})
+        );
+    }
+
+    #[test]
     fn emitter_finish_reason_end_turn() {
         let mut em = StreamEmitter::default();
         em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "hi"}]}}]
+        }));
+        em.drain();
         em.process_chunk(&serde_json::json!({
             "candidates": [{"finishReason": "STOP"}]
         }));
@@ -1247,6 +1559,10 @@ mod tests {
     fn emitter_finish_reason_max_tokens() {
         let mut em = StreamEmitter::default();
         em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "hi"}]}}]
+        }));
+        em.drain();
         em.process_chunk(&serde_json::json!({
             "candidates": [{"finishReason": "MAX_TOKENS"}]
         }));
@@ -1359,9 +1675,6 @@ mod tests {
 
     #[test]
     fn builder_timeouts_applied_on_build() {
-        // Verify the build succeeds — reqwest validates the configuration
-        // internally. If timeout/connect_timeout were somehow invalid,
-        // .build() would return an error.
         let client = GeminiClient::builder()
             .api_key("test-key")
             .timeout(Duration::from_mins(3))
@@ -1400,8 +1713,6 @@ mod tests {
 
     #[tokio::test]
     async fn sse_reader_next_data_malformed_returns_none() {
-        // Malformed JSON data should be logged (H4) and the reader
-        // continues looking for the next valid data line.
         let chunk = "data: not valid json\n\ndata: {\"ok\":true}\n\n";
         let stream = futures::stream::iter(vec![Ok::<String, ApiError>(chunk.to_string())]);
         let mut reader = SseReader {
@@ -1460,9 +1771,16 @@ mod tests {
     fn request_body_response_format_absent_when_none() {
         let msgs = vec![Message::user("hi")];
         let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let gc = body
+            .get("generationConfig")
+            .expect("generationConfig must be present for thinkingConfig");
         assert!(
-            body.get("generationConfig").is_none(),
-            "generationConfig should be absent when no response_format"
+            gc.get("responseMimeType").is_none(),
+            "responseMimeType must be absent without response_format"
+        );
+        assert!(
+            gc.get("responseJsonSchema").is_none(),
+            "responseJsonSchema must be absent without response_format"
         );
     }
 
@@ -1592,8 +1910,6 @@ mod tests {
 
     #[test]
     fn gemini_strict_does_not_emit_tool_config() {
-        // Strict constrains shape, not selection — toolConfig must not
-        // appear under Strict.
         let msgs = vec![Message::user("hi")];
         let tools = vec![ToolSchema {
             tool: "echo".into(),
@@ -1640,8 +1956,6 @@ mod tests {
 
     #[test]
     fn request_body_system_role_merges_with_caller_system() {
-        // Both caller `system` and an inline Role::System message present →
-        // systemInstruction carries both (caller prompt first).
         let msgs = vec![Message::user("hi"), system_role_msg("reminder")];
         let body = build_request_body(&msgs, Some("be brief"), None, None, &ToolConstraint::None);
 
@@ -1664,7 +1978,6 @@ mod tests {
 
     #[test]
     fn request_body_system_role_preserves_message_order() {
-        // Folding must not reorder the remaining (non-system) messages.
         let msgs = vec![
             Message::user("first"),
             system_role_msg("mid reminder"),

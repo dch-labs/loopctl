@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Added
 
+- `DisplayHint` advisory rendering hint on `ToolOutput` (`with_hint()` builder),
+  threaded through `ToolDispatchResult` and `ToolPostContext` so presentation
+  layers (TUI, headless console) can render a tool result by the tool's own
+  declaration instead of inferring the strategy from the tool name. Six
+  variants: `Text`, `Diff`, `Json`, `Code { language }`, `Suppress`,
+  `Markdown`. Advisory only — compaction, loop-detection hashing, and loop
+  semantics are unaffected (the hint terminates at the observer context and
+  never enters the message model).
 - `ConstrainedProfile`, `FrontierProfile`, and `GoalReminder` (`presets`
   module): a named small-model-tuned runtime profile and its frontier opt-out
   counterpart. `ConstrainedProfile::apply(&mut loop_)` wires the small-model
@@ -127,6 +135,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Changed
 
+- **Breaking:** `ToolOutput`, `ToolDispatchResult`, and `ToolPostContext` are
+  now `#[non_exhaustive]`, matching `DisplayHint`. Downstream code that
+  constructs these via struct literal must switch to the named constructors
+  (`ToolOutput::text`/`success`/`error`/`error_text`, `ToolDispatchResult::ok`/
+  `err`/`from_tool_output`/`from_result`, or the `From<ToolOutput>` impl) or
+  add `..Default::default()` where a `Default` exists. Same-crate construction
+  is unaffected. Future fields on these types will now arrive non-breaking.
 - The engine now calls `ApiClient::stream_messages_with_options` instead of
   `stream_messages` on every turn (both the inline-streaming path in
   `engine::bare::stream` and the `StreamHandler` path), passing the loop's

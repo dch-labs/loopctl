@@ -143,6 +143,110 @@ pub struct ToolSchema {
 // ToolOutput
 // ===================================================
 
+/// Advisory rendering hint attached to a [`ToolOutput`].
+///
+/// Tells presentation layers (TUI, headless console, loggers) *how* the tool
+/// author intends the payload to be rendered. It is **purely advisory**: the
+/// agent loop, compaction, loop-detection hashing, and message serialization
+/// never read it. A consumer that does not understand a variant MUST fall back
+/// to plain-text rendering — `None` and [`DisplayHint::Text`] are equivalent.
+///
+/// `#[non_exhaustive]` so loopctl can add rendering strategies (e.g. `Table`,
+/// `Image`) in a later minor release without breaking downstream `match`es
+/// that carry a `_ =>` arm. Downstream code that matches on `DisplayHint`
+/// MUST include a wildcard arm.
+///
+/// # Serialization
+///
+/// Derives [`Serialize`] and [`Deserialize`] (using `#[serde(tag = "type")]`,
+/// matching the [`MessagePart`](crate::message::MessagePart) convention) so
+/// observer-event sinks and debug pretty-printers can carry the hint. The hint
+/// is still never part of the conversation message model — it terminates at
+/// [`ToolPostContext`](crate::observer::ToolPostContext) and is not added to
+/// [`MessagePart::ToolResult`](crate::message::MessagePart) — so this derive
+/// does not by itself leak the hint into API payloads or saved sessions.
+///
+/// # When to set
+///
+/// Set the hint via [`ToolOutput::with_hint`] when the tool knows its payload
+/// has a structure richer than plain text. Tools that emit ordinary prose
+/// leave the hint as `None` (the default). See each variant's doc for when it
+/// applies.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use loopctl::tool::{ToolOutput, DisplayHint};
+///
+/// // An Edit tool that produces a unified diff:
+/// let result = ToolOutput::text(diff_text).with_hint(DisplayHint::Diff);
+///
+/// // A JSON tool that wants pretty-printing:
+/// let result = ToolOutput::text(json_string).with_hint(DisplayHint::Json);
+///
+/// // A Read tool whose output is the file body — suppress the one-line preview:
+/// let result = ToolOutput::text(file_contents).with_hint(DisplayHint::Suppress);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DisplayHint {
+    /// Plain text — the default. `None` ≡ `Text`.
+    ///
+    /// Render the payload as-is. This is what every tool gets when it does not
+    /// call [`ToolOutput::with_hint`].
+    #[serde(rename = "text")]
+    Text,
+
+    /// A unified diff — render with `+`/`-` line coloring.
+    ///
+    /// Intended for Edit/MultiEdit/Patch tools whose payload is a
+    /// `diff`-formatted string. A consumer that supports diff rendering parses
+    /// the payload as a unified diff; one that does not falls back to `Text`.
+    #[serde(rename = "diff")]
+    Diff,
+
+    /// Structured JSON — pretty-print / syntax-highlight.
+    ///
+    /// The payload is a JSON-encoded string the consumer may parse and
+    /// re-format. If parsing fails the consumer falls back to `Text`.
+    #[serde(rename = "json")]
+    Json,
+
+    /// Syntax-highlighted source code in the given language.
+    ///
+    /// `language` is a free-form hint (e.g. `"rust"`, `"python"`, `"json"`),
+    /// matching the identifiers used by common highlighters. A consumer that
+    /// does not highlight renders the payload as plain `Text`.
+    #[serde(rename = "code")]
+    Code {
+        /// The source language identifier (lowercase convention, e.g. `"rust"`).
+        language: String,
+    },
+
+    /// Noise to humans — suppress surface-level previews.
+    ///
+    /// The payload is still sent to the model in full (loop semantics are
+    /// unaffected); only *presentation* layers should elide it (e.g. omit the
+    /// one-line output preview in Normal verbosity, or collapse the block).
+    /// Intended for tools whose output duplicates content the user already saw
+    /// (a Read echoing a large file) or is machine-only.
+    #[serde(rename = "suppress")]
+    Suppress,
+
+    /// Structured Markdown the tool authored as Markdown.
+    ///
+    /// Use when the payload is *intentionally* Markdown the tool constructed
+    /// (a formatted report, a rendered table-as-markdown, a summary with
+    /// emphasis), so the consumer can skip heuristic detection and render it
+    /// confidently. For plain prose, prefer [`Text`](Self::Text) (the default)
+    /// — any text *could* be rendered as Markdown, but `Markdown` signals the
+    /// tool's positive intent. A consumer that does not render Markdown falls
+    /// back to `Text`.
+    #[serde(rename = "markdown")]
+    Markdown,
+}
+
 /// Result from a tool invocation.
 ///
 /// Every [`Tool::call`] returns a `Result<ToolOutput, ToolError>`. On
@@ -193,6 +297,7 @@ pub struct ToolSchema {
 ///   → Err(ToolError)                                [hard failure]
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ToolOutput {
     /// The payload returned by the tool.
     ///
@@ -208,6 +313,15 @@ pub struct ToolOutput {
     /// went wrong. Defaults to `false` for results created via
     /// [`ToolOutput::success`] or [`ToolOutput::text`].
     pub is_error: bool,
+
+    /// Advisory rendering hint. `None` ≡ [`DisplayHint::Text`].
+    ///
+    /// **Never affects loop semantics** — not read by compaction, loop-detection
+    /// hashing, or message serialization. Forwarded to
+    /// [`ToolDispatchResult`] and onward to
+    /// [`ToolPostContext`](crate::observer::ToolPostContext) so presentation
+    /// layers can read it. Set via [`with_hint`](ToolOutput::with_hint).
+    pub display_hint: Option<DisplayHint>,
 }
 
 impl ToolOutput {
@@ -234,6 +348,7 @@ impl ToolOutput {
         Self {
             payload: payload.into(),
             is_error: false,
+            display_hint: None,
         }
     }
 
@@ -260,6 +375,7 @@ impl ToolOutput {
         Self {
             payload: payload.into(),
             is_error: true,
+            display_hint: None,
         }
     }
 
@@ -308,6 +424,27 @@ impl ToolOutput {
     /// ```
     pub fn error_text(text: impl Into<String>) -> Self {
         Self::error(text.into())
+    }
+
+    /// Attach an advisory [`DisplayHint`]. Fluent builder.
+    ///
+    /// Does not mutate [`payload`](ToolOutput::payload) or
+    /// [`is_error`](ToolOutput::is_error); the hint travels alongside the
+    /// content for presentation layers to read. Loop semantics are
+    /// unaffected.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::tool::{ToolOutput, DisplayHint};
+    ///
+    /// let out = ToolOutput::text(diff).with_hint(DisplayHint::Diff);
+    /// assert_eq!(out.display_hint, Some(DisplayHint::Diff));
+    /// ```
+    #[must_use]
+    pub fn with_hint(mut self, hint: DisplayHint) -> Self {
+        self.display_hint = Some(hint);
+        self
     }
 
     /// Extract all text content from the result, regardless of structure.
@@ -513,6 +650,7 @@ impl From<&str> for ToolOutput {
 /// assert_eq!(result.resolved_tool_name, "bash");
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ToolDispatchResult {
     /// The ID the model assigned to this tool call.
     ///
@@ -560,6 +698,13 @@ pub struct ToolDispatchResult {
     /// model requested) should read this field instead of the
     /// pre-dispatch `ToolDispatchContext::tool_name`.
     pub resolved_tool_name: String,
+
+    /// Advisory rendering hint forwarded from the originating [`ToolOutput`].
+    ///
+    /// `None` for error/panic/blocked paths that have no `ToolOutput` to read
+    /// from. Carried into [`ToolPostContext`](crate::observer::ToolPostContext)
+    /// for observers to read; never read by loop semantics.
+    pub display_hint: Option<DisplayHint>,
 }
 
 impl ToolDispatchResult {
@@ -575,6 +720,7 @@ impl ToolDispatchResult {
             is_error: false,
             duration,
             resolved_tool_name: tool_name.to_string(),
+            display_hint: None,
         }
     }
 
@@ -589,6 +735,7 @@ impl ToolDispatchResult {
             is_error: true,
             duration,
             resolved_tool_name: tool_name.to_string(),
+            display_hint: None,
         }
     }
 
@@ -645,6 +792,7 @@ impl ToolDispatchResult {
             is_error: true,
             duration,
             resolved_tool_name: tool_name.to_string(),
+            display_hint: None,
         }
     }
 
@@ -690,6 +838,7 @@ impl From<ToolOutput> for ToolDispatchResult {
             is_error: output.is_error,
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
+            display_hint: output.display_hint,
         }
     }
 }
@@ -1384,6 +1533,8 @@ pub trait Tool: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "testing")]
+    use crate::engine::loop_core::Loop;
     use serde_json::json;
 
     struct EchoTool;
@@ -1673,7 +1824,6 @@ mod tests {
 
     #[test]
     fn tool_output_structured_with_plain_serialize() {
-        // structured works with any Serialize type, not just StructuredOutput.
         #[derive(serde::Serialize)]
         struct Count {
             n: u32,
@@ -1728,5 +1878,295 @@ mod tests {
         let out = ToolOutput::text(r#"{"count": 5}"#);
         let result: Option<Target> = out.structured_as();
         assert!(result.is_none(), "mismatched shape should not deserialize");
+    }
+
+    #[test]
+    fn display_hint_with_hint_sets_field() {
+        let out = ToolOutput::text("x").with_hint(DisplayHint::Json);
+        assert_eq!(out.display_hint, Some(DisplayHint::Json));
+    }
+
+    #[test]
+    fn display_hint_default_is_none_for_all_constructors() {
+        assert_eq!(ToolOutput::text("x").display_hint, None);
+        assert_eq!(ToolOutput::error_text("x").display_hint, None);
+        assert_eq!(
+            ToolOutput::success(MessageToolContent::Text("x".to_string())).display_hint,
+            None
+        );
+        assert_eq!(
+            ToolOutput::error(MessageToolContent::Text("x".to_string())).display_hint,
+            None
+        );
+        let from_string: ToolOutput = String::from("x").into();
+        assert_eq!(from_string.display_hint, None);
+        let from_str: ToolOutput = "x".into();
+        assert_eq!(from_str.display_hint, None);
+    }
+
+    #[test]
+    fn display_hint_with_hint_does_not_mutate_payload_or_error_flag() {
+        let out = ToolOutput::error_text("boom").with_hint(DisplayHint::Suppress);
+        assert!(out.is_error, "is_error untouched");
+        assert_eq!(out.text_content(), "boom", "payload untouched");
+        assert_eq!(out.display_hint, Some(DisplayHint::Suppress));
+    }
+
+    #[test]
+    fn display_hint_code_carries_language() {
+        let out = ToolOutput::text("fn main() {}").with_hint(DisplayHint::Code {
+            language: "rust".into(),
+        });
+        match &out.display_hint {
+            Some(DisplayHint::Code { language }) => assert_eq!(language, "rust"),
+            other => panic!("expected Code{{language}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn display_hint_markdown_round_trips() {
+        let out = ToolOutput::text("# hi").with_hint(DisplayHint::Markdown);
+        assert_eq!(out.display_hint, Some(DisplayHint::Markdown));
+    }
+
+    #[test]
+    fn display_hint_is_clone_and_eq() {
+        let diff = DisplayHint::Diff;
+        assert_eq!(diff, DisplayHint::Diff);
+        let code = DisplayHint::Code {
+            language: "py".into(),
+        };
+        assert_eq!(
+            code,
+            DisplayHint::Code {
+                language: "py".into()
+            }
+        );
+        assert_ne!(DisplayHint::Text, DisplayHint::Diff);
+    }
+
+    #[test]
+    fn display_hint_serde_round_trip_tagged() {
+        let json = serde_json::to_string(&DisplayHint::Diff).expect("Diff serializes");
+        assert_eq!(json, "{\"type\":\"diff\"}");
+        let parsed: DisplayHint = serde_json::from_str(&json).expect("Diff deserializes");
+        assert_eq!(parsed, DisplayHint::Diff);
+
+        let code_json = serde_json::to_string(&DisplayHint::Code {
+            language: "rust".into(),
+        })
+        .expect("");
+        assert_eq!(code_json, "{\"type\":\"code\",\"language\":\"rust\"}");
+        let code_parsed: DisplayHint = serde_json::from_str(&code_json).expect("");
+        assert_eq!(
+            code_parsed,
+            DisplayHint::Code {
+                language: "rust".into()
+            }
+        );
+    }
+
+    #[test]
+    fn from_tool_output_forwards_display_hint() {
+        let out = ToolOutput::text("diff body").with_hint(DisplayHint::Diff);
+        let result: ToolDispatchResult = out.into();
+        assert_eq!(result.display_hint, Some(DisplayHint::Diff));
+    }
+
+    #[test]
+    fn tool_dispatch_result_ok_err_from_tool_error_carry_none() {
+        use std::time::Duration;
+        assert_eq!(
+            ToolDispatchResult::ok("t", "x".into(), Duration::ZERO).display_hint,
+            None
+        );
+        assert_eq!(
+            ToolDispatchResult::err("t", "x".into(), Duration::ZERO).display_hint,
+            None
+        );
+    }
+
+    #[test]
+    fn from_tool_output_constructor_forwards_hint() {
+        use std::time::Duration;
+        let out = ToolOutput::text("json body").with_hint(DisplayHint::Json);
+        let result = ToolDispatchResult::from_tool_output("t", out, Duration::ZERO);
+        assert_eq!(result.display_hint, Some(DisplayHint::Json));
+    }
+
+    #[test]
+    fn from_result_forwards_hint_on_ok_and_none_on_err() {
+        use std::time::Duration;
+        let ok: Result<ToolOutput, ToolError> =
+            Ok(ToolOutput::text("x").with_hint(DisplayHint::Markdown));
+        assert_eq!(
+            ToolDispatchResult::from_result("t", ok, Duration::ZERO).display_hint,
+            Some(DisplayHint::Markdown)
+        );
+
+        let err: Result<ToolOutput, ToolError> = Err(ToolError::not_found("t", &[]));
+        assert_eq!(
+            ToolDispatchResult::from_result("t", err, Duration::ZERO).display_hint,
+            None
+        );
+    }
+
+    /// A stub tool that returns a fixed hinted `ToolOutput`.
+    struct HintedTool {
+        name: &'static str,
+        output_text: &'static str,
+        hint: Option<DisplayHint>,
+    }
+
+    impl Tool for HintedTool {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn description(&self) -> &'static str {
+            "stub for display-hint threading tests"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: self.name.into(),
+                description: "stub for display-hint threading tests".into(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolOutput, ToolError>> + Send + '_>>
+        {
+            let out = match self.hint.clone() {
+                Some(h) => ToolOutput::text(self.output_text).with_hint(h),
+                None => ToolOutput::text(self.output_text),
+            };
+            Box::pin(async move { Ok(out) })
+        }
+    }
+
+    /// Captures every `on_tool_post` snapshot for later assertion.
+    #[derive(Default)]
+    struct PostCapture {
+        posts: std::sync::Mutex<Vec<crate::observer::ToolPostContext>>,
+    }
+
+    impl crate::observer::LoopObserver for PostCapture {
+        fn name(&self) -> &'static str {
+            "post-capture"
+        }
+        fn on_tool_post(&self, ctx: &crate::observer::ToolPostContext) {
+            crate::error::recover_guard(self.posts.lock()).push(ctx.clone());
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    #[cfg(feature = "testing")]
+    fn hinted_dispatch_setup(
+        tool_name: &'static str,
+        output_text: &'static str,
+        hint: Option<DisplayHint>,
+    ) -> (
+        crate::engine::BareLoop<crate::testing::MockApiClient>,
+        std::sync::Arc<PostCapture>,
+    ) {
+        use crate::testing::{MockApiClient, MockResponse, MockToolCall};
+
+        let client = MockApiClient::new("test-model").with_responses(vec![
+            MockResponse {
+                text: String::new(),
+                tool_call: Some(MockToolCall {
+                    id: "call_1".into(),
+                    name: tool_name.into(),
+                    input: json!({}),
+                }),
+                stop_reason: "tool_use".into(),
+            },
+            MockResponse {
+                text: "done".into(),
+                tool_call: None,
+                stop_reason: "end_turn".into(),
+            },
+        ]);
+
+        let mut registry = crate::tool::ToolRegistry::new();
+        registry.register(HintedTool {
+            name: tool_name,
+            output_text,
+            hint,
+        });
+
+        let mut agent = crate::engine::BareLoop::new(
+            std::sync::Arc::new(client),
+            registry,
+            crate::config::LoopConfig::default(),
+        );
+        let capture = std::sync::Arc::new(PostCapture::default());
+        agent.register_observer(capture.clone());
+        (agent, capture)
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn hint_reaches_observer_on_normal_path() {
+        let (mut agent, capture) = hinted_dispatch_setup(
+            "diff_tool",
+            "@@ -1 +1 @@\n-old\n+new",
+            Some(DisplayHint::Diff),
+        );
+        agent.run("edit the file").await.unwrap();
+
+        let posts = crate::error::recover_guard(capture.posts.lock()).clone();
+        assert_eq!(posts.len(), 1, "exactly one tool call this turn");
+        assert_eq!(
+            posts[0].display_hint,
+            Some(DisplayHint::Diff),
+            "the hint set by the tool must reach the observer"
+        );
+        assert_eq!(posts[0].tool, "diff_tool");
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn no_hint_tool_yields_none_at_observer() {
+        let (mut agent, capture) = hinted_dispatch_setup("plain", "just text", None);
+        agent.run("go").await.unwrap();
+
+        let posts = crate::error::recover_guard(capture.posts.lock()).clone();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(
+            posts[0].display_hint, None,
+            "no hint set → None at observer"
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn suppress_hint_keeps_full_payload_into_conversation() {
+        let (mut agent, capture) =
+            hinted_dispatch_setup("reader", "the quick brown fox", Some(DisplayHint::Suppress));
+        agent.run("read it").await.unwrap();
+
+        let posts = crate::error::recover_guard(capture.posts.lock()).clone();
+        assert_eq!(posts[0].display_hint, Some(DisplayHint::Suppress));
+
+        // The full payload reached the conversation (loop semantics unaffected).
+        let conv = agent.conversation();
+        let tool_result_text: String = conv
+            .iter()
+            .flat_map(|m| {
+                m.parts.iter().filter_map(|p| match p {
+                    crate::message::MessagePart::ToolResult { output, .. } => {
+                        Some(output.to_string())
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        assert!(
+            tool_result_text.contains("the quick brown fox"),
+            "Suppress hint must not strip the payload from the conversation: {tool_result_text}"
+        );
     }
 }

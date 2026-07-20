@@ -303,6 +303,7 @@ pub struct ToolPreContext {
 /// Sent after a tool completes, providing the tool name, a hash
 /// of the output, whether an error occurred, and the execution duration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ToolPostContext {
     /// Turn number.
     ///
@@ -331,6 +332,15 @@ pub struct ToolPostContext {
     /// Measured from tool dispatch to completion, including any
     /// permission prompts.
     pub duration: std::time::Duration,
+
+    /// Advisory rendering hint forwarded from the tool's
+    /// [`ToolOutput`](crate::tool::ToolOutput).
+    ///
+    /// `None` when the call was blocked before execution (no `ToolOutput`
+    /// exists), when the tool set no hint, or on error/panic paths.
+    /// Presentation layers read this to pick a render strategy; loop code
+    /// never reads it.
+    pub display_hint: Option<crate::tool::DisplayHint>,
 }
 
 /// Context for [`LoopObserver::on_compaction`](crate::observer::LoopObserver::on_compaction).

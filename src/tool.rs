@@ -195,7 +195,6 @@ pub enum DisplayHint {
     ///
     /// Render the payload as-is. This is what every tool gets when it does not
     /// call [`ToolOutput::with_hint`].
-    #[serde(rename = "text")]
     Text,
 
     /// A unified diff — render with `+`/`-` line coloring.
@@ -203,14 +202,12 @@ pub enum DisplayHint {
     /// Intended for Edit/MultiEdit/Patch tools whose payload is a
     /// `diff`-formatted string. A consumer that supports diff rendering parses
     /// the payload as a unified diff; one that does not falls back to `Text`.
-    #[serde(rename = "diff")]
     Diff,
 
     /// Structured JSON — pretty-print / syntax-highlight.
     ///
     /// The payload is a JSON-encoded string the consumer may parse and
     /// re-format. If parsing fails the consumer falls back to `Text`.
-    #[serde(rename = "json")]
     Json,
 
     /// Syntax-highlighted source code in the given language.
@@ -218,7 +215,6 @@ pub enum DisplayHint {
     /// `language` is a free-form hint (e.g. `"rust"`, `"python"`, `"json"`),
     /// matching the identifiers used by common highlighters. A consumer that
     /// does not highlight renders the payload as plain `Text`.
-    #[serde(rename = "code")]
     Code {
         /// The source language identifier (lowercase convention, e.g. `"rust"`).
         language: String,
@@ -231,7 +227,6 @@ pub enum DisplayHint {
     /// one-line output preview in Normal verbosity, or collapse the block).
     /// Intended for tools whose output duplicates content the user already saw
     /// (a Read echoing a large file) or is machine-only.
-    #[serde(rename = "suppress")]
     Suppress,
 
     /// Structured Markdown the tool authored as Markdown.
@@ -243,7 +238,6 @@ pub enum DisplayHint {
     /// — any text *could* be rendered as Markdown, but `Markdown` signals the
     /// tool's positive intent. A consumer that does not render Markdown falls
     /// back to `Text`.
-    #[serde(rename = "markdown")]
     Markdown,
 }
 
@@ -2011,6 +2005,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn soft_error_preserves_display_hint() {
+        let soft_err = ToolOutput::error_text("conflict in foo.rs").with_hint(DisplayHint::Diff);
+        assert!(soft_err.is_error, "fixture is a soft error");
+        let result: ToolDispatchResult = soft_err.into();
+        assert_eq!(
+            result.display_hint,
+            Some(DisplayHint::Diff),
+            "soft-error outputs preserve their hint (only hard errors / panics drop it)"
+        );
+    }
+
     /// A stub tool that returns a fixed hinted `ToolOutput`.
     struct HintedTool {
         name: &'static str,
@@ -2061,7 +2067,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "testing")]
     #[cfg(feature = "testing")]
     fn hinted_dispatch_setup(
         tool_name: &'static str,

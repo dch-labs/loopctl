@@ -476,6 +476,7 @@ mod tests {
                     resolved_tool_name: String::new(),
                     tool_call_id: String::new(),
                     duration: Duration::ZERO,
+                    display_hint: None,
                 }
             })
         }
@@ -515,6 +516,7 @@ mod tests {
                     resolved_tool_name: String::new(),
                     tool_call_id: String::new(),
                     duration: Duration::ZERO,
+                    display_hint: None,
                 }
             })
         }
@@ -852,6 +854,7 @@ mod tests {
                 is_error: false,
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
+                display_hint: None,
             },
             0,
             vec![],
@@ -873,6 +876,7 @@ mod tests {
                 is_error: false,
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
+                display_hint: None,
             },
             0,
             vec![],
@@ -908,6 +912,7 @@ mod tests {
                 is_error: false,
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
+                display_hint: None,
             },
             0,
             vec![],
@@ -921,6 +926,7 @@ mod tests {
                 is_error: false,
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
+                display_hint: None,
             },
             1,
             vec![],
@@ -945,6 +951,7 @@ mod tests {
             is_error: false,
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
+            display_hint: None,
         };
         insert(
             &cache,
@@ -982,6 +989,7 @@ mod tests {
                 is_error: false,
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
+                display_hint: None,
             },
             0,
             vec!["x".to_string()],
@@ -1000,6 +1008,7 @@ mod tests {
             is_error: false,
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
+            display_hint: None,
         };
         // Two entries both touching "shared.rs".
         let k1 = make_key(

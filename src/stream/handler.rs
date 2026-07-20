@@ -359,8 +359,12 @@ pub struct RateLimitConfig {
     /// [`default_delay`](Self::default_delay) is always used.
     pub respect_retry_after: bool,
 
-    /// Backoff used when the server gives no `Retry-After`, or when
-    /// [`respect_retry_after`](Self::respect_retry_after) is `false`.
+    /// Backoff used when the server gives no `Retry-After`.
+    ///
+    /// Also used unconditionally when
+    /// [`respect_retry_after`](Self::respect_retry_after) is `false`. Defaults
+    /// to 5s — long enough to let a transient burst clear, short enough that a
+    /// missing header doesn't stall the agent.
     pub default_delay: Duration,
 
     /// Upper bound on any single rate-limit backoff.
@@ -390,9 +394,10 @@ pub struct RateLimitConfig {
 
     /// Hard cap on rate-limit retries for a single turn.
     ///
-    /// Once this many retries have been exhausted, the turn fails. Distinct
-    /// from [`fallback_after_retries`](Self::fallback_after_retries), which
-    /// controls the *escalation* threshold, not the hard stop.
+    /// Once this many retries have been exhausted, the turn fails outright.
+    /// Distinct from [`fallback_after_retries`](Self::fallback_after_retries),
+    /// which controls the *escalation* threshold to a fallback model, not the
+    /// hard stop after which the turn gives up entirely.
     pub max_retries: u32,
 }
 
@@ -464,12 +469,27 @@ impl RateLimitConfig {
 }
 
 /// Which kind of rate-limit / overload response was detected.
+///
+/// Set by [`DetectedRateLimit::detect`] when classifying an [`ApiError`]; the
+/// distinction matters because the two responses come from different failure
+/// modes (a hard per-account quota vs. a transient capacity signal) even
+/// though both honour `Retry-After`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateLimitKind {
     /// HTTP 429 Too Many Requests.
+    ///
+    /// The canonical rate-limit signal: the caller has exceeded a per-account
+    /// or per-key quota. The server typically sends a `Retry-After` hint;
+    /// [`backoff`](RateLimitConfig::backoff) honours it when
+    /// [`respect_retry_after`](RateLimitConfig::respect_retry_after) is set.
     RateLimited,
-    /// HTTP 503 Service Unavailable / 529 Overloaded — a rate-limit-adjacent
-    /// transient that honours `Retry-After`.
+
+    /// HTTP 503 Service Unavailable / 529 Overloaded.
+    ///
+    /// A rate-limit-adjacent transient: the provider is overloaded rather than
+    /// enforcing a quota. Treated the same as [`RateLimited`](Self::RateLimited)
+    /// for backoff purposes (it honours `Retry-After`), but surfaced as a
+    /// distinct kind so callers can log or route it differently.
     Overloaded,
 }
 
@@ -481,10 +501,26 @@ pub enum RateLimitKind {
 #[derive(Debug, Clone)]
 pub struct DetectedRateLimit {
     /// The detected rate-limit class.
+    ///
+    /// Either [`RateLimitKind::RateLimited`] (HTTP 429) or
+    /// [`RateLimitKind::Overloaded`] (HTTP 503/529). Determines nothing on its
+    /// own — both kinds honour `Retry-After` — but lets the caller distinguish
+    /// a quota hit from a transient capacity signal.
     pub kind: RateLimitKind,
-    /// The server-advised delay, `None` if absent or malformed.
+
+    /// The server-advised delay, parsed from the `Retry-After` header.
+    ///
+    /// `None` when the header was absent or could not be parsed as a number of
+    /// seconds or an HTTP-date. When `None`, the caller falls back to
+    /// [`RateLimitConfig::default_delay`].
     pub retry_after: Option<Duration>,
-    /// The original error message, preserved for logging / fallback context.
+
+    /// The original error message, preserved verbatim.
+    ///
+    /// Kept so the caller can log the provider's wording, include it in a
+    /// fallback-model prompt, or surface it to the user without losing the
+    /// diagnostic detail that [`detect`](Self::detect) collapsed into
+    /// [`kind`](Self::kind).
     pub message: String,
 }
 
@@ -580,23 +616,77 @@ fn clamp_delay_to_deadline(delay: Duration, deadline: Option<Instant>) -> Durati
     delay.min(remaining)
 }
 
-/// Outcome of a rate-limit retry decision (see [`StreamHandler::rate_limit_retry`]).
+/// Outcome of a rate-limit retry decision.
+///
+/// Returned by [`StreamHandler::rate_limit_retry`] for each detected rate
+/// limit on the current model. The variants form a three-step escalation
+/// ladder: retry in place while the count is low, escalate to the model
+/// circuit breaker once it crosses
+/// [`fallback_after_retries`](RateLimitConfig::fallback_after_retries), and
+/// give up entirely once it crosses
+/// [`max_retries`](RateLimitConfig::max_retries).
 #[derive(Debug)]
 enum RateLimitRetry {
     /// Escalate to the model circuit breaker.
+    ///
+    /// Returned once the per-model retry count exceeds
+    /// [`fallback_after_retries`](RateLimitConfig::fallback_after_retries).
+    /// The caller trips the breaker, which routes subsequent turns to a
+    /// fallback model if one is configured; if not, the escalation has nowhere
+    /// to go and the turn fails.
     Escalate {
-        /// Number of rate-limit retries honored before escalating.
+        /// Number of rate-limit retries honored before this escalation.
+        ///
+        /// Always strictly greater than
+        /// [`fallback_after_retries`](RateLimitConfig::fallback_after_retries)
+        /// — the count that triggered the escalation, incremented before the
+        /// decision is made. Surfaced for logging and for the
+        /// [`RateLimitEscalation`](crate::error::LoopError::RateLimitEscalation)
+        /// error payload.
         attempts: u32,
-        /// Last server-advised hint, after clamping.
+
+        /// The server-advised delay from the triggering response.
+        ///
+        /// The raw `Retry-After` from [`DetectedRateLimit`] (`None` if the
+        /// header was absent). Carried unmodified — clamping to
+        /// [`max_delay`](RateLimitConfig::max_delay) happens in
+        /// [`backoff`](RateLimitConfig::backoff) on the retry path, not here.
+        /// Preserved so the escalation consumer can log or forward the
+        /// provider's hint.
         retry_after: Option<Duration>,
     },
+
     /// Give up on the current model without escalating.
+    ///
+    /// Returned once the per-model retry count exceeds
+    /// [`max_retries`](RateLimitConfig::max_retries) — the hard stop after
+    /// which retrying the same model is pointless. Distinct from
+    /// [`Escalate`](Self::Escalate): escalation hands off to the circuit
+    /// breaker (and a fallback model), `HardStop` fails the turn outright.
     HardStop,
-    /// Sleep `delay` then retry the current model.
+
+    /// Sleep for `delay`, then retry the current model.
+    ///
+    /// Returned while the retry count is below both
+    /// [`fallback_after_retries`](RateLimitConfig::fallback_after_retries) and
+    /// [`max_retries`](RateLimitConfig::max_retries). The delay is the
+    /// [`backoff`](RateLimitConfig::backoff) for the detected response,
+    /// further clamped to the remaining time before the turn's
+    /// `total_stream_timeout` deadline so a large `Retry-After` cannot overrun
+    /// the turn budget.
     Retry(Duration),
 }
 
 /// Pull the carried [`StreamOutcome`] out of a [`StreamHandlerError`], if any.
+///
+/// Only [`InitFailed`](StreamHandlerError::InitFailed) and
+/// [`StreamFailed`](StreamHandlerError::StreamFailed) carry one (the outcome
+/// that was in progress when the error was raised); every other variant maps
+/// to `None`. The caller uses the recovered outcome to route the failure into
+/// the correct retry budget — a [`RateLimited`](StreamOutcome::RateLimited)
+/// outcome draws on [`RateLimitConfig`], distinct from the transport-retry
+/// budget, so a rate-limit storm cannot exhaust transport retries (nor vice
+/// versa).
 fn carried_outcome(error: &StreamHandlerError) -> Option<StreamOutcome> {
     match error {
         StreamHandlerError::InitFailed(o) | StreamHandlerError::StreamFailed(o) => {
@@ -624,10 +714,29 @@ async fn sleep_cancellable(
 }
 
 /// Result of polling the stream once inside [`StreamHandler::next_event`].
+///
+/// Produced by the `tokio::select!` that races the stream against the
+/// per-event timeout. Only two outcomes materialize here: the stream produced
+/// an item ([`Next`](Self::Next)), or the per-event timeout fired first
+/// ([`TimedOut`](Self::TimedOut)). Cancellation and the total-stream deadline
+/// are also raced in the same `select!`, but they return directly as
+/// [`StreamHandlerError::Cancelled`] / `StreamFailed` and so do not need a
+/// variant here.
 enum EventPoll {
-    /// The stream produced an item (`None` means the stream ended).
+    /// The stream produced an item before the per-event timeout.
+    ///
+    /// Delegates the three sub-cases to the caller: `Some(Ok(event))` is
+    /// yielded to the accumulator, `Some(Err(api_error))` becomes an API-error
+    /// outcome, and `None` means the stream ended cleanly (turn completes).
     Next(Option<Result<crate::stream::StreamEvent, crate::api::error::ApiError>>),
+
     /// The per-event timeout fired before any item arrived.
+    ///
+    /// Increments the consecutive-timeout counter; once it reaches
+    /// [`max_consecutive_timeouts`](StreamTimeoutConfig::max_consecutive_timeouts),
+    /// the caller escalates to a [`StreamFailed`](StreamHandlerError::StreamFailed)
+    /// event-timeout outcome. A lower threshold (`min(2, max_consecutive_timeouts)`)
+    /// applies when no events have been received yet (empty-stream fast-fail).
     TimedOut,
 }
 
@@ -638,15 +747,43 @@ enum EventPoll {
 /// populate [`StreamOutcome`] fields when it short-circuits.
 struct EventDiagnostics {
     /// Events processed so far this turn.
+    ///
+    /// Surfaced on the [`StreamOutcome::TotalTimeout`] and
+    /// [`StreamOutcome::RateLimited`] outcomes so the caller can tell a
+    /// mid-stream failure (some events got through) from an immediate one
+    /// (nothing arrived). Not used by [`event_timeout`](Self::event_timeout),
+    /// which reports consecutive-timeout count instead.
     events_processed: u64,
+
     /// When the stream started, for elapsed-duration outcomes.
+    ///
+    /// Read via [`Instant::elapsed`] when building
+    /// [`StreamOutcome::TotalTimeout`]'s `duration` field. Captured once at
+    /// the top of [`process_events`](StreamHandler::process_events) rather
+    /// than per event so the reported duration is the full stream lifetime,
+    /// not the time since the most recent event.
     stream_start: Instant,
+
     /// Whether partial content has been accumulated.
+    ///
+    /// Recomputed each loop iteration (the whole [`EventDiagnostics`] is
+    /// rebuilt per iteration in [`process_events`](StreamHandler::process_events))
+    /// from the accumulator's current part count: `true` once at least one
+    /// usable event has been received. Flows into the `has_partial_data` flag
+    /// on [`StreamOutcome::TotalTimeout`], [`StreamOutcome::EventTimeout`],
+    /// and [`StreamOutcome::RateLimited`], letting a downstream consumer
+    /// decide whether to salvage the partial output or discard it.
     has_partial_data: bool,
 }
 
 impl EventDiagnostics {
     /// Build the [`StreamOutcome::TotalTimeout`] for this point in the stream.
+    ///
+    /// Snapshots the current diagnostic state — partial-data flag, events
+    /// processed so far, and elapsed time since [`stream_start`](Self::stream_start)
+    /// — into a `TotalTimeout` outcome. Used by [`process_events`](StreamHandler::process_events)
+    /// when the turn's `total_stream_timeout` deadline fires (both at the
+    /// top-of-loop check and inside the per-event `select!`).
     fn total_timeout(&self) -> StreamOutcome {
         StreamOutcome::TotalTimeout {
             has_partial_data: self.has_partial_data,
@@ -656,6 +793,12 @@ impl EventDiagnostics {
     }
 
     /// Build the [`StreamOutcome::EventTimeout`] for this point in the stream.
+    ///
+    /// Carries the partial-data flag plus the caller-supplied
+    /// `consecutive_timeouts` count (this method does not track the counter
+    /// itself — `process_events` owns it and passes the current value in).
+    /// Used once the per-event timeout crosses
+    /// [`max_consecutive_timeouts`](StreamTimeoutConfig::max_consecutive_timeouts).
     fn event_timeout(&self, consecutive_timeouts: u32) -> StreamOutcome {
         StreamOutcome::EventTimeout {
             has_partial_data: self.has_partial_data,
@@ -663,8 +806,15 @@ impl EventDiagnostics {
         }
     }
 
-    /// Map a stream API error to the matching outcome: rate-limit when detected,
-    /// otherwise a generic init failure.
+    /// Map a stream API error to the matching [`StreamHandlerError`].
+    ///
+    /// Two branches: if [`DetectedRateLimit::detect`] classifies the error as
+    /// a 429/503/529, builds a [`StreamOutcome::RateLimited`] carrying the
+    /// parsed `Retry-After` and current progress; otherwise wraps it as a
+    /// generic [`StreamOutcome::InitFailed`] with `attempts: 1` (this is the
+    /// per-event error path, not the init-retry path, so the attempt counter
+    /// isn't meaningful here). Used by `process_events` when the stream yields
+    /// an `Err` event.
     fn api_error_outcome(&self, error: &crate::api::error::ApiError) -> StreamHandlerError {
         if let Some(detail) = DetectedRateLimit::detect(error) {
             return StreamHandlerError::StreamFailed(StreamOutcome::RateLimited {
@@ -947,11 +1097,14 @@ impl std::error::Error for StreamHandlerError {}
 // StreamProgress
 // ===================================================
 
-/// Progress data emitted during long-running streams.
+/// A snapshot of stream progress for external reporting.
 ///
-/// Passed to the progress callback at regular intervals
-/// ([`progress_interval`](StreamTimeoutConfig::progress_interval))
-/// to report stream health.
+/// Plain data struct carrying the two progress signals a consumer is likely
+/// to want (elapsed time and events processed). `StreamHandler` does not
+/// itself emit `StreamProgress` — it has no built-in progress callback. The
+/// struct is shipped so a downstream consumer that drives its own progress
+/// reporting (metrics observer, TUI heartbeat, deadline watcher) has a
+/// shared shape to read or fill.
 ///
 /// # Example
 ///
@@ -968,8 +1121,17 @@ impl std::error::Error for StreamHandlerError {}
 #[derive(Debug, Clone)]
 pub struct StreamProgress {
     /// Time elapsed since the stream started.
+    ///
+    /// Wall-clock duration from stream open to the snapshot point. Useful for
+    /// heartbeat-style reporting (“still streaming after Ns”) and for
+    /// deadline-aware consumers that compare it against their own budget.
     pub elapsed: Duration,
+
     /// Number of SSE events processed so far.
+    ///
+    /// Count of stream events successfully accumulated up to the snapshot
+    /// point. A flat or slow-growing count is the early signal of a stalled
+    /// stream before a timeout fires.
     pub events_processed: u64,
 }
 
@@ -979,17 +1141,35 @@ pub struct StreamProgress {
 
 /// Holds configuration for the streaming resilience layer.
 ///
-/// `StreamHandler` stores [`StreamTimeoutConfig`] and [`StreamRetryConfig`]
-/// for the three-phase streaming lifecycle:
+/// `StreamHandler` wraps an [`ApiClient`]'s streaming path with timeout,
+/// retry, and rate-limit handling. It owns four independent budgets that
+/// together make a stream turn robust:
 ///
-/// 1. **Initialize** — Opens a stream, waits for the first event with a
-///    timeout, retries with exponential backoff on failure.
+/// 1. **Timeouts** ([`StreamTimeoutConfig`]) — initial-event, per-event, and
+///    total-stream deadlines, plus the consecutive-timeout escalation
+///    threshold and the optional non-streaming fallback.
 ///
-/// 2. **Process** — Consumes events with per-event and total timeouts.
-///    Emits progress callbacks at regular intervals.
+/// 2. **Transport retries** ([`StreamRetryConfig`]) — exponential backoff for
+///    stream-initialization failures (connection drops, transport errors),
+///    distinct from rate-limit retries.
 ///
-/// 3. **Recover** — If streaming fails, falls back to
-///    [`ApiClient::create_message`] for a non-streaming response.
+/// 3. **Rate-limit handling** ([`RateLimitConfig`]) — `Retry-After`-aware
+///    backoff for 429/503/529 responses, with its own retry budget, an
+///    escalation threshold to the model circuit breaker, and a hard stop.
+///    Kept independent from transport retries so a rate-limit storm cannot
+///    exhaust the transport budget (nor vice versa).
+///
+/// 4. **Proactive throttling** (optional
+///    [`RateLimiter`](crate::stream::rate_limit::RateLimiter)) — a per-provider
+///    token bucket that gates each stream attempt *before* it fires, sleeping
+///    up to `max_wait` rather than risking a 429.
+///
+/// On exhaustion, the handler escalates: rate-limit retries trip the model
+/// circuit breaker (route to a fallback model), transport retries fall back
+/// to [`ApiClient::create_message`] when
+/// [`fallback_to_non_streaming`](StreamTimeoutConfig::fallback_to_non_streaming)
+/// is set, and a turn that can't recover fails with a typed
+/// [`StreamHandlerError`].
 ///
 /// # Example
 ///
@@ -1010,13 +1190,46 @@ pub struct StreamProgress {
 /// ```
 pub struct StreamHandler {
     /// Timeout configuration for all phases.
+    ///
+    /// Drives the initial-event / per-event / total-stream deadlines, the
+    /// consecutive-timeout escalation threshold, and the
+    /// non-streaming-fallback toggle. Read on every turn in `stream_turn` and
+    /// on each event poll.
     timeout_config: StreamTimeoutConfig,
-    /// Retry configuration for stream initialization.
+
+    /// Retry configuration for stream-initialization failures.
+    ///
+    /// Exponential backoff applied to transport-level failures (connection
+    /// drops, TLS errors, etc.) before any event arrives. Read in the
+    /// init-retry loop; distinct from `rate_limit_config`, which has its own
+    /// budget.
     retry_config: StreamRetryConfig,
+
     /// Rate-limit detection + backoff policy.
+    ///
+    /// Governs reactive handling of server-returned 429/503/529 responses
+    /// (honoured `Retry-After`, default delay, cap, escalation threshold to
+    /// the model circuit breaker, hard-stop ceiling). Read by the
+    /// `rate_limit_retry` decision on each detected rate limit.
     rate_limit_config: RateLimitConfig,
+
     /// Optional proactive per-provider rate limiter (token bucket).
+    ///
+    /// When set, each stream attempt is gated by `gate_on_rate_limit` *before*
+    /// firing — sleeping up to the limiter's `max_wait` for a token rather
+    /// than risking a 429. `None` (the default) means reactive-only handling:
+    /// no pre-throttling, server 429s still handled via `rate_limit_config`.
     rate_limiter: Option<Arc<crate::stream::rate_limit::RateLimiter>>,
+
+    /// Per-turn request options applied to every stream-open call.
+    ///
+    /// Carries [`tool_constraint`](crate::structured::ToolConstraint) for
+    /// constrained tool-call decoding. Default is
+    /// [`RequestOptions::default`](crate::structured::RequestOptions::default)
+    /// (no constraint), reproducing the prior unconstrained behavior.
+    /// Passed to [`ApiClient::stream_messages_with_options`] at the stream-open
+    /// call site. Set via [`with_request_options`](StreamHandler::with_request_options).
+    request_options: crate::structured::RequestOptions,
 }
 
 impl fmt::Debug for StreamHandler {
@@ -1026,6 +1239,7 @@ impl fmt::Debug for StreamHandler {
             .field("retry_config", &self.retry_config)
             .field("rate_limit_config", &self.rate_limit_config)
             .field("rate_limiter", &self.rate_limiter)
+            .field("request_options", &self.request_options)
             .finish()
     }
 }
@@ -1059,6 +1273,7 @@ impl StreamHandler {
             retry_config: StreamRetryConfig::default(),
             rate_limit_config: RateLimitConfig::default(),
             rate_limiter: None,
+            request_options: crate::structured::RequestOptions::default(),
         }
     }
 
@@ -1088,13 +1303,35 @@ impl StreamHandler {
         self
     }
 
+    /// Set the per-turn [`RequestOptions`](crate::structured::RequestOptions)
+    /// applied to every stream-open call. Consuming builder.
+    ///
+    /// Default is [`RequestOptions::default`](crate::structured::RequestOptions::default)
+    /// (no constraint), which reproduces prior behavior. Set
+    /// [`tool_constraint`](crate::structured::ToolConstraint) to
+    /// [`Strict`](crate::structured::ToolConstraint::Strict) for constrained
+    /// tool-call decoding.
+    #[must_use]
+    pub fn with_request_options(mut self, options: crate::structured::RequestOptions) -> Self {
+        self.request_options = options;
+        self
+    }
+
     /// Returns a reference to the timeout configuration.
+    ///
+    /// Read-only access to the [`StreamTimeoutConfig`] stored on the handler.
+    /// Mutate via [`with_config`](StreamHandler::with_config) (which replaces
+    /// both timeout and retry together); there is no per-field setter.
     #[must_use]
     pub fn timeout_config(&self) -> &StreamTimeoutConfig {
         &self.timeout_config
     }
 
     /// Returns a reference to the retry configuration.
+    ///
+    /// Read-only access to the [`StreamRetryConfig`] stored on the handler.
+    /// Mutate via [`with_config`](StreamHandler::with_config) (which replaces
+    /// both retry and timeout together); there is no per-field setter.
     #[must_use]
     pub fn retry_config(&self) -> &StreamRetryConfig {
         &self.retry_config
@@ -1120,6 +1357,10 @@ impl StreamHandler {
     }
 
     /// Returns a reference to the rate-limit configuration.
+    ///
+    /// Read-only access to the [`RateLimitConfig`] stored on the handler.
+    /// Mutate via
+    /// [`with_rate_limit_config`](StreamHandler::with_rate_limit_config).
     #[must_use]
     pub fn rate_limit_config(&self) -> &RateLimitConfig {
         &self.rate_limit_config
@@ -1160,11 +1401,17 @@ impl StreamHandler {
     /// Primary entry point for resilient streaming. It
     /// orchestrates the full lifecycle:
     ///
-    /// 1. Opens a stream via [`ApiClient::stream_messages`].
+    /// 1. Opens a stream via [`ApiClient::stream_messages_with_options`]
+    ///    (gated by the proactive [`RateLimiter`](crate::stream::rate_limit::RateLimiter),
+    ///    if attached).
     /// 2. Processes events with per-event and total timeouts.
-    /// 3. On transient errors, retries with exponential backoff.
-    /// 4. If all retries fail and `fallback_to_non_streaming` is enabled,
-    ///    falls back to [`ApiClient::create_message`].
+    /// 3. On transient transport errors, retries with exponential backoff;
+    ///    on 429/503/529 responses, backs off under the rate-limit budget
+    ///    and escalates to the model circuit breaker once that budget is
+    ///    exhausted.
+    /// 4. If all retries fail and
+    ///    [`fallback_to_non_streaming`](StreamTimeoutConfig::fallback_to_non_streaming)
+    ///    is enabled, falls back to [`ApiClient::create_message`].
     ///
     /// The returned [`StreamTurnResult`] carries the accumulated message,
     /// token usage, stop reason, and timing regardless of which path
@@ -1326,8 +1573,13 @@ impl StreamHandler {
 
     /// Attempt a single streaming pass.
     ///
-    /// Opens a stream via [`ApiClient::stream_messages`] and processes
-    /// all events with timeout and cancellation support.
+    /// Gates on the proactive [`RateLimiter`](crate::stream::rate_limit::RateLimiter)
+    /// (if attached), opens a stream via
+    /// [`ApiClient::stream_messages_with_options`] carrying the handler's
+    /// [`RequestOptions`](crate::structured::RequestOptions), and processes
+    /// all events with timeout and cancellation support. Called inside the
+    /// retry loop in [`stream_turn`](StreamHandler::stream_turn), so a retried
+    /// 429 re-gates on the rate limiter.
     ///
     /// # Errors
     ///
@@ -1343,7 +1595,12 @@ impl StreamHandler {
     ) -> Result<StreamTurnResult, StreamHandlerError> {
         self.gate_on_rate_limit(client, cancel, total_deadline)
             .await?;
-        let stream = client.stream_messages(conversation, system, tool_schemas);
+        let stream = client.stream_messages_with_options(
+            conversation,
+            system,
+            tool_schemas,
+            self.request_options.clone(),
+        );
         self.process_events(stream, cancel, total_deadline).await
     }
 
@@ -1553,6 +1810,18 @@ impl StreamHandler {
     }
 
     /// Whether the total-stream deadline has already passed.
+    ///
+    /// Polled between events at the top of [`next_event`](Self::next_event)'s
+    /// loop, before the per-event `select!` commits to another wait. This
+    /// catches a deadline that elapsed while the loop was processing the
+    /// previous event (or building diagnostics) — the
+    /// [`total_deadline_future`](Self::total_deadline_future) `select!` arm
+    /// only fires *during* a wait, so without this check a long event handler
+    /// could overshoot the deadline by up to one event's processing time.
+    ///
+    /// `None` means no total-stream deadline is configured (the turn is
+    /// bounded only by the per-event timeout) and the function returns
+    /// `false` for every poll.
     fn deadline_exceeded(total_deadline: Option<Instant>) -> bool {
         match total_deadline {
             Some(deadline) => Instant::now() >= deadline,
@@ -1692,14 +1961,46 @@ impl StreamHandler {
 #[non_exhaustive]
 pub struct StreamTurnResult {
     /// The fully accumulated assistant message.
+    ///
+    /// On the streaming path, built by the accumulator from every received
+    /// event — so it carries the full part structure (text blocks, tool
+    /// calls, images). On the non-streaming fallback path, built from just
+    /// the first text part of the JSON response, so non-text parts are lost
+    /// when [`from_fallback`](Self::from_fallback) is `true`.
     pub message: Message,
+
     /// Token counts for this turn, if reported by the provider.
+    ///
+    /// Populated on the streaming path from the provider's final usage event.
+    /// `None` on the non-streaming fallback path (the JSON extraction does
+    /// not parse usage), and `None` on either path when the provider did not
+    /// report usage.
     pub usage: Option<Usage>,
+
     /// Why the model stopped generating.
+    ///
+    /// [`EndTurn`](StreamStopReason::EndTurn),
+    /// [`ToolCall`](StreamStopReason::ToolCall), etc. — parsed from the
+    /// provider's stop signal. On the non-streaming fallback path, defaults to
+    /// [`EndTurn`](StreamStopReason::EndTurn) when the response carries no
+    /// parseable stop reason.
     pub stop_reason: StreamStopReason,
+
     /// Whether the result came from a non-streaming fallback.
+    ///
+    /// `false` on the normal streaming path; `true` when streaming exhausted
+    /// its retries and [`fallback_to_non_streaming`](StreamTimeoutConfig::fallback_to_non_streaming)
+    /// routed the turn through [`ApiClient::create_message`]. Callers can use
+    /// this to downgrade trust in the result (the fallback path loses non-text
+    /// parts and usage) or surface a warning to the user.
     pub from_fallback: bool,
+
     /// Wall-clock time spent on this turn.
+    ///
+    /// Measured from the turn's stream-open (or fallback dispatch) to the
+    /// completed result, inclusive of any retries and backoff sleeps along
+    /// the way — so it reflects the *true* latency the turn incurred, not
+    /// just the final successful attempt's duration.
     pub elapsed: Duration,
 }
 

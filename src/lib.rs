@@ -78,6 +78,7 @@ pub mod memory;
 pub mod message;
 pub mod middleware;
 pub mod observer;
+pub mod presets;
 #[cfg(feature = "providers")]
 pub mod provider;
 pub mod reflection;

@@ -65,13 +65,13 @@ use std::sync::Arc;
 
 pub use crate::tool::ToolDispatchResult;
 
-pub use memoize::{MemoizingMiddleware, PathExtractor};
+pub use memoize::{MemoizingMiddleware, NoopPathExtractor, PathExtractor};
 pub use output_limit::OutputLimitMiddleware;
 pub use permission::{AskResolverFn, PermissionCheckFn, PermissionMiddleware};
 pub use timeout::{TimeoutConfig, TimeoutMiddleware};
 pub use tool_call::ToolCallMiddleware;
 pub use unknown_tool::UnknownToolMiddleware;
-pub use verify::{Verifier, VerifyMiddleware, VerifyResult};
+pub use verify::{NoopVerifier, Verifier, VerifyMiddleware, VerifyResult};
 
 // ==================================================
 // Dispatch context

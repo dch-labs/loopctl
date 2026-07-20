@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Added
 
+- `ConstrainedProfile`, `FrontierProfile`, and `GoalReminder` (`presets`
+  module): a named small-model-tuned runtime profile and its frontier opt-out
+  counterpart. `ConstrainedProfile::apply(&mut loop_)` wires the small-model
+  middleware stack (verify with `NoopVerifier`, memoize with
+  `NoopPathExtractor`, output cap) and registers a `GoalReminder` contributor;
+  `loop_config()` returns a tighter `LoopConfig` (120k window, 100 turns) and
+  `request_options()` returns `tool_constraint: Strict`. Compose the pieces
+  individually via `pipeline_builder()` / `loop_config()` / `request_options()`.
+- `NoopVerifier` (`middleware::verify`): a `Verifier` that always passes,
+  co-located with the `Verifier` trait. Default verifier for
+  `ConstrainedProfile`; swap in a real build/lint step when available.
+- `NoopPathExtractor` (`middleware::memoize`): a `PathExtractor` that extracts
+  no paths, disabling path-based cache invalidation (TTL-only caching).
+  Default extractor for `ConstrainedProfile`.
+- `BareLoop::set_request_options(opts)` builder: set the per-turn
+  `RequestOptions` (carrying `tool_constraint`) applied to every provider call.
+  Default is `RequestOptions::default()` (no constraint), reproducing prior
+  behavior.
+- `StreamHandler::with_request_options(opts)` builder: the same option applied
+  to the handler's stream-open call.
 - `ContextContributor` trait and `ContributorContext<'a>` (`engine::contributor`
   module): a write-side hook at the turn boundary. Implementors return an
   optional `Message` that the loop appends to the conversation before the next
@@ -107,6 +127,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Changed
 
+- The engine now calls `ApiClient::stream_messages_with_options` instead of
+  `stream_messages` on every turn (both the inline-streaming path in
+  `engine::bare::stream` and the `StreamHandler` path), passing the loop's
+  `RequestOptions`. This is additive — the default `RequestOptions::default()`
+  has no `response_format` and `tool_constraint: None`, which reproduces the
+  prior behavior exactly. Custom `ApiClient` impls that do not override
+  `stream_messages_with_options` inherit the trait default (which delegates to
+  `stream_messages` when `response_format` is `None`), so they continue to
+  work; a `tool_constraint` other than `None` set via `set_request_options`
+  only takes effect on clients that override `_with_options` (the built-in
+  OpenAI, Anthropic, and Gemini clients do).
 - **Breaking:** `message::Role` gains a `System` variant. Every exhaustive
   `match` on `Role` in downstream code must add a `System =>` arm (or a `_ =>`
   wildcard). Migration: add `Role::System => /* your mapping */` to each match,

@@ -86,6 +86,36 @@ pub trait PathExtractor: Send + Sync {
     fn paths(&self, tool_name: &str, input: &Value) -> Vec<String>;
 }
 
+/// A [`PathExtractor`] that extracts no paths.
+///
+/// Disables path-based cache invalidation entirely: cached entries are evicted
+/// only by TTL (`ttl_turns`), never by write-class calls. Suitable when the
+/// caller cannot (or does not want to) associate tool inputs with filesystem
+/// paths — e.g. for a tool whose output is deterministic and path-independent.
+///
+/// Zero-sized; cheap to construct and `Arc`-share.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::sync::Arc;
+/// use loopctl::middleware::{MemoizingMiddleware, NoopPathExtractor};
+///
+/// let mw = MemoizingMiddleware::new(
+///     vec!["Read".into()],
+///     vec!["Write".into()],
+///     Arc::new(NoopPathExtractor),
+///     5, // TTL in turns — the only invalidation path with this extractor
+/// );
+/// ```
+pub struct NoopPathExtractor;
+
+impl PathExtractor for NoopPathExtractor {
+    fn paths(&self, _tool_name: &str, _input: &Value) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 // ===================================================
 // Cache types (private)
 // ===================================================
@@ -1109,6 +1139,50 @@ mod tests {
         assert!(
             !r3.output.to_string().contains("[cached]"),
             "successful write should invalidate cached read: {}",
+            r3.output
+        );
+    }
+
+    #[test]
+    fn noop_path_extractor_returns_empty() {
+        let extractor = NoopPathExtractor;
+        // Arbitrary tool/input combinations all yield no paths.
+        assert!(
+            extractor
+                .paths("Read", &serde_json::json!({"path": "/etc/hosts"}))
+                .is_empty()
+        );
+        assert!(
+            extractor
+                .paths("Grep", &serde_json::json!({"pattern": "x"}))
+                .is_empty()
+        );
+        assert!(extractor.paths("Write", &serde_json::json!({})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn noop_path_extractor_disables_path_invalidation() {
+        let mw = make_middleware(Arc::new(NoopPathExtractor), 5);
+        let read_content = ToolContent::from_string("file body");
+        let (pipeline, _calls) = pipeline(mw, read_content.clone(), false);
+
+        // Step 1: Read(foo.rs) — populates the cache.
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "foo.rs"}), 1);
+        let r1 = pipeline.dispatch(&mut ctx).await;
+        assert!(!r1.output.to_string().contains("[cached]"));
+
+        // Step 2: Write(foo.rs) — would normally invalidate, but the
+        // no-op extractor contributes no paths, so the cache survives.
+        let mut ctx = ctx_for("Write", serde_json::json!({"path": "foo.rs"}), 1);
+        let wr = pipeline.dispatch(&mut ctx).await;
+        assert!(!wr.is_error, "write should succeed");
+
+        // Step 3: Read(foo.rs) again — still cached (NOT invalidated).
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "foo.rs"}), 2);
+        let r3 = pipeline.dispatch(&mut ctx).await;
+        assert!(
+            r3.output.to_string().contains("[cached]"),
+            "NoopPathExtractor disables path invalidation; read still cached: {}",
             r3.output
         );
     }

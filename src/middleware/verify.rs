@@ -112,7 +112,7 @@ pub struct VerifyResult {
 ///
 /// Useful as the default verifier when wiring [`VerifyMiddleware`] into a
 /// pipeline that has no real build/lint step to run — the middleware still
-/// registers and appends a `[verify] passed: true` block, but no actual
+/// registers and appends a `[verify] passed: ` block, but no actual
 /// check happens. Swap in a real verifier (`cargo check`, `tsc`) when one is
 /// available.
 ///
@@ -125,7 +125,7 @@ pub struct VerifyResult {
 /// use loopctl::middleware::{NoopVerifier, Verifier, VerifyMiddleware};
 ///
 /// let pipeline = ToolPipeline::builder()
-///         .with(VerifyMiddleware::new(Arc::new(NoopVerifier), vec!["Write".into()]))
+///     .with(VerifyMiddleware::new(Arc::new(NoopVerifier), vec!["Write".into()]))
 ///     .core(registry)
 ///     .build()?;
 /// ```

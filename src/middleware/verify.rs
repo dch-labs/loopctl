@@ -354,6 +354,7 @@ mod tests {
                     resolved_tool_name: String::new(),
                     tool_call_id: String::new(),
                     duration: std::time::Duration::ZERO,
+                    display_hint: None,
                 }
             })
         }

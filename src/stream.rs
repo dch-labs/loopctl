@@ -402,11 +402,18 @@ pub struct IndexedDelta {
 /// the API sends. Consumers should append the payload to the
 /// appropriate in-progress part.
 ///
+/// `#[non_exhaustive]` so the framework can add content kinds (e.g.
+/// `Image`/`Audio`) in a later minor release without breaking downstream
+/// `match`es. Downstream code that matches on `DeltaPart` MUST include a
+/// wildcard arm.
+///
 /// # Variants
 ///
 /// - [`Text`](Self::Text) — Append to the text buffer for text parts.
 /// - [`ToolCall`](Self::ToolCall) — Append to the JSON buffer for tool-call parts.
 /// - [`InputJson`](Self::InputJson) — Append to the JSON buffer (raw string form).
+/// - [`Thinking`](Self::Thinking) — Append to the reasoning buffer for separate
+///   display; not part of the assistant's visible text.
 ///
 /// # Example
 ///
@@ -424,10 +431,15 @@ pub struct IndexedDelta {
 ///             json_buf.push_str(s);
 ///         }
 ///     }
+///     DeltaPart::Thinking { .. } => {
+///         // Reasoning is delivered via on_thinking_delta; not accumulated here.
+///     }
+///     _ => {}
 /// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum DeltaPart {
     /// Text delta — append to the existing text content.
     ///
@@ -479,6 +491,29 @@ pub enum DeltaPart {
         /// part, then parse the combined string as JSON once
         /// [`PartStop`](StreamEvent::PartStop) is received.
         partial_json: String,
+    },
+
+    /// Thinking/reasoning delta — append to a reasoning buffer for separate
+    /// display. NOT part of the assistant's visible text.
+    ///
+    /// Emitted by reasoning models (Claude extended-thinking, DeepSeek-R1,
+    /// OpenAI o-series). Stream-only: the [`StreamAccumulator`] does NOT carry
+    /// reasoning into the built [`Message`]; consume
+    /// it via
+    /// [`on_thinking_delta`](crate::observer::LoopObserver::on_thinking_delta).
+    /// An empty `text` signals redacted reasoning (e.g. Anthropic
+    /// `redacted_thinking`); render a placeholder rather than the empty string.
+    ///
+    /// Serialized as `"type":"thinking_delta"` with a `"text"` field.
+    #[serde(rename = "thinking_delta")]
+    Thinking {
+        /// The reasoning text fragment to append.
+        ///
+        /// Concatenate in arrival order per turn to reconstruct the full
+        /// reasoning trace. Empty string when the reasoning is redacted
+        /// (the provider withheld the content); consumers should render a
+        /// placeholder, not the empty string.
+        text: String,
     },
 }
 
@@ -1029,6 +1064,10 @@ impl StreamAccumulator {
                             self.current_tool_input.push_str(s);
                         }
                     }
+                    // Reasoning is not part of the assistant Message. Drop it
+                    // here; observers already received it via on_thinking_delta
+                    // upstream (engine/bare/stream.rs).
+                    DeltaPart::Thinking { .. } => {}
                 }
                 Ok(())
             }
@@ -1535,7 +1574,6 @@ mod tests {
         assert_eq!(acc.usage().unwrap().input_tokens, 100);
         assert_eq!(acc.usage().unwrap().output_tokens, 50);
 
-        // Second delta overwrites usage.
         acc.process(&StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some("max_tokens".into()),
@@ -1545,5 +1583,68 @@ mod tests {
         .unwrap();
         assert_eq!(acc.usage().unwrap().input_tokens, 200);
         assert_eq!(acc.usage().unwrap().output_tokens, 75);
+    }
+
+    #[test]
+    fn accumulator_drops_thinking_not_into_text() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 1,
+            part: None,
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 1,
+            delta: DeltaPart::Thinking {
+                text: "reasoning here".into(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop).unwrap();
+        let msg = acc.build();
+        let text = msg.parts.iter().find_map(|p| match p {
+            MessagePart::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert!(
+            !text.unwrap_or("").contains("reasoning here"),
+            "reasoning must not leak into the message text: {text:?}"
+        );
+    }
+
+    #[test]
+    fn deltapart_thinking_serde_roundtrip() {
+        let delta = DeltaPart::Thinking { text: "hmm".into() };
+        let json = serde_json::to_string(&delta).unwrap();
+        assert_eq!(json, r#"{"type":"thinking_delta","text":"hmm"}"#);
+        let parsed: DeltaPart = serde_json::from_str(&json).unwrap();
+        match &parsed {
+            DeltaPart::Thinking { text } => assert_eq!(text, "hmm"),
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deltapart_thinking_empty_text_roundtrip() {
+        let delta = DeltaPart::Thinking {
+            text: String::new(),
+        };
+        let json = serde_json::to_string(&delta).unwrap();
+        let parsed: DeltaPart = serde_json::from_str(&json).unwrap();
+        match &parsed {
+            DeltaPart::Thinking { text } => assert_eq!(text, ""),
+            other => panic!("expected Thinking with empty text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deltapart_thinking_match_compiles() {
+        let delta = DeltaPart::Thinking { text: "x".into() };
+        let result = match &delta {
+            DeltaPart::Text { text } => format!("text:{text}"),
+            DeltaPart::Thinking { text } => format!("thinking:{text}"),
+            DeltaPart::ToolCall { .. } | DeltaPart::InputJson { .. } => "other".into(),
+        };
+        assert_eq!(result, "thinking:x");
     }
 }

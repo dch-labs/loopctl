@@ -897,6 +897,7 @@ impl SseReader {
 /// - Emitting [`PartStop`] when parts finish.
 /// - Emitting the final [`MessageDelta`] with stop reason and usage.
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct StreamEmitter {
     /// Whether [`MessageStart`] has been emitted for the current stream.
     ///
@@ -935,6 +936,23 @@ struct StreamEmitter {
     ///
     /// [`DeltaPart::InputJson`]: crate::stream::DeltaPart::InputJson
     current_tool_index: Option<usize>,
+
+    /// Whether a thinking/reasoning content block is currently open.
+    ///
+    /// Anthropic signals the start of a thinking block with
+    /// `content_block_start` (`type: "thinking"` or `"redacted_thinking"`)
+    /// and its end with `content_block_stop`. This flag tracks the open state
+    /// so the matching `content_block_stop` emits exactly one
+    /// [`StreamEvent::PartStop`].
+    thinking_part_open: bool,
+
+    /// Index of the thinking block.
+    ///
+    /// Most recently opened thinking bolock by
+    /// `content_block_start`, used to route subsequent `thinking_delta`
+    /// fragments. Mirrors [`current_tool_index`](Self::current_tool_index)
+    /// for the reasoning lane.
+    thinking_index: Option<usize>,
 
     /// Whether the terminal stop signal has been processed.
     ///
@@ -1064,6 +1082,20 @@ impl StreamEmitter {
                     part: Some(MessagePart::text("")),
                 }));
             }
+            Some("thinking" | "redacted_thinking") => {
+                self.thinking_part_open = true;
+                self.thinking_index = Some(index);
+                self.push(StreamEvent::PartStart(PartStart { index, part: None }));
+
+                if matches!(block_type, Some("redacted_thinking")) {
+                    self.push(StreamEvent::IndexedDelta(IndexedDelta {
+                        index,
+                        delta: DeltaPart::Thinking {
+                            text: String::new(),
+                        },
+                    }));
+                }
+            }
             _ => {}
         }
     }
@@ -1113,6 +1145,21 @@ impl StreamEmitter {
                     }));
                 }
             }
+            Some("thinking_delta") => {
+                let text = v
+                    .pointer("/delta/thinking")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !text.is_empty() {
+                    // Use the index from the corresponding content_block_start.
+                    let thinking_index = self.thinking_index.unwrap_or(TEXT_PART_INDEX);
+                    self.push(StreamEvent::IndexedDelta(IndexedDelta {
+                        index: thinking_index,
+                        delta: DeltaPart::Thinking { text },
+                    }));
+                }
+            }
             _ => {}
         }
     }
@@ -1129,6 +1176,10 @@ impl StreamEmitter {
     fn on_block_stop(&mut self, _data: Option<Value>) {
         if self.text_part_open {
             self.text_part_open = false;
+            self.push(StreamEvent::PartStop);
+        } else if self.thinking_part_open {
+            self.thinking_part_open = false;
+            self.thinking_index = None;
             self.push(StreamEvent::PartStop);
         } else if self.tool_parts_open > 0 {
             self.tool_parts_open = self.tool_parts_open.saturating_sub(1);
@@ -2268,5 +2319,109 @@ mod tests {
         // And the user contents arrive in original order.
         assert_eq!(messages[0]["content"], "first");
         assert_eq!(messages[2]["content"], "third");
+    }
+
+    #[test]
+    fn emitter_thinking_delta_emits_thinking_variant() {
+        let mut em = StreamEmitter::default();
+
+        // Start a thinking block at index 0.
+        em.on_block_start(Some(serde_json::json!({
+            "index": 0,
+            "content_block": {"type": "thinking"}
+        })));
+        em.drain();
+
+        // Thinking delta.
+        em.on_block_delta(Some(serde_json::json!({
+            "delta": {"type": "thinking_delta", "thinking": "reasoning here"}
+        })));
+        let events = em.drain();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            StreamEvent::IndexedDelta(d) => match &d.delta {
+                DeltaPart::Thinking { text } => assert_eq!(text, "reasoning here"),
+                other => panic!("expected Thinking, got {other:?}"),
+            },
+            other => panic!("expected IndexedDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emitter_signature_delta_is_ignored() {
+        let mut em = StreamEmitter::default();
+
+        // Start a thinking block + emit a thinking delta.
+        em.on_block_start(Some(serde_json::json!({
+            "index": 0,
+            "content_block": {"type": "thinking"}
+        })));
+        em.on_block_delta(Some(serde_json::json!({
+            "delta": {"type": "thinking_delta", "thinking": "visible reasoning"}
+        })));
+        em.drain();
+
+        // Now send a signature_delta — must NOT emit any additional event.
+        em.on_block_delta(Some(serde_json::json!({
+            "delta": {"type": "signature_delta", "signature": "opaque_base64_blob"}
+        })));
+        let events = em.drain();
+
+        assert!(
+            events.is_empty(),
+            "signature_delta must not emit any events: got {events:?}"
+        );
+    }
+
+    #[test]
+    fn emitter_redacted_thinking_emits_empty_delta() {
+        let mut em = StreamEmitter::default();
+
+        // Start a redacted_thinking block — should emit PartStart + one
+        // empty Thinking delta (the placeholder convention).
+        em.on_block_start(Some(serde_json::json!({
+            "index": 0,
+            "content_block": {"type": "redacted_thinking"}
+        })));
+        let events = em.drain();
+
+        // PartStart + one empty Thinking delta.
+        assert_eq!(events.len(), 2, "expected PartStart + empty Thinking delta");
+        assert!(matches!(events[0], StreamEvent::PartStart(_)));
+        match &events[1] {
+            StreamEvent::IndexedDelta(d) => match &d.delta {
+                DeltaPart::Thinking { text } => {
+                    assert!(text.is_empty(), "redacted thinking → empty text");
+                }
+                other => panic!("expected Thinking, got {other:?}"),
+            },
+            other => panic!("expected IndexedDelta, got {other:?}"),
+        }
+        assert!(em.thinking_part_open, "thinking_part_open set");
+    }
+
+    #[test]
+    fn emitter_thinking_block_stop_closes_part() {
+        let mut em = StreamEmitter::default();
+
+        em.on_block_start(Some(serde_json::json!({
+            "index": 0,
+            "content_block": {"type": "thinking"}
+        })));
+        em.on_block_delta(Some(serde_json::json!({
+            "delta": {"type": "thinking_delta", "thinking": "reasoning"}
+        })));
+        em.drain();
+
+        // Block stop must close the thinking part: emit one PartStop and
+        // reset the tracking fields.
+        em.on_block_stop(None);
+        let events = em.drain();
+
+        assert_eq!(events.len(), 1, "exactly one PartStop");
+        assert!(matches!(events[0], StreamEvent::PartStop));
+        assert!(!em.thinking_part_open, "thinking_part_open reset");
+        assert!(em.thinking_index.is_none(), "thinking_index cleared");
     }
 }

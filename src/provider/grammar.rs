@@ -194,10 +194,10 @@ mod tests {
             // tool name key in our grammar.
             let mut accumulated = String::new();
             for ev in events {
-                if let crate::stream::StreamEvent::IndexedDelta(d) = ev {
-                    if let crate::stream::DeltaPart::InputJson { partial_json } = d.delta {
-                        accumulated.push_str(&partial_json);
-                    }
+                if let crate::stream::StreamEvent::IndexedDelta(d) = ev
+                    && let crate::stream::DeltaPart::InputJson { partial_json } = d.delta
+                {
+                    accumulated.push_str(&partial_json);
                 }
             }
             total = total.saturating_add(1);

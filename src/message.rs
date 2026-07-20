@@ -253,8 +253,8 @@ impl fmt::Display for Message {
 ///
 /// # Serialization
 ///
-/// Serialized as lowercase `snake_case` strings (`"user"`, `"assistant"`)
-/// to match the API convention.
+/// Serialized as lowercase `snake_case` strings (`"user"`, `"assistant"`,
+/// `"system"`) to match the API convention.
 ///
 /// # Example
 ///
@@ -262,6 +262,7 @@ impl fmt::Display for Message {
 /// use loopctl::message::{Role};
 /// assert_eq!(Role::User.to_string(), "user");
 /// assert_eq!(Role::Assistant.to_string(), "assistant");
+/// assert_eq!(Role::System.to_string(), "system");
 /// ```
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -277,12 +278,22 @@ pub enum Role {
     /// Contains the model's generated response, which may include
     /// text, tool-call invocations, or both.
     Assistant,
+
+    /// Framework-injected context, such as a turn-boundary reminder.
+    ///
+    /// Providers map this to their native system representation: an inline
+    /// `{role: "system"}` message on OpenAI, or the top-level system field on
+    /// Anthropic and Gemini (which do not accept an inline system role
+    /// mid-conversation). Application code does not normally construct
+    /// `System` messages directly — they are produced by framework machinery
+    /// like [`ContextContributor`](crate::engine::ContextContributor).
+    System,
 }
 
 /// Formats a [`Role`] as its lowercase API string.
 ///
 /// This implementation is used by [`Display`](fmt::Display) to produce
-/// the string that LLM APIs expect: `"user"` or `"assistant"`.
+/// the string that LLM APIs expect: `"user"`, `"assistant"`, or `"system"`.
 /// It is also used for logging and building request payloads
 /// without pulling in the serde serializer.
 ///
@@ -297,6 +308,7 @@ impl fmt::Display for Role {
         match self {
             Self::User => write!(f, "user"),
             Self::Assistant => write!(f, "assistant"),
+            Self::System => write!(f, "system"),
         }
     }
 }
@@ -1136,5 +1148,23 @@ mod tests {
             ToolContentPart::text("line 2"),
         ]);
         assert_eq!(result.to_string(), "line 1\nline 2");
+    }
+
+    #[test]
+    fn test_role_system_serializes_snake_case() {
+        let s = serde_json::to_string(&Role::System).expect("System serializes");
+        assert_eq!(s, "\"system\"");
+    }
+
+    #[test]
+    fn test_role_system_display() {
+        assert_eq!(Role::System.to_string(), "system");
+    }
+
+    #[test]
+    fn test_role_system_round_trips() {
+        let parsed: Role =
+            serde_json::from_str("\"system\"").expect("\"system\" deserializes to a Role");
+        assert_eq!(parsed, Role::System);
     }
 }

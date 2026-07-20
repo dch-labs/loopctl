@@ -48,7 +48,7 @@ const SSE_EVENT_PREFIX: &str = "event: ";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); // connect + response + body
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(2); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
@@ -605,7 +605,9 @@ fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32)
         tool_constraint,
     } = spec;
 
-    let msgs: Vec<Value> = messages.iter().map(convert_message).collect();
+    let (non_system, effective_system) = super::fold_system_messages(messages, *system);
+    let msgs: Vec<Value> = non_system.iter().map(|m| convert_message(m)).collect();
+    let effective_system = effective_system.unwrap_or_default();
     let (tools_val, tool_choice) = if let Some(rf) = response_format {
         let forced_tool = serde_json::json!({
             "name": rf.name,
@@ -626,21 +628,21 @@ fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32)
         "model": model,
         "max_tokens": max_tokens,
         "messages": msgs,
-        "system": system.unwrap_or(""),
+        "system": effective_system,
         "stream": stream,
         "tools": tools_val,
     });
 
-    if tools_val.is_none() {
-        if let Some(obj) = body.as_object_mut() {
-            obj.remove("tools");
-        }
+    if tools_val.is_none()
+        && let Some(obj) = body.as_object_mut()
+    {
+        obj.remove("tools");
     }
 
-    if let Some(choice) = tool_choice {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("tool_choice".to_string(), choice);
-        }
+    if let Some(choice) = tool_choice
+        && let Some(obj) = body.as_object_mut()
+    {
+        obj.insert("tool_choice".to_string(), choice);
     }
 
     body
@@ -652,8 +654,12 @@ fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32)
 ///   (Anthropic's recommended optimization).
 /// - Messages with tool calls or tool results use the full `content` array.
 fn convert_message(m: &Message) -> Value {
+    // System messages are folded into the top-level `system` field by
+    // `build_request_body` before this function is reached, so the `System`
+    // pattern below is defensive: if one ever reaches here, route it to `user`
+    // so the text renders rather than being dropped silently.
     let role = match m.role {
-        Role::User => "user",
+        Role::User | Role::System => "user",
         Role::Assistant => "assistant",
     };
 
@@ -1792,7 +1798,7 @@ mod tests {
 
     #[test]
     fn builder_custom_timeout() {
-        let custom = Duration::from_secs(300);
+        let custom = Duration::from_mins(5);
         let builder = AnthropicClientBuilder::default().timeout(custom);
         assert_eq!(builder.timeout, custom);
         // connect_timeout should be unchanged.
@@ -1810,7 +1816,7 @@ mod tests {
 
     #[test]
     fn builder_custom_both_timeouts() {
-        let req_timeout = Duration::from_secs(600);
+        let req_timeout = Duration::from_mins(10);
         let conn_timeout = Duration::from_secs(30);
         let builder = AnthropicClientBuilder::default()
             .timeout(req_timeout)
@@ -1826,7 +1832,7 @@ mod tests {
         // .build() would return an error.
         let client = AnthropicClient::builder()
             .api_key("sk-test")
-            .timeout(Duration::from_secs(180))
+            .timeout(Duration::from_mins(3))
             .connect_timeout(Duration::from_secs(15))
             .build();
         assert!(client.is_ok(), "build should succeed with valid timeouts");
@@ -2159,5 +2165,108 @@ mod tests {
         assert_eq!(tools[0]["name"], "result");
         assert_eq!(body["tool_choice"]["type"], "tool");
         assert_eq!(body["tool_choice"]["name"], "result");
+    }
+
+    fn system_role_msg(text: &str) -> Message {
+        Message::new(Role::System, vec![MessagePart::text(text)])
+    }
+
+    #[test]
+    fn request_body_system_role_folded_into_system_field() {
+        // An inline Role::System message must NOT appear in the messages
+        // array; its text must be folded into the top-level `system` field.
+        let msgs = vec![
+            Message::user("hello"),
+            system_role_msg("stay on task"),
+            Message::assistant("working"),
+        ];
+        let body = build_request_body(
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
+            false,
+            DEFAULT_MAX_TOKENS,
+        );
+
+        let messages = body["messages"].as_array().expect("messages is an array");
+        assert_eq!(messages.len(), 2, "system-role message is filtered out");
+        for m in messages {
+            assert_ne!(
+                m["role"].as_str().unwrap_or(""),
+                "system",
+                "no inline system-role message should be emitted"
+            );
+        }
+        assert_eq!(body["system"], "stay on task");
+    }
+
+    #[test]
+    fn request_body_system_role_merges_with_caller_system() {
+        // When both a caller-supplied system prompt and an inline
+        // Role::System message are present, the top-level `system` field
+        // carries both (caller prompt first, folded text appended).
+        let msgs = vec![Message::user("hi"), system_role_msg("reminder")];
+        let body = build_request_body(
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: Some("be brief"),
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
+            false,
+            DEFAULT_MAX_TOKENS,
+        );
+        let system = body["system"].as_str().expect("system is a string");
+        assert!(
+            system.starts_with("be brief"),
+            "caller system prompt comes first: got {system:?}"
+        );
+        assert!(
+            system.contains("reminder"),
+            "folded text is appended: got {system:?}"
+        );
+        assert!(
+            system.contains('\n'),
+            "caller prompt and folded text are newline-separated: got {system:?}"
+        );
+    }
+
+    #[test]
+    fn request_body_system_role_preserves_message_order() {
+        // Folding must not reorder the remaining (non-system) messages.
+        let msgs = vec![
+            Message::user("first"),
+            system_role_msg("mid reminder"),
+            Message::assistant("second"),
+            Message::user("third"),
+        ];
+        let body = build_request_body(
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
+            false,
+            DEFAULT_MAX_TOKENS,
+        );
+        let messages = body["messages"].as_array().expect("messages is an array");
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(roles, vec!["user", "assistant", "user"]);
+        // And the user contents arrive in original order.
+        assert_eq!(messages[0]["content"], "first");
+        assert_eq!(messages[2]["content"], "third");
     }
 }

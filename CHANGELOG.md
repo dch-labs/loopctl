@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Added
 
+- `ContextContributor` trait and `ContributorContext<'a>` (`engine::contributor`
+  module): a write-side hook at the turn boundary. Implementors return an
+  optional `Message` that the loop appends to the conversation before the next
+  model call. Register on `BareLoop` via `add_contributor`; with no contributors
+  registered, the loop behaves identically to before (the turn-top consultation
+  is a single cheap branch).
+- `Role::System` variant on `message::Role`. Serialized as `"system"`. Used for
+  framework-injected context such as a turn-boundary reminder. Providers map it
+  to their native system representation: an inline `{role: "system"}` message on
+  OpenAI, or the top-level system field on Anthropic and Gemini (which do not
+  accept an inline system role mid-conversation).
 - `ApiError::rate_limited(message, retry_after)` constructor for the structured
   rate-limit carrier variant.
 - `LoopError::RateLimitEscalation { attempts, retry_after }` variant,
@@ -96,6 +107,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Changed
 
+- **Breaking:** `message::Role` gains a `System` variant. Every exhaustive
+  `match` on `Role` in downstream code must add a `System =>` arm (or a `_ =>`
+  wildcard). Migration: add `Role::System => /* your mapping */` to each match,
+  or switch to a wildcard arm. The three built-in providers are already
+  updated; the Anthropic and Gemini serializers fold any inline `Role::System`
+  messages into the top-level system request field (`system` / `systemInstruction`)
+  rather than emitting them inline, because those providers accept system content
+  only as a top-level field. When both a caller-supplied system prompt and inline
+  `Role::System` messages are present, they are joined (caller prompt first,
+  folded text appended, newline-separated). OpenAI emits `Role::System` as an
+  inline `{role: "system"}` message, its native form.
 - **Breaking:** `Reflector::analyze` gains a new `tool_schema:
   Option<&ToolSchema>` parameter between `tool_input` and `context`. The
   engine's call site now resolves the failing tool's schema from the

@@ -528,16 +528,15 @@ impl ApiError {
             }
             Self::RateLimit { .. } => ErrorCode::ApiRateLimited,
             Self::Http(msg) => {
-                if let Some(rest) = msg.strip_prefix("HTTP ") {
-                    if let Some(colon) = rest.find(':') {
-                        if let Ok(status) = rest[..colon].parse::<u16>() {
-                            return if status >= 500 {
-                                ErrorCode::HttpResponseError
-                            } else {
-                                ErrorCode::HttpRequestError
-                            };
-                        }
-                    }
+                if let Some(rest) = msg.strip_prefix("HTTP ")
+                    && let Some(colon) = rest.find(':')
+                    && let Ok(status) = rest[..colon].parse::<u16>()
+                {
+                    return if status >= 500 {
+                        ErrorCode::HttpResponseError
+                    } else {
+                        ErrorCode::HttpRequestError
+                    };
                 }
                 ErrorCode::HttpConnectionError
             }

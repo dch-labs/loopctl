@@ -49,7 +49,7 @@ const DEFAULT_MODEL: &str = "gpt-4o";
 const SSE_DONE: &str = "[DONE]";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120); // connect + response + body
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(2); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
@@ -675,6 +675,7 @@ fn convert_message(m: &Message) -> Value {
     let role = match m.role {
         Role::User => "user",
         Role::Assistant => "assistant",
+        Role::System => "system",
     };
     let mut text_parts: Vec<&str> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
@@ -1706,7 +1707,7 @@ mod tests {
 
     #[test]
     fn builder_custom_timeout() {
-        let custom = Duration::from_secs(300);
+        let custom = Duration::from_mins(5);
         let builder = OpenAiClientBuilder::default().timeout(custom);
         assert_eq!(builder.timeout, custom);
         // connect_timeout should be unchanged.
@@ -1724,7 +1725,7 @@ mod tests {
 
     #[test]
     fn builder_custom_both_timeouts() {
-        let req_timeout = Duration::from_secs(600);
+        let req_timeout = Duration::from_mins(10);
         let conn_timeout = Duration::from_secs(30);
         let builder = OpenAiClientBuilder::default()
             .timeout(req_timeout)
@@ -1740,7 +1741,7 @@ mod tests {
         // .build() would return an error.
         let client = OpenAiClient::builder()
             .api_key("sk-test")
-            .timeout(Duration::from_secs(180))
+            .timeout(Duration::from_mins(3))
             .connect_timeout(Duration::from_secs(15))
             .build();
         assert!(client.is_ok(), "build should succeed with valid timeouts");
@@ -2087,5 +2088,16 @@ mod tests {
             json.get("guided_json").is_none(),
             "guided_json must be absent for an empty tool slice"
         );
+    }
+
+    #[test]
+    fn convert_message_system_role_emitted_inline() {
+        // OpenAI accepts an inline {role: "system"} message natively, so a
+        // Role::System message is emitted verbatim (not folded into a
+        // top-level field).
+        let msg = Message::new(Role::System, vec![MessagePart::text("stay on task")]);
+        let value = convert_message(&msg);
+        assert_eq!(value["role"], "system");
+        assert_eq!(value["content"], "stay on task");
     }
 }

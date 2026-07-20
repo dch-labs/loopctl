@@ -79,22 +79,22 @@ impl<C: ApiClient> BareLoop<C> {
                     // observer. The match is hoisted out of the
                     // `if let Some(streamer)` guard so observers fire even
                     // when no streamer is set.
-                    if let StreamEvent::IndexedDelta(indexed_delta) = &event {
-                        if let crate::stream::DeltaPart::Text { text } = &indexed_delta.delta {
-                            if let Some(ref streamer) = self.text_streamer {
-                                streamer(text);
-                            }
-                            self.managers.observers().on_text_delta(&TextDeltaContext {
-                                turn: self.budget.total_turns,
-                                delta: text.clone(),
-                            });
+                    if let StreamEvent::IndexedDelta(indexed_delta) = &event
+                        && let crate::stream::DeltaPart::Text { text } = &indexed_delta.delta
+                    {
+                        if let Some(ref streamer) = self.text_streamer {
+                            streamer(text);
                         }
+                        self.managers.observers().on_text_delta(&TextDeltaContext {
+                            turn: self.budget.total_turns,
+                            delta: text.clone(),
+                        });
                     }
-                    if let StreamEvent::MessageDelta(delta) = &event {
-                        if let Some(ref reason_str) = delta.delta.stop_reason {
-                            stop_reason =
-                                StreamStopReason::from_api_str(reason_str).unwrap_or(stop_reason);
-                        }
+                    if let StreamEvent::MessageDelta(delta) = &event
+                        && let Some(ref reason_str) = delta.delta.stop_reason
+                    {
+                        stop_reason =
+                            StreamStopReason::from_api_str(reason_str).unwrap_or(stop_reason);
                     }
                     accumulator
                         .process(&event)

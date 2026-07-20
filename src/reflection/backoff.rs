@@ -170,10 +170,10 @@ mod tests {
     fn backoff_builder_custom() {
         let strategy = ExponentialBackoffRecovery::new(5)
             .with_base_delay(Duration::from_millis(200))
-            .with_max_delay(Duration::from_secs(60));
+            .with_max_delay(Duration::from_mins(1));
         assert_eq!(strategy.max_retries(), 5);
         assert_eq!(strategy.base_delay(), Duration::from_millis(200));
-        assert_eq!(strategy.max_delay(), Duration::from_secs(60));
+        assert_eq!(strategy.max_delay(), Duration::from_mins(1));
     }
 
     #[tokio::test]

@@ -242,12 +242,12 @@ impl GitExecutor {
 
         match Self::commit(&config.message_template, config.commit_mode.is_amend()) {
             Ok(sha) => {
-                if config.auto_push {
-                    if let Err(e) = Self::push(config.push_branch.as_deref()) {
-                        return AutoCommitResult::Failed {
-                            error: format!("Commit succeeded but push failed: {e}"),
-                        };
-                    }
+                if config.auto_push
+                    && let Err(e) = Self::push(config.push_branch.as_deref())
+                {
+                    return AutoCommitResult::Failed {
+                        error: format!("Commit succeeded but push failed: {e}"),
+                    };
                 }
                 AutoCommitResult::Committed { sha }
             }
@@ -461,10 +461,10 @@ impl Hook for AutoCommitHook {
             return;
         }
 
-        if self.config.commit_on_tools.contains(&ctx.tool_name) {
-            if let Some(file_path) = ctx.input.get("file_path").and_then(|v| v.as_str()) {
-                self.track_modification(file_path);
-            }
+        if self.config.commit_on_tools.contains(&ctx.tool_name)
+            && let Some(file_path) = ctx.input.get("file_path").and_then(|v| v.as_str())
+        {
+            self.track_modification(file_path);
         }
     }
 

@@ -282,7 +282,7 @@ mod tests {
         }
         assert!(bucket.available_at(t0) < 1.0, "bucket should be drained");
         // After 60s it should be back at capacity.
-        let t1 = t0 + Duration::from_secs(60);
+        let t1 = t0 + Duration::from_mins(1);
         let available = bucket.available_at(t1);
         assert!(
             (available - 5.0).abs() < 0.5,

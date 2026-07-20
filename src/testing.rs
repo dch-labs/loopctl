@@ -1463,10 +1463,10 @@ mod tests {
         let stream = client.stream_messages(vec![Message::user("Hi")], None, None);
         let events: Vec<_> = stream.collect().await;
         let has_text = events.iter().any(|e| {
-            if let Ok(StreamEvent::IndexedDelta(delta)) = e {
-                if let DeltaPart::Text { text } = &delta.delta {
-                    return text == "Custom response";
-                }
+            if let Ok(StreamEvent::IndexedDelta(delta)) = e
+                && let DeltaPart::Text { text } = &delta.delta
+            {
+                return text == "Custom response";
             }
             false
         });
@@ -1484,10 +1484,10 @@ mod tests {
         let events: Vec<_> = stream.collect().await;
 
         let has_tool_use = events.iter().any(|e| {
-            if let Ok(StreamEvent::PartStart(start)) = e {
-                if let Some(MessagePart::ToolCall { name, .. }) = &start.part {
-                    return name == "echo";
-                }
+            if let Ok(StreamEvent::PartStart(start)) = e
+                && let Some(MessagePart::ToolCall { name, .. }) = &start.part
+            {
+                return name == "echo";
             }
             false
         });
@@ -1530,10 +1530,10 @@ mod tests {
         let stream1 = client.stream_messages(vec![Message::user("Hi")], None, None);
         let events1: Vec<_> = stream1.collect().await;
         let has_first = events1.iter().any(|e| {
-            if let Ok(StreamEvent::IndexedDelta(delta)) = e {
-                if let DeltaPart::Text { text } = &delta.delta {
-                    return text == "First";
-                }
+            if let Ok(StreamEvent::IndexedDelta(delta)) = e
+                && let DeltaPart::Text { text } = &delta.delta
+            {
+                return text == "First";
             }
             false
         });
@@ -1542,10 +1542,10 @@ mod tests {
         let stream2 = client.stream_messages(vec![Message::user("Hi")], None, None);
         let events2: Vec<_> = stream2.collect().await;
         let has_second = events2.iter().any(|e| {
-            if let Ok(StreamEvent::IndexedDelta(delta)) = e {
-                if let DeltaPart::Text { text } = &delta.delta {
-                    return text == "Second";
-                }
+            if let Ok(StreamEvent::IndexedDelta(delta)) = e
+                && let DeltaPart::Text { text } = &delta.delta
+            {
+                return text == "Second";
             }
             false
         });

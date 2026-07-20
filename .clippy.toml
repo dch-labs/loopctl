@@ -20,7 +20,7 @@ too-many-lines-threshold = 150
 too-many-arguments-threshold = 7
 
 # MSRV from Cargo.toml.
-msrv = "1.85.0"
+msrv = "1.94.0"
 
 # Warn when passing types larger than this by value (bytes).
 trivial-copy-size-limit = 32

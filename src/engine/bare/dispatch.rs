@@ -454,6 +454,7 @@ impl<C: ApiClient> BareLoop<C> {
                     is_error: true,
                     duration: Duration::ZERO,
                     resolved_tool_name: tc.tool.clone(),
+                    display_hint: None,
                 };
                 results.push(soft);
             }
@@ -640,6 +641,7 @@ impl<C: ApiClient> BareLoop<C> {
             result_hash: loop_detector::hash_result(&result.output.to_string()),
             is_error: result.is_error,
             duration: result.duration,
+            display_hint: result.display_hint.clone(),
         });
     }
 
@@ -749,6 +751,7 @@ impl<C: ApiClient> BareLoop<C> {
                         is_error: result.is_error,
                         duration,
                         resolved_tool_name: tc.tool.clone(),
+                        display_hint: result.display_hint,
                     }
                 }
                 Ok(Err(e)) => {
@@ -760,6 +763,7 @@ impl<C: ApiClient> BareLoop<C> {
                         is_error: true,
                         duration,
                         resolved_tool_name: tc.tool.clone(),
+                        display_hint: None,
                     }
                 }
                 Err(panic_payload) => {
@@ -782,6 +786,7 @@ impl<C: ApiClient> BareLoop<C> {
                         is_error: true,
                         duration,
                         resolved_tool_name: tc.tool.clone(),
+                        display_hint: None,
                     }
                 }
             }
@@ -809,6 +814,7 @@ impl<C: ApiClient> BareLoop<C> {
             is_error: true,
             duration: Duration::ZERO,
             resolved_tool_name: tc.tool.clone(),
+            display_hint: None,
         }
     }
 
@@ -881,6 +887,7 @@ impl<C: ApiClient> BareLoop<C> {
                 is_error: true,
                 duration: Duration::ZERO,
                 resolved_tool_name: tc.tool.clone(),
+                display_hint: None,
             }),
             HookAction::Ask { message } => Some(ToolDispatchResult {
                 tool_call_id: tc.id.clone(),
@@ -888,6 +895,7 @@ impl<C: ApiClient> BareLoop<C> {
                 is_error: true,
                 duration: Duration::ZERO,
                 resolved_tool_name: tc.tool.clone(),
+                display_hint: None,
             }),
         }
     }
@@ -1020,6 +1028,7 @@ impl<C: ApiClient> BareLoop<C> {
             is_error: dispatch_result.is_error,
             duration: dispatch_result.duration,
             resolved_tool_name: dispatch_result.resolved_tool_name,
+            display_hint: dispatch_result.display_hint,
         })
     }
 

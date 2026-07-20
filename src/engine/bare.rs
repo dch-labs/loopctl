@@ -2091,6 +2091,7 @@ mod tests {
             is_error: false,
             duration: Duration::from_millis(100),
             resolved_tool_name: String::new(),
+            display_hint: None,
         }];
 
         let msg = BareLoop::<MockClient>::build_tool_result_message(results);

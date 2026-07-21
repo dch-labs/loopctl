@@ -126,6 +126,17 @@ pub trait LoopObserver: Send + Sync {
     /// must not parse, render, or perform I/O synchronously, since it runs on
     /// the stream-ingestion task.
     ///
+    /// # Retry caveat (handler path)
+    ///
+    /// When a [`StreamHandler`](crate::stream::handler::StreamHandler) is
+    /// configured, this callback fires for every event of every attempt —
+    /// including partial events from a failed attempt that got cut off
+    /// mid-stream. An observer that concatenates `delta` across calls will,
+    /// under the handler path only, see duplicated or truncated-then-restarted
+    /// fragments after a retry. Consumers that need only committed output must
+    /// buffer until [`on_response`](Self::on_response) (or
+    /// [`on_turn_end`](Self::on_turn_end)).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -152,6 +163,11 @@ pub trait LoopObserver: Send + Sync {
     /// visible assistant text; do not concatenate it with `on_text_delta` /
     /// [`on_response`](Self::on_response) output. Redacted reasoning arrives
     /// as an empty `delta` (render a placeholder, not the empty string).
+    ///
+    /// Inherits the same retry caveat as [`on_text_delta`](Self::on_text_delta):
+    /// under a configured [`StreamHandler`](crate::stream::handler::StreamHandler),
+    /// partial events from a failed attempt fire here too. Buffer until
+    /// [`on_turn_end`](Self::on_turn_end) if you need only committed reasoning.
     fn on_thinking_delta(&self, _ctx: &ThinkingDeltaContext) {}
 
     /// Called when the engine has accumulated a tool call and is about to dispatch it.

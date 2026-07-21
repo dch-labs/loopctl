@@ -171,8 +171,14 @@ pub trait Compactable {
 /// that need to control streaming behaviour (timeouts, retries, fallback
 /// to non-streaming mode).
 pub trait StreamCapable {
-    /// Returns the stream handler, if resilient streaming is configured.
-    fn stream_handler(&self) -> Option<&StreamHandler>;
+    /// Returns the stream handler.
+    ///
+    /// Always returns a handler — when no resilient handler is configured,
+    /// returns a shared reference to [`StreamHandler::passthrough_default`]
+    /// (a no-resilience handler that yields the raw provider stream with no
+    /// retries, timeouts, or fallback). The engine's `stream_turn` always
+    /// routes through a handler; this never returns `None`.
+    fn stream_handler(&self) -> &StreamHandler;
 }
 
 /// Capability to run bidirectional hooks that can block actions.

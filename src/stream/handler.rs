@@ -38,10 +38,11 @@ use crate::api::ApiClient;
 use crate::api::error::{ApiError, http_status_is_overload};
 use crate::cancel::CancelSignal;
 use crate::message::Message;
-use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
-use crate::tool::ToolSchema;
+use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason};
 use futures::StreamExt;
+use futures::stream::Stream;
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -742,7 +743,7 @@ enum EventPoll {
 
 /// Read-only diagnostic context used to build timeout and error outcomes.
 ///
-/// Snapshotted once per loop iteration in [`StreamHandler::process_events`] and
+/// Snapshotted once per loop iteration in [`StreamHandler::stream_turn`] and
 /// handed to [`StreamHandler::next_event`], which needs progress/elapsed data to
 /// populate [`StreamOutcome`] fields when it short-circuits.
 struct EventDiagnostics {
@@ -759,7 +760,7 @@ struct EventDiagnostics {
     ///
     /// Read via [`Instant::elapsed`] when building
     /// [`StreamOutcome::TotalTimeout`]'s `duration` field. Captured once at
-    /// the top of [`process_events`](StreamHandler::process_events) rather
+    /// the top of [`stream_turn`](Self::stream_turn) rather
     /// than per event so the reported duration is the full stream lifetime,
     /// not the time since the most recent event.
     stream_start: Instant,
@@ -767,7 +768,7 @@ struct EventDiagnostics {
     /// Whether partial content has been accumulated.
     ///
     /// Recomputed each loop iteration (the whole [`EventDiagnostics`] is
-    /// rebuilt per iteration in [`process_events`](StreamHandler::process_events))
+    /// rebuilt per iteration in [`stream_turn`](Self::stream_turn))
     /// from the accumulator's current part count: `true` once at least one
     /// usable event has been received. Flows into the `has_partial_data` flag
     /// on [`StreamOutcome::TotalTimeout`], [`StreamOutcome::EventTimeout`],
@@ -781,7 +782,7 @@ impl EventDiagnostics {
     ///
     /// Snapshots the current diagnostic state — partial-data flag, events
     /// processed so far, and elapsed time since [`stream_start`](Self::stream_start)
-    /// — into a `TotalTimeout` outcome. Used by [`process_events`](StreamHandler::process_events)
+    /// — into a `TotalTimeout` outcome. Used by [`stream_turn`](Self::stream_turn)
     /// when the turn's `total_stream_timeout` deadline fires (both at the
     /// top-of-loop check and inside the per-event `select!`).
     fn total_timeout(&self) -> StreamOutcome {
@@ -796,7 +797,7 @@ impl EventDiagnostics {
     ///
     /// Carries the partial-data flag plus the caller-supplied
     /// `consecutive_timeouts` count (this method does not track the counter
-    /// itself — `process_events` owns it and passes the current value in).
+    /// itself — `stream_turn` owns it and passes the current value in).
     /// Used once the per-event timeout crosses
     /// [`max_consecutive_timeouts`](StreamTimeoutConfig::max_consecutive_timeouts).
     fn event_timeout(&self, consecutive_timeouts: u32) -> StreamOutcome {
@@ -813,7 +814,7 @@ impl EventDiagnostics {
     /// parsed `Retry-After` and current progress; otherwise wraps it as a
     /// generic [`StreamOutcome::InitFailed`] with `attempts: 1` (this is the
     /// per-event error path, not the init-retry path, so the attempt counter
-    /// isn't meaningful here). Used by `process_events` when the stream yields
+    /// isn't meaningful here). Used by `stream_turn` when the stream yields
     /// an `Err` event.
     fn api_error_outcome(&self, error: &crate::api::error::ApiError) -> StreamHandlerError {
         if let Some(detail) = DetectedRateLimit::detect(error) {
@@ -1059,8 +1060,6 @@ pub enum StreamHandlerError {
         attempts: u32,
         /// Last server-advised `Retry-After` hint, after clamping. `None` when no header sent.
         retry_after: Option<Duration>,
-        /// The rate-limit outcome that triggered escalation.
-        prior: StreamOutcome,
     },
 }
 
@@ -1082,7 +1081,6 @@ impl fmt::Display for StreamHandlerError {
             Self::RateLimitEscalation {
                 attempts,
                 retry_after,
-                prior: _,
             } => write!(
                 f,
                 "rate-limit escalation after {attempts} retries (retry-after {retry_after:?})"
@@ -1193,8 +1191,8 @@ pub struct StreamHandler {
     ///
     /// Drives the initial-event / per-event / total-stream deadlines, the
     /// consecutive-timeout escalation threshold, and the
-    /// non-streaming-fallback toggle. Read on every turn in `stream_turn` and
-    /// on each event poll.
+    /// non-streaming-fallback toggle. Read on every turn in
+    /// [`stream_turn`](Self::stream_turn) and on each event poll.
     timeout_config: StreamTimeoutConfig,
 
     /// Retry configuration for stream-initialization failures.
@@ -1220,16 +1218,6 @@ pub struct StreamHandler {
     /// than risking a 429. `None` (the default) means reactive-only handling:
     /// no pre-throttling, server 429s still handled via `rate_limit_config`.
     rate_limiter: Option<Arc<crate::stream::rate_limit::RateLimiter>>,
-
-    /// Per-turn request options applied to every stream-open call.
-    ///
-    /// Carries [`tool_constraint`](crate::structured::ToolConstraint) for
-    /// constrained tool-call decoding. Default is
-    /// [`RequestOptions::default`](crate::structured::RequestOptions::default)
-    /// (no constraint), reproducing the prior unconstrained behavior.
-    /// Passed to [`ApiClient::stream_messages_with_options`] at the stream-open
-    /// call site. Set via [`with_request_options`](StreamHandler::with_request_options).
-    request_options: crate::structured::RequestOptions,
 }
 
 impl fmt::Debug for StreamHandler {
@@ -1239,7 +1227,6 @@ impl fmt::Debug for StreamHandler {
             .field("retry_config", &self.retry_config)
             .field("rate_limit_config", &self.rate_limit_config)
             .field("rate_limiter", &self.rate_limiter)
-            .field("request_options", &self.request_options)
             .finish()
     }
 }
@@ -1251,6 +1238,74 @@ impl Default for StreamHandler {
 }
 
 impl StreamHandler {
+    /// Create a no-resilience handler — yields the raw provider stream with
+    /// no retries, no timeouts, no fallback, no rate-limit handling.
+    ///
+    /// Used as the default when no `StreamHandler` is configured: the engine
+    /// always routes streaming through a handler, and `passthrough()` is what
+    /// you get when you haven't opted into resilience. Behaves like the
+    /// pre-redesign inline streaming path — one attempt, no retry, surface
+    /// the underlying [`ApiClient`] errors directly.
+    ///
+    /// Also useful as an explicit baseline for callers who want to start
+    /// fresh and reconfigure only the fields they care about:
+    ///
+    /// ```rust,no_run
+    /// # use loopctl::stream::handler::{StreamHandler, StreamTimeoutConfig};
+    /// let handler = StreamHandler::passthrough()
+    ///     .with_config(
+    ///         StreamTimeoutConfig {
+    ///             total_stream_timeout: std::time::Duration::from_secs(60),
+    ///             ..Default::default()
+    ///         },
+    ///         Default::default(),
+    ///     );
+    /// ```
+    ///
+    /// Returned by [`passthrough_default`](Self::passthrough_default) as a
+    /// shared static, so [`StreamCapable::stream_handler`](crate::capabilities::StreamCapable::stream_handler)
+    /// can return `&Self` (never `Option<&Self>`).
+    #[must_use]
+    pub fn passthrough() -> Self {
+        // Duration::MAX overflows Instant::now() + it; stream_turn maps that
+        // overflow to None (no deadline), so this never fires spuriously.
+        const NEVER_TIME_OUT: Duration = Duration::MAX;
+        Self {
+            timeout_config: StreamTimeoutConfig {
+                initial_event_timeout: NEVER_TIME_OUT,
+                per_event_timeout: NEVER_TIME_OUT,
+                total_stream_timeout: NEVER_TIME_OUT,
+                // validate() rejects 0; value is irrelevant since timeouts never fire.
+                max_consecutive_timeouts: 1,
+                progress_interval: NEVER_TIME_OUT,
+                fallback_to_non_streaming: false,
+            },
+            retry_config: StreamRetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            },
+            rate_limit_config: RateLimitConfig {
+                max_retries: 0,
+                fallback_after_retries: 0,
+                ..Default::default()
+            },
+            rate_limiter: None,
+        }
+    }
+
+    /// Return a shared reference to the default passthrough handler.
+    ///
+    /// Constructed lazily on first access (via `std::sync::OnceLock`) and
+    /// shared by all callers that don't configure their own [`StreamHandler`].
+    /// Used by
+    /// [`StreamCapable::stream_handler`](crate::capabilities::StreamCapable::stream_handler)
+    /// to always return `&Self` regardless of configuration.
+    #[must_use]
+    pub fn passthrough_default() -> &'static Self {
+        static PASSTHROUGH: std::sync::OnceLock<StreamHandler> = std::sync::OnceLock::new();
+        PASSTHROUGH.get_or_init(Self::passthrough)
+    }
+
     /// Create a handler with default configuration.
     ///
     /// The defaults are suitable for production LLM API usage:
@@ -1273,7 +1328,6 @@ impl StreamHandler {
             retry_config: StreamRetryConfig::default(),
             rate_limit_config: RateLimitConfig::default(),
             rate_limiter: None,
-            request_options: crate::structured::RequestOptions::default(),
         }
     }
 
@@ -1300,20 +1354,6 @@ impl StreamHandler {
     pub fn with_config(mut self, timeout: StreamTimeoutConfig, retry: StreamRetryConfig) -> Self {
         self.timeout_config = timeout;
         self.retry_config = retry;
-        self
-    }
-
-    /// Set the per-turn [`RequestOptions`](crate::structured::RequestOptions)
-    /// applied to every stream-open call. Consuming builder.
-    ///
-    /// Default is [`RequestOptions::default`](crate::structured::RequestOptions::default)
-    /// (no constraint), which reproduces prior behavior. Set
-    /// [`tool_constraint`](crate::structured::ToolConstraint) to
-    /// [`Strict`](crate::structured::ToolConstraint::Strict) for constrained
-    /// tool-call decoding.
-    #[must_use]
-    pub fn with_request_options(mut self, options: crate::structured::RequestOptions) -> Self {
-        self.request_options = options;
         self
     }
 
@@ -1368,8 +1408,8 @@ impl StreamHandler {
 
     /// Attach a per-provider rate limiter (proactive throttle).
     ///
-    /// When set, every `stream_turn` attempt waits for a token before opening
-    /// the stream, spacing requests to the limiter's `requests_per_minute`
+    /// When set, every `stream_turn` attempt waits for a token before
+    /// opening the stream, spacing requests to the limiter's `requests_per_minute`
     /// ceiling. `None` (the default) disables proactive throttling — the
     /// handler then relies purely on the reactive 429 handling.
     ///
@@ -1396,148 +1436,173 @@ impl StreamHandler {
     // Runtime methods
     // ==================================================
 
-    /// Stream one complete turn with retry, timeout, and fallback.
+    /// Drive one turn as a stream of [`HandlerEvent`]s.
     ///
-    /// Primary entry point for resilient streaming. It
-    /// orchestrates the full lifecycle:
+    /// The engine consumes this stream directly: real stream events flow to
+    /// observers and the engine's accumulator (identical to the inline
+    /// streaming path), [`HandlerEvent::AttemptReset`] signals a retry so the
+    /// engine can discard partial state, and [`HandlerEvent::Fallback`]
+    /// delivers the non-streaming fallback message when retries exhaust.
     ///
-    /// 1. Opens a stream via [`ApiClient::stream_messages_with_options`]
-    ///    (gated by the proactive [`RateLimiter`](crate::stream::rate_limit::RateLimiter),
-    ///    if attached).
-    /// 2. Processes events with per-event and total timeouts.
-    /// 3. On transient transport errors, retries with exponential backoff;
-    ///    on 429/503/529 responses, backs off under the rate-limit budget
-    ///    and escalates to the model circuit breaker once that budget is
-    ///    exhausted.
-    /// 4. If all retries fail and
-    ///    [`fallback_to_non_streaming`](StreamTimeoutConfig::fallback_to_non_streaming)
-    ///    is enabled, falls back to [`ApiClient::create_message`].
-    ///
-    /// The returned [`StreamTurnResult`] carries the accumulated message,
-    /// token usage, stop reason, and timing regardless of which path
-    /// produced the result (streaming or fallback).
-    ///
-    /// # Parameters
-    ///
-    /// - `client` — The LLM API client to stream from.
-    /// - `conversation` — The conversation history to send.
-    /// - `system` — An optional system prompt.
-    /// - `tool_schemas` — Optional tool definitions.
-    /// - `cancel` — Shared cancellation signal.
+    /// The handler keeps its retry/rate-limit/timeout/fallback machinery —
+    /// this method is the retry loop reshaped as a stream. Events from failed
+    /// attempts are yielded as `HandlerEvent::Stream` to the engine before the
+    /// attempt fails; the engine then receives `AttemptReset` and discards
+    /// them. Consumers that want only committed output must reset their state
+    /// on `AttemptReset`.
     ///
     /// # Errors
     ///
-    /// Returns [`StreamHandlerError`] on unrecoverable failure:
-    /// - [`InitFailed`](StreamHandlerError::InitFailed) — stream could not
-    ///   be opened after all retries.
-    /// - [`StreamFailed`](StreamHandlerError::StreamFailed) — stream
-    ///   failed mid-event with a timeout or API error.
-    /// - [`FallbackFailed`](StreamHandlerError::FallbackFailed) — both
-    ///   streaming and non-streaming fallback failed.
-    /// - [`RateLimitEscalation`](StreamHandlerError::RateLimitEscalation) —
-    ///   rate-limit retries on this model were exhausted; escalate to a
-    ///   fallback model.
-    /// - [`Cancelled`](StreamHandlerError::Cancelled) — cancellation
-    ///   signal fired.
-    pub async fn stream_turn<C: ApiClient>(
-        &self,
-        client: &C,
-        conversation: Vec<Message>,
-        system: Option<String>,
-        tool_schemas: Option<Vec<ToolSchema>>,
-        cancel: &Arc<CancelSignal>,
-    ) -> Result<StreamTurnResult, StreamHandlerError> {
-        let total_deadline = Some(
-            Instant::now()
-                .checked_add(self.timeout_config.total_stream_timeout)
-                .unwrap_or(Instant::now()),
-        );
+    /// Item errors carry the same [`StreamHandlerError`] variants the
+    /// pre-redesign `stream_turn` returned: cancellation, timeout, transport
+    /// retry exhaustion, rate-limit escalation, and non-streaming fallback
+    /// failure.
+    /// A successful turn ends with `None` from the stream (or after
+    /// [`HandlerEvent::Fallback`]).
+    pub fn stream_turn<'a, C: ApiClient>(
+        &'a self,
+        client: &'a C,
+        request: crate::api::StreamRequest,
+        options: crate::structured::RequestOptions,
+        cancel: &'a Arc<CancelSignal>,
+    ) -> Pin<Box<dyn Stream<Item = Result<HandlerEvent, StreamHandlerError>> + Send + 'a>> {
+        let crate::api::StreamRequest {
+            messages: conversation,
+            system,
+            tools: tool_schemas,
+        } = request;
+        // `checked_add` returns `None` when the timeout (e.g. `Duration::MAX`
+        // in the passthrough handler) would overflow `Instant`. Treat that as
+        // "no total deadline" (`None`) rather than wrapping to `Instant::now()`
+        // (which would immediately fire a spurious TotalTimeout).
+        let total_deadline = Instant::now().checked_add(self.timeout_config.total_stream_timeout);
         let max_attempts = self.retry_config.max_retries.saturating_add(1);
-        let mut rate_limit_retries: u32 = 0;
-        let mut transport_attempts: u32 = 0;
-        loop {
-            if let Some(deadline) = total_deadline
-                && Instant::now() >= deadline
-            {
-                return Err(StreamHandlerError::InitFailed(
-                    StreamOutcome::TotalTimeout {
-                        has_partial_data: false,
-                        events_processed: 0,
-                        duration: self.timeout_config.total_stream_timeout,
-                    },
-                ));
-            }
-            match self
-                .try_stream(
-                    client,
-                    conversation.clone(),
-                    system.clone(),
-                    tool_schemas.clone(),
-                    cancel,
-                    total_deadline,
-                )
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(StreamHandlerError::Cancelled) => {
-                    return Err(StreamHandlerError::Cancelled);
-                }
-                Err(e) => {
-                    let last_stream_outcome = carried_outcome(&e);
 
-                    // Rate-limit retries draw on their own budget
-                    // (RateLimitConfig), independent of the transport retry
-                    // budget below — a rate-limit storm must not exhaust
-                    // transport retries (nor vice versa).
-                    if let Some(StreamOutcome::RateLimited { detail, .. }) = &last_stream_outcome {
-                        match self.rate_limit_retry(detail, &mut rate_limit_retries, total_deadline)
-                        {
-                            RateLimitRetry::Escalate {
-                                attempts,
-                                retry_after,
-                            } => {
-                                return Err(StreamHandlerError::RateLimitEscalation {
-                                    attempts,
-                                    retry_after,
-                                    prior: last_stream_outcome.clone().unwrap_or(
-                                        StreamOutcome::RateLimited {
-                                            detail: detail.clone(),
-                                            has_partial_data: false,
-                                            events_processed: 0,
-                                        },
-                                    ),
-                                });
+        Box::pin(async_stream::try_stream! {
+            let mut rate_limit_retries: u32 = 0;
+            let mut transport_attempts: u32 = 0;
+            let mut attempt: u32 = 0;
+            // Shadow accumulator tracks partial-data presence for diagnostics.
+            let mut shadow = StreamAccumulator::new();
+
+            'outer: loop {
+                if let Some(deadline) = total_deadline
+                    && Instant::now() >= deadline
+                {
+                    Err(StreamHandlerError::InitFailed(
+                        StreamOutcome::TotalTimeout {
+                            has_partial_data: !shadow.peek_parts().is_empty(),
+                            events_processed: 0,
+                            duration: self.timeout_config.total_stream_timeout,
+                        },
+                    ))?;
+                }
+
+                attempt = attempt.saturating_add(1);
+                if attempt > 1 {
+                    shadow = StreamAccumulator::new();
+                    yield HandlerEvent::AttemptReset;
+                }
+
+                self.gate_on_rate_limit(client, cancel, total_deadline).await?;
+                let request = crate::api::StreamRequest {
+                    messages: conversation.clone(),
+                    system: system.clone(),
+                    tools: tool_schemas.clone(),
+                };
+                let mut stream =
+                    client.stream_messages_with_options(request, options.clone());
+
+                let mut consecutive_timeouts: usize = 0;
+                let mut events_processed: u64 = 0;
+                let stream_start = Instant::now();
+
+                loop {
+                    let diagnostics = EventDiagnostics {
+                        events_processed,
+                        stream_start,
+                        has_partial_data: !shadow.peek_parts().is_empty(),
+                    };
+                    match self.next_event(
+                        &mut stream,
+                        cancel,
+                        &mut consecutive_timeouts,
+                        total_deadline,
+                        &diagnostics,
+                    ).await {
+                        Ok(Some(event)) => {
+                            events_processed = events_processed.saturating_add(1);
+                            consecutive_timeouts = 0;
+                            if let Err(e) = shadow.process(&event) {
+                                Err(StreamHandlerError::StreamFailed(
+                                    StreamOutcome::InitFailed {
+                                        attempts: 1,
+                                        last_error: e.to_string(),
+                                    },
+                                ))?;
                             }
-                            RateLimitRetry::HardStop => return Err(e),
-                            RateLimitRetry::Retry(delay) => {
-                                sleep_cancellable(delay, cancel).await?;
-                                continue;
+                            yield HandlerEvent::Stream(event);
+                        }
+                        Ok(None) => return,
+                        Err(err) => {
+                            let last_stream_outcome = carried_outcome(&err);
+
+                            if let Some(StreamOutcome::RateLimited { detail, .. }) = &last_stream_outcome {
+                                let rate_limit_decision = self.rate_limit_retry(
+                                    detail,
+                                    &mut rate_limit_retries,
+                                    total_deadline,
+                                );
+                                match rate_limit_decision {
+                                    RateLimitRetry::Escalate { attempts, retry_after } => {
+                                        Err(StreamHandlerError::RateLimitEscalation {
+                                            attempts,
+                                            retry_after,
+                                        })?;
+                                        return;
+                                    }
+                                    RateLimitRetry::HardStop => {
+                                        Err(err)?;
+                                        return;
+                                    }
+                                    RateLimitRetry::Retry(delay) => {
+                                        sleep_cancellable(delay, cancel).await?;
+                                        continue 'outer;
+                                    }
+                                }
                             }
+
+                            if transport_attempts >= max_attempts.saturating_sub(1) {
+                                if self.timeout_config.fallback_to_non_streaming {
+                                    let request = crate::api::StreamRequest {
+                                        messages: conversation.clone(),
+                                        system: system.clone(),
+                                        tools: tool_schemas.clone(),
+                                    };
+                                    let (message, fallback_stop_reason) = self.fallback_non_streaming(
+                                        client,
+                                        request,
+                                        cancel,
+                                        last_stream_outcome.clone(),
+                                    ).await?;
+                                    yield HandlerEvent::Fallback {
+                                        message,
+                                        stop_reason: fallback_stop_reason,
+                                    };
+                                    return;
+                                }
+                                Err(err)?;
+                                return;
+                            }
+                            let delay = self.retry_config.base_delay(transport_attempts);
+                            transport_attempts = transport_attempts.saturating_add(1);
+                            sleep_cancellable(delay, cancel).await?;
+                            continue 'outer;
                         }
                     }
-
-                    // Non-rate-limit errors consume the transport retry budget.
-                    if transport_attempts >= max_attempts.saturating_sub(1) {
-                        if self.timeout_config.fallback_to_non_streaming {
-                            return self
-                                .fallback_non_streaming(
-                                    client,
-                                    conversation,
-                                    system,
-                                    tool_schemas,
-                                    cancel,
-                                    last_stream_outcome,
-                                )
-                                .await;
-                        }
-                        return Err(e);
-                    }
-                    let delay = self.retry_config.base_delay(transport_attempts);
-                    transport_attempts = transport_attempts.saturating_add(1);
-                    sleep_cancellable(delay, cancel).await?;
                 }
             }
-        }
+        })
     }
 
     /// Decide how to handle a rate-limit failure on the current model.
@@ -1578,32 +1643,9 @@ impl StreamHandler {
     /// [`ApiClient::stream_messages_with_options`] carrying the handler's
     /// [`RequestOptions`](crate::structured::RequestOptions), and processes
     /// all events with timeout and cancellation support. Called inside the
-    /// retry loop in [`stream_turn`](StreamHandler::stream_turn), so a retried
-    /// 429 re-gates on the rate limiter.
+    /// retry loop in [`stream_turn`](Self::stream_turn), so a
+    /// retried 429 re-gates on the rate limiter.
     ///
-    /// # Errors
-    ///
-    /// Returns [`StreamHandlerError`] if the stream fails or times out.
-    async fn try_stream<C: ApiClient>(
-        &self,
-        client: &C,
-        conversation: Vec<Message>,
-        system: Option<String>,
-        tool_schemas: Option<Vec<ToolSchema>>,
-        cancel: &Arc<CancelSignal>,
-        total_deadline: Option<Instant>,
-    ) -> Result<StreamTurnResult, StreamHandlerError> {
-        self.gate_on_rate_limit(client, cancel, total_deadline)
-            .await?;
-        let stream = client.stream_messages_with_options(
-            conversation,
-            system,
-            tool_schemas,
-            self.request_options.clone(),
-        );
-        self.process_events(stream, cancel, total_deadline).await
-    }
-
     /// Wait for a rate-limit token before opening the stream.
     ///
     /// When a [`RateLimiter`](crate::stream::rate_limit::RateLimiter) is
@@ -1614,11 +1656,12 @@ impl StreamHandler {
     /// the turn's remaining `total_deadline` so the gate cannot overrun the
     /// turn budget; if the deadline has already elapsed the gate proceeds
     /// rather than sleeping (the downstream per-event/total-timeout checks in
-    /// [`process_events`](Self::process_events) report the expiry). A no-op
+    /// [`stream_turn`](Self::stream_turn) report the expiry). A no-op
     /// when no limiter is attached.
     ///
-    /// Fires per attempt (called from [`try_stream`](Self::try_stream), which
-    /// runs inside the retry loop), so a retried 429 re-respects the budget.
+    /// Fires per attempt (called from
+    /// [`stream_turn`](Self::stream_turn), which runs the retry
+    /// loop), so a retried 429 re-respects the budget.
     /// Cancel-safe: a turn stuck waiting for tokens is still user-cancellable.
     ///
     /// # Errors
@@ -1665,68 +1708,6 @@ impl StreamHandler {
         }
     }
 
-    /// Process events from an open stream with per-event and total timeouts.
-    ///
-    /// Reads events from the stream, accumulating them into a
-    /// [`Message`]. Applies per-event timeouts and an overall deadline.
-    /// Checks cancellation between events.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamHandlerError::StreamFailed`] on timeout or API error,
-    /// or [`StreamHandlerError::Cancelled`] if the cancel signal fires.
-    async fn process_events<S>(
-        &self,
-        mut stream: S,
-        cancel: &Arc<CancelSignal>,
-        total_deadline: Option<Instant>,
-    ) -> Result<StreamTurnResult, StreamHandlerError>
-    where
-        S: futures::Stream<Item = Result<crate::stream::StreamEvent, crate::api::error::ApiError>>
-            + Unpin,
-    {
-        let mut accumulator = StreamAccumulator::new();
-        let mut stop_reason = StreamStopReason::EndTurn;
-        let mut consecutive_timeouts: usize = 0;
-        let mut events_processed: u64 = 0;
-        let stream_start = Instant::now();
-
-        loop {
-            let diagnostics = EventDiagnostics {
-                events_processed,
-                stream_start,
-                has_partial_data: !accumulator.peek_parts().is_empty(),
-            };
-            let Some(event) = self
-                .next_event(
-                    &mut stream,
-                    cancel,
-                    &mut consecutive_timeouts,
-                    total_deadline,
-                    &diagnostics,
-                )
-                .await?
-            else {
-                break;
-            };
-            events_processed = events_processed.saturating_add(1);
-            consecutive_timeouts = 0;
-            Self::apply_event(&event, &mut accumulator, &mut stop_reason)?;
-        }
-
-        let usage = accumulator.usage().copied();
-        let message = accumulator.build();
-        let elapsed = stream_start.elapsed();
-
-        Ok(StreamTurnResult {
-            message,
-            usage,
-            stop_reason,
-            from_fallback: false,
-            elapsed,
-        })
-    }
-
     /// Wait for the next stream event, enforcing the total deadline and
     /// per-event timeout.
     ///
@@ -1766,7 +1747,12 @@ impl StreamHandler {
             let event_result = tokio::select! {
                 event = stream.next() => EventPoll::Next(event),
                 () = cancel.notified() => return Err(StreamHandlerError::Cancelled),
-                () = tokio::time::sleep_until(event_deadline.into()) => EventPoll::TimedOut,
+                () = async {
+                    match event_deadline {
+                        Some(d) => tokio::time::sleep_until(d.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => EventPoll::TimedOut,
                 () = Self::total_deadline_future(total_deadline) => {
                     return Err(StreamHandlerError::StreamFailed(diagnostics.total_timeout()));
                 }
@@ -1790,23 +1776,22 @@ impl StreamHandler {
         }
     }
 
-    /// The deadline for the next stream event.
+    /// The deadline for the next stream event, or `None` if per-event
+    /// timeouts are disabled (the timeout is `Duration::MAX`, which
+    /// overflows `Instant::now() + it`).
     ///
     /// Uses [`initial_event_timeout`](StreamTimeoutConfig::initial_event_timeout)
     /// before any event has arrived (the model may need time to begin
     /// generating), then switches to
-    /// [`per_event_timeout`](StreamTimeoutConfig::per_event_timeout) once events
-    /// are flowing. Falls back to "now" if the addition overflows.
-    fn event_deadline(&self, events_processed: u64) -> Instant {
+    /// [`per_event_timeout`](StreamTimeoutConfig::per_event_timeout) once
+    /// events are flowing.
+    fn event_deadline(&self, events_processed: u64) -> Option<Instant> {
         let base_timeout = if events_processed == 0 {
             self.timeout_config.initial_event_timeout
         } else {
             self.timeout_config.per_event_timeout
         };
-
-        Instant::now()
-            .checked_add(base_timeout)
-            .unwrap_or(Instant::now())
+        Instant::now().checked_add(base_timeout)
     }
 
     /// Whether the total-stream deadline has already passed.
@@ -1844,33 +1829,6 @@ impl StreamHandler {
         }
     }
 
-    /// Fold one event into the accumulator, tracking stop reason.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StreamHandlerError::StreamFailed`] if the event cannot be
-    /// accumulated.
-    fn apply_event(
-        event: &StreamEvent,
-        accumulator: &mut StreamAccumulator,
-        stop_reason: &mut StreamStopReason,
-    ) -> Result<(), StreamHandlerError> {
-        if let StreamEvent::MessageDelta(delta) = event
-            && let Some(ref reason_str) = delta.delta.stop_reason
-        {
-            *stop_reason = StreamStopReason::from_api_str(reason_str).unwrap_or(*stop_reason);
-        }
-        if let Err(e) = accumulator.process(event) {
-            return Err(StreamHandlerError::StreamFailed(
-                StreamOutcome::InitFailed {
-                    attempts: 1,
-                    last_error: e.to_string(),
-                },
-            ));
-        }
-        Ok(())
-    }
-
     /// Fall back to non-streaming message creation.
     ///
     /// Called when streaming fails (timeout, retries exhausted) and
@@ -1885,20 +1843,16 @@ impl StreamHandler {
     async fn fallback_non_streaming<C: ApiClient>(
         &self,
         client: &C,
-        conversation: Vec<Message>,
-        system: Option<String>,
-        tool_schemas: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
         cancel: &Arc<CancelSignal>,
         stream_outcome: Option<StreamOutcome>,
-    ) -> Result<StreamTurnResult, StreamHandlerError> {
+    ) -> Result<(Message, StreamStopReason), StreamHandlerError> {
         if cancel.is_cancelled() {
             return Err(StreamHandlerError::Cancelled);
         }
 
-        let start = Instant::now();
-
         let result = tokio::select! {
-            res = client.create_message(conversation, system, tool_schemas) => res,
+            res = client.create_message(request) => res,
             () = cancel.notified() => {
                 return Err(StreamHandlerError::Cancelled);
             }
@@ -1916,20 +1870,12 @@ impl StreamHandler {
                             .find_map(|p| p.get("text").and_then(|t| t.as_str()).map(String::from))
                     })
                     .unwrap_or_default();
-
                 let stop_reason = value
                     .get("stop_reason")
                     .and_then(|r| r.as_str())
                     .and_then(StreamStopReason::from_api_str)
                     .unwrap_or(StreamStopReason::EndTurn);
-
-                Ok(StreamTurnResult {
-                    message: Message::assistant(&text),
-                    usage: None,
-                    stop_reason,
-                    from_fallback: true,
-                    elapsed: start.elapsed(),
-                })
+                Ok((Message::assistant(&text), stop_reason))
             }
             Err(e) => Err(StreamHandlerError::FallbackFailed {
                 stream_outcome: stream_outcome.unwrap_or(StreamOutcome::InitFailed {
@@ -1942,71 +1888,138 @@ impl StreamHandler {
     }
 }
 
-/// Result of a successful streaming turn via [`StreamHandler::stream_turn`].
+/// Event yielded by [`StreamHandler::stream_turn`].
 ///
-/// Carries the accumulated message, token usage, and stop reason,
-/// alongside metadata about how the turn was completed (normal streaming
-/// vs. non-streaming fallback).
+/// The engine drives the handler's turn as a stream of these events: real
+/// stream events flow through to observers and the engine's accumulator;
+/// retry boundaries and the non-streaming fallback are surfaced as
+/// first-class signals so the engine can react (reset state, swap in the
+/// fallback message).
 ///
-/// # Example
-///
-/// ```rust,ignore
-/// let result = handler.stream_turn(client, messages, system, tools, cancel).await?;
-/// if result.from_fallback {
-///     eprintln!("Warning: fell back to non-streaming");
-/// }
-/// println!("Response: {:?}", result.message);
-/// ```
+/// See [`StreamHandler::stream_turn`] for the contract.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct StreamTurnResult {
-    /// The fully accumulated assistant message.
+pub enum HandlerEvent {
+    /// A raw event from the provider's stream (text delta, thinking delta,
+    /// tool call, etc.).
     ///
-    /// On the streaming path, built by the accumulator from every received
-    /// event — so it carries the full part structure (text blocks, tool
-    /// calls, images). On the non-streaming fallback path, built from just
-    /// the first text part of the JSON response, so non-text parts are lost
-    /// when [`from_fallback`](Self::from_fallback) is `true`.
-    pub message: Message,
+    /// The engine forwards these to observers (`on_text_delta`,
+    /// `on_thinking_delta`, `text_streamer`) exactly like the inline path,
+    /// then feeds them to its own [`StreamAccumulator`].
+    Stream(StreamEvent),
 
-    /// Token counts for this turn, if reported by the provider.
+    /// The handler is starting a new attempt after a retry decision.
     ///
-    /// Populated on the streaming path from the provider's final usage event.
-    /// `None` on the non-streaming fallback path (the JSON extraction does
-    /// not parse usage), and `None` on either path when the provider did not
-    /// report usage.
-    pub usage: Option<Usage>,
+    /// Fired before the first `Stream` event of attempts 2, 3, … (never on
+    /// the first attempt). The engine must reset any per-attempt state —
+    /// including its [`StreamAccumulator`] — so events from the failed
+    /// attempt are discarded rather than concatenated with the retry's
+    /// events. Observers that concatenate deltas per turn must reset too.
+    AttemptReset,
 
-    /// Why the model stopped generating.
+    /// Streaming retries are exhausted and the non-streaming fallback
+    /// succeeded.
     ///
-    /// [`EndTurn`](StreamStopReason::EndTurn),
-    /// [`ToolCall`](StreamStopReason::ToolCall), etc. — parsed from the
-    /// provider's stop signal. On the non-streaming fallback path, defaults to
-    /// [`EndTurn`](StreamStopReason::EndTurn) when the response carries no
-    /// parseable stop reason.
-    pub stop_reason: StreamStopReason,
-
-    /// Whether the result came from a non-streaming fallback.
+    /// Carries the final message and stop reason extracted from the
+    /// non-streaming
+    /// [`create_message`](crate::api::ApiClient::create_message) JSON
+    /// response. The engine should stop accumulating and use these directly —
+    /// the streaming accumulator's partial state from failed attempts is
+    /// irrelevant on this path.
     ///
-    /// `false` on the normal streaming path; `true` when streaming exhausted
-    /// its retries and [`fallback_to_non_streaming`](StreamTimeoutConfig::fallback_to_non_streaming)
-    /// routed the turn through [`ApiClient::create_message`]. Callers can use
-    /// this to downgrade trust in the result (the fallback path loses non-text
-    /// parts and usage) or surface a warning to the user.
-    pub from_fallback: bool,
-
-    /// Wall-clock time spent on this turn.
-    ///
-    /// Measured from the turn's stream-open (or fallback dispatch) to the
-    /// completed result, inclusive of any retries and backoff sleeps along
-    /// the way — so it reflects the *true* latency the turn incurred, not
-    /// just the final successful attempt's duration.
-    pub elapsed: Duration,
+    /// Always the last event before the stream ends (when the fallback path
+    /// is taken).
+    Fallback {
+        /// The fallback assistant message (text extracted from the JSON
+        /// response's first text part).
+        message: Message,
+        /// Stop reason parsed from the JSON response’s `stop_reason` field,
+        /// defaulting to [`EndTurn`](StreamStopReason::EndTurn) when absent
+        /// or unrecognized.
+        stop_reason: StreamStopReason,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-only result shape matching the old `StreamTurnResult`, used by
+    /// [`StreamHandler::drive_turn`] to keep existing tests' assertions working.
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    struct DriveResult {
+        message: Message,
+        usage: Option<Usage>,
+        stop_reason: StreamStopReason,
+        from_fallback: bool,
+    }
+
+    impl StreamHandler {
+        /// Drive `stream_turn` to completion and return the assembled
+        /// `(Message, Option<Usage>, StreamStopReason, from_fallback)` tuple —
+        /// the same shape `stream_turn` used to return directly. Mirrors how the
+        /// engine consumes the stream: events accumulate, `AttemptReset`
+        /// discards partial state, `Fallback` short-circuits with the fallback
+        /// message.
+        async fn drive_turn<C: ApiClient>(
+            &self,
+            client: &C,
+            request: crate::api::StreamRequest,
+            cancel: &Arc<CancelSignal>,
+        ) -> Result<DriveResult, StreamHandlerError> {
+            let mut stream = self.stream_turn(
+                client,
+                request,
+                crate::structured::RequestOptions::default(),
+                cancel,
+            );
+            let mut accumulator = StreamAccumulator::new();
+            let mut stop_reason = StreamStopReason::EndTurn;
+            let mut from_fallback = false;
+            while let Some(item) = stream.next().await {
+                match item? {
+                    HandlerEvent::Stream(ev) => {
+                        if let StreamEvent::MessageDelta(delta) = &ev
+                            && let Some(ref reason_str) = delta.delta.stop_reason
+                        {
+                            stop_reason =
+                                StreamStopReason::from_api_str(reason_str).unwrap_or(stop_reason);
+                        }
+                        accumulator.process(&ev).map_err(|e| {
+                            StreamHandlerError::StreamFailed(StreamOutcome::InitFailed {
+                                attempts: 1,
+                                last_error: e.to_string(),
+                            })
+                        })?;
+                    }
+                    HandlerEvent::AttemptReset => {
+                        accumulator = StreamAccumulator::new();
+                        stop_reason = StreamStopReason::EndTurn;
+                    }
+                    HandlerEvent::Fallback {
+                        message,
+                        stop_reason: fallback_stop_reason,
+                    } => {
+                        from_fallback = true;
+                        return Ok(DriveResult {
+                            message,
+                            usage: None,
+                            stop_reason: fallback_stop_reason,
+                            from_fallback,
+                        });
+                    }
+                }
+            }
+            let usage = accumulator.usage().copied();
+            Ok(DriveResult {
+                message: accumulator.build(),
+                usage,
+                stop_reason,
+                from_fallback,
+            })
+        }
+    }
 
     #[test]
     fn timeout_config_default_values() {
@@ -2017,6 +2030,28 @@ mod tests {
         assert_eq!(config.max_consecutive_timeouts, 10);
         assert_eq!(config.progress_interval, Duration::from_secs(30));
         assert!(config.fallback_to_non_streaming);
+    }
+
+    #[test]
+    fn passthrough_sets_no_resilience_config() {
+        let h = StreamHandler::passthrough();
+        assert_eq!(h.timeout_config().initial_event_timeout, Duration::MAX);
+        assert_eq!(h.timeout_config().per_event_timeout, Duration::MAX);
+        assert_eq!(h.timeout_config().total_stream_timeout, Duration::MAX);
+        assert!(!h.timeout_config().fallback_to_non_streaming);
+        assert_eq!(h.retry_config().max_retries, 0);
+        assert_eq!(h.rate_limit_config().max_retries, 0);
+        assert_eq!(h.rate_limit_config().fallback_after_retries, 0);
+    }
+
+    #[test]
+    fn passthrough_default_returns_shared_static() {
+        let a = StreamHandler::passthrough_default();
+        let b = StreamHandler::passthrough_default();
+        assert!(
+            std::ptr::eq(a, b),
+            "passthrough_default must return the same static"
+        );
     }
 
     #[test]
@@ -2166,19 +2201,9 @@ mod tests {
 
     #[test]
     fn error_rate_limit_escalation_display() {
-        let prior = StreamOutcome::RateLimited {
-            detail: DetectedRateLimit {
-                kind: RateLimitKind::RateLimited,
-                retry_after: Some(Duration::from_secs(5)),
-                message: "slow down".to_string(),
-            },
-            has_partial_data: false,
-            events_processed: 0,
-        };
         let err = StreamHandlerError::RateLimitEscalation {
             attempts: 4,
             retry_after: Some(Duration::from_secs(5)),
-            prior,
         };
         let s = err.to_string();
         assert!(s.contains("rate-limit escalation"), "got: {s}");
@@ -2395,37 +2420,10 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
-    #[test]
-    fn stream_turn_result_fields() {
-        let result = StreamTurnResult {
-            message: Message::assistant("hello"),
-            usage: Some(Usage::new(10, 5)),
-            stop_reason: StreamStopReason::EndTurn,
-            from_fallback: false,
-            elapsed: Duration::from_millis(100),
-        };
-        assert!(!result.from_fallback);
-        assert_eq!(result.stop_reason, StreamStopReason::EndTurn);
-        assert!(result.usage.is_some());
-    }
-
-    #[test]
-    fn stream_turn_result_fallback_flag() {
-        let result = StreamTurnResult {
-            message: Message::assistant("fallback text"),
-            usage: None,
-            stop_reason: StreamStopReason::EndTurn,
-            from_fallback: true,
-            elapsed: Duration::from_millis(200),
-        };
-        assert!(result.from_fallback);
-        assert!(result.usage.is_none());
-    }
-
     use crate::api::error::ApiError;
     use crate::stream::{
         DeltaPart, IndexedDelta, MessageDelta, MessageDeltaPayload, MessageMetadata, MessageStart,
-        PartStart, StreamEvent,
+        PartStart, StreamEvent, Usage,
     };
 
     fn happy_stream_events() -> Vec<Result<StreamEvent, ApiError>> {
@@ -2456,142 +2454,6 @@ mod tests {
             })),
             Ok(StreamEvent::MessageStop),
         ]
-    }
-
-    fn event_stream(
-        events: Vec<Result<StreamEvent, ApiError>>,
-    ) -> std::pin::Pin<
-        Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
-    > {
-        Box::pin(futures::stream::iter(events))
-    }
-
-    #[tokio::test]
-    async fn process_events_happy_path() {
-        let handler = StreamHandler::new();
-        let cancel = Arc::new(CancelSignal::new());
-        let stream = event_stream(happy_stream_events());
-
-        let result = handler
-            .process_events(stream, &cancel, None)
-            .await
-            .expect("should succeed");
-
-        assert!(!result.from_fallback);
-        assert_eq!(result.stop_reason, StreamStopReason::EndTurn);
-        assert!(result.elapsed > Duration::ZERO);
-    }
-
-    #[tokio::test]
-    async fn process_events_api_error_mid_stream() {
-        let handler = StreamHandler::new();
-        let cancel = Arc::new(CancelSignal::new());
-        let events = vec![
-            Ok(StreamEvent::MessageStart(MessageStart {
-                message: MessageMetadata {
-                    id: "msg_test".to_string(),
-                    role: "assistant".to_string(),
-                    model: "test-model".to_string(),
-                },
-            })),
-            Err(ApiError::api("connection lost")),
-        ];
-        let stream = event_stream(events);
-
-        let err = handler
-            .process_events(stream, &cancel, None)
-            .await
-            .expect_err("should fail on API error");
-
-        match err {
-            StreamHandlerError::StreamFailed(outcome) => {
-                let s = outcome.to_string();
-                assert!(s.contains("connection lost"), "unexpected: {s}");
-            }
-            other => panic!("expected StreamFailed, got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn process_events_total_timeout() {
-        // Use a very short total timeout to trigger it immediately.
-        let handler = StreamHandler::new().with_config(
-            StreamTimeoutConfig {
-                total_stream_timeout: Duration::from_millis(1),
-                per_event_timeout: Duration::from_mins(5),
-                initial_event_timeout: Duration::from_mins(2),
-                max_consecutive_timeouts: 10,
-                progress_interval: Duration::from_secs(30),
-                fallback_to_non_streaming: false,
-            },
-            StreamRetryConfig::default(),
-        );
-        let cancel = Arc::new(CancelSignal::new());
-
-        // Set a total deadline in the past so it triggers immediately.
-        let deadline = Some(
-            Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .unwrap_or(Instant::now()),
-        );
-
-        // Use a stream that never produces events (pending forever).
-        let pending_stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
-        > = Box::pin(futures::stream::pending());
-
-        let err = handler
-            .process_events(pending_stream, &cancel, deadline)
-            .await
-            .expect_err("should fail on total timeout");
-
-        match err {
-            StreamHandlerError::StreamFailed(StreamOutcome::TotalTimeout { .. }) => {}
-            other => panic!("expected StreamFailed(TotalTimeout), got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn process_events_cancelled() {
-        let handler = StreamHandler::new().with_config(
-            StreamTimeoutConfig {
-                per_event_timeout: Duration::from_mins(5),
-                ..Default::default()
-            },
-            StreamRetryConfig::default(),
-        );
-        let cancel = Arc::new(CancelSignal::new());
-        cancel.cancel();
-
-        let pending_stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
-        > = Box::pin(futures::stream::pending());
-
-        let err = handler
-            .process_events(pending_stream, &cancel, None)
-            .await
-            .expect_err("should fail on cancellation");
-
-        assert!(
-            matches!(err, StreamHandlerError::Cancelled),
-            "expected Cancelled, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn process_events_empty_stream() {
-        // A stream that ends immediately (None) should produce an
-        // empty-but-successful result.
-        let handler = StreamHandler::new();
-        let cancel = Arc::new(CancelSignal::new());
-        let stream = event_stream(vec![]);
-
-        let result = handler
-            .process_events(stream, &cancel, None)
-            .await
-            .expect("empty stream should succeed");
-
-        assert!(!result.from_fallback);
     }
 
     struct HandlerMock {
@@ -2628,9 +2490,7 @@ mod tests {
 
         fn stream_messages(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> std::pin::Pin<
             Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
         > {
@@ -2640,9 +2500,7 @@ mod tests {
 
         fn create_message(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
         > {
@@ -2670,12 +2528,10 @@ mod tests {
         let client = HandlerMock::new().with_text_response("fallback works");
         let cancel = Arc::new(CancelSignal::new());
 
-        let result = handler
+        let (message, stop_reason) = handler
             .fallback_non_streaming(
                 &client,
-                vec![],
-                None,
-                None,
+                crate::api::StreamRequest::new(vec![]),
                 &cancel,
                 Some(StreamOutcome::InitFailed {
                     last_error: "stream failed".to_string(),
@@ -2685,8 +2541,19 @@ mod tests {
             .await
             .expect("fallback should succeed");
 
-        assert!(result.from_fallback);
-        assert_eq!(result.stop_reason, StreamStopReason::EndTurn);
+        // The fallback returns a Message built from the first text part of the
+        // non-streaming JSON response, plus the stop_reason from the JSON.
+        let text: String = message
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                crate::stream::MessagePart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains("fallback works"), "got: {text:?}");
+        // HandlerMock::with_text_response sets stop_reason: "end_turn".
+        assert_eq!(stop_reason, StreamStopReason::EndTurn);
     }
 
     #[tokio::test]
@@ -2703,7 +2570,12 @@ mod tests {
         cancel.cancel();
 
         let err = handler
-            .fallback_non_streaming(&client, vec![], None, None, &cancel, None)
+            .fallback_non_streaming(
+                &client,
+                crate::api::StreamRequest::new(vec![]),
+                &cancel,
+                None,
+            )
             .await
             .expect_err("should fail on cancellation");
 
@@ -2728,9 +2600,7 @@ mod tests {
         let err = handler
             .fallback_non_streaming(
                 &client,
-                vec![],
-                None,
-                None,
+                crate::api::StreamRequest::new(vec![]),
                 &cancel,
                 Some(StreamOutcome::InitFailed {
                     last_error: "stream timeout".to_string(),
@@ -2760,13 +2630,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_turn_yields_handler_event_stream_per_event() {
+        // Each raw stream event must arrive as a HandlerEvent::Stream, in
+        // arrival order, when driving the handler as a stream.
+        let handler = StreamHandler::new();
+        let client = HandlerMock::new().with_text_response("hello");
+        let cancel = Arc::new(CancelSignal::new());
+
+        let mut stream = handler.stream_turn(
+            &client,
+            crate::api::StreamRequest::new(vec![]),
+            crate::structured::RequestOptions::default(),
+            &cancel,
+        );
+        let mut saw_stream_events = 0;
+        let mut saw_attempt_reset = false;
+        let mut saw_fallback = false;
+        while let Some(item) = stream.next().await {
+            match item.expect("stream item ok") {
+                HandlerEvent::Stream(_) => saw_stream_events += 1,
+                HandlerEvent::AttemptReset => saw_attempt_reset = true,
+                HandlerEvent::Fallback { .. } => saw_fallback = true,
+            }
+        }
+        assert!(saw_stream_events > 0, "should yield Stream events");
+        assert!(!saw_attempt_reset, "happy path must not emit AttemptReset");
+        assert!(!saw_fallback, "happy path must not emit Fallback");
+    }
+
+    /// Mock that fails its first streaming attempt with a transport error,
+    /// then succeeds on the second. Used by the AttemptReset test to verify
+    /// the handler emits `AttemptReset` before the retried attempt's events.
+    struct RetryingMock {
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ApiClient for RetryingMock {
+        fn model(&self) -> String {
+            "retry-test".to_string()
+        }
+        fn base_url(&self) -> String {
+            "retry-test".to_string()
+        }
+        fn set_model(&self, _: &str) -> bool {
+            false
+        }
+        fn stream_messages(
+            &self,
+            request: crate::api::StreamRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+            self.stream_messages_with_options(request, crate::structured::RequestOptions::default())
+        }
+        fn create_message(
+            &self,
+            request: crate::api::StreamRequest,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+        > {
+            self.create_message_with_options(request, crate::structured::RequestOptions::default())
+        }
+        fn stream_messages_with_options(
+            &self,
+            _request: crate::api::StreamRequest,
+            _options: crate::structured::RequestOptions,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+            use std::sync::atomic::Ordering;
+            let n = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // First attempt: one event then transport error.
+                Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::MessageStart(MessageStart {
+                        message: MessageMetadata {
+                            id: String::new(),
+                            role: "assistant".into(),
+                            model: String::new(),
+                        },
+                    })),
+                    Err(ApiError::api("transient")),
+                ]))
+            } else {
+                // Second attempt: clean happy-path events.
+                Box::pin(futures::stream::iter(happy_stream_events()))
+            }
+        }
+        fn create_message_with_options(
+            &self,
+            _request: crate::api::StreamRequest,
+            _options: crate::structured::RequestOptions,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(serde_json::Value::Null) })
+        }
+        fn extract_structured(&self, _: &serde_json::Value) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_turn_yields_attempt_reset_on_retry() {
+        // A retried transport failure must emit AttemptReset before the
+        // retried attempt's events. Engine uses this to discard partial state.
+        use std::sync::atomic::AtomicUsize;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler = StreamHandler::new();
+        let client = RetryingMock { attempts };
+        let cancel = Arc::new(CancelSignal::new());
+
+        let mut stream = handler.stream_turn(
+            &client,
+            crate::api::StreamRequest::new(vec![]),
+            crate::structured::RequestOptions::default(),
+            &cancel,
+        );
+        let mut saw_attempt_reset = false;
+        while let Some(item) = stream.next().await {
+            if let HandlerEvent::AttemptReset = item.expect("stream item ok") {
+                saw_attempt_reset = true;
+            }
+        }
+        assert!(
+            saw_attempt_reset,
+            "second attempt must be preceded by AttemptReset"
+        );
+    }
+
+    #[tokio::test]
     async fn stream_turn_happy_path() {
         let handler = StreamHandler::new();
         let client = HandlerMock::new().with_text_response("hello world");
         let cancel = Arc::new(CancelSignal::new());
 
         let result = handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("stream_turn should succeed");
 
@@ -2782,7 +2779,7 @@ mod tests {
         cancel.cancel();
 
         let err = handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("should fail on cancellation");
 
@@ -2811,9 +2808,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -2823,9 +2818,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -2852,7 +2845,7 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let err = handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("should fail when streaming errors and fallback is disabled");
 
@@ -2864,6 +2857,126 @@ mod tests {
             }
             other => panic!("expected StreamFailed, got: {other}"),
         }
+    }
+
+    /// Mock that always fails streaming but succeeds on non-streaming
+    /// `create_message`. Used by the fallback regression test to verify the
+    /// handler yields `HandlerEvent::Fallback` with the message and stop_reason
+    /// extracted from the JSON response.
+    struct StreamingFailingFallbackMock;
+    impl ApiClient for StreamingFailingFallbackMock {
+        fn model(&self) -> String {
+            "fallback-test".to_string()
+        }
+        fn base_url(&self) -> String {
+            "fallback-test".to_string()
+        }
+        fn set_model(&self, _: &str) -> bool {
+            false
+        }
+        fn stream_messages(
+            &self,
+            _request: crate::api::StreamRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+            // Always fail streaming — forces the handler to retry, then
+            // fall back to create_message.
+            Box::pin(futures::stream::once(async {
+                Err(ApiError::api("stream down"))
+            }))
+        }
+        fn create_message(
+            &self,
+            _request: crate::api::StreamRequest,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+        > {
+            Box::pin(async {
+                Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": "fallback answer"}],
+                    "stop_reason": "max_tokens",
+                }))
+            })
+        }
+        fn stream_messages_with_options(
+            &self,
+            _request: crate::api::StreamRequest,
+            _options: crate::structured::RequestOptions,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+            Box::pin(futures::stream::once(async {
+                Err(ApiError::api("stream down"))
+            }))
+        }
+        fn create_message_with_options(
+            &self,
+            _request: crate::api::StreamRequest,
+            _options: crate::structured::RequestOptions,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+        > {
+            Box::pin(async {
+                Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": "fallback answer"}],
+                    "stop_reason": "max_tokens",
+                }))
+            })
+        }
+        fn extract_structured(&self, _: &serde_json::Value) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_turn_returns_fallback_message_and_stop_reason() {
+        // When streaming fails after retries and fallback is enabled, the
+        // engine should see the fallback message and the stop_reason from the
+        // non-streaming JSON response (not the streaming accumulator's stale
+        // values). Regression test for an earlier bug where Fallback dropped
+        // stop_reason.
+        let handler = StreamHandler::new().with_config(
+            StreamTimeoutConfig {
+                fallback_to_non_streaming: true,
+                ..Default::default()
+            },
+            StreamRetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            },
+        );
+        let client = StreamingFailingFallbackMock;
+        let cancel = Arc::new(CancelSignal::new());
+
+        let result = handler
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .await
+            .expect("fallback should succeed");
+
+        assert!(
+            result.from_fallback,
+            "result should be marked from_fallback"
+        );
+        // Stop reason comes from the JSON's "max_tokens", not the streaming
+        // default "end_turn".
+        assert_eq!(
+            result.stop_reason,
+            StreamStopReason::MaxTokens,
+            "fallback stop_reason must come from the JSON response"
+        );
+        let text: String = result
+            .message
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                crate::stream::MessagePart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.contains("fallback answer"),
+            "fallback message text, got {text:?}"
+        );
+        // Usage is None on the fallback path (non-streaming JSON doesn't
+        // reliably carry token counts).
+        assert!(result.usage.is_none());
     }
 
     #[test]
@@ -3086,69 +3199,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_event_extracts_stop_reason_and_accumulates() {
-        let mut accumulator = StreamAccumulator::new();
-        let mut stop_reason = StreamStopReason::EndTurn;
-
-        StreamHandler::apply_event(
-            &StreamEvent::MessageStart(MessageStart {
-                message: MessageMetadata {
-                    id: "msg".to_string(),
-                    role: "assistant".to_string(),
-                    model: "m".to_string(),
-                },
-            }),
-            &mut accumulator,
-            &mut stop_reason,
-        )
-        .expect("MessageStart should accumulate");
-        StreamHandler::apply_event(
-            &StreamEvent::PartStart(PartStart {
-                index: 0,
-                part: Some(crate::stream::MessagePart::text("")),
-            }),
-            &mut accumulator,
-            &mut stop_reason,
-        )
-        .expect("PartStart should accumulate");
-
-        let result = StreamHandler::apply_event(
-            &StreamEvent::MessageDelta(MessageDelta {
-                delta: MessageDeltaPayload {
-                    stop_reason: Some("end_turn".to_string()),
-                },
-                usage: None,
-            }),
-            &mut accumulator,
-            &mut stop_reason,
-        );
-        assert!(result.is_ok());
-        assert_eq!(stop_reason, StreamStopReason::EndTurn);
-
-        let message = accumulator.build();
-        assert_eq!(message.role, crate::message::Role::Assistant);
-    }
-
-    #[test]
-    fn apply_event_unknown_stop_reason_keeps_prior() {
-        let mut accumulator = StreamAccumulator::new();
-        let mut stop_reason = StreamStopReason::ToolCall;
-
-        StreamHandler::apply_event(
-            &StreamEvent::MessageDelta(MessageDelta {
-                delta: MessageDeltaPayload {
-                    stop_reason: Some("not_a_real_reason".to_string()),
-                },
-                usage: None,
-            }),
-            &mut accumulator,
-            &mut stop_reason,
-        )
-        .expect("apply_event should not error on an out-of-context delta");
-        assert_eq!(stop_reason, StreamStopReason::ToolCall);
-    }
-
-    #[test]
     fn detected_rate_limit_from_structured_variant() {
         let err = ApiError::RateLimit {
             retry_after: Some(Duration::from_secs(7)),
@@ -3209,117 +3259,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn process_events_rate_limit_mid_stream() {
-        let handler = StreamHandler::new();
-        let cancel = Arc::new(CancelSignal::new());
-        let events = vec![
-            Ok(StreamEvent::MessageStart(MessageStart {
-                message: MessageMetadata {
-                    id: "msg_test".to_string(),
-                    role: "assistant".to_string(),
-                    model: "test-model".to_string(),
-                },
-            })),
-            Err(ApiError::RateLimit {
-                retry_after: Some(Duration::from_secs(4)),
-                message: "slow down".into(),
-            }),
-        ];
-        let stream = event_stream(events);
-
-        let err = handler
-            .process_events(stream, &cancel, None)
-            .await
-            .expect_err("rate-limit error should fail the stream");
-
-        match err {
-            StreamHandlerError::StreamFailed(StreamOutcome::RateLimited {
-                detail,
-                has_partial_data,
-                ..
-            }) => {
-                assert_eq!(detail.kind, RateLimitKind::RateLimited);
-                assert_eq!(detail.retry_after, Some(Duration::from_secs(4)));
-                assert!(!has_partial_data, "MessageStart carries no parts");
-            }
-            other => panic!("expected RateLimited outcome, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn process_events_rate_limit_with_partial_data() {
-        let handler = StreamHandler::new();
-        let cancel = Arc::new(CancelSignal::new());
-        let events = vec![
-            Ok(StreamEvent::MessageStart(MessageStart {
-                message: MessageMetadata {
-                    id: "msg_test".to_string(),
-                    role: "assistant".to_string(),
-                    model: "test-model".to_string(),
-                },
-            })),
-            Ok(StreamEvent::PartStart(PartStart {
-                index: 0,
-                part: Some(crate::stream::MessagePart::text("partial")),
-            })),
-            Ok(StreamEvent::IndexedDelta(IndexedDelta {
-                index: 0,
-                delta: DeltaPart::Text {
-                    text: " response".into(),
-                },
-            })),
-            Ok(StreamEvent::PartStop),
-            Err(ApiError::http_with_status(503, "overloaded")),
-        ];
-        let stream = event_stream(events);
-
-        let err = handler
-            .process_events(stream, &cancel, None)
-            .await
-            .expect_err("503 should fail the stream");
-
-        match err {
-            StreamHandlerError::StreamFailed(StreamOutcome::RateLimited {
-                detail,
-                has_partial_data,
-                events_processed,
-            }) => {
-                assert_eq!(detail.kind, RateLimitKind::Overloaded);
-                assert!(has_partial_data, "PartStart+delta should count as partial");
-                assert!(events_processed >= 2, "at least 2 events processed");
-            }
-            other => panic!("expected RateLimited outcome, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn process_events_non_rate_error_still_init_failed() {
-        let handler = StreamHandler::new();
-        let cancel = Arc::new(CancelSignal::new());
-        let events: Vec<Result<StreamEvent, ApiError>> = vec![
-            Ok(StreamEvent::MessageStart(MessageStart {
-                message: MessageMetadata {
-                    id: "msg_test".to_string(),
-                    role: "assistant".to_string(),
-                    model: "test-model".to_string(),
-                },
-            })),
-            Err(ApiError::api("connection reset")),
-        ];
-        let stream = event_stream(events);
-
-        let err = handler
-            .process_events(stream, &cancel, None)
-            .await
-            .expect_err("should fail");
-
-        match err {
-            StreamHandlerError::StreamFailed(StreamOutcome::InitFailed { .. }) => {}
-            other => panic!("expected InitFailed for non-rate error, got: {other:?}"),
-        }
-    }
-
     #[test]
     fn stream_outcome_rate_limited_display() {
         let outcome = StreamOutcome::RateLimited {
@@ -3370,9 +3309,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> std::pin::Pin<
             Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
         > {
@@ -3380,9 +3317,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
         > {
@@ -3511,7 +3446,7 @@ mod tests {
         let start = Instant::now();
         for _ in 0..3 {
             handler
-                .stream_turn(&client, vec![], None, None, &cancel)
+                .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
                 .await
                 .expect("turn should succeed");
         }
@@ -3536,7 +3471,7 @@ mod tests {
         // First turn consumes the only token.
         let cancel = Arc::new(CancelSignal::new());
         handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("first turn should succeed");
 
@@ -3545,7 +3480,7 @@ mod tests {
         cancel2.cancel();
         let start = Instant::now();
         let err = handler
-            .stream_turn(&client, vec![], None, None, &cancel2)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel2)
             .await
             .expect_err("should be cancelled, not hang for 60s");
         let elapsed = start.elapsed();
@@ -3572,14 +3507,14 @@ mod tests {
 
         // First turn consumes the only token.
         handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("first turn should succeed");
 
         // Second turn: bucket empty, wait capped at 50ms, then proceeds.
         let start = Instant::now();
         let result = handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await;
         let elapsed = start.elapsed();
 
@@ -3606,9 +3541,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -3626,9 +3559,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -3662,7 +3593,7 @@ mod tests {
 
         let start = Instant::now();
         let result = handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("second attempt should succeed");
         let elapsed = start.elapsed();
@@ -3685,9 +3616,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -3700,9 +3629,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -3724,25 +3651,17 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let err = handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("should escalate, not succeed");
         match err {
             StreamHandlerError::RateLimitEscalation {
                 attempts,
                 retry_after,
-                prior,
             } => {
                 // fallback_after_retries == 2, so escalation fires on the 3rd hit.
                 assert_eq!(attempts, 3);
                 assert_eq!(retry_after, Some(Duration::from_millis(1)));
-                match prior {
-                    StreamOutcome::RateLimited { detail, .. } => {
-                        assert_eq!(detail.kind, RateLimitKind::RateLimited);
-                        assert_eq!(detail.retry_after, Some(Duration::from_millis(1)));
-                    }
-                    other => panic!("prior should be RateLimited, got {other:?}"),
-                }
             }
             other => panic!("expected RateLimitEscalation, got {other:?}"),
         }
@@ -3767,9 +3686,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -3786,9 +3703,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -3825,7 +3740,7 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let err = handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("should escalate after the rate-limit budget, not fall through");
         match err {
@@ -3849,9 +3764,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -3864,9 +3777,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -3889,7 +3800,7 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let err = handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("hard-stop should fail the turn");
         match err {
@@ -3917,9 +3828,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -3937,9 +3846,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -3963,7 +3870,7 @@ mod tests {
         };
         let cancel = Arc::new(CancelSignal::new());
         handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("first call should succeed after one rate-limit retry");
 
@@ -3973,7 +3880,7 @@ mod tests {
             attempts: AtomicUsize::new(0),
         };
         handler
-            .stream_turn(&client2, vec![], None, None, &cancel)
+            .drive_turn(&client2, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("second call should not see leaked rate-limit state");
     }
@@ -3989,9 +3896,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -4001,9 +3906,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -4030,7 +3933,7 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let err = handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("transport errors should fail");
         assert!(
@@ -4050,9 +3953,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -4065,9 +3966,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -4105,7 +4004,7 @@ mod tests {
 
         let start = Instant::now();
         let err = handler
-            .stream_turn(&client, vec![], None, None, &cancel)
+            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("tight total timeout should fail the turn");
         let elapsed = start.elapsed();
@@ -4131,9 +4030,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -4143,9 +4040,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -4174,7 +4069,11 @@ mod tests {
 
         let start = Instant::now();
         let err = handler
-            .stream_turn(&AlwaysFailingMock, vec![], None, None, &cancel)
+            .drive_turn(
+                &AlwaysFailingMock,
+                crate::api::StreamRequest::new(vec![]),
+                &cancel,
+            )
             .await
             .expect_err("should return Cancelled, not hang for 60s");
         let elapsed = start.elapsed();

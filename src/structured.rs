@@ -584,8 +584,13 @@ pub async fn request_structured<T: StructuredOutput + serde::de::DeserializeOwne
     system: Option<String>,
 ) -> Result<T, StructuredError> {
     let opts = RequestOptions::new().response_format(ResponseFormat::from_type::<T>());
+    let request = crate::api::StreamRequest {
+        messages,
+        system,
+        tools: None,
+    };
     let raw = client
-        .create_message_with_options(messages, system, None, opts)
+        .create_message_with_options(request, opts)
         .await
         .map_err(StructuredError::Api)?;
     let value = client.extract_structured(&raw);
@@ -729,9 +734,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<crate::tool::ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<
@@ -744,9 +747,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<crate::tool::ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
@@ -762,9 +763,8 @@ mod tests {
     async fn default_client_rejects_response_format() {
         let client = PlainMockClient;
         let opts = RequestOptions::new().response_format(ResponseFormat::from_type::<Action>());
-        let result = client
-            .create_message_with_options(vec![], None, None, opts)
-            .await;
+        let request = crate::api::StreamRequest::new(vec![]);
+        let result = client.create_message_with_options(request, opts).await;
         assert!(
             result.is_err(),
             "client without structured-output support should reject response_format"
@@ -780,9 +780,8 @@ mod tests {
     async fn default_client_delegates_empty_options() {
         let client = PlainMockClient;
         let opts = RequestOptions::new();
-        let result = client
-            .create_message_with_options(vec![], None, None, opts)
-            .await;
+        let request = crate::api::StreamRequest::new(vec![]);
+        let result = client.create_message_with_options(request, opts).await;
         assert!(result.is_ok(), "empty options should delegate normally");
     }
 
@@ -793,9 +792,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<crate::tool::ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<
@@ -808,9 +805,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<crate::tool::ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
@@ -822,9 +817,7 @@ mod tests {
         }
         fn create_message_with_options(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<crate::tool::ToolSchema>>,
+            _request: crate::api::StreamRequest,
             _options: RequestOptions,
         ) -> Pin<
             Box<
@@ -858,9 +851,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<crate::tool::ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<
@@ -873,9 +864,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<crate::tool::ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
@@ -887,9 +876,7 @@ mod tests {
         }
         fn create_message_with_options(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<crate::tool::ToolSchema>>,
+            _request: crate::api::StreamRequest,
             _options: RequestOptions,
         ) -> Pin<
             Box<

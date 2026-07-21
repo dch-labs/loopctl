@@ -88,6 +88,17 @@ pub struct GeminiClient {
     /// [`FallbackManager`](crate::fallback::FallbackManager) trips to a
     /// fallback model.
     model: std::sync::Mutex<String>,
+
+    /// Whether to request thought summaries from reasoning-capable models.
+    ///
+    /// When `true`, every request body gets
+    /// `generationConfig.thinkingConfig.includeThoughts = true`. The Gemini
+    /// API rejects `thinkingConfig` with `400 INVALID_ARGUMENT` on models
+    /// that don't support thinking, so this is opt-in — the caller must know
+    /// their model is reasoning-capable (e.g. Gemini 2.5 Pro/Flash, Gemini 3)
+    /// before enabling it. Defaults to `false`. Set via
+    /// [`GeminiClientBuilder::include_thoughts`].
+    include_thoughts: bool,
 }
 
 impl GeminiClient {
@@ -224,16 +235,20 @@ impl ApiClient for GeminiClient {
 
     fn stream_messages(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let body = build_request_body(
             &messages,
             system.as_deref(),
             tools.as_deref(),
             None,
             &ToolConstraint::None,
+            self.include_thoughts,
         );
         let url = self.stream_url();
         let http = self.http.clone();
@@ -259,16 +274,20 @@ impl ApiClient for GeminiClient {
 
     fn create_message(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let body = build_request_body(
             &messages,
             system.as_deref(),
             tools.as_deref(),
             None,
             &ToolConstraint::None,
+            self.include_thoughts,
         );
         let url = self.generate_url();
 
@@ -291,11 +310,14 @@ impl ApiClient for GeminiClient {
 
     fn stream_messages_with_options(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let rf = options.response_format.as_ref();
         let body = build_request_body(
             &messages,
@@ -303,6 +325,7 @@ impl ApiClient for GeminiClient {
             tools.as_deref(),
             rf,
             &options.tool_constraint,
+            self.include_thoughts,
         );
         let url = self.stream_url();
         let http = self.http.clone();
@@ -328,11 +351,14 @@ impl ApiClient for GeminiClient {
 
     fn create_message_with_options(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let response_format = options.response_format.as_ref();
         let body = build_request_body(
             &messages,
@@ -340,6 +366,7 @@ impl ApiClient for GeminiClient {
             tools.as_deref(),
             response_format,
             &options.tool_constraint,
+            self.include_thoughts,
         );
         let url = self.generate_url();
         Box::pin(async move {
@@ -406,6 +433,15 @@ pub struct GeminiClientBuilder {
     /// Separate from the total timeout so a slow-connecting server can be
     /// detected faster. Defaults to 10 seconds.
     connect_timeout: Duration,
+
+    /// Whether to opt into thought summaries from reasoning-capable models.
+    ///
+    /// When `true`, every request gets
+    /// `generationConfig.thinkingConfig.includeThoughts = true`. The Gemini
+    /// API rejects `thinkingConfig` on non-reasoning models with
+    /// `400 INVALID_ARGUMENT`, so this is `false` by default and the caller
+    /// must opt in once they know their model supports thinking.
+    include_thoughts: bool,
 }
 
 impl Default for GeminiClientBuilder {
@@ -416,6 +452,7 @@ impl Default for GeminiClientBuilder {
             model: DEFAULT_MODEL.into(),
             timeout: DEFAULT_REQUEST_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            include_thoughts: false,
         }
     }
 }
@@ -474,6 +511,24 @@ impl GeminiClientBuilder {
         self
     }
 
+    /// Opt into thought summaries from reasoning-capable models.
+    ///
+    /// When enabled, every request body gets
+    /// `generationConfig.thinkingConfig.includeThoughts = true`, which asks
+    /// Gemini to surface its reasoning alongside the visible answer. Only
+    /// reasoning-capable models (e.g. Gemini 2.5 Pro/Flash, Gemini 3) honor
+    /// this — non-reasoning models reject `thinkingConfig` with
+    /// `400 INVALID_ARGUMENT`, so this defaults to `false`.
+    ///
+    /// The response-side parser routes `thought: true` parts to
+    /// [`DeltaPart::Thinking`] regardless of this flag — it's purely the
+    /// request-side opt-in.
+    #[must_use]
+    pub fn include_thoughts(mut self, enabled: bool) -> Self {
+        self.include_thoughts = enabled;
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
@@ -494,6 +549,7 @@ impl GeminiClientBuilder {
             api_key,
             base_url: self.base_url,
             model: std::sync::Mutex::new(self.model),
+            include_thoughts: self.include_thoughts,
         })
     }
 }
@@ -507,15 +563,14 @@ impl GeminiClientBuilder {
 /// Unlike OpenAI/Anthropic, Gemini puts the model in the URL, not the
 /// request body. Each [`Message`] is serialized via [`convert_message`].
 ///
-/// `generationConfig` is always injected with
-/// `thinkingConfig.includeThoughts = true` so reasoning-capable models
-/// (Gemini 2.5+) surface thought parts in the streamed response;
-/// non-reasoning models ignore the flag.
+/// `generationConfig` is injected only when it has something to carry:
+/// `thinkingConfig.includeThoughts = true` when `include_thoughts` is set,
+/// and/or `responseMimeType` + `responseJsonSchema` when `response_format`
+/// is set. When neither applies, `generationConfig` is omitted entirely.
 ///
 /// Tool-call constraint:
-/// - When `response_format` is set, injects `responseMimeType` +
-///   `responseJsonSchema` into `generationConfig` and suppresses `tools`;
-///   `tool_constraint` is ignored in that case.
+/// - When `response_format` is set, suppresses `tools`; `tool_constraint`
+///   is ignored in that case.
 /// - Otherwise, when `tool_constraint` is `Strict`, each
 ///   `functionDeclaration`'s `parameters` is tightened
 ///   (`additionalProperties: false`, full `required`) via [`convert_tools`].
@@ -527,6 +582,7 @@ fn build_request_body(
     tools: Option<&[ToolSchema]>,
     response_format: Option<&crate::structured::ResponseFormat>,
     tool_constraint: &ToolConstraint,
+    include_thoughts: bool,
 ) -> Value {
     let (non_system, effective_system) = super::fold_system_messages(messages, system);
     let contents: Vec<Value> = non_system.iter().map(|m| convert_message(m)).collect();
@@ -551,17 +607,19 @@ fn build_request_body(
         }
 
         let mut generation_config = serde_json::Map::new();
-        generation_config.insert(
-            "thinkingConfig".into(),
-            serde_json::json!({ "includeThoughts": true }),
-        );
-
+        if include_thoughts {
+            generation_config.insert(
+                "thinkingConfig".into(),
+                serde_json::json!({ "includeThoughts": true }),
+            );
+        }
         if let Some(rf) = response_format {
             generation_config.insert("responseMimeType".into(), "application/json".into());
             generation_config.insert("responseJsonSchema".into(), rf.schema.clone());
         }
-
-        obj.insert("generationConfig".into(), Value::Object(generation_config));
+        if !generation_config.is_empty() {
+            obj.insert("generationConfig".into(), Value::Object(generation_config));
+        }
     }
 
     body
@@ -826,8 +884,11 @@ impl StreamEmitter {
     /// text parts in `candidates[0].content.parts[]`. Each part carries a
     /// `thought` boolean: `true` for reasoning (routed to
     /// [`DeltaPart::Thinking`]), absent or `false` for visible text (routed
-    /// to [`DeltaPart::Text`]). Both lanes open a [`PartStart`] on the first
-    /// non-empty fragment and are closed by
+    /// to [`DeltaPart::Text`]). Opening a lane after the other has been
+    /// streaming emits a [`PartStop`](StreamEvent::PartStop) for the previous
+    /// lane first — the downstream accumulator keys on a single active index,
+    /// so failing to close would let deltas for one lane clobber the other's
+    /// buffered state. Both lanes are closed by
     /// [`extract_finish_reason`](Self::extract_finish_reason).
     ///
     /// The `functionCall` part is skipped here — it's handled by
@@ -860,6 +921,10 @@ impl StreamEmitter {
                 .unwrap_or(false);
 
             if is_thought {
+                if self.text_part_open {
+                    self.text_part_open = false;
+                    self.push(StreamEvent::PartStop);
+                }
                 if !self.thinking_part_open {
                     self.thinking_part_open = true;
                     self.push(StreamEvent::PartStart(PartStart {
@@ -874,6 +939,10 @@ impl StreamEmitter {
                     },
                 }));
             } else {
+                if self.thinking_part_open {
+                    self.thinking_part_open = false;
+                    self.push(StreamEvent::PartStop);
+                }
                 if !self.text_part_open {
                     self.text_part_open = true;
                     self.push(StreamEvent::PartStart(PartStart {
@@ -910,6 +979,19 @@ impl StreamEmitter {
             let args = func_call.pointer("/args").cloned().unwrap_or(Value::Null);
             let args_str = serde_json::to_string(&args).unwrap_or_default();
 
+            // Function-call parts reuse TEXT_PART_INDEX. Close any open lane
+            // first so the downstream accumulator (single active index) sees
+            // a clean PartStart → PartStop window for the tool call rather
+            // than a clobbered buffer.
+            if self.thinking_part_open {
+                self.thinking_part_open = false;
+                self.push(StreamEvent::PartStop);
+            }
+            if self.text_part_open {
+                self.text_part_open = false;
+                self.push(StreamEvent::PartStop);
+            }
+
             self.push(StreamEvent::PartStart(PartStart {
                 index: TEXT_PART_INDEX,
                 part: Some(MessagePart::ToolCall {
@@ -933,24 +1015,31 @@ impl StreamEmitter {
     /// When present, closes any open thinking part and text part with
     /// [`PartStop`](StreamEvent::PartStop), then emits a
     /// [`MessageDelta`](StreamEvent::MessageDelta) carrying the mapped
-    /// [`StreamStopReason`]. Does nothing if the chunk has no finish reason.
+    /// [`StreamStopReason`]. No-op on a second `finishReason` chunk (the
+    /// `finished` guard defends against proxies/gateways that re-emit).
     fn extract_finish_reason(&mut self, json: &Value) {
+        if self.finished {
+            return;
+        }
         let Some(reason) = json
             .pointer("/candidates/0/finishReason")
             .and_then(Value::as_str)
         else {
             return;
         };
+        self.finished = true;
         let stop = match reason {
             "MAX_TOKENS" => StreamStopReason::MaxTokens,
             _ => StreamStopReason::EndTurn,
         };
 
         if self.thinking_part_open {
+            self.thinking_part_open = false;
             self.push(StreamEvent::PartStop);
         }
 
         if self.text_part_open {
+            self.text_part_open = false;
             self.push(StreamEvent::PartStop);
         }
 
@@ -1010,7 +1099,7 @@ mod tests {
     #[test]
     fn request_body_user_text() {
         let msgs = vec![Message::user("hello")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
 
         let contents = body["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 1);
@@ -1022,7 +1111,14 @@ mod tests {
     #[test]
     fn request_body_includes_system_instruction() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, Some("be brief"), None, None, &ToolConstraint::None);
+        let body = build_request_body(
+            &msgs,
+            Some("be brief"),
+            None,
+            None,
+            &ToolConstraint::None,
+            false,
+        );
 
         let sys = &body["systemInstruction"];
         assert!(sys.is_object());
@@ -1032,7 +1128,7 @@ mod tests {
     #[test]
     fn request_body_no_system_instruction_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
         assert!(body.get("systemInstruction").is_none());
     }
 
@@ -1042,14 +1138,14 @@ mod tests {
             Role::Assistant,
             vec![MessagePart::text("hello")],
         )];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
         assert_eq!(body["contents"][0]["role"], "model");
     }
 
     #[test]
     fn request_body_user_role() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
         assert_eq!(body["contents"][0]["role"], "user");
     }
 
@@ -1063,7 +1159,7 @@ mod tests {
                 input: serde_json::json!({"msg": "hi"}),
             }],
         )];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
 
         let parts = body["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["functionCall"]["name"], "echo");
@@ -1080,7 +1176,7 @@ mod tests {
                 is_error: None,
             }],
         )];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
 
         let parts = body["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["functionResponse"]["name"], "call_1");
@@ -1098,7 +1194,14 @@ mod tests {
             description: "Search the web".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
-        let body = build_request_body(&msgs, None, Some(&tools), None, &ToolConstraint::None);
+        let body = build_request_body(
+            &msgs,
+            None,
+            Some(&tools),
+            None,
+            &ToolConstraint::None,
+            false,
+        );
 
         let tools_arr = body["tools"].as_array().unwrap();
         assert_eq!(tools_arr.len(), 1);
@@ -1111,7 +1214,7 @@ mod tests {
     #[test]
     fn request_body_no_tools_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
         assert!(body.get("tools").is_none());
     }
 
@@ -1122,7 +1225,7 @@ mod tests {
             Message::new(Role::Assistant, vec![MessagePart::text("hi")]),
             Message::user("bye"),
         ];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
 
         let contents = body["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 3);
@@ -1438,6 +1541,11 @@ mod tests {
 
     #[test]
     fn emitter_thought_and_text_parts_interleave() {
+        // Gemini interleaves thought and text parts in the same parts[] array.
+        // When the lane changes the emitter closes the previous lane with a
+        // PartStop before opening the next, so the downstream accumulator
+        // (single active index) never sees one lane's deltas clobber the
+        // other's buffered state.
         let mut em = StreamEmitter::default();
         em.started = true;
 
@@ -1472,6 +1580,41 @@ mod tests {
             deltas[1].delta
         );
         assert_eq!(deltas[1].index, TEXT_PART_INDEX);
+        // The lane switch between the two deltas must emit exactly one
+        // PartStop for the thinking lane before the text PartStart.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::PartStop))
+                .count(),
+            1,
+            "lane switch must close the thinking lane"
+        );
+    }
+
+    #[test]
+    fn emitter_text_to_thought_lane_switch_emits_part_stop() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "visible", "thought": false}]}
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "thinking…", "thought": true}]}
+            }]
+        }));
+        let events = em.drain();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::PartStop))
+                .count(),
+            1,
+            "lane switch must close the text lane"
+        );
     }
 
     #[test]
@@ -1498,13 +1641,28 @@ mod tests {
     }
 
     #[test]
-    fn request_body_includes_thinking_config() {
+    fn request_body_includes_thinking_config_when_opted_in() {
+        // Opt-in: includeThoughts injected only when the caller asked for it.
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, true);
 
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["includeThoughts"], true,
-            "includeThoughts must be injected into generationConfig"
+            "includeThoughts must be injected when include_thoughts=true"
+        );
+    }
+
+    #[test]
+    fn request_body_omits_thinking_config_by_default() {
+        // Default: includeThoughts NOT injected (non-reasoning models reject
+        // it with 400 INVALID_ARGUMENT). generationConfig should be absent
+        // entirely when there's nothing else to put in it either.
+        let msgs = vec![Message::user("hi")];
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+
+        assert!(
+            body.get("generationConfig").is_none(),
+            "generationConfig must be omitted when include_thoughts=false and no response_format"
         );
     }
 
@@ -1516,7 +1674,7 @@ mod tests {
             "result",
             serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
         );
-        let body = build_request_body(&msgs, None, None, Some(&rf), &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, Some(&rf), &ToolConstraint::None, true);
 
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["includeThoughts"],
@@ -1575,6 +1733,105 @@ mod tests {
         } else {
             panic!("expected MessageDelta");
         }
+    }
+
+    #[test]
+    fn emitter_duplicate_finish_reason_is_noop() {
+        // A second finishReason chunk (e.g. from a proxy/gateway that re-emits)
+        // must not produce duplicate PartStop / MessageDelta events.
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "hi"}]}}]
+        }));
+        em.drain();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let first = em.drain();
+        let first_deltas = first
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::MessageDelta(_)))
+            .count();
+        let first_stops = first
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .count();
+
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let second = em.drain();
+
+        assert_eq!(first_deltas, 1, "first finishReason emits one MessageDelta");
+        assert_eq!(first_stops, 1, "first finishReason emits one PartStop");
+        assert!(
+            second.is_empty(),
+            "second finishReason must produce no events, got {second:?}"
+        );
+    }
+
+    #[test]
+    fn emitter_function_call_after_text_closes_text_lane() {
+        // When a functionCall arrives after the text lane has been streaming,
+        // the emitter must close the text lane with a PartStop before opening
+        // the tool part. Both reuse TEXT_PART_INDEX; without the close the
+        // accumulator would clobber the text buffer with tool state.
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "calling tool", "thought": false}]}
+            }]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"functionCall": {"name": "search", "args": {"q": "rust"}}}]
+                }
+            }]
+        }));
+        let events = em.drain();
+
+        // Exactly one PartStop for the text lane (between the text delta and
+        // the tool PartStart).
+        let stops = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .count();
+        assert_eq!(stops, 1, "text lane must be closed before tool PartStart");
+
+        // Ordering: TextDelta → PartStop → tool PartStart.
+        let text_delta_idx = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    StreamEvent::IndexedDelta(IndexedDelta {
+                        delta: DeltaPart::Text { .. },
+                        ..
+                    })
+                )
+            })
+            .expect("Text delta present");
+        let stop_idx = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::PartStop))
+            .expect("PartStop present");
+        let tool_start_idx = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    StreamEvent::PartStart(PartStart {
+                        part: Some(MessagePart::ToolCall { .. }),
+                        ..
+                    })
+                )
+            })
+            .expect("Tool PartStart present");
+        assert!(text_delta_idx < stop_idx, "text delta before PartStop");
+        assert!(stop_idx < tool_start_idx, "PartStop before tool PartStart");
     }
 
     #[test]
@@ -1683,6 +1940,28 @@ mod tests {
         assert!(client.is_ok(), "build should succeed with valid timeouts");
     }
 
+    #[test]
+    fn builder_include_thoughts_defaults_false() {
+        let client = GeminiClient::builder().api_key("test-key").build().unwrap();
+        assert!(
+            !client.include_thoughts,
+            "include_thoughts must default to false (non-reasoning models reject thinkingConfig)"
+        );
+    }
+
+    #[test]
+    fn builder_include_thoughts_true_propagates_to_client() {
+        let client = GeminiClient::builder()
+            .api_key("test-key")
+            .include_thoughts(true)
+            .build()
+            .unwrap();
+        assert!(
+            client.include_thoughts,
+            "include_thoughts(true) must propagate to the built client"
+        );
+    }
+
     #[tokio::test]
     async fn sse_reader_take_line_splits_on_newline() {
         let mut reader = SseReader {
@@ -1755,7 +2034,7 @@ mod tests {
             "result",
             serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
         );
-        let body = build_request_body(&msgs, None, None, Some(&rf), &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, Some(&rf), &ToolConstraint::None, false);
 
         assert_eq!(
             body["generationConfig"]["responseMimeType"],
@@ -1768,19 +2047,15 @@ mod tests {
     }
 
     #[test]
-    fn request_body_response_format_absent_when_none() {
+    fn request_body_generation_config_omitted_when_nothing_applies() {
+        // Without response_format AND include_thoughts=false, generationConfig
+        // has nothing to carry, so it must be absent entirely.
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
-        let gc = body
-            .get("generationConfig")
-            .expect("generationConfig must be present for thinkingConfig");
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+
         assert!(
-            gc.get("responseMimeType").is_none(),
-            "responseMimeType must be absent without response_format"
-        );
-        assert!(
-            gc.get("responseJsonSchema").is_none(),
-            "responseJsonSchema must be absent without response_format"
+            body.get("generationConfig").is_none(),
+            "generationConfig must be omitted when there's nothing to put in it"
         );
     }
 
@@ -1800,6 +2075,7 @@ mod tests {
             Some(&[caller_tool]),
             Some(&rf),
             &ToolConstraint::None,
+            false,
         );
 
         assert!(
@@ -1851,7 +2127,14 @@ mod tests {
                 "properties": {"msg": {"type": "string"}}
             }),
         }];
-        let body = build_request_body(&msgs, None, Some(&tools), None, &ToolConstraint::Strict);
+        let body = build_request_body(
+            &msgs,
+            None,
+            Some(&tools),
+            None,
+            &ToolConstraint::Strict,
+            false,
+        );
 
         let decls = body["tools"][0]["functionDeclarations"].as_array().unwrap();
         assert_eq!(decls.len(), 1);
@@ -1871,7 +2154,14 @@ mod tests {
             description: "Echo".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
-        let body = build_request_body(&msgs, None, Some(&tools), None, &ToolConstraint::None);
+        let body = build_request_body(
+            &msgs,
+            None,
+            Some(&tools),
+            None,
+            &ToolConstraint::None,
+            false,
+        );
 
         let decls = body["tools"][0]["functionDeclarations"].as_array().unwrap();
         assert_eq!(
@@ -1899,6 +2189,7 @@ mod tests {
             Some(&[caller_tool]),
             Some(&rf),
             &ToolConstraint::Strict,
+            false,
         );
 
         assert!(
@@ -1916,7 +2207,14 @@ mod tests {
             description: "Echo".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
-        let body = build_request_body(&msgs, None, Some(&tools), None, &ToolConstraint::Strict);
+        let body = build_request_body(
+            &msgs,
+            None,
+            Some(&tools),
+            None,
+            &ToolConstraint::Strict,
+            false,
+        );
 
         assert!(
             body.get("toolConfig").is_none(),
@@ -1937,7 +2235,7 @@ mod tests {
             system_role_msg("stay on task"),
             Message::assistant("working"),
         ];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
 
         let contents = body["contents"].as_array().expect("contents is an array");
         assert_eq!(contents.len(), 2, "system-role message is filtered out");
@@ -1957,7 +2255,14 @@ mod tests {
     #[test]
     fn request_body_system_role_merges_with_caller_system() {
         let msgs = vec![Message::user("hi"), system_role_msg("reminder")];
-        let body = build_request_body(&msgs, Some("be brief"), None, None, &ToolConstraint::None);
+        let body = build_request_body(
+            &msgs,
+            Some("be brief"),
+            None,
+            None,
+            &ToolConstraint::None,
+            false,
+        );
 
         let sys_text = body["systemInstruction"]["parts"][0]["text"]
             .as_str()
@@ -1984,7 +2289,7 @@ mod tests {
             Message::assistant("second"),
             Message::user("third"),
         ];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
         let contents = body["contents"].as_array().expect("contents is an array");
         let roles: Vec<&str> = contents
             .iter()

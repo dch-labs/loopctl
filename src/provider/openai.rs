@@ -223,10 +223,13 @@ impl ApiClient for OpenAiClient {
 
     fn stream_messages(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let body = RequestBody::build(
             &model,
@@ -263,10 +266,13 @@ impl ApiClient for OpenAiClient {
 
     fn create_message(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let body = RequestBody::build(
             &model,
@@ -299,11 +305,14 @@ impl ApiClient for OpenAiClient {
 
     fn stream_messages_with_options(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = RequestBody::build(
@@ -341,11 +350,14 @@ impl ApiClient for OpenAiClient {
 
     fn create_message_with_options(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = RequestBody::build(
@@ -1056,16 +1068,24 @@ impl StreamEmitter {
         }
     }
 
-    /// Translate a single delta object into text and/or tool-call events.
+    /// Translate a single delta object into text and/or reasoning events.
     ///
     /// If the delta carries non-empty `content`, emits a `PartStart` (on the
     /// first text delta) followed by `IndexedDelta(Text)` events. If it
-    /// carries `tool_calls`, delegates each to
+    /// carries non-empty `reasoning_content`, the same shape is emitted for
+    /// the reasoning lane. Switching lanes emits a `PartStop` for the previous
+    /// lane first — the downstream accumulator keys on a single active index,
+    /// so leaving both open would let one lane's deltas clobber the other's
+    /// buffered state. If it carries `tool_calls`, delegates each to
     /// [`process_tool_call`](Self::process_tool_call).
     fn process_delta(&mut self, delta: &OpenAiDelta) {
         if let Some(text) = &delta.content
             && !text.is_empty()
         {
+            if self.thinking_part_open {
+                self.thinking_part_open = false;
+                self.push(StreamEvent::PartStop);
+            }
             if !self.text_part_open {
                 self.text_part_open = true;
                 self.push(StreamEvent::PartStart(PartStart {
@@ -1082,6 +1102,10 @@ impl StreamEmitter {
         if let Some(reasoning) = &delta.reasoning_content
             && !reasoning.is_empty()
         {
+            if self.text_part_open {
+                self.text_part_open = false;
+                self.push(StreamEvent::PartStop);
+            }
             if !self.thinking_part_open {
                 self.thinking_part_open = true;
                 self.push(StreamEvent::PartStart(PartStart {
@@ -2242,5 +2266,83 @@ mod tests {
         });
         assert!(has_thinking, "a Thinking delta should have fired");
         assert!(has_text, "a Text delta should have fired");
+
+        // The lane switch from reasoning to text must emit exactly one
+        // PartStop for the reasoning lane before the text PartStart. Without
+        // it the downstream accumulator (which keys on a single active index)
+        // would let text deltas clobber the reasoning lane's state.
+        let lane_switch_stops = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .count();
+        assert_eq!(
+            lane_switch_stops, 1,
+            "lane switch must close the reasoning lane with one PartStop"
+        );
+    }
+
+    #[test]
+    fn openai_combined_content_and_reasoning_in_one_delta() {
+        // A single delta object can carry both content and reasoning_content.
+        // process_delta handles content first (closing thinking if open), then
+        // reasoning (closing text if open). Lock in the expected sequence:
+        // PartStart(text) → TextDelta → PartStop → PartStart(thinking) →
+        // ThinkingDelta.
+        let mut em = StreamEmitter::default();
+        let chunk = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"o1","choices":[{"delta":{"content":"answer","reasoning_content":"why"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&chunk);
+        let events = em.drain();
+
+        let has_text = events.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Text { ref text } if text == "answer")
+            )
+        });
+        let has_thinking = events.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Thinking { ref text } if text == "why")
+            )
+        });
+        assert!(has_text, "text delta must fire");
+        assert!(has_thinking, "thinking delta must fire");
+
+        // The reasoning lane opens after the text lane, so the text lane must
+        // be closed with exactly one PartStop between them.
+        let stops = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .count();
+        assert_eq!(stops, 1, "exactly one PartStop for the text lane");
+
+        // Ordering: TextDelta → PartStop → ThinkingDelta.
+        let text_idx = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Text { .. })
+                )
+            })
+            .expect("text delta present");
+        let stop_idx = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::PartStop))
+            .expect("PartStop present");
+        let thinking_idx = events
+            .iter()
+            .rposition(|e| {
+                matches!(
+                    e,
+                    StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Thinking { .. })
+                )
+            })
+            .expect("thinking delta present");
+        assert!(text_idx < stop_idx, "text delta before PartStop");
+        assert!(stop_idx < thinking_idx, "PartStop before thinking delta");
     }
 }

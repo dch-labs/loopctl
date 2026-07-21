@@ -635,20 +635,18 @@ impl ApiClient for MockApiClient {
     ///
     /// ```rust
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-    /// use loopctl::api::ApiClient;
+    /// use loopctl::api::{ApiClient, StreamRequest};
     /// use loopctl::testing::MockApiClient;
     ///
     /// let client = MockApiClient::new("test-model").with_text_response("Hi!");
-    /// let stream = client.stream_messages(vec![], None, None);
+    /// let stream = client.stream_messages(StreamRequest::new(vec![]));
     /// let events: Vec<_> = futures::StreamExt::collect(stream).await;
     /// assert!(events.len() >= 4);
     /// # });
     /// ```
     fn stream_messages(
         &self,
-        _messages: Vec<Message>,
-        _system: Option<String>,
-        _tools: Option<Vec<ToolSchema>>,
+        _request: crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
         if let Some(ref err) = self.error {
             let err = err.clone();
@@ -715,26 +713,23 @@ impl ApiClient for MockApiClient {
     /// future resolves to an [`ApiError`] instead, bypassing the
     /// response queue entirely.
     ///
-    /// The `_messages`, `_system`, and `_tools` parameters are accepted
-    /// for trait compatibility but ignored.
+    /// The `_request` parameter is accepted for trait compatibility but ignored.
     ///
     /// # Example
     ///
     /// ```rust
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-    /// use loopctl::api::ApiClient;
+    /// use loopctl::api::{ApiClient, StreamRequest};
     /// use loopctl::testing::MockApiClient;
     ///
     /// let client = MockApiClient::new("test-model").with_text_response("Hi!");
-    /// let result = client.create_message(vec![], None, None).await;
+    /// let result = client.create_message(StreamRequest::new(vec![])).await;
     /// assert_eq!(result.unwrap()["content"][0]["text"], "Hi!");
     /// # });
     /// ```
     fn create_message(
         &self,
-        _messages: Vec<Message>,
-        _system: Option<String>,
-        _tools: Option<Vec<ToolSchema>>,
+        _request: crate::api::StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
         if let Some(ref err) = self.error {
             let err = err.clone();
@@ -1451,7 +1446,11 @@ mod tests {
     #[tokio::test]
     async fn test_mock_client_default_response() {
         let client = MockApiClient::new("test-model");
-        let stream = client.stream_messages(vec![Message::user("Hi")], None, None);
+        let stream = client.stream_messages(crate::api::StreamRequest {
+            messages: vec![Message::user("Hi")],
+            system: None,
+            tools: None,
+        });
         let events: Vec<_> = stream.collect().await;
         assert!(events.len() >= 4);
         assert!(events[0].is_ok());
@@ -1460,7 +1459,11 @@ mod tests {
     #[tokio::test]
     async fn test_mock_client_custom_text() {
         let client = MockApiClient::new("test-model").with_text_response("Custom response");
-        let stream = client.stream_messages(vec![Message::user("Hi")], None, None);
+        let stream = client.stream_messages(crate::api::StreamRequest {
+            messages: vec![Message::user("Hi")],
+            system: None,
+            tools: None,
+        });
         let events: Vec<_> = stream.collect().await;
         let has_text = events.iter().any(|e| {
             if let Ok(StreamEvent::IndexedDelta(delta)) = e
@@ -1480,7 +1483,11 @@ mod tests {
             "echo",
             json!({"message": "hi"}),
         );
-        let stream = client.stream_messages(vec![Message::user("Hi")], None, None);
+        let stream = client.stream_messages(crate::api::StreamRequest {
+            messages: vec![Message::user("Hi")],
+            system: None,
+            tools: None,
+        });
         let events: Vec<_> = stream.collect().await;
 
         let has_tool_use = events.iter().any(|e| {
@@ -1506,7 +1513,11 @@ mod tests {
     #[tokio::test]
     async fn test_mock_client_error() {
         let client = MockApiClient::new("test-model").with_error("API error");
-        let stream = client.stream_messages(vec![Message::user("Hi")], None, None);
+        let stream = client.stream_messages(crate::api::StreamRequest {
+            messages: vec![Message::user("Hi")],
+            system: None,
+            tools: None,
+        });
         let events: Vec<_> = stream.collect().await;
         assert_eq!(events.len(), 1);
         assert!(events[0].is_err());
@@ -1527,7 +1538,11 @@ mod tests {
             },
         ]);
 
-        let stream1 = client.stream_messages(vec![Message::user("Hi")], None, None);
+        let stream1 = client.stream_messages(crate::api::StreamRequest {
+            messages: vec![Message::user("Hi")],
+            system: None,
+            tools: None,
+        });
         let events1: Vec<_> = stream1.collect().await;
         let has_first = events1.iter().any(|e| {
             if let Ok(StreamEvent::IndexedDelta(delta)) = e
@@ -1539,7 +1554,11 @@ mod tests {
         });
         assert!(has_first);
 
-        let stream2 = client.stream_messages(vec![Message::user("Hi")], None, None);
+        let stream2 = client.stream_messages(crate::api::StreamRequest {
+            messages: vec![Message::user("Hi")],
+            system: None,
+            tools: None,
+        });
         let events2: Vec<_> = stream2.collect().await;
         let has_second = events2.iter().any(|e| {
             if let Ok(StreamEvent::IndexedDelta(delta)) = e
@@ -1556,7 +1575,11 @@ mod tests {
     async fn test_mock_client_create_message() {
         let client = MockApiClient::new("test-model").with_text_response("Hello!");
         let result = client
-            .create_message(vec![Message::user("Hi")], None, None)
+            .create_message(crate::api::StreamRequest {
+                messages: vec![Message::user("Hi")],
+                system: None,
+                tools: None,
+            })
             .await;
         assert!(result.is_ok());
         let json = result.unwrap();

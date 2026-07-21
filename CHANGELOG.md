@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Added
 
+- `DeltaPart::Thinking { text }` variant + `on_thinking_delta` observer event
+  (`ThinkingDeltaContext`): reasoning-model tokens (Claude extended-thinking,
+  DeepSeek-R1, OpenAI o-series, Gemini 2.5+) are now routed as their own
+  stream kind instead of being dropped or misrouted into text. Stream-only —
+  reasoning is not accumulated into the `Message` and does not reach
+  `ResponseContext.text`; consume it via `on_thinking_delta` or the raw
+  `IndexedDelta(Thinking)` stream event. Anthropic parses `thinking_delta`
+  (and emits an empty Thinking delta for `redacted_thinking`); OpenAI parses
+  `reasoning_content` (aliased to `reasoning`); Gemini parses per-part
+  `thought: true` flags. An empty `delta` signals redacted reasoning (render
+  a placeholder). For Gemini, `GeminiClientBuilder::include_thoughts(true)`
+  opts into `generationConfig.thinkingConfig.includeThoughts` on the request
+  side — opt-in because the Gemini API rejects `thinkingConfig` with
+  `400 INVALID_ARGUMENT` on non-reasoning models; defaults to `false`.
 - `DisplayHint` advisory rendering hint on `ToolOutput` (`with_hint()` builder),
   threaded through `ToolDispatchResult` and `ToolPostContext` so presentation
   layers (TUI, headless console) can render a tool result by the tool's own
@@ -35,8 +49,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   `RequestOptions` (carrying `tool_constraint`) applied to every provider call.
   Default is `RequestOptions::default()` (no constraint), reproducing prior
   behavior.
-- `StreamHandler::with_request_options(opts)` builder: the same option applied
-  to the handler's stream-open call.
+- `StreamHandler::passthrough()` constructor + `passthrough_default()` — a
+  no-resilience handler (no retries, no timeouts, no fallback) used as the
+  engine default when no handler is configured.
+- `HandlerEvent` enum (`stream::handler`): events yielded by the new
+  stream-based `StreamHandler::stream_turn`. Variants: `Stream(StreamEvent)`
+  for raw provider events, `AttemptReset` on retry, `Fallback { message,
+  stop_reason }` on non-streaming fallback.
+- `StreamRequest` struct (`api`): bundles `(messages, system, tools)` into a
+  single parameter for `ApiClient` methods. Replaces the positional
+  `(Vec<Message>, Option<String>, Option<Vec<ToolSchema>>)` parameter lists on
+  `stream_messages`, `create_message`, and their `_with_options` variants.
+  Builders: `new`, `system`, `system_opt`, `tools`, `tools_opt`.
+- `GeminiClientBuilder::include_thoughts(bool)` builder: opt into Gemini's
+  `thinkingConfig.includeThoughts` for reasoning-capable models (2.5 Pro/Flash,
+  Gemini 3). Defaults to `false` — the Gemini API rejects `thinkingConfig`
+  with `400 INVALID_ARGUMENT` on non-reasoning models, so the caller must opt
+  in once they know their model supports thinking.
 - `ContextContributor` trait and `ContributorContext<'a>` (`engine::contributor`
   module): a write-side hook at the turn boundary. Implementors return an
   optional `Message` that the loop appends to the conversation before the next
@@ -53,10 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 - `LoopError::RateLimitEscalation { attempts, retry_after }` variant,
   recoverable, raised when the stream handler exhausts rate-limit retries on a
   model and escalates to the circuit breaker.
-- `StreamHandlerError::RateLimitEscalation { attempts, retry_after, prior }`
+- `StreamHandlerError::RateLimitEscalation { attempts, retry_after }`
   variant. After `RateLimitConfig::fallback_after_retries` rate-limit retries,
-  `stream_turn` returns this instead of looping indefinitely or falling back to
-  the same model's non-streaming endpoint.
+  `stream_turn` yields this as a stream error instead of looping
+  indefinitely or falling back to the same model's non-streaming endpoint.
 - Rate-limit backoff sleeps are now clamped to the turn's `total_stream_timeout`
   so a large `Retry-After` cannot overrun the turn budget.
 - The engine routes `RateLimitEscalation` to
@@ -135,6 +164,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Changed
 
+- **Breaking:** `stream::DeltaPart` is now `#[non_exhaustive]`. Every
+  `match` on `DeltaPart` in downstream code must include a `_ =>` wildcard arm
+  — handling `Thinking` explicitly is optional but does not replace the
+  wildcard requirement. Same-crate matches are unaffected. Future variant
+  additions (e.g. `Image`, `Audio`) will arrive non-breaking.
+- **Breaking:** `ApiClient::stream_messages`, `stream_messages_with_options`,
+  `create_message`, and `create_message_with_options` now take a single
+  `StreamRequest` parameter instead of positional `(messages, system, tools)`.
+  Every `impl ApiClient` must update its signatures.
+- **Breaking:** `StreamHandler::stream_turn` now returns
+  `impl Stream<Item = Result<HandlerEvent, StreamHandlerError>>` instead of
+  `Future<Result<StreamTurnResult, _>>`. Callers must drive the stream and
+  accumulate events themselves. The engine's `stream_turn` does this internally
+  and fires observer callbacks (`on_text_delta`, `on_thinking_delta`,
+  `text_streamer`) per event — configuring a `StreamHandler` for resilience no
+  longer drops real-time observability.
+- **Breaking:** `StreamCapable::stream_handler` now returns `&StreamHandler`
+  (not `Option<&StreamHandler>`). When no handler is configured, returns a
+  shared `StreamHandler::passthrough_default()` (no-resilience default).
+- **Breaking:** `StreamHandlerError::RateLimitEscalation` lost its `prior`
+  field. The variant is now `{ attempts, retry_after }`.
+- **Breaking:** `StreamHandler::stream_turn` now takes `options:
+  RequestOptions` as an explicit parameter. `StreamHandler::with_request_options`
+  is removed — use `BareLoop::set_request_options` instead.
 - **Breaking:** `ToolOutput`, `ToolDispatchResult`, and `ToolPostContext` are
   now `#[non_exhaustive]`, matching `DisplayHint`. Downstream code that
   constructs these via struct literal must switch to the named constructors
@@ -193,6 +246,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   between calls. Previously, a Ctrl-C during a multi-tool batch was only
   honored at the next turn boundary; now it aborts the remaining calls in the
   batch.
+
+### Removed
+
+- `StreamTurnResult` (the handler no longer accumulates; the engine assembles
+  the result from the event stream).
+- `StreamHandler::with_request_options` builder (options now flow via
+  `stream_turn`'s parameter; configure via `BareLoop::set_request_options`).
+- `StreamHandlerError::RateLimitEscalation.prior: StreamOutcome` field (never
+  read by any consumer).
 
 ## [0.1.0] - 2025-07-01
 

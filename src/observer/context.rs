@@ -223,6 +223,44 @@ pub struct TextDeltaContext {
     pub delta: String,
 }
 
+/// Context for [`LoopObserver::on_thinking_delta`](crate::observer::LoopObserver::on_thinking_delta).
+///
+/// Carries one incremental reasoning ("thinking") chunk. Parallel in shape to
+/// [`TextDeltaContext`]: same fields, same lifetime semantics (concatenate in
+/// arrival order per turn to reconstruct the full reasoning trace). Reasoning
+/// is distinct from the assistant's visible text and is never included in
+/// [`ResponseContext`].
+///
+/// # Redacted reasoning
+///
+/// An empty `delta` signals redacted reasoning (e.g. Anthropic
+/// `redacted_thinking`) — the provider withheld the content. Consumers should
+/// render a placeholder ("reasoning redacted"), not the empty string.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::observer::ThinkingDeltaContext;
+///
+/// let ctx = ThinkingDeltaContext { turn: 0, delta: "considering options…".to_string() };
+/// assert_eq!(ctx.turn, 0);
+/// assert_eq!(ctx.delta, "considering options…");
+/// ```
+#[derive(Debug, Clone)]
+pub struct ThinkingDeltaContext {
+    /// Turn number (0-indexed), matching `on_turn_start` / `on_turn_end`.
+    ///
+    /// Same value [`TextDeltaContext::turn`] carries for the same turn, so an
+    /// observer can interleave thinking and text deltas correctly.
+    pub turn: usize,
+
+    /// The incremental reasoning chunk. Concatenate in arrival order per turn.
+    ///
+    /// Empty string for redacted/encrypted reasoning (e.g. Anthropic
+    /// `redacted_thinking`) — render a placeholder, not the empty string.
+    pub delta: String,
+}
+
 /// Context for [`LoopObserver::on_tool_call_received`](crate::observer::LoopObserver::on_tool_call_received).
 ///
 /// Fired once per tool call after the streaming response has been accumulated

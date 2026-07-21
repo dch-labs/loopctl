@@ -49,6 +49,7 @@ const DEFAULT_MODEL: &str = "gpt-4o";
 const SSE_DONE: &str = "[DONE]";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
+const THINKING_PART_INDEX: usize = 1;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(2); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
@@ -222,10 +223,13 @@ impl ApiClient for OpenAiClient {
 
     fn stream_messages(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let body = RequestBody::build(
             &model,
@@ -262,10 +266,13 @@ impl ApiClient for OpenAiClient {
 
     fn create_message(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let body = RequestBody::build(
             &model,
@@ -298,11 +305,14 @@ impl ApiClient for OpenAiClient {
 
     fn stream_messages_with_options(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = RequestBody::build(
@@ -340,11 +350,14 @@ impl ApiClient for OpenAiClient {
 
     fn create_message_with_options(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = RequestBody::build(
@@ -934,6 +947,8 @@ struct OpenAiChoice {
 #[derive(Deserialize)]
 struct OpenAiDelta {
     content: Option<String>,
+    #[serde(alias = "reasoning")]
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<OpenAiToolCallDelta>>,
 }
 
@@ -966,6 +981,7 @@ struct OpenAiToolCallFunction {
 /// Splitting this out from the `try_stream!` macro body makes the
 /// translation logic testable without a live network connection.
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct StreamEmitter {
     /// Whether [`StreamEvent::MessageStart`] has been emitted for the
     /// current stream.
@@ -983,6 +999,14 @@ struct StreamEmitter {
     /// tracks the open state so [`process_finish`](Self::process_finish)
     /// emits exactly one [`StreamEvent::PartStop`] to close it.
     text_part_open: bool,
+
+    /// Whether the reasoning (thinking) content part is currently open.
+    ///
+    /// Reasoning models stream reasoning via `delta.reasoning_content` (or its
+    /// alias `delta.reasoning`). The emitter opens a thinking part on the
+    /// first non-empty fragment and closes it in `process_finish`, symmetric
+    /// to the text lane.
+    thinking_part_open: bool,
 
     /// Number of tool-call parts currently open.
     ///
@@ -1044,16 +1068,24 @@ impl StreamEmitter {
         }
     }
 
-    /// Translate a single delta object into text and/or tool-call events.
+    /// Translate a single delta object into text and/or reasoning events.
     ///
     /// If the delta carries non-empty `content`, emits a `PartStart` (on the
     /// first text delta) followed by `IndexedDelta(Text)` events. If it
-    /// carries `tool_calls`, delegates each to
+    /// carries non-empty `reasoning_content`, the same shape is emitted for
+    /// the reasoning lane. Switching lanes emits a `PartStop` for the previous
+    /// lane first — the downstream accumulator keys on a single active index,
+    /// so leaving both open would let one lane's deltas clobber the other's
+    /// buffered state. If it carries `tool_calls`, delegates each to
     /// [`process_tool_call`](Self::process_tool_call).
     fn process_delta(&mut self, delta: &OpenAiDelta) {
         if let Some(text) = &delta.content
             && !text.is_empty()
         {
+            if self.thinking_part_open {
+                self.thinking_part_open = false;
+                self.push(StreamEvent::PartStop);
+            }
             if !self.text_part_open {
                 self.text_part_open = true;
                 self.push(StreamEvent::PartStart(PartStart {
@@ -1064,6 +1096,28 @@ impl StreamEmitter {
             self.push(StreamEvent::IndexedDelta(IndexedDelta {
                 index: TEXT_PART_INDEX,
                 delta: DeltaPart::Text { text: text.clone() },
+            }));
+        }
+
+        if let Some(reasoning) = &delta.reasoning_content
+            && !reasoning.is_empty()
+        {
+            if self.text_part_open {
+                self.text_part_open = false;
+                self.push(StreamEvent::PartStop);
+            }
+            if !self.thinking_part_open {
+                self.thinking_part_open = true;
+                self.push(StreamEvent::PartStart(PartStart {
+                    index: THINKING_PART_INDEX,
+                    part: None,
+                }));
+            }
+            self.push(StreamEvent::IndexedDelta(IndexedDelta {
+                index: THINKING_PART_INDEX,
+                delta: DeltaPart::Thinking {
+                    text: reasoning.clone(),
+                },
             }));
         }
 
@@ -1130,6 +1184,11 @@ impl StreamEmitter {
 
         // Close any open text part.
         if self.text_part_open {
+            self.push(StreamEvent::PartStop);
+        }
+
+        // Close any open reasoning (thinking) part.
+        if self.thinking_part_open {
             self.push(StreamEvent::PartStop);
         }
 
@@ -2099,5 +2158,191 @@ mod tests {
         let value = convert_message(&msg);
         assert_eq!(value["role"], "system");
         assert_eq!(value["content"], "stay on task");
+    }
+
+    #[test]
+    fn openai_delta_reasoning_content_emits_thinking() {
+        let mut em = StreamEmitter::default();
+        let chunk = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"o1","choices":[{"delta":{"reasoning_content":"thinking…"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&chunk);
+        let events = em.drain();
+
+        // Expect at least one IndexedDelta carrying Thinking.
+        let thinking = events.iter().find_map(|e| match e {
+            StreamEvent::IndexedDelta(d) => match &d.delta {
+                DeltaPart::Thinking { text } => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(thinking.as_deref(), Some("thinking…"));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::PartStart(_))),
+            "a PartStart should fire for the reasoning lane"
+        );
+    }
+
+    #[test]
+    fn openai_delta_reasoning_alias_works() {
+        let mut em = StreamEmitter::default();
+        let chunk = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"o1","choices":[{"delta":{"reasoning":"via alias"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&chunk);
+        let events = em.drain();
+
+        let thinking = events.iter().find_map(|e| match e {
+            StreamEvent::IndexedDelta(d) => match &d.delta {
+                DeltaPart::Thinking { text } => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(
+            thinking.as_deref(),
+            Some("via alias"),
+            "#[serde(alias = \"reasoning\")] must accept the field"
+        );
+    }
+
+    #[test]
+    fn openai_reasoning_does_not_open_text_part() {
+        let mut em = StreamEmitter::default();
+        let chunk = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"o1","choices":[{"delta":{"reasoning_content":"reasoning only"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&chunk);
+        let events = em.drain();
+
+        // No Text delta should be emitted from a reasoning-only chunk.
+        let has_text = events.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Text { .. })
+            )
+        });
+        assert!(!has_text, "reasoning-only chunk must not emit Text deltas");
+        assert!(!em.text_part_open, "reasoning must not set text_part_open");
+    }
+
+    #[test]
+    fn openai_reasoning_and_text_interleave() {
+        let mut em = StreamEmitter::default();
+
+        // Chunk 1: reasoning.
+        let chunk = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"o1","choices":[{"delta":{"reasoning_content":"think"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&chunk);
+
+        // Chunk 2: text.
+        let chunk = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"o1","choices":[{"delta":{"content":"answer"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&chunk);
+        let events = em.drain();
+
+        // Both lanes should have fired — one Thinking, one Text.
+        let has_thinking = events.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Thinking { .. })
+            )
+        });
+        let has_text = events.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Text { .. })
+            )
+        });
+        assert!(has_thinking, "a Thinking delta should have fired");
+        assert!(has_text, "a Text delta should have fired");
+
+        // The lane switch from reasoning to text must emit exactly one
+        // PartStop for the reasoning lane before the text PartStart. Without
+        // it the downstream accumulator (which keys on a single active index)
+        // would let text deltas clobber the reasoning lane's state.
+        let lane_switch_stops = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .count();
+        assert_eq!(
+            lane_switch_stops, 1,
+            "lane switch must close the reasoning lane with one PartStop"
+        );
+    }
+
+    #[test]
+    fn openai_combined_content_and_reasoning_in_one_delta() {
+        // A single delta object can carry both content and reasoning_content.
+        // process_delta handles content first (closing thinking if open), then
+        // reasoning (closing text if open). Lock in the expected sequence:
+        // PartStart(text) → TextDelta → PartStop → PartStart(thinking) →
+        // ThinkingDelta.
+        let mut em = StreamEmitter::default();
+        let chunk = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"o1","choices":[{"delta":{"content":"answer","reasoning_content":"why"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&chunk);
+        let events = em.drain();
+
+        let has_text = events.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Text { ref text } if text == "answer")
+            )
+        });
+        let has_thinking = events.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Thinking { ref text } if text == "why")
+            )
+        });
+        assert!(has_text, "text delta must fire");
+        assert!(has_thinking, "thinking delta must fire");
+
+        // The reasoning lane opens after the text lane, so the text lane must
+        // be closed with exactly one PartStop between them.
+        let stops = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .count();
+        assert_eq!(stops, 1, "exactly one PartStop for the text lane");
+
+        // Ordering: TextDelta → PartStop → ThinkingDelta.
+        let text_idx = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Text { .. })
+                )
+            })
+            .expect("text delta present");
+        let stop_idx = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::PartStop))
+            .expect("PartStop present");
+        let thinking_idx = events
+            .iter()
+            .rposition(|e| {
+                matches!(
+                    e,
+                    StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Thinking { .. })
+                )
+            })
+            .expect("thinking delta present");
+        assert!(text_idx < stop_idx, "text delta before PartStop");
+        assert!(stop_idx < thinking_idx, "PartStop before thinking delta");
     }
 }

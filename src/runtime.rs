@@ -692,8 +692,10 @@ impl crate::capabilities::Compactable for LoopRuntime {
 }
 
 impl crate::capabilities::StreamCapable for LoopRuntime {
-    fn stream_handler(&self) -> Option<&StreamHandler> {
-        self.stream_handler.as_ref()
+    fn stream_handler(&self) -> &StreamHandler {
+        self.stream_handler
+            .as_ref()
+            .unwrap_or(StreamHandler::passthrough_default())
     }
 }
 
@@ -814,9 +816,13 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_handler_defaults_to_none() {
+    fn test_stream_handler_defaults_to_passthrough() {
         let runtime = LoopRuntime::new();
-        assert!(runtime.stream_handler().is_none());
+        let handler = runtime.stream_handler();
+        assert_eq!(
+            handler.timeout_config().total_stream_timeout,
+            std::time::Duration::MAX
+        );
     }
 
     #[test]
@@ -846,14 +852,27 @@ mod tests {
     }
 
     #[test]
-    fn test_set_stream_handler_returns_some() {
+    fn test_set_stream_handler_overrides_passthrough() {
         use crate::stream::handler::StreamHandler;
 
         let handler = StreamHandler::new();
         let mut runtime = LoopRuntime::new();
-        assert!(runtime.stream_handler().is_none());
+        assert_eq!(
+            runtime
+                .stream_handler()
+                .timeout_config()
+                .total_stream_timeout,
+            std::time::Duration::MAX
+        );
         runtime.set_stream_handler(handler);
-        assert!(runtime.stream_handler().is_some());
+        // After set_stream_handler, the production defaults apply (15 min total).
+        assert_eq!(
+            runtime
+                .stream_handler()
+                .timeout_config()
+                .total_stream_timeout,
+            std::time::Duration::from_mins(15)
+        );
     }
 
     #[test]

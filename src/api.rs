@@ -15,6 +15,83 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+/// A request to an LLM provider — the conversation, system prompt, and tools.
+///
+/// Bundles the three fields that every [`ApiClient`] method takes together,
+/// so method signatures stay short (`&self, request, ...`) instead of
+/// repeating `messages, system, tools` at every call site.
+///
+/// Construct via `StreamRequest::new(messages)` and chain `.system(...)`
+/// / `.tools(...)` as needed, or build with struct-literal syntax.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use loopctl::api::StreamRequest;
+///
+/// let req = StreamRequest::new(vec![Message::user("hi")])
+///     .system("be brief")
+///     .tools(vec![search_tool]);
+/// let stream = client.stream_messages(req);
+/// ```
+#[derive(Debug, Clone)]
+pub struct StreamRequest {
+    /// The conversation history. Owned because the request body must be built
+    /// from owned data — callers clone the full history each turn
+    /// (O(n) in messages).
+    pub messages: Vec<Message>,
+    /// An optional system prompt to prepend.
+    pub system: Option<String>,
+    /// Optional tool definitions the model may invoke.
+    pub tools: Option<Vec<ToolSchema>>,
+}
+
+impl StreamRequest {
+    /// Create a request with messages and no system prompt or tools.
+    #[must_use]
+    pub fn new(messages: Vec<Message>) -> Self {
+        Self {
+            messages,
+            system: None,
+            tools: None,
+        }
+    }
+
+    /// Set the system prompt.
+    #[must_use]
+    pub fn system(mut self, system: impl Into<String>) -> Self {
+        self.system = Some(system.into());
+        self
+    }
+
+    /// Set the system prompt from an existing [`Option<String>`].
+    ///
+    /// Convenience for call sites that already hold the prompt as an `Option`
+    /// (e.g. forwarded from another field). `None` leaves it unset.
+    #[must_use]
+    pub fn system_opt(mut self, system: Option<String>) -> Self {
+        self.system = system;
+        self
+    }
+
+    /// Set the tool definitions.
+    #[must_use]
+    pub fn tools(mut self, tools: Vec<ToolSchema>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Set the tool definitions from an existing [`Option<Vec<ToolSchema>>`].
+    ///
+    /// Convenience for call sites that already hold tools as an `Option`.
+    /// `None` leaves them unset.
+    #[must_use]
+    pub fn tools_opt(mut self, tools: Option<Vec<ToolSchema>>) -> Self {
+        self.tools = tools;
+        self
+    }
+}
+
 /// Interface for API clients that communicate with LLM providers.
 ///
 /// Defines the contract for both streaming and non-streaming
@@ -54,9 +131,7 @@ use std::sync::Arc;
 ///
 ///     fn stream_messages(
 ///         &self,
-///         messages: Vec<Message>,
-///         system: Option<String>,
-///         tools: Option<Vec<ToolSchema>>,
+///         request: StreamRequest,
 ///     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
 ///         // Clone data from &self, then build and return a stream
 ///         let model = self.model.clone();
@@ -67,9 +142,7 @@ use std::sync::Arc;
 ///
 ///     fn create_message(
 ///         &self,
-///         messages: Vec<Message>,
-///         system: Option<String>,
-///         tools: Option<Vec<ToolSchema>>,
+///         request: StreamRequest,
 ///     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>> {
 ///         // Non-streaming fallback
 ///         todo!()
@@ -118,9 +191,9 @@ pub trait ApiClient: Send + Sync {
 
     /// Stream messages from the LLM provider.
     ///
-    /// Sends the conversation history (`messages`), an optional
-    /// `system` prompt, and optional [`ToolSchema`] definitions to the
-    /// LLM, returning a `'static` [`Stream`] of [`StreamEvent`]s.
+    /// Sends the [`StreamRequest`] (conversation history, optional system
+    /// prompt, optional tool definitions) to the LLM, returning a `'static`
+    /// [`Stream`] of [`StreamEvent`]s.
     ///
     /// Called by the agent's turn-processing loop for every LLM
     /// interaction. The stream produces events such as
@@ -136,45 +209,24 @@ pub trait ApiClient: Send + Sync {
     /// required data from `&self` before constructing the stream. No
     /// references to `&self` may be captured.
     ///
-    /// # Parameters
-    ///
-    /// - `messages` — The conversation history as a [`Vec<Message>`].
-    ///   Takes ownership because the request body must be built from owned
-    ///   data for the returned `+ '_` future; callers (e.g.
-    ///   [`BareLoop`](crate::engine::BareLoop)) clone the full history each
-    ///   turn — O(n) in the number of messages.
-    /// - `system` — An optional system prompt to prepend.
-    /// - `tools` — Optional tool definitions the model may invoke.
-    ///
     /// # Returns
     ///
     /// A pinned, boxed stream of [`Result<StreamEvent, ApiError>`].
     fn stream_messages(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>;
 
     /// Non-streaming message request (fallback).
     ///
-    /// Sends the same parameters as [`stream_messages`](ApiClient::stream_messages)
-    /// but returns a single [`serde_json::Value`] instead of a stream. Useful
-    /// for simple one-shot queries where streaming overhead isn't needed,
-    /// or as a fallback when the provider does not support streaming.
+    /// Sends the same [`StreamRequest`] as
+    /// [`stream_messages`](ApiClient::stream_messages) but returns a single
+    /// [`serde_json::Value`] instead of a stream. Useful for simple one-shot
+    /// queries where streaming overhead isn't needed, or as a fallback when
+    /// the provider does not support streaming.
     ///
     /// Called by utility code that needs a complete response in one shot,
     /// such as token estimation probes or health checks.
-    ///
-    /// # Parameters
-    ///
-    /// - `messages` — The conversation history as a [`Vec<Message>`].
-    ///   Takes ownership because the request body must be built from owned
-    ///   data for the returned `+ '_` future; callers (e.g.
-    ///   [`BareLoop`](crate::engine::BareLoop)) clone the full history each
-    ///   turn — O(n) in the number of messages.
-    /// - `system` — An optional system prompt to prepend.
-    /// - `tools` — Optional tool definitions the model may invoke.
     ///
     /// # Returns
     ///
@@ -182,9 +234,7 @@ pub trait ApiClient: Send + Sync {
     /// from the provider, or an [`ApiError`] if the request fails.
     fn create_message(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>;
 
     /// Streaming variant that honors [`RequestOptions`](crate::structured::RequestOptions).
@@ -198,13 +248,11 @@ pub trait ApiClient: Send + Sync {
     /// this to inject the schema.
     fn stream_messages_with_options(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
         if options.response_format.is_none() {
-            return self.stream_messages(messages, system, tools);
+            return self.stream_messages(request);
         }
         Box::pin(futures::stream::once(async {
             Err(ApiError::config(
@@ -227,13 +275,11 @@ pub trait ApiClient: Send + Sync {
     /// on the extracted payload.
     fn create_message_with_options(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>> {
         if options.response_format.is_none() {
-            return self.create_message(messages, system, tools);
+            return self.create_message(request);
         }
         Box::pin(async {
             Err(ApiError::config(
@@ -317,9 +363,7 @@ mod tests {
 
         fn stream_messages(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
             // Return a simple stream with one event
             let events: Vec<Result<StreamEvent, ApiError>> = vec![
@@ -347,9 +391,7 @@ mod tests {
 
         fn create_message(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
             Box::pin(async {
@@ -369,7 +411,11 @@ mod tests {
     #[tokio::test]
     async fn test_mock_client_stream() {
         let client = MockClient::new("test-model");
-        let stream = client.stream_messages(vec![Message::user("Hi")], None, None);
+        let stream = client.stream_messages(crate::api::StreamRequest {
+            messages: vec![Message::user("Hi")],
+            system: None,
+            tools: None,
+        });
 
         let events: Vec<_> = stream.collect().await;
         assert_eq!(events.len(), 4);
@@ -395,11 +441,61 @@ mod tests {
     async fn test_mock_client_create_message() {
         let client = MockClient::new("test-model");
         let result = client
-            .create_message(vec![Message::user("Hi")], None, None)
+            .create_message(crate::api::StreamRequest {
+                messages: vec![Message::user("Hi")],
+                system: None,
+                tools: None,
+            })
             .await;
         assert!(result.is_ok());
         let json = result.unwrap();
         assert!(json.get("content").is_some());
+    }
+
+    #[test]
+    fn stream_request_new_defaults() {
+        let req = StreamRequest::new(vec![Message::user("hi")]);
+        assert_eq!(req.messages.len(), 1);
+        assert!(req.system.is_none());
+        assert!(req.tools.is_none());
+    }
+
+    #[test]
+    fn stream_request_system_builder() {
+        let req = StreamRequest::new(vec![]).system("be brief");
+        assert_eq!(req.system.as_deref(), Some("be brief"));
+    }
+
+    #[test]
+    fn stream_request_system_opt_builder() {
+        let req = StreamRequest::new(vec![]).system_opt(Some("x".into()));
+        assert_eq!(req.system.as_deref(), Some("x"));
+        let req = StreamRequest::new(vec![]).system_opt(None);
+        assert!(req.system.is_none());
+    }
+
+    #[test]
+    fn stream_request_tools_builder() {
+        let tools = vec![crate::tool::ToolSchema {
+            tool: "search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let req = StreamRequest::new(vec![]).tools(tools);
+        assert_eq!(req.tools.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stream_request_tools_opt_builder() {
+        let tools = vec![crate::tool::ToolSchema {
+            tool: "search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let req = StreamRequest::new(vec![]).tools_opt(Some(tools));
+        assert_eq!(req.tools.as_ref().unwrap().len(), 1);
+        let req = StreamRequest::new(vec![]).tools_opt(None);
+        assert!(req.tools.is_none());
     }
 
     #[test]

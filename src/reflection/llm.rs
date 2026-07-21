@@ -293,9 +293,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<Item = Result<crate::stream::StreamEvent, ApiError>>
@@ -307,21 +305,22 @@ mod tests {
         }
         fn create_message(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
             Box::pin(async { Ok(serde_json::json!({})) })
         }
         fn create_message_with_options(
             &self,
-            messages: Vec<Message>,
-            system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            request: crate::api::StreamRequest,
             _options: RequestOptions,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
+            let crate::api::StreamRequest {
+                messages,
+                system,
+                tools: _,
+            } = request;
             let user = messages.first().and_then(|m| {
                 m.parts.first().and_then(|p| match p {
                     MessagePart::Text { text } => Some(text.clone()),
@@ -345,9 +344,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<Item = Result<crate::stream::StreamEvent, ApiError>>
@@ -359,18 +356,14 @@ mod tests {
         }
         fn create_message(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
             Box::pin(async { Ok(serde_json::json!({})) })
         }
         fn create_message_with_options(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
             _options: RequestOptions,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
@@ -387,9 +380,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            m: Vec<Message>,
-            s: Option<String>,
-            t: Option<Vec<ToolSchema>>,
+            request: crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<Item = Result<crate::stream::StreamEvent, ApiError>>
@@ -397,22 +388,18 @@ mod tests {
                     + 'static,
             >,
         > {
-            self.0.stream_messages(m, s, t)
+            self.0.stream_messages(request)
         }
         fn create_message(
             &self,
-            m: Vec<Message>,
-            s: Option<String>,
-            t: Option<Vec<ToolSchema>>,
+            request: crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
-            self.0.create_message(m, s, t)
+            self.0.create_message(request)
         }
         fn create_message_with_options(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
             _options: RequestOptions,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {

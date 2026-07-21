@@ -225,39 +225,28 @@ impl ApiClient for AnthropicClient {
 
     fn stream_messages(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        self.stream_messages_with_options(
-            messages,
-            system,
-            tools,
-            crate::structured::RequestOptions::default(),
-        )
+        self.stream_messages_with_options(request, crate::structured::RequestOptions::default())
     }
 
     fn create_message(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        self.create_message_with_options(
-            messages,
-            system,
-            tools,
-            crate::structured::RequestOptions::default(),
-        )
+        self.create_message_with_options(request, crate::structured::RequestOptions::default())
     }
 
     fn stream_messages_with_options(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = build_request_body(
@@ -296,11 +285,14 @@ impl ApiClient for AnthropicClient {
 
     fn create_message_with_options(
         &self,
-        messages: Vec<Message>,
-        system: Option<String>,
-        tools: Option<Vec<ToolSchema>>,
+        request: crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+        let crate::api::StreamRequest {
+            messages,
+            system,
+            tools,
+        } = request;
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = build_request_body(
@@ -1242,12 +1234,12 @@ impl StreamEmitter {
     /// Handle a `message_stop` event.
     ///
     /// Marks the stream finished, closes any content blocks still marked
-    /// open (one [`StreamEvent::PartStop`] for an open text block, then
-    /// one per open tool block, with both counters reset), and emits the
-    /// terminal [`StreamEvent::MessageStop`] that consumers rely on to
-    /// know the stream is complete. The closing `PartStop`s are pushed
-    /// first so the event order matches the documented protocol
-    /// (`PartStop* → MessageStop`).
+    /// open (one [`StreamEvent::PartStop`] for an open thinking block, one
+    /// for an open text block, then one per open tool block, with all
+    /// counters reset), and emits the terminal [`StreamEvent::MessageStop`]
+    /// that consumers rely on to know the stream is complete. The closing
+    /// `PartStop`s are pushed first so the event order matches the
+    /// documented protocol (`PartStop* → MessageStop`).
     ///
     /// Setting `finished` here is what suppresses the synthetic
     /// [`StreamEvent::MessageStop`] in [`finish`](Self::finish), so a
@@ -1255,12 +1247,17 @@ impl StreamEmitter {
     /// terminal event appended after the SSE stream ends.
     fn on_message_stop(&mut self) {
         self.finished = true;
+        if self.thinking_part_open {
+            self.push(StreamEvent::PartStop);
+        }
         if self.text_part_open {
             self.push(StreamEvent::PartStop);
         }
         for _ in 0..self.tool_parts_open {
             self.push(StreamEvent::PartStop);
         }
+        self.thinking_part_open = false;
+        self.thinking_index = None;
         self.tool_parts_open = 0;
         self.text_part_open = false;
         self.push(StreamEvent::MessageStop);
@@ -2423,5 +2420,60 @@ mod tests {
         assert!(matches!(events[0], StreamEvent::PartStop));
         assert!(!em.thinking_part_open, "thinking_part_open reset");
         assert!(em.thinking_index.is_none(), "thinking_index cleared");
+    }
+
+    #[test]
+    fn emitter_message_stop_closes_open_thinking_block() {
+        // If a thinking block is still open when `message_stop` arrives
+        // (e.g. a stream that ended without a final `content_block_stop`),
+        // `on_message_stop` must defensively emit a PartStop for it before
+        // the terminal MessageStop. Without it the open block leaks and the
+        // downstream accumulator never finalizes the part boundary.
+        let mut em = StreamEmitter::default();
+
+        em.on_block_start(Some(serde_json::json!({
+            "index": 0,
+            "content_block": {"type": "thinking"}
+        })));
+        em.on_block_delta(Some(serde_json::json!({
+            "delta": {"type": "thinking_delta", "thinking": "reasoning"}
+        })));
+        em.drain();
+        assert!(
+            em.thinking_part_open,
+            "test precondition: thinking lane open"
+        );
+
+        em.on_message_stop();
+        let events = em.drain();
+
+        // Expected: one PartStop (thinking) then one MessageStop.
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::PartStop)),
+            "message_stop must emit a PartStop for the open thinking block"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
+            "message_stop must emit the terminal MessageStop"
+        );
+        assert!(
+            !em.thinking_part_open,
+            "thinking_part_open must be reset by message_stop"
+        );
+        assert!(
+            em.thinking_index.is_none(),
+            "thinking_index must be cleared by message_stop"
+        );
+
+        // Ordering: PartStop before MessageStop.
+        let stop_idx = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::PartStop))
+            .expect("PartStop present");
+        let msg_stop_idx = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::MessageStop))
+            .expect("MessageStop present");
+        assert!(stop_idx < msg_stop_idx, "PartStop must precede MessageStop");
     }
 }

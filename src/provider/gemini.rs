@@ -963,50 +963,55 @@ impl StreamEmitter {
     /// Extract a function (tool) call from the chunk and emit the
     /// corresponding part-start and input-json events.
     ///
-    /// Reads `candidates[0].content.parts[0].functionCall` for the tool
-    /// `name` and `args`. Emits a [`PartStart`](StreamEvent::PartStart)
+    /// Scans `candidates[0].content.parts` for the first part containing a
+    /// `functionCall` field. Emits a [`PartStart`](StreamEvent::PartStart)
     /// with a [`ToolCall`](crate::message::MessagePart::ToolCall) part,
     /// followed by an [`InputJson`](crate::stream::DeltaPart::InputJson)
     /// delta carrying the serialized arguments. Does nothing if no function
     /// call is present in the chunk.
     fn extract_function_call(&mut self, json: &Value) {
-        if let Some(func_call) = json.pointer("/candidates/0/content/parts/0/functionCall") {
-            let name = func_call
-                .pointer("/name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let args = func_call.pointer("/args").cloned().unwrap_or(Value::Null);
-            let args_str = serde_json::to_string(&args).unwrap_or_default();
+        let Some(parts) = json
+            .pointer("/candidates/0/content/parts")
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
 
-            // Function-call parts reuse TEXT_PART_INDEX. Close any open lane
-            // first so the downstream accumulator (single active index) sees
-            // a clean PartStart → PartStop window for the tool call rather
-            // than a clobbered buffer.
-            if self.thinking_part_open {
-                self.thinking_part_open = false;
-                self.push(StreamEvent::PartStop);
-            }
-            if self.text_part_open {
-                self.text_part_open = false;
-                self.push(StreamEvent::PartStop);
-            }
+        let Some(func_call) = parts.iter().find_map(|p| p.get("functionCall")) else {
+            return;
+        };
+        let name = func_call
+            .pointer("/name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let args = func_call.pointer("/args").cloned().unwrap_or(Value::Null);
+        let args_str = serde_json::to_string(&args).unwrap_or_default();
 
-            self.push(StreamEvent::PartStart(PartStart {
-                index: TEXT_PART_INDEX,
-                part: Some(MessagePart::ToolCall {
-                    id: String::new(),
-                    name,
-                    input: args,
-                }),
-            }));
-            self.push(StreamEvent::IndexedDelta(IndexedDelta {
-                index: TEXT_PART_INDEX,
-                delta: DeltaPart::InputJson {
-                    partial_json: args_str,
-                },
-            }));
+        if self.thinking_part_open {
+            self.thinking_part_open = false;
+            self.push(StreamEvent::PartStop);
         }
+
+        if self.text_part_open {
+            self.text_part_open = false;
+            self.push(StreamEvent::PartStop);
+        }
+
+        self.push(StreamEvent::PartStart(PartStart {
+            index: TEXT_PART_INDEX,
+            part: Some(MessagePart::ToolCall {
+                id: String::new(),
+                name,
+                input: args,
+            }),
+        }));
+        self.push(StreamEvent::IndexedDelta(IndexedDelta {
+            index: TEXT_PART_INDEX,
+            delta: DeltaPart::InputJson {
+                partial_json: args_str,
+            },
+        }));
     }
 
     /// Extract the finish reason from the chunk and emit stop events.
@@ -1832,6 +1837,63 @@ mod tests {
             .expect("Tool PartStart present");
         assert!(text_delta_idx < stop_idx, "text delta before PartStop");
         assert!(stop_idx < tool_start_idx, "PartStop before tool PartStart");
+    }
+
+    #[test]
+    fn emitter_function_call_at_nonzero_part_index() {
+        // A functionCall may appear at parts[1] (or later) when Gemini
+        // interleaves a thought part with a tool call in the same chunk.
+        // The emitter must scan all parts, not just parts[0].
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "reasoning about the call", "thought": true},
+                        {"functionCall": {"name": "search", "args": {"q": "rust"}}}
+                    ]
+                }
+            }]
+        }));
+        let events = em.drain();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::PartStart(PartStart {
+                    part: Some(MessagePart::ToolCall { name, .. }),
+                    ..
+                }) if name == "search"
+            )),
+            "functionCall at parts[1] must be found and emitted"
+        );
+    }
+
+    #[test]
+    fn emitter_no_function_call_does_nothing() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "just text"},
+                        {"text": "more text"}
+                    ]
+                }
+            }]
+        }));
+        let events = em.drain();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::PartStart(PartStart {
+                    part: Some(MessagePart::ToolCall { .. }),
+                    ..
+                })
+            )),
+            "no functionCall in any part must not emit a tool PartStart"
+        );
     }
 
     #[test]

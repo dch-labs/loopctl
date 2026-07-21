@@ -931,46 +931,90 @@ impl<C: ApiClient> BareLoop<C> {
     async fn do_stream(&mut self) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
         match self.stream_turn().await {
             Ok((msg, usage, stop)) => {
-                self.managers.fallback.record_model_success();
-                let (in_tok, out_tok) = Self::usage_tokens(usage.as_ref());
-                self.managers.observers().on_stream_success(&StreamContext {
-                    turn: self.budget.total_turns,
-                    model: self.client.model(),
-                    input_tokens: in_tok,
-                    output_tokens: out_tok,
-                });
+                self.record_stream_success(usage.as_ref());
                 Ok((msg, usage, stop))
             }
-            Err(e) => {
-                let tripped = if matches!(e, LoopError::RateLimitEscalation { .. }) {
-                    self.managers.fallback.record_model_failure()
-                } else {
-                    self.managers.fallback.record_api_failure()
-                };
-                if tripped {
-                    let from = self.client.model();
-                    if let Some(to) = self.managers.fallback.fallback_model() {
-                        tracing::warn!(from = %from, to = %to, "fallback manager tripped");
-                        self.managers
-                            .observers()
-                            .on_fallback(&FallbackContext { from, to });
-                    }
-                }
+            Err(e) => Err(self.record_stream_failure(e)),
+        }
+    }
 
+    /// Record a successful stream completion.
+    ///
+    /// Fires [`on_stream_success`](crate::observer::LoopObserver::on_stream_success)
+    /// with this turn's token counts and tells the
+    /// [`FallbackManager`](crate::fallback::FallbackManager) the current model
+    /// is healthy (so a transient failure earlier in the session doesn't keep
+    /// the circuit breaker tripped forever).
+    ///
+    /// Called from [`do_stream`](Self::do_stream) on the `Ok` branch only;
+    /// has no return value because the caller already holds the successful
+    /// `(Message, Option<Usage>, StreamStopReason)` and just needs the
+    /// side-effects.
+    fn record_stream_success(&mut self, usage: Option<&Usage>) {
+        self.managers.fallback.record_model_success();
+        let (in_tok, out_tok) = Self::usage_tokens(usage);
+
+        // TODO: fire_stream_success
+        self.managers.observers().on_stream_success(&StreamContext {
+            turn: self.budget.total_turns,
+            model: self.client.model(),
+            input_tokens: in_tok,
+            output_tokens: out_tok,
+        });
+    }
+
+    /// Record a stream failure and return the error to propagate.
+    ///
+    /// Distinguishes [`LoopError::RateLimitEscalation`] (which trips the
+    /// model circuit breaker via
+    /// [`record_model_failure`](crate::fallback::FallbackManager::record_model_failure))
+    /// from other stream errors (which only count as a generic API failure
+    /// via
+    /// [`record_api_failure`](crate::fallback::FallbackManager::record_api_failure)).
+    /// When the breaker trips and a fallback model is configured, fires
+    /// [`on_fallback`](crate::observer::LoopObserver::on_fallback).
+    ///
+    /// Then fires
+    /// [`on_stream_failure`](crate::observer::LoopObserver::on_stream_failure)
+    /// (regardless of breaker outcome), sets the terminal
+    /// [`LoopState::Failed`], and returns the original error so the caller
+    /// can propagate it from [`do_stream`](Self::do_stream).
+    ///
+    /// `LoopError::Cancelled` is **not** routed through here — cancellation
+    /// is a clean termination that sets [`LoopState::Cancelled`] without
+    /// tripping the breaker or firing `on_stream_failure`. The caller
+    /// ([`run_turn_body`](Self::run_turn_body)) handles cancellation before
+    /// reaching [`do_stream`](Self::do_stream).
+    fn record_stream_failure(&mut self, e: LoopError) -> LoopError {
+        let tripped = if matches!(e, LoopError::RateLimitEscalation { .. }) {
+            self.managers.fallback.record_model_failure()
+        } else {
+            self.managers.fallback.record_api_failure()
+        };
+
+        if tripped {
+            let from = self.client.model();
+            if let Some(to) = self.managers.fallback.fallback_model() {
+                tracing::warn!(from = %from, to = %to, "fallback manager tripped");
                 self.managers
                     .observers()
-                    .on_stream_failure(&StreamFailureContext {
-                        turn: self.budget.total_turns,
-                        model: self.client.model(),
-                        error: e.clone(),
-                    });
-
-                self.state = LoopState::Failed {
-                    error: e.to_string(),
-                };
-                Err(e)
+                    .on_fallback(&FallbackContext { from, to });
             }
         }
+
+        // TODO: fire_stream_failure
+        self.managers
+            .observers()
+            .on_stream_failure(&StreamFailureContext {
+                turn: self.budget.total_turns,
+                model: self.client.model(),
+                error: e.clone(),
+            });
+
+        self.state = LoopState::Failed {
+            error: e.to_string(),
+        };
+        e
     }
 
     /// Fold this turn's token counts into the running session totals on
@@ -1146,6 +1190,7 @@ impl<C: ApiClient> BareLoop<C> {
         turn_out: u64,
         turn_start: Instant,
     ) -> TurnResult {
+        // TODO: fire_complete_turn
         self.finish_turn(turn_in, turn_out, turn_start.elapsed());
         self.state = LoopState::Completed {
             summary: text.clone(),
@@ -1299,6 +1344,7 @@ impl<C: ApiClient> BareLoop<C> {
         self.budget.total_turns = self.budget.total_turns.saturating_add(1);
 
         if tool_calls.is_empty() {
+            // TODO: complete turn
             return Ok(self.complete_session(text, turn_in, turn_out, turn_start));
         }
 
@@ -1392,6 +1438,7 @@ impl<C: ApiClient> crate::engine::loop_core::Loop for BareLoop<C> {
                 biased;
                 () = cancel.notified() => {
                     self.state = LoopState::Cancelled;
+                    // TODO: fire_turn_cancelled
                     self.managers.observers().on_turn_end(&TurnEndContext {
                         turn: current_turn,
                         success: false,
@@ -1658,9 +1705,7 @@ mod tests {
 
         fn stream_messages(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
             let mut guard = crate::error::recover_guard(self.responses.lock());
@@ -1677,9 +1722,7 @@ mod tests {
 
         fn create_message(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
             Box::pin(async { Ok(json!({"content": []})) })
         }
@@ -1969,7 +2012,7 @@ mod tests {
         let result = agent.run("Hi").await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            LoopError::Api(msg) => assert!(msg.contains("No more mock responses")),
+            LoopError::Api(msg) => assert!(msg.contains("No more mock responses"), "got: {msg}"),
             other => panic!("Expected Api error, got: {other}"),
         }
     }
@@ -2189,6 +2232,36 @@ mod tests {
         assert!(!received.is_empty(), "streamer should have fired");
         assert!(
             received.join("").contains("Hello world"),
+            "got: {received:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_text_streamer_fires_when_stream_handler_configured() {
+        // Regression: when a StreamHandler is attached, the engine must still
+        // fire text_streamer / on_text_delta for each streamed text delta. The
+        // handler path used to bypass observers entirely.
+        let client = MockClient::new("test-model");
+        client.add_text_response("via handler");
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        agent.set_stream_handler(StreamHandler::new());
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let buf = Arc::clone(&received);
+        agent.set_text_streamer(Arc::new(move |delta: &str| {
+            crate::error::recover_guard(buf.lock()).push(delta.to_string());
+        }));
+
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        let received = crate::error::recover_guard(received.lock());
+        assert!(
+            !received.is_empty(),
+            "streamer should fire even with a StreamHandler configured"
+        );
+        assert!(
+            received.join("").contains("via handler"),
             "got: {received:?}",
         );
     }
@@ -3117,9 +3190,7 @@ mod tests {
 
         fn stream_messages(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
             let rx = crate::error::recover_guard(self.rx.lock())
@@ -3130,9 +3201,7 @@ mod tests {
 
         fn create_message(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
             Box::pin(async { Err(ApiError::api("not implemented")) })
         }
@@ -3336,9 +3405,7 @@ mod tests {
 
             fn stream_messages(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<crate::tool::ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> Pin<
                 Box<
                     dyn futures::stream::Stream<Item = Result<StreamEvent, ApiError>>
@@ -3351,9 +3418,7 @@ mod tests {
 
             fn create_message(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<crate::tool::ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -3819,9 +3884,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
             {
                 Box::pin(futures::stream::once(async {
@@ -3833,9 +3896,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _messages: Vec<Message>,
-                _system: Option<String>,
-                _tools: Option<Vec<ToolSchema>>,
+                _request: crate::api::StreamRequest,
             ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
                 Box::pin(async { Ok(json!({})) })
             }
@@ -4029,11 +4090,10 @@ mod tests {
 
         fn stream_messages(
             &self,
-            messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            request: crate::api::StreamRequest,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
+            let messages = request.messages;
             crate::error::recover_guard(self.seen.lock()).push(messages);
             let mut guard = crate::error::recover_guard(self.responses.lock());
             if let Some(events) = guard.pop_front() {
@@ -4048,12 +4108,11 @@ mod tests {
 
         fn stream_messages_with_options(
             &self,
-            messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            request: crate::api::StreamRequest,
             options: crate::structured::RequestOptions,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
+            let messages = request.messages;
             crate::error::recover_guard(self.seen.lock()).push(messages);
             crate::error::recover_guard(self.seen_options.lock()).push(options);
             let mut guard = crate::error::recover_guard(self.responses.lock());
@@ -4069,9 +4128,7 @@ mod tests {
 
         fn create_message(
             &self,
-            _messages: Vec<Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
             Box::pin(async { Ok(json!({"content": []})) })
         }
@@ -4448,6 +4505,160 @@ mod tests {
         assert!(
             has_reminder,
             "GoalReminder (cadence 1) should have injected the goal text as a System message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_thinking_delta_fires_per_thinking_delta() {
+        struct ThinkingRecorder {
+            deltas: Arc<Mutex<Vec<(usize, String)>>>,
+        }
+        impl crate::observer::LoopObserver for ThinkingRecorder {
+            fn name(&self) -> &'static str {
+                "thinking-recorder"
+            }
+            fn on_thinking_delta(&self, ctx: &crate::observer::ThinkingDeltaContext) {
+                crate::error::recover_guard(self.deltas.lock()).push((ctx.turn, ctx.delta.clone()));
+            }
+        }
+
+        let client = MockClient::new("test-model");
+        let events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg-1".into(),
+                    role: "assistant".into(),
+                    model: "test-model".into(),
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 1,
+                part: None,
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::Thinking {
+                    text: "First reasoning".into(),
+                },
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::Thinking {
+                    text: " chunk".into(),
+                },
+            }),
+            StreamEvent::PartStop,
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(MessagePart::text("ignored")),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Text {
+                    text: "final answer".into(),
+                },
+            }),
+            StreamEvent::PartStop,
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".into()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        client.add_events(events);
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::new(ThinkingRecorder {
+            deltas: Arc::clone(&captured),
+        });
+        agent.register_observer(recorder as Arc<dyn crate::observer::LoopObserver>);
+
+        let result = agent.run("Hi").await.unwrap();
+        assert!(result.success);
+
+        let captured = crate::error::recover_guard(captured.lock());
+        assert_eq!(
+            captured.len(),
+            2,
+            "one on_thinking_delta per Thinking delta"
+        );
+        let joined: String = captured.iter().map(|(_, d)| d.as_str()).collect();
+        assert_eq!(joined, "First reasoning chunk");
+        assert_eq!(captured[0].0, 0, "turn number matches budget.total_turns");
+    }
+
+    #[tokio::test]
+    async fn test_on_thinking_delta_independent_of_text_delta() {
+        struct MixedRecorder {
+            text_calls: Arc<Mutex<usize>>,
+            thinking_calls: Arc<Mutex<usize>>,
+        }
+        impl crate::observer::LoopObserver for MixedRecorder {
+            fn name(&self) -> &'static str {
+                "mixed-recorder"
+            }
+            fn on_text_delta(&self, _ctx: &crate::observer::TextDeltaContext) {
+                *crate::error::recover_guard(self.text_calls.lock()) += 1;
+            }
+            fn on_thinking_delta(&self, _ctx: &crate::observer::ThinkingDeltaContext) {
+                *crate::error::recover_guard(self.thinking_calls.lock()) += 1;
+            }
+        }
+
+        let client = MockClient::new("test-model");
+        let events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg-1".into(),
+                    role: "assistant".into(),
+                    model: "test-model".into(),
+                },
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::Thinking {
+                    text: "reasoning".into(),
+                },
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Text {
+                    text: "answer".into(),
+                },
+            }),
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".into()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        client.add_events(events);
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        let text_calls = Arc::new(Mutex::new(0usize));
+        let thinking_calls = Arc::new(Mutex::new(0usize));
+        let recorder = Arc::new(MixedRecorder {
+            text_calls: Arc::clone(&text_calls),
+            thinking_calls: Arc::clone(&thinking_calls),
+        });
+        agent.register_observer(recorder as Arc<dyn crate::observer::LoopObserver>);
+
+        agent.run("Hi").await.unwrap();
+
+        assert_eq!(
+            *crate::error::recover_guard(text_calls.lock()),
+            1,
+            "text callback fires once (for the Text delta)"
+        );
+        assert_eq!(
+            *crate::error::recover_guard(thinking_calls.lock()),
+            1,
+            "thinking callback fires once (for the Thinking delta)"
         );
     }
 }

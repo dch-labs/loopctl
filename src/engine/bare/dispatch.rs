@@ -1139,9 +1139,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _history: Vec<crate::message::Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<Item = Result<crate::stream::StreamEvent, ApiError>>
@@ -1153,9 +1151,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _history: Vec<crate::message::Message>,
-            _system: Option<String>,
-            _tools: Option<Vec<ToolSchema>>,
+            _request: crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
             Box::pin(async { Err(ApiError::http("not implemented")) })

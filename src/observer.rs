@@ -13,6 +13,7 @@
 //! - [`StreamContext`] / [`StreamFailureContext`] — stream success/failure
 //! - [`ResponseContext`] — model response text and usage
 //! - [`TextDeltaContext`] — incremental text chunk while streaming
+//! - [`ThinkingDeltaContext`] — incremental reasoning chunk while streaming
 //! - [`ToolCallReceivedContext`] — tool call accumulated, before dispatch
 //! - [`ToolPreContext`] / [`ToolPostContext`] — tool dispatch lifecycle
 //! - [`CompactedContext`] — context window compaction
@@ -43,8 +44,8 @@ pub mod context;
 pub use context::{
     CompactedContext, ConvergenceDetectedContext, FallbackContext, LoopDetectedContext,
     ModelSwitchedContext, ResponseContext, SessionEndContext, SessionStartContext, StreamContext,
-    StreamFailureContext, TextDeltaContext, ToolCallReceivedContext, ToolPostContext,
-    ToolPreContext, TurnEndContext, TurnStartContext,
+    StreamFailureContext, TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext,
+    ToolPostContext, ToolPreContext, TurnEndContext, TurnStartContext,
 };
 // ==================================================
 // LoopObserver Trait
@@ -125,6 +126,17 @@ pub trait LoopObserver: Send + Sync {
     /// must not parse, render, or perform I/O synchronously, since it runs on
     /// the stream-ingestion task.
     ///
+    /// # Retry caveat (handler path)
+    ///
+    /// When a [`StreamHandler`](crate::stream::handler::StreamHandler) is
+    /// configured, this callback fires for every event of every attempt —
+    /// including partial events from a failed attempt that got cut off
+    /// mid-stream. An observer that concatenates `delta` across calls will,
+    /// under the handler path only, see duplicated or truncated-then-restarted
+    /// fragments after a retry. Consumers that need only committed output must
+    /// buffer until [`on_response`](Self::on_response) (or
+    /// [`on_turn_end`](Self::on_turn_end)).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -143,6 +155,20 @@ pub trait LoopObserver: Send + Sync {
     /// }
     /// ```
     fn on_text_delta(&self, _ctx: &TextDeltaContext) {}
+
+    /// Called for each incremental reasoning ("thinking") chunk.
+    ///
+    /// Fired per `DeltaPart::Thinking` during streaming, symmetric to
+    /// [`on_text_delta`](Self::on_text_delta). Reasoning is distinct from
+    /// visible assistant text; do not concatenate it with `on_text_delta` /
+    /// [`on_response`](Self::on_response) output. Redacted reasoning arrives
+    /// as an empty `delta` (render a placeholder, not the empty string).
+    ///
+    /// Inherits the same retry caveat as [`on_text_delta`](Self::on_text_delta):
+    /// under a configured [`StreamHandler`](crate::stream::handler::StreamHandler),
+    /// partial events from a failed attempt fire here too. Buffer until
+    /// [`on_turn_end`](Self::on_turn_end) if you need only committed reasoning.
+    fn on_thinking_delta(&self, _ctx: &ThinkingDeltaContext) {}
 
     /// Called when the engine has accumulated a tool call and is about to dispatch it.
     ///
@@ -345,6 +371,17 @@ impl ObserverHost {
     pub fn on_text_delta(&self, ctx: &TextDeltaContext) {
         for obs in &self.observers {
             obs.on_text_delta(ctx);
+        }
+    }
+
+    /// Dispatch [`LoopObserver::on_thinking_delta`] to all observers.
+    ///
+    /// Iterates registered observers in registration order. Called once per
+    /// streamed reasoning delta, so each observer's `on_thinking_delta` must
+    /// be cheap.
+    pub fn on_thinking_delta(&self, ctx: &ThinkingDeltaContext) {
+        for obs in &self.observers {
+            obs.on_thinking_delta(ctx);
         }
     }
 
@@ -706,6 +743,62 @@ mod tests {
             tool: "echo".into(),
             call_id: "c1".into(),
             input: serde_json::Value::Null,
+        });
+    }
+
+    #[test]
+    fn host_dispatches_on_thinking_delta_to_all_observers() {
+        struct ThinkingRecorder {
+            deltas: std::sync::Mutex<Vec<String>>,
+        }
+        impl LoopObserver for ThinkingRecorder {
+            fn name(&self) -> &'static str {
+                "thinking-recorder"
+            }
+            fn on_thinking_delta(&self, ctx: &ThinkingDeltaContext) {
+                crate::error::recover_guard(self.deltas.lock()).push(ctx.delta.clone());
+            }
+        }
+
+        let obs1 = Arc::new(ThinkingRecorder {
+            deltas: std::sync::Mutex::new(Vec::new()),
+        });
+        let obs2 = Arc::new(ThinkingRecorder {
+            deltas: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut host = ObserverHost::new();
+        host.register(Arc::clone(&obs1) as Arc<dyn LoopObserver>);
+        host.register(Arc::clone(&obs2) as Arc<dyn LoopObserver>);
+
+        host.on_thinking_delta(&ThinkingDeltaContext {
+            turn: 2,
+            delta: "reasoning".into(),
+        });
+
+        assert_eq!(
+            crate::error::recover_guard(obs1.deltas.lock()).clone(),
+            vec!["reasoning".to_string()]
+        );
+        assert_eq!(
+            crate::error::recover_guard(obs2.deltas.lock()).clone(),
+            vec!["reasoning".to_string()]
+        );
+    }
+
+    #[test]
+    fn on_thinking_delta_default_is_noop() {
+        struct NoopObserver;
+        impl LoopObserver for NoopObserver {
+            fn name(&self) -> &'static str {
+                "noop"
+            }
+        }
+        let obs = NoopObserver;
+        // A bare observer that doesn't override on_thinking_delta must compile
+        // and not panic when the method is called.
+        obs.on_thinking_delta(&ThinkingDeltaContext {
+            turn: 0,
+            delta: String::new(),
         });
     }
 }

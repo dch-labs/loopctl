@@ -28,7 +28,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"], optional = true }
-async-stream = { version = "0.3", optional = true }
+async-stream = "0.3"
 httpdate = { version = "1", optional = true }
 jsonschema = { version = "0.30", optional = true }
 
@@ -44,7 +44,7 @@ tool_health = []
 tool_shield = ["tool_health"]
 
 # Providers
-providers = ["dep:reqwest", "dep:async-stream", "dep:httpdate"]
+providers = ["dep:reqwest", "dep:httpdate"]
 openai = ["providers"]
 anthropic = ["providers"]
 ollama = ["providers", "openai"]

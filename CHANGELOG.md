@@ -165,10 +165,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 ### Changed
 
 - **Breaking:** `stream::DeltaPart` is now `#[non_exhaustive]`. Every
-  exhaustive `match` on `DeltaPart` in downstream code must add a `_ =>` arm
-  (or a `Thinking =>` arm for the new variant). Same-crate matches are
-  unaffected. Future variant additions (e.g. `Image`, `Audio`) will arrive
-  non-breaking.
+  `match` on `DeltaPart` in downstream code must include a `_ =>` wildcard arm
+  — handling `Thinking` explicitly is optional but does not replace the
+  wildcard requirement. Same-crate matches are unaffected. Future variant
+  additions (e.g. `Image`, `Audio`) will arrive non-breaking.
 - **Breaking:** `ApiClient::stream_messages`, `stream_messages_with_options`,
   `create_message`, and `create_message_with_options` now take a single
   `StreamRequest` parameter instead of positional `(messages, system, tools)`.

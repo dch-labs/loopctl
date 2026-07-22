@@ -66,6 +66,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   Gemini 3). Defaults to `false` — the Gemini API rejects `thinkingConfig`
   with `400 INVALID_ARGUMENT` on non-reasoning models, so the caller must opt
   in once they know their model supports thinking.
+- HTTP connection-pool injection and tuning on all three provider builders
+  (`OpenAiClientBuilder`, `AnthropicClientBuilder`, `GeminiClientBuilder`):
+  `.http_client(reqwest::Client)` injects a shared client so multiple providers
+  can reuse one connection pool. `.pool_max_idle_per_host(usize)`,
+  `.pool_idle_timeout(Duration)`, and `.tcp_keepalive(Duration)` expose the
+  underlying `reqwest` pool knobs (default to reqwest's built-in defaults when
+  unset). When an injected client is used, these knobs and `.timeout()` /
+  `.connect_timeout()` are ignored — configure them on the injected client.
 - `ContextContributor` trait and `ContributorContext<'a>` (`engine::contributor`
   module): a write-side hook at the turn boundary. Implementors return an
   optional `Message` that the loop appends to the conversation before the next
@@ -165,10 +173,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 ### Changed
 
 - **Breaking:** `stream::DeltaPart` is now `#[non_exhaustive]`. Every
-  `match` on `DeltaPart` in downstream code must include a `_ =>` wildcard arm
-  — handling `Thinking` explicitly is optional but does not replace the
-  wildcard requirement. Same-crate matches are unaffected. Future variant
-  additions (e.g. `Image`, `Audio`) will arrive non-breaking.
+  exhaustive `match` on `DeltaPart` in downstream code must add a `_ =>` arm
+  (or a `Thinking =>` arm for the new variant). Same-crate matches are
+  unaffected. Future variant additions (e.g. `Image`, `Audio`) will arrive
+  non-breaking.
 - **Breaking:** `ApiClient::stream_messages`, `stream_messages_with_options`,
   `create_message`, and `create_message_with_options` now take a single
   `StreamRequest` parameter instead of positional `(messages, system, tools)`.
@@ -188,6 +196,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 - **Breaking:** `StreamHandler::stream_turn` now takes `options:
   RequestOptions` as an explicit parameter. `StreamHandler::with_request_options`
   is removed — use `BareLoop::set_request_options` instead.
+- **Breaking:** All three provider builders (`OpenAiClientBuilder`,
+  `AnthropicClientBuilder`, `GeminiClientBuilder`) now use `with_` prefix on
+  consuming builder methods (e.g. `.with_api_key()`, `.with_model()`,
+  `.with_timeout()`, `.with_http_client()`). The old no-prefix names
+  (`.api_key()`, `.model()`, etc.) are removed.
 - **Breaking:** `ToolOutput`, `ToolDispatchResult`, and `ToolPostContext` are
   now `#[non_exhaustive]`, matching `DisplayHint`. Downstream code that
   constructs these via struct literal must switch to the named constructors
@@ -246,6 +259,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   between calls. Previously, a Ctrl-C during a multi-tool batch was only
   honored at the next turn boundary; now it aborts the remaining calls in the
   batch.
+- Internally-built `reqwest::Client`s now set `tcp_nodelay(true)` by default.
+  SSE streaming emits many small packets; disabling Nagle's algorithm reduces
+  per-delta latency. No correctness impact.
 
 ### Removed
 

@@ -14,8 +14,8 @@
 //!
 //! // Explicit:
 //! let client = GeminiClient::builder()
-//!     .api_key("AIza...")
-//!     .model("gemini-2.0-flash")
+//!     .with_api_key("AIza...")
+//!     .with_model("gemini-2.0-flash")
 //!     .build()?;
 //! ```
 
@@ -27,7 +27,6 @@ use reqwest::Response;
 use serde_json::Value;
 use std::time::Duration;
 
-use super::ClientBuilderExt;
 use crate::api::ApiClient;
 use crate::api::error::ApiError;
 use crate::message::{Message, MessagePart, Role};
@@ -48,11 +47,9 @@ const DEFAULT_MODEL: &str = "gemini-2.0-flash";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const THINKING_PART_INDEX: usize = 1;
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(2); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ==================================================
 // Client
@@ -107,7 +104,7 @@ impl GeminiClient {
     ///
     /// Returns a [`GeminiClientBuilder`] with sensible defaults. The only
     /// required field is `api_key`; everything else has a production-ready
-    /// default. Call `.api_key(...).build()` to finish, or chain additional
+    /// default. Call `.with_api_key(...).build()` to finish, or chain additional
     /// setters for custom configuration.
     ///
     /// # Example
@@ -116,8 +113,8 @@ impl GeminiClient {
     /// use loopctl::provider::GeminiClient;
     ///
     /// let client = GeminiClient::builder()
-    ///     .api_key("AI...")
-    ///     .model("gemini-2.0-flash")
+    ///     .with_api_key("AI...")
+    ///     .with_model("gemini-2.0-flash")
     ///     .build()
     /// .unwrap();
     /// ```
@@ -150,9 +147,9 @@ impl GeminiClient {
         let model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
 
         Self::builder()
-            .api_key(api_key)
-            .base_url(base_url)
-            .model(model)
+            .with_api_key(api_key)
+            .with_base_url(base_url)
+            .with_model(model)
             .build()
     }
 
@@ -424,21 +421,6 @@ pub struct GeminiClientBuilder {
     /// Can be changed at runtime via [`GeminiClient::set_model`].
     model: String,
 
-    /// The total HTTP request timeout (connect + response + body).
-    ///
-    /// Bounds the entire request lifecycle. Defaults to 120 seconds.
-    /// Ignored when a client was supplied via
-    /// [`http_client`](Self::http_client); configure it on that client instead.
-    timeout: Duration,
-
-    /// The TCP connection establishment timeout (including TLS handshake).
-    ///
-    /// Separate from the total timeout so a slow-connecting server can be
-    /// detected faster. Defaults to 10 seconds.
-    /// Ignored when a client was supplied via
-    /// [`http_client`](Self::http_client).
-    connect_timeout: Duration,
-
     /// Whether to opt into thought summaries from reasoning-capable models.
     ///
     /// When `true`, every request gets
@@ -448,38 +430,12 @@ pub struct GeminiClientBuilder {
     /// must opt in once they know their model supports thinking.
     include_thoughts: bool,
 
-    /// A pre-built shared `reqwest::Client`, if injected via
-    /// [`http_client`](Self::http_client). When set, pool and TCP knobs are
-    /// ignored.
-    http: Option<reqwest::Client>,
-
-    /// Maximum idle connections kept alive per host.
+    /// Shared HTTP client configuration (timeouts, pool, TCP).
     ///
-    /// `None` defers to reqwest's default (unlimited). Set to a small value
-    /// (e.g. 1–4) for memory-constrained runners or workloads that make
-    /// mostly serial requests to a single host.
-    pool_max_idle_per_host: Option<usize>,
-
-    /// How long an idle connection stays in the pool before being closed.
-    ///
-    /// `None` defers to reqwest's default (90s). Raise for long-idle
-    /// interactive workloads to keep TLS sessions warm; lower for tight
-    /// batch jobs to free file descriptors sooner.
-    pool_idle_timeout: Option<Duration>,
-
-    /// OS-level TCP keepalive interval.
-    ///
-    /// `None` disables TCP keepalive (reqwest default). Enable (~60s) if
-    /// connections are silently dropped after idle periods (e.g. behind
-    /// aggressive NATs or load balancers).
-    tcp_keepalive: Option<Duration>,
-
-    /// Whether to disable Nagle's algorithm (`TCP_NODELAY`).
-    ///
-    /// Defaults to `true` — SSE streaming emits many small packets, and
-    /// Nagle's algorithm coalesces them, adding latency per delta. No public
-    /// setter; always applied on internally-built clients.
-    tcp_nodelay: bool,
+    /// Holds the timeout, connection-pool, and TCP knobs that apply to the
+    /// internally-built `reqwest::Client`, or an externally-supplied client
+    /// injected via [`with_http_client`](Self::with_http_client).
+    http: super::HttpClientConfig,
 }
 
 impl Default for GeminiClientBuilder {
@@ -488,14 +444,8 @@ impl Default for GeminiClientBuilder {
             api_key: None,
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
-            timeout: DEFAULT_REQUEST_TIMEOUT,
-            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             include_thoughts: false,
-            http: None,
-            pool_max_idle_per_host: None,
-            pool_idle_timeout: None,
-            tcp_keepalive: None,
-            tcp_nodelay: true,
+            http: super::HttpClientConfig::default(),
         }
     }
 }
@@ -506,7 +456,7 @@ impl GeminiClientBuilder {
     /// Required — [`build`](Self::build) returns an error if this is not set.
     /// The key is sent as the `x-goog-api-key` header on every request.
     #[must_use]
-    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
     }
@@ -516,7 +466,7 @@ impl GeminiClientBuilder {
     /// Defaults to `https://generativelanguage.googleapis.com/v1beta`.
     /// Override when targeting a proxy or Google AI-compatible endpoint.
     #[must_use]
-    pub fn base_url(mut self, url: impl Into<String>) -> Self {
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
     }
@@ -528,31 +478,28 @@ impl GeminiClientBuilder {
     /// [`GeminiClient::set_model`] (e.g. when the
     /// [`FallbackManager`](crate::fallback::FallbackManager) trips).
     #[must_use]
-    pub fn model(mut self, model: impl Into<String>) -> Self {
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
     }
 
     /// Set the total request timeout (connect + response + body).
     ///
-    /// Defaults to 120 seconds. This bounds the entire HTTP request lifecycle —
-    /// a hanging server will be aborted after this duration rather than
-    /// blocking the agent loop indefinitely.
+    /// Defaults to 120 seconds. Ignored when a client was supplied via
+    /// [`with_http_client`](Self::with_http_client).
     #[must_use]
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.http = self.http.with_timeout(timeout);
         self
     }
 
     /// Set the TCP connection establishment timeout.
     ///
-    /// Defaults to 10 seconds. This is the maximum time to wait for the TCP
-    /// connection (including TLS handshake) to be established.
-    /// Ignored when a client was supplied via
-    /// [`http_client`](Self::http_client).
+    /// Defaults to 10 seconds. Ignored when a client was supplied via
+    /// [`with_http_client`](Self::with_http_client).
     #[must_use]
-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.http = self.http.with_connect_timeout(timeout);
         self
     }
 
@@ -569,7 +516,7 @@ impl GeminiClientBuilder {
     /// [`DeltaPart::Thinking`] regardless of this flag — it's purely the
     /// request-side opt-in.
     #[must_use]
-    pub fn include_thoughts(mut self, enabled: bool) -> Self {
+    pub fn with_include_thoughts(mut self, enabled: bool) -> Self {
         self.include_thoughts = enabled;
         self
     }
@@ -580,50 +527,38 @@ impl GeminiClientBuilder {
     /// provider built from the same handle, and the pool/TCP knobs are
     /// ignored. Configure timeouts on the injected client, not here.
     #[must_use]
-    pub fn http_client(mut self, client: reqwest::Client) -> Self {
-        self.http = Some(client);
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http = self.http.with_http_client(client);
         self
     }
 
     /// Set the maximum idle connections kept alive per host.
     ///
-    /// Defaults to reqwest's built-in default (unlimited). Set to a small
-    /// value (e.g. 1–4) for memory-constrained runners or workloads that
-    /// make mostly serial requests to a single host.
-    ///
-    /// Ignored when a client was supplied via
-    /// [`http_client`](Self::http_client).
+    /// Defaults to reqwest's built-in default (unlimited). Ignored when a
+    /// client was supplied via [`with_http_client`](Self::with_http_client).
     #[must_use]
-    pub fn pool_max_idle_per_host(mut self, n: usize) -> Self {
-        self.pool_max_idle_per_host = Some(n);
+    pub fn with_pool_max_idle_per_host(mut self, n: usize) -> Self {
+        self.http = self.http.with_pool_max_idle_per_host(n);
         self
     }
 
     /// Set how long an idle connection stays in the pool before being closed.
     ///
-    /// Defaults to reqwest's built-in default (90s). Raise for long-idle
-    /// interactive workloads to keep TLS sessions warm; lower for tight
-    /// batch jobs to free file descriptors sooner.
-    ///
-    /// Ignored when a client was supplied via
-    /// [`http_client`](Self::http_client).
+    /// Defaults to reqwest's built-in default (90s). Ignored when a client
+    /// was supplied via [`with_http_client`](Self::with_http_client).
     #[must_use]
-    pub fn pool_idle_timeout(mut self, d: Duration) -> Self {
-        self.pool_idle_timeout = Some(d);
+    pub fn with_pool_idle_timeout(mut self, d: Duration) -> Self {
+        self.http = self.http.with_pool_idle_timeout(d);
         self
     }
 
     /// Set the OS-level TCP keepalive interval.
     ///
-    /// Defaults to disabled (reqwest default). Enable (~60s) if connections
-    /// are silently dropped after idle periods (e.g. behind aggressive NATs
-    /// or load balancers).
-    ///
-    /// Ignored when a client was supplied via
-    /// [`http_client`](Self::http_client).
+    /// Defaults to disabled (reqwest default). Ignored when a client was
+    /// supplied via [`with_http_client`](Self::with_http_client).
     #[must_use]
-    pub fn tcp_keepalive(mut self, d: Duration) -> Self {
-        self.tcp_keepalive = Some(d);
+    pub fn with_tcp_keepalive(mut self, d: Duration) -> Self {
+        self.http = self.http.with_tcp_keepalive(d);
         self
     }
 
@@ -636,18 +571,7 @@ impl GeminiClientBuilder {
         let api_key = self
             .api_key
             .ok_or_else(|| ApiError::auth_invalid_key("API key not provided"))?;
-        let http = match self.http {
-            Some(shared) => shared,
-            None => reqwest::Client::builder()
-                .timeout(self.timeout)
-                .connect_timeout(self.connect_timeout)
-                .tcp_nodelay(self.tcp_nodelay)
-                .maybe_pool_max_idle_per_host(self.pool_max_idle_per_host)
-                .maybe_pool_idle_timeout(self.pool_idle_timeout)
-                .maybe_tcp_keepalive(self.tcp_keepalive)
-                .build()
-                .map_err(|e| ApiError::http(e.to_string()))?,
-        };
+        let http = self.http.build()?;
 
         Ok(GeminiClient {
             http,
@@ -1400,15 +1324,18 @@ mod tests {
 
     #[test]
     fn builder_succeeds_with_key() {
-        let client = GeminiClient::builder().api_key("test-key").build().unwrap();
+        let client = GeminiClient::builder()
+            .with_api_key("test-key")
+            .build()
+            .unwrap();
         assert_eq!(client.model(), DEFAULT_MODEL);
     }
 
     #[test]
     fn builder_custom_model() {
         let client = GeminiClient::builder()
-            .api_key("test-key")
-            .model("gemini-1.5-pro")
+            .with_api_key("test-key")
+            .with_model("gemini-1.5-pro")
             .build()
             .unwrap();
         assert_eq!(client.model(), "gemini-1.5-pro");
@@ -1417,9 +1344,9 @@ mod tests {
     #[test]
     fn builder_custom_base_url() {
         let client = GeminiClient::builder()
-            .api_key("test-key")
-            .base_url("https://custom.example.com")
-            .model("gemini-pro")
+            .with_api_key("test-key")
+            .with_base_url("https://custom.example.com")
+            .with_model("gemini-pro")
             .build()
             .unwrap();
         assert_eq!(client.model(), "gemini-pro");
@@ -1428,7 +1355,7 @@ mod tests {
     #[test]
     fn stream_url_does_not_expose_api_key() {
         let client = GeminiClient::builder()
-            .api_key("secret-key-123")
+            .with_api_key("secret-key-123")
             .build()
             .unwrap();
         let url = client.stream_url();
@@ -1445,7 +1372,7 @@ mod tests {
     #[test]
     fn generate_url_does_not_expose_api_key() {
         let client = GeminiClient::builder()
-            .api_key("secret-key-456")
+            .with_api_key("secret-key-456")
             .build()
             .unwrap();
         let url = client.generate_url();
@@ -2060,113 +1987,21 @@ mod tests {
     }
 
     #[test]
-    fn builder_has_default_timeouts() {
-        // The builder should initialize with sensible non-zero defaults
-        // so that a hanging server cannot block the agent loop indefinitely.
-        let builder = GeminiClientBuilder::default();
-        assert_eq!(builder.timeout, DEFAULT_REQUEST_TIMEOUT);
-        assert_eq!(builder.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
-    }
-
-    #[test]
-    fn builder_custom_timeout() {
-        let custom = Duration::from_mins(5);
-        let builder = GeminiClientBuilder::default().timeout(custom);
-        assert_eq!(builder.timeout, custom);
-        // connect_timeout should be unchanged.
-        assert_eq!(builder.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
-    }
-
-    #[test]
-    fn builder_custom_connect_timeout() {
-        let custom = Duration::from_secs(45);
-        let builder = GeminiClientBuilder::default().connect_timeout(custom);
-        assert_eq!(builder.connect_timeout, custom);
-        // timeout should be unchanged.
-        assert_eq!(builder.timeout, DEFAULT_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn builder_custom_both_timeouts() {
-        let req_timeout = Duration::from_mins(10);
-        let conn_timeout = Duration::from_secs(30);
-        let builder = GeminiClientBuilder::default()
-            .timeout(req_timeout)
-            .connect_timeout(conn_timeout);
-        assert_eq!(builder.timeout, req_timeout);
-        assert_eq!(builder.connect_timeout, conn_timeout);
-    }
-
-    #[test]
     fn builder_timeouts_applied_on_build() {
         let client = GeminiClient::builder()
-            .api_key("test-key")
-            .timeout(Duration::from_mins(3))
-            .connect_timeout(Duration::from_secs(15))
+            .with_api_key("test-key")
+            .with_timeout(Duration::from_mins(3))
+            .with_connect_timeout(Duration::from_secs(15))
             .build();
         assert!(client.is_ok(), "build should succeed with valid timeouts");
     }
 
     #[test]
-    fn builder_accepts_injected_http_client() {
-        let shared = reqwest::Client::new();
-        let client_a = GeminiClient::builder()
-            .api_key("key-a")
-            .http_client(shared.clone())
-            .build();
-        let client_b = GeminiClient::builder()
-            .api_key("key-b")
-            .http_client(shared)
-            .build();
-        assert!(client_a.is_ok() && client_b.is_ok());
-    }
-
-    #[test]
-    fn injected_client_supersedes_builder_timeouts() {
-        let shared = reqwest::Client::builder()
-            .timeout(Duration::from_secs(1))
+    fn builder_include_thoughts_defaults_false() {
+        let client = GeminiClient::builder()
+            .with_api_key("test-key")
             .build()
             .unwrap();
-        let client = GeminiClient::builder()
-            .api_key("test-key")
-            .http_client(shared)
-            .timeout(Duration::from_secs(99))
-            .build();
-        assert!(client.is_ok());
-    }
-
-    #[test]
-    fn pool_knobs_build_clean() {
-        let client = GeminiClient::builder()
-            .api_key("test-key")
-            .pool_max_idle_per_host(4)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .tcp_keepalive(Duration::from_secs(90))
-            .build();
-        assert!(client.is_ok());
-    }
-
-    #[test]
-    fn tcp_nodelay_default_is_true() {
-        let builder = GeminiClientBuilder::default();
-        assert!(builder.tcp_nodelay);
-    }
-
-    #[test]
-    fn injected_client_ignores_pool_knobs() {
-        let shared = reqwest::Client::new();
-        let client = GeminiClient::builder()
-            .api_key("test-key")
-            .http_client(shared)
-            .pool_max_idle_per_host(4)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .build();
-        assert!(client.is_ok());
-    }
-
-    #[test]
-    fn builder_include_thoughts_defaults_false() {
-        let client = GeminiClient::builder().api_key("test-key").build().unwrap();
         assert!(
             !client.include_thoughts,
             "include_thoughts must default to false (non-reasoning models reject thinkingConfig)"
@@ -2176,8 +2011,8 @@ mod tests {
     #[test]
     fn builder_include_thoughts_true_propagates_to_client() {
         let client = GeminiClient::builder()
-            .api_key("test-key")
-            .include_thoughts(true)
+            .with_api_key("test-key")
+            .with_include_thoughts(true)
             .build()
             .unwrap();
         assert!(
@@ -2311,7 +2146,10 @@ mod tests {
 
     #[test]
     fn extract_structured_from_text_field() {
-        let client = GeminiClient::builder().api_key("test").build().unwrap();
+        let client = GeminiClient::builder()
+            .with_api_key("test")
+            .build()
+            .unwrap();
         let raw = serde_json::json!({
             "candidates": [{
                 "content": {
@@ -2327,7 +2165,10 @@ mod tests {
 
     #[test]
     fn extract_structured_prose_falls_back_to_raw() {
-        let client = GeminiClient::builder().api_key("test").build().unwrap();
+        let client = GeminiClient::builder()
+            .with_api_key("test")
+            .build()
+            .unwrap();
         let raw = serde_json::json!({
             "candidates": [{
                 "content": {

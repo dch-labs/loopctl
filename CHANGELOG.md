@@ -196,6 +196,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 - **Breaking:** `StreamHandler::stream_turn` now takes `options:
   RequestOptions` as an explicit parameter. `StreamHandler::with_request_options`
   is removed — use `BareLoop::set_request_options` instead.
+- **Breaking:** All three provider builders (`OpenAiClientBuilder`,
+  `AnthropicClientBuilder`, `GeminiClientBuilder`) now use `with_` prefix on
+  consuming builder methods (e.g. `.with_api_key()`, `.with_model()`,
+  `.with_timeout()`, `.with_http_client()`). The old no-prefix names
+  (`.api_key()`, `.model()`, etc.) are removed.
 - **Breaking:** `ToolOutput`, `ToolDispatchResult`, and `ToolPostContext` are
   now `#[non_exhaustive]`, matching `DisplayHint`. Downstream code that
   constructs these via struct literal must switch to the named constructors

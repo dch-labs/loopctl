@@ -58,6 +58,90 @@ use crate::{
     api::error::ApiError,
     message::{MessagePart, Role},
 };
+use std::time::Duration;
+
+/// Extension trait for [`reqwest::ClientBuilder`] that accepts `Option<T>`
+/// for pool and TCP knobs, no-opping when `None`.
+///
+/// Each provider builder stores pool/TCP settings as `Option<T>` so that
+/// `None` means "defer to reqwest's default." Without this trait, applying
+/// those settings in `build()` requires three separate `if let Some(...)`
+/// blocks. With it, the builder chain stays fluent:
+///
+/// ```rust,ignore
+/// reqwest::Client::builder()
+///     .timeout(timeout)
+///     .connect_timeout(connect_timeout)
+///     .tcp_nodelay(true)
+///     .maybe_pool_max_idle_per_host(pool_max_idle)
+///     .maybe_pool_idle_timeout(pool_idle_timeout)
+///     .maybe_tcp_keepalive(tcp_keepalive)
+///     .build()
+/// ```
+///
+/// When the value is `None`, the method returns the builder unchanged —
+/// reqwest's built-in default is used. When `Some`, the value is forwarded
+/// to the corresponding `reqwest::ClientBuilder` method.
+pub(super) trait ClientBuilderExt: Sized {
+    /// Set the maximum number of idle connections kept alive per host.
+    ///
+    /// When `Some(n)`, forwards to
+    /// [`pool_max_idle_per_host`](reqwest::ClientBuilder::pool_max_idle_per_host).
+    /// When `None`, the builder is returned unchanged and reqwest's default
+    /// (unlimited) is used.
+    ///
+    /// Most callers leave this at `None`. Set to a small value (e.g. 1–4)
+    /// for memory-constrained runners or workloads that make mostly serial
+    /// requests to a single host.
+    fn maybe_pool_max_idle_per_host(self, val: Option<usize>) -> Self;
+
+    /// Set how long an idle connection stays in the pool before being closed.
+    ///
+    /// When `Some(d)`, forwards to
+    /// [`pool_idle_timeout`](reqwest::ClientBuilder::pool_idle_timeout).
+    /// When `None`, the builder is returned unchanged and reqwest's default
+    /// (90 seconds) is used.
+    ///
+    /// Raise for long-idle interactive workloads to keep TLS sessions warm
+    /// between turns. Lower for tight batch jobs to free file descriptors
+    /// sooner.
+    fn maybe_pool_idle_timeout(self, val: Option<Duration>) -> Self;
+
+    /// Enable OS-level TCP keepalive at the given interval.
+    ///
+    /// When `Some(d)`, forwards to
+    /// [`tcp_keepalive`](reqwest::ClientBuilder::tcp_keepalive). When `None`,
+    /// the builder is returned unchanged and TCP keepalive stays disabled
+    /// (reqwest default).
+    ///
+    /// Enable (~60 seconds) if connections are silently dropped after idle
+    /// periods — e.g. behind aggressive NATs, firewalls, or load balancers
+    /// that reap idle TCP sessions without sending FIN.
+    fn maybe_tcp_keepalive(self, val: Option<Duration>) -> Self;
+}
+
+impl ClientBuilderExt for reqwest::ClientBuilder {
+    fn maybe_pool_max_idle_per_host(self, val: Option<usize>) -> Self {
+        match val {
+            Some(n) => self.pool_max_idle_per_host(n),
+            None => self,
+        }
+    }
+
+    fn maybe_pool_idle_timeout(self, val: Option<Duration>) -> Self {
+        match val {
+            Some(d) => self.pool_idle_timeout(Some(d)),
+            None => self,
+        }
+    }
+
+    fn maybe_tcp_keepalive(self, val: Option<Duration>) -> Self {
+        match val {
+            Some(d) => self.tcp_keepalive(d),
+            None => self,
+        }
+    }
+}
 
 #[cfg(feature = "openai")]
 pub mod openai;

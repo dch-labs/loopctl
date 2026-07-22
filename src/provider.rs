@@ -58,6 +58,218 @@ use crate::{
     api::error::ApiError,
     message::{MessagePart, Role},
 };
+use std::time::Duration;
+
+/// Shared HTTP-client configuration embedded by every provider builder.
+///
+/// Holds the timeout, connection-pool, and TCP knobs that are identical
+/// across [`OpenAiClient`](crate::provider::OpenAiClient),
+/// [`AnthropicClient`](crate::provider::AnthropicClient), and
+/// [`GeminiClient`](crate::provider::GeminiClient). Each provider builder
+/// embeds this struct and delegates its HTTP-related setters to it, so the
+/// pool/TCP documentation and construction logic lives in one place.
+#[derive(Clone)]
+pub(super) struct HttpClientConfig {
+    /// The total HTTP request timeout (connect + response + body).
+    ///
+    /// Bounds the entire request lifecycle — a hanging server will be
+    /// aborted after this duration rather than blocking the agent loop
+    /// indefinitely. Defaults to 120 seconds.
+    ///
+    /// Ignored when an external client is supplied via
+    /// [`with_http_client`](Self::with_http_client); configure it on that
+    /// client instead.
+    timeout: Duration,
+
+    /// The TCP connection establishment timeout (including TLS handshake).
+    ///
+    /// Separate from the total timeout so a slow-connecting server can be
+    /// detected faster than a slow-responding one. Defaults to 10 seconds.
+    ///
+    /// Ignored when an external client is supplied via
+    /// [`with_http_client`](Self::with_http_client).
+    connect_timeout: Duration,
+
+    /// A pre-built, shared `reqwest::Client`, if injected via
+    /// [`with_http_client`](Self::with_http_client).
+    ///
+    /// When set, the client's connection pool is shared with every other
+    /// provider built from the same handle, and the pool/TCP knobs below
+    /// (`pool_*`, `tcp_*`) are ignored — they are only applied when the
+    /// builder constructs its own client. Configure timeouts on the injected
+    /// client, not here.
+    http: Option<reqwest::Client>,
+
+    /// Maximum idle connections kept alive per host.
+    ///
+    /// `None` defers to reqwest's default (unlimited). Set to a small value
+    /// (e.g. 1–4) for memory-constrained runners or workloads that make
+    /// mostly serial requests to a single host.
+    pool_max_idle_per_host: Option<usize>,
+
+    /// How long an idle connection stays in the pool before being closed.
+    ///
+    /// `None` defers to reqwest's default (90s). Raise for long-idle
+    /// interactive workloads to keep TLS sessions warm; lower for tight
+    /// batch jobs to free file descriptors sooner.
+    pool_idle_timeout: Option<Duration>,
+
+    /// OS-level TCP keepalive interval.
+    ///
+    /// `None` disables TCP keepalive (reqwest default). Enable (~60s) if
+    /// connections are silently dropped after idle periods (e.g. behind
+    /// aggressive NATs or load balancers).
+    tcp_keepalive: Option<Duration>,
+
+    /// Whether to disable Nagle's algorithm (`TCP_NODELAY`).
+    ///
+    /// Defaults to `true` — SSE streaming emits many small packets, and
+    /// Nagle's algorithm coalesces them, adding latency per delta.
+    tcp_nodelay: bool,
+}
+
+impl Default for HttpClientConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_mins(2),
+            connect_timeout: Duration::from_secs(10),
+            http: None,
+            pool_max_idle_per_host: None,
+            pool_idle_timeout: None,
+            tcp_keepalive: None,
+            tcp_nodelay: true,
+        }
+    }
+}
+
+impl HttpClientConfig {
+    /// Set the total request timeout.
+    ///
+    /// Ignored when an external client was supplied via
+    /// [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub(super) fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Set the TCP connection establishment timeout.
+    ///
+    /// Ignored when an external client was supplied.
+    #[must_use]
+    pub(super) fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Inject a pre-built, shared `reqwest::Client`.
+    ///
+    /// When set, the client's connection pool is shared with every other
+    /// provider built from the same handle, and the pool/TCP knobs are
+    /// ignored. Configure timeouts on the injected client, not here.
+    #[must_use]
+    pub(super) fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http = Some(client);
+        self
+    }
+
+    /// Set the maximum idle connections kept alive per host.
+    ///
+    /// Defaults to reqwest's built-in default (unlimited). Set to a small
+    /// value (e.g. 1–4) for memory-constrained runners or workloads that
+    /// make mostly serial requests to a single host.
+    ///
+    /// Ignored when an external client was supplied.
+    #[must_use]
+    pub(super) fn with_pool_max_idle_per_host(mut self, n: usize) -> Self {
+        self.pool_max_idle_per_host = Some(n);
+        self
+    }
+
+    /// Set how long an idle connection stays in the pool before being closed.
+    ///
+    /// Defaults to reqwest's built-in default (90s). Raise for long-idle
+    /// interactive workloads to keep TLS sessions warm; lower for tight
+    /// batch jobs to free file descriptors sooner.
+    ///
+    /// Ignored when an external client was supplied.
+    #[must_use]
+    pub(super) fn with_pool_idle_timeout(mut self, d: Duration) -> Self {
+        self.pool_idle_timeout = Some(d);
+        self
+    }
+
+    /// Set the OS-level TCP keepalive interval.
+    ///
+    /// Defaults to disabled (reqwest default). Enable (~60s) if connections
+    /// are silently dropped after idle periods (e.g. behind aggressive NATs
+    /// or load balancers).
+    ///
+    /// Ignored when an external client was supplied.
+    #[must_use]
+    pub(super) fn with_tcp_keepalive(mut self, d: Duration) -> Self {
+        self.tcp_keepalive = Some(d);
+        self
+    }
+
+    /// Build a `reqwest::Client` from this configuration.
+    ///
+    /// If an external client was supplied via
+    /// [`with_http_client`](Self::with_http_client), it is returned verbatim. Otherwise
+    /// a new client is constructed with the configured timeouts, pool knobs,
+    /// and `tcp_nodelay(true)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] if `reqwest::Client::builder().build()` fails.
+    pub(super) fn build(self) -> Result<reqwest::Client, ApiError> {
+        match self.http {
+            Some(shared) => Ok(shared),
+            None => reqwest::Client::builder()
+                .timeout(self.timeout)
+                .connect_timeout(self.connect_timeout)
+                .tcp_nodelay(self.tcp_nodelay)
+                .maybe_pool_max_idle_per_host(self.pool_max_idle_per_host)
+                .maybe_pool_idle_timeout(self.pool_idle_timeout)
+                .maybe_tcp_keepalive(self.tcp_keepalive)
+                .build()
+                .map_err(|e| ApiError::http(e.to_string())),
+        }
+    }
+}
+
+/// Extension trait for [`reqwest::ClientBuilder`] that accepts `Option<T>`
+/// for pool and TCP knobs, no-opping when `None`.
+///
+/// Used internally by [`HttpClientConfig::build`].
+trait ClientBuilderExt: Sized {
+    fn maybe_pool_max_idle_per_host(self, val: Option<usize>) -> Self;
+    fn maybe_pool_idle_timeout(self, val: Option<Duration>) -> Self;
+    fn maybe_tcp_keepalive(self, val: Option<Duration>) -> Self;
+}
+
+impl ClientBuilderExt for reqwest::ClientBuilder {
+    fn maybe_pool_max_idle_per_host(self, val: Option<usize>) -> Self {
+        match val {
+            Some(n) => self.pool_max_idle_per_host(n),
+            None => self,
+        }
+    }
+
+    fn maybe_pool_idle_timeout(self, val: Option<Duration>) -> Self {
+        match val {
+            Some(d) => self.pool_idle_timeout(Some(d)),
+            None => self,
+        }
+    }
+
+    fn maybe_tcp_keepalive(self, val: Option<Duration>) -> Self {
+        match val {
+            Some(d) => self.tcp_keepalive(d),
+            None => self,
+        }
+    }
+}
 
 #[cfg(feature = "openai")]
 pub mod openai;
@@ -223,9 +435,9 @@ pub fn ollama(model: &str) -> Result<OpenAiClient, ApiError> {
     let api_key = env_or_default("OLLAMA_API_KEY", "ollama");
 
     OpenAiClient::builder()
-        .api_key(api_key)
-        .base_url(base)
-        .model(model)
+        .with_api_key(api_key)
+        .with_base_url(base)
+        .with_model(model)
         .build()
 }
 
@@ -251,9 +463,9 @@ pub fn deepseek() -> Result<OpenAiClient, ApiError> {
     let model = env_or_default("DEEPSEEK_MODEL", DEEPSEEK_DEFAULT_MODEL);
 
     OpenAiClient::builder()
-        .api_key(api_key)
-        .base_url(DEEPSEEK_BASE_URL)
-        .model(model)
+        .with_api_key(api_key)
+        .with_base_url(DEEPSEEK_BASE_URL)
+        .with_model(model)
         .build()
 }
 
@@ -279,9 +491,9 @@ pub fn grok() -> Result<OpenAiClient, ApiError> {
     let model = env_or_default("GROK_MODEL", GROK_DEFAULT_MODEL);
 
     OpenAiClient::builder()
-        .api_key(api_key)
-        .base_url(GROK_BASE_URL)
-        .model(model)
+        .with_api_key(api_key)
+        .with_base_url(GROK_BASE_URL)
+        .with_model(model)
         .build()
 }
 
@@ -311,9 +523,9 @@ pub fn zai() -> Result<AnthropicClient, ApiError> {
     let model = env_or_default("ZAI_MODEL", ZAI_DEFAULT_MODEL);
 
     AnthropicClient::builder()
-        .api_key(api_key)
-        .base_url(ZAI_BASE_URL)
-        .model(model)
+        .with_api_key(api_key)
+        .with_base_url(ZAI_BASE_URL)
+        .with_model(model)
         .build()
 }
 
@@ -341,9 +553,9 @@ pub fn self_hosted(base_url: &str, model: &str) -> Result<OpenAiClient, ApiError
     let api_key = env_or_default("OPENAI_API_KEY", "self-hosted");
 
     OpenAiClient::builder()
-        .api_key(api_key)
-        .base_url(base_url)
-        .model(model)
+        .with_api_key(api_key)
+        .with_base_url(base_url)
+        .with_model(model)
         .build()
 }
 
@@ -645,5 +857,53 @@ mod tests {
         let msgs = [sys_msg(&["part one", "part two"])];
         let (_non_system, system) = fold_system_messages(&msgs, None);
         assert_eq!(system.as_deref(), Some("part one\npart two"));
+    }
+
+    #[test]
+    fn default_builds_clean() {
+        assert!(HttpClientConfig::default().build().is_ok());
+    }
+
+    #[test]
+    fn accepts_injected_http_client() {
+        let shared = reqwest::Client::new();
+        let config = HttpClientConfig::default().with_http_client(shared);
+        assert!(config.build().is_ok());
+    }
+
+    #[test]
+    fn injected_client_supersedes_timeouts() {
+        let shared = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let config = HttpClientConfig::default()
+            .with_http_client(shared)
+            .with_timeout(Duration::from_secs(99));
+        assert!(config.build().is_ok());
+    }
+
+    #[test]
+    fn pool_knobs_build_clean() {
+        let config = HttpClientConfig::default()
+            .with_pool_max_idle_per_host(4)
+            .with_pool_idle_timeout(Duration::from_secs(30))
+            .with_tcp_keepalive(Duration::from_secs(90));
+        assert!(config.build().is_ok());
+    }
+
+    #[test]
+    fn tcp_nodelay_default_is_true() {
+        assert!(HttpClientConfig::default().tcp_nodelay);
+    }
+
+    #[test]
+    fn injected_client_ignores_pool_knobs() {
+        let shared = reqwest::Client::new();
+        let config = HttpClientConfig::default()
+            .with_http_client(shared)
+            .with_pool_max_idle_per_host(4)
+            .with_pool_idle_timeout(Duration::from_secs(30));
+        assert!(config.build().is_ok());
     }
 }

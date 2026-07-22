@@ -476,9 +476,9 @@ async fn main() {
 
         let client = build_or_die!(
             loopctl::provider::OpenAiClient::builder()
-                .api_key("ollama")
-                .base_url(base)
-                .model(model)
+                .with_api_key("ollama")
+                .with_base_url(base)
+                .with_model(model)
                 .build(),
             "Ollama"
         );

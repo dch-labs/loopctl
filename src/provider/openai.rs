@@ -14,9 +14,9 @@
 //!
 //! // Explicit:
 //! let client = OpenAiClient::builder()
-//!     .api_key("sk-...")
-//!     .base_url("https://api.deepseek.com/v1")
-//!     .model("deepseek-chat")
+//!     .with_api_key("sk-...")
+//!     .with_base_url("https://api.deepseek.com/v1")
+//!     .with_model("deepseek-chat")
 //!     .build()?;
 //! ```
 
@@ -50,11 +50,9 @@ const SSE_DONE: &str = "[DONE]";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const THINKING_PART_INDEX: usize = 1;
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(2); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ==================================================
 // Client
@@ -101,7 +99,7 @@ impl OpenAiClient {
     ///
     /// Returns an [`OpenAiClientBuilder`] with sensible defaults. The only
     /// required field is `api_key`; everything else has a production-ready
-    /// default. Call `.api_key(...).build()` to finish, or chain additional
+    /// default. Call `.with_api_key(...).build()` to finish, or chain additional
     /// setters for custom configuration.
     ///
     /// # Example
@@ -110,8 +108,8 @@ impl OpenAiClient {
     /// use loopctl::provider::OpenAiClient;
     ///
     /// let client = OpenAiClient::builder()
-    ///     .api_key("sk-...")
-    ///     .model("gpt-4o")
+    ///     .with_api_key("sk-...")
+    ///     .with_model("gpt-4o")
     ///     .build()
     /// .unwrap();
     /// ```
@@ -150,9 +148,9 @@ impl OpenAiClient {
             .unwrap_or_else(|_| DEFAULT_MODEL.into());
 
         Self::builder()
-            .api_key(api_key)
-            .base_url(base_url)
-            .model(model)
+            .with_api_key(api_key)
+            .with_base_url(base_url)
+            .with_model(model)
             .build()
     }
 
@@ -433,16 +431,12 @@ pub struct OpenAiClientBuilder {
     /// Can be changed at runtime via [`OpenAiClient::set_model`].
     model: String,
 
-    /// The total HTTP request timeout (connect + response + body).
+    /// Shared HTTP client configuration (timeouts, pool, TCP).
     ///
-    /// Bounds the entire request lifecycle. Defaults to 120 seconds.
-    timeout: Duration,
-
-    /// The TCP connection establishment timeout (including TLS handshake).
-    ///
-    /// Separate from the total timeout so a slow-connecting server can be
-    /// detected faster. Defaults to 10 seconds.
-    connect_timeout: Duration,
+    /// Holds the timeout, connection-pool, and TCP knobs that apply to the
+    /// internally-built `reqwest::Client`, or an externally-supplied client
+    /// injected via [`with_http_client`](Self::with_http_client).
+    http: super::HttpClientConfig,
 }
 
 impl Default for OpenAiClientBuilder {
@@ -451,8 +445,7 @@ impl Default for OpenAiClientBuilder {
             api_key: None,
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
-            timeout: DEFAULT_REQUEST_TIMEOUT,
-            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            http: super::HttpClientConfig::default(),
         }
     }
 }
@@ -464,7 +457,7 @@ impl OpenAiClientBuilder {
     /// The key is sent as the `Authorization: Bearer <key>` header on every
     /// request.
     #[must_use]
-    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
     }
@@ -475,7 +468,7 @@ impl OpenAiClientBuilder {
     /// OpenAI-compatible endpoint (e.g. `https://api.deepseek.com/v1`,
     /// `http://localhost:11434/v1` for Ollama, or a vLLM server).
     #[must_use]
-    pub fn base_url(mut self, url: impl Into<String>) -> Self {
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
     }
@@ -486,29 +479,69 @@ impl OpenAiClientBuilder {
     /// changed at runtime via [`OpenAiClient::set_model`] (e.g. when the
     /// [`FallbackManager`](crate::fallback::FallbackManager) trips).
     #[must_use]
-    pub fn model(mut self, model: impl Into<String>) -> Self {
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
     }
 
     /// Set the total request timeout (connect + response + body).
     ///
-    /// Defaults to 120 seconds. This bounds the entire HTTP request lifecycle —
-    /// a hanging server will be aborted after this duration rather than
-    /// blocking the agent loop indefinitely.
+    /// Defaults to 120 seconds. Ignored when a client was supplied via
+    /// [`with_http_client`](Self::with_http_client).
     #[must_use]
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.http = self.http.with_timeout(timeout);
         self
     }
 
     /// Set the TCP connection establishment timeout.
     ///
-    /// Defaults to 10 seconds. This is the maximum time to wait for the TCP
-    /// connection (including TLS handshake) to be established.
+    /// Defaults to 10 seconds. Ignored when a client was supplied via
+    /// [`with_http_client`](Self::with_http_client).
     #[must_use]
-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.http = self.http.with_connect_timeout(timeout);
+        self
+    }
+
+    /// Inject a pre-built, shared `reqwest::Client`.
+    ///
+    /// When set, the client's connection pool is shared with every other
+    /// provider built from the same handle, and the pool/TCP knobs are
+    /// ignored. Configure timeouts on the injected client, not here.
+    #[must_use]
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http = self.http.with_http_client(client);
+        self
+    }
+
+    /// Set the maximum idle connections kept alive per host.
+    ///
+    /// Defaults to reqwest's built-in default (unlimited). Ignored when a
+    /// client was supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_pool_max_idle_per_host(mut self, n: usize) -> Self {
+        self.http = self.http.with_pool_max_idle_per_host(n);
+        self
+    }
+
+    /// Set how long an idle connection stays in the pool before being closed.
+    ///
+    /// Defaults to reqwest's built-in default (90s). Ignored when a client
+    /// was supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_pool_idle_timeout(mut self, d: Duration) -> Self {
+        self.http = self.http.with_pool_idle_timeout(d);
+        self
+    }
+
+    /// Set the OS-level TCP keepalive interval.
+    ///
+    /// Defaults to disabled (reqwest default). Ignored when a client was
+    /// supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_tcp_keepalive(mut self, d: Duration) -> Self {
+        self.http = self.http.with_tcp_keepalive(d);
         self
     }
 
@@ -521,12 +554,7 @@ impl OpenAiClientBuilder {
         let api_key = self
             .api_key
             .ok_or_else(|| ApiError::auth_invalid_key("API key not provided"))?;
-
-        let http = reqwest::Client::builder()
-            .timeout(self.timeout)
-            .connect_timeout(self.connect_timeout)
-            .build()
-            .map_err(|e| ApiError::http(e.to_string()))?;
+        let http = self.http.build()?;
 
         Ok(OpenAiClient {
             http,
@@ -1756,52 +1784,11 @@ mod tests {
     }
 
     #[test]
-    fn builder_has_default_timeouts() {
-        // The builder should initialize with sensible non-zero defaults
-        // so that a hanging server cannot block the agent loop indefinitely.
-        let builder = OpenAiClientBuilder::default();
-        assert_eq!(builder.timeout, DEFAULT_REQUEST_TIMEOUT);
-        assert_eq!(builder.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
-    }
-
-    #[test]
-    fn builder_custom_timeout() {
-        let custom = Duration::from_mins(5);
-        let builder = OpenAiClientBuilder::default().timeout(custom);
-        assert_eq!(builder.timeout, custom);
-        // connect_timeout should be unchanged.
-        assert_eq!(builder.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
-    }
-
-    #[test]
-    fn builder_custom_connect_timeout() {
-        let custom = Duration::from_secs(45);
-        let builder = OpenAiClientBuilder::default().connect_timeout(custom);
-        assert_eq!(builder.connect_timeout, custom);
-        // timeout should be unchanged.
-        assert_eq!(builder.timeout, DEFAULT_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn builder_custom_both_timeouts() {
-        let req_timeout = Duration::from_mins(10);
-        let conn_timeout = Duration::from_secs(30);
-        let builder = OpenAiClientBuilder::default()
-            .timeout(req_timeout)
-            .connect_timeout(conn_timeout);
-        assert_eq!(builder.timeout, req_timeout);
-        assert_eq!(builder.connect_timeout, conn_timeout);
-    }
-
-    #[test]
     fn builder_timeouts_applied_on_build() {
-        // Verify the build succeeds — reqwest validates the configuration
-        // internally. If timeout/connect_timeout were somehow invalid,
-        // .build() would return an error.
         let client = OpenAiClient::builder()
-            .api_key("sk-test")
-            .timeout(Duration::from_mins(3))
-            .connect_timeout(Duration::from_secs(15))
+            .with_api_key("sk-test")
+            .with_timeout(Duration::from_mins(3))
+            .with_connect_timeout(Duration::from_secs(15))
             .build();
         assert!(client.is_ok(), "build should succeed with valid timeouts");
     }
@@ -1943,7 +1930,10 @@ mod tests {
 
     #[test]
     fn extract_structured_from_string_content() {
-        let client = OpenAiClient::builder().api_key("test").build().unwrap();
+        let client = OpenAiClient::builder()
+            .with_api_key("test")
+            .build()
+            .unwrap();
         let raw = serde_json::json!({
             "choices": [{
                 "message": {
@@ -1957,7 +1947,10 @@ mod tests {
 
     #[test]
     fn extract_structured_from_object_content() {
-        let client = OpenAiClient::builder().api_key("test").build().unwrap();
+        let client = OpenAiClient::builder()
+            .with_api_key("test")
+            .build()
+            .unwrap();
         let raw = serde_json::json!({
             "choices": [{
                 "message": {
@@ -1971,7 +1964,10 @@ mod tests {
 
     #[test]
     fn extract_structured_prose_falls_back_to_raw() {
-        let client = OpenAiClient::builder().api_key("test").build().unwrap();
+        let client = OpenAiClient::builder()
+            .with_api_key("test")
+            .build()
+            .unwrap();
         let raw = serde_json::json!({
             "choices": [{
                 "message": {

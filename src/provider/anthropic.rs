@@ -13,8 +13,8 @@
 //!
 //! // Explicit:
 //! let client = AnthropicClient::builder()
-//!     .api_key("sk-ant-...")
-//!     .model("claude-sonnet-4-20250514")
+//!     .with_api_key("sk-ant-...")
+//!     .with_model("claude-sonnet-4-20250514")
 //!     .build()?;
 //! ```
 
@@ -26,7 +26,6 @@ use reqwest::Response;
 use serde_json::Value;
 use std::time::Duration;
 
-use super::ClientBuilderExt;
 use crate::api::ApiClient;
 use crate::api::error::ApiError;
 use crate::message::{Message, MessagePart, Role};
@@ -49,11 +48,9 @@ const SSE_EVENT_PREFIX: &str = "event: ";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(2); // connect + response + body
 const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
 const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ==================================================
 // Client
@@ -65,7 +62,7 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`StreamEvent`] protocol and the Anthropic Messages SSE format.
 ///
 /// Also works with Anthropic-compatible endpoints such as `Z.ai`
-/// — use a custom `base_url` via [`AnthropicClientBuilder::base_url`].
+/// — use a custom `base_url` via [`AnthropicClientBuilder::with_base_url`].
 pub struct AnthropicClient {
     /// The underlying HTTP client (connection-pooled `reqwest::Client`).
     ///
@@ -106,7 +103,7 @@ impl AnthropicClient {
     ///
     /// Returns an [`AnthropicClientBuilder`] with sensible defaults. The only
     /// required field is `api_key`; everything else has a production-ready
-    /// default. Call `.api_key(...).build()` to finish, or chain additional
+    /// default. Call `.with_api_key(...).build()` to finish, or chain additional
     /// setters for custom configuration.
     ///
     /// # Example
@@ -115,8 +112,8 @@ impl AnthropicClient {
     /// use loopctl::provider::AnthropicClient;
     ///
     /// let client = AnthropicClient::builder()
-    ///     .api_key("sk-ant-...")
-    ///     .model("claude-sonnet-4-20250514")
+    ///     .with_api_key("sk-ant-...")
+    ///     .with_model("claude-sonnet-4-20250514")
     ///     .build()
     /// .unwrap();
     /// ```
@@ -148,9 +145,9 @@ impl AnthropicClient {
         let model = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
 
         Self::builder()
-            .api_key(api_key)
-            .base_url(base_url)
-            .model(model)
+            .with_api_key(api_key)
+            .with_base_url(base_url)
+            .with_model(model)
             .build()
     }
 
@@ -356,7 +353,7 @@ pub struct AnthropicClientBuilder {
     ///
     /// Required — [`build`](Self::build) returns an error if this is `None`.
     /// The key is sent as the `x-api-key` header on every request. Set via
-    /// [`api_key`](Self::api_key) on the builder, or read from
+    /// [`with_api_key`](Self::with_api_key) on the builder, or read from
     /// `ANTHROPIC_API_KEY` via [`AnthropicClient::from_env`].
     api_key: Option<String>,
 
@@ -376,53 +373,12 @@ pub struct AnthropicClientBuilder {
     /// Anthropic requires this field on every request. Defaults to 8192.
     max_tokens: u32,
 
-    /// The total HTTP request timeout (connect + response + body).
+    /// Shared HTTP client configuration (timeouts, pool, TCP).
     ///
-    /// Bounds the entire request lifecycle. Defaults to 120 seconds.
-    /// Ignored when a client was supplied via
-    /// [`http_client`](Self::http_client); configure it on that client instead.
-    timeout: Duration,
-
-    /// The TCP connection establishment timeout (including TLS handshake).
-    ///
-    /// Separate from the total timeout so a slow-connecting server can be
-    /// detected faster than a slow-responding one. Defaults to 10 seconds.
-    /// Ignored when a client was supplied via
-    /// [`http_client`](Self::http_client).
-    connect_timeout: Duration,
-
-    /// A pre-built shared `reqwest::Client`, if injected via
-    /// [`http_client`](Self::http_client). When set, pool and TCP knobs are
-    /// ignored.
-    http: Option<reqwest::Client>,
-
-    /// Maximum idle connections kept alive per host.
-    ///
-    /// `None` defers to reqwest's default (unlimited). Set to a small value
-    /// (e.g. 1–4) for memory-constrained runners or workloads that make
-    /// mostly serial requests to a single host.
-    pool_max_idle_per_host: Option<usize>,
-
-    /// How long an idle connection stays in the pool before being closed.
-    ///
-    /// `None` defers to reqwest's default (90s). Raise for long-idle
-    /// interactive workloads to keep TLS sessions warm; lower for tight
-    /// batch jobs to free file descriptors sooner.
-    pool_idle_timeout: Option<Duration>,
-
-    /// OS-level TCP keepalive interval.
-    ///
-    /// `None` disables TCP keepalive (reqwest default). Enable (~60s) if
-    /// connections are silently dropped after idle periods (e.g. behind
-    /// aggressive NATs or load balancers).
-    tcp_keepalive: Option<Duration>,
-
-    /// Whether to disable Nagle's algorithm (`TCP_NODELAY`).
-    ///
-    /// Defaults to `true` — SSE streaming emits many small packets, and
-    /// Nagle's algorithm coalesces them, adding latency per delta. No public
-    /// setter; always applied on internally-built clients.
-    tcp_nodelay: bool,
+    /// Holds the timeout, connection-pool, and TCP knobs that apply to the
+    /// internally-built `reqwest::Client`, or an externally-supplied client
+    /// injected via [`with_http_client`](Self::with_http_client).
+    http: super::HttpClientConfig,
 }
 
 impl Default for AnthropicClientBuilder {
@@ -432,13 +388,7 @@ impl Default for AnthropicClientBuilder {
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
             max_tokens: DEFAULT_MAX_TOKENS,
-            timeout: DEFAULT_REQUEST_TIMEOUT,
-            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            http: None,
-            pool_max_idle_per_host: None,
-            pool_idle_timeout: None,
-            tcp_keepalive: None,
-            tcp_nodelay: true,
+            http: super::HttpClientConfig::default(),
         }
     }
 }
@@ -449,7 +399,7 @@ impl AnthropicClientBuilder {
     /// Required — [`build`](Self::build) returns an error if this is not set.
     /// The key is sent as the `x-api-key` header on every request.
     #[must_use]
-    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
     }
@@ -460,7 +410,7 @@ impl AnthropicClientBuilder {
     /// proxy, gateway, or Anthropic-compatible endpoint (e.g. Z.AI at
     /// `https://api.z.ai/api/anthropic`).
     #[must_use]
-    pub fn base_url(mut self, url: impl Into<String>) -> Self {
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
     }
@@ -471,7 +421,7 @@ impl AnthropicClientBuilder {
     /// changed at runtime via [`AnthropicClient::set_model`] (e.g. when the
     /// [`FallbackManager`](crate::fallback::FallbackManager) trips).
     #[must_use]
-    pub fn model(mut self, model: impl Into<String>) -> Self {
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
     }
@@ -483,31 +433,28 @@ impl AnthropicClientBuilder {
     /// response. Defaults to 8192. Increase for long-form generation;
     /// decrease to cap cost on simple queries.
     #[must_use]
-    pub fn max_tokens(mut self, tokens: u32) -> Self {
+    pub fn with_max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = tokens;
         self
     }
 
     /// Set the total request timeout (connect + response + body).
     ///
-    /// Defaults to 120 seconds. This bounds the entire HTTP request lifecycle —
-    /// a hanging server will be aborted after this duration rather than
-    /// blocking the agent loop indefinitely.
+    /// Defaults to 120 seconds. Ignored when a client was supplied via
+    /// [`with_http_client`](Self::with_http_client).
     #[must_use]
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.http = self.http.with_timeout(timeout);
         self
     }
 
     /// Set the TCP connection establishment timeout.
     ///
-    /// Defaults to 10 seconds. This is the maximum time to wait for the TCP
-    /// connection (including TLS handshake) to be established.
-    /// Ignored when a client was supplied via
-    /// [`http_client`](Self::http_client).
+    /// Defaults to 10 seconds. Ignored when a client was supplied via
+    /// [`with_http_client`](Self::with_http_client).
     #[must_use]
-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.http = self.http.with_connect_timeout(timeout);
         self
     }
 
@@ -517,50 +464,38 @@ impl AnthropicClientBuilder {
     /// provider built from the same handle, and the pool/TCP knobs are
     /// ignored. Configure timeouts on the injected client, not here.
     #[must_use]
-    pub fn http_client(mut self, client: reqwest::Client) -> Self {
-        self.http = Some(client);
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http = self.http.with_http_client(client);
         self
     }
 
     /// Set the maximum idle connections kept alive per host.
     ///
-    /// Defaults to reqwest's built-in default (unlimited). Set to a small
-    /// value (e.g. 1–4) for memory-constrained runners or workloads that
-    /// make mostly serial requests to a single host.
-    ///
-    /// Ignored when a client was supplied via
-    /// [`http_client`](Self::http_client).
+    /// Defaults to reqwest's built-in default (unlimited). Ignored when a
+    /// client was supplied via [`with_http_client`](Self::with_http_client).
     #[must_use]
-    pub fn pool_max_idle_per_host(mut self, n: usize) -> Self {
-        self.pool_max_idle_per_host = Some(n);
+    pub fn with_pool_max_idle_per_host(mut self, n: usize) -> Self {
+        self.http = self.http.with_pool_max_idle_per_host(n);
         self
     }
 
     /// Set how long an idle connection stays in the pool before being closed.
     ///
-    /// Defaults to reqwest's built-in default (90s). Raise for long-idle
-    /// interactive workloads to keep TLS sessions warm; lower for tight
-    /// batch jobs to free file descriptors sooner.
-    ///
-    /// Ignored when a client was supplied via
-    /// [`http_client`](Self::http_client).
+    /// Defaults to reqwest's built-in default (90s). Ignored when a client
+    /// was supplied via [`with_http_client`](Self::with_http_client).
     #[must_use]
-    pub fn pool_idle_timeout(mut self, d: Duration) -> Self {
-        self.pool_idle_timeout = Some(d);
+    pub fn with_pool_idle_timeout(mut self, d: Duration) -> Self {
+        self.http = self.http.with_pool_idle_timeout(d);
         self
     }
 
     /// Set the OS-level TCP keepalive interval.
     ///
-    /// Defaults to disabled (reqwest default). Enable (~60s) if connections
-    /// are silently dropped after idle periods (e.g. behind aggressive NATs
-    /// or load balancers).
-    ///
-    /// Ignored when a client was supplied via
-    /// [`http_client`](Self::http_client).
+    /// Defaults to disabled (reqwest default). Ignored when a client was
+    /// supplied via [`with_http_client`](Self::with_http_client).
     #[must_use]
-    pub fn tcp_keepalive(mut self, d: Duration) -> Self {
-        self.tcp_keepalive = Some(d);
+    pub fn with_tcp_keepalive(mut self, d: Duration) -> Self {
+        self.http = self.http.with_tcp_keepalive(d);
         self
     }
 
@@ -572,23 +507,12 @@ impl AnthropicClientBuilder {
     /// # Errors
     ///
     /// Returns [`ApiError`] if no API key was set via
-    /// [`api_key`](Self::api_key).
+    /// [`with_api_key`](Self::with_api_key).
     pub fn build(self) -> Result<AnthropicClient, ApiError> {
         let api_key = self
             .api_key
             .ok_or_else(|| ApiError::auth_invalid_key("API key not provided"))?;
-        let http = match self.http {
-            Some(shared) => shared,
-            None => reqwest::Client::builder()
-                .timeout(self.timeout)
-                .connect_timeout(self.connect_timeout)
-                .tcp_nodelay(self.tcp_nodelay)
-                .maybe_pool_max_idle_per_host(self.pool_max_idle_per_host)
-                .maybe_pool_idle_timeout(self.pool_idle_timeout)
-                .maybe_tcp_keepalive(self.tcp_keepalive)
-                .build()
-                .map_err(|e| ApiError::http(e.to_string()))?,
-        };
+        let http = self.http.build()?;
 
         Ok(AnthropicClient {
             http,
@@ -1735,7 +1659,7 @@ mod tests {
     #[test]
     fn builder_succeeds_with_key() {
         let client = AnthropicClient::builder()
-            .api_key("sk-test")
+            .with_api_key("sk-test")
             .build()
             .unwrap();
         assert_eq!(client.model(), DEFAULT_MODEL);
@@ -1744,9 +1668,9 @@ mod tests {
     #[test]
     fn builder_custom_base_url_and_model() {
         let client = AnthropicClient::builder()
-            .api_key("sk-test")
-            .base_url("https://custom.example.com")
-            .model("claude-3-haiku")
+            .with_api_key("sk-test")
+            .with_base_url("https://custom.example.com")
+            .with_model("claude-3-haiku")
             .build()
             .unwrap();
         assert_eq!(client.model(), "claude-3-haiku");
@@ -1941,108 +1865,13 @@ mod tests {
     }
 
     #[test]
-    fn builder_has_default_timeouts() {
-        // The builder should initialize with sensible non-zero defaults
-        // so that a hanging server cannot block the agent loop indefinitely.
-        let builder = AnthropicClientBuilder::default();
-        assert_eq!(builder.timeout, DEFAULT_REQUEST_TIMEOUT);
-        assert_eq!(builder.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
-    }
-
-    #[test]
-    fn builder_custom_timeout() {
-        let custom = Duration::from_mins(5);
-        let builder = AnthropicClientBuilder::default().timeout(custom);
-        assert_eq!(builder.timeout, custom);
-        // connect_timeout should be unchanged.
-        assert_eq!(builder.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
-    }
-
-    #[test]
-    fn builder_custom_connect_timeout() {
-        let custom = Duration::from_secs(45);
-        let builder = AnthropicClientBuilder::default().connect_timeout(custom);
-        assert_eq!(builder.connect_timeout, custom);
-        // timeout should be unchanged.
-        assert_eq!(builder.timeout, DEFAULT_REQUEST_TIMEOUT);
-    }
-
-    #[test]
-    fn builder_custom_both_timeouts() {
-        let req_timeout = Duration::from_mins(10);
-        let conn_timeout = Duration::from_secs(30);
-        let builder = AnthropicClientBuilder::default()
-            .timeout(req_timeout)
-            .connect_timeout(conn_timeout);
-        assert_eq!(builder.timeout, req_timeout);
-        assert_eq!(builder.connect_timeout, conn_timeout);
-    }
-
-    #[test]
     fn builder_timeouts_applied_on_build() {
         let client = AnthropicClient::builder()
-            .api_key("sk-test")
-            .timeout(Duration::from_mins(3))
-            .connect_timeout(Duration::from_secs(15))
+            .with_api_key("sk-test")
+            .with_timeout(Duration::from_mins(3))
+            .with_connect_timeout(Duration::from_secs(15))
             .build();
         assert!(client.is_ok(), "build should succeed with valid timeouts");
-    }
-
-    #[test]
-    fn builder_accepts_injected_http_client() {
-        let shared = reqwest::Client::new();
-        let client_a = AnthropicClient::builder()
-            .api_key("sk-a")
-            .http_client(shared.clone())
-            .build();
-        let client_b = AnthropicClient::builder()
-            .api_key("sk-b")
-            .http_client(shared)
-            .build();
-        assert!(client_a.is_ok() && client_b.is_ok());
-    }
-
-    #[test]
-    fn injected_client_supersedes_builder_timeouts() {
-        let shared = reqwest::Client::builder()
-            .timeout(Duration::from_secs(1))
-            .build()
-            .unwrap();
-        let client = AnthropicClient::builder()
-            .api_key("sk-test")
-            .http_client(shared)
-            .timeout(Duration::from_secs(99))
-            .build();
-        assert!(client.is_ok());
-    }
-
-    #[test]
-    fn pool_knobs_build_clean() {
-        let client = AnthropicClient::builder()
-            .api_key("sk-test")
-            .pool_max_idle_per_host(4)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .tcp_keepalive(Duration::from_secs(90))
-            .build();
-        assert!(client.is_ok());
-    }
-
-    #[test]
-    fn tcp_nodelay_default_is_true() {
-        let builder = AnthropicClientBuilder::default();
-        assert!(builder.tcp_nodelay);
-    }
-
-    #[test]
-    fn injected_client_ignores_pool_knobs() {
-        let shared = reqwest::Client::new();
-        let client = AnthropicClient::builder()
-            .api_key("sk-test")
-            .http_client(shared)
-            .pool_max_idle_per_host(4)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .build();
-        assert!(client.is_ok());
     }
 
     #[tokio::test]
@@ -2217,7 +2046,10 @@ mod tests {
 
     #[test]
     fn extract_structured_from_tool_use_input() {
-        let client = AnthropicClient::builder().api_key("test").build().unwrap();
+        let client = AnthropicClient::builder()
+            .with_api_key("test")
+            .build()
+            .unwrap();
         let raw = serde_json::json!({
             "content": [{
                 "type": "tool_use",
@@ -2231,7 +2063,10 @@ mod tests {
 
     #[test]
     fn extract_structured_text_only_falls_back_to_raw() {
-        let client = AnthropicClient::builder().api_key("test").build().unwrap();
+        let client = AnthropicClient::builder()
+            .with_api_key("test")
+            .build()
+            .unwrap();
         let raw = serde_json::json!({
             "id": "msg_1",
             "model": "claude-3",

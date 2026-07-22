@@ -27,6 +27,7 @@ use reqwest::Response;
 use serde_json::Value;
 use std::time::Duration;
 
+use super::ClientBuilderExt;
 use crate::api::ApiClient;
 use crate::api::error::ApiError;
 use crate::message::{Message, MessagePart, Role};
@@ -426,12 +427,16 @@ pub struct GeminiClientBuilder {
     /// The total HTTP request timeout (connect + response + body).
     ///
     /// Bounds the entire request lifecycle. Defaults to 120 seconds.
+    /// Ignored when a client was supplied via
+    /// [`http_client`](Self::http_client); configure it on that client instead.
     timeout: Duration,
 
     /// The TCP connection establishment timeout (including TLS handshake).
     ///
     /// Separate from the total timeout so a slow-connecting server can be
     /// detected faster. Defaults to 10 seconds.
+    /// Ignored when a client was supplied via
+    /// [`http_client`](Self::http_client).
     connect_timeout: Duration,
 
     /// Whether to opt into thought summaries from reasoning-capable models.
@@ -442,6 +447,39 @@ pub struct GeminiClientBuilder {
     /// `400 INVALID_ARGUMENT`, so this is `false` by default and the caller
     /// must opt in once they know their model supports thinking.
     include_thoughts: bool,
+
+    /// A pre-built shared `reqwest::Client`, if injected via
+    /// [`http_client`](Self::http_client). When set, pool and TCP knobs are
+    /// ignored.
+    http: Option<reqwest::Client>,
+
+    /// Maximum idle connections kept alive per host.
+    ///
+    /// `None` defers to reqwest's default (unlimited). Set to a small value
+    /// (e.g. 1–4) for memory-constrained runners or workloads that make
+    /// mostly serial requests to a single host.
+    pool_max_idle_per_host: Option<usize>,
+
+    /// How long an idle connection stays in the pool before being closed.
+    ///
+    /// `None` defers to reqwest's default (90s). Raise for long-idle
+    /// interactive workloads to keep TLS sessions warm; lower for tight
+    /// batch jobs to free file descriptors sooner.
+    pool_idle_timeout: Option<Duration>,
+
+    /// OS-level TCP keepalive interval.
+    ///
+    /// `None` disables TCP keepalive (reqwest default). Enable (~60s) if
+    /// connections are silently dropped after idle periods (e.g. behind
+    /// aggressive NATs or load balancers).
+    tcp_keepalive: Option<Duration>,
+
+    /// Whether to disable Nagle's algorithm (`TCP_NODELAY`).
+    ///
+    /// Defaults to `true` — SSE streaming emits many small packets, and
+    /// Nagle's algorithm coalesces them, adding latency per delta. No public
+    /// setter; always applied on internally-built clients.
+    tcp_nodelay: bool,
 }
 
 impl Default for GeminiClientBuilder {
@@ -453,6 +491,11 @@ impl Default for GeminiClientBuilder {
             timeout: DEFAULT_REQUEST_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             include_thoughts: false,
+            http: None,
+            pool_max_idle_per_host: None,
+            pool_idle_timeout: None,
+            tcp_keepalive: None,
+            tcp_nodelay: true,
         }
     }
 }
@@ -505,6 +548,8 @@ impl GeminiClientBuilder {
     ///
     /// Defaults to 10 seconds. This is the maximum time to wait for the TCP
     /// connection (including TLS handshake) to be established.
+    /// Ignored when a client was supplied via
+    /// [`http_client`](Self::http_client).
     #[must_use]
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
@@ -529,6 +574,59 @@ impl GeminiClientBuilder {
         self
     }
 
+    /// Inject a pre-built, shared `reqwest::Client`.
+    ///
+    /// When set, the client's connection pool is shared with every other
+    /// provider built from the same handle, and the pool/TCP knobs are
+    /// ignored. Configure timeouts on the injected client, not here.
+    #[must_use]
+    pub fn http_client(mut self, client: reqwest::Client) -> Self {
+        self.http = Some(client);
+        self
+    }
+
+    /// Set the maximum idle connections kept alive per host.
+    ///
+    /// Defaults to reqwest's built-in default (unlimited). Set to a small
+    /// value (e.g. 1–4) for memory-constrained runners or workloads that
+    /// make mostly serial requests to a single host.
+    ///
+    /// Ignored when a client was supplied via
+    /// [`http_client`](Self::http_client).
+    #[must_use]
+    pub fn pool_max_idle_per_host(mut self, n: usize) -> Self {
+        self.pool_max_idle_per_host = Some(n);
+        self
+    }
+
+    /// Set how long an idle connection stays in the pool before being closed.
+    ///
+    /// Defaults to reqwest's built-in default (90s). Raise for long-idle
+    /// interactive workloads to keep TLS sessions warm; lower for tight
+    /// batch jobs to free file descriptors sooner.
+    ///
+    /// Ignored when a client was supplied via
+    /// [`http_client`](Self::http_client).
+    #[must_use]
+    pub fn pool_idle_timeout(mut self, d: Duration) -> Self {
+        self.pool_idle_timeout = Some(d);
+        self
+    }
+
+    /// Set the OS-level TCP keepalive interval.
+    ///
+    /// Defaults to disabled (reqwest default). Enable (~60s) if connections
+    /// are silently dropped after idle periods (e.g. behind aggressive NATs
+    /// or load balancers).
+    ///
+    /// Ignored when a client was supplied via
+    /// [`http_client`](Self::http_client).
+    #[must_use]
+    pub fn tcp_keepalive(mut self, d: Duration) -> Self {
+        self.tcp_keepalive = Some(d);
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
@@ -538,11 +636,18 @@ impl GeminiClientBuilder {
         let api_key = self
             .api_key
             .ok_or_else(|| ApiError::auth_invalid_key("API key not provided"))?;
-        let http = reqwest::Client::builder()
-            .timeout(self.timeout)
-            .connect_timeout(self.connect_timeout)
-            .build()
-            .map_err(|e| ApiError::http(e.to_string()))?;
+        let http = match self.http {
+            Some(shared) => shared,
+            None => reqwest::Client::builder()
+                .timeout(self.timeout)
+                .connect_timeout(self.connect_timeout)
+                .tcp_nodelay(self.tcp_nodelay)
+                .maybe_pool_max_idle_per_host(self.pool_max_idle_per_host)
+                .maybe_pool_idle_timeout(self.pool_idle_timeout)
+                .maybe_tcp_keepalive(self.tcp_keepalive)
+                .build()
+                .map_err(|e| ApiError::http(e.to_string()))?,
+        };
 
         Ok(GeminiClient {
             http,
@@ -2000,6 +2105,63 @@ mod tests {
             .connect_timeout(Duration::from_secs(15))
             .build();
         assert!(client.is_ok(), "build should succeed with valid timeouts");
+    }
+
+    #[test]
+    fn builder_accepts_injected_http_client() {
+        let shared = reqwest::Client::new();
+        let client_a = GeminiClient::builder()
+            .api_key("key-a")
+            .http_client(shared.clone())
+            .build();
+        let client_b = GeminiClient::builder()
+            .api_key("key-b")
+            .http_client(shared)
+            .build();
+        assert!(client_a.is_ok() && client_b.is_ok());
+    }
+
+    #[test]
+    fn injected_client_supersedes_builder_timeouts() {
+        let shared = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let client = GeminiClient::builder()
+            .api_key("test-key")
+            .http_client(shared)
+            .timeout(Duration::from_secs(99))
+            .build();
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn pool_knobs_build_clean() {
+        let client = GeminiClient::builder()
+            .api_key("test-key")
+            .pool_max_idle_per_host(4)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(90))
+            .build();
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn tcp_nodelay_default_is_true() {
+        let builder = GeminiClientBuilder::default();
+        assert!(builder.tcp_nodelay);
+    }
+
+    #[test]
+    fn injected_client_ignores_pool_knobs() {
+        let shared = reqwest::Client::new();
+        let client = GeminiClient::builder()
+            .api_key("test-key")
+            .http_client(shared)
+            .pool_max_idle_per_host(4)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build();
+        assert!(client.is_ok());
     }
 
     #[test]

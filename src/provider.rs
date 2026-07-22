@@ -215,7 +215,7 @@ impl HttpClientConfig {
     /// Build a `reqwest::Client` from this configuration.
     ///
     /// If an external client was supplied via
-    /// [`http_client`](Self::http_client), it is returned verbatim. Otherwise
+    /// [`with_http_client`](Self::with_http_client), it is returned verbatim. Otherwise
     /// a new client is constructed with the configured timeouts, pool knobs,
     /// and `tcp_nodelay(true)`.
     ///

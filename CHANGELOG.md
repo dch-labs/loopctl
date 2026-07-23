@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Added
 
+- `engine::machine::LoopMachine` and supporting types — a sans-IO, serializable
+  state machine that owns every agent-loop decision (turn counting, max-turn
+  enforcement, tool-call validity, stop-reason routing, compaction trigger,
+  history, cancellation). `Serialize + Deserialize`, with no `async`, no
+  `tokio`, and no `ApiClient` in its surface. Includes `RunConfig`,
+  `MachineStep` (`CallLLM`/`CallTools`/`Compact`/`Done`), `ModelTurn`,
+  `PendingToolCall`, `MachineOutcome`, and `MachineState`. The machine is not
+  yet wired into `BareLoop` in this release; it is public so a driver can be
+  written against it.
+- `LoopError` now derives `Serialize`, `Deserialize`, `PartialEq`, and `Eq`.
+- `compact::types::CompactReason` now derives `Serialize` and `Deserialize`.
 - `DeltaPart::Thinking { text }` variant + `on_thinking_delta` observer event
   (`ThinkingDeltaContext`): reasoning-model tokens (Claude extended-thinking,
   DeepSeek-R1, OpenAI o-series, Gemini 2.5+) are now routed as their own
@@ -185,6 +196,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Changed
 
+- **Breaking (compaction thresholds → basis points):** the compaction trigger
+  threshold and compaction-target fraction are now integers in basis points
+  (0–10_000; 10_000 = 100%) instead of `f64` fractions. This removes lossy
+  `u64 → f64` casts from the threshold arithmetic. Affected APIs:
+  `ContextManager::with_threshold(u16)` and `with_compact_target_pct(u16)`
+  (were `f64`); `ContextManager::threshold() -> u16` and
+  `compact_target_pct() -> u16` (were `f64`);
+  `LoopConfig::with_compact_threshold(u16)` and the `compact_threshold` field
+  (were `f64`). The default is `8_000` (was `0.80`); the clamp range is
+  `[1_000, 10_000]` (was `[0.1, 1.0]`). Migration: multiply existing `f64`
+  values by `10_000` and round — `0.80 → 8_000`, `0.50 → 5_000`, `0.70 → 7_000`.
 - **Breaking (renames):** consuming builder methods that return `Self` are now
   uniformly prefixed `with_`, matching the crate-wide convention. The old
   no-prefix names are removed. Affected types and methods (old → new):

@@ -85,7 +85,7 @@
 ///   engine escalated to the model circuit breaker.
 /// - [`Internal`](LoopError::Internal) — A catch-all for unexpected
 ///   or infrastructure-level errors.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum LoopError {
     /// A tool was not found in the registry.

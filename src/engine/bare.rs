@@ -535,7 +535,7 @@ impl<C: ApiClient> BareLoop<C> {
     ///     .with_min_messages(6);
     /// let manager = ContextManager::new(Arc::new(compactor))
     ///     .with_context_window(200_000)
-    ///     .with_threshold(0.80);
+    ///     .with_threshold(8_000);
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_context_manager(Arc::new(manager));

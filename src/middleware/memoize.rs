@@ -17,7 +17,7 @@
 //!
 //! # Registration
 //!
-//! Register *before* `.core(registry)` so the middleware can short-circuit
+//! Register *before* `.with_core(registry)` so the middleware can short-circuit
 //! on a hit before the inner dispatch fires:
 //!
 //! ```rust,ignore
@@ -26,13 +26,13 @@
 //!
 //! let extractor: Arc<dyn PathExtractor> = /* … */;
 //! let pipeline = ToolPipeline::builder()
-//!     .with(MemoizingMiddleware::new(
+//!     .with_middleware(MemoizingMiddleware::new(
 //!         vec!["Read".into(), "Grep".into()],
 //!         vec!["Write".into(), "Edit".into()],
 //!         extractor,
 //!         5, // ttl_turns
 //!     ))
-//!     .core(registry)
+//!     .with_core(registry)
 //!     .build()?;
 //! ```
 
@@ -539,13 +539,13 @@ mod tests {
         let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let registry = Arc::new(ToolRegistry::new());
         let pipeline = ToolPipeline::builder()
-            .with(mw)
-            .with(FixedOutputMiddleware {
+            .with_middleware(mw)
+            .with_middleware(FixedOutputMiddleware {
                 output,
                 is_error,
                 call_count: call_count.clone(),
             })
-            .core(registry)
+            .with_core(registry)
             .build()
             .expect("pipeline builds");
         (pipeline, call_count)
@@ -1083,14 +1083,14 @@ mod tests {
         let mw = make_middleware(Arc::new(PathFromInput), 10);
         let registry = Arc::new(ToolRegistry::new());
         let pipeline = ToolPipeline::builder()
-            .with(mw)
-            .with(RoutingFixedOutputMiddleware {
+            .with_middleware(mw)
+            .with_middleware(RoutingFixedOutputMiddleware {
                 read_output: ToolContent::from_string("file contents"),
                 write_output: ToolContent::from_string("permission denied"),
                 write_is_error: true,
                 call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
-            .core(registry)
+            .with_core(registry)
             .build()
             .expect("pipeline builds");
 
@@ -1121,14 +1121,14 @@ mod tests {
         let mw = make_middleware(Arc::new(PathFromInput), 10);
         let registry = Arc::new(ToolRegistry::new());
         let pipeline = ToolPipeline::builder()
-            .with(mw)
-            .with(RoutingFixedOutputMiddleware {
+            .with_middleware(mw)
+            .with_middleware(RoutingFixedOutputMiddleware {
                 read_output: ToolContent::from_string("file contents"),
                 write_output: ToolContent::from_string("wrote"),
                 write_is_error: false,
                 call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
-            .core(registry)
+            .with_core(registry)
             .build()
             .expect("pipeline builds");
 

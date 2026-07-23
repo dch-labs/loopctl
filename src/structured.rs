@@ -294,7 +294,7 @@ impl RequestOptions {
     /// When set, the provider constrains the model's output to the schema.
     /// When left `None` (the default), the model's output is unconstrained.
     #[must_use]
-    pub fn response_format(mut self, rf: ResponseFormat) -> Self {
+    pub fn with_response_format(mut self, rf: ResponseFormat) -> Self {
         self.response_format = Some(rf);
         self
     }
@@ -305,7 +305,7 @@ impl RequestOptions {
     /// [`ToolConstraint::Strict`] makes malformed tool calls structurally
     /// impossible via the provider's native strict mode.
     #[must_use]
-    pub fn tool_constraint(mut self, c: ToolConstraint) -> Self {
+    pub fn with_tool_constraint(mut self, c: ToolConstraint) -> Self {
         self.tool_constraint = c;
         self
     }
@@ -583,7 +583,7 @@ pub async fn request_structured<T: StructuredOutput + serde::de::DeserializeOwne
     messages: Vec<Message>,
     system: Option<String>,
 ) -> Result<T, StructuredError> {
-    let opts = RequestOptions::new().response_format(ResponseFormat::from_type::<T>());
+    let opts = RequestOptions::new().with_response_format(ResponseFormat::from_type::<T>());
     let request = crate::api::StreamRequest {
         messages,
         system,
@@ -655,7 +655,7 @@ mod tests {
         assert!(opts.response_format.is_none());
 
         let rf = ResponseFormat::from_type::<Action>();
-        let opts = RequestOptions::new().response_format(rf);
+        let opts = RequestOptions::new().with_response_format(rf);
         assert!(opts.response_format.is_some());
         assert_eq!(opts.response_format.as_ref().unwrap().name, "action");
     }
@@ -762,7 +762,8 @@ mod tests {
     #[tokio::test]
     async fn default_client_rejects_response_format() {
         let client = PlainMockClient;
-        let opts = RequestOptions::new().response_format(ResponseFormat::from_type::<Action>());
+        let opts =
+            RequestOptions::new().with_response_format(ResponseFormat::from_type::<Action>());
         let request = crate::api::StreamRequest::new(vec![]);
         let result = client.create_message_with_options(request, opts).await;
         assert!(
@@ -911,13 +912,13 @@ mod tests {
 
     #[test]
     fn request_options_tool_constraint_builder() {
-        let opts = RequestOptions::new().tool_constraint(ToolConstraint::Strict);
+        let opts = RequestOptions::new().with_tool_constraint(ToolConstraint::Strict);
         assert!(matches!(opts.tool_constraint, ToolConstraint::Strict));
         // And response_format still composes on the same builder.
         let rf = ResponseFormat::from_type::<Action>();
         let opts = RequestOptions::new()
-            .response_format(rf)
-            .tool_constraint(ToolConstraint::Strict);
+            .with_response_format(rf)
+            .with_tool_constraint(ToolConstraint::Strict);
         assert!(opts.response_format.is_some());
         assert!(matches!(opts.tool_constraint, ToolConstraint::Strict));
     }
@@ -928,7 +929,7 @@ mod tests {
         // including tool_constraint — to be Clone. This test pins that by
         // cloning an options value that carries a constraint and asserting
         // both copies hold the same variant.
-        let opts = RequestOptions::new().tool_constraint(ToolConstraint::Strict);
+        let opts = RequestOptions::new().with_tool_constraint(ToolConstraint::Strict);
         let cloned = opts.clone();
         assert!(matches!(opts.tool_constraint, ToolConstraint::Strict));
         assert!(matches!(cloned.tool_constraint, ToolConstraint::Strict));

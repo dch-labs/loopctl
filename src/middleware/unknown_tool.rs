@@ -499,8 +499,8 @@ mod tests {
     async fn dispatch_appends_suggestion_for_typo() {
         let registry = make_registry();
         let pipeline = ToolPipeline::builder()
-            .with(UnknownToolMiddleware::new(Arc::clone(&registry)))
-            .core(registry)
+            .with_middleware(UnknownToolMiddleware::new(Arc::clone(&registry)))
+            .with_core(registry)
             .build()
             .expect("valid pipeline");
 
@@ -522,11 +522,11 @@ mod tests {
     async fn dispatch_suggestion_uses_post_dispatch_tool_name() {
         let registry = make_registry();
         let pipeline = ToolPipeline::builder()
-            .with(UnknownToolMiddleware::new(Arc::clone(&registry)))
-            .with(RenameMiddleware {
+            .with_middleware(UnknownToolMiddleware::new(Arc::clone(&registry)))
+            .with_middleware(RenameMiddleware {
                 new_name: "read_fil".into(),
             })
-            .core(registry)
+            .with_core(registry)
             .build()
             .expect("valid pipeline");
 
@@ -547,8 +547,8 @@ mod tests {
     async fn dispatch_known_tool_no_suggestion() {
         let registry = make_registry();
         let pipeline = ToolPipeline::builder()
-            .with(UnknownToolMiddleware::new(Arc::clone(&registry)))
-            .core(registry)
+            .with_middleware(UnknownToolMiddleware::new(Arc::clone(&registry)))
+            .with_core(registry)
             .build()
             .expect("valid pipeline");
 

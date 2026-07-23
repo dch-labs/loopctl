@@ -14,7 +14,7 @@
 //!
 //! # Registration
 //!
-//! Register `VerifyMiddleware` before `.core(registry)` in the pipeline
+//! Register `VerifyMiddleware` before `.with_core(registry)` in the pipeline
 //! so it wraps the result on the way out. To bound diagnostics size,
 //! pair it with [`OutputLimitMiddleware`](super::OutputLimitMiddleware)
 //! registered *after* `VerifyMiddleware`, so the limit wraps the
@@ -125,8 +125,8 @@ pub struct VerifyResult {
 /// use loopctl::middleware::{NoopVerifier, Verifier, VerifyMiddleware};
 ///
 /// let pipeline = ToolPipeline::builder()
-///     .with(VerifyMiddleware::new(Arc::new(NoopVerifier), vec!["Write".into()]))
-///     .core(registry)
+///     .with_middleware(VerifyMiddleware::new(Arc::new(NoopVerifier), vec!["Write".into()]))
+///     .with_core(registry)
 ///     .build()?;
 /// ```
 pub struct NoopVerifier;
@@ -165,7 +165,7 @@ impl Verifier for NoopVerifier {
 ///
 /// # Registration
 ///
-/// Register *before* `.core(registry)` so the middleware wraps the
+/// Register *before* `.with_core(registry)` so the middleware wraps the
 /// result on the way out:
 ///
 /// ```rust,ignore
@@ -174,8 +174,8 @@ impl Verifier for NoopVerifier {
 ///
 /// let verifier: Arc<dyn loopctl::middleware::Verifier> = /* … */;
 /// let pipeline = ToolPipeline::builder()
-///     .with(VerifyMiddleware::new(verifier, vec!["Write".into(), "Edit".into()]))
-///     .core(registry)
+///     .with_middleware(VerifyMiddleware::new(verifier, vec!["Write".into(), "Edit".into()]))
+///     .with_core(registry)
 ///     .build()?;
 /// ```
 ///
@@ -367,9 +367,9 @@ mod tests {
     ) -> ToolPipeline {
         let registry = Arc::new(ToolRegistry::new());
         ToolPipeline::builder()
-            .with(verify)
-            .with(FixedOutputMiddleware { output, is_error })
-            .core(registry)
+            .with_middleware(verify)
+            .with_middleware(FixedOutputMiddleware { output, is_error })
+            .with_core(registry)
             .build()
             .expect("pipeline builds")
     }

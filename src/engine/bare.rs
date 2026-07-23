@@ -649,7 +649,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// In debug builds, panics if called after the session has started.
     ///
     /// Build the pipeline using [`ToolPipeline::builder()`], adding middleware
-    /// layers **without** calling `.core()` — the registry is injected
+    /// layers **without** calling `.with_core()` — the registry is injected
     /// automatically from `self.tools` so that schema generation and dispatch
     /// always share the same underlying registry:
     ///
@@ -659,7 +659,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// use loopctl::engine::middleware::{ToolPipeline, TimeoutMiddleware};
     ///
     /// let builder = ToolPipeline::builder()
-    ///     .with(TimeoutMiddleware::from_secs(30));
+    ///     .with_middleware(TimeoutMiddleware::from_secs(30));
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_pipeline(builder)?;
@@ -672,7 +672,7 @@ impl<C: ApiClient> BareLoop<C> {
     pub fn set_pipeline(&mut self, builder: ToolPipelineBuilder) -> Result<(), LoopError> {
         self.debug_assert_idle();
         let pipeline = builder
-            .core(Arc::clone(&self.tools))
+            .with_core(Arc::clone(&self.tools))
             .build()
             .map_err(|e| LoopError::Config(e.to_string()))?;
         self.managers.set_pipeline(pipeline);
@@ -789,12 +789,113 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
     /// agent.set_request_options(
-    ///     RequestOptions::new().tool_constraint(ToolConstraint::Strict),
+    ///     RequestOptions::new().with_tool_constraint(ToolConstraint::Strict),
     /// );
     /// ```
     pub fn set_request_options(&mut self, options: RequestOptions) {
         self.debug_assert_idle();
         self.request_options = options;
+    }
+
+    /// Set the reflector, consuming `self`. Fluent mirror of
+    /// [`set_reflector`](BareLoop::set_reflector).
+    #[must_use]
+    pub fn with_reflector(mut self, reflector: Arc<dyn Reflector>) -> Self {
+        self.set_reflector(reflector);
+        self
+    }
+
+    /// Set the recovery strategy, consuming `self`. Fluent mirror of
+    /// [`set_recovery_strategy`](BareLoop::set_recovery_strategy).
+    #[must_use]
+    pub fn with_recovery_strategy(mut self, strategy: Arc<dyn RecoveryStrategy>) -> Self {
+        self.set_recovery_strategy(strategy);
+        self
+    }
+
+    /// Set the context manager, consuming `self`. Fluent mirror of
+    /// [`set_context_manager`](BareLoop::set_context_manager).
+    #[must_use]
+    pub fn with_context_manager(mut self, manager: Arc<ContextManager>) -> Self {
+        self.set_context_manager(manager);
+        self
+    }
+
+    /// Set the stream handler, consuming `self`. Fluent mirror of
+    /// [`set_stream_handler`](BareLoop::set_stream_handler).
+    #[must_use]
+    pub fn with_stream_handler(mut self, handler: StreamHandler) -> Self {
+        self.set_stream_handler(handler);
+        self
+    }
+
+    /// Set the hook executor, consuming `self`. Fluent mirror of
+    /// [`set_hook_executor`](BareLoop::set_hook_executor).
+    ///
+    /// *Requires `hooks` feature.*
+    #[cfg(feature = "hooks")]
+    #[must_use]
+    pub fn with_hook_executor(mut self, executor: Arc<HookExecutor>) -> Self {
+        self.set_hook_executor(executor);
+        self
+    }
+
+    /// Set the tool health registry, consuming `self`. Fluent mirror of
+    /// [`set_health_registry`](BareLoop::set_health_registry).
+    ///
+    /// *Requires `tool_health` feature.*
+    #[cfg(feature = "tool_health")]
+    #[must_use]
+    pub fn with_health_registry(mut self, registry: Arc<ToolHealthRegistry>) -> Self {
+        self.set_health_registry(registry);
+        self
+    }
+
+    /// Set the middleware pipeline, consuming `self`. Fluent mirror of
+    /// [`set_pipeline`](BareLoop::set_pipeline).
+    ///
+    /// Because building the pipeline can fail, this returns `Result<Self,
+    /// LoopError>` — chain it with `?`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::Config`] if the builder fails to produce a valid
+    /// pipeline. See [`set_pipeline`](BareLoop::set_pipeline).
+    pub fn with_pipeline(mut self, builder: ToolPipelineBuilder) -> Result<Self, LoopError> {
+        self.set_pipeline(builder)?;
+        Ok(self)
+    }
+
+    /// Register an observer, consuming `self`. Fluent mirror of
+    /// [`register_observer`](BareLoop::register_observer).
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn crate::observer::LoopObserver>) -> Self {
+        self.register_observer(observer);
+        self
+    }
+
+    /// Set the real-time text streaming callback, consuming `self`. Fluent
+    /// mirror of [`set_text_streamer`](BareLoop::set_text_streamer).
+    #[must_use]
+    pub fn with_text_streamer(mut self, f: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.set_text_streamer(f);
+        self
+    }
+
+    /// Register a context contributor, consuming `self`. Fluent mirror of
+    /// [`add_contributor`](BareLoop::add_contributor).
+    #[must_use]
+    pub fn with_contributor(mut self, contributor: Box<dyn ContextContributor>) -> Self {
+        self.add_contributor(contributor);
+        self
+    }
+
+    /// Set the per-turn request options, consuming `self`. Fluent mirror of
+    /// [`set_request_options`](BareLoop::set_request_options).
+    #[must_use]
+    pub fn with_request_options(mut self, options: RequestOptions) -> Self {
+        self.set_request_options(options);
+        self
     }
 
     /// Begin a model switch operation.
@@ -1240,7 +1341,7 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
     /// significantly different context window — otherwise the
     /// auto-compactor will use the wrong threshold.
     #[must_use]
-    pub fn context_window(mut self, tokens: u64) -> Self {
+    pub fn with_context_window(mut self, tokens: u64) -> Self {
         self.context_window = Some(tokens);
         self
     }
@@ -1249,7 +1350,7 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
     ///
     /// If omitted, the existing `LoopConfig::max_tokens` is kept.
     #[must_use]
-    pub fn max_tokens(mut self, tokens: u32) -> Self {
+    pub fn with_max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = Some(tokens);
         self
     }
@@ -3263,7 +3364,7 @@ mod tests {
         registry.register(EchoTool);
         let config = make_config();
         let mut agent = BareLoop::new(Arc::new(client), registry, config);
-        // Build a builder WITHOUT calling .core() — set_pipeline must inject it.
+        // Build a builder WITHOUT calling .with_core() — set_pipeline must inject it.
         let builder = ToolPipeline::builder();
         agent.set_pipeline(builder).unwrap();
 
@@ -3316,7 +3417,8 @@ mod tests {
 
         let capture = Arc::new(Mutex::new(Vec::<usize>::new()));
         let mut agent = BareLoop::new(Arc::new(client), registry, config);
-        let builder = ToolPipeline::builder().with(TurnNumberCapture::new(Arc::clone(&capture)));
+        let builder =
+            ToolPipeline::builder().with_middleware(TurnNumberCapture::new(Arc::clone(&capture)));
         agent.set_pipeline(builder).unwrap();
 
         let result = agent.run("test").await;
@@ -3512,7 +3614,7 @@ mod tests {
 
         loop_
             .switch_model("small-model")
-            .context_window(8192)
+            .with_context_window(8192)
             .apply()
             .unwrap();
 
@@ -3526,7 +3628,11 @@ mod tests {
         let tools = ToolRegistry::new();
         let mut loop_ = BareLoop::new(client, tools, LoopConfig::default());
 
-        loop_.switch_model("m2").max_tokens(4096).apply().unwrap();
+        loop_
+            .switch_model("m2")
+            .with_max_tokens(4096)
+            .apply()
+            .unwrap();
 
         assert_eq!(loop_.config().model, "m2");
         assert_eq!(loop_.config().max_tokens, 4096);
@@ -4431,7 +4537,7 @@ mod tests {
         let mut agent = BareLoop::new(Arc::new(client.clone()), ToolRegistry::new(), config);
         agent.set_request_options(
             crate::structured::RequestOptions::new()
-                .tool_constraint(crate::structured::ToolConstraint::Strict),
+                .with_tool_constraint(crate::structured::ToolConstraint::Strict),
         );
         agent.run("Hi").await.unwrap();
 
@@ -4659,6 +4765,47 @@ mod tests {
             *crate::error::recover_guard(thinking_calls.lock()),
             1,
             "thinking callback fires once (for the Thinking delta)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fluent_with_chain_builds_a_working_loop() {
+        let client = MockClient::new("test-model");
+        client.add_text_response("done");
+
+        let observer = Arc::new(CountingObserver::new());
+        let registered: Arc<dyn crate::observer::LoopObserver> = observer.clone();
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config())
+            .with_observer(registered)
+            .with_reflector(Arc::new(NoopReflector))
+            .with_request_options(RequestOptions::default());
+
+        let result = agent.run("Hi").await.unwrap();
+
+        assert!(result.success, "the fluent-built loop runs a turn");
+        assert_eq!(
+            observer.turn_starts.load(Ordering::SeqCst),
+            1,
+            "with_observer registered the observer (it received the turn event)"
+        );
+    }
+
+    #[test]
+    fn fluent_with_observer_equivalent_to_register_observer() {
+        let client = MockClient::new("test-model");
+        let observer: Arc<dyn crate::observer::LoopObserver> = Arc::new(CountingObserver::new());
+
+        let fluent = BareLoop::new(Arc::new(client.clone()), ToolRegistry::new(), make_config())
+            .with_observer(Arc::clone(&observer));
+
+        let mut imperative = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        imperative.register_observer(Arc::clone(&observer));
+
+        assert_eq!(
+            fluent.managers.observers().len(),
+            imperative.managers.observers().len(),
+            "both paths register the same number of observers"
         );
     }
 }

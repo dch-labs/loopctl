@@ -169,9 +169,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   Path-aware invalidation via the caller-supplied `PathExtractor` trait;
   TTL-based expiry per `ttl_turns`. Default-off; only successful results
   are cached.
+- Fluent `with_*()` builder methods on `LoopConfig` (one per public field,
+  e.g. `with_model`, `with_max_turns`, `with_session_id`,
+  `with_parallel_tool_dispatch`). Each is `#[must_use]`, consuming, and
+  returns `Self` for chaining. Purely additive — `Default`-based and direct
+  struct-literal construction are unchanged and remain first-class.
+- Consuming `with_*()` fluent builders on `BareLoop`, mirroring the existing
+  `&mut self` setters so a loop can be assembled as a chain off `BareLoop::new`:
+  `with_reflector`, `with_recovery_strategy`, `with_context_manager`,
+  `with_stream_handler`, `with_hook_executor` (`hooks` feature),
+  `with_health_registry` (`tool_health` feature), `with_pipeline` (returns
+  `Result<Self, LoopError>` — chain with `?`), `with_observer`,
+  `with_text_streamer`, `with_contributor`, `with_request_options`. The
+  original `set_*`/`register_*` setters are unchanged and remain available.
 
 ### Changed
 
+- **Breaking (renames):** consuming builder methods that return `Self` are now
+  uniformly prefixed `with_`, matching the crate-wide convention. The old
+  no-prefix names are removed. Affected types and methods (old → new):
+  `SessionResultBuilder` (`session_id`/`total_turns`/`input_tokens`/
+  `output_tokens`/`total_duration`/`tool_calls`/`success`/`final_output`/
+  `error` → `with_*`); `ModelSwitch` (`context_window`, `max_tokens` →
+  `with_*`); `StreamRequest` (`system`, `system_opt`, `tools`, `tools_opt` →
+  `with_*`); `RequestOptions` (`response_format`, `tool_constraint` → `with_*`);
+  `UnixShieldBuilder` (`warn_threshold`, `block_threshold`, `pattern`,
+  `combination_rule` → `with_*`); `AutoCommitConfigBuilder` (`enabled`,
+  `message_template`, `auto_push`, `files` → `with_*`); `ToolPipelineBuilder`
+  (`core` → `with_core`; the middleware accumulators `with` and `with_arc` are
+  renamed to `with_middleware` and `with_middleware_arc` so they no longer read
+  ambiguously next to `with_core`). Migration: add the `with_` prefix at each
+  call site.
+- `ToolPipelineBuilder::build` now distinguishes its two failure cases:
+  `PipelineError::Empty` when neither middleware nor a core was added (the
+  builder is untouched), and `PipelineError::MissingCore` when at least one
+  middleware was added but no core registry was set. Previously both cases
+  returned `MissingCore`, and `Empty` was unreachable. The `Empty` and
+  `MissingCore` variants now carry multiline rustdoc explaining each condition.
+- **Breaking (optional-field builders unified):** builder methods that set an
+  `Option<T>` field now uniformly take `Option<T>` and drop the `_opt` suffix —
+  the parameter type already conveys "optional," so the name should not.
+  `StreamRequest` loses `with_system_opt`/`with_tools_opt`; `with_system` and
+  `with_tools` now take `Option<String>`/`Option<Vec<ToolSchema>>` (pass
+  `Some(…)` to set, `None` to clear). `LoopConfig::with_system_prompt` changes
+  from `impl Into<String>` to `Option<String>`, so it can now clear the
+  override with `None` (previously it could only set). `AttemptRecord::with_reason`
+  and `Operation::with_result_hash` already followed this shape and are
+  unchanged. Migration: wrap existing literal/value arguments in `Some(…)` (or
+  rename `with_*_opt` → `with_*`).
 - **Breaking:** `stream::DeltaPart` is now `#[non_exhaustive]`. Every
   exhaustive `match` on `DeltaPart` in downstream code must add a `_ =>` arm
   (or a `Thinking =>` arm for the new variant). Same-crate matches are

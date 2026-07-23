@@ -282,7 +282,7 @@ impl RequestOptions {
     /// Create empty options with no response format set.
     ///
     /// Equivalent to [`RequestOptions::default`]. Use
-    /// [`response_format`](Self::response_format) to chain a format
+    /// [`with_response_format`](Self::with_response_format) to chain a format
     /// builder-style.
     #[must_use]
     pub fn new() -> Self {

@@ -914,7 +914,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// # let client = std::sync::Arc::new(MockApiClient::new("model-a"));
     /// # let tools = ToolRegistry::new();
     /// # let mut loop_ = BareLoop::new(client, tools, LoopConfig::default());
-    /// loop_.switch_model("model-b").context_window(8192).apply().unwrap();
+    /// loop_.switch_model("model-b").with_context_window(8192).apply().unwrap();
     /// assert_eq!(loop_.config().model, "model-b");
     /// assert_eq!(loop_.config().context_window, 8192);
     /// ```

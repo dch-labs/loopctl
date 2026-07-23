@@ -60,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   single parameter for `ApiClient` methods. Replaces the positional
   `(Vec<Message>, Option<String>, Option<Vec<ToolSchema>>)` parameter lists on
   `stream_messages`, `create_message`, and their `_with_options` variants.
-  Builders: `new`, `system`, `system_opt`, `tools`, `tools_opt`.
+  Builders: `new`, `with_system`, `with_tools` (both take `Option`).
 - `GeminiClientBuilder::include_thoughts(bool)` builder: opt into Gemini's
   `thinkingConfig.includeThoughts` for reasoning-capable models (2.5 Pro/Flash,
   Gemini 3). Defaults to `false` — the Gemini API rejects `thinkingConfig`

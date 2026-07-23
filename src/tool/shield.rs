@@ -957,19 +957,19 @@ impl ToolSafetyShield for UnixShield {
 pub struct UnixShieldBuilder {
     /// Aggregate score at or above which the built shield will return
     /// [`SafetyAction::Warn`]. Defaults to `0.4`; override via
-    /// [`warn_threshold`](Self::warn_threshold).
+    /// [`with_warn_threshold`](Self::with_warn_threshold).
     warn_threshold: f32,
 
     /// Aggregate score at or above which the built shield will return
     /// [`SafetyAction::Block`]. Defaults to `0.7`; override via
-    /// [`block_threshold`](Self::block_threshold).
+    /// [`with_block_threshold`](Self::with_block_threshold).
     block_threshold: f32,
 
     /// Per-tool single-turn risk patterns, keyed by tool name.
     ///
     /// Populated from [`UnixShield::unix_patterns`] by
     /// [`new`](Self::new); empty under [`blank`](Self::blank); extended
-    /// via [`pattern`](Self::pattern).
+    /// via [`with_pattern`](Self::with_pattern).
     patterns: HashMap<&'static str, Vec<RiskPattern>>,
 
     /// Combination rules for dangerous sequences.

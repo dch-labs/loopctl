@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(cfg.context_window, 120_000);
         assert_eq!(cfg.max_turns, 100);
         assert_eq!(cfg.max_tokens, 16_384);
-        assert_eq!(cfg.compact_threshold, 0.80);
+        assert_eq!(cfg.compact_threshold, 8_000);
         assert!(cfg.auto_compact);
     }
 

@@ -79,14 +79,14 @@ pub struct LoopConfig {
     /// ([`validate`](LoopConfig::validate)).
     pub context_window: u64,
 
-    /// Threshold to trigger auto-compaction, as a fraction of the context
-    /// window (0.0–1.0).
+    /// Threshold to trigger auto-compaction, in basis points (`0–10_000`;
+    /// `10_000` = 100% of the context window).
     ///
     /// When the estimated token usage of the conversation exceeds
-    /// `compact_threshold * context_window`, the compactor runs before the next
-    /// turn to avoid an overflow. Defaults to `0.80`. Must be finite and in
-    /// `[0.0, 1.0]` ([`validate`](LoopConfig::validate)).
-    pub compact_threshold: f64,
+    /// `compact_threshold * context_window / 10_000`, the compactor runs before
+    /// the next turn to avoid an overflow. Defaults to `8_000` (80%). Must be in
+    /// `[0, 10_000]` ([`validate`](LoopConfig::validate)).
+    pub compact_threshold: u16,
 
     /// Whether auto-compaction is enabled.
     ///
@@ -121,7 +121,7 @@ impl Default for LoopConfig {
     /// | [`max_turns`](LoopConfig::max_turns) | `200` |
     /// | [`max_tokens`](LoopConfig::max_tokens) | `16_384` |
     /// | [`context_window`](LoopConfig::context_window) | `200_000` |
-    /// | [`compact_threshold`](LoopConfig::compact_threshold) | `0.80` |
+    /// | [`compact_threshold`](LoopConfig::compact_threshold) | `8_000` (80%) |
     /// | [`auto_compact`](LoopConfig::auto_compact) | `true` |
     /// | [`parallel_tool_dispatch`](LoopConfig::parallel_tool_dispatch) | `Sequential`, `max_concurrency: 8` |
     ///
@@ -142,7 +142,7 @@ impl Default for LoopConfig {
             max_turns: 200,
             max_tokens: 16_384,
             context_window: 200_000,
-            compact_threshold: 0.80,
+            compact_threshold: 8_000,
             auto_compact: true,
             parallel_tool_dispatch: ParallelDispatchConfig::default(),
         }
@@ -218,16 +218,16 @@ impl LoopConfig {
         self
     }
 
-    /// Set the auto-compaction trigger threshold as a fraction of the context
-    /// window (0.0–1.0).
+    /// Set the auto-compaction trigger threshold in basis points (`0–10_000`;
+    /// `10_000` = 100% of the context window).
     ///
-    /// When estimated token usage exceeds `compact_threshold * context_window`,
-    /// compaction runs before the next turn. This builder stores the value
-    /// verbatim — it does **not** clamp; the range is enforced by
-    /// [`validate`](LoopConfig::validate), which is the single source of truth
-    /// for the `[0.0, 1.0]` bound.
+    /// When estimated token usage exceeds
+    /// `compact_threshold * context_window / 10_000`, compaction runs before the
+    /// next turn. This builder stores the value verbatim — it does **not** clamp;
+    /// the range is enforced by [`validate`](LoopConfig::validate), which is the
+    /// single source of truth for the `[0, 10_000]` bound.
     #[must_use]
-    pub fn with_compact_threshold(mut self, compact_threshold: f64) -> Self {
+    pub fn with_compact_threshold(mut self, compact_threshold: u16) -> Self {
         self.compact_threshold = compact_threshold;
         self
     }
@@ -257,7 +257,7 @@ impl LoopConfig {
     /// Validate the configuration fields.
     ///
     /// Checks that:
-    /// - `compact_threshold` is in the range `[0.0, 1.0]` (not `NaN`).
+    /// - `compact_threshold` is in the range `[0, 10_000]`.
     /// - `max_turns` is greater than zero.
     /// - `context_window` is greater than zero.
     /// - `max_tokens` is greater than zero.
@@ -276,7 +276,7 @@ impl LoopConfig {
     /// let config = LoopConfig::default();
     /// assert!(config.validate().is_ok());
     ///
-    /// let bad = LoopConfig::default().with_compact_threshold(1.5);
+    /// let bad = LoopConfig::default().with_compact_threshold(15_000);
     /// assert!(bad.validate().is_err());
     /// ```
     #[must_use = "validation errors should not be silently ignored"]
@@ -301,12 +301,9 @@ impl LoopConfig {
                 "model must not be empty".to_string(),
             ));
         }
-        if self.compact_threshold.is_nan()
-            || self.compact_threshold < 0.0
-            || self.compact_threshold > 1.0
-        {
+        if self.compact_threshold > 10_000 {
             return Err(crate::error::LoopError::Config(format!(
-                "compact_threshold must be in [0.0, 1.0], got {}",
+                "compact_threshold must be in [0, 10_000], got {}",
                 self.compact_threshold
             )));
         }
@@ -504,8 +501,8 @@ mod tests {
 
     #[test]
     fn with_compact_threshold_stores_value_without_clamping() {
-        let config = LoopConfig::default().with_compact_threshold(1.5);
-        assert!((config.compact_threshold - 1.5).abs() < f64::EPSILON);
+        let config = LoopConfig::default().with_compact_threshold(15_000);
+        assert_eq!(config.compact_threshold, 15_000);
     }
 
     #[test]
@@ -540,7 +537,7 @@ mod tests {
         let defaults = LoopConfig::default();
         assert_eq!(config.max_tokens, defaults.max_tokens);
         assert_eq!(config.context_window, defaults.context_window);
-        assert!((config.compact_threshold - defaults.compact_threshold).abs() < f64::EPSILON);
+        assert_eq!(config.compact_threshold, defaults.compact_threshold);
         assert_eq!(config.auto_compact, defaults.auto_compact);
     }
 
@@ -553,7 +550,7 @@ mod tests {
 
     #[test]
     fn validate_still_rejects_builder_built_invalid_config() {
-        let config = LoopConfig::default().with_compact_threshold(1.5);
+        let config = LoopConfig::default().with_compact_threshold(15_000);
         assert!(config.validate().is_err());
     }
 }

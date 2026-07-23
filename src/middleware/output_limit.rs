@@ -21,8 +21,8 @@ use std::pin::Pin;
 /// use loopctl::middleware::OutputLimitMiddleware;
 ///
 /// let pipeline = ToolPipeline::builder()
-///     .with(OutputLimitMiddleware::new(10_000))
-///     .core(registry)
+///     .with_middleware(OutputLimitMiddleware::new(10_000))
+///     .with_core(registry)
 ///     .build()?;
 /// ```
 pub struct OutputLimitMiddleware {

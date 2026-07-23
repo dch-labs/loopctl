@@ -163,7 +163,7 @@ mod tests {
         let client = crate::provider::OpenAiClient::from_env().expect("OPENAI_* env");
         let schemas = sample_schemas();
         let grammar = std::sync::Arc::new(JsonSchemaGrammar::from_schemas(&schemas));
-        let opts = RequestOptions::new().tool_constraint(ToolConstraint::Grammar(grammar));
+        let opts = RequestOptions::new().with_tool_constraint(ToolConstraint::Grammar(grammar));
 
         // A small fixed corpus of prompts that should each produce exactly
         // one valid tool call. The 99% bar is over this corpus.
@@ -179,7 +179,7 @@ mod tests {
         for prompt in corpus {
             let stream = client.stream_messages_with_options(
                 crate::api::StreamRequest::new(vec![crate::message::Message::user(prompt)])
-                    .tools_opt(Some(schemas.clone())),
+                    .with_tools(Some(schemas.clone())),
                 opts.clone(),
             );
             let events: Vec<Result<crate::stream::StreamEvent, crate::api::error::ApiError>> =

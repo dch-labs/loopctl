@@ -568,10 +568,10 @@ impl SessionResult {
     /// # use std::time::Duration;
     /// # use uuid::Uuid;
     /// let result = SessionResult::builder()
-    ///     .session_id(Uuid::nil())
-    ///     .total_turns(5)
-    ///     .tool_calls(3)
-    ///     .success(true)
+    ///     .with_session_id(Uuid::nil())
+    ///     .with_total_turns(5)
+    ///     .with_tool_calls(3)
+    ///     .with_success(true)
     /// .build();
     /// assert_eq!(result.total_turns, 5);
     /// assert_eq!(result.tool_calls, 3);
@@ -626,63 +626,63 @@ pub struct SessionResultBuilder {
 impl SessionResultBuilder {
     /// Set the session ID.
     #[must_use]
-    pub fn session_id(mut self, id: Uuid) -> Self {
+    pub fn with_session_id(mut self, id: Uuid) -> Self {
         self.session_id = id;
         self
     }
 
     /// Set the total turns executed.
     #[must_use]
-    pub fn total_turns(mut self, turns: usize) -> Self {
+    pub fn with_total_turns(mut self, turns: usize) -> Self {
         self.total_turns = turns;
         self
     }
 
     /// Set the total input tokens.
     #[must_use]
-    pub fn input_tokens(mut self, tokens: u64) -> Self {
+    pub fn with_input_tokens(mut self, tokens: u64) -> Self {
         self.input_tokens = tokens;
         self
     }
 
     /// Set the total output tokens.
     #[must_use]
-    pub fn output_tokens(mut self, tokens: u64) -> Self {
+    pub fn with_output_tokens(mut self, tokens: u64) -> Self {
         self.output_tokens = tokens;
         self
     }
 
     /// Set the total session duration.
     #[must_use]
-    pub fn total_duration(mut self, duration: Duration) -> Self {
+    pub fn with_total_duration(mut self, duration: Duration) -> Self {
         self.total_duration = duration;
         self
     }
 
     /// Set the total tool calls made.
     #[must_use]
-    pub fn tool_calls(mut self, calls: usize) -> Self {
+    pub fn with_tool_calls(mut self, calls: usize) -> Self {
         self.tool_calls = calls;
         self
     }
 
     /// Set whether the session succeeded.
     #[must_use]
-    pub fn success(mut self, success: bool) -> Self {
+    pub fn with_success(mut self, success: bool) -> Self {
         self.success = success;
         self
     }
 
     /// Set the final output text.
     #[must_use]
-    pub fn final_output(mut self, output: impl Into<String>) -> Self {
+    pub fn with_final_output(mut self, output: impl Into<String>) -> Self {
         self.final_output = Some(output.into());
         self
     }
 
     /// Set the error message.
     #[must_use]
-    pub fn error(mut self, error: impl Into<String>) -> Self {
+    pub fn with_error(mut self, error: impl Into<String>) -> Self {
         self.error = Some(error.into());
         self
     }

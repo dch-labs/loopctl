@@ -346,28 +346,28 @@ impl AutoCommitConfigBuilder {
 
     /// Enable or disable auto-commit.
     #[must_use]
-    pub fn enabled(mut self, enabled: bool) -> Self {
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.config.enabled = enabled;
         self
     }
 
     /// Set the commit message template.
     #[must_use]
-    pub fn message_template(mut self, template: impl Into<String>) -> Self {
+    pub fn with_message_template(mut self, template: impl Into<String>) -> Self {
         self.config.message_template = template.into();
         self
     }
 
     /// Set whether to auto-push.
     #[must_use]
-    pub fn auto_push(mut self, value: bool) -> Self {
+    pub fn with_auto_push(mut self, value: bool) -> Self {
         self.config.auto_push = value;
         self
     }
 
     /// Set files to add before commit.
     #[must_use]
-    pub fn files(mut self, files: Vec<String>) -> Self {
+    pub fn with_files(mut self, files: Vec<String>) -> Self {
         self.config.files = files;
         self
     }
@@ -491,9 +491,9 @@ mod tests {
     #[test]
     fn config_builder() {
         let config = AutoCommitConfigBuilder::new()
-            .enabled(true)
-            .message_template("feat: {{tool}}")
-            .auto_push(true)
+            .with_enabled(true)
+            .with_message_template("feat: {{tool}}")
+            .with_auto_push(true)
             .build();
 
         assert!(config.enabled);

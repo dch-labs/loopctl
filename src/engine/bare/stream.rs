@@ -54,8 +54,8 @@ impl<C: ApiClient> BareLoop<C> {
         let mut stream = handler.stream_turn(
             &*self.client,
             crate::api::StreamRequest::new(self.conversation.clone())
-                .system_opt(self.config.system_prompt.clone())
-                .tools_opt(self.build_tool_schemas()),
+                .with_system(self.config.system_prompt.clone())
+                .with_tools(self.build_tool_schemas()),
             self.request_options.clone(),
             &self.cancelled,
         );

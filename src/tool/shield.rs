@@ -942,12 +942,12 @@ impl ToolSafetyShield for UnixShield {
 /// use loopctl::tool::shield::{UnixShield, RiskPattern, CombinationRule};
 ///
 /// let shield = UnixShield::builder()
-///     .warn_threshold(0.3)
-///     .block_threshold(0.6)
-///     .pattern("PowerShell", vec![
+///     .with_warn_threshold(0.3)
+///     .with_block_threshold(0.6)
+///     .with_pattern("PowerShell", vec![
 ///         RiskPattern { name: "remove_item", score: 0.9, pattern: "Remove-Item" },
 ///     ])
-///     .combination_rule(CombinationRule {
+///     .with_combination_rule(CombinationRule {
 ///         description: "download then run",
 ///         score: 0.8,
 ///         triggers: &[("PowerShell", Some("Invoke-WebRequest")), ("PowerShell", Some("Invoke-Expression"))],
@@ -957,26 +957,26 @@ impl ToolSafetyShield for UnixShield {
 pub struct UnixShieldBuilder {
     /// Aggregate score at or above which the built shield will return
     /// [`SafetyAction::Warn`]. Defaults to `0.4`; override via
-    /// [`warn_threshold`](Self::warn_threshold).
+    /// [`with_warn_threshold`](Self::with_warn_threshold).
     warn_threshold: f32,
 
     /// Aggregate score at or above which the built shield will return
     /// [`SafetyAction::Block`]. Defaults to `0.7`; override via
-    /// [`block_threshold`](Self::block_threshold).
+    /// [`with_block_threshold`](Self::with_block_threshold).
     block_threshold: f32,
 
     /// Per-tool single-turn risk patterns, keyed by tool name.
     ///
     /// Populated from [`UnixShield::unix_patterns`] by
     /// [`new`](Self::new); empty under [`blank`](Self::blank); extended
-    /// via [`pattern`](Self::pattern).
+    /// via [`with_pattern`](Self::with_pattern).
     patterns: HashMap<&'static str, Vec<RiskPattern>>,
 
     /// Combination rules for dangerous sequences.
     ///
     /// Populated from [`UnixShield::unix_combination_rules`] by
     /// [`new`](Self::new); empty under [`blank`](Self::blank); extended
-    /// via [`combination_rule`](Self::combination_rule).
+    /// via [`with_combination_rule`](Self::with_combination_rule).
     ///
     /// [`UnixShield::unix_combination_rules`]: crate::tool::shield::UnixShield::unix_combination_rules
     combination_rules: Vec<CombinationRule>,
@@ -985,7 +985,7 @@ pub struct UnixShieldBuilder {
 impl UnixShieldBuilder {
     /// Create a builder initialised with the default Unix patterns.
     ///
-    /// Call [`pattern`](UnixShieldBuilder::pattern) to add additional
+    /// Call [`with_pattern`](UnixShieldBuilder::with_pattern) to add additional
     /// patterns, or use [`blank`](UnixShieldBuilder::blank) to start
     /// from scratch.
     #[must_use]
@@ -1017,7 +1017,7 @@ impl UnixShieldBuilder {
     /// An aggregate score at or above this value produces a
     /// [`SafetyAction::Warn`] decision.
     #[must_use]
-    pub fn warn_threshold(mut self, threshold: f32) -> Self {
+    pub fn with_warn_threshold(mut self, threshold: f32) -> Self {
         self.warn_threshold = threshold.clamp(0.0, 1.0);
         self
     }
@@ -1027,7 +1027,7 @@ impl UnixShieldBuilder {
     /// An aggregate score at or above this value produces a
     /// [`SafetyAction::Block`] decision.
     #[must_use]
-    pub fn block_threshold(mut self, threshold: f32) -> Self {
+    pub fn with_block_threshold(mut self, threshold: f32) -> Self {
         self.block_threshold = threshold.clamp(0.0, 1.0);
         self
     }
@@ -1040,7 +1040,7 @@ impl UnixShieldBuilder {
     /// for a given `tool_name` also adds it to the built shield's
     /// [`watched_tools`](ToolSafetyShield::watched_tools) set.
     #[must_use]
-    pub fn pattern(mut self, tool_name: &'static str, patterns: Vec<RiskPattern>) -> Self {
+    pub fn with_pattern(mut self, tool_name: &'static str, patterns: Vec<RiskPattern>) -> Self {
         self.patterns.entry(tool_name).or_default().extend(patterns);
         self
     }
@@ -1056,7 +1056,7 @@ impl UnixShieldBuilder {
     ///
     /// [`UnixShield::evaluate`]: crate::tool::shield::UnixShield::evaluate
     #[must_use]
-    pub fn combination_rule(mut self, rule: CombinationRule) -> Self {
+    pub fn with_combination_rule(mut self, rule: CombinationRule) -> Self {
         self.combination_rules.push(rule);
         self
     }
@@ -1213,7 +1213,7 @@ mod tests {
         // Use a blank shield with a single rule to avoid false matches
         // from other built-in rules (e.g. "modify permissions then write").
         let shield = UnixShieldBuilder::blank()
-            .combination_rule(CombinationRule {
+            .with_combination_rule(CombinationRule {
                 description: "write then execute",
                 score: 0.75,
                 triggers: &[("Write", None), ("Bash", Some("chmod +x"))],
@@ -1235,7 +1235,7 @@ mod tests {
         // Now test correct order: Write first, then Bash(chmod +x) as the
         // current call.
         let shield2 = UnixShieldBuilder::blank()
-            .combination_rule(CombinationRule {
+            .with_combination_rule(CombinationRule {
                 description: "write then execute",
                 score: 0.75,
                 triggers: &[("Write", None), ("Bash", Some("chmod +x"))],
@@ -1257,7 +1257,7 @@ mod tests {
     #[test]
     fn builder_custom_pattern() {
         let shield = UnixShieldBuilder::blank()
-            .pattern(
+            .with_pattern(
                 "PowerShell",
                 vec![RiskPattern {
                     name: "remove_item",
@@ -1281,8 +1281,8 @@ mod tests {
     #[test]
     fn builder_custom_thresholds() {
         let shield = UnixShield::builder()
-            .warn_threshold(0.1)
-            .block_threshold(0.2)
+            .with_warn_threshold(0.1)
+            .with_block_threshold(0.2)
             .build();
         // sudo scores 0.6, which is above block_threshold of 0.2
         let decision = shield.evaluate(&ctx("Bash", json!({ "command": "sudo ls" }), 0));

@@ -99,22 +99,22 @@ impl ConstrainedProfile {
     /// (cached alongside the result) and then through the output cap
     /// (truncated if the combined output exceeds the cap).
     ///
-    /// No `.core()` is set — pass the result to
+    /// No `.with_core()` is set — pass the result to
     /// [`BareLoop::set_pipeline`], which attaches the tool registry.
     #[must_use]
     pub fn pipeline_builder() -> crate::middleware::ToolPipelineBuilder {
         ToolPipeline::builder()
-            .with(VerifyMiddleware::new(
+            .with_middleware(VerifyMiddleware::new(
                 Arc::new(NoopVerifier),
                 WRITE_TOOLS.iter().map(|s| (*s).to_string()).collect(),
             ))
-            .with(MemoizingMiddleware::new(
+            .with_middleware(MemoizingMiddleware::new(
                 MEMOIZED_TOOLS.iter().map(|s| (*s).to_string()).collect(),
                 WRITE_TOOLS.iter().map(|s| (*s).to_string()).collect(),
                 Arc::new(NoopPathExtractor),
                 MEMOIZE_TTL_TURNS,
             ))
-            .with(OutputLimitMiddleware::new(OUTPUT_CAP_CHARS))
+            .with_middleware(OutputLimitMiddleware::new(OUTPUT_CAP_CHARS))
     }
 
     /// [`RequestOptions`] requesting strict tool-call decoding.
@@ -123,7 +123,7 @@ impl ConstrainedProfile {
     /// the provider on every turn.
     #[must_use]
     pub fn request_options() -> RequestOptions {
-        RequestOptions::new().tool_constraint(ToolConstraint::Strict)
+        RequestOptions::new().with_tool_constraint(ToolConstraint::Strict)
     }
 
     /// Apply the profile's pipeline and goal-reminder contributor to a

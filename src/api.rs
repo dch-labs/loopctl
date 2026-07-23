@@ -21,8 +21,9 @@ use std::sync::Arc;
 /// so method signatures stay short (`&self, request, ...`) instead of
 /// repeating `messages, system, tools` at every call site.
 ///
-/// Construct via `StreamRequest::new(messages)` and chain `.system(...)`
-/// / `.tools(...)` as needed, or build with struct-literal syntax.
+/// Construct via `StreamRequest::new(messages)` and chain
+/// `.with_system(...)` / `.with_tools(...)` as needed, or build with
+/// struct-literal syntax.
 ///
 /// # Example
 ///
@@ -30,19 +31,38 @@ use std::sync::Arc;
 /// use loopctl::api::StreamRequest;
 ///
 /// let req = StreamRequest::new(vec![Message::user("hi")])
-///     .system("be brief")
-///     .tools(vec![search_tool]);
+///     .with_system(Some("be brief".to_string()))
+///     .with_tools(Some(vec![search_tool]));
 /// let stream = client.stream_messages(req);
 /// ```
 #[derive(Debug, Clone)]
 pub struct StreamRequest {
-    /// The conversation history. Owned because the request body must be built
-    /// from owned data — callers clone the full history each turn
-    /// (O(n) in messages).
+    /// The conversation history sent to the model.
+    ///
+    /// Owned because the request body is built from owned data — callers clone
+    /// the full history each turn (O(n) in messages). This is the only required
+    /// field; an empty `Vec` is permitted (a cold-start prompt with no prior
+    /// turns).
     pub messages: Vec<Message>,
-    /// An optional system prompt to prepend.
+
+    /// An optional system prompt prepended above `messages`.
+    ///
+    /// When `Some`, providers emit it in their native system-prompt slot
+    /// (top-level `system` on Anthropic/Gemini, a leading `system` role message
+    /// on OpenAI). When `None`, the provider receives no system prompt for the
+    /// turn. The value is forwarded verbatim from
+    /// [`LoopConfig::system_prompt`](crate::config::LoopConfig::system_prompt);
+    /// set it there to drive this field.
     pub system: Option<String>,
-    /// Optional tool definitions the model may invoke.
+
+    /// Optional tool definitions the model may invoke this turn.
+    ///
+    /// When `Some`, providers advertise these schemas to the model (OpenAI
+    /// `tools`, Anthropic `tools`, Gemini `functionDeclarations`). When `None`,
+    /// no tools are advertised and the model cannot issue tool calls. Note the
+    /// framework silently suppresses `tools` when a
+    /// [`response_format`](crate::structured::RequestOptions) constraint is set
+    /// — see the structured-output docs.
     pub tools: Option<Vec<ToolSchema>>,
 }
 
@@ -58,35 +78,24 @@ impl StreamRequest {
     }
 
     /// Set the system prompt.
-    #[must_use]
-    pub fn system(mut self, system: impl Into<String>) -> Self {
-        self.system = Some(system.into());
-        self
-    }
-
-    /// Set the system prompt from an existing [`Option<String>`].
     ///
-    /// Convenience for call sites that already hold the prompt as an `Option`
-    /// (e.g. forwarded from another field). `None` leaves it unset.
+    /// The field is optional: pass `Some(prompt)` to set it or `None` to leave
+    /// it unset (the default). This mirrors the field type directly, so a
+    /// caller that already holds an `Option<String>` (e.g. forwarded from
+    /// another config field) needs no conversion.
     #[must_use]
-    pub fn system_opt(mut self, system: Option<String>) -> Self {
+    pub fn with_system(mut self, system: Option<String>) -> Self {
         self.system = system;
         self
     }
 
     /// Set the tool definitions.
-    #[must_use]
-    pub fn tools(mut self, tools: Vec<ToolSchema>) -> Self {
-        self.tools = Some(tools);
-        self
-    }
-
-    /// Set the tool definitions from an existing [`Option<Vec<ToolSchema>>`].
     ///
-    /// Convenience for call sites that already hold tools as an `Option`.
-    /// `None` leaves them unset.
+    /// The field is optional: pass `Some(tools)` to attach tool schemas or
+    /// `None` to send no tools (the default). Mirrors the field type so an
+    /// existing `Option<Vec<ToolSchema>>` maps without conversion.
     #[must_use]
-    pub fn tools_opt(mut self, tools: Option<Vec<ToolSchema>>) -> Self {
+    pub fn with_tools(mut self, tools: Option<Vec<ToolSchema>>) -> Self {
         self.tools = tools;
         self
     }
@@ -462,15 +471,9 @@ mod tests {
 
     #[test]
     fn stream_request_system_builder() {
-        let req = StreamRequest::new(vec![]).system("be brief");
+        let req = StreamRequest::new(vec![]).with_system(Some("be brief".to_string()));
         assert_eq!(req.system.as_deref(), Some("be brief"));
-    }
-
-    #[test]
-    fn stream_request_system_opt_builder() {
-        let req = StreamRequest::new(vec![]).system_opt(Some("x".into()));
-        assert_eq!(req.system.as_deref(), Some("x"));
-        let req = StreamRequest::new(vec![]).system_opt(None);
+        let req = StreamRequest::new(vec![]).with_system(None);
         assert!(req.system.is_none());
     }
 
@@ -481,20 +484,9 @@ mod tests {
             description: "Search".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
-        let req = StreamRequest::new(vec![]).tools(tools);
+        let req = StreamRequest::new(vec![]).with_tools(Some(tools));
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn stream_request_tools_opt_builder() {
-        let tools = vec![crate::tool::ToolSchema {
-            tool: "search".into(),
-            description: "Search".into(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }];
-        let req = StreamRequest::new(vec![]).tools_opt(Some(tools));
-        assert_eq!(req.tools.as_ref().unwrap().len(), 1);
-        let req = StreamRequest::new(vec![]).tools_opt(None);
+        let req = StreamRequest::new(vec![]).with_tools(None);
         assert!(req.tools.is_none());
     }
 

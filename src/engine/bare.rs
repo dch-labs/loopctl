@@ -1754,6 +1754,16 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
         !self.machine.is_terminal()
     }
 
+    /// Finalize the current run and return its [`Run`] accumulator.
+    ///
+    /// Every `run()` exit path — clean completion, error, max-turns,
+    /// cancellation — funnels through here. Records the run's end
+    /// timestamp, fires the session-end observers, and re-arms the
+    /// cancel signal so the next `run()` starts clean. Re-arming here
+    /// (rather than at the top of `run()`) preserves a cancel that
+    /// arrived before the run: the run observes it and returns
+    /// [`LoopError::Cancelled`], and only then is the signal cleared,
+    /// so the agent is never left permanently dead after one cancel.
     fn finalize<'a>(
         &'a mut self,
         success: bool,
@@ -1767,6 +1777,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             let duration = run.duration();
 
             self.notify_session_end(&run, success, duration);
+            self.cancelled.reset();
 
             Ok(run)
         })
@@ -3538,6 +3549,37 @@ mod tests {
         agent.cancel();
         assert!(signal.is_cancelled());
         assert!(agent.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_second_run_after_cancel_is_not_dead() {
+        let client = MockClient::new("test-model");
+        client.add_text_response("second run should reach me");
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+
+        agent.cancel();
+
+        let first = agent.run("first", &RunConfig::default()).await;
+        assert!(
+            matches!(first, Err(LoopError::Cancelled)),
+            "first run must be cancelled, got {first:?}"
+        );
+
+        let client2 = MockClient::new("test-model");
+        client2.add_text_response("second run ok");
+        agent.client = Arc::new(client2);
+
+        let second = agent.run("second", &RunConfig::default()).await;
+        match &second {
+            Ok(run) => assert_eq!(
+                run.output.as_deref(),
+                Some("second run ok"),
+                "second run must complete after cancel, got run with output {:?}",
+                run.output
+            ),
+            Err(e) => panic!("second run after cancel must not fail, got {e:?}"),
+        }
     }
 
     #[tokio::test]

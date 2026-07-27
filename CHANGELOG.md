@@ -205,6 +205,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   `Result<Self, LoopError>` — chain with `?`), `with_observer`,
   `with_text_streamer`, `with_contributor`, `with_request_options`. The
   original `set_*`/`register_*` setters are unchanged and remain available.
+- `CancelSignal::reset()` — re-arm a fired signal by swapping in a fresh
+  underlying `CancellationToken`. Required because the token is one-shot
+  by design; once fired it cannot be revived. All clones of an
+  `Arc<CancelSignal>` observe the new token, so a handle returned by
+  `BareLoop::cancel_signal()` keeps working across resets. `BareLoop`
+  calls this in `finalize()` so each `run()` starts with a clean signal.
 
 ### Changed
 
@@ -410,6 +416,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   to the matching slot, and flushes slots in `PartStart` arrival order
   (FIFO) on `PartStop`. Anthropic (strictly sequential) and Gemini
   (atomic per-chunk tool calls) are unaffected.
+- `BareLoop` was permanently dead after a single cancellation. Once
+  `cancel()` fired, the `CancelSignal` (a one-shot
+  `CancellationToken`) stayed cancelled forever, so every subsequent
+  `run()` returned `LoopError::Cancelled` immediately. `run()` now
+  re-arms the signal in `finalize()` — the single chokepoint every run
+  exit path passes through — so the next `run()` starts clean. A cancel
+  that arrives *before* a run still cancels that run (the signal is
+  cleared only after the run observes it and returns), preserving the
+  pre-run-cancel contract.
 
 ## [0.1.0] - 2025-07-01
 

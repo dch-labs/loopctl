@@ -947,9 +947,12 @@ struct OpenAiDelta {
 struct OpenAiToolCallDelta {
     /// Server-assigned identifier for the tool call.
     ///
-    /// Present on the first chunk for this `index`; the emitter forwards
-    /// it as the call id so the host can match the result later.
-    id: String,
+    /// Present only on the first chunk for this `index`; continuation
+    /// chunks omit it. The emitter latches it on the first chunk and
+    /// forwards it as the call id so the host can match the result
+    /// later. Defaults to `None` when the server omits the field.
+    #[serde(default)]
+    id: Option<String>,
 
     /// Position of this tool call in the request's tool list.
     ///
@@ -965,6 +968,7 @@ struct OpenAiToolCallDelta {
     /// the function `name` (first chunk for this `index`) or a fragment
     /// of the JSON `arguments` (subsequent chunks) — the
     /// [`StreamEmitter`] reassembles both per index.
+    #[serde(default)]
     function: Option<OpenAiToolCallFunction>,
 }
 
@@ -973,23 +977,25 @@ struct OpenAiToolCallDelta {
 /// The `name` arrives on the first chunk for a tool call; `arguments`
 /// is a JSON string that may itself arrive in fragments across several
 /// chunks and must be concatenated before parsing.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct OpenAiToolCallFunction {
     /// Accumulated JSON arguments for the tool call.
     ///
     /// A partial JSON string that grows across chunks; the emitter
     /// buffers it per `index` and hands the complete string to the
     /// caller once the part stops.
+    #[serde(default)]
     arguments: String,
 
     /// Fully-qualified name of the tool to invoke.
     ///
     /// Matches the `name` the tool was registered under in the request's
     /// `tools` array. Arrives on the first chunk for a given `index`
-    /// only; subsequent chunks for the same call carry just argument
-    /// fragments, so the emitter latches this value and reuses it for
-    /// every later chunk with the same index.
-    name: String,
+    /// only; continuation chunks for the same call omit it, so the
+    /// emitter latches this value on the first chunk and ignores it on
+    /// later ones. Defaults to `None` when the server omits the field.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// Stateful translator that converts a sequence of [`OpenAiChunk`]s
@@ -1180,11 +1186,11 @@ impl StreamEmitter {
             self.push(StreamEvent::PartStart(PartStart {
                 index: tc.index,
                 part: Some(MessagePart::ToolCall {
-                    id: tc.id.clone(),
+                    id: tc.id.clone().unwrap_or_default(),
                     name: tc
                         .function
                         .as_ref()
-                        .map(|f| f.name.clone())
+                        .and_then(|f| f.name.clone())
                         .unwrap_or_default(),
                     input: Value::Null,
                 }),
@@ -1393,7 +1399,6 @@ mod tests {
         assert_eq!(calls[0]["id"], "call_1");
         assert_eq!(calls[0]["type"], "function");
         assert_eq!(calls[0]["function"]["name"], "echo");
-        // arguments should be stringified JSON
         assert_eq!(
             calls[0]["function"]["arguments"].as_str().unwrap(),
             r#"{"message":"hi"}"#
@@ -1418,9 +1423,6 @@ mod tests {
 
     #[test]
     fn convert_message_multiple_tool_results_expand() {
-        // A single loopctl message with two tool-result parts must expand to
-        // two separate OpenAI tool messages (not one array-valued element,
-        // which Ollama/OpenAI reject).
         let m = Message::new(
             Role::User,
             vec![
@@ -1540,7 +1542,6 @@ mod tests {
         em.process_chunk(&chunk);
 
         let events = em.drain();
-        // MessageStart, PartStart(0), IndexedDelta(Text)
         assert_eq!(events.len(), 3);
         assert!(matches!(
             events[1],
@@ -1574,7 +1575,6 @@ mod tests {
         em.process_chunk(&chunk0);
         em.drain();
 
-        // Tool call delta.
         let chunk = OpenAiChunk::parse(
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
         )
@@ -1582,7 +1582,6 @@ mod tests {
         em.process_chunk(&chunk);
         let events = em.drain();
 
-        // PartStart(tool) + IndexedDelta(InputJson)
         assert_eq!(events.len(), 2);
         assert!(matches!(
             events[0],
@@ -1612,7 +1611,7 @@ mod tests {
         em.drain();
 
         let fragment = OpenAiChunk::parse(
-            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"echo","arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
         )
         .unwrap();
         em.process_chunk(&fragment);
@@ -1642,7 +1641,7 @@ mod tests {
         let chunks = [
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":null},"finish_reason":null}]}"#,
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
-            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"echo","arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
         ];
         for raw in chunks {
@@ -1674,16 +1673,11 @@ mod tests {
         let mut em = StreamEmitter::default();
         let mut acc = StreamAccumulator::new();
         let chunks = [
-            // Message start.
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":null},"finish_reason":null}]}"#,
-            // Call A (index 0): header + first fragment.
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
-            // Call B (index 1): header + first fragment.
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"search","arguments":"{\"q\":"}}]},"finish_reason":null}]}"#,
-            // Call A: remaining fragment.
-            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"echo","arguments":"\"a\"}"}}]},"finish_reason":null}]}"#,
-            // Call B: remaining fragment.
-            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"search","arguments":"\"b\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"b\"}"}}]},"finish_reason":null}]}"#,
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
         ];
         for raw in chunks {
@@ -1710,6 +1704,44 @@ mod tests {
             MessagePart::ToolCall { name, input, .. } => {
                 assert_eq!(name, "search");
                 assert_eq!(input, &serde_json::json!({"q": "b"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emitter_real_continuation_chunks_omit_id_and_name() {
+        use crate::stream::StreamAccumulator;
+
+        let mut em = StreamEmitter::default();
+        let mut acc = StreamAccumulator::new();
+        let chunks = [
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":null},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
+        ];
+        for raw in chunks {
+            let chunk = OpenAiChunk::parse(raw).expect("real chunk shape must deserialize");
+            em.process_chunk(&chunk);
+            for ev in em.drain() {
+                acc.process(&ev).expect("accumulator accepts events");
+            }
+        }
+        for ev in em.finish() {
+            acc.process(&ev).expect("accumulator accepts finish events");
+        }
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 1, "one tool call expected");
+        match &msg.parts[0] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "echo");
+                assert_eq!(
+                    input,
+                    &serde_json::json!({"msg": "hi"}),
+                    "continuation fragment must accumulate, not be dropped"
+                );
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }

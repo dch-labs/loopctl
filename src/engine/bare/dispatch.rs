@@ -229,17 +229,15 @@ impl<C: ApiClient> BareLoop<C> {
     /// Dispatch tool calls one at a time.
     ///
     /// Each [`ToolCall`] runs to completion via
-    /// [`dispatch_tool_with_recovery`](Self::dispatch_tool_with_recovery)
-    /// before the next begins. Observers see strictly paired
-    /// `on_tool_pre` / `on_tool_post` events per call, in input order. The
-    /// cancel signal is checked between calls so a Ctrl-C mid-batch aborts the
-    /// remaining calls rather than running them all.
+    /// [`execute_tool_call`](Self::execute_tool_call) before the next
+    /// begins. The cancel signal is checked between calls so a Ctrl-C
+    /// mid-batch aborts the remaining calls rather than running them all.
     ///
     /// # Errors
     ///
     /// Returns [`LoopError::Cancelled`] if the cancel signal fires between
     /// calls, or any hard error from
-    /// [`dispatch_tool_with_recovery`](Self::dispatch_tool_with_recovery).
+    /// [`execute_tool_call`](Self::execute_tool_call).
     async fn dispatch_tools_sequential(
         &self,
         tool_calls: &[ToolCall],
@@ -250,42 +248,31 @@ impl<C: ApiClient> BareLoop<C> {
             if self.is_cancelled() {
                 return Err(LoopError::Cancelled);
             }
-            let result = self.dispatch_tool_with_recovery(call, turn_idx).await?;
+            let result = self.execute_tool_call(call.clone(), turn_idx).await?;
             results.push(result);
         }
         Ok(results)
     }
 
-    /// Dispatch independent tool calls concurrently, preserving the ordering
-    /// invariant.
+    /// Dispatch independent tool calls concurrently.
     ///
-    /// The batch flows through five phases:
+    /// Builds a [`DispatchPlan`] from the registry's
+    /// [`is_safe_for_concurrent_execution`](crate::tool::Tool::is_safe_for_concurrent_execution)
+    /// and [`resource_key`](crate::tool::Tool::resource_key) metadata, then
+    /// runs each wave of calls concurrently under a semaphore capped at
+    /// [`max_concurrency`](crate::config::ParallelDispatchConfig::max_concurrency).
+    /// Each call runs through [`execute_tool_call`](Self::execute_tool_call)
+    /// — the same end-to-end path as sequential — so observers,
+    /// detection, hooks, and health all fire identically regardless of
+    /// dispatch mode.
     ///
-    /// 1. **PRE** (sequential, input order): for each call — cancel-check,
-    ///    `on_tool_pre`, pre-hooks, pre-detection. Blocked calls get a
-    ///    pre-computed soft-error result and are excluded from parallel
-    ///    execution. A detection hard-stop returns `Err` immediately, before
-    ///    any task spawns.
-    /// 2. **PLAN**: [`ToolDependencyGraph`] partitions eligible calls into
-    ///    waves based on `is_safe_for_concurrent_execution` and
-    ///    `resource_key` conflicts.
-    /// 3. **EXEC** (concurrent): each wave's calls run under a
-    ///    [`Semaphore`](tokio::sync::Semaphore) capped at `max_concurrency`,
-    ///    each racing the shared cancel signal via `tokio::select!`.
-    /// 4. **JOIN**: results are collected indexed by original position so they
-    ///    come home in input order regardless of completion order.
-    /// 5. **POST** (sequential, input order): `post_detection`,
-    ///    `on_tool_post`, post-hooks, `record_tool_health` for each call.
-    ///
-    /// Falls back to the sequential path when parallelism yields no benefit
-    /// (fewer than 2 eligible calls). Soft errors are collected (not fatal);
-    /// the model sees all N results in input order.
+    /// Falls back to the sequential path when there are fewer than 2 calls.
     ///
     /// # Errors
     ///
-    /// [`LoopError::Cancelled`] if the cancel signal fires during dispatch
-    /// (either in PRE or inside an EXEC task). [`LoopError::LoopDetected`]
-    /// (propagated from PRE detection) on a hard stop.
+    /// [`LoopError::Cancelled`] if the cancel signal fires during dispatch.
+    /// [`LoopError::LoopDetected`] on a hard stop from detection. Any hard
+    /// error from an individual [`execute_tool_call`](Self::execute_tool_call).
     async fn dispatch_tools_parallel(
         &self,
         tool_calls: &[ToolCall],
@@ -295,124 +282,38 @@ impl<C: ApiClient> BareLoop<C> {
             return self.dispatch_tools_sequential(tool_calls, turn_idx).await;
         }
 
-        let tool_context = self.build_tool_context();
-        let (pre_results, eligible) = self.parallel_pre_phase(tool_calls, turn_idx)?;
-
-        if eligible.len() < 2 {
-            return self
-                .parallel_run_remaining(tool_calls, &pre_results, &tool_context, turn_idx)
-                .await;
-        }
-
-        let exec_results = self
-            .parallel_exec_phase(tool_calls, &eligible, &pre_results, &tool_context, turn_idx)
-            .await?;
-        Ok(self.parallel_post_phase(tool_calls, &pre_results, &exec_results, turn_idx))
-    }
-
-    /// PRE phase: for each call (input order), fire `on_tool_pre`, check
-    /// pre-hooks, run pre-detection. Blocked calls get a pre-computed
-    /// soft-error result stashed in `pre_results`; eligible calls are collected
-    /// into the returned index list.
-    ///
-    /// # Errors
-    ///
-    /// [`LoopError::Cancelled`] if the cancel signal fires, or
-    /// [`LoopError::LoopDetected`] from pre-detection.
-    fn parallel_pre_phase(
-        &self,
-        tool_calls: &[ToolCall],
-        turn_idx: usize,
-    ) -> Result<(Vec<Option<ToolDispatchResult>>, Vec<usize>), LoopError> {
-        let mut pre_results: Vec<Option<ToolDispatchResult>> =
-            (0..tool_calls.len()).map(|_| None).collect();
-        let mut eligible: Vec<usize> = Vec::new();
-
-        for (i, tc) in tool_calls.iter().enumerate() {
-            if self.is_cancelled() {
-                return Err(LoopError::Cancelled);
-            }
-            self.fire_tool_pre(turn_idx, tc);
-
-            if let Some(blocked) = self.check_pre_tool_use_hooks(tc, turn_idx) {
-                self.fire_tool_post(turn_idx, tc, &blocked);
-                if let Some(slot) = pre_results.get_mut(i) {
-                    *slot = Some(blocked);
-                }
-                continue;
-            }
-
-            if let Some(blocked) = self.pre_detection(tc, turn_idx)? {
-                self.fire_tool_post(turn_idx, tc, &blocked);
-                if let Some(slot) = pre_results.get_mut(i) {
-                    *slot = Some(blocked);
-                }
-                continue;
-            }
-            eligible.push(i);
-        }
-        Ok((pre_results, eligible))
-    }
-
-    /// EXEC phase: run eligible calls concurrently in waves under a semaphore.
-    ///
-    /// Each wave's tasks race the cancel signal via `tokio::select!`. Results
-    /// are placed in a position-indexed vec so they land in input order.
-    ///
-    /// # Errors
-    ///
-    /// [`LoopError::Cancelled`] if any task is cancelled, or a hard
-    /// [`LoopError`] propagated from `dispatch_tool`.
-    async fn parallel_exec_phase(
-        &self,
-        tool_calls: &[ToolCall],
-        eligible: &[usize],
-        pre_results: &[Option<ToolDispatchResult>],
-        tool_context: &ToolContext,
-        turn_idx: usize,
-    ) -> Result<Vec<Option<ToolDispatchResult>>, LoopError> {
-        let graph = ToolDependencyGraph::from_calls(tool_calls, &self.tools);
-        let plan = graph.plan();
+        let plan = ToolDependencyGraph::from_calls(tool_calls, &self.tools).plan();
         let max_concurrency = self
             .run_config()
             .parallel_tool_dispatch
             .max_concurrency
-            .clamp(1, eligible.len());
+            .clamp(1, tool_calls.len());
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
-        let mut exec_results: Vec<Option<ToolDispatchResult>> =
+        let mut results: Vec<Option<ToolDispatchResult>> =
             (0..tool_calls.len()).map(|_| None).collect();
+
         for wave in &plan.waves {
             if self.is_cancelled() {
                 return Err(LoopError::Cancelled);
             }
-            let wave_eligible: Vec<usize> = wave
-                .iter()
-                .copied()
-                .filter(|idx| pre_results.get(*idx).is_some_and(Option::is_none))
-                .collect();
-            if wave_eligible.is_empty() {
-                continue;
-            }
 
-            let mut tasks = Vec::with_capacity(wave_eligible.len());
-            for &idx in &wave_eligible {
+            let mut tasks = Vec::with_capacity(wave.len());
+            for &idx in wave {
                 let tc = tool_calls.get(idx).cloned();
-                let ctx = tool_context.clone();
                 let sem = Arc::clone(&semaphore);
-                let cancel = Arc::clone(&self.cancelled);
                 let turn = turn_idx;
                 tasks.push(async move {
                     let _permit = sem.acquire_owned().await.ok()?;
-                    self.run_parallel_task(tc?, &ctx, &cancel, turn).await
+                    Some(self.execute_tool_call(tc?, turn).await)
                 });
             }
 
             let outcomes = futures::future::join_all(tasks).await;
-            for (outcome, &idx) in outcomes.into_iter().zip(&wave_eligible) {
+            for (outcome, &idx) in outcomes.into_iter().zip(wave) {
                 match outcome {
                     None => return Err(LoopError::Cancelled),
                     Some(Ok(result)) => {
-                        if let Some(slot) = exec_results.get_mut(idx) {
+                        if let Some(slot) = results.get_mut(idx) {
                             *slot = Some(result);
                         }
                     }
@@ -420,105 +321,53 @@ impl<C: ApiClient> BareLoop<C> {
                 }
             }
         }
-        Ok(exec_results)
-    }
 
-    /// POST phase: for each call (input order), run `post_detection`,
-    /// `on_tool_post`, post-hooks, and `record_tool_health`. Blocked calls
-    /// (from PRE) emit their stashed soft-error result; executed calls emit
-    /// their exec result.
-    fn parallel_post_phase(
-        &self,
-        tool_calls: &[ToolCall],
-        pre_results: &[Option<ToolDispatchResult>],
-        exec_results: &[Option<ToolDispatchResult>],
-        turn_idx: usize,
-    ) -> Vec<ToolDispatchResult> {
-        let mut results = Vec::with_capacity(tool_calls.len());
-        for (i, tc) in tool_calls.iter().enumerate() {
-            if let Some(Some(pr)) = pre_results.get(i) {
-                results.push(pr.clone());
-            } else if let Some(er) = exec_results.get(i).and_then(|r| r.as_ref()) {
-                self.post_detection(tc, er);
-                self.fire_tool_post(turn_idx, tc, er);
-                self.notify_post_tool_use_hooks(tc, er, turn_idx);
-                // Health was already recorded inside run_parallel_task on
-                // every attempt — don't double-count here.
-                results.push(er.clone());
-            } else {
-                let soft = ToolDispatchResult {
-                    tool_call_id: tc.id.clone(),
+        Ok(results
+            .into_iter()
+            .map(|r| {
+                r.unwrap_or_else(|| ToolDispatchResult {
+                    tool_call_id: String::new(),
                     output: ToolContent::Text("dispatch produced no result".to_string()),
                     is_error: true,
                     duration: Duration::ZERO,
-                    resolved_tool_name: tc.tool.clone(),
+                    resolved_tool_name: String::new(),
                     display_hint: None,
-                };
-                results.push(soft);
-            }
-        }
-        results
+                })
+            })
+            .collect())
     }
 
-    /// Run remaining (non-blocked, non-eligible-for-parallel) calls
-    /// sequentially when there aren't enough to justify concurrency.
+    /// Execute a single tool call end-to-end.
+    ///
+    /// The single function that owns the full lifecycle of one tool call:
+    /// PRE (observer pre-notification, pre-hooks, pre-detection) → dispatch
+    /// → POST (post-detection, observer post-notification, post-hooks,
+    /// health recording) → recovery decision. On failure, consults
+    /// [`recovery_wait_or_return`](Self::recovery_wait_or_return) and loops
+    /// — re-firing PRE and POST on every retry attempt — until the tool
+    /// succeeds, the strategy gives up (returns a soft error), or the user
+    /// cancels.
+    ///
+    /// Safe to run concurrently: every side-effect target (`LoopObserver`,
+    /// `DetectionManager`, `HookExecutor`, `HealthRegistry`) is `Send +
+    /// Sync`. Sequential and parallel dispatch both call this function, so
+    /// there is exactly one definition of what "execute a tool call"
+    /// means — no divergence in side-effect granularity, observer event
+    /// counts, or recovery behaviour between modes.
     ///
     /// # Errors
     ///
-    /// [`LoopError::Cancelled`] or any hard error from
+    /// Returns [`LoopError::Cancelled`] when the recovery strategy aborts
+    /// on cancellation, [`LoopError::LoopDetected`] on a hard detection
+    /// stop, or any hard error from
     /// [`dispatch_tool`](Self::dispatch_tool).
-    async fn parallel_run_remaining(
+    async fn execute_tool_call(
         &self,
-        tool_calls: &[ToolCall],
-        pre_results: &[Option<ToolDispatchResult>],
-        tool_context: &ToolContext,
-        turn_idx: usize,
-    ) -> Result<Vec<ToolDispatchResult>, LoopError> {
-        let mut results = Vec::with_capacity(tool_calls.len());
-        for (i, tc) in tool_calls.iter().enumerate() {
-            if let Some(Some(pr)) = pre_results.get(i) {
-                results.push(pr.clone());
-            } else {
-                if self.is_cancelled() {
-                    return Err(LoopError::Cancelled);
-                }
-                let start = Instant::now();
-                let r = self
-                    .dispatch_tool(tc, tool_context, start, turn_idx)
-                    .await?;
-                self.post_detection(tc, &r);
-                self.fire_tool_post(turn_idx, tc, &r);
-                self.notify_post_tool_use_hooks(tc, &r, turn_idx);
-                self.record_tool_health(tc.tool.as_str(), &r);
-                results.push(r);
-            }
-        }
-        Ok(results)
-    }
-
-    /// Dispatch a single tool call with reflection and recovery on errors.
-    ///
-    /// If the tool succeeds, returns immediately. On failure, consults the
-    /// [`Reflector`](crate::reflection::Reflector) and
-    /// [`RecoveryStrategy`](crate::reflection::RecoveryStrategy) to decide
-    /// whether to retry, skip, ask the user, or fail.
-    ///
-    /// Each attempt fires [`on_tool_pre`](crate::observer::LoopObserver::on_tool_pre)
-    /// before dispatch and [`on_tool_post`](crate::observer::LoopObserver::on_tool_post)
-    /// after, so observers always see a complete lifecycle pair.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LoopError`] if the detection manager signals a hard stop
-    /// (e.g. [`LoopError::LoopDetected`]).
-    async fn dispatch_tool_with_recovery(
-        &self,
-        tc: &ToolCall,
+        mut tc: ToolCall,
         turn_idx: usize,
     ) -> Result<ToolDispatchResult, LoopError> {
         let tool_context = self.build_tool_context();
         let mut attempt: u32 = 0;
-        let mut tc = tc.clone();
 
         loop {
             self.fire_tool_pre(turn_idx, &tc);
@@ -534,10 +383,11 @@ impl<C: ApiClient> BareLoop<C> {
             }
 
             let start = Instant::now();
-            let tool_result = self
-                .dispatch_tool(&tc, &tool_context, start, turn_idx)
-                .await?;
-
+            let tool_result = tokio::select! {
+                biased;
+                () = self.cancelled.notified() => return Err(LoopError::Cancelled),
+                r = self.dispatch_tool(&tc, &tool_context, start, turn_idx) => r?,
+            };
             self.post_detection(&tc, &tool_result);
             self.fire_tool_post(turn_idx, &tc, &tool_result);
             self.notify_post_tool_use_hooks(&tc, &tool_result, turn_idx);
@@ -557,61 +407,6 @@ impl<C: ApiClient> BareLoop<C> {
                 }
                 Err(RecoveryOutcome::SoftError(returned_result)) => return Ok(returned_result),
                 Err(RecoveryOutcome::Cancelled) => return Err(LoopError::Cancelled),
-            }
-        }
-    }
-
-    /// Execute one parallel-wave task: the retry/recovery loop with cancellation,
-    /// no observer/hook/detection side-effects.
-    ///
-    /// Runs [`dispatch_tool`](Self::dispatch_tool) once, racing the shared
-    /// cancel signal. On error, consults
-    /// [`recovery_wait_or_return`](Self::recovery_wait_or_return) — retrying
-    /// with any correction, returning the soft error, or aborting on cancel.
-    /// The parallel PRE/POST phases own the observer/hook/detection
-    /// side-effects.
-    ///
-    /// Returns `None` if cancelled, `Some(Ok(result))` for success or soft
-    /// error, `Some(Err(e))` for a hard error.
-    async fn run_parallel_task(
-        &self,
-        mut tc: ToolCall,
-        ctx: &ToolContext,
-        cancel: &Arc<crate::cancel::CancelSignal>,
-        turn: usize,
-    ) -> Option<Result<ToolDispatchResult, LoopError>> {
-        let mut attempt: u32 = 0;
-        loop {
-            let start = Instant::now();
-            let result = tokio::select! {
-                biased;
-                () = cancel.notified() => return None,
-                r = self.dispatch_tool(&tc, ctx, start, turn) => r,
-            };
-            let tool_result = match result {
-                Ok(r) => r,
-                Err(e) => return Some(Err(e)),
-            };
-            // Record health on every attempt — the registry is thread-safe
-            // (atomic counters), so this is safe to call from concurrent
-            // tasks. Detection/observer side-effects stay in the POST phase
-            // (they are not thread-safe).
-            self.record_tool_health(tc.tool.as_str(), &tool_result);
-            if !tool_result.is_error {
-                return Some(Ok(tool_result));
-            }
-            match self
-                .recovery_wait_or_return(&tc, &tool_result, attempt)
-                .await
-            {
-                Ok((next_attempt, correction)) => {
-                    attempt = next_attempt;
-                    Self::apply_correction_if_present(&mut tc, correction);
-                }
-                Err(RecoveryOutcome::SoftError(returned_result)) => {
-                    return Some(Ok(returned_result));
-                }
-                Err(RecoveryOutcome::Cancelled) => return None,
             }
         }
     }
@@ -718,7 +513,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// error results. A tool not in the registry produces a soft error.
     ///
     /// Observer notifications are handled by the caller
-    /// ([`dispatch_tool_with_recovery`](Self::dispatch_tool_with_recovery)).
+    /// ([`execute_tool_call`](Self::execute_tool_call)).
     ///
     /// # Errors
     ///
@@ -993,7 +788,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// middleware chain (timeout, permissions, output limits, etc.).
     ///
     /// Observer notifications are handled by the caller
-    /// ([`dispatch_tool_with_recovery`](Self::dispatch_tool_with_recovery)).
+    /// ([`execute_tool_call`](Self::execute_tool_call)).
     ///
     /// # Errors
     ///
@@ -1651,6 +1446,83 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "cancel should interrupt the 10s backoff promptly; elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_runs_recovery_on_failure() {
+        use crate::reflection::{
+            FailureAnalysis, FailureSeverity, RecoveryAction, RecoveryStrategy,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct AlwaysRecoverable;
+        impl crate::reflection::Reflector for AlwaysRecoverable {
+            fn analyze(
+                &self,
+                error: &str,
+                tool_name: &str,
+                _tool_input: &Value,
+                _tool_schema: Option<&crate::tool::ToolSchema>,
+                _context: &crate::reflection::ReflectionContext,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<FailureAnalysis, crate::reflection::ReflectionError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let error = error.to_string();
+                let tool_name = tool_name.to_string();
+                Box::pin(async move {
+                    Ok(FailureAnalysis {
+                        is_recoverable: true,
+                        root_cause: error,
+                        severity: FailureSeverity::Medium,
+                        correction: None,
+                        context: format!("tool: {tool_name}"),
+                    })
+                })
+            }
+        }
+
+        struct CountingRetry {
+            calls: Arc<AtomicU32>,
+        }
+        impl RecoveryStrategy for CountingRetry {
+            fn decide(
+                &self,
+                _analysis: &FailureAnalysis,
+                _attempt: u32,
+                _max_attempts: u32,
+            ) -> Pin<Box<dyn Future<Output = RecoveryAction> + Send + '_>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async { RecoveryAction::Skip("counted".into()) })
+            }
+        }
+
+        let decide_calls = Arc::new(AtomicU32::new(0));
+        let error_tool = crate::tool::FnTool::new(
+            "error_tool".into(),
+            "Always errors".into(),
+            Value::Object(serde_json::Map::new()),
+            |_, _| Box::pin(async { Err(ToolError::Execution("boom".to_string())) }),
+        );
+
+        let mut registry = ToolRegistry::new();
+        registry.register(error_tool);
+        let mut bare = make_loop(registry);
+        bare.set_reflector(Arc::new(AlwaysRecoverable));
+        bare.set_recovery_strategy(Arc::new(CountingRetry {
+            calls: Arc::clone(&decide_calls),
+        }));
+
+        let tc = make_call("1", "error_tool", Value::Null);
+        let _ = bare.execute_tool_call(tc, 0).await.ok();
+
+        assert!(
+            decide_calls.load(Ordering::Relaxed) > 0,
+            "execute_tool_call must run recovery on failure"
         );
     }
 }

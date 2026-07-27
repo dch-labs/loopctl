@@ -423,6 +423,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Fixed
 
+- Tool dispatch had three separate code paths (sequential, small-batch
+  parallel, and wave-parallel) each with its own copy of the recovery
+  loop, PRE/POST side-effect logic, and cancel handling. Two bugs came
+  from this split: the small-batch path called `dispatch_tool` directly
+  with no recovery (a flaky tool failed permanently where it would
+  recover elsewhere), and the parallel paths fired observer/detection/
+  hook side-effects once on the final result while sequential fired
+  them per retry attempt — diverging loop-detection sensitivity, health
+  inputs, and observer event counts by dispatch mode. The entire
+  dispatch machinery is now one function (`execute_tool_call`) that owns
+  the full lifecycle (PRE → dispatch → POST → recovery loop) with
+  mid-flight cancel via `tokio::select!`. Sequential and parallel both
+  call it, so there is exactly one definition of "execute a tool call"
+  — no divergence is possible. Six functions (`parallel_pre_phase`,
+  `parallel_exec_phase`, `parallel_post_phase`, `parallel_run_remaining`,
+  `run_parallel_task`, `dispatch_tool_with_recovery`) collapsed into one
+  `execute_tool_call` + two thin dispatch loops.
 - OpenAI streaming silently dropped every multi-chunk tool-call argument
   fragment after the first, truncating the tool input JSON. The
   deserialization structs declared `id` (on the tool-call delta) and

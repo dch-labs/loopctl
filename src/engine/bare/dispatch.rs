@@ -370,15 +370,15 @@ impl<C: ApiClient> BareLoop<C> {
         let mut attempt: u32 = 0;
 
         loop {
-            self.fire_tool_pre(turn_idx, &tc);
+            self.notify_tool_pre(turn_idx, &tc);
 
             if let Some(blocked) = self.check_pre_tool_use_hooks(&tc, turn_idx) {
-                self.fire_tool_post(turn_idx, &tc, &blocked);
+                self.notify_tool_post(turn_idx, &tc, &blocked);
                 return Ok(blocked);
             }
 
             if let Some(blocked) = self.pre_detection(&tc, turn_idx)? {
-                self.fire_tool_post(turn_idx, &tc, &blocked);
+                self.notify_tool_post(turn_idx, &tc, &blocked);
                 return Ok(blocked);
             }
 
@@ -389,7 +389,7 @@ impl<C: ApiClient> BareLoop<C> {
                 r = self.dispatch_tool(&tc, &tool_context, start, turn_idx) => r?,
             };
             self.post_detection(&tc, &tool_result);
-            self.fire_tool_post(turn_idx, &tc, &tool_result);
+            self.notify_tool_post(turn_idx, &tc, &tool_result);
             self.notify_post_tool_use_hooks(&tc, &tool_result, turn_idx);
             self.record_tool_health(tc.tool.as_str(), &tool_result);
 
@@ -417,7 +417,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// the turn index, tool name, and tool-call ID. Called once per call before
     /// any hook checks, detection, or execution — observers always see this
     /// first, regardless of whether the call is later blocked or retried.
-    fn fire_tool_pre(&self, turn_idx: usize, tc: &ToolCall) {
+    fn notify_tool_pre(&self, turn_idx: usize, tc: &ToolCall) {
         self.managers.observers().on_tool_pre(&ToolPreContext {
             turn: turn_idx,
             tool: tc.tool.clone(),
@@ -432,7 +432,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// successful execution, hook block, detection block, or soft error — so
     /// that every `on_tool_pre` has a matching `on_tool_post`, regardless of
     /// the path taken. Observers can pair the two by `tool_call_id`.
-    fn fire_tool_post(&self, turn_idx: usize, tc: &ToolCall, result: &ToolDispatchResult) {
+    fn notify_tool_post(&self, turn_idx: usize, tc: &ToolCall, result: &ToolDispatchResult) {
         self.managers.observers().on_tool_post(&ToolPostContext {
             turn: turn_idx,
             tool: tc.tool.clone(),

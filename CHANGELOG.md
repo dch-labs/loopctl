@@ -373,9 +373,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 - Internally-built `reqwest::Client`s now set `tcp_nodelay(true)` by default.
   SSE streaming emits many small packets; disabling Nagle's algorithm reduces
   per-delta latency. No correctness impact.
+- `FallbackManager`'s circuit-breaker state is now unified behind a single
+  `Mutex<BreakerState>`. Previously it was split across four independent
+  `Relaxed` atomics (`fallback_state`, `consecutive_failures`,
+  `primary_success_count`, `fallback_activated`) plus a `Mutex<FallbackInner>`,
+  which left a TOCTOU window between the state read and the
+  transition/counter-reset. The read-decide-transition in `record_failure` /
+  `record_success` now runs while holding the one lock, so the race is closed
+  by construction. Internal refactor — no public-API change beyond the method
+  merges noted under `### Removed`.
 
 ### Removed
 
+- `FallbackManager::record_api_failure` and
+  `FallbackManager::record_model_failure` — merged into a single
+  [`FallbackManager::record_failure(FailureKind)`](crate::fallback::FallbackManager::record_failure).
+  The two methods differed only in how a failure during
+  [`Recovering`](crate::fallback::FallbackState::Recovering) was treated:
+  a sustained rate-limit re-trips the breaker, a transient error leaves
+  the half-open probe in place. That distinction is now an explicit
+  [`FailureKind`](crate::fallback::FailureKind) argument (`RateLimit` vs
+  `Transient`) instead of two near-identical methods. Migration: pass
+  `FailureKind::RateLimit` where you called `record_model_failure`,
+  `FailureKind::Transient` where you called `record_api_failure`.
+- `FallbackManager::record_failure` / `record_success` zero-body aliases
+  for `record_api_failure` / `record_model_success` — removed alongside
+  the merge. `record_success` is the new canonical name for the success
+  path (was `record_model_success`).
+- `FallbackEntry` and `AttemptRecord` are now `pub(crate)` — they were
+  `pub` with no external users and ~400 lines of speculative accessors.
+  The `fallback_entry(name)` lookup method (which leaked the internal
+  type) is removed. These types were never part of the documented public
+  API surface; only `FallbackManager`, `FallbackState`, `FallbackConfig`,
+  and `FailureKind` are public in the `fallback` module now.
+- `FallbackState::From<u8>` impl and the `= 0`/`= 1`/`= 2` discriminants
+  — dead weight from when state round-tripped through an `AtomicU8`.
+  State is now a plain field on an internal struct; no `u8` casting
+  remains.
 - `Loop::process_turn` trait method and `BareLoop::run_turn_body` — the
   machine-driven `run()` replaces the old per-turn execution path. The
   `LoopMachine` is the new turn unit; drive it via `BareLoop::run()` (or

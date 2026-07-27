@@ -122,7 +122,7 @@ pub trait Detectable {
 ///
 /// ```rust,ignore
 /// fn handle_stream_error(runtime: &impl FallbackCapable) {
-///     let tripped = runtime.fallback().record_api_failure();
+///     let tripped = runtime.fallback().record_failure(loopctl::fallback::FailureKind::Transient);
 ///     if tripped {
 ///         if let Some(model) = runtime.fallback().fallback_model() {
 ///             // switch to fallback model

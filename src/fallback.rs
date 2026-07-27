@@ -19,31 +19,30 @@
 //!
 //! - **[`FallbackState`]** — The three circuit-breaker states (`Primary`, `Fallback`, `Recovering`).
 //! - **[`FallbackConfig`]** — Configuration struct with thresholds and timeouts.
-//! - **[`FallbackManager`]** — The state machine itself; thread-safe via atomics and `Mutex`.
+//! - **[`FallbackManager`]** — The state machine itself; thread-safe via a single `Mutex`.
 //!
 //! # Quick Start
 //!
 //! ```rust
-//! use loopctl::fallback::{FallbackManager, FallbackConfig};
+//! use loopctl::fallback::{FallbackManager, FallbackConfig, FailureKind};
 //!
 //! // Create a manager with a trip threshold of 3 failures
 //! let mgr = FallbackManager::new(3, 2);
 //!
 //! // Simulate failures until the circuit trips
-//! mgr.record_model_failure();
-//! mgr.record_model_failure();
-//! assert!(mgr.record_model_failure()); // 3rd failure trips the circuit
+//! mgr.record_failure(FailureKind::Transient);
+//! mgr.record_failure(FailureKind::Transient);
+//! assert!(mgr.record_failure(FailureKind::Transient)); // 3rd failure trips the circuit
 //! assert!(mgr.is_using_fallback());
 //!
 //! // Manually transition to recovering, then record successes to resume primary
 //! mgr.transition_to_recovering();
-//! mgr.record_model_success(); // 1st success
-//! mgr.record_model_success(); // 2nd → back to Primary
+//! mgr.record_success(); // 1st success
+//! mgr.record_success(); // 2nd → back to Primary
 //! assert!(!mgr.is_using_fallback());
 //! ```
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -66,452 +65,171 @@ use tracing::{debug, info, warn};
 /// use loopctl::fallback::FallbackState;
 ///
 /// let state = FallbackState::Primary;
-/// assert_eq!(state as u8, 0);
-/// assert_eq!(FallbackState::from(1), FallbackState::Fallback);
+/// assert_eq!(state, FallbackState::Primary);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackState {
-    /// Operating on the primary model — no failures have tripped the
-    /// circuit breaker yet.
-    Primary = 0,
+    /// The circuit is closed and the primary model is in use.
+    ///
+    /// This is the initial state and the steady-state target: requests
+    /// route to the primary model, the failure counter increments on
+    /// each failure, and a single success resets it. When
+    /// [`consecutive_failures`](FallbackManager::consecutive_failures)
+    /// reaches [`trip_threshold`](FallbackConfig::trip_threshold), the
+    /// manager transitions to [`Fallback`](Self::Fallback).
+    Primary,
 
-    /// A fallback model is active — the primary model failed and the
-    /// breaker tripped. Subsequent failures on the fallback model are
-    /// tracked separately.
-    Fallback = 1,
+    /// The circuit is open and a fallback model is in use.
+    ///
+    /// Entered when the primary model's consecutive failures exceeded
+    /// the trip threshold. Requests route to the active fallback model
+    /// (the first non-failed entry in the chain). The manager stays here
+    /// for at least
+    /// [`recovery_timeout`](FallbackConfig::recovery_timeout) before it
+    /// is willing to probe the primary again, at which point it
+    /// transitions to [`Recovering`](Self::Recovering).
+    Fallback,
 
-    /// Between models — the primary failed, no fallback has been
-    /// selected yet, or a fallback also failed and the manager is
-    /// searching for another candidate.
-    Recovering = 2,
+    /// Half-open: the manager is probing whether the primary has recovered.
+    ///
+    /// Entered from [`Fallback`](Self::Fallback) after the cooldown
+    /// elapses (see
+    /// [`should_try_resume_primary`](FallbackManager::should_try_resume_primary)).
+    /// Requests route back to the primary while a recovery success
+    /// counter accrues; reaching
+    /// [`recovery_successes_needed`](FallbackConfig::recovery_successes_needed)
+    /// successes closes the circuit back to [`Primary`](Self::Primary).
+    /// A single sustained failure ([`FailureKind::RateLimit`])
+    /// during this probe re-opens the circuit to [`Fallback`](Self::Fallback).
+    Recovering,
 }
 
-/// Converts a raw `u8` back into a [`FallbackState`].
+/// What kind of failure triggered a [`FallbackManager::record_failure`] call.
 ///
-/// Inverse of `state as u8`. Unknown values default to
-/// [`FallbackState::Primary`] for safety.
-///
-/// # Safety
-///
-/// The conversion is infallible — any out-of-range `u8` maps to
-/// [`FallbackState::Primary`] so that a corrupted value cannot
-/// cause a panic.
-///
-/// # Example
-///
-/// ```rust
-/// use loopctl::fallback::FallbackState;
-///
-/// assert_eq!(FallbackState::from(0u8), FallbackState::Primary);
-/// assert_eq!(FallbackState::from(1u8), FallbackState::Fallback);
-/// assert_eq!(FallbackState::from(2u8), FallbackState::Recovering);
-/// assert_eq!(FallbackState::from(255u8), FallbackState::Primary); // unknown → safe default
-/// ```
-impl From<u8> for FallbackState {
-    fn from(value: u8) -> Self {
-        match value {
-            1 => FallbackState::Fallback,
-            2 => FallbackState::Recovering,
-            _ => FallbackState::Primary,
-        }
-    }
+/// The engine routes different failure causes through one recorder, and the
+/// cause changes how a failure during [`FallbackState::Recovering`] is
+/// treated: a sustained rate-limit means the primary is still degraded, so
+/// the circuit re-trips to [`FallbackState::Fallback`]; a transient error
+/// leaves the half-open probe in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// A transient API error (timeout, 5xx, network).
+    ///
+    /// During [`Recovering`](FallbackState::Recovering) the circuit stays
+    /// half-open — one transient blip does not by itself prove the primary
+    /// is still bad.
+    Transient,
+
+    /// A sustained rate-limit escalation.
+    ///
+    /// During [`Recovering`](FallbackState::Recovering) the circuit
+    /// re-trips to [`Fallback`](FallbackState::Fallback): the primary is
+    /// still actively refusing load, so probing it further is pointless.
+    RateLimit,
 }
 
-/// A single failed attempt on a fallback model.
+/// A single model in the fallback chain, with a failure counter.
 ///
-/// Records *when* a failure occurred and an optional reason string
-/// (e.g. `"rate_limit"`, `"timeout"`, `"500 Internal Server Error"`).
-/// Entries accumulate in [`FallbackEntry::attempts`]; once the count
-/// reaches [`FallbackEntry::max_fail_count`], the model is considered
-/// failed and skipped by [`FallbackManager::fallback_model`].
+/// Each entry pairs a model name with a consecutive-failure count and a
+/// `max_fail_count` threshold. When [`attempt_count`](Self::attempt_count)
+/// reaches `max_fail_count`, the entry is considered [`failed`](Self::failed)
+/// and is skipped by [`FallbackManager::fallback_model`].
 ///
-/// # Example
-///
-/// ```rust
-/// use loopctl::fallback::AttemptRecord;
-///
-/// let record = AttemptRecord::new("rate_limit");
-/// assert_eq!(record.reason(), Some("rate_limit"));
-/// ```
+/// Internal to the fallback manager — not part of the public API.
 #[derive(Debug, Clone)]
-pub struct AttemptRecord {
-    failed_at: Instant,
-    reason: Option<String>,
-}
-
-impl AttemptRecord {
-    /// Create a new attempt record with the given reason.
+pub(crate) struct FallbackEntry {
+    /// The model identifier this entry represents.
     ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::AttemptRecord;
-    /// let record = AttemptRecord::new("rate_limit");
-    /// assert_eq!(record.reason(), Some("rate_limit"));
-    /// ```
-    #[must_use]
-    pub fn new(reason: impl Into<String>) -> Self {
-        Self {
-            failed_at: Instant::now(),
-            reason: Some(reason.into()),
-        }
-    }
-
-    /// Create a new attempt record without a reason.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::AttemptRecord;
-    /// let record = AttemptRecord::anonymous();
-    /// assert!(record.reason().is_none());
-    /// ```
-    #[must_use]
-    pub fn anonymous() -> Self {
-        Self {
-            failed_at: Instant::now(),
-            reason: None,
-        }
-    }
-
-    /// Set the reason for this failure record.
-    ///
-    /// Pass `None` for an anonymous record, or `Some("reason")` for
-    /// a labelled one.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::AttemptRecord;
-    /// let record = AttemptRecord::new("timeout").with_reason(Some("timeout".to_string()));
-    /// assert_eq!(record.reason(), Some("timeout"));
-    /// ```
-    #[must_use]
-    pub fn with_reason(mut self, reason: Option<String>) -> Self {
-        self.reason = reason;
-        self
-    }
-
-    /// When this failure was recorded.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::AttemptRecord;
-    /// let record = AttemptRecord::new("timeout");
-    /// // failed_at is close to now
-    /// assert!(record.failed_at().elapsed().as_secs() < 1);
-    /// ```
-    #[must_use]
-    pub fn failed_at(&self) -> Instant {
-        self.failed_at
-    }
-
-    /// The optional reason for this failure.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::AttemptRecord;
-    /// let record = AttemptRecord::new("rate_limit");
-    /// assert_eq!(record.reason(), Some("rate_limit"));
-    /// ```
-    #[must_use]
-    pub fn reason(&self) -> Option<&str> {
-        self.reason.as_deref()
-    }
-}
-
-/// A single model in the fallback chain, with attempt history.
-///
-/// Each entry has a model name, a list of recorded failure attempts,
-/// and a `max_fail_count` threshold. When [`attempts`](Self::attempts)
-/// grows to `max_fail_count` entries, the entry is considered
-/// [`failed`](Self::failed) and is automatically skipped by
-/// [`FallbackManager::fallback_model`].
-///
-/// # Example
-///
-/// ```rust
-/// use loopctl::fallback::FallbackEntry;
-///
-/// let mut entry = FallbackEntry::new("llm-70b");
-/// assert_eq!(entry.name(), "llm-70b");
-/// assert!(!entry.failed());
-///
-/// entry.record_attempt("timeout");
-/// entry.record_attempt("timeout");
-/// assert_eq!(entry.attempt_count(), 2);
-/// assert!(entry.failed()); // max_fail_count defaults to 2
-/// ```
-#[derive(Debug, Clone)]
-pub struct FallbackEntry {
-    /// Model identifier (e.g. `"llm-70b"`). Must match the API client's routing identifier.
+    /// Must match the routing identifier the API client expects (e.g.
+    /// `"llm-70b"`, `"gpt-4o"`). Used both to look the entry up in the
+    /// chain and as the value returned by
+    /// [`fallback_model`](FallbackManager::fallback_model) when this
+    /// entry is the active fallback. Set at construction and never
+    /// mutated.
     name: String,
-    /// Set to `false` to take a model out of rotation independently of failure tracking.
+
+    /// Whether this model is eligible to serve requests.
+    ///
+    /// An out-of-band kill switch separate from failure tracking:
+    /// `false` forces [`failed`](Self::failed) to return `true`
+    /// regardless of the attempt count, so the manager skips this
+    /// entry. Use [`set_available`](Self::set_available) to take a
+    /// model out of rotation (e.g. an API key was revoked, the model
+    /// was decommissioned) without recording spurious failures.
     available: bool,
-    /// Recorded failure attempts for this model.
-    attempts: Vec<AttemptRecord>,
-    /// When `attempts.len()` reaches this threshold the model is taken out of rotation.
+
+    /// How many consecutive failures this model has recorded.
+    ///
+    /// Incremented by [`record_attempt`](Self::record_attempt) and
+    /// compared against [`max_fail_count`](Self::max_fail_count) to
+    /// decide [`failed`](Self::failed). Reset to zero by
+    /// [`clear_attempts`](Self::clear_attempts) when the circuit
+    /// recovers, giving a degraded model a fresh start.
+    attempt_count: usize,
+
+    /// The failure count at which this model is taken out of rotation.
+    ///
+    /// Once [`attempt_count`](Self::attempt_count) reaches this value
+    /// the entry is [`failed`](Self::failed) and the manager advances
+    /// to the next candidate in the chain. Defaults to the manager's
+    /// [`max_fail_count`](FallbackConfig::max_fail_count) at
+    /// construction; override per-entry with
+    /// [`with_max_fail_count`](Self::with_max_fail_count).
     max_fail_count: usize,
 }
 
 impl FallbackEntry {
     /// Create a new entry for the given model, not yet failed.
     ///
-    /// Uses a default `max_fail_count` of `2`
-    /// failure marks the model as failed. Use
+    /// Uses a default `max_fail_count` of `2`. Use
     /// [`with_max_fail_count`](Self::with_max_fail_count) to customise.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let entry = FallbackEntry::new("llm-70b");
-    /// assert_eq!(entry.name(), "llm-70b");
-    /// assert!(!entry.failed());
-    /// assert_eq!(entry.max_fail_count(), 2);
-    /// ```
-    #[must_use]
-    pub fn new(name: impl Into<String>) -> Self {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             available: true,
-            attempts: Vec::new(),
+            attempt_count: 0,
             max_fail_count: 2,
         }
     }
 
     /// Set a custom `max_fail_count` threshold.
     ///
-    /// The model is only considered failed after this many attempts
-    /// have been recorded via [`record_attempt`](Self::record_attempt).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let mut entry = FallbackEntry::new("llm-70b").with_max_fail_count(3);
-    /// assert_eq!(entry.max_fail_count(), 3);
-    ///
-    /// entry.record_attempt("timeout");
-    /// entry.record_attempt("rate_limit");
-    /// assert!(!entry.failed()); // only 2 of 3
-    ///
-    /// entry.record_attempt("server_error");
-    /// assert!(entry.failed()); // 3 of 3
-    /// ```
+    /// If raising the threshold on an already-failed entry, the attempt
+    /// count is padded up so it stays failed under the new threshold.
     #[must_use]
-    pub fn with_max_fail_count(mut self, max_fail_count: usize) -> Self {
+    pub(crate) fn with_max_fail_count(mut self, max_fail_count: usize) -> Self {
         let new_max = max_fail_count.max(1);
-        // If the entry was already failed, add attempts to keep it failed
-        // under the new threshold.
-        while self.attempts.len() < new_max && self.failed() {
-            self.attempts.push(AttemptRecord::anonymous());
+        if self.failed() && self.attempt_count < new_max {
+            self.attempt_count = new_max;
         }
         self.max_fail_count = new_max;
         self
     }
 
-    /// Create a new entry already marked as failed.
-    ///
-    /// Useful when initializing from a known-degraded model.
-    /// [`failed()`](Self::failed) returns `true` immediately.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let entry = FallbackEntry::new_failed("llm-70b");
-    /// assert!(entry.failed());
-    /// ```
-    #[must_use]
-    pub fn new_failed(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            available: true,
-            attempts: vec![AttemptRecord::anonymous(), AttemptRecord::anonymous()],
-            max_fail_count: 2,
-        }
-    }
-
-    /// The model name.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let entry = FallbackEntry::new("llm-70b");
-    /// assert_eq!(entry.name(), "llm-70b");
-    /// ```
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     /// Whether this model should be skipped.
     ///
-    /// Returns `true` when the model is not [`available`](Self::available)
-    /// or when [`attempt_count`](Self::attempt_count) has reached
-    /// [`max_fail_count`](Self::max_fail_count).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let mut entry = FallbackEntry::new("llm-70b");
-    /// assert!(!entry.failed());
-    /// entry.record_attempt("timeout");
-    /// entry.record_attempt("timeout"); // max_fail_count defaults to 2
-    /// assert!(entry.failed());
-    /// ```
-    #[must_use]
-    pub fn failed(&self) -> bool {
-        !self.available || self.attempts.len() >= self.max_fail_count
-    }
-
-    /// The configured maximum failure count before this model is skipped.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let entry = FallbackEntry::new("llm-70b").with_max_fail_count(3);
-    /// assert_eq!(entry.max_fail_count(), 3);
-    /// ```
-    #[must_use]
-    pub fn max_fail_count(&self) -> usize {
-        self.max_fail_count
-    }
-
-    /// Whether this model is available for use.
-    ///
-    /// A model that is not available is always skipped by
-    /// [`FallbackManager::fallback_model`], regardless of failure count.
-    /// Set to `false` via [`set_available`](Self::set_available) to take
-    /// a model out of rotation (e.g. API key revoked, model decommissioned).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let mut entry = FallbackEntry::new("llm-70b");
-    /// assert!(entry.available());
-    /// entry.set_available(false);
-    /// assert!(!entry.available());
-    /// assert!(entry.failed()); // unavailable ⇒ failed
-    /// ```
-    #[must_use]
-    pub fn available(&self) -> bool {
-        self.available
+    /// `true` when the model is not `available` or when its attempt count
+    /// has reached `max_fail_count`.
+    pub(crate) fn failed(&self) -> bool {
+        !self.available || self.attempt_count >= self.max_fail_count
     }
 
     /// Set whether this model is available for use.
     ///
-    /// When set to `false`, [`failed()`](Self::failed) returns `true`
+    /// When set to `false`, [`failed`](Self::failed) returns `true`
     /// regardless of the attempt count, and the manager skips this model.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let mut entry = FallbackEntry::new("llm-70b");
-    /// entry.set_available(false);
-    /// assert!(entry.failed());
-    /// entry.set_available(true);
-    /// assert!(!entry.failed()); // no attempts recorded
-    /// ```
-    pub fn set_available(&mut self, available: bool) {
+    pub(crate) fn set_available(&mut self, available: bool) {
         self.available = available;
     }
 
-    /// How many failure attempts have been recorded.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let mut entry = FallbackEntry::new("llm-70b");
-    /// assert_eq!(entry.attempt_count(), 0);
-    /// entry.record_attempt("timeout");
-    /// assert_eq!(entry.attempt_count(), 1);
-    /// ```
-    #[must_use]
-    pub fn attempt_count(&self) -> usize {
-        self.attempts.len()
+    /// Record a new failure attempt.
+    pub(crate) fn record_attempt(&mut self) {
+        self.attempt_count = self.attempt_count.saturating_add(1);
     }
 
-    /// Access the recorded failure attempts.
-    ///
-    /// Returns a slice of [`AttemptRecord`] in chronological order
-    /// (oldest first).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let mut entry = FallbackEntry::new("llm-70b");
-    /// entry.record_attempt("timeout");
-    /// entry.record_attempt("rate_limit");
-    /// let attempts = entry.attempts();
-    /// assert_eq!(attempts.len(), 2);
-    /// assert_eq!(attempts[0].reason(), Some("timeout"));
-    /// ```
-    #[must_use]
-    pub fn attempts(&self) -> &[AttemptRecord] {
-        &self.attempts
-    }
-
-    /// Record a new failure attempt with an optional reason.
-    ///
-    /// If this causes [`attempt_count`](Self::attempt_count) to reach
-    /// [`max_fail_count`](Self::max_fail_count), subsequent calls to
-    /// [`failed()`](Self::failed) will return `true`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let mut entry = FallbackEntry::new("llm-70b");
-    /// entry.record_attempt("timeout");
-    /// entry.record_attempt("timeout"); // exceeds max_fail_count (default = 2)
-    /// assert!(entry.failed());
-    /// ```
-    pub fn record_attempt(&mut self, reason: impl Into<String>) {
-        self.attempts.push(AttemptRecord::new(reason));
-    }
-
-    /// Record a new failure attempt without a reason.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let mut entry = FallbackEntry::new("llm-70b");
-    /// entry.record_attempt_anonymous();
-    /// entry.record_attempt_anonymous(); // exceeds max_fail_count (default = 2)
-    /// assert!(entry.failed());
-    /// ```
-    pub fn record_attempt_anonymous(&mut self) {
-        self.attempts.push(AttemptRecord::anonymous());
-    }
-
-    /// Clear all recorded attempts, resetting [`failed()`](Self::failed)
-    /// to `false`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackEntry;
-    /// let mut entry = FallbackEntry::new("llm-70b");
-    /// entry.record_attempt("timeout");
-    /// entry.record_attempt("timeout"); // exceeds max_fail_count (default = 2)
-    /// assert!(entry.failed());
-    /// entry.clear_attempts();
-    /// assert!(!entry.failed());
-    /// ```
-    pub fn clear_attempts(&mut self) {
-        self.attempts.clear();
+    /// Clear all recorded attempts, resetting [`failed`](Self::failed) to `false`.
+    pub(crate) fn clear_attempts(&mut self) {
+        self.attempt_count = 0;
     }
 }
 
@@ -570,7 +288,7 @@ pub struct FallbackConfig {
 
     /// Per-model failure threshold before a fallback model is skipped. Defaults to `2`.
     ///
-    /// Applied to each [`FallbackEntry`] in the fallback chain: once a single
+    /// Applied to each fallback model in the chain: once a single
     /// model accumulates this many recorded attempts, it is taken out of
     /// rotation and [`FallbackManager::active_model`] advances to the next
     /// candidate.
@@ -611,33 +329,68 @@ impl Default for FallbackConfig {
 /// # Example
 ///
 /// ```rust
-/// use loopctl::fallback::{FallbackManager, FallbackConfig};
+/// use loopctl::fallback::{FallbackManager, FallbackConfig, FailureKind};
 /// use std::sync::Arc;
 /// use std::time::Duration;
 ///
-/// let mgr = Arc::new(FallbackManager::new(5, 3).with_config(&FallbackConfig::default()));
+/// let mgr = Arc::new(FallbackManager::new(5, 3).with_config(FallbackConfig::default()));
 ///
 /// // Simulate failures
-/// assert!(!mgr.record_model_failure()); // 1
-/// assert!(!mgr.record_model_failure()); // 2
-/// assert!(mgr.record_model_failure());  // 3 → circuit trips
+/// assert!(!mgr.record_failure(FailureKind::Transient)); // 1
+/// assert!(!mgr.record_failure(FailureKind::Transient)); // 2
+/// assert!(mgr.record_failure(FailureKind::Transient));  // 3 → circuit trips
 ///
 /// assert!(mgr.is_using_fallback());
 ///
 /// // ... later, after cooldown ...
 /// if mgr.should_try_resume_primary(Duration::from_secs(60)) {
 ///     mgr.transition_to_recovering();
-///     mgr.record_model_success();
-///     mgr.record_model_success(); // → back to Primary
+///     mgr.record_success();
+///     mgr.record_success(); // → back to Primary
 /// }
 /// ```
 /// Consolidated mutex-protected fallback state.
 ///
-/// All mutable fallback bookkeeping lives behind a single lock so that
-/// related fields are always observed together, preventing partial-state
-/// reads that could occur when acquiring separate locks sequentially.
-#[derive(Default)]
-struct FallbackInner {
+/// The complete mutable circuit-breaker state.
+///
+/// Every field that can change over the lifetime of a
+/// [`FallbackManager`] lives here, behind a single
+/// [`Mutex`](std::sync::Mutex). Holding the whole state under one lock
+/// makes each public method's read-modify-write atomic with respect to
+/// every other method: there is no window in which one caller can
+/// observe a half-applied transition or race a counter reset. Plain
+/// fields, no atomics — the lock is the only synchronization.
+struct BreakerState {
+    /// Current circuit-breaker phase.
+    ///
+    /// `Primary` at construction; transitions through `Fallback` and
+    /// `Recovering` as failures and recoveries are recorded.
+    state: FallbackState,
+
+    /// Consecutive failures on the current model.
+    ///
+    /// Incremented by the `record_*_failure` methods while in `Primary`;
+    /// reaching [`FallbackManager::fallback_threshold`] trips the
+    /// circuit. Reset to `0` on trip and on any success in `Primary`.
+    consecutive_failures: usize,
+
+    /// Consecutive successes on the primary accumulated during
+    /// `Recovering`.
+    ///
+    /// Incremented by [`record_success`](FallbackManager::record_success)
+    /// while in `Recovering`; reaching
+    /// [`primary_resume_threshold`](FallbackManager::primary_resume_threshold)
+    /// closes the circuit back to `Primary`. Reset on entry to
+    /// `Recovering` and on trip.
+    primary_success_count: usize,
+
+    /// Sticky flag recording whether fallback has ever been activated.
+    ///
+    /// `true` once the circuit has tripped at least once, and never
+    /// reset for the life of the manager. Lets observers tell "still on
+    /// primary, never failed" from "recovered back to primary".
+    fallback_activated: bool,
+
     /// Original model name, before any fallback was activated.
     ///
     /// Captured when the manager first trips so the recovering state
@@ -658,7 +411,7 @@ struct FallbackInner {
     /// Computed once and reused while the manager is in the fallback
     /// state, so callers asking "which model am I on now?" get an
     /// `O(1)` answer without re-scanning `fallback_models`. Recomputed
-    /// whenever the set of failed entries changes.
+    /// in place whenever the set of failed entries changes.
     active_fallback: Option<String>,
 
     /// Instant at which fallback was activated.
@@ -671,86 +424,44 @@ struct FallbackInner {
     fallback_switched_at: Option<Instant>,
 }
 
+impl Default for BreakerState {
+    fn default() -> Self {
+        Self {
+            state: FallbackState::Primary,
+            consecutive_failures: 0,
+            primary_success_count: 0,
+            fallback_activated: false,
+            original_model: None,
+            fallback_models: Vec::new(),
+            active_fallback: None,
+            fallback_switched_at: None,
+        }
+    }
+}
+
 /// Circuit breaker for API model fallback.
 ///
 /// `&FallbackManager` is `Send + Sync` and can be freely shared across
 /// threads (e.g. via `Arc<FallbackManager>`). No `&mut self` is needed
 /// for any operation.
 pub struct FallbackManager {
-    /// Number of consecutive failures on the primary that trips the
-    /// circuit.
+    /// Immutable configuration: thresholds and timeouts.
     ///
-    /// Once [`consecutive_failures`](Self::consecutive_failures) reaches
-    /// this value the manager transitions from `Primary` to `Fallback`.
-    /// Set at construction and immutable thereafter.
-    fallback_threshold: usize,
+    /// Single source of truth for the trip threshold, recovery
+    /// threshold, per-model max-fail count, and recovery timeout —
+    /// mirrors the [`DetectionManager::config`](crate::detection::DetectionManager::config)
+    /// pattern. Held by value, outside the state lock.
+    config: FallbackConfig,
 
-    /// Number of consecutive successes required on the primary during
-    /// recovery before transitioning back.
+    /// All mutable circuit-breaker state, behind a single lock.
     ///
-    /// Counts towards this via
-    /// [`record_model_success`](FallbackManager::record_model_success)
-    /// while in the `Recovering` state; reaching it transitions to
-    /// `Primary`. Set at construction and immutable thereafter.
-    primary_resume_threshold: usize,
-
-    /// Per-model max failure count seeded into new
-    /// [`FallbackEntry`] instances.
-    ///
-    /// When a fallback model is added without an explicit cap, it
-    /// inherits this value as its `max_fail_count`. Set at construction
-    /// and immutable thereafter.
-    default_max_fail_count: usize,
-
-    /// Consecutive API failure counter on the current model.
-    ///
-    /// Incremented by
-    /// [`record_model_failure`](FallbackManager::record_model_failure),
-    /// reset to zero on any success. Hitting `fallback_threshold` trips
-    /// the circuit. Atomic so it updates lock-free on the hot path.
-    consecutive_failures: AtomicUsize,
-
-    /// Sticky flag recording whether fallback has ever been activated.
-    ///
-    /// `true` once the circuit has tripped at least once, and never
-    /// reset for the life of the manager. Lets observers tell "still
-    /// on primary, never failed" from "recovered back to primary".
-    fallback_activated: AtomicBool,
-
-    /// Current circuit-breaker state, encoded as an atomic.
-    ///
-    /// `0` = `Primary`, `1` = `Fallback`, `2` = `Recovering` (see
-    /// [`FallbackState`]). Stored as `AtomicU8` for lock-free reads on
-    /// every request; mutated only on state transitions.
-    fallback_state: AtomicU8,
-
-    /// Consecutive successes on the primary accumulated during the
-    /// `Recovering` state.
-    ///
-    /// Incremented by
-    /// [`record_model_success`](FallbackManager::record_model_success);
-    /// reaching `primary_resume_threshold` transitions back to
-    /// `Primary` and resets this to zero. Atomic so it updates
-    /// lock-free.
-    primary_success_count: AtomicUsize,
-
-    /// Consolidated mutex-protected fallback state.
-    ///
-    /// Holding all related fields behind a single lock prevents partial-state
-    /// reads that could occur when acquiring the (formerly separate) locks one
-    /// at a time.
-    inner: Mutex<FallbackInner>,
-
-    /// How long to remain in fallback before attempting primary
-    /// recovery.
-    ///
-    /// Compared against the elapsed time since
-    /// [`fallback_switched_at`](FallbackInner::fallback_switched_at)
-    /// by
-    /// [`should_try_resume_primary`](FallbackManager::should_try_resume_primary)
-    /// to decide when a cooldown has elapsed. Set at construction and
-    /// immutable thereafter.
-    recovery_timeout: Duration,
+    /// Holding every changeable field ([`BreakerState`]) under one
+    /// [`Mutex`](std::sync::Mutex) makes each public method's
+    /// read-modify-write atomic relative to every other method — no
+    /// window for a partial-state read or a counter/transition race.
+    /// Immutable config ([`config`](Self::config)) stays outside the
+    /// lock.
+    state: Mutex<BreakerState>,
 }
 
 impl FallbackManager {
@@ -772,7 +483,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(5, 3);
     /// // Trip after 5 failures, resume after 3 consecutive successes
@@ -780,27 +491,25 @@ impl FallbackManager {
     #[must_use]
     pub fn new(fallback_threshold: usize, primary_resume_threshold: usize) -> Self {
         Self {
-            fallback_threshold,
-            primary_resume_threshold,
-            default_max_fail_count: 2,
-            consecutive_failures: AtomicUsize::new(0),
-            fallback_activated: AtomicBool::new(false),
-            fallback_state: AtomicU8::new(FallbackState::Primary as u8),
-            primary_success_count: AtomicUsize::new(0),
-            inner: Mutex::new(FallbackInner::default()),
-            recovery_timeout: Duration::from_mins(1),
+            config: FallbackConfig {
+                trip_threshold: fallback_threshold,
+                recovery_successes_needed: primary_resume_threshold,
+                ..FallbackConfig::default()
+            },
+            state: Mutex::new(BreakerState::default()),
         }
     }
 
     /// Apply configuration from a [`FallbackConfig`] struct.
     ///
-    /// Sets the failure threshold, recovery parameters, and per-model
-    /// max fail count from the config.
+    /// Replaces the manager's entire config. Prefer
+    /// [`new_with_config`](Self::new_with_config) for config-driven
+    /// construction; use this builder when chaining off [`new`](Self::new).
     ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::{FallbackManager, FallbackConfig};
+    /// use loopctl::fallback::{FallbackManager, FallbackConfig, FailureKind};
     /// use std::time::Duration;
     ///
     /// let config = FallbackConfig {
@@ -809,45 +518,55 @@ impl FallbackManager {
     ///     recovery_successes_needed: 3,
     ///     max_fail_count: 2,
     /// };
-    /// let mgr = FallbackManager::new(5, 3).with_config(&config);
+    /// let mgr = FallbackManager::new(5, 3).with_config(config);
     /// ```
     #[must_use]
-    pub fn with_config(mut self, config: &FallbackConfig) -> Self {
-        self.fallback_threshold = config.trip_threshold;
-        self.primary_resume_threshold = config.recovery_successes_needed;
-        self.default_max_fail_count = config.max_fail_count;
-        self.recovery_timeout = config.recovery_timeout;
+    pub fn with_config(mut self, config: FallbackConfig) -> Self {
+        self.config = config;
         self
     }
 
-    /// Set the recovery timeout (builder style).
+    /// The immutable [`FallbackConfig`] this manager was constructed with.
     ///
-    /// This is how long the manager stays in fallback before it is willing
-    /// to probe the primary model again via
-    /// [`should_try_resume_primary`](Self::should_try_resume_primary).
+    /// Read thresholds and timeouts (trip threshold, recovery timeout,
+    /// per-model max-fail count, recovery successes needed) from here
+    /// rather than from duplicated accessors.
     ///
-    /// Mirrors [`FallbackConfig::recovery_timeout`] for cases where a full
-    /// [`with_config`](Self::with_config) is not desired.
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::fallback::{FallbackManager, FallbackConfig};
+    /// use std::time::Duration;
+    ///
+    /// let cfg = FallbackConfig { trip_threshold: 5, ..FallbackConfig::default() };
+    /// let mgr = FallbackManager::new_with_config(cfg);
+    /// assert_eq!(mgr.config().trip_threshold, 5);
+    /// ```
     #[must_use]
-    pub fn with_recovery_timeout(mut self, recovery_timeout: Duration) -> Self {
-        self.recovery_timeout = recovery_timeout;
-        self
+    pub fn config(&self) -> &FallbackConfig {
+        &self.config
     }
 
-    /// Configured recovery timeout.
+    /// Create a new manager directly from a [`FallbackConfig`].
     ///
-    /// Returns the duration the manager will remain in fallback before it
-    /// is willing to probe the primary model again. Set via
-    /// [`with_config`](Self::with_config) (from
-    /// [`FallbackConfig::recovery_timeout`]) or
-    /// [`with_recovery_timeout`](Self::with_recovery_timeout).
+    /// The config-driven counterpart of [`new`](Self::new): build the
+    /// whole config struct (typically from a file or env) and construct
+    /// in one step instead of overriding fields after the fact.
     ///
-    /// Pass this to
-    /// [`should_try_resume_primary`](Self::should_try_resume_primary) to
-    /// honour the configured timeout without hard-coding a value.
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::fallback::{FallbackManager, FallbackConfig};
+    ///
+    /// let cfg = FallbackConfig::default();
+    /// let mgr = FallbackManager::new_with_config(cfg);
+    /// ```
     #[must_use]
-    pub fn recovery_timeout(&self) -> Duration {
-        self.recovery_timeout
+    pub fn new_with_config(config: FallbackConfig) -> Self {
+        Self {
+            config,
+            state: Mutex::new(BreakerState::default()),
+        }
     }
 
     /// Create with fallback already activated.
@@ -872,7 +591,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new_with_fallback("llm-70b".into(), 3);
     /// assert!(mgr.is_using_fallback());
@@ -881,14 +600,10 @@ impl FallbackManager {
     #[must_use]
     pub fn new_with_fallback(original_model: String, fallback_threshold: usize) -> Self {
         let mgr = Self::new(fallback_threshold, 2);
-        if let Ok(mut inner) = mgr.inner.lock() {
-            inner.original_model = Some(original_model);
-            inner.fallback_switched_at = Some(Instant::now());
+        if let Ok(mut state) = mgr.state.lock() {
+            state.original_model = Some(original_model);
+            Self::transition_to_fallback_impl(&mut state);
         }
-        mgr.fallback_activated.store(true, Ordering::Relaxed);
-        mgr.consecutive_failures.store(0, Ordering::Relaxed);
-        mgr.fallback_state
-            .store(FallbackState::Fallback as u8, Ordering::Relaxed);
         mgr
     }
 
@@ -902,7 +617,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::for_model("llm-70b");
     /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
@@ -910,8 +625,8 @@ impl FallbackManager {
     /// ```
     pub fn for_model(primary_model: impl Into<String>) -> Self {
         let mgr = Self::new(3, 2);
-        if let Ok(mut inner) = mgr.inner.lock() {
-            inner.original_model = Some(primary_model.into());
+        if let Ok(mut state) = mgr.state.lock() {
+            state.original_model = Some(primary_model.into());
         }
         mgr
     }
@@ -921,13 +636,15 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::{FallbackManager, FallbackState};
+    /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// assert_eq!(mgr.state(), FallbackState::Primary);
     /// ```
     pub fn state(&self) -> FallbackState {
-        FallbackState::from(self.fallback_state.load(Ordering::Relaxed))
+        self.state
+            .lock()
+            .map_or(FallbackState::Primary, |s| s.state)
     }
 
     /// Check if we're currently using a fallback model.
@@ -941,7 +658,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::{FallbackManager, FallbackState};
+    /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
     /// assert!(!mgr.is_using_fallback());
     /// ```
@@ -960,12 +677,12 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
     /// assert!(!mgr.is_fallback_active());
     /// ```
     pub fn is_fallback_active(&self) -> bool {
-        self.fallback_activated.load(Ordering::Relaxed)
+        self.state.lock().is_ok_and(|s| s.fallback_activated)
     }
 
     /// Get the number of consecutive failures.
@@ -976,14 +693,14 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
     /// assert_eq!(mgr.consecutive_failures(), 0);
-    /// mgr.record_model_failure();
+    /// mgr.record_failure(FailureKind::Transient);
     /// assert_eq!(mgr.consecutive_failures(), 1);
     /// ```
     pub fn consecutive_failures(&self) -> usize {
-        self.consecutive_failures.load(Ordering::Relaxed)
+        self.state.lock().map_or(0, |s| s.consecutive_failures)
     }
 
     /// Get the original model name (before fallback).
@@ -997,15 +714,15 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::for_model("llm-70b");
     /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
     /// ```
     pub fn original_model(&self) -> Option<String> {
-        self.inner
+        self.state
             .lock()
             .ok()
-            .and_then(|i| i.original_model.clone())
+            .and_then(|s| s.original_model.clone())
     }
 
     /// Set the original model name.
@@ -1016,15 +733,15 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
     /// assert_eq!(mgr.original_model(), None);
     /// mgr.set_original_model("llm-70b".into());
     /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
     /// ```
     pub fn set_original_model(&self, model: String) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.original_model = Some(model);
+        if let Ok(mut state) = self.state.lock() {
+            state.original_model = Some(model);
         }
     }
 
@@ -1040,14 +757,14 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// use std::time::Duration;
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// assert!(mgr.fallback_switched_at().is_none());
     /// ```
     pub fn fallback_switched_at(&self) -> Option<Instant> {
-        self.inner.lock().ok().and_then(|i| i.fallback_switched_at)
+        self.state.lock().ok().and_then(|s| s.fallback_switched_at)
     }
 
     /// Get the model that should be used for the next request.
@@ -1071,14 +788,20 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::for_model("llm-70b");
     /// assert_eq!(mgr.active_model(), Some("llm-70b".to_string()));
     /// ```
     pub fn active_model(&self) -> Option<String> {
-        match self.state() {
-            FallbackState::Primary | FallbackState::Recovering => self.original_model(),
-            FallbackState::Fallback => self.fallback_model().or_else(|| self.original_model()),
+        let Ok(state) = self.state.lock() else {
+            return None;
+        };
+        match state.state {
+            FallbackState::Primary | FallbackState::Recovering => state.original_model.clone(),
+            FallbackState::Fallback => state
+                .active_fallback
+                .clone()
+                .or_else(|| state.original_model.clone()),
         }
     }
 
@@ -1097,7 +820,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::{FallbackManager, FallbackState};
+    /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     ///
     /// let mgr = FallbackManager::for_model("llm-1");
     /// mgr.add_fallback_model("llm-2");
@@ -1108,21 +831,21 @@ impl FallbackManager {
     /// assert_eq!(mgr.fallback_models(), vec!["llm-4"]);
     ///
     /// // Simulate failures until circuit trips
-    /// mgr.record_model_failure();
-    /// mgr.record_model_failure();
-    /// mgr.record_model_failure(); // trips to Fallback
+    /// mgr.record_failure(FailureKind::Transient);
+    /// mgr.record_failure(FailureKind::Transient);
+    /// mgr.record_failure(FailureKind::Transient); // trips to Fallback
     ///
     /// assert_eq!(mgr.state(), FallbackState::Fallback);
     /// assert_eq!(mgr.active_model(), Some("llm-4".to_string()));
     /// ```
     pub fn set_fallback_model(&self, model: impl Into<String>) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.fallback_models.clear();
-            inner
+        if let Ok(mut state) = self.state.lock() {
+            state.fallback_models.clear();
+            state
                 .fallback_models
-                .push(FallbackEntry::new(model).with_max_fail_count(self.default_max_fail_count));
+                .push(FallbackEntry::new(model).with_max_fail_count(self.config.max_fail_count));
+            Self::recompute_active_fallback_impl(&mut state);
         }
-        self.recompute_active_fallback();
     }
 
     /// Get the first fallback model, if any are configured.
@@ -1134,7 +857,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// assert!(mgr.fallback_model().is_none());
@@ -1144,10 +867,10 @@ impl FallbackManager {
     /// assert_eq!(mgr.fallback_model(), Some("llm-70b".to_string())); // first in chain
     /// ```
     pub fn fallback_model(&self) -> Option<String> {
-        self.inner
+        self.state
             .lock()
             .ok()
-            .and_then(|i| i.active_fallback.clone())
+            .and_then(|s| s.active_fallback.clone())
     }
 
     /// Get the full fallback model chain.
@@ -1158,7 +881,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.add_fallback_model("llm-70b");
@@ -1169,10 +892,10 @@ impl FallbackManager {
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b", "llm-32b"]);
     /// ```
     pub fn fallback_models(&self) -> Vec<String> {
-        self.inner
+        self.state
             .lock()
             .ok()
-            .map(|i| i.fallback_models.iter().map(|e| e.name.clone()).collect())
+            .map(|s| s.fallback_models.iter().map(|e| e.name.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -1189,7 +912,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.add_fallback_model("llm-70b");
@@ -1199,12 +922,12 @@ impl FallbackManager {
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b"]);
     /// ```
     pub fn add_fallback_model(&self, model: impl Into<String>) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner
+        if let Ok(mut state) = self.state.lock() {
+            state
                 .fallback_models
-                .push(FallbackEntry::new(model).with_max_fail_count(self.default_max_fail_count));
+                .push(FallbackEntry::new(model).with_max_fail_count(self.config.max_fail_count));
+            Self::recompute_active_fallback_impl(&mut state);
         }
-        self.recompute_active_fallback();
     }
 
     /// Insert a fallback model at a specific position in the chain.
@@ -1220,7 +943,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.add_fallback_model("llm-70b");
@@ -1231,15 +954,15 @@ impl FallbackManager {
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b", "llm-32b"]);
     /// ```
     pub fn insert_fallback_model(&self, index: usize, model: impl Into<String>) {
-        if let Ok(mut inner) = self.inner.lock() {
-            let entry = FallbackEntry::new(model).with_max_fail_count(self.default_max_fail_count);
-            if index >= inner.fallback_models.len() {
-                inner.fallback_models.push(entry);
+        if let Ok(mut state) = self.state.lock() {
+            let entry = FallbackEntry::new(model).with_max_fail_count(self.config.max_fail_count);
+            if index >= state.fallback_models.len() {
+                state.fallback_models.push(entry);
             } else {
-                inner.fallback_models.insert(index, entry);
+                state.fallback_models.insert(index, entry);
             }
+            Self::recompute_active_fallback_impl(&mut state);
         }
-        self.recompute_active_fallback();
     }
 
     /// Remove a fallback model by name.
@@ -1251,7 +974,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.add_fallback_model("llm-70b");
@@ -1264,18 +987,15 @@ impl FallbackManager {
     /// assert_eq!(chain, vec!["llm-120b"]);
     /// ```
     pub fn remove_fallback_model(&self, model: &str) -> bool {
-        let removed = if let Ok(mut inner) = self.inner.lock() {
-            if let Some(pos) = inner.fallback_models.iter().position(|x| x.name == model) {
-                inner.fallback_models.remove(pos);
-                true
-            } else {
-                false
+        let mut removed = false;
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(pos) = state.fallback_models.iter().position(|x| x.name == model) {
+                state.fallback_models.remove(pos);
+                removed = true;
             }
-        } else {
-            false
-        };
-        if removed {
-            self.recompute_active_fallback();
+            if removed {
+                Self::recompute_active_fallback_impl(&mut state);
+            }
         }
         removed
     }
@@ -1292,7 +1012,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.set_fallback_models(vec!["llm-70b".into(), "llm-120b".into(), "llm-32b".into()]);
@@ -1301,14 +1021,14 @@ impl FallbackManager {
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b", "llm-32b"]);
     /// ```
     pub fn set_fallback_models(&self, models: Vec<String>) {
-        let max_fc = self.default_max_fail_count;
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.fallback_models = models
+        let max_fc = self.config.max_fail_count;
+        if let Ok(mut state) = self.state.lock() {
+            state.fallback_models = models
                 .into_iter()
                 .map(|name| FallbackEntry::new(name).with_max_fail_count(max_fc))
                 .collect();
+            Self::recompute_active_fallback_impl(&mut state);
         }
-        self.recompute_active_fallback();
     }
 
     /// Mark a fallback model as failed by name.
@@ -1322,7 +1042,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.add_fallback_model("llm-2");
@@ -1338,18 +1058,15 @@ impl FallbackManager {
     /// assert_eq!(mgr.fallback_model(), Some("llm-3".to_string()));
     /// ```
     pub fn mark_fallback_failed(&self, model: &str) -> bool {
-        let found = if let Ok(mut inner) = self.inner.lock() {
-            if let Some(entry) = inner.fallback_models.iter_mut().find(|e| e.name == model) {
-                entry.record_attempt("marked_failed");
-                true
-            } else {
-                false
+        let mut found = false;
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(entry) = state.fallback_models.iter_mut().find(|e| e.name == model) {
+                entry.record_attempt();
+                found = true;
             }
-        } else {
-            false
-        };
-        if found {
-            self.recompute_active_fallback();
+            if found {
+                Self::recompute_active_fallback_impl(&mut state);
+            }
         }
         found
     }
@@ -1363,7 +1080,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.add_fallback_model("llm-2");
@@ -1375,18 +1092,15 @@ impl FallbackManager {
     /// assert!(mgr.failed_fallbacks().is_empty());
     /// ```
     pub fn clear_fallback_failed(&self, model: &str) -> bool {
-        let found = if let Ok(mut inner) = self.inner.lock() {
-            if let Some(entry) = inner.fallback_models.iter_mut().find(|e| e.name == model) {
+        let mut found = false;
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(entry) = state.fallback_models.iter_mut().find(|e| e.name == model) {
                 entry.clear_attempts();
-                true
-            } else {
-                false
+                found = true;
             }
-        } else {
-            false
-        };
-        if found {
-            self.recompute_active_fallback();
+            if found {
+                Self::recompute_active_fallback_impl(&mut state);
+            }
         }
         found
     }
@@ -1399,7 +1113,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.add_fallback_model("llm-2");
@@ -1414,12 +1128,12 @@ impl FallbackManager {
     /// assert!(mgr.failed_fallbacks().is_empty());
     /// ```
     pub fn clear_all_fallback_failed(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            for entry in &mut inner.fallback_models {
+        if let Ok(mut state) = self.state.lock() {
+            for entry in &mut state.fallback_models {
                 entry.clear_attempts();
             }
+            Self::recompute_active_fallback_impl(&mut state);
         }
-        self.recompute_active_fallback();
     }
 
     /// Get the names of all fallback models marked as failed.
@@ -1430,7 +1144,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.add_fallback_model("llm-2");
@@ -1442,11 +1156,11 @@ impl FallbackManager {
     /// assert_eq!(failed, vec!["llm-3"]);
     /// ```
     pub fn failed_fallbacks(&self) -> Vec<String> {
-        self.inner
+        self.state
             .lock()
             .ok()
-            .map(|i| {
-                i.fallback_models
+            .map(|s| {
+                s.fallback_models
                     .iter()
                     .filter(|e| e.failed())
                     .map(|e| e.name.clone())
@@ -1463,7 +1177,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.add_fallback_model("llm-2");
@@ -1475,11 +1189,11 @@ impl FallbackManager {
     /// assert_eq!(available, vec!["llm-2"]);
     /// ```
     pub fn available_fallbacks(&self) -> Vec<String> {
-        self.inner
+        self.state
             .lock()
             .ok()
-            .map(|i| {
-                i.fallback_models
+            .map(|s| {
+                s.fallback_models
                     .iter()
                     .filter(|e| !e.failed())
                     .map(|e| e.name.clone())
@@ -1488,43 +1202,13 @@ impl FallbackManager {
             .unwrap_or_default()
     }
 
-    /// Look up a fallback entry by name.
+    /// Set the `available` flag on a fallback model.
     ///
-    /// Returns a cloned [`FallbackEntry`] for the first model in the chain
-    /// whose name matches, or `None` if the name is not present. Use this
-    /// to inspect a specific model's failure status without iterating the
-    /// full chain.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::FallbackManager;
-    ///
-    /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.add_fallback_model("llm-70b");
-    /// mgr.add_fallback_model("llm-120b");
-    ///
-    /// let entry = mgr.fallback_entry("llm-70b");
-    /// assert!(entry.is_some());
-    /// let e = entry.unwrap();
-    /// assert_eq!(e.name(), "llm-70b");
-    /// assert!(!e.failed()); // not failed yet
-    ///
-    /// assert!(mgr.fallback_entry("nonexistent").is_none());
-    /// ```
-    pub fn fallback_entry(&self, name: &str) -> Option<FallbackEntry> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|i| i.fallback_models.iter().find(|e| e.name == name).cloned())
-    }
-
-    /// Set the [`available`](FallbackEntry::available) flag on a fallback model.
-    ///
-    /// When set to `false`, the entry is considered [`failed`](FallbackEntry::failed)
-    /// regardless of its attempt count, and [`active_model`](Self::active_model)
-    /// will skip it. When set back to `true`, the entry becomes eligible again
-    /// (unless its attempt count has also reached [`FallbackEntry::max_fail_count`]).
+    /// When set to `false`, the model is considered failed regardless of
+    /// its attempt count, and [`active_model`](Self::active_model) will
+    /// skip it. When set back to `true`, the model becomes eligible again
+    /// (unless its attempt count has also reached the per-model
+    /// `max_fail_count`).
     ///
     /// Returns `true` if the model was found in the chain and updated,
     /// `false` if no model with that name exists.
@@ -1532,7 +1216,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.add_fallback_model("llm-2");
@@ -1549,18 +1233,15 @@ impl FallbackManager {
     /// assert_eq!(mgr.fallback_model(), Some("llm-2".to_string()));
     /// ```
     pub fn set_fallback_available(&self, model: &str, available: bool) -> bool {
-        let found = if let Ok(mut inner) = self.inner.lock() {
-            if let Some(entry) = inner.fallback_models.iter_mut().find(|e| e.name == model) {
+        let mut found = false;
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(entry) = state.fallback_models.iter_mut().find(|e| e.name == model) {
                 entry.set_available(available);
-                true
-            } else {
-                false
+                found = true;
             }
-        } else {
-            false
-        };
-        if found {
-            self.recompute_active_fallback();
+            if found {
+                Self::recompute_active_fallback_impl(&mut state);
+            }
         }
         found
     }
@@ -1583,48 +1264,96 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
-    /// assert!(!mgr.record_api_failure()); // 1
-    /// assert!(!mgr.record_api_failure()); // 2
-    /// assert!(mgr.record_api_failure());  // 3 — threshold reached, now activated
-    /// assert!(!mgr.record_api_failure()); // 4 — already activated, no re-trip
+    /// assert!(!mgr.record_failure(FailureKind::Transient)); // 1
+    /// assert!(!mgr.record_failure(FailureKind::Transient)); // 2
+    /// assert!(mgr.record_failure(FailureKind::Transient));  // 3 — threshold reached, now activated
+    /// assert!(!mgr.record_failure(FailureKind::Transient)); // 4 — already activated, no re-trip
     /// ```
-    pub fn record_api_failure(&self) -> bool {
-        match self.state() {
+    /// Record a failure on the current model and trip the circuit if the
+    /// threshold is reached.
+    ///
+    /// Called by the agent loop each time an LLM request fails. The
+    /// effect depends on the current circuit state and the failure
+    /// [`kind`](FailureKind):
+    ///
+    /// - **[`Primary`](FallbackState::Primary)**: Increments the failure
+    ///   counter. If it reaches
+    ///   [`fallback_threshold`](Self::new), transitions to
+    ///   [`Fallback`](FallbackState::Fallback) and returns `true`.
+    /// - **[`Fallback`](FallbackState::Fallback)**: Logs a warning — the
+    ///   fallback model itself is failing. Consider calling
+    ///   [`mark_fallback_failed`](Self::mark_fallback_failed) to skip it.
+    ///   Returns `false`; the counter is unchanged.
+    /// - **[`Recovering`](FallbackState::Recovering)**: A
+    ///   [`FailureKind::RateLimit`] re-trips the circuit to
+    ///   [`Fallback`](FallbackState::Fallback) — the primary is still
+    ///   rate-limited, so probing it further is pointless. A
+    ///   [`FailureKind::Transient`] error leaves the half-open probe in
+    ///   place. Returns `false` either way.
+    ///
+    /// # Returns
+    ///
+    /// `true` only when this call tripped the circuit from `Primary` to
+    /// `Fallback`; `false` otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
+    /// let mgr = FallbackManager::new(3, 2);
+    /// assert!(!mgr.record_failure(FailureKind::Transient)); // 1
+    /// assert!(!mgr.record_failure(FailureKind::Transient)); // 2
+    /// assert!(mgr.record_failure(FailureKind::Transient));  // 3 → trips to Fallback
+    /// assert_eq!(mgr.state(), FallbackState::Fallback);
+    /// ```
+    pub fn record_failure(&self, kind: FailureKind) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        match state.state {
             FallbackState::Primary => {
-                let failures = self
-                    .consecutive_failures
-                    .fetch_add(1, Ordering::Relaxed)
-                    .saturating_add(1);
-                if failures >= self.fallback_threshold {
+                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                if state.consecutive_failures >= self.config.trip_threshold {
                     warn!(
-                        consecutive_failures = failures,
-                        threshold = self.fallback_threshold,
+                        consecutive_failures = state.consecutive_failures,
+                        threshold = self.config.trip_threshold,
                         "Fallback threshold reached"
                     );
-                    self.transition_to_fallback();
-                    return true;
+                    Self::transition_to_fallback_impl(&mut state);
+                    true
+                } else {
+                    false
                 }
-                false
             }
-            FallbackState::Fallback | FallbackState::Recovering => {
-                let failures = self.consecutive_failures.load(Ordering::Relaxed);
+            FallbackState::Fallback => {
+                let fb_name = state
+                    .active_fallback
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
                 warn!(
-                    consecutive_failures = failures,
-                    "API failure recorded while not in Primary state; counter unchanged"
+                    "Fallback model \"{fb_name}\" also experiencing failures; consider calling mark_fallback_failed(\"{fb_name}\") to skip it"
                 );
                 false
             }
+            FallbackState::Recovering => match kind {
+                FailureKind::RateLimit => {
+                    warn!(
+                        "Primary model rate-limited during recovery test, re-tripping to fallback"
+                    );
+                    Self::transition_to_fallback_impl(&mut state);
+                    false
+                }
+                FailureKind::Transient => {
+                    warn!(
+                        consecutive_failures = state.consecutive_failures,
+                        "Transient failure recorded during recovery; staying half-open"
+                    );
+                    false
+                }
+            },
         }
-    }
-
-    /// Alias for [`record_api_failure`](Self::record_api_failure) — framework-style name.
-    ///
-    /// Provided for callers that prefer the shorter `record_failure` name.
-    /// Delegates directly to [`record_api_failure`](Self::record_api_failure).
-    pub fn record_failure(&self) -> bool {
-        self.record_api_failure()
     }
 
     /// Reset the consecutive failure counter.
@@ -1637,16 +1366,18 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.record_api_failure();
-    /// mgr.record_api_failure();
+    /// mgr.record_failure(FailureKind::Transient);
+    /// mgr.record_failure(FailureKind::Transient);
     /// assert_eq!(mgr.consecutive_failures(), 2);
     /// mgr.reset_failure_counter();
     /// assert_eq!(mgr.consecutive_failures(), 0);
     /// ```
     pub fn reset_failure_counter(&self) {
-        self.consecutive_failures.store(0, Ordering::Relaxed);
+        if let Ok(mut state) = self.state.lock() {
+            state.consecutive_failures = 0;
+        }
     }
 
     /// Record a success on the current model.
@@ -1666,104 +1397,32 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.record_api_failure();
+    /// mgr.record_failure(FailureKind::Transient);
     /// assert_eq!(mgr.consecutive_failures(), 1);
-    /// mgr.record_model_success(); // resets failures to 0
+    /// mgr.record_success(); // resets failures to 0
     /// assert_eq!(mgr.consecutive_failures(), 0);
     /// ```
-    pub fn record_model_success(&self) {
-        match self.state() {
+    pub fn record_success(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        match state.state {
             FallbackState::Primary => {
-                self.consecutive_failures.store(0, Ordering::Relaxed);
+                state.consecutive_failures = 0;
             }
-            FallbackState::Fallback => {
-                // Success on fallback, stay in fallback
-            }
+            FallbackState::Fallback => {}
             FallbackState::Recovering => {
-                let successes = self
-                    .primary_success_count
-                    .fetch_add(1, Ordering::Relaxed)
-                    .saturating_add(1);
+                state.primary_success_count = state.primary_success_count.saturating_add(1);
                 debug!(
-                    successes,
-                    threshold = self.primary_resume_threshold,
+                    successes = state.primary_success_count,
+                    threshold = self.config.recovery_successes_needed,
                     "Primary model success during recovery test"
                 );
-                if successes >= self.primary_resume_threshold {
-                    self.transition_to_primary();
+                if state.primary_success_count >= self.config.recovery_successes_needed {
+                    Self::transition_to_primary_impl(&mut state);
                 }
-            }
-        }
-    }
-
-    /// Alias for [`record_model_success`](Self::record_model_success) — framework-style name.
-    ///
-    /// Provided for callers that prefer the shorter `record_success` name.
-    /// Delegates directly to [`record_model_success`](Self::record_model_success).
-    pub fn record_success(&self) {
-        self.record_model_success();
-    }
-
-    /// Record a failure on the current model.
-    ///
-    /// Called by the agent loop when an LLM request fails. The effect
-    /// depends on the current circuit state:
-    ///
-    /// - **[`Primary`](FallbackState::Primary)**: Increments the failure
-    ///   counter. If the count reaches the threshold, transitions to
-    ///   [`Fallback`](FallbackState::Fallback) via
-    ///   [`transition_to_fallback`](Self::transition_to_fallback).
-    /// - **[`Fallback`](FallbackState::Fallback)**: Logs a warning —
-    ///   the fallback model itself is experiencing failures. The circuit
-    ///   stays open.
-    /// - **[`Recovering`](FallbackState::Recovering)**: Immediately
-    ///   reopens the circuit back to [`Fallback`](FallbackState::Fallback)
-    ///   — the primary is not yet healthy.
-    ///
-    /// # Returns
-    ///
-    /// `true` if this specific failure caused the circuit to trip from
-    /// `Primary` to `Fallback`; `false` otherwise.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::{FallbackManager, FallbackState};
-    ///
-    /// let mgr = FallbackManager::new(3, 2);
-    /// assert!(!mgr.record_model_failure()); // 1
-    /// assert!(!mgr.record_model_failure()); // 2
-    /// assert!(mgr.record_model_failure());  // 3 → trips to Fallback
-    /// assert_eq!(mgr.state(), FallbackState::Fallback);
-    /// ```
-    pub fn record_model_failure(&self) -> bool {
-        match self.state() {
-            FallbackState::Primary => {
-                let failures = self
-                    .consecutive_failures
-                    .fetch_add(1, Ordering::Relaxed)
-                    .saturating_add(1);
-                if failures >= self.fallback_threshold {
-                    self.transition_to_fallback();
-                    return true;
-                }
-                false
-            }
-            FallbackState::Fallback => {
-                let fb_name = self
-                    .fallback_model()
-                    .unwrap_or_else(|| "unknown".to_string());
-                warn!(
-                    "Fallback model \"{fb_name}\" also experiencing failures; consider calling mark_fallback_failed(\"{fb_name}\") to skip it"
-                );
-                false
-            }
-            FallbackState::Recovering => {
-                warn!("Primary model failed during recovery test, staying on fallback");
-                self.transition_to_fallback();
-                false
             }
         }
     }
@@ -1791,7 +1450,7 @@ impl FallbackManager {
     ///
     /// ```rust
     /// use std::time::Duration;
-    /// use loopctl::fallback::FallbackManager;
+    /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// // Not in fallback state → false
@@ -1813,7 +1472,7 @@ impl FallbackManager {
     /// Moves the circuit breaker to [`FallbackState::Fallback`], records
     /// the current time as [`fallback_switched_at`](Self::fallback_switched_at),
     /// and resets the recovery success counter. Called automatically by
-    /// [`record_model_failure`](Self::record_model_failure) when the
+    /// [`record_failure`](Self::record_failure) when the
     /// failure threshold is reached, or manually when the circuit needs
     /// to trip immediately.
     ///
@@ -1823,20 +1482,29 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::{FallbackManager, FallbackState};
+    /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.transition_to_fallback();
     /// assert_eq!(mgr.state(), FallbackState::Fallback);
     /// ```
     pub fn transition_to_fallback(&self) {
-        self.fallback_state
-            .store(FallbackState::Fallback as u8, Ordering::Relaxed);
-        self.fallback_activated.store(true, Ordering::Relaxed);
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.fallback_switched_at = Some(Instant::now());
+        if let Ok(mut state) = self.state.lock() {
+            Self::transition_to_fallback_impl(&mut state);
         }
-        self.primary_success_count.store(0, Ordering::Relaxed);
+    }
+
+    /// [`transition_to_fallback`](Self::transition_to_fallback) assuming
+    /// the caller already holds the state lock.
+    ///
+    /// Called from the `record_*` methods so the trip runs while their
+    /// guard is held, making the read-decide-transition atomic with
+    /// respect to other callers.
+    fn transition_to_fallback_impl(state: &mut BreakerState) {
+        state.state = FallbackState::Fallback;
+        state.fallback_activated = true;
+        state.fallback_switched_at = Some(Instant::now());
+        state.primary_success_count = 0;
         info!("Circuit breaker: transitioned to Fallback state");
     }
 
@@ -1847,13 +1515,13 @@ impl FallbackManager {
     /// counter. Called by the agent loop after
     /// [`should_try_resume_primary`](Self::should_try_resume_primary)
     /// returns `true`. Subsequent calls to
-    /// [`record_model_success`](Self::record_model_success) will count
+    /// [`record_success`](Self::record_success) will count
     /// toward the recovery threshold.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::{FallbackManager, FallbackState};
+    /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.transition_to_fallback();
@@ -1861,9 +1529,16 @@ impl FallbackManager {
     /// assert_eq!(mgr.state(), FallbackState::Recovering);
     /// ```
     pub fn transition_to_recovering(&self) {
-        self.fallback_state
-            .store(FallbackState::Recovering as u8, Ordering::Relaxed);
-        self.primary_success_count.store(0, Ordering::Relaxed);
+        if let Ok(mut state) = self.state.lock() {
+            Self::transition_to_recovering_impl(&mut state);
+        }
+    }
+
+    /// [`transition_to_recovering`](Self::transition_to_recovering)
+    /// assuming the caller already holds the state lock.
+    fn transition_to_recovering_impl(state: &mut BreakerState) {
+        state.state = FallbackState::Recovering;
+        state.primary_success_count = 0;
         info!("Circuit breaker: transitioned to Recovering state (testing primary)");
     }
 
@@ -1873,7 +1548,7 @@ impl FallbackManager {
     /// the fallback timestamp, and resets all counters (failures,
     /// successes, and the `fallback_activated` flag). Called
     /// automatically when the recovery success threshold is reached
-    /// inside [`record_model_success`](Self::record_model_success), or
+    /// inside [`record_success`](Self::record_success), or
     /// manually to force an immediate return to primary.
     ///
     /// After this call, [`is_using_fallback`](Self::is_using_fallback)
@@ -1882,7 +1557,7 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::{FallbackManager, FallbackState};
+    /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// mgr.transition_to_fallback();
@@ -1891,15 +1566,28 @@ impl FallbackManager {
     /// assert!(!mgr.is_using_fallback());
     /// ```
     pub fn transition_to_primary(&self) {
-        self.fallback_state
-            .store(FallbackState::Primary as u8, Ordering::Relaxed);
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.fallback_switched_at = None;
+        if let Ok(mut state) = self.state.lock() {
+            Self::transition_to_primary_impl(&mut state);
         }
-        self.primary_success_count.store(0, Ordering::Relaxed);
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        self.fallback_activated.store(false, Ordering::Relaxed);
-        self.clear_all_fallback_failed();
+    }
+
+    /// [`transition_to_primary`](Self::transition_to_primary) assuming
+    /// the caller already holds the state lock.
+    ///
+    /// Inlines the [`clear_all_fallback_failed`](Self::clear_all_fallback_failed)
+    /// and active-fallback recompute against the held guard, because the
+    /// public versions acquire the same lock themselves and
+    /// `std::sync::Mutex` is not reentrant.
+    fn transition_to_primary_impl(state: &mut BreakerState) {
+        state.state = FallbackState::Primary;
+        state.fallback_switched_at = None;
+        state.primary_success_count = 0;
+        state.consecutive_failures = 0;
+        state.fallback_activated = false;
+        for entry in &mut state.fallback_models {
+            entry.clear_attempts();
+        }
+        Self::recompute_active_fallback_impl(state);
         info!("Circuit breaker: transitioned to Primary state (primary model recovered)");
     }
 
@@ -1917,10 +1605,10 @@ impl FallbackManager {
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::fallback::{FallbackManager, FallbackState};
+    /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// for _ in 0..3 { mgr.record_model_failure(); }
+    /// for _ in 0..3 { mgr.record_failure(FailureKind::Transient); }
     /// assert_eq!(mgr.state(), FallbackState::Fallback);
     ///
     /// mgr.reset();
@@ -1929,32 +1617,25 @@ impl FallbackManager {
     /// assert_eq!(mgr.consecutive_failures(), 0);
     /// ```
     pub fn reset(&self) {
-        self.fallback_state
-            .store(FallbackState::Primary as u8, Ordering::Relaxed);
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        self.primary_success_count.store(0, Ordering::Relaxed);
-        self.fallback_activated.store(false, Ordering::Relaxed);
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.fallback_switched_at = None;
+        if let Ok(mut state) = self.state.lock() {
+            Self::transition_to_primary_impl(&mut state);
         }
-        self.clear_all_fallback_failed();
     }
 
-    /// Recompute the cached [`active_fallback`](Self::active_fallback) from
-    /// the current fallback chain.
+    /// Recompute the cached [`active_fallback`](BreakerState::active_fallback)
+    /// from the current fallback chain, in place against a held guard.
     ///
-    /// [`fallback_models`]: Self::fallback_models
-    /// [`active_fallback`]: Self::active_fallback
-    fn recompute_active_fallback(&self) {
-        let active = self.inner.lock().ok().and_then(|i| {
-            i.fallback_models
-                .iter()
-                .find(|e| !e.failed())
-                .map(|e| e.name.clone())
-        });
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.active_fallback = active;
-        }
+    /// Walks [`fallback_models`](BreakerState::fallback_models) for the
+    /// first non-failed entry and stores its name, so
+    /// [`fallback_model`](Self::fallback_model) stays `O(1)`. Called by
+    /// every method that mutates the chain or a model's failed flag, and
+    /// by [`transition_to_primary_impl`](Self::transition_to_primary_impl).
+    fn recompute_active_fallback_impl(state: &mut BreakerState) {
+        state.active_fallback = state
+            .fallback_models
+            .iter()
+            .find(|e| !e.failed())
+            .map(|e| e.name.clone());
     }
 }
 
@@ -1980,17 +1661,17 @@ mod tests {
     #[test]
     fn test_failure_threshold() {
         let mgr = FallbackManager::new(3, 2);
-        assert!(!mgr.record_api_failure()); // 1
-        assert!(!mgr.record_api_failure()); // 2
-        assert!(mgr.record_api_failure()); // 3 — threshold reached
+        assert!(!mgr.record_failure(FailureKind::Transient)); // 1
+        assert!(!mgr.record_failure(FailureKind::Transient)); // 2
+        assert!(mgr.record_failure(FailureKind::Transient)); // 3 — threshold reached
     }
 
     #[test]
     fn test_model_failure_triggers_fallback() {
         let mgr = FallbackManager::new(3, 2);
-        assert!(!mgr.record_model_failure()); // 1
-        assert!(!mgr.record_model_failure()); // 2
-        assert!(mgr.record_model_failure()); // 3 — triggers fallback
+        assert!(!mgr.record_failure(FailureKind::Transient)); // 1
+        assert!(!mgr.record_failure(FailureKind::Transient)); // 2
+        assert!(mgr.record_failure(FailureKind::Transient)); // 3 — triggers fallback
         assert_eq!(mgr.state(), FallbackState::Fallback);
     }
 
@@ -1999,7 +1680,7 @@ mod tests {
         let mgr = FallbackManager::new(3, 2);
         // Trigger fallback
         for _ in 0..3 {
-            mgr.record_model_failure();
+            mgr.record_failure(FailureKind::Transient);
         }
         assert_eq!(mgr.state(), FallbackState::Fallback);
 
@@ -2008,8 +1689,8 @@ mod tests {
         assert_eq!(mgr.state(), FallbackState::Recovering);
 
         // Recover after enough successes
-        mgr.record_model_success(); // 1
-        mgr.record_model_success(); // 2 — threshold reached
+        mgr.record_success(); // 1
+        mgr.record_success(); // 2 — threshold reached
         assert_eq!(mgr.state(), FallbackState::Primary);
     }
 
@@ -2017,10 +1698,10 @@ mod tests {
     fn test_recovery_failure_goes_back_to_fallback() {
         let mgr = FallbackManager::new(3, 2);
         for _ in 0..3 {
-            mgr.record_model_failure();
+            mgr.record_failure(FailureKind::Transient);
         }
         mgr.transition_to_recovering();
-        mgr.record_model_failure(); // failure during recovery
+        mgr.record_failure(FailureKind::RateLimit); // sustained failure during recovery re-trips
         assert_eq!(mgr.state(), FallbackState::Fallback);
     }
 
@@ -2031,7 +1712,7 @@ mod tests {
 
         // Trigger fallback
         for _ in 0..3 {
-            mgr.record_model_failure();
+            mgr.record_failure(FailureKind::Transient);
         }
         // Not enough time
         assert!(!mgr.should_try_resume_primary(Duration::from_hours(1)));
@@ -2051,7 +1732,7 @@ mod tests {
     fn test_reset() {
         let mgr = FallbackManager::new(3, 2);
         for _ in 0..3 {
-            mgr.record_model_failure();
+            mgr.record_failure(FailureKind::Transient);
         }
         assert_eq!(mgr.state(), FallbackState::Fallback);
 
@@ -2066,24 +1747,23 @@ mod tests {
         let mgr = FallbackManager::new(3, 2);
         // Trip the circuit
         for _ in 0..3 {
-            mgr.record_api_failure();
+            mgr.record_failure(FailureKind::Transient);
         }
         // Activate fallback
         mgr.transition_to_fallback();
-        mgr.fallback_activated.store(true, Ordering::Relaxed);
 
         // Further failures should not return true (already activated)
-        assert!(!mgr.record_api_failure());
+        assert!(!mgr.record_failure(FailureKind::Transient));
     }
 
     #[test]
     fn test_record_success_resets_on_primary() {
         let mgr = FallbackManager::new(3, 2);
-        mgr.record_api_failure();
-        mgr.record_api_failure();
+        mgr.record_failure(FailureKind::Transient);
+        mgr.record_failure(FailureKind::Transient);
         assert_eq!(mgr.consecutive_failures(), 2);
 
-        mgr.record_model_success();
+        mgr.record_success();
         assert_eq!(mgr.consecutive_failures(), 0);
     }
 
@@ -2105,8 +1785,8 @@ mod tests {
         for _ in 0..10 {
             let mgr = Arc::clone(&mgr);
             handles.push(thread::spawn(move || {
-                mgr.record_api_failure();
-                mgr.record_model_success();
+                mgr.record_failure(FailureKind::Transient);
+                mgr.record_success();
                 mgr.state();
                 mgr.consecutive_failures();
             }));
@@ -2163,7 +1843,7 @@ mod tests {
         let mgr = FallbackManager::for_model("primary-model");
         mgr.add_fallback_model("fallback-model");
         // Record a failure while in Primary to dirty the counter, then trip.
-        mgr.record_failure();
+        mgr.record_failure(FailureKind::Transient);
         mgr.transition_to_fallback();
 
         // State is dirty.
@@ -2182,46 +1862,46 @@ mod tests {
     fn with_max_fail_count_no_padding_when_not_failed() {
         let entry = FallbackEntry::new("model-a").with_max_fail_count(5);
         assert!(!entry.failed());
-        assert_eq!(entry.attempt_count(), 0);
+        assert_eq!(entry.attempt_count, 0);
         assert_eq!(entry.max_fail_count, 5);
     }
 
     #[test]
     fn with_max_fail_count_pads_already_failed_entry() {
         let mut entry = FallbackEntry::new("model-b");
-        entry.record_attempt("timeout");
-        entry.record_attempt("timeout");
+        entry.record_attempt();
+        entry.record_attempt();
         assert!(entry.failed());
-        assert_eq!(entry.attempt_count(), 2);
+        assert_eq!(entry.attempt_count, 2);
 
         let entry = entry.with_max_fail_count(5);
         assert_eq!(entry.max_fail_count, 5);
-        assert_eq!(entry.attempt_count(), 5);
+        assert_eq!(entry.attempt_count, 5);
         assert!(entry.failed());
     }
 
     #[test]
     fn with_max_fail_count_pads_exactly_to_new_threshold() {
         let mut entry = FallbackEntry::new("model-c");
-        entry.record_attempt("err");
-        entry.record_attempt("err");
+        entry.record_attempt();
+        entry.record_attempt();
         assert!(entry.failed());
 
         let entry = entry.with_max_fail_count(3);
-        assert_eq!(entry.attempt_count(), 3);
+        assert_eq!(entry.attempt_count, 3);
         assert!(entry.failed());
     }
 
     #[test]
     fn with_max_fail_count_no_padding_when_lowering() {
         let mut entry = FallbackEntry::new("model-d");
-        entry.record_attempt("err");
-        entry.record_attempt("err");
+        entry.record_attempt();
+        entry.record_attempt();
         assert!(entry.failed());
 
         let entry = entry.with_max_fail_count(1);
         assert_eq!(entry.max_fail_count, 1);
-        assert_eq!(entry.attempt_count(), 2);
+        assert_eq!(entry.attempt_count, 2);
         assert!(entry.failed());
     }
 

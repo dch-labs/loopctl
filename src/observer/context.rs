@@ -4,10 +4,6 @@
 //! Observers receive shared references (`&Context`) — the structs are
 //! notification-only data carriers.
 
-// ==================================================
-// Context structs
-// ==================================================
-
 /// Context for [`LoopObserver::on_session_start`](crate::observer::LoopObserver::on_session_start).
 ///
 /// Carries the session identifier so observers can correlate
@@ -431,8 +427,15 @@ pub struct FallbackContext {
 #[derive(Debug, Clone)]
 pub struct ModelSwitchedContext {
     /// Model identifier before the switch.
+    ///
+    /// The model the session was using up to the point of the hot-swap, so
+    /// observers can log or revert the transition.
     pub from: String,
+
     /// Model identifier after the switch.
+    ///
+    /// The model that will handle subsequent requests, which may differ in
+    /// capability or cost from the previous one.
     pub to: String,
 }
 

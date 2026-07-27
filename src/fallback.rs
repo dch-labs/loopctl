@@ -546,29 +546,37 @@ impl FallbackEntry {
 #[derive(Debug, Clone)]
 pub struct FallbackConfig {
     /// Consecutive API failures required to trip the circuit open. Defaults to `3`.
+    ///
+    /// Once [`FallbackManager`] records this many failures in a row on the primary
+    /// model, it transitions from [`FallbackState::Primary`] to
+    /// [`FallbackState::Fallback`]. A higher value tolerates transient blips; a
+    /// lower value reacts faster to a degrading provider.
     pub trip_threshold: usize,
+
     /// Minimum time in fallback before probing the primary model again. Defaults to 60 s.
+    ///
+    /// Cooldown enforced by [`FallbackManager::should_try_resume_primary`]: the
+    /// manager stays on the fallback model for at least this long before it is
+    /// willing to probe the primary again via [`FallbackState::Recovering`].
     pub recovery_timeout: Duration,
+
     /// Consecutive successes during recovering before the circuit fully closes. Defaults to `2`.
+    ///
+    /// Number of healthy responses the primary model must produce while in
+    /// [`FallbackState::Recovering`] before the manager transitions back to
+    /// [`FallbackState::Primary`]. Requiring more than one guards against a
+    /// single lucky success masking an ongoing outage.
     pub recovery_successes_needed: usize,
+
     /// Per-model failure threshold before a fallback model is skipped. Defaults to `2`.
+    ///
+    /// Applied to each [`FallbackEntry`] in the fallback chain: once a single
+    /// model accumulates this many recorded attempts, it is taken out of
+    /// rotation and [`FallbackManager::active_model`] advances to the next
+    /// candidate.
     pub max_fail_count: usize,
 }
 
-/// Produces a [`FallbackConfig`] with sensible production defaults.
-///
-/// Defaults: `trip_threshold = 3`, `recovery_timeout = 60 s`,
-/// `recovery_successes_needed = 2`, `max_fail_count = 2`.
-///
-/// # Example
-///
-/// ```rust
-/// use loopctl::fallback::FallbackConfig;
-///
-/// let config = FallbackConfig::default();
-/// assert_eq!(config.trip_threshold, 3);
-/// assert_eq!(config.max_fail_count, 2);
-/// ```
 impl Default for FallbackConfig {
     fn default() -> Self {
         Self {
@@ -630,13 +638,36 @@ impl Default for FallbackConfig {
 /// reads that could occur when acquiring separate locks sequentially.
 #[derive(Default)]
 struct FallbackInner {
-    /// Original model name (before fallback).
+    /// Original model name, before any fallback was activated.
+    ///
+    /// Captured when the manager first trips so the recovering state
+    /// knows which model to resume to. `None` until the circuit breaker
+    /// has switched away from the primary at least once.
     original_model: Option<String>,
-    /// Ordered fallback models with failure status.
+
+    /// Ordered list of fallback models with their per-model failure
+    /// status.
+    ///
+    /// Each entry pairs a model name with whether it has already been
+    /// tried-and-failed. The manager walks this list in order when
+    /// selecting the next fallback, skipping entries marked failed.
     fallback_models: Vec<FallbackEntry>,
-    /// Cached first non-failed fallback model name.
+
+    /// Cached name of the first non-failed fallback model.
+    ///
+    /// Computed once and reused while the manager is in the fallback
+    /// state, so callers asking "which model am I on now?" get an
+    /// `O(1)` answer without re-scanning `fallback_models`. Recomputed
+    /// whenever the set of failed entries changes.
     active_fallback: Option<String>,
-    /// Time when fallback was activated.
+
+    /// Instant at which fallback was activated.
+    ///
+    /// Recorded when the manager transitions from `Primary` to
+    /// `Fallback`, and compared against the current time to compute
+    /// cooldown eligibility for
+    /// [`should_try_resume_primary`](FallbackManager::should_try_resume_primary).
+    /// `None` while the manager has never left the primary.
     fallback_switched_at: Option<Instant>,
 }
 
@@ -646,27 +677,79 @@ struct FallbackInner {
 /// threads (e.g. via `Arc<FallbackManager>`). No `&mut self` is needed
 /// for any operation.
 pub struct FallbackManager {
-    /// Failures before switching to fallback.
+    /// Number of consecutive failures on the primary that trips the
+    /// circuit.
+    ///
+    /// Once [`consecutive_failures`](Self::consecutive_failures) reaches
+    /// this value the manager transitions from `Primary` to `Fallback`.
+    /// Set at construction and immutable thereafter.
     fallback_threshold: usize,
-    /// Successes needed on primary before resuming.
+
+    /// Number of consecutive successes required on the primary during
+    /// recovery before transitioning back.
+    ///
+    /// Counts towards this via
+    /// [`record_model_success`](FallbackManager::record_model_success)
+    /// while in the `Recovering` state; reaching it transitions to
+    /// `Primary`. Set at construction and immutable thereafter.
     primary_resume_threshold: usize,
-    /// Per-model max failure count for new [`FallbackEntry`] instances.
+
+    /// Per-model max failure count seeded into new
+    /// [`FallbackEntry`] instances.
+    ///
+    /// When a fallback model is added without an explicit cap, it
+    /// inherits this value as its `max_fail_count`. Set at construction
+    /// and immutable thereafter.
     default_max_fail_count: usize,
-    /// Consecutive API failure counter.
+
+    /// Consecutive API failure counter on the current model.
+    ///
+    /// Incremented by
+    /// [`record_model_failure`](FallbackManager::record_model_failure),
+    /// reset to zero on any success. Hitting `fallback_threshold` trips
+    /// the circuit. Atomic so it updates lock-free on the hot path.
     consecutive_failures: AtomicUsize,
-    /// Whether fallback has been activated (sticky flag).
+
+    /// Sticky flag recording whether fallback has ever been activated.
+    ///
+    /// `true` once the circuit has tripped at least once, and never
+    /// reset for the life of the manager. Lets observers tell "still
+    /// on primary, never failed" from "recovered back to primary".
     fallback_activated: AtomicBool,
-    /// Circuit breaker state (0=Primary, 1=Fallback, 2=Recovering).
+
+    /// Current circuit-breaker state, encoded as an atomic.
+    ///
+    /// `0` = `Primary`, `1` = `Fallback`, `2` = `Recovering` (see
+    /// [`FallbackState`]). Stored as `AtomicU8` for lock-free reads on
+    /// every request; mutated only on state transitions.
     fallback_state: AtomicU8,
-    /// Consecutive successes on primary during recovery.
+
+    /// Consecutive successes on the primary accumulated during the
+    /// `Recovering` state.
+    ///
+    /// Incremented by
+    /// [`record_model_success`](FallbackManager::record_model_success);
+    /// reaching `primary_resume_threshold` transitions back to
+    /// `Primary` and resets this to zero. Atomic so it updates
+    /// lock-free.
     primary_success_count: AtomicUsize,
+
     /// Consolidated mutex-protected fallback state.
     ///
     /// Holding all related fields behind a single lock prevents partial-state
     /// reads that could occur when acquiring the (formerly separate) locks one
     /// at a time.
     inner: Mutex<FallbackInner>,
-    /// How long to remain in fallback before attempting primary recovery.
+
+    /// How long to remain in fallback before attempting primary
+    /// recovery.
+    ///
+    /// Compared against the elapsed time since
+    /// [`fallback_switched_at`](FallbackInner::fallback_switched_at)
+    /// by
+    /// [`should_try_resume_primary`](FallbackManager::should_try_resume_primary)
+    /// to decide when a cooldown has elapsed. Set at construction and
+    /// immutable thereafter.
     recovery_timeout: Duration,
 }
 
@@ -832,10 +915,6 @@ impl FallbackManager {
         }
         mgr
     }
-
-    // ==================================================
-    // Accessors
-    // ==================================================
 
     /// Get the current circuit breaker state.
     ///
@@ -1232,10 +1311,6 @@ impl FallbackManager {
         self.recompute_active_fallback();
     }
 
-    // ==================================================
-    // Fallback failure tracking
-    // ==================================================
-
     /// Mark a fallback model as failed by name.
     ///
     /// Call this when the fallback model itself returns errors. The model
@@ -1490,10 +1565,6 @@ impl FallbackManager {
         found
     }
 
-    // ==================================================
-    // Recording
-    // ==================================================
-
     /// Record an API failure and check if fallback should be triggered.
     ///
     /// Called by the agent loop each time an LLM API call fails (e.g.
@@ -1520,20 +1591,31 @@ impl FallbackManager {
     /// assert!(!mgr.record_api_failure()); // 4 — already activated, no re-trip
     /// ```
     pub fn record_api_failure(&self) -> bool {
-        let failures = self
-            .consecutive_failures
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        if failures >= self.fallback_threshold && !self.fallback_activated.load(Ordering::Relaxed) {
-            warn!(
-                consecutive_failures = failures,
-                threshold = self.fallback_threshold,
-                "Fallback threshold reached"
-            );
-            self.fallback_activated.store(true, Ordering::Relaxed);
-            true
-        } else {
-            false
+        match self.state() {
+            FallbackState::Primary => {
+                let failures = self
+                    .consecutive_failures
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                if failures >= self.fallback_threshold {
+                    warn!(
+                        consecutive_failures = failures,
+                        threshold = self.fallback_threshold,
+                        "Fallback threshold reached"
+                    );
+                    self.transition_to_fallback();
+                    return true;
+                }
+                false
+            }
+            FallbackState::Fallback | FallbackState::Recovering => {
+                let failures = self.consecutive_failures.load(Ordering::Relaxed);
+                warn!(
+                    consecutive_failures = failures,
+                    "API failure recorded while not in Primary state; counter unchanged"
+                );
+                false
+            }
         }
     }
 
@@ -1685,10 +1767,6 @@ impl FallbackManager {
             }
         }
     }
-
-    // ==================================================
-    // State transitions
-    // ==================================================
 
     /// Check if we should try resuming the primary model.
     ///
@@ -1862,10 +1940,6 @@ impl FallbackManager {
         self.clear_all_fallback_failed();
     }
 
-    // ==================================================
-    // Private helpers
-    // ==================================================
-
     /// Recompute the cached [`active_fallback`](Self::active_fallback) from
     /// the current fallback chain.
     ///
@@ -1884,22 +1958,6 @@ impl FallbackManager {
     }
 }
 
-/// Produces a [`FallbackManager`] with production defaults.
-///
-/// Equivalent to `FallbackManager::new(3, 2)` — trips after 3
-/// consecutive failures and resumes after 2 consecutive successes.
-/// No model name is stored; use [`FallbackManager::for_model`] or
-/// [`FallbackManager::set_original_model`] to configure one.
-///
-/// # Example
-///
-/// ```rust
-/// use loopctl::fallback::FallbackManager;
-///
-/// let mgr = FallbackManager::default();
-/// assert_eq!(mgr.consecutive_failures(), 0);
-/// assert!(!mgr.is_using_fallback());
-/// ```
 impl Default for FallbackManager {
     fn default() -> Self {
         Self::new(3, 2)
@@ -2104,8 +2162,9 @@ mod tests {
     fn test_consolidated_mutex_reset_clears_all() {
         let mgr = FallbackManager::for_model("primary-model");
         mgr.add_fallback_model("fallback-model");
-        mgr.transition_to_fallback();
+        // Record a failure while in Primary to dirty the counter, then trip.
         mgr.record_failure();
+        mgr.transition_to_fallback();
 
         // State is dirty.
         assert!(mgr.consecutive_failures() > 0);

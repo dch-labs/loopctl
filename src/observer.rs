@@ -47,13 +47,10 @@ pub use context::{
     StreamFailureContext, TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext,
     ToolPostContext, ToolPreContext, TurnEndContext, TurnStartContext,
 };
-// ==================================================
-// LoopObserver Trait
-// ==================================================
 
 /// A notification observer that receives typed callbacks at agent loop lifecycle points.
 ///
-/// Observers are registered via [`LoopRuntime`](crate::runtime::LoopRuntime) and called at each
+/// Observers are registered via [`LoopManagers`](crate::managers::LoopManagers) and called at each
 /// lifecycle point in registration order. All methods are **notification-only** — they
 /// return `()`. Use the hook system (requires `hooks` feature) if you need to control
 /// flow (block/allow actions).
@@ -246,10 +243,6 @@ pub trait LoopObserver: Send + Sync {
     fn reset(&self) {}
 }
 
-// ==================================================
-// ObserverHost
-// ==================================================
-
 /// Holds registered observers and dispatches notifications to each.
 ///
 /// Observers run in registration order. All observers are always notified —
@@ -279,13 +272,44 @@ impl ObserverHost {
         self.observers.push(observer);
     }
 
-    /// Number of registered observers.
+    /// Dispatch a closure to each observer, isolating panics.
+    ///
+    /// If an observer panics, it is logged and the remaining observers
+    /// still receive the event. This matches the panic-isolation applied
+    /// to tool dispatch.
+    fn dispatch<F>(&self, f: F)
+    where
+        F: Fn(&dyn LoopObserver),
+    {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        for obs in &self.observers {
+            let obs: &dyn LoopObserver = obs.as_ref();
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| f(obs))) {
+                tracing::error!(
+                    observer = obs.name(),
+                    payload_downcast = payload.is::<&str>(),
+                    "observer panicked; continuing with remaining observers"
+                );
+            }
+        }
+    }
+
+    /// Number of observers currently registered.
+    ///
+    /// Cheap (`O(1)`) read of the observer vector length. Returns `0`
+    /// for a freshly constructed host, in which case every dispatch
+    /// method is effectively a no-op (it iterates an empty `Vec`).
     #[must_use]
     pub fn len(&self) -> usize {
         self.observers.len()
     }
 
     /// Whether no observers are registered.
+    ///
+    /// `true` when [`len`](Self::len) is `0`. When `true`, every
+    /// dispatch call short-circuits through an empty loop, so an
+    /// observerless host adds negligible overhead to the agent loop.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.observers.is_empty()
@@ -296,72 +320,72 @@ impl ObserverHost {
     /// Calls [`LoopObserver::reset`] on every registered observer,
     /// allowing them to clear per-session accumulators.
     pub fn reset_all(&self) {
-        for obs in &self.observers {
-            obs.reset();
-        }
+        self.dispatch(|obs| obs.reset());
     }
 
     /// Dispatch [`LoopObserver::on_session_start`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired once per session, before the first turn begins. Iterates
+    /// registered observers in registration order; use it to initialize
+    /// per-session observer state.
     pub fn on_session_start(&self, ctx: &SessionStartContext) {
-        for obs in &self.observers {
-            obs.on_session_start(ctx);
-        }
+        self.dispatch(|obs| obs.on_session_start(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_session_end`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired once per session, after the loop has terminated. Iterates
+    /// registered observers in registration order; check
+    /// [`SessionEndContext::success`] in each observer to distinguish a
+    /// normal exit from a failure.
     pub fn on_session_end(&self, ctx: &SessionEndContext) {
-        for obs in &self.observers {
-            obs.on_session_end(ctx);
-        }
+        self.dispatch(|obs| obs.on_session_end(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_turn_start`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired before the model is called for the turn. Iterates
+    /// registered observers in registration order.
     pub fn on_turn_start(&self, ctx: &TurnStartContext) {
-        for obs in &self.observers {
-            obs.on_turn_start(ctx);
-        }
+        self.dispatch(|obs| obs.on_turn_start(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_turn_end`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired after the turn's model call and any tool dispatch have
+    /// completed. Iterates registered observers in registration order;
+    /// check [`TurnEndContext::success`] to detect turn-level failures.
     pub fn on_turn_end(&self, ctx: &TurnEndContext) {
-        for obs in &self.observers {
-            obs.on_turn_end(ctx);
-        }
+        self.dispatch(|obs| obs.on_turn_end(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_stream_success`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired when a streaming model call completes successfully.
+    /// Iterates registered observers in registration order. Not fired
+    /// when the stream fails — see
+    /// [`on_stream_failure`](Self::on_stream_failure).
     pub fn on_stream_success(&self, ctx: &StreamContext) {
-        for obs in &self.observers {
-            obs.on_stream_success(ctx);
-        }
+        self.dispatch(|obs| obs.on_stream_success(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_stream_failure`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired when a streaming model call fails (timeout, transport
+    /// error, rate limit). Iterates registered observers in registration
+    /// order; the loop may retry or fall back to another model after
+    /// this notification.
     pub fn on_stream_failure(&self, ctx: &StreamFailureContext) {
-        for obs in &self.observers {
-            obs.on_stream_failure(ctx);
-        }
+        self.dispatch(|obs| obs.on_stream_failure(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_response`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired once the full model response is assembled — the committed
+    /// assistant text plus any tool calls, before the framework resolves
+    /// tool results. Iterates registered observers in registration order.
     pub fn on_response(&self, ctx: &ResponseContext) {
-        for obs in &self.observers {
-            obs.on_response(ctx);
-        }
+        self.dispatch(|obs| obs.on_response(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_text_delta`] to all observers.
@@ -369,9 +393,7 @@ impl ObserverHost {
     /// Iterates registered observers in registration order. Called once per
     /// streamed text delta, so each observer's `on_text_delta` must be cheap.
     pub fn on_text_delta(&self, ctx: &TextDeltaContext) {
-        for obs in &self.observers {
-            obs.on_text_delta(ctx);
-        }
+        self.dispatch(|obs| obs.on_text_delta(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_thinking_delta`] to all observers.
@@ -380,87 +402,86 @@ impl ObserverHost {
     /// streamed reasoning delta, so each observer's `on_thinking_delta` must
     /// be cheap.
     pub fn on_thinking_delta(&self, ctx: &ThinkingDeltaContext) {
-        for obs in &self.observers {
-            obs.on_thinking_delta(ctx);
-        }
+        self.dispatch(|obs| obs.on_thinking_delta(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_tool_pre`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired before a tool is dispatched, carrying the call's name and
+    /// input. Iterates registered observers in registration order.
+    /// Notification-only — use the hook system (requires the `hooks`
+    /// feature) for flow control.
     pub fn on_tool_pre(&self, ctx: &ToolPreContext) {
-        for obs in &self.observers {
-            obs.on_tool_pre(ctx);
-        }
+        self.dispatch(|obs| obs.on_tool_pre(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_tool_call_received`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired when the framework receives a tool call from the model
+    /// response, before it is dispatched. Iterates registered observers
+    /// in registration order; useful for pending-call tracking.
     pub fn on_tool_call_received(&self, ctx: &ToolCallReceivedContext) {
-        for obs in &self.observers {
-            obs.on_tool_call_received(ctx);
-        }
+        self.dispatch(|obs| obs.on_tool_call_received(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_tool_post`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired after a tool completes, carrying its output and timing.
+    /// Iterates registered observers in registration order; useful for
+    /// loop-detection correlation.
     pub fn on_tool_post(&self, ctx: &ToolPostContext) {
-        for obs in &self.observers {
-            obs.on_tool_post(ctx);
-        }
+        self.dispatch(|obs| obs.on_tool_post(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_compaction`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired after the context manager reduces the history, carrying the
+    /// before/after token counts. Iterates registered observers in
+    /// registration order; fired only when compaction actually occurred,
+    /// not on no-action passes.
     pub fn on_compaction(&self, ctx: &CompactedContext) {
-        for obs in &self.observers {
-            obs.on_compaction(ctx);
-        }
+        self.dispatch(|obs| obs.on_compaction(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_fallback`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired when the fallback manager activates a fallback model,
+    /// carrying the reason and the selected model. Iterates registered
+    /// observers in registration order; the fallback model will be used
+    /// for subsequent requests.
     pub fn on_fallback(&self, ctx: &FallbackContext) {
-        for obs in &self.observers {
-            obs.on_fallback(ctx);
-        }
+        self.dispatch(|obs| obs.on_fallback(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_model_switched`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired after an explicit model switch is accepted by the client,
+    /// carrying the old and new model names. Iterates registered
+    /// observers in registration order.
     pub fn on_model_switched(&self, ctx: &ModelSwitchedContext) {
-        for obs in &self.observers {
-            obs.on_model_switched(ctx);
-        }
+        self.dispatch(|obs| obs.on_model_switched(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_loop_detected`] to all observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired when the loop detector observes the same operation
+    /// repeatedly, exceeding the configured threshold. Iterates
+    /// registered observers in registration order.
     pub fn on_loop_detected(&self, ctx: &LoopDetectedContext) {
-        for obs in &self.observers {
-            obs.on_loop_detected(ctx);
-        }
+        self.dispatch(|obs| obs.on_loop_detected(ctx));
     }
 
-    /// Dispatch [`LoopObserver::on_convergence_detected`] to all observers.
+    /// Dispatch [`LoopObserver::on_convergence_detected`] to all
+    /// observers.
     ///
-    /// Iterates registered observers in registration order.
+    /// Fired when the convergence detector observes semantically
+    /// similar assistant responses, as determined by the convergence
+    /// detection policy. Iterates registered observers in registration
+    /// order.
     pub fn on_convergence_detected(&self, ctx: &ConvergenceDetectedContext) {
-        for obs in &self.observers {
-            obs.on_convergence_detected(ctx);
-        }
+        self.dispatch(|obs| obs.on_convergence_detected(ctx));
     }
 }
-
-// ==================================================
-// Tests
-// ==================================================
 
 #[cfg(test)]
 mod tests {

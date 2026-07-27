@@ -52,10 +52,6 @@ use context::{
     SessionEndContext, SessionStartContext,
 };
 
-// ===================================================
-// Hook trait
-// ===================================================
-
 /// Hook trait for bidirectional lifecycle control.
 ///
 /// Hooks differ from observers ([`crate::observer::LoopObserver`]) in two key ways:
@@ -110,10 +106,6 @@ pub trait Hook: Send + Sync {
     /// produced a given result.
     fn name(&self) -> &str;
 
-    // ==================================================
-    // Pre-hooks (return value controls flow)
-    // ==================================================
-
     /// Called before a tool is executed.
     ///
     /// Return `Some(HookAction::Block{...})` to prevent execution.
@@ -133,10 +125,6 @@ pub trait Hook: Send + Sync {
         None
     }
 
-    // ==================================================
-    // Post-hooks (notification only, no flow control)
-    // ==================================================
-
     /// Called after a tool completes execution.
     ///
     /// Cannot block. Use this for audit logging, metric recording,
@@ -147,10 +135,6 @@ pub trait Hook: Send + Sync {
     ///
     /// Notification-only; cannot alter the compaction result.
     fn on_post_compact(&self, _ctx: &PostCompactContext) {}
-
-    // ==================================================
-    // Session lifecycle
-    // ==================================================
 
     /// Called when an agent session starts.
     ///
@@ -164,10 +148,6 @@ pub trait Hook: Send + Sync {
     /// or final metric emission.
     fn on_session_end(&self, _ctx: &SessionEndContext) {}
 }
-
-// ===================================================
-// Interactivity
-// ===================================================
 
 /// Whether the session can interact with a human operator.
 ///
@@ -188,10 +168,6 @@ pub enum Interactivity {
     /// Human is available — `Ask` passes through unchanged.
     Interactive,
 }
-
-// ===================================================
-// HookAction
-// ===================================================
 
 /// Action returned by a pre-hook to control flow.
 ///
@@ -248,6 +224,11 @@ impl fmt::Display for HookAction {
 
 impl HookAction {
     /// Convenience constructor for [`HookAction::Block`].
+    ///
+    /// Accepts any `Into<String>` so string literals work directly.
+    /// The carried `reason` is returned to the model as a tool error,
+    /// giving it a chance to adjust its approach. Prefer this over
+    /// struct-literal construction at call sites that block.
     pub fn block(reason: impl Into<String>) -> Self {
         Self::Block {
             reason: reason.into(),
@@ -255,6 +236,13 @@ impl HookAction {
     }
 
     /// Convenience constructor for [`HookAction::Ask`].
+    ///
+    /// Accepts any `Into<String>` so string literals work directly.
+    /// The carried `message` is presented to the user for confirmation;
+    /// the executor delegates to a
+    /// [`ConfirmationHandler`](crate::hooks::builtin::ConfirmationHandler)
+    /// to resolve it. In headless mode `Ask` is downgraded to `Block`
+    /// by the [`HookExecutor`].
     pub fn ask(message: impl Into<String>) -> Self {
         Self::Ask {
             message: message.into(),
@@ -262,24 +250,43 @@ impl HookAction {
     }
 
     /// Returns `true` if this action allows the operation to proceed.
+    ///
+    /// `true` only for [`HookAction::Allow`]. Use this in match arms
+    /// where the default path is to proceed and only the block/ask
+    /// branches need explicit handling.
     #[must_use]
     pub fn is_allow(&self) -> bool {
         matches!(self, Self::Allow)
     }
 
     /// Returns `true` if this action blocks the operation.
+    ///
+    /// `true` only for [`HookAction::Block`]. Note that in headless
+    /// mode an [`HookAction::Ask`] is downgraded to `Block`, so a
+    /// post-executor action that reports `is_block` may have originated
+    /// as an `Ask`.
     #[must_use]
     pub fn is_block(&self) -> bool {
         matches!(self, Self::Block { .. })
     }
 
     /// Returns `true` if this action requests interactive confirmation.
+    ///
+    /// `true` only for [`HookAction::Ask`]. Note this reflects the
+    /// action as produced by the hook, before the executor applies its
+    /// interactivity policy — an `Ask` returned by a hook may surface
+    /// as `Block` after the executor downgrades it in headless mode.
     #[must_use]
     pub fn is_ask(&self) -> bool {
         matches!(self, Self::Ask { .. })
     }
 
     /// Returns the block reason, if this is a [`HookAction::Block`].
+    ///
+    /// `Some(reason)` when this action is a `Block`, `None` for `Allow`
+    /// and `Ask`. Useful for logging why an action was refused without
+    /// a full match arm — pair with [`is_block`](Self::is_block) when
+    /// you need to distinguish the variants.
     #[must_use]
     pub fn block_reason(&self) -> Option<&str> {
         match self {

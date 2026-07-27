@@ -82,10 +82,6 @@ pub mod registry;
 pub use permission::PermissionCheck;
 pub use registry::{FnTool, ToolRegistry};
 
-// ===================================================
-// ToolSchema
-// ===================================================
-
 /// Schema descriptor for a tool, used for LLM API tool definitions.
 ///
 /// When the agent loop sends a list of available tools to the LLM, each
@@ -138,10 +134,6 @@ pub struct ToolSchema {
     /// valid `input` objects for [`Tool::call`].
     pub input_schema: Value,
 }
-
-// ===================================================
-// ToolOutput
-// ===================================================
 
 /// Advisory rendering hint attached to a [`ToolOutput`].
 ///
@@ -562,49 +554,16 @@ impl ToolOutput {
 }
 
 impl From<String> for ToolOutput {
-    /// Convert a [`String`] into a successful text [`ToolOutput`].
-    ///
-    /// Enables `let result: ToolOutput = s.into()` where `s: String`.
-    /// Equivalent to calling [`ToolOutput::text`]. Sets
-    /// [`is_error`](ToolOutput::is_error) to `false`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
-    ///
-    /// let s = String::from("hello");
-    /// let result: ToolOutput = s.into();
-    /// assert_eq!(result.text_content(), "hello");
-    /// ```
     fn from(s: String) -> Self {
         Self::text(s)
     }
 }
 
 impl From<&str> for ToolOutput {
-    /// Convert a `&str` into a successful text [`ToolOutput`].
-    ///
-    /// Enables `let result: ToolOutput = "ok".into()`. Equivalent to
-    /// calling [`ToolOutput::text`]. Sets
-    /// [`is_error`](ToolOutput::is_error) to `false`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
-    ///
-    /// let result: ToolOutput = "ok".into();
-    /// assert_eq!(result.text_content(), "ok");
-    /// ```
     fn from(s: &str) -> Self {
         Self::text(s)
     }
 }
-
-// ===================================================
-// ToolDispatchResult
-// ===================================================
 
 /// The outcome of a single tool invocation.
 ///
@@ -837,10 +796,6 @@ impl From<ToolOutput> for ToolDispatchResult {
     }
 }
 
-// ===================================================
-// ToolError
-// ===================================================
-
 /// Error type for tool invocations.
 ///
 /// Covers the full range of failure modes a tool can encounter — from
@@ -1038,10 +993,6 @@ impl ToolError {
     }
 }
 
-// ===================================================
-// ToolContext
-// ===================================================
-
 /// Session-level context provided to every tool invocation.
 ///
 /// The agent loop constructs a [`ToolContext`] at session start and passes
@@ -1162,18 +1113,6 @@ impl ToolContext {
 }
 
 impl fmt::Debug for ToolContext {
-    /// Format the context for debug output, summarizing extensions.
-    ///
-    /// Produces a human-readable struct dump. The `extensions` field is
-    /// rendered as a count (e.g., `"3 entries"`) rather than printing every
-    /// entry, because extensions can be arbitrarily large and their types
-    /// may not implement [`Debug`](std::fmt::Debug).
-    ///
-    /// # Example output
-    ///
-    /// ```text
-    /// ToolContext { cwd: "/tmp/ws", session_id: 0123-4567-..., temp_dir: "/tmp", is_non_interactive: false, user_context: {}, extensions: 2 entries }
-    /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ToolContext")
             .field("cwd", &self.cwd)
@@ -1186,30 +1125,30 @@ impl fmt::Debug for ToolContext {
     }
 }
 
+/// Produce a context with sensible defaults.
+///
+/// Creates a ready-to-use [`ToolContext`] suitable for most agent
+/// sessions. The defaults are:
+///
+/// | Field               | Default                              |
+/// |---------------------|--------------------------------------|
+/// | `cwd`               | `"."` (process current directory)    |
+/// | `session_id`        | new UUID v4                          |
+/// | `temp_dir`          | [`std::env::temp_dir`]               |
+/// | `is_non_interactive`| `false`                              |
+/// | `user_context`      | empty [`HashMap`]                    |
+/// | `extensions`        | empty [`HashMap`]                    |
+///
+/// # Example
+///
+/// ```rust
+/// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
+///
+/// let ctx = ToolContext::default();
+/// assert_eq!(ctx.cwd, ".");
+/// assert!(!ctx.is_non_interactive);
+/// ```
 impl Default for ToolContext {
-    /// Produce a context with sensible defaults.
-    ///
-    /// Creates a ready-to-use [`ToolContext`] suitable for most agent
-    /// sessions. The defaults are:
-    ///
-    /// | Field               | Default                              |
-    /// |---------------------|--------------------------------------|
-    /// | `cwd`               | `"."` (process current directory)    |
-    /// | `session_id`        | new UUID v4                          |
-    /// | `temp_dir`          | [`std::env::temp_dir`]               |
-    /// | `is_non_interactive`| `false`                              |
-    /// | `user_context`      | empty [`HashMap`]                    |
-    /// | `extensions`        | empty [`HashMap`]                    |
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
-    ///
-    /// let ctx = ToolContext::default();
-    /// assert_eq!(ctx.cwd, ".");
-    /// assert!(!ctx.is_non_interactive);
-    /// ```
     fn default() -> Self {
         Self {
             cwd: ".".to_string(),
@@ -1221,9 +1160,6 @@ impl Default for ToolContext {
         }
     }
 }
-// ===================================================
-// Tool trait
-// ===================================================
 
 /// The trait that all agent tools must implement.
 ///
@@ -1520,15 +1456,13 @@ pub trait Tool: Send + Sync {
     }
 }
 
-// ===================================================
-// Tests
-// ===================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(feature = "testing")]
-    use crate::engine::loop_core::Loop;
+    use crate::engine::RunConfig;
+    #[cfg(feature = "testing")]
+    use crate::engine::core::Loop;
     use serde_json::json;
 
     struct EchoTool;
@@ -2105,7 +2039,7 @@ mod tests {
         let mut agent = crate::engine::BareLoop::new(
             std::sync::Arc::new(client),
             registry,
-            crate::config::LoopConfig::default(),
+            crate::config::SessionConfig::default(),
         );
         let capture = std::sync::Arc::new(PostCapture::default());
         agent.register_observer(capture.clone());
@@ -2120,7 +2054,10 @@ mod tests {
             "@@ -1 +1 @@\n-old\n+new",
             Some(DisplayHint::Diff),
         );
-        agent.run("edit the file").await.unwrap();
+        agent
+            .run("edit the file", &RunConfig::default())
+            .await
+            .unwrap();
 
         let posts = crate::error::recover_guard(capture.posts.lock()).clone();
         assert_eq!(posts.len(), 1, "exactly one tool call this turn");
@@ -2136,7 +2073,7 @@ mod tests {
     #[tokio::test]
     async fn no_hint_tool_yields_none_at_observer() {
         let (mut agent, capture) = hinted_dispatch_setup("plain", "just text", None);
-        agent.run("go").await.unwrap();
+        agent.run("go", &RunConfig::default()).await.unwrap();
 
         let posts = crate::error::recover_guard(capture.posts.lock()).clone();
         assert_eq!(posts.len(), 1);
@@ -2151,7 +2088,7 @@ mod tests {
     async fn suppress_hint_keeps_full_payload_into_conversation() {
         let (mut agent, capture) =
             hinted_dispatch_setup("reader", "the quick brown fox", Some(DisplayHint::Suppress));
-        agent.run("read it").await.unwrap();
+        agent.run("read it", &RunConfig::default()).await.unwrap();
 
         let posts = crate::error::recover_guard(capture.posts.lock()).clone();
         assert_eq!(posts[0].display_hint, Some(DisplayHint::Suppress));

@@ -4,7 +4,7 @@
 //! - **[`convergence`]** — Detects when agent responses become semantically similar.
 //! - **[`manager`]** — Unified [`DetectionManager`] that orchestrates both detectors.
 //!
-//! For capability traits and the runtime bundle, see [`crate::runtime`].
+//! For capability traits and the runtime bundle, see [`crate::managers`].
 
 pub mod convergence;
 pub mod loop_detector;

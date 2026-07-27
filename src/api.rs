@@ -51,7 +51,7 @@ pub struct StreamRequest {
     /// (top-level `system` on Anthropic/Gemini, a leading `system` role message
     /// on OpenAI). When `None`, the provider receives no system prompt for the
     /// turn. The value is forwarded verbatim from
-    /// [`LoopConfig::system_prompt`](crate::config::LoopConfig::system_prompt);
+    /// [`SessionConfig::system_prompt`](crate::config::SessionConfig::system_prompt);
     /// set it there to drive this field.
     pub system: Option<String>,
 
@@ -67,7 +67,13 @@ pub struct StreamRequest {
 }
 
 impl StreamRequest {
-    /// Create a request with messages and no system prompt or tools.
+    /// Create a request carrying `messages` and no system prompt or tools.
+    ///
+    /// The minimal constructor: only the required conversation history
+    /// is set. Chain
+    /// [`with_system`](Self::with_system) and
+    /// [`with_tools`](Self::with_tools) to populate the optional fields,
+    /// or use struct-literal syntax to set every field at once.
     #[must_use]
     pub fn new(messages: Vec<Message>) -> Self {
         Self {

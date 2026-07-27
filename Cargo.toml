@@ -28,6 +28,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"], optional = true }
+bytes = "1"
 async-stream = "0.3"
 httpdate = { version = "1", optional = true }
 jsonschema = { version = "0.48", optional = true }

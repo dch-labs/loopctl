@@ -78,9 +78,6 @@ use thiserror::Error;
 #[repr(u16)]
 #[non_exhaustive]
 pub enum ErrorCode {
-    // ==================================================
-    // API errors (1000-1005)
-    // ==================================================
     /// A generic LLM API request failed.
     ///
     /// Returned when the API responds with an unexpected status or the
@@ -130,9 +127,6 @@ pub enum ErrorCode {
     /// truncation) before retrying. Maps to **1005**.
     ApiContextOverflow = 1005,
 
-    // ==================================================
-    // Auth errors (1100-1101)
-    // ==================================================
     /// The API key is invalid or missing.
     ///
     /// The key may be expired, revoked, or not yet set. Check
@@ -146,9 +140,6 @@ pub enum ErrorCode {
     /// Maps to **1101**.
     AuthFailed = 1101,
 
-    // ==================================================
-    // HTTP errors (1200-1202)
-    // ==================================================
     /// A low-level HTTP connection error.
     ///
     /// Typically a DNS failure, TCP timeout, or TLS handshake error.
@@ -177,9 +168,6 @@ pub enum ErrorCode {
     /// the message for downstream log aggregation.
     HttpResponseError = 1202,
 
-    // ==================================================
-    // Tool errors (1300-1304)
-    // ==================================================
     /// The requested tool does not exist.
     ///
     /// The agent asked for a tool name that is not registered with the
@@ -224,9 +212,6 @@ pub enum ErrorCode {
     /// but the caller should consider increasing the timeout first.
     ToolTimeout = 1304,
 
-    // ==================================================
-    // Config errors (1400-1403)
-    // ==================================================
     /// The configuration file could not be found.
     ///
     /// The path pointed to by the config setting does not exist or is
@@ -250,9 +235,6 @@ pub enum ErrorCode {
     /// No value was provided and no default is available. Maps to **1403**.
     ConfigMissing = 1403,
 
-    // ==================================================
-    // I/O errors (1500-1502)
-    // ==================================================
     /// A required file was not found on disk.
     ///
     /// Similar to [`ConfigFileNotFound`] but for general I/O paths.
@@ -271,27 +253,18 @@ pub enum ErrorCode {
     /// Disk full, permission denied, or path invalid. Maps to **1502**.
     IoWriteError = 1502,
 
-    // ==================================================
-    // JSON errors (1600)
-    // ==================================================
     /// A JSON payload could not be parsed.
     ///
     /// The response body or request payload contained malformed JSON.
     /// Maps to **1600**.
     JsonParseError = 1600,
 
-    // ==================================================
-    // Internal (1700)
-    // ==================================================
     /// An internal / unexpected error.
     ///
     /// Catch-all for bugs or unclassifiable failures. If you see this
     /// code in production please file a bug report. Maps to **1700**.
     InternalError = 1700,
 
-    // ==================================================
-    // Signal (1999)
-    // ==================================================
     /// The operation was interrupted by a user signal (e.g. Ctrl-C).
     ///
     /// Not an error per se — the agent loop checks for this code to
@@ -366,9 +339,21 @@ pub enum ApiError {
     /// delay without re-parsing.
     #[error("Rate limit exceeded (retry after {retry_after:?}): {message}")]
     RateLimit {
-        /// The server-advised delay.
+        /// The server-advised delay before retrying.
+        ///
+        /// Carries the parsed `Retry-After` header (or equivalent hint)
+        /// so downstream layers — the stream handler's back-off and the
+        /// fallback manager's model switch — can honour the provider's
+        /// guidance without re-parsing the message. `None` when the
+        /// provider sent no header or it failed to parse.
         retry_after: Option<std::time::Duration>,
         /// The error body or human-readable message.
+        ///
+        /// Preserved verbatim from the provider's response (for example
+        /// `"429 Too Many Requests"`), primarily for logging and
+        /// diagnostics. Classification does not depend on it — the
+        /// variant alone selects
+        /// [`ErrorCode::ApiRateLimited`].
         message: String,
     },
 
@@ -448,10 +433,6 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    // ==================================================
-    // Classifiers
-    // ==================================================
-
     /// Derive the machine-readable [`ErrorCode`] for this error.
     ///
     /// Inspects the error variant and, for message-based variants
@@ -606,6 +587,22 @@ impl ApiError {
     }
 
     /// Check a message string for context-overflow keywords.
+    ///
+    /// Shared keyword matcher behind [`is_context_overflow`](Self::is_context_overflow)
+    /// and the message inspection inside [`code`](Self::code). Returns
+    /// `true` when the lowercased message contains any of the phrases
+    /// providers use to signal that the prompt exceeded the model's
+    /// maximum context length: `"context"`, `"too many tokens"`,
+    /// `"exceeds maximum"`, or `"max tokens"`.
+    ///
+    /// The match is deliberately broad (substring on the lowercased
+    /// text) so that provider-specific phrasings — Anthropic's
+    /// `"prompt is too long"`, OpenAI's `"maximum context length"`,
+    /// and generic `"too many tokens"` renderings — all collapse to a
+    /// single signal. The trade-off is a small false-positive risk on
+    /// unrelated messages that happen to contain the word `"context"`,
+    /// which is acceptable given the downstream consumers retry
+    /// through compaction rather than aborting.
     fn is_context_overflow_internal(msg: &str) -> bool {
         let msg_lower = msg.to_lowercase();
         msg_lower.contains("context")
@@ -727,10 +724,6 @@ impl ApiError {
     pub const fn is_tool_error(&self) -> bool {
         matches!(self, Self::Tool(..))
     }
-
-    // ==================================================
-    // Constructors
-    // ==================================================
 
     /// Create a generic [`ApiError::Api`] variant.
     ///

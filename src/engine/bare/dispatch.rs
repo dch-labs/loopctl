@@ -13,6 +13,7 @@ use super::{
 };
 #[cfg(feature = "hooks")]
 use super::{PostToolUseContext, PreToolUseContext};
+use crate::capabilities::Detectable;
 #[cfg(feature = "tool_health")]
 use crate::capabilities::HealthTrackable;
 #[cfg(feature = "hooks")]
@@ -44,10 +45,6 @@ enum RecoveryOutcome {
     /// Propagated as [`LoopError::Cancelled`] so the turn aborts immediately.
     Cancelled,
 }
-
-// ===================================================
-// Parallel dispatch: dependency graph + dispatch plan
-// ===================================================
 
 /// Analysis of a batch of tool calls, classifying each as parallelizable and
 /// grouping independent calls into waves.
@@ -201,7 +198,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Execute a batch of tool calls and return results in input order.
     ///
     /// Routes to the sequential or parallel path based on
-    /// [`parallel_tool_dispatch`](crate::config::LoopConfig::parallel_tool_dispatch).
+    /// [`parallel_tool_dispatch`](crate::engine::RunConfig::parallel_tool_dispatch).
     /// Both paths honour mid-batch cancellation: if the cancel signal fires
     /// between (or during) calls, the method returns
     /// [`LoopError::Cancelled`] promptly.
@@ -219,7 +216,7 @@ impl<C: ApiClient> BareLoop<C> {
         tool_calls: &[ToolCall],
         turn_idx: usize,
     ) -> Result<Vec<ToolDispatchResult>, LoopError> {
-        match self.config.parallel_tool_dispatch.mode {
+        match self.run_config().parallel_tool_dispatch.mode {
             crate::config::ParallelMode::Parallel => {
                 self.dispatch_tools_parallel(tool_calls, turn_idx).await
             }
@@ -377,7 +374,7 @@ impl<C: ApiClient> BareLoop<C> {
         let graph = ToolDependencyGraph::from_calls(tool_calls, &self.tools);
         let plan = graph.plan();
         let max_concurrency = self
-            .config
+            .run_config()
             .parallel_tool_dispatch
             .max_concurrency
             .clamp(1, eligible.len());
@@ -445,7 +442,8 @@ impl<C: ApiClient> BareLoop<C> {
                 self.post_detection(tc, er);
                 self.fire_tool_post(turn_idx, tc, er);
                 self.notify_post_tool_use_hooks(tc, er, turn_idx);
-                self.record_tool_health(tc.tool.as_str(), er);
+                // Health was already recorded inside run_parallel_task on
+                // every attempt — don't double-count here.
                 results.push(er.clone());
             } else {
                 let soft = ToolDispatchResult {
@@ -555,7 +553,7 @@ impl<C: ApiClient> BareLoop<C> {
             {
                 Ok((next_attempt, correction)) => {
                     attempt = next_attempt;
-                    Self::apply_correction_if_present(&mut tc, correction, &tool_result);
+                    Self::apply_correction_if_present(&mut tc, correction);
                 }
                 Err(RecoveryOutcome::SoftError(returned_result)) => return Ok(returned_result),
                 Err(RecoveryOutcome::Cancelled) => return Err(LoopError::Cancelled),
@@ -594,6 +592,11 @@ impl<C: ApiClient> BareLoop<C> {
                 Ok(r) => r,
                 Err(e) => return Some(Err(e)),
             };
+            // Record health on every attempt — the registry is thread-safe
+            // (atomic counters), so this is safe to call from concurrent
+            // tasks. Detection/observer side-effects stay in the POST phase
+            // (they are not thread-safe).
+            self.record_tool_health(tc.tool.as_str(), &tool_result);
             if !tool_result.is_error {
                 return Some(Ok(tool_result));
             }
@@ -603,7 +606,7 @@ impl<C: ApiClient> BareLoop<C> {
             {
                 Ok((next_attempt, correction)) => {
                     attempt = next_attempt;
-                    Self::apply_correction_if_present(&mut tc, correction, &tool_result);
+                    Self::apply_correction_if_present(&mut tc, correction);
                 }
                 Err(RecoveryOutcome::SoftError(returned_result)) => {
                     return Some(Ok(returned_result));
@@ -650,13 +653,9 @@ impl<C: ApiClient> BareLoop<C> {
     /// The correction modifies the tool call's input before the next retry
     /// attempt. If the correction cannot be applied, logs a warning and
     /// proceeds with the original input.
-    fn apply_correction_if_present(
-        tc: &mut ToolCall,
-        correction: Option<Correction>,
-        tool_result: &ToolDispatchResult,
-    ) {
+    fn apply_correction_if_present(tc: &mut ToolCall, correction: Option<Correction>) {
         let Some(correction) = correction else { return };
-        if let CorrectionResult::Failed(msg) = tc.apply_correction(&correction, tool_result) {
+        if let CorrectionResult::Failed(msg) = tc.apply_correction(&correction) {
             tracing::warn!(
                 tool = %tc.tool,
                 error = %msg,
@@ -682,14 +681,13 @@ impl<C: ApiClient> BareLoop<C> {
         let operation = Operation::from_input_with_signature(
             &tc.tool,
             &tc.input,
-            self.managers.detection.signature(),
+            self.managers.detection().signature(),
         );
-        let pattern = self.managers.detection.record_operation(operation);
+        let pattern = self.managers.detection().record_operation(operation);
 
-        // Inline loop/convergence detection. Some(error) forces a hard stop —
-        // propagate it so the agent loop terminates. None means no detection
-        // fired and dispatch continues.
-        match self.managers.handle_detected_pattern(&pattern, turn_idx) {
+        // Notify observers, then decide whether to abort.
+        self.managers.notify_detected_pattern(&pattern, turn_idx);
+        match self.decide_detected_pattern(&pattern) {
             Some(e) => Err(e),
             None => Ok(None),
         }
@@ -708,9 +706,9 @@ impl<C: ApiClient> BareLoop<C> {
             &tc.tool,
             &tc.input,
             result_hash,
-            self.managers.detection.signature(),
+            self.managers.detection().signature(),
         );
-        self.managers.detection.record_operation(operation);
+        self.managers.detection().record_operation(operation);
     }
 
     /// Execute a single tool call.
@@ -876,7 +874,7 @@ impl<C: ApiClient> BareLoop<C> {
         let ctx = PreToolUseContext {
             tool_name: tc.tool.clone(),
             input: tc.input.clone(),
-            session_id: self.config.session_id,
+            session_id: self.session.id,
             turn_number: turn_idx,
         };
         match executor.check_pre_tool_use(&ctx) {
@@ -944,7 +942,7 @@ impl<C: ApiClient> BareLoop<C> {
                 .as_millis()
                 .try_into()
                 .unwrap_or(u64::MAX),
-            session_id: self.config.session_id,
+            session_id: self.session.id,
             turn_number: turn_idx,
         };
         executor.notify_post_tool_use(&ctx);
@@ -1098,8 +1096,9 @@ impl<C: ApiClient> BareLoop<C> {
 #[allow(clippy::unnecessary_literal_bound)]
 mod tests {
     use crate::api::error::ApiError;
-    use crate::config::LoopConfig;
-    use crate::engine::loop_core::ToolCall;
+    use crate::config::SessionConfig;
+    use crate::engine::core::ToolCall;
+    use crate::engine::{Run, RunConfig};
     use crate::message::ToolContent;
     use crate::tool::{
         Tool, ToolContext, ToolError, ToolOutput, ToolSchema, registry::ToolRegistry,
@@ -1191,7 +1190,7 @@ mod tests {
     }
 
     fn make_loop(tools: ToolRegistry) -> BareLoop<MockClient> {
-        let config = LoopConfig::default();
+        let config = SessionConfig::default();
         let client = Arc::new(MockClient::new("test"));
         BareLoop::new(client, tools, config)
     }
@@ -1425,10 +1424,17 @@ mod tests {
     }
 
     fn make_parallel_loop(tools: ToolRegistry) -> BareLoop<MockClient> {
-        let mut config = LoopConfig::default();
-        config.parallel_tool_dispatch.mode = crate::config::ParallelMode::Parallel;
         let client = Arc::new(MockClient::new("test"));
-        BareLoop::new(client, tools, config)
+        let run_config = RunConfig {
+            parallel_tool_dispatch: crate::config::ParallelDispatchConfig {
+                mode: crate::config::ParallelMode::Parallel,
+                ..Default::default()
+            },
+            ..RunConfig::default()
+        };
+        let mut bare = BareLoop::new(client, tools, SessionConfig::default());
+        bare.session.runs.push(Run::new("", &run_config));
+        bare
     }
 
     #[tokio::test]
@@ -1537,8 +1543,8 @@ mod tests {
     #[tokio::test]
     async fn parallel_sequential_fallback() {
         use crate::testing::MockTool;
-        let config = LoopConfig::default();
-        // Default is Sequential — no change needed.
+        let config = SessionConfig::default();
+        // Default dispatch mode is Sequential — no change needed.
         let mut registry = ToolRegistry::new();
         registry.register(
             MockTool::new("a", "a")

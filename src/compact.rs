@@ -42,10 +42,10 @@
 //!
 //! let manager = ContextManager::new(Arc::new(compactor))
 //!     .with_context_window(200_000)
-//!     .with_threshold(8_000);
+//!     .with_threshold(80);
 //!
 //! assert_eq!(manager.context_window(), 200_000);
-//! assert_eq!(manager.threshold(), 8_000);
+//! assert_eq!(manager.threshold(), 80);
 //! ```
 //!
 //! # Integration with `BareLoop`
@@ -69,10 +69,6 @@ pub use types::{
     CompactReason, CompactTelemetry, CompactionContext, CompactionOutcome, ContextOverflow,
     EnsureContextResult, PostCompactStats, PreCompactStats,
 };
-
-// ===================================================
-// ContextCompactor trait
-// ===================================================
 
 /// Strategy trait for compacting a conversation's message history.
 ///
@@ -150,10 +146,6 @@ pub trait ContextCompactor: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = CompactionOutcome> + Send + '_>>;
 }
 
-// ===================================================
-// CompactBase
-// ===================================================
-
 /// Determines the base used to calculate the compaction target.
 ///
 /// When compaction triggers, the manager asks the compactor to reduce
@@ -177,9 +169,9 @@ pub trait ContextCompactor: Send + Sync {
 /// let compactor = TruncatingCompactor::new();
 /// let manager = ContextManager::new(Arc::new(compactor))
 ///     .with_context_window(200_000)
-///     .with_threshold(8_000)               // triggers at 160k tokens
+///     .with_threshold(80)               // triggers at 160k tokens
 ///     .with_compact_target(CompactBase::Context)   // target = % of 200k
-///     .with_compact_target_pct(5_000);     // compact to 50% of 200k = 100k
+///     .with_compact_target_pct(50);     // compact to 50% of 200k = 100k
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CompactBase {
@@ -195,16 +187,12 @@ pub enum CompactBase {
     ///
     /// `target = compact_threshold_tokens × compact_target_pct / 10_000`
     ///
-    /// This is the default. With the default `threshold = 8_000` bps (80%) and
-    /// `compact_target_pct = 7_000` bps (70%), compaction targets 56% of the
-    /// context window (`8000 × 7000 / 10_000² = 0.56`).
+    /// This is the default. With the default `threshold = 80` (80%) and
+    /// `compact_target_pct = 70` (70%), compaction targets 56% of the
+    /// context window.
     #[default]
     Threshold,
 }
-
-// ===================================================
-// ContextManager
-// ===================================================
 
 /// Manages context window usage and triggers compaction when needed.
 ///
@@ -233,7 +221,7 @@ pub enum CompactBase {
 ///
 /// let manager = ContextManager::new(Arc::new(compactor))
 ///     .with_context_window(1_000)
-///     .with_threshold(8_000);
+///     .with_threshold(80);
 ///
 /// // Short conversation — no compaction needed.
 /// let messages = vec![
@@ -243,6 +231,7 @@ pub enum CompactBase {
 /// let tokens = ContextManager::estimate_tokens(&messages);
 /// assert!(!manager.should_compact(tokens));
 /// ```
+#[derive(Clone)]
 pub struct ContextManager {
     /// The compaction strategy.
     ///
@@ -260,13 +249,13 @@ pub struct ContextManager {
     /// and the emergency-zone and compaction-target calculations.
     context_window: u64,
 
-    /// Threshold in basis points (`0–10_000`; `10_000` = 100%) at which compaction triggers.
+    /// Threshold as a percentage (0–100) at which compaction triggers.
     ///
-    /// When estimated token usage reaches `threshold_bps * context_window / 10_000`,
+    /// When estimated token usage reaches `threshold * context_window / 100`,
     /// [`should_compact`](Self::should_compact) returns `true` and a compaction
     /// pass runs before the next turn. Set via [`with_threshold`](Self::with_threshold),
-    /// which clamps to `[1_000, 10_000]`; defaults to `8_000` (80%).
-    threshold_bps: u16,
+    /// which clamps to `[1, 100]`; defaults to `80`.
+    threshold: u8,
 
     /// Whether auto-compaction is enabled.
     ///
@@ -286,13 +275,13 @@ pub struct ContextManager {
     /// [`with_compact_target`](Self::with_compact_target).
     compact_base: CompactBase,
 
-    /// Fraction of the target base to compact down to, in basis points (`0–10_000`).
+    /// Fraction of the target base to compact down to, as a percentage (0–100).
     ///
-    /// The post-compaction size aimed for: `compact_target_bps * base / 10_000`,
+    /// The post-compaction size aimed for: `compact_target * base / 100`,
     /// where `base` is determined by [`compact_base`](Self::compact_base).
-    /// Defaults to `7_000` (70%); set and clamped to `[1_000, 10_000]` via
+    /// Defaults to `70` (70%); set and clamped to `[1, 100]` via
     /// [`with_compact_target_pct`](Self::with_compact_target_pct).
-    compact_target_bps: u16,
+    compact_target: u8,
 }
 
 impl ContextManager {
@@ -303,19 +292,19 @@ impl ContextManager {
     /// | Setting              | Default                      |
     /// |----------------------|------------------------------|
     /// | `context_window`     | 200_000                      |
-    /// | `threshold`          | 8_000 bps (80%)              |
+    /// | `threshold`          | 80 (80%)                     |
     /// | `auto_compact`       | `true`                       |
-    /// | `compact_target`     | [`CompactBase::Threshold`] |
-    /// | `compact_target_pct` | 7_000 bps (70%)              |
+    /// | `compact_target`     | [`CompactBase::Threshold`]   |
+    /// | `compact_target_pct` | 70 (70%)                     |
     #[must_use]
     pub fn new(compactor: Arc<dyn ContextCompactor>) -> Self {
         Self {
             compactor,
             context_window: 200_000,
-            threshold_bps: 8_000,
+            threshold: 80,
             auto_compact: true,
             compact_base: CompactBase::Threshold,
-            compact_target_bps: 7_000,
+            compact_target: 70,
         }
     }
 
@@ -329,12 +318,12 @@ impl ContextManager {
         self
     }
 
-    /// Set the compaction threshold in basis points (`0–10_000`; `10_000` = 100%).
+    /// Set the compaction threshold as a percentage (0–100).
     ///
-    /// Clamped to `[1_000, 10_000]` (10%–100%) to prevent degenerate configurations.
+    /// Clamped to `[1, 100]` to prevent degenerate configurations.
     #[must_use]
-    pub fn with_threshold(mut self, threshold_bps: u16) -> Self {
-        self.threshold_bps = threshold_bps.clamp(1_000, 10_000);
+    pub fn with_threshold(mut self, threshold: u8) -> Self {
+        self.threshold = threshold.clamp(1, 100);
         self
     }
 
@@ -359,14 +348,14 @@ impl ContextManager {
         self
     }
 
-    /// Set the fraction of the target base to compact down to, in basis points
-    /// (`0–10_000`; `10_000` = 100%).
+    /// Set the fraction of the target base to compact down to, as a percentage
+    /// (`0–100`; `100` = 100%).
     ///
-    /// Clamped to `[1_000, 10_000]` (10%–100%) to prevent degenerate configurations.
-    /// Defaults to `7_000` (70%).
+    /// Clamped to `[1, 100]` to prevent degenerate configurations.
+    /// Defaults to `70`.
     #[must_use]
-    pub fn with_compact_target_pct(mut self, pct_bps: u16) -> Self {
-        self.compact_target_bps = pct_bps.clamp(1_000, 10_000);
+    pub fn with_compact_target_pct(mut self, pct: u8) -> Self {
+        self.compact_target = pct.clamp(1, 100);
         self
     }
 
@@ -379,13 +368,13 @@ impl ContextManager {
         self.context_window
     }
 
-    /// The compaction threshold in basis points (`0–10_000`; `10_000` = 100%).
+    /// The compaction threshold as a percentage (0–100).
     ///
     /// Compaction triggers when estimated tokens reach
     /// `context_window * threshold / 10_000`. See [`with_threshold`](Self::with_threshold).
     #[must_use]
-    pub fn threshold(&self) -> u16 {
-        self.threshold_bps
+    pub fn threshold(&self) -> u8 {
+        self.threshold
     }
 
     /// Whether auto-compaction is enabled.
@@ -405,25 +394,23 @@ impl ContextManager {
         self.compact_base
     }
 
-    /// The fraction of the target base to compact down to, in basis points
-    /// (`0–10_000`; `10_000` = 100%).
+    /// The fraction of the target base to compact down to, as a percentage
+    /// (`0–100`; `100` = 100%).
     ///
     /// See [`with_compact_target_pct`](Self::with_compact_target_pct).
     #[must_use]
-    pub fn compact_target_pct(&self) -> u16 {
-        self.compact_target_bps
+    pub fn compact_target_pct(&self) -> u8 {
+        self.compact_target
     }
 
     /// The token budget at which compaction triggers.
     ///
-    /// Equal to `context_window * threshold_bps / 10_000`, computed in
-    /// saturating integer arithmetic (widened to `u128` to avoid overflow).
+    /// Equal to `context_window * threshold`.
     #[must_use]
     pub fn compact_threshold_tokens(&self) -> u64 {
-        const BASIS: u128 = 10_000;
-        let product =
-            u128::from(self.threshold_bps).saturating_mul(u128::from(self.context_window)) / BASIS;
-        u64::try_from(product).unwrap_or(u64::MAX)
+        self.context_window
+            .saturating_mul(u64::from(self.threshold))
+            / 100
     }
 
     /// The token count to compact down to.
@@ -431,17 +418,15 @@ impl ContextManager {
     /// Computed from [`compact_target`](Self::compact_target) and
     /// [`compact_target_pct`](Self::compact_target_pct):
     ///
-    /// - [`CompactBase::Threshold`]: `compact_threshold_tokens × pct_bps / 10_000`
-    /// - [`CompactBase::Context`]: `context_window × pct_bps / 10_000`
+    /// - [`CompactBase::Threshold`]: `compact_threshold_tokens × pct`
+    /// - [`CompactBase::Context`]: `context_window × pct`
     #[must_use]
     pub fn compact_target_tokens(&self) -> u64 {
-        const BASIS: u128 = 10_000;
         let base: u64 = match self.compact_base {
             CompactBase::Threshold => self.compact_threshold_tokens(),
             CompactBase::Context => self.context_window,
         };
-        let product = u128::from(self.compact_target_bps).saturating_mul(u128::from(base)) / BASIS;
-        u64::try_from(product).unwrap_or(u64::MAX)
+        base.saturating_mul(u64::from(self.compact_target)) / 100
     }
 
     /// Estimate the token count for a slice of messages.
@@ -605,6 +590,27 @@ impl ContextManager {
         messages: Vec<Message>,
         turn: usize,
     ) -> Result<EnsureContextResult, ContextOverflow> {
+        self.compact_with_reason(messages, turn, CompactReason::Manual)
+            .await
+    }
+
+    /// Trigger compaction with a specific reason, bypassing the threshold check.
+    ///
+    /// Use this when the decision to compact was already made (e.g. by the
+    /// driving state machine) and the `reason` should reach the compactor's
+    /// [`CompactionContext`] so it can vary strategy (e.g. more aggressive
+    /// summarization for [`CompactReason::Emergency`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ContextOverflow`] if compaction fails or the result
+    /// still exceeds the context window.
+    pub async fn compact_with_reason(
+        &self,
+        messages: Vec<Message>,
+        turn: usize,
+        reason: CompactReason,
+    ) -> Result<EnsureContextResult, ContextOverflow> {
         let tokens_before = Self::estimate_tokens(&messages);
 
         if messages.is_empty() {
@@ -615,7 +621,7 @@ impl ContextManager {
         let target_tokens = self.compact_target_tokens();
         let context = CompactionContext {
             tokens_before,
-            reason: CompactReason::Manual,
+            reason,
             context_window: self.context_window,
             turn,
         };
@@ -656,30 +662,19 @@ impl ContextManager {
     /// Note: Currently does not depend on instance state, but is a method
     /// by design to allow future configuration-aware telemetry.
     #[must_use]
-    #[allow(
-        clippy::unused_self,
-        clippy::arithmetic_side_effects,
-        clippy::cast_possible_truncation
-    )]
     pub fn build_telemetry(
-        &self,
         trigger: CompactReason,
         pre_messages: &[Message],
         post_messages: &[Message],
-        _outcome: &CompactionOutcome,
         start: Instant,
     ) -> CompactTelemetry {
         let pre_tokens = Self::estimate_tokens(pre_messages);
         let post_tokens = Self::estimate_tokens(post_messages);
         let tokens_saved = pre_tokens.saturating_sub(post_tokens);
-        let percent_saved = if pre_tokens > 0 {
-            let ratio = u128::from(tokens_saved)
-                .saturating_mul(100)
-                .saturating_div(u128::from(pre_tokens));
-            u8::try_from(ratio.min(100)).unwrap_or(100)
-        } else {
-            0
-        };
+        let percent_saved: u8 = tokens_saved
+            .checked_mul(100)
+            .and_then(|v| v.checked_div(pre_tokens))
+            .map_or(0, |ratio| ratio.min(100) as u8);
 
         CompactTelemetry {
             trigger,
@@ -724,10 +719,6 @@ impl fmt::Debug for ContextManager {
     }
 }
 
-// ===================================================
-// Tests
-// ===================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,7 +757,7 @@ mod tests {
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor));
         assert_eq!(manager.context_window(), 200_000);
-        assert_eq!(manager.threshold(), 8_000);
+        assert_eq!(manager.threshold(), 80);
         assert!(manager.auto_compact());
     }
 
@@ -775,22 +766,22 @@ mod tests {
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(100_000)
-            .with_threshold(5_000)
+            .with_threshold(50)
             .with_auto_compact(false);
         assert_eq!(manager.context_window(), 100_000);
-        assert_eq!(manager.threshold(), 5_000);
+        assert_eq!(manager.threshold(), 50);
         assert!(!manager.auto_compact());
     }
 
     #[test]
     fn test_threshold_clamped() {
         let compactor = TruncatingCompactor::new();
-        let manager = ContextManager::new(Arc::new(compactor)).with_threshold(100);
-        assert_eq!(manager.threshold(), 1_000);
+        let manager = ContextManager::new(Arc::new(compactor)).with_threshold(1);
+        assert_eq!(manager.threshold(), 1);
 
         let compactor2 = TruncatingCompactor::new();
-        let manager = ContextManager::new(Arc::new(compactor2)).with_threshold(20_000);
-        assert_eq!(manager.threshold(), 10_000);
+        let manager = ContextManager::new(Arc::new(compactor2)).with_threshold(200);
+        assert_eq!(manager.threshold(), 100);
     }
 
     #[test]
@@ -798,7 +789,7 @@ mod tests {
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(1_000)
-            .with_threshold(8_000);
+            .with_threshold(80);
         // 800 is the threshold for 1000 * 8000 / 10_000
         assert!(!manager.should_compact(799));
     }
@@ -808,7 +799,7 @@ mod tests {
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(1_000)
-            .with_threshold(8_000);
+            .with_threshold(80);
         assert!(manager.should_compact(800));
     }
 
@@ -817,7 +808,7 @@ mod tests {
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(1_000)
-            .with_threshold(5_000); // threshold at 500, but emergency at 950
+            .with_threshold(50); // threshold at 500, but emergency at 950
         assert!(manager.should_compact(950));
     }
 
@@ -841,7 +832,7 @@ mod tests {
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(1_000)
-            .with_threshold(8_000);
+            .with_threshold(80);
         assert_eq!(
             manager.compact_reason(800),
             CompactReason::ThresholdExceeded
@@ -860,58 +851,50 @@ mod tests {
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(200_000)
-            .with_threshold(8_000);
+            .with_threshold(80);
         assert_eq!(manager.compact_threshold_tokens(), 160_000);
     }
 
     #[test]
     fn test_compact_target_tokens_default() {
-        // Default: CompactBase::Threshold with pct 7_000 bps (70%)
-        // threshold = 200_000 * 8_000 / 10_000 = 160_000
-        // target   = 160_000 * 7_000 / 10_000 = 112_000
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(200_000)
-            .with_threshold(8_000);
+            .with_threshold(80);
         assert_eq!(manager.compact_target_tokens(), 112_000);
     }
 
     #[test]
     fn test_compact_target_tokens_context_base() {
-        // CompactBase::Context with pct 5_000 bps (50%)
-        // target = 200_000 * 5_000 / 10_000 = 100_000
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(200_000)
-            .with_threshold(8_000)
+            .with_threshold(80)
             .with_compact_target(CompactBase::Context)
-            .with_compact_target_pct(5_000);
+            .with_compact_target_pct(50);
         assert_eq!(manager.compact_target_tokens(), 100_000);
     }
 
     #[test]
     fn test_compact_target_tokens_threshold_base() {
-        // CompactBase::Threshold with pct 5_000 bps (50%)
-        // threshold = 200_000 * 8_000 / 10_000 = 160_000
-        // target   = 160_000 * 5_000 / 10_000 = 80_000
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(200_000)
-            .with_threshold(8_000)
+            .with_threshold(80)
             .with_compact_target(CompactBase::Threshold)
-            .with_compact_target_pct(5_000);
+            .with_compact_target_pct(50);
         assert_eq!(manager.compact_target_tokens(), 80_000);
     }
 
     #[test]
     fn test_compact_target_pct_clamped() {
         let compactor = TruncatingCompactor::new();
-        let manager = ContextManager::new(Arc::new(compactor)).with_compact_target_pct(100);
-        assert_eq!(manager.compact_target_pct(), 1_000);
+        let manager = ContextManager::new(Arc::new(compactor)).with_compact_target_pct(1);
+        assert_eq!(manager.compact_target_pct(), 1);
 
         let compactor2 = TruncatingCompactor::new();
-        let manager2 = ContextManager::new(Arc::new(compactor2)).with_compact_target_pct(20_000);
-        assert_eq!(manager2.compact_target_pct(), 10_000);
+        let manager2 = ContextManager::new(Arc::new(compactor2)).with_compact_target_pct(200);
+        assert_eq!(manager2.compact_target_pct(), 100);
     }
 
     #[test]
@@ -919,7 +902,7 @@ mod tests {
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor));
         assert_eq!(manager.compact_target(), CompactBase::Threshold);
-        assert_eq!(manager.compact_target_pct(), 7_000);
+        assert_eq!(manager.compact_target_pct(), 70);
     }
 
     #[tokio::test]
@@ -1004,7 +987,7 @@ mod tests {
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(1_000_000) // very large window
-            .with_threshold(8_000);
+            .with_threshold(80);
         let msgs = make_conversation(3);
         let result = manager.ensure_context_fits(msgs.clone(), 1).await;
         match result {
@@ -1025,7 +1008,7 @@ mod tests {
         // 2 messages ≈ 18 tokens, so 200 tokens is plenty of headroom.
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(200)
-            .with_threshold(1_000);
+            .with_threshold(10);
         let msgs = make_conversation(20); // 40 messages
         let result = manager.ensure_context_fits(msgs, 1).await;
         match result {
@@ -1089,11 +1072,11 @@ mod tests {
     #[test]
     fn test_build_telemetry() {
         let compactor = TruncatingCompactor::new();
-        let manager = ContextManager::new(Arc::new(compactor)).with_context_window(1_000);
+        let _manager = ContextManager::new(Arc::new(compactor)).with_context_window(1_000);
 
         let pre = make_conversation(10);
         let post = make_conversation(2);
-        let outcome = CompactionOutcome {
+        let _outcome = CompactionOutcome {
             messages: post.clone(),
             tokens_after: 100,
             tokens_saved: 800,
@@ -1102,13 +1085,8 @@ mod tests {
         };
 
         let start = Instant::now();
-        let telemetry = manager.build_telemetry(
-            CompactReason::ThresholdExceeded,
-            &pre,
-            &post,
-            &outcome,
-            start,
-        );
+        let telemetry =
+            ContextManager::build_telemetry(CompactReason::ThresholdExceeded, &pre, &post, start);
 
         assert_eq!(telemetry.trigger, CompactReason::ThresholdExceeded);
         assert_eq!(telemetry.pre_compact.total_messages, 20);

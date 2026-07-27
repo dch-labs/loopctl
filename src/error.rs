@@ -97,9 +97,18 @@ pub enum LoopError {
     /// [`tool_not_found`](LoopError::tool_not_found).
     #[error("Tool not found: {tool}. Available: {available}")]
     ToolNotFound {
-        /// The name of the requested tool (not normalised or lowercased).
+        /// The name of the requested tool.
+        ///
+        /// Preserved verbatim — no lowercasing or trimming is applied —
+        /// so the caller can display exactly what the agent asked for,
+        /// useful for case-sensitivity debugging.
         tool: String,
-        /// Available tool names, capped at ten with "… and N more" suffix.
+
+        /// Human-readable list of registered tool names.
+        ///
+        /// Formatted as a comma-separated string, capped at ten names
+        /// with a trailing "… and N more" summary for large registries.
+        /// Built by [`tool_not_found`](LoopError::tool_not_found).
         available: String,
     },
 
@@ -111,9 +120,18 @@ pub enum LoopError {
     /// [`is_recoverable`](LoopError::is_recoverable).
     #[error("Tool execution error: {tool}: {message}")]
     ToolExecution {
-        /// Name of the tool that failed (matches the [`ToolRegistry`](crate::tool::ToolRegistry) key).
+        /// Name of the tool that failed.
+        ///
+        /// Matches the key used when registering the tool in the
+        /// [`ToolRegistry`](crate::tool::ToolRegistry), so callers can
+        /// correlate the failure with a specific implementation.
         tool: String,
-        /// Description of the execution failure returned by the tool.
+
+        /// Description of the execution failure.
+        ///
+        /// The free-form message returned by the tool itself — typically
+        /// its `Err` rendering, or a wrapped IO/panic message. Use this
+        /// for logging and user-facing diagnostics.
         message: String,
     },
 
@@ -126,7 +144,15 @@ pub enum LoopError {
     /// [`is_recoverable`](LoopError::is_recoverable) because
     /// retrying the same input will produce the same result.
     #[error("Invalid input: {0}")]
-    InvalidInput(String),
+    InvalidInput(
+        /// Description of the invalid input.
+        ///
+        /// Names the field or argument that failed validation and
+        /// explains the constraint, for example `"parameter 'count'
+        /// must be non-negative"`. Rendering is stable enough for
+        /// log grep.
+        String,
+    ),
 
     /// An API call failed (e.g. LLM provider error).
     ///
@@ -137,6 +163,11 @@ pub enum LoopError {
     #[error("API error: {0}")]
     Api(
         /// Upstream error message or status description.
+        ///
+        /// The provider's own error text, or a short rendering of the
+        /// HTTP status and body. Suitable for logging and for
+        /// surfacing to the caller when a retry strategy is being
+        /// chosen.
         String,
     ),
 
@@ -147,7 +178,12 @@ pub enum LoopError {
     /// investigate why the agent is not converging.
     #[error("Max turns exceeded: {max}")]
     MaxTurnsExceeded {
-        /// The configured maximum turn count. See [`LoopConfig::max_turns`](crate::config::LoopConfig::max_turns).
+        /// The configured maximum turn count.
+        ///
+        /// Reflects the value supplied via
+        /// [`RunConfig::max_turns`](crate::engine::RunConfig::max_turns)
+        /// (or its default) when the run was started, so the caller can
+        /// decide whether to raise the limit and retry.
         max: usize,
     },
 
@@ -161,8 +197,18 @@ pub enum LoopError {
     #[error("Context window exceeded: used {used} of {limit} tokens")]
     ContextExceeded {
         /// Number of tokens consumed when the limit was exceeded.
+        ///
+        /// An estimate derived from the current message history; it
+        /// includes both the prompt and any retained tool results. Pair
+        /// with `limit` to report utilization to the caller.
         used: u64,
-        /// Maximum tokens allowed by the model. See [`LoopConfig::context_window`](crate::config::LoopConfig::context_window).
+
+        /// Maximum tokens allowed by the model.
+        ///
+        /// Sourced from
+        /// [`SessionConfig::context_window`](crate::config::SessionConfig::context_window).
+        /// When `used` exceeds this after compaction, the run cannot
+        /// continue on the current model.
         limit: u64,
     },
 
@@ -175,9 +221,18 @@ pub enum LoopError {
     /// without parsing error messages.
     #[error("Phase '{phase}' failed: {message}")]
     PhaseFailed {
-        /// Name of the phase that failed (e.g. `"pre_process"`, `"reflection"`).
+        /// Name of the phase that failed.
+        ///
+        /// One of the framework's well-known phase identifiers, such as
+        /// `"pre_process"`, `"reflection"`, or `"post_process"`. Callers
+        /// can match on this to apply phase-specific recovery.
         phase: String,
+
         /// Description of the phase failure.
+        ///
+        /// Free-form detail supplied by the failing phase — usually the
+        /// underlying error rendered to a string. Suitable for logs and
+        /// user-facing diagnostics.
         message: String,
     },
 
@@ -187,7 +242,14 @@ pub enum LoopError {
     /// connection failure, a serialization error, or a capacity limit
     /// reached in the backing store.
     #[error("Memory error: {0}")]
-    Memory(String),
+    Memory(
+        /// Description of the memory-backend failure.
+        ///
+        /// Captures the underlying store error — a database connection
+        /// failure, a serialization fault, or a capacity limit reached
+        /// in the backing store — rendered as a short diagnostic.
+        String,
+    ),
 
     /// Reflection / self-correction cycle failed.
     ///
@@ -196,7 +258,14 @@ pub enum LoopError {
     /// variant is *recoverable* — the framework may retry the
     /// reflection or fall back to a simpler strategy.
     #[error("Reflection error: {0}")]
-    Reflection(String),
+    Reflection(
+        /// Description of the reflection failure.
+        ///
+        /// Free-form detail from the reflection phase — typically the
+        /// underlying error message or a note on which correction
+        /// strategy was abandoned. Use this for logging.
+        String,
+    ),
 
     /// The agent was cancelled by the user or a shutdown signal.
     ///
@@ -216,7 +285,12 @@ pub enum LoopError {
     /// `message` field describes the detected pattern.
     #[error("Loop detected: {message}")]
     LoopDetected {
-        /// Description of the detected loop (e.g. `"Tool Read called 5 times with identical arguments"`).
+        /// Description of the detected loop.
+        ///
+        /// A human-readable summary of the repeated pattern, for
+        /// example `"Tool Read called 5 times with identical
+        /// arguments"`. Use this to explain to the caller why the agent
+        /// was halted.
         message: String,
     },
 
@@ -229,7 +303,12 @@ pub enum LoopError {
     /// to increase the limit or accept the partial result.
     #[error("Tool limit reached: {message}")]
     ToolLimitReached {
-        /// Description of the limit reached (e.g. `"Session tool limit of 100 reached"`).
+        /// Description of the limit reached.
+        ///
+        /// Names the scope (session or turn) and the cap that was hit,
+        /// for example `"Session tool limit of 100 reached"`. The caller
+        /// can use this to decide between raising the limit and
+        /// accepting the partial result.
         message: String,
     },
 
@@ -241,7 +320,12 @@ pub enum LoopError {
     /// whether to retry from the last complete message.
     #[error("Stream error: {0}")]
     StreamError(
-        /// Description of the streaming failure (network drop, malformed SSE, timeout).
+        /// Description of the streaming failure.
+        ///
+        /// Covers the common mid-stream failure modes — network drops,
+        /// malformed server-sent events, provider timeouts — rendered
+        /// as a short diagnostic string. The caller may use it to
+        /// decide whether to resume from the last complete message.
         String,
     ),
 
@@ -254,7 +338,12 @@ pub enum LoopError {
     /// configuration and retry.
     #[error("Configuration error: {0}")]
     Config(
-        /// Description of the configuration problem (e.g. `"max_turns must be > 0"`).
+        /// Description of the configuration problem.
+        ///
+        /// Names the offending field and the constraint it violated,
+        /// for example `"max_turns must be > 0"` or `"model must be
+        /// non-empty"`. Use this to guide the caller toward the exact
+        /// setting to fix.
         String,
     ),
 
@@ -265,7 +354,15 @@ pub enum LoopError {
     /// this only for truly unexpected conditions (e.g. a poisoned
     /// mutex, an allocation failure).
     #[error("{0}")]
-    Internal(String),
+    Internal(
+        /// Description of the internal error.
+        ///
+        /// A catch-all diagnostic for conditions that do not fit a more
+        /// specific variant — poisoned mutexes, allocation failures,
+        /// or invariant violations. Prefer a more specific variant
+        /// wherever possible.
+        String,
+    ),
 
     /// Rate-limit retries on the current model were exhausted.
     ///
@@ -277,9 +374,17 @@ pub enum LoopError {
     #[error("Rate-limit escalation after {attempts} retries (retry-after {retry_after:?})")]
     RateLimitEscalation {
         /// Number of rate-limit retries honored before escalating.
+        ///
+        /// Counts the 429/529 responses the stream handler retried
+        /// (honoring the provider's `Retry-After`) before giving up on
+        /// the current model and handing control to the circuit breaker.
         attempts: u32,
-        /// Last server-advised `Retry-After` hint, after clamping. Used for
-        /// diagnostics; `None` when the provider sent no header.
+
+        /// Last server-advised `Retry-After` hint, after clamping.
+        ///
+        /// Preserved for diagnostics and back-off tuning. `None` when
+        /// the provider sent no header on the final rate-limited
+        /// response.
         retry_after: Option<std::time::Duration>,
     },
 }
@@ -374,10 +479,6 @@ impl LoopError {
         matches!(self, Self::Cancelled)
     }
 }
-
-// ===================================================
-// Mutex poison recovery helper
-// ===================================================
 
 /// Recover a mutex guard from a `LockResult`, ignoring poison.
 ///

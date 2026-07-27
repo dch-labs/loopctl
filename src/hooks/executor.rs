@@ -55,7 +55,21 @@ use crate::hooks::context::{
 /// - [`Interactivity::Interactive`] — `Ask` passes through unchanged,
 ///   allowing the agent to present a prompt to the user.
 pub struct HookExecutor {
+    /// Registered hooks in the order they will be invoked.
+    ///
+    /// Stored as `Arc<dyn Hook>` so a single hook instance can be
+    /// shared across executors cheaply, and so the executor itself is
+    /// `Send + Sync`. The vector is append-only after construction and
+    /// never reordered.
     hooks: Vec<Arc<dyn Hook>>,
+
+    /// How [`HookAction::Ask`] results are handled.
+    ///
+    /// Set at construction (default
+    /// [`Interactivity::Headless`]) and applied by
+    /// [`apply_interactivity`](Self::apply_interactivity) to every
+    /// pre-tool-use result. Headless downgrades `Ask` to `Block`;
+    /// interactive passes it through unchanged.
     interactivity: Interactivity,
 }
 
@@ -78,30 +92,38 @@ impl HookExecutor {
         }
     }
 
-    /// Set the interactivity mode.
+    /// Set the interactivity mode (builder style).
     ///
-    /// Use this builder method to change the mode after construction, or
-    /// [`with_hook`](Self::with_hook) to add hooks via the builder pattern.
+    /// Overrides the default [`Interactivity::Headless`] set by
+    /// [`new`](Self::new). Switch to [`Interactivity::Interactive`] when
+    /// a human is available to confirm [`HookAction::Ask`] prompts, so
+    /// they pass through unchanged instead of being downgraded to
+    /// [`HookAction::Block`].
     #[must_use]
     pub fn with_interactivity(mut self, interactivity: Interactivity) -> Self {
         self.interactivity = interactivity;
         self
     }
 
-    /// Register a hook (builder pattern).
+    /// Register a hook via the builder pattern.
     ///
-    /// Hooks are called in registration order. Returns `self`
-    /// for chaining: `HookExecutor::new().with_hook(a).with_hook(b)`.
+    /// Appends `hook` to the end of the execution list, so hooks fire
+    /// in registration order. Returns `self` for chaining — for example
+    /// `HookExecutor::new().with_hook(a).with_hook(b)`. Use
+    /// [`register`](Self::register) instead when you need to mutate an
+    /// existing executor.
     #[must_use]
     pub fn with_hook(mut self, hook: Arc<dyn Hook>) -> Self {
         self.hooks.push(hook);
         self
     }
 
-    /// Register a hook (mutating).
+    /// Register a hook by mutating the executor in place.
     ///
-    /// Appends a hook to the end of the execution list.
-    /// Unlike [`with_hook`](Self::with_hook), this takes `&mut self`.
+    /// Appends `hook` to the end of the execution list, mirroring
+    /// [`with_hook`](Self::with_hook) but taking `&mut self` instead of
+    /// consuming the executor. Useful when hooks are registered
+    /// conditionally after construction.
     pub fn register(&mut self, hook: Arc<dyn Hook>) {
         self.hooks.push(hook);
     }
@@ -120,17 +142,15 @@ impl HookExecutor {
         }
     }
 
-    /// Number of registered hooks.
+    /// Number of hooks currently registered.
     ///
-    /// Returns 0 for a freshly constructed executor.
+    /// Returns `0` for a freshly constructed executor. Cheap (`O(1)`)
+    /// since it reads the vector length directly; safe to call from
+    /// hot paths.
     #[must_use]
     pub fn hook_count(&self) -> usize {
         self.hooks.len()
     }
-
-    // ==================================================
-    // Pre-hook checks (short-circuit on first non-None)
-    // ==================================================
 
     /// Check pre-tool-use hooks.
     ///
@@ -167,10 +187,16 @@ impl HookExecutor {
         Box::pin(async move { action })
     }
 
-    /// Check pre-compact hooks. Merges results from all hooks:
-    /// - If any hook aborts, returns immediately with abort.
-    /// - Instructions from later hooks override earlier ones.
-    /// - Additional contexts accumulate.
+    /// Check pre-compact hooks, merging every hook's [`CompactResult`].
+    ///
+    /// Unlike [`check_pre_tool_use`](Self::check_pre_tool_use), there is
+    /// no short-circuit on the first result — all hooks run, and their
+    /// results are combined: if any hook returns
+    /// [`abort: true`](CompactResult::abort), the merged result is that
+    /// abort (the first one wins, returned immediately); otherwise the
+    /// last hook's `new_instructions` overrides earlier ones, and every
+    /// hook's `additional_context` entries accumulate in registration
+    /// order.
     #[must_use]
     pub fn check_pre_compact(&self, ctx: &PreCompactContext) -> CompactResult {
         let mut result = CompactResult::allow();
@@ -203,13 +229,13 @@ impl HookExecutor {
         Box::pin(async move { result })
     }
 
-    // ==================================================
-    // Post-hook notifications (all hooks run)
-    // ==================================================
-
-    /// Notify all post-tool-use hooks.
+    /// Notify every registered post-tool-use hook.
     ///
-    /// All registered hooks are called regardless of return value.
+    /// Fires [`Hook::on_post_tool_use`] on each hook in registration
+    /// order. There is no short-circuit and no return value —
+    /// post-hooks are notification-only, so every hook always runs.
+    /// Use this for logging, metrics, and side-effects like file
+    /// tracking.
     pub fn notify_post_tool_use(&self, ctx: &PostToolUseContext) {
         for hook in &self.hooks {
             hook.on_post_tool_use(ctx);
@@ -229,27 +255,38 @@ impl HookExecutor {
         Box::pin(async {})
     }
 
-    /// Notify all post-compact hooks.
+    /// Notify every registered post-compact hook.
     ///
-    /// All registered hooks are called regardless of return value.
+    /// Fires [`Hook::on_post_compact`] on each hook in registration
+    /// order with the compaction outcome (messages removed, tokens
+    /// saved, duration). Notification-only — every hook always runs,
+    /// regardless of any prior hook's behaviour. Use it for budget
+    /// tracking and post-compaction logging.
     pub fn notify_post_compact(&self, ctx: &PostCompactContext) {
         for hook in &self.hooks {
             hook.on_post_compact(ctx);
         }
     }
 
-    /// Notify all session-start hooks.
+    /// Notify every registered session-start hook.
     ///
-    /// All registered hooks are called regardless of return value.
+    /// Fires [`Hook::on_session_start`] on each hook in registration
+    /// order, once, at the beginning of a session. Notification-only —
+    /// every hook always runs. Use it to initialize per-session state
+    /// (open resources, reset counters, emit a start log line).
     pub fn notify_session_start(&self, ctx: &SessionStartContext) {
         for hook in &self.hooks {
             hook.on_session_start(ctx);
         }
     }
 
-    /// Notify all session-end hooks.
+    /// Notify every registered session-end hook.
     ///
-    /// All registered hooks are called regardless of return value.
+    /// Fires [`Hook::on_session_end`] on each hook in registration
+    /// order, once, after the loop has terminated. Notification-only —
+    /// every hook always runs. Use it to flush resources, finalize
+    /// tracking, and emit a summary log line keyed off
+    /// [`SessionEndContext::reason`].
     pub fn notify_session_end(&self, ctx: &SessionEndContext) {
         for hook in &self.hooks {
             hook.on_session_end(ctx);

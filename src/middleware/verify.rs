@@ -29,10 +29,6 @@ use crate::tool::ToolContext;
 
 use super::{ToolDispatchContext, ToolDispatchResult, ToolMiddleware, ToolPipeline};
 
-// ===================================================
-// Verifier trait + VerifyResult
-// ===================================================
-
 /// A pluggable verifier run after write-class tools.
 ///
 /// Implement this trait to supply the verification logic for
@@ -145,10 +141,6 @@ impl Verifier for NoopVerifier {
         })
     }
 }
-
-// ===================================================
-// VerifyMiddleware
-// ===================================================
 
 /// Post-execution middleware that runs a [`Verifier`] after configured
 /// write-class tools.

@@ -13,9 +13,10 @@
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
-use loopctl::config::LoopConfig;
+use loopctl::config::SessionConfig;
 use loopctl::engine::BareLoop;
-use loopctl::engine::loop_core::Loop;
+use loopctl::engine::RunConfig;
+use loopctl::engine::core::Loop;
 use loopctl::testing::MockApiClient;
 use loopctl::tool::ToolRegistry;
 
@@ -45,7 +46,11 @@ async fn main() {
         let client =
             MockApiClient::new("repl-model").with_text_response(&format!("You said: {input}"));
 
-        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), LoopConfig::default());
+        let mut agent = BareLoop::new(
+            Arc::new(client),
+            ToolRegistry::new(),
+            SessionConfig::default(),
+        );
 
         // A fresh agent per turn means a fresh CancelSignal per turn: Ctrl-C
         // interrupts the current turn only, and the next prompt gets a clean
@@ -58,10 +63,10 @@ async fn main() {
             }
         });
 
-        match agent.run(input).await {
+        match agent.run(input, &RunConfig::default()).await {
             Ok(result) => {
                 listener.abort();
-                let output = result.final_output.unwrap_or_default();
+                let output = result.output.unwrap_or_default();
                 writeln!(&mut stdout, "{output}\n").unwrap();
             }
             Err(e) => {

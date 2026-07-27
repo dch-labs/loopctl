@@ -48,10 +48,6 @@ use crate::message::{ToolContent, ToolContentPart};
 
 use super::{ToolDispatchContext, ToolDispatchResult, ToolMiddleware, ToolPipeline};
 
-// ===================================================
-// PathExtractor trait
-// ===================================================
-
 /// Extracts the filesystem paths a tool call touches, for cache invalidation.
 ///
 /// Implement this per tool (or per tool family) to tell
@@ -116,10 +112,6 @@ impl PathExtractor for NoopPathExtractor {
     }
 }
 
-// ===================================================
-// Cache types (private)
-// ===================================================
-
 /// Cache key: the tool name plus the hash of its canonical-serialized input.
 ///
 /// Both components are required: the same input hash could theoretically
@@ -171,10 +163,6 @@ struct CacheEntry {
     /// path-evicted.
     paths: Vec<String>,
 }
-
-// ===================================================
-// MemoizingMiddleware
-// ===================================================
 
 /// Deduplicates repeat tool calls by `(tool_name, hash(canonical input))`.
 ///

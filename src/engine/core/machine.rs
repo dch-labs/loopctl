@@ -1,95 +1,18 @@
-//! Sans-IO agent-loop state machine.
+//! The sans-IO agent-loop state machine.
 //!
-//! [`LoopMachine`] owns every *decision* the agent loop makes — turn counting,
+//! [`LoopMachine`] owns every *decision* the loop makes — turn counting,
 //! max-turn enforcement, tool-call validity, stop-reason routing, compaction
 //! triggering, history accumulation, and the cancellation flag — and performs
-//! zero IO. It is advanced by feeding it outcomes via its methods; a thin IO
-//! driver (the `BareLoop` in [`crate::engine`]) runs a `match
-//! machine.next_step()` loop, performs the side effect each step requests, and
-//! feeds the result back.
-//!
-//! Because the machine is pure and [`Serialize`] + [`Deserialize`], a run can be
-//! serialized mid-flight and resumed in another process.
-//!
-//! [`Serialize`]: serde::Serialize
-//! [`Deserialize`]: serde::Deserialize
+//! zero IO. The machine is policy-free and serializes as pure state; the turn
+//! budget and compaction thresholds are passed in fresh on each
+//! [`next_step`](LoopMachine::next_step) call via [`MachinePolicy`].
 
 use serde::{Deserialize, Serialize};
 
+use super::lifecycle::{StopReason, ToolCall};
 use crate::compact::types::CompactReason;
-use crate::config::ParallelDispatchConfig;
-use crate::engine::loop_core::{StopReason, ToolCall};
 use crate::error::LoopError;
 use crate::message::{Message, MessagePart, Role, ToolContent};
-
-/// Per-run configuration.
-///
-/// The slice of agent configuration that varies across `run()` calls on the
-/// same agent (turn/token budgets, compaction policy, dispatch mode). It is
-/// owned by the machine so that the machine's decisions are self-contained and
-/// a serialized machine carries its configuration with it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunConfig {
-    /// Maximum number of turns before forcing completion.
-    ///
-    /// A safety cap on runaway loops: once the machine has taken this many
-    /// turns without the model finishing, the run ends with
-    /// [`MachineOutcome::MaxTurnsExceeded`]. Defaults to `200`. Set it per-run
-    /// to bound long-running tool loops.
-    pub max_turns: usize,
-
-    /// Maximum tokens for each API response.
-    ///
-    /// The per-response cap the driver sends to the provider, limiting the
-    /// length of a single model reply. Defaults to `16_384`.
-    pub max_tokens: u32,
-
-    /// Context window size in tokens.
-    ///
-    /// The hard upper bound on tokens the model accepts in one request. The
-    /// machine uses it as the denominator for the compaction trigger: the
-    /// [`MachineStep::Compact`] step fires once estimated context size reaches
-    /// [`compact_threshold`](Self::compact_threshold) of this window. Defaults
-    /// to `200_000`; should match the configured model's real window.
-    pub context_window: u64,
-
-    /// Threshold to trigger auto-compaction, in basis points (`0–10_000`;
-    /// `10_000` = 100% of the context window).
-    ///
-    /// The machine emits [`MachineStep::Compact`] once the current context size
-    /// exceeds this fraction of [`context_window`](Self::context_window).
-    /// Defaults to `8_000` (80%). Only consulted when
-    /// [`auto_compact`](Self::auto_compact) is `true`.
-    pub compact_threshold: u16,
-
-    /// Whether auto-compaction is enabled.
-    ///
-    /// When `false`, the machine never emits [`MachineStep::Compact`] on its
-    /// own — the host must manage context size manually (useful in tests or
-    /// fixed-length runs). When `true` (the default), the machine gates
-    /// compaction with [`compact_threshold`](Self::compact_threshold).
-    pub auto_compact: bool,
-
-    /// How independent tool calls within a single turn are dispatched.
-    ///
-    /// Controls whether the driver runs a turn's independent tool calls
-    /// sequentially or in parallel, up to a concurrency limit. See
-    /// [`ParallelDispatchConfig`].
-    pub parallel_tool_dispatch: ParallelDispatchConfig,
-}
-
-impl Default for RunConfig {
-    fn default() -> Self {
-        Self {
-            max_turns: 200,
-            max_tokens: 16_384,
-            context_window: 200_000,
-            compact_threshold: 8_000,
-            auto_compact: true,
-            parallel_tool_dispatch: ParallelDispatchConfig::default(),
-        }
-    }
-}
 
 /// One unit of work the driver must perform before feeding an outcome back.
 ///
@@ -104,7 +27,7 @@ pub enum MachineStep {
     ///
     /// The driver builds the feed (the messages actually sent to the LLM) from
     /// [`LoopMachine::history`], calls the provider, and feeds the completed
-    /// [`ModelTurn`] back via [`LoopMachine::model_response`]. `turn` is the
+    /// [`ModelResponse`] back via [`LoopMachine::model_response`]. `turn` is the
     /// 1-indexed number of the turn being requested.
     CallLLM {
         /// The 1-indexed turn number being requested.
@@ -158,7 +81,7 @@ pub enum MachineStep {
 /// A tool call awaiting dispatch, with an optional preresolved result.
 ///
 /// The machine classifies each model-emitted tool call against the names the
-/// driver reported as available ([`ModelTurn::available_tools`]). For a name the
+/// driver reported as available ([`ModelResponse::available_tools`]). For a name the
 /// driver did not advertise, the machine sets
 /// [`preresolved_result`](Self::preresolved_result) to a synthetic error
 /// [`Message`]; the driver feeds that back as the tool result without
@@ -175,7 +98,7 @@ pub struct PendingToolCall {
     /// A pre-resolved result for calls suppressed by invalid-tool-call recovery.
     ///
     /// `Some(message)` when the tool name was not in the call's
-    /// [`available_tools`](ModelTurn::available_tools): the machine has built a
+    /// [`available_tools`](ModelResponse::available_tools): the machine has built a
     /// synthetic error [`Message`] and the driver should feed it back as the
     /// tool result *without* dispatching, so the model learns the name is
     /// unknown and can correct itself. `None` for valid calls, which the driver
@@ -188,14 +111,13 @@ pub struct PendingToolCall {
 /// The driver consumes the provider's stream, accumulates the final assistant
 /// [`Message`], and packages it with its usage and stop reason into this
 /// struct. Streaming stays driver-side; the machine only ever sees a completed
-/// turn.
+/// response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
-pub struct ModelTurn {
+pub struct ModelResponse {
     /// The assistant message the model produced.
     ///
-    /// The fully-accumulated response, including any text and tool-call
-    /// [`MessagePart`] parts.
+    /// The fully-accumulated response, including any text and tool-call [`MessagePart`] parts.
     pub message: Message,
 
     /// Input tokens reported for this call.
@@ -236,29 +158,15 @@ pub enum MachineOutcome {
     /// The model finished without requesting further tools.
     ///
     /// The normal end state: the last model response carried no tool calls, so
-    /// the machine treated it as the final answer. The captured totals let a
-    /// host record exactly what the completed run cost.
+    /// the machine treated it as the final answer. Token and turn totals are
+    /// not carried here — the owning `Run` is the
+    /// single source for accounting, derived from its `turns` list.
     Completed {
         /// The final text the model produced.
         ///
         /// Concatenation of the text parts of the last assistant message. May be
         /// empty if the model's final message carried only non-text parts.
         final_text: String,
-
-        /// Total input tokens consumed across the run.
-        ///
-        /// Sum of every turn's [`ModelTurn::input_tokens`].
-        total_input_tokens: u64,
-
-        /// Total output tokens consumed across the run.
-        ///
-        /// Sum of every turn's [`ModelTurn::output_tokens`].
-        total_output_tokens: u64,
-
-        /// Number of turns executed.
-        ///
-        /// How many model calls the run made before finishing.
-        turns_taken: usize,
     },
 
     /// The run was halted because `max_turns` was reached.
@@ -266,13 +174,8 @@ pub enum MachineOutcome {
     /// The model kept requesting tools (or otherwise not finishing) until the
     /// turn budget was exhausted, so the machine stopped it rather than loop
     /// indefinitely. Usually a sign the agent isn't converging — raise
-    /// [`max_turns`](RunConfig::max_turns) or investigate the loop.
-    MaxTurnsExceeded {
-        /// Number of turns executed before the limit was hit.
-        ///
-        /// Equal to the configured [`RunConfig::max_turns`].
-        turns_taken: usize,
-    },
+    /// `max_turns` or investigate the loop.
+    MaxTurnsExceeded,
 
     /// The run was cancelled.
     ///
@@ -300,22 +203,23 @@ pub enum MachineOutcome {
 /// Where the machine is in its request/respond cycle.
 ///
 /// One value is produced at each point in the loop and is also exposed by
-/// [`LoopMachine::state`] for inspection. It is the machine's own step-protocol
-/// bookkeeping — distinct from the public `LoopState` observation surface, which
-/// a driver derives for observers.
+/// [`LoopMachine::state`] and the trait method for inspection.
+/// It is the machine's own step-protocol bookkeeping, surfaced to observers so
+/// a host can see where a run currently is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MachineState {
     /// Ready to request the next model call.
     ///
     /// The starting state, and the state the machine returns to after tool
     /// results or a compaction result are fed back — i.e. whenever it is ready
-    /// to call the model again.
+    /// to call the model again. The driver also reports this as the idle
+    /// pre-run state before the first turn.
     Start,
 
     /// A model call has been requested; awaiting the response.
     ///
     /// Entered when the machine emits [`MachineStep::CallLLM`] and left when the
-    /// driver feeds the [`ModelTurn`] back via [`LoopMachine::model_response`].
+    /// driver feeds the [`ModelResponse`] back via [`LoopMachine::model_response`].
     AwaitingModel {
         /// The 1-indexed turn number in flight.
         ///
@@ -355,27 +259,67 @@ pub enum MachineState {
     Terminal(MachineOutcome),
 }
 
-/// The sans-IO agent-loop state machine.
+/// Policy inputs passed to [`LoopMachine::next_step`] on each call.
 ///
-/// Owns the append-only history and every decision the loop makes. Construct
-/// one with [`LoopMachine::new`], then repeatedly call [`Self::next_step`] and
-/// feed the result back. The machine performs no IO; a driver is required to
-/// actually call the LLM, dispatch tools, and compact context.
+/// The machine is policy-free: it tracks state and reports facts. The turn
+/// budget and compaction thresholds live here, not on the machine, so the
+/// machine serializes as pure state. Build one from your session/run config
+/// and pass it fresh each `next_step` call.
+#[derive(Debug, Clone, Copy)]
+pub struct MachinePolicy {
+    /// Maximum turns before the run is capped.
+    ///
+    /// The turn budget for this run. The machine checks `turns_taken` against
+    /// this on every `next_step` call; reaching the cap ends the run with
+    /// [`MachineOutcome::MaxTurnsExceeded`].
+    pub max_turns: usize,
+
+    /// Model context window in tokens.
+    ///
+    /// The compaction trigger compares the current context size against this
+    /// value (via `compact_threshold`) and the 95% emergency line.
+    pub context_window: u64,
+
+    /// Compaction threshold as a percentage of the context window (0–100).
+    ///
+    /// When `context_tokens` reaches this percentage of `context_window`, the
+    /// machine emits a [`MachineStep::Compact`] with a threshold-exceeded
+    /// reason (if `auto_compact` is `true`).
+    pub compact_threshold: u8,
+
+    /// Whether automatic compaction is enabled.
+    ///
+    /// When `true` the machine emits `Compact` steps once the threshold (or the
+    /// 95% emergency line) is reached. When `false` only the emergency line
+    /// fires; threshold-compaction is left to the driver.
+    pub auto_compact: bool,
+}
+
+/// The sans-IO agent-loop state machine — pure state, no policy.
+///
+/// Owns the append-only history and tracks where the loop is in its
+/// request/respond cycle. Construct one with
+/// [`LoopMachine::from_history`], then repeatedly call
+/// [`Self::next_step`] (passing a fresh [`MachinePolicy`]) and feed the
+/// result back. The machine performs no IO and stores no policy — it
+/// serializes as pure state.
 ///
 /// # Example
 ///
-/// Driving a machine to completion (illustrative — a real driver performs IO in
-/// each arm):
+/// Driving a machine to completion (illustrative — a real driver performs IO
+/// in each arm):
 ///
 /// ```no_run
-/// # use loopctl::engine::machine::{LoopMachine, RunConfig, ModelTurn, MachineStep, MachineOutcome};
-/// # fn build_turn(_: &LoopMachine) -> ModelTurn { unimplemented!() }
-/// let mut machine = LoopMachine::new(RunConfig::default(), "Hello");
+/// # use loopctl::engine::core::{LoopMachine, MachinePolicy, ModelResponse, MachineStep, MachineOutcome};
+/// # use loopctl::message::Message;
+/// # fn build_response(_: &LoopMachine) -> ModelResponse { unimplemented!() }
+/// let policy = MachinePolicy { max_turns: 10, context_window: 200_000, compact_threshold: 80, auto_compact: true };
+/// let mut machine = LoopMachine::from_history(vec![Message::user("Hello")]);
 /// loop {
-///     match machine.next_step() {
+///     match machine.next_step(policy) {
 ///         MachineStep::CallLLM { .. } => {
-///             let turn = build_turn(&machine);
-///             machine.model_response(turn);
+///             let response = build_response(&machine);
+///             machine.model_response(response);
 ///         }
 ///         MachineStep::CallTools { .. } => {
 ///             machine.tool_results(Vec::new());
@@ -383,7 +327,7 @@ pub enum MachineState {
 ///         MachineStep::Compact { .. } => {
 ///             machine.compaction_result(machine.history().to_vec(), 0);
 ///         }
-///         MachineStep::Done(MachineOutcome::Completed { final_text, .. }) => {
+///         MachineStep::Done(MachineOutcome::Completed { final_text }) => {
 ///             assert_eq!(final_text, "Hi there");
 ///             break;
 ///         }
@@ -393,12 +337,6 @@ pub enum MachineState {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopMachine {
-    /// The per-run configuration the machine decides against.
-    ///
-    /// The turn budget, compaction policy, and dispatch mode that govern this
-    /// run. Owned by the machine so it travels with a serialized instance.
-    config: RunConfig,
-
     /// The append-only conversation history.
     ///
     /// The complete record of the run: the opening user message, every
@@ -415,32 +353,17 @@ pub struct LoopMachine {
 
     /// How many turns have completed.
     ///
-    /// The count of model responses accepted so far. Bounded by
-    /// [`RunConfig::max_turns`]; reaching that cap ends the run with
+    /// The count of model responses accepted so far. The driver checks this
+    /// against the turn budget passed to [`next_step`](Self::next_step);
+    /// reaching the cap ends the run with
     /// [`MachineOutcome::MaxTurnsExceeded`].
     turns_taken: usize,
 
-    /// Cumulative input tokens across the run, for accounting.
-    ///
-    /// Total prompt-side token consumption from every accepted turn. Reported
-    /// in [`MachineOutcome::Completed`] when the run finishes. Distinct from
-    /// [`context_tokens`](Self::context_tokens), which tracks current size for
-    /// the compaction trigger rather than lifetime consumption.
-    total_input_tokens: u64,
-
-    /// Cumulative output tokens across the run, for accounting.
-    ///
-    /// Total generation-side token consumption from every accepted turn.
-    /// Reported in [`MachineOutcome::Completed`] when the run finishes.
-    total_output_tokens: u64,
-
     /// Current context-size estimate, in tokens.
     ///
-    /// The machine's view of how large the conversation currently is, used to
-    /// decide when to compact. Compared against
-    /// [`compact_threshold`](RunConfig::compact_threshold) of
-    /// [`context_window`](RunConfig::context_window); crossing it triggers a
-    /// [`MachineStep::Compact`].
+    /// The machine's view of how large the conversation currently is.
+    /// [`next_step`](Self::next_step) compares it against the compaction
+    /// policy to decide whether to emit a [`MachineStep::Compact`].
     context_tokens: u64,
 
     /// Whether [`Self::cancel`] has been called.
@@ -458,36 +381,34 @@ pub struct LoopMachine {
 }
 
 impl LoopMachine {
-    /// Construct a machine for a new run with the given `user_input`.
+    /// Construct a machine seeded with an existing conversation history.
     ///
-    /// The user's message is appended to the (initially empty) history as the
-    /// first entry, and the first [`Self::next_step`] call requests the initial
-    /// [`MachineStep::CallLLM`] at turn 1.
+    /// The driver calls this at the top of every `run()`, passing the
+    /// session's accumulated messages so the model sees prior turns. For a
+    /// fresh single-message conversation, pass `vec![Message::user(prompt)]`.
+    ///
+    /// The machine starts in pure state: zero turns taken this run, zero
+    /// context tokens, not cancelled. The turn budget, compaction window,
+    /// and policy knobs are not stored — they are passed to
+    /// [`next_step`](Self::next_step) on each call so the machine stays
+    /// policy-free and serializes as pure state.
     #[must_use]
-    pub fn new(config: RunConfig, user_input: impl Into<String>) -> Self {
+    pub fn from_history(history: Vec<Message>) -> Self {
         Self {
-            config,
-            history: vec![Message::user(user_input)],
+            history,
             state: MachineState::Start,
             turns_taken: 0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
             context_tokens: 0,
             cancelled: false,
             pending_tools: Vec::new(),
         }
     }
 
-    /// The configuration the machine makes its decisions against.
-    ///
-    /// The driver reads it to build provider requests (e.g.
-    /// [`RunConfig::max_tokens`], [`RunConfig::parallel_tool_dispatch`]).
-    #[must_use]
-    pub fn config(&self) -> &RunConfig {
-        &self.config
-    }
-
     /// Return the next step the driver must perform.
+    ///
+    /// `policy` supplies the turn budget and compaction thresholds the machine
+    /// consults to decide between `CallLLM`, `Compact`, and `MaxTurnsExceeded`.
+    /// It is not stored — pass it fresh each call from the session/run config.
     ///
     /// This is pure and idempotent: calling it twice with no intervening feed
     /// method ([`Self::model_response`], [`Self::tool_results`],
@@ -499,7 +420,7 @@ impl LoopMachine {
     ///
     /// If [`Self::cancel`] has been called, the next call returns
     /// [`MachineStep::Done`] with [`MachineOutcome::Cancelled`].
-    pub fn next_step(&mut self) -> MachineStep {
+    pub fn next_step(&mut self, policy: MachinePolicy) -> MachineStep {
         if let MachineState::Terminal(outcome) = &self.state {
             let outcome = outcome.clone();
             return MachineStep::Done(outcome);
@@ -511,9 +432,14 @@ impl LoopMachine {
             return MachineStep::Done(outcome);
         }
 
-        let turn = self.turns_taken.saturating_add(1);
+        let turn = match &self.state {
+            MachineState::AwaitingModel { turn } => *turn,
+            _ => self.turns_taken.saturating_add(1),
+        };
         match self.state.clone() {
-            MachineState::Start | MachineState::AwaitingModel { .. } => self.request_model(turn),
+            MachineState::Start | MachineState::AwaitingModel { .. } => {
+                self.request_model(turn, policy)
+            }
             MachineState::AwaitingTools { .. } => {
                 let calls = std::mem::take(&mut self.pending_tools);
                 MachineStep::CallTools { calls }
@@ -529,14 +455,18 @@ impl LoopMachine {
     /// Returns [`MachineOutcome::MaxTurnsExceeded`] when the budget is spent,
     /// [`MachineStep::Compact`] when the context size has crossed the threshold
     /// and auto-compaction is on, or [`MachineStep::CallLLM`] otherwise.
-    fn request_model(&mut self, turn: usize) -> MachineStep {
-        if self.turns_taken >= self.config.max_turns {
-            let turns_taken = self.turns_taken;
-            let outcome = MachineOutcome::MaxTurnsExceeded { turns_taken };
+    fn request_model(&mut self, turn: usize, policy: MachinePolicy) -> MachineStep {
+        if self.turns_taken >= policy.max_turns {
+            let outcome = MachineOutcome::MaxTurnsExceeded;
             self.state = MachineState::Terminal(outcome.clone());
             return MachineStep::Done(outcome);
         }
-        if self.config.auto_compact && self.should_compact() {
+        if self.is_emergency(policy) {
+            let reason = CompactReason::Emergency;
+            self.state = MachineState::AwaitingCompaction { reason };
+            return MachineStep::Compact { reason };
+        }
+        if policy.auto_compact && self.should_compact(policy) {
             let reason = CompactReason::ThresholdExceeded;
             self.state = MachineState::AwaitingCompaction { reason };
             return MachineStep::Compact { reason };
@@ -548,20 +478,31 @@ impl LoopMachine {
     /// Decide whether the current context size warrants a compaction pass.
     ///
     /// Compares the machine's current context-size estimate against the
-    /// configured [`compact_threshold`](RunConfig::compact_threshold) of the
-    /// [`context_window`](RunConfig::context_window): returns `true` when the
-    /// estimate has grown past that fraction of the window, signalling that the
-    /// next step should be [`MachineStep::Compact`] rather than another model
-    /// call. Returns `false` when compaction is disabled by a zero threshold or
-    /// window, or when the context still fits comfortably.
-    fn should_compact(&self) -> bool {
-        const BASIS: u128 = 10_000;
-        if self.config.context_window == 0 || self.config.compact_threshold == 0 {
+    /// configured `compact_threshold` of the model's context window: returns
+    /// `true` when the estimate has grown past that fraction of the window,
+    /// signalling that the next step should be [`MachineStep::Compact`] rather
+    /// than another model call. Returns `false` when compaction is disabled by
+    /// a zero threshold or window, or when the context still fits comfortably.
+    fn should_compact(&self, policy: MachinePolicy) -> bool {
+        if policy.context_window == 0 || policy.compact_threshold == 0 {
             return false;
         }
-        let limit = u128::from(self.config.compact_threshold)
-            .saturating_mul(u128::from(self.config.context_window));
-        u128::from(self.context_tokens).saturating_mul(BASIS) > limit
+        let limit = policy
+            .context_window
+            .saturating_mul(u64::from(policy.compact_threshold))
+            / 100;
+        self.context_tokens > limit
+    }
+
+    /// Whether the context is in the emergency zone (≥ 95% of the window).
+    ///
+    /// Fires regardless of `auto_compact` or the configured threshold — a
+    /// safety net against context overflow.
+    fn is_emergency(&self, policy: MachinePolicy) -> bool {
+        if policy.context_window == 0 {
+            return false;
+        }
+        self.context_tokens >= policy.context_window.saturating_mul(95) / 100
     }
 
     /// Feed a completed model call back into the machine.
@@ -574,31 +515,32 @@ impl LoopMachine {
     /// [`MachineStep::CallTools`].
     ///
     /// Has no effect once the machine is terminal.
-    pub fn model_response(&mut self, turn: ModelTurn) {
+    pub fn model_response(&mut self, response: ModelResponse) {
         if self.is_terminal() {
             return;
         }
 
-        let message = turn.message;
-        let tool_calls = Self::extract_tool_calls(&message);
+        let message = response.message;
+        let tool_calls: Vec<ToolCall> = message
+            .tool_call_parts()
+            .into_iter()
+            .map(|(id, tool, input)| ToolCall {
+                id: id.to_string(),
+                tool: tool.to_string(),
+                input: input.clone(),
+            })
+            .collect();
         self.history.push(message);
-        self.total_input_tokens = self.total_input_tokens.saturating_add(turn.input_tokens);
-        self.total_output_tokens = self.total_output_tokens.saturating_add(turn.output_tokens);
-        self.context_tokens = turn.input_tokens;
+        self.context_tokens = response.input_tokens;
         self.turns_taken = self.turns_taken.saturating_add(1);
 
         if tool_calls.is_empty() {
             let final_text = self
                 .history
                 .last()
-                .map(Self::extract_text)
+                .map(Message::text_content)
                 .unwrap_or_default();
-            let outcome = MachineOutcome::Completed {
-                final_text,
-                total_input_tokens: self.total_input_tokens,
-                total_output_tokens: self.total_output_tokens,
-                turns_taken: self.turns_taken,
-            };
+            let outcome = MachineOutcome::Completed { final_text };
             self.state = MachineState::Terminal(outcome);
             return;
         }
@@ -606,7 +548,7 @@ impl LoopMachine {
         let turn_number = self.turns_taken;
         self.pending_tools = tool_calls
             .into_iter()
-            .map(|call| Self::classify(call, &turn.available_tools))
+            .map(|call| Self::classify(call, &response.available_tools))
             .collect();
         self.state = MachineState::AwaitingTools { turn: turn_number };
     }
@@ -624,6 +566,23 @@ impl LoopMachine {
         self.history.extend(messages);
         self.pending_tools.clear();
         self.state = MachineState::Start;
+    }
+
+    /// Inject an arbitrary message into the history.
+    ///
+    /// The driver calls this to add a message that did not come from a model
+    /// response, a tool result, or a compaction pass — for example a host
+    /// steering message, or the output of a [`ContextContributor`] that
+    /// re-emits the agent's goal before the next turn. The message becomes part
+    /// of the record the driver builds the feed from on the next
+    /// [`MachineStep::CallLLM`]. Has no effect once the machine is terminal.
+    ///
+    /// [`ContextContributor`]: crate::engine::ContextContributor
+    pub fn inject(&mut self, message: Message) {
+        if self.is_terminal() {
+            return;
+        }
+        self.history.push(message);
     }
 
     /// Feed compacted history back into the machine.
@@ -651,6 +610,22 @@ impl LoopMachine {
     /// machine's state reflects the abort rather than resuming the partial step.
     pub fn cancel(&mut self) {
         self.cancelled = true;
+    }
+
+    /// Record a terminal failure in the machine's state.
+    ///
+    /// A driver that hits an unrecoverable error (stream failure, dispatch
+    /// error, compaction overflow) calls this so the machine transitions to
+    /// [`MachineState::Terminal`] with [`MachineOutcome::Failed`] carrying
+    /// `error`. Without this, a serialized machine that errored has no failure
+    /// record and would resume as if the error never happened. The driver
+    /// still returns the error from `run()`; this call ensures the machine's
+    /// own state agrees. Has no effect once the machine is already terminal.
+    pub fn fail(&mut self, error: LoopError) {
+        if self.is_terminal() {
+            return;
+        }
+        self.state = MachineState::Terminal(MachineOutcome::Failed { error });
     }
 
     /// Whether [`Self::cancel`] has been called.
@@ -691,24 +666,6 @@ impl LoopMachine {
     #[must_use]
     pub fn turns_taken(&self) -> usize {
         self.turns_taken
-    }
-
-    /// Total input tokens accumulated so far.
-    ///
-    /// The run's lifetime input consumption, for accounting. Also carried in
-    /// [`MachineOutcome::Completed`] once the run ends.
-    #[must_use]
-    pub fn total_input_tokens(&self) -> u64 {
-        self.total_input_tokens
-    }
-
-    /// Total output tokens accumulated so far.
-    ///
-    /// The run's total generation cost, for accounting. Also carried in
-    /// [`MachineOutcome::Completed`] once the run ends.
-    #[must_use]
-    pub fn total_output_tokens(&self) -> u64 {
-        self.total_output_tokens
     }
 
     /// Whether the machine has reached a terminal outcome.
@@ -761,41 +718,6 @@ impl LoopMachine {
             )],
         )
     }
-
-    /// Concatenate every text part of a message into a single string.
-    ///
-    /// Walks the message's parts in order and joins all text content, skipping
-    /// non-text parts (tool calls, tool results, images) entirely. Used to
-    /// derive the final answer text from the model's last response.
-    fn extract_text(message: &Message) -> String {
-        message
-            .parts
-            .iter()
-            .filter_map(|part| part.as_text())
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    /// Collect the tool calls a message requests, in order.
-    ///
-    /// Scans the message's parts for tool-call parts and maps each to a
-    /// [`ToolCall`] (carrying its id, tool name, and JSON input). Returns an
-    /// empty vector when the message contains no tool calls — the signal that
-    /// the turn is complete rather than a request to dispatch tools.
-    fn extract_tool_calls(message: &Message) -> Vec<ToolCall> {
-        message
-            .parts
-            .iter()
-            .filter_map(|part| match part {
-                MessagePart::ToolCall { id, name, input } => Some(ToolCall {
-                    id: id.clone(),
-                    tool: name.clone(),
-                    input: input.clone(),
-                }),
-                _ => None,
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -803,18 +725,21 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    fn small_machine(max_turns: usize) -> LoopMachine {
-        LoopMachine::new(
-            RunConfig {
-                max_turns,
-                ..RunConfig::default()
-            },
-            "hello",
-        )
+    fn small_machine(_max_turns: usize) -> LoopMachine {
+        LoopMachine::from_history(vec![Message::user("hello")])
     }
 
-    fn text_turn(text: &str, input_tokens: u64, output_tokens: u64) -> ModelTurn {
-        ModelTurn {
+    fn test_policy(max_turns: usize) -> MachinePolicy {
+        MachinePolicy {
+            max_turns,
+            context_window: 200_000,
+            compact_threshold: 80,
+            auto_compact: true,
+        }
+    }
+
+    fn text_response(text: &str, input_tokens: u64, output_tokens: u64) -> ModelResponse {
+        ModelResponse {
             message: Message::assistant(text),
             input_tokens,
             output_tokens,
@@ -823,9 +748,9 @@ mod tests {
         }
     }
 
-    fn tool_turn(tool: &str, available: &[&str], input_tokens: u64) -> ModelTurn {
+    fn tool_response(tool: &str, available: &[&str], input_tokens: u64) -> ModelResponse {
         let part = MessagePart::tool_call("call_1", tool, Value::Object(serde_json::Map::new()));
-        ModelTurn {
+        ModelResponse {
             message: Message::new(Role::Assistant, vec![part]),
             input_tokens,
             output_tokens: 10,
@@ -840,8 +765,8 @@ mod tests {
 
     #[test]
     fn calling_llm_from_new_emits_call_llm_step() {
-        let mut machine = LoopMachine::new(RunConfig::default(), "hello");
-        let step = machine.next_step();
+        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        let step = machine.next_step(test_policy(5));
         let MachineStep::CallLLM { turn } = step else {
             panic!("expected CallLLM, got {step:?}");
         };
@@ -851,23 +776,20 @@ mod tests {
 
     #[test]
     fn machine_api_has_no_async_no_tokio_no_apiclient() {
-        // If any driving method were async or needed a client/runtime, this
-        // body would not compile or would require a tokio context. It touches
-        // only the pure machine surface.
-        let mut machine = LoopMachine::new(RunConfig::default(), "hello");
-        assert!(matches!(machine.next_step(), MachineStep::CallLLM { .. }));
-        machine.model_response(text_turn("hi", 5, 3));
+        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        assert!(matches!(
+            machine.next_step(test_policy(5)),
+            MachineStep::CallLLM { .. }
+        ));
+        machine.model_response(text_response("hi", 5, 3));
         // A text-only turn completes the run, so the machine is terminal.
         assert!(machine.is_terminal());
         assert_eq!(machine.turns_taken(), 1);
-        assert_eq!(machine.total_input_tokens(), 5);
-        assert_eq!(machine.total_output_tokens(), 3);
         assert_eq!(machine.history().len(), 2);
         assert!(matches!(
             machine.state(),
             MachineState::Terminal(MachineOutcome::Completed { .. })
         ));
-        assert_eq!(machine.config().max_turns, RunConfig::default().max_turns);
         machine.cancel();
         assert!(machine.is_cancelled());
     }
@@ -875,26 +797,24 @@ mod tests {
     #[test]
     fn resume_after_model_response_round_trips() {
         let mut machine = small_machine(5);
-        let _ = machine.next_step();
-        machine.model_response(tool_turn("echo", &["echo"], 10));
-        // Now AwaitingTools.
+        let _ = machine.next_step(test_policy(5));
+        machine.model_response(tool_response("echo", &["echo"], 10));
         let snapshot = serde_json::to_string(&machine).expect("serialize");
         let mut restored: LoopMachine = serde_json::from_str(&snapshot).expect("deserialize");
-        let a = machine.next_step();
-        let b = restored.next_step();
+        let a = machine.next_step(test_policy(5));
+        let b = restored.next_step(test_policy(5));
         assert!(same_step(&a, &b), "steps diverged after round-trip");
     }
 
     #[test]
     fn resume_after_tool_results_round_trips() {
         let mut machine = small_machine(5);
-        let _ = machine.next_step();
-        machine.model_response(tool_turn("echo", &["echo"], 10));
-        let step = machine.next_step();
+        let _ = machine.next_step(test_policy(5));
+        machine.model_response(tool_response("echo", &["echo"], 10));
+        let step = machine.next_step(test_policy(5));
         let MachineStep::CallTools { calls } = &step else {
             panic!("expected CallTools, got {step:?}");
         };
-        // Synthesize the tool-result message the driver would build.
         let results: Vec<Message> = calls
             .iter()
             .map(|c| {
@@ -911,35 +831,33 @@ mod tests {
         machine.tool_results(results);
         let snapshot = serde_json::to_string(&machine).expect("serialize");
         let mut restored: LoopMachine = serde_json::from_str(&snapshot).expect("deserialize");
-        let a = machine.next_step();
-        let b = restored.next_step();
+        let a = machine.next_step(test_policy(5));
+        let b = restored.next_step(test_policy(5));
         assert!(same_step(&a, &b), "steps diverged after round-trip");
     }
 
     #[test]
     fn resume_after_compaction_result_round_trips() {
-        // window = 100, threshold = 0.5 ⇒ compact once tokens > 50.
-        let mut machine = LoopMachine::new(
-            RunConfig {
-                max_turns: 5,
-                context_window: 100,
-                compact_threshold: 5_000,
-                auto_compact: true,
-                ..RunConfig::default()
-            },
-            "hello",
-        );
-        // Drive a tool-call turn past the threshold so the next step compacts.
-        let _ = machine.next_step(); // CallLLM
-        machine.model_response(tool_turn("echo", &["echo"], 60)); // AwaitingTools
-        let _ = machine.next_step(); // CallTools
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: true,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        let _ = machine.next_step(policy); // CallLLM
+        machine.model_response(tool_response("echo", &["echo"], 60)); // AwaitingTools
+        let _ = machine.next_step(policy); // CallTools
         machine.tool_results(vec![Message::user("tool-out")]); // → Start
-        assert!(matches!(machine.next_step(), MachineStep::Compact { .. }));
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::Compact { .. }
+        ));
         machine.compaction_result(vec![Message::user("compacted")], 0);
         let snapshot = serde_json::to_string(&machine).expect("serialize");
         let mut restored: LoopMachine = serde_json::from_str(&snapshot).expect("deserialize");
-        let a = machine.next_step();
-        let b = restored.next_step();
+        let a = machine.next_step(policy);
+        let b = restored.next_step(policy);
         assert!(same_step(&a, &b), "steps diverged after round-trip");
     }
 
@@ -948,25 +866,23 @@ mod tests {
         let mut machine = small_machine(2);
         // Turn 1.
         assert!(matches!(
-            machine.next_step(),
+            machine.next_step(test_policy(2)),
             MachineStep::CallLLM { turn: 1 }
         ));
-        machine.model_response(tool_turn("echo", &["echo"], 1));
-        let _ = machine.next_step();
+        machine.model_response(tool_response("echo", &["echo"], 1));
+        let _ = machine.next_step(test_policy(2));
         machine.tool_results(vec![Message::user("r")]);
         // Turn 2.
         assert!(matches!(
-            machine.next_step(),
+            machine.next_step(test_policy(2)),
             MachineStep::CallLLM { turn: 2 }
         ));
-        machine.model_response(tool_turn("echo", &["echo"], 1));
-        let _ = machine.next_step();
+        machine.model_response(tool_response("echo", &["echo"], 1));
+        let _ = machine.next_step(test_policy(2));
         machine.tool_results(vec![Message::user("r")]);
         // Turn 3 must be denied.
-        match machine.next_step() {
-            MachineStep::Done(MachineOutcome::MaxTurnsExceeded { turns_taken }) => {
-                assert_eq!(turns_taken, 2);
-            }
+        match machine.next_step(test_policy(2)) {
+            MachineStep::Done(MachineOutcome::MaxTurnsExceeded) => {}
             other => panic!("expected MaxTurnsExceeded, got {other:?}"),
         }
         assert!(machine.is_terminal());
@@ -975,25 +891,56 @@ mod tests {
     #[test]
     fn cancel_returns_done_cancelled_at_next_step() {
         let mut machine = small_machine(5);
-        let _ = machine.next_step();
+        let _ = machine.next_step(test_policy(5));
         machine.cancel();
-        match machine.next_step() {
+        match machine.next_step(test_policy(5)) {
             MachineStep::Done(MachineOutcome::Cancelled) => {}
             other => panic!("expected Done(Cancelled), got {other:?}"),
         }
         // Idempotent: stays terminal-cancelled.
         assert!(matches!(
-            machine.next_step(),
+            machine.next_step(test_policy(5)),
             MachineStep::Done(MachineOutcome::Cancelled)
         ));
     }
 
     #[test]
+    fn fail_returns_done_failed_at_next_step() {
+        let mut machine = small_machine(5);
+        let _ = machine.next_step(test_policy(5));
+        let err = LoopError::Api("stream failed".to_string());
+        machine.fail(err.clone());
+        match machine.next_step(test_policy(5)) {
+            MachineStep::Done(MachineOutcome::Failed { error }) => {
+                assert_eq!(error, err);
+            }
+            other => panic!("expected Done(Failed), got {other:?}"),
+        }
+        assert!(machine.is_terminal());
+    }
+
+    #[test]
+    fn failed_outcome_survives_round_trip() {
+        let mut machine = small_machine(5);
+        let _ = machine.next_step(test_policy(5));
+        let err = LoopError::Api("stream failed".to_string());
+        machine.fail(err.clone());
+        let snapshot = serde_json::to_string(&machine).expect("serialize");
+        let mut restored: LoopMachine = serde_json::from_str(&snapshot).expect("deserialize");
+        match restored.next_step(test_policy(5)) {
+            MachineStep::Done(MachineOutcome::Failed { error }) => {
+                assert_eq!(error, err, "failure record survives round-trip");
+            }
+            other => panic!("expected Done(Failed) after resume, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_tool_call_gets_preresolved_result() {
         let mut machine = small_machine(5);
-        let _ = machine.next_step();
-        machine.model_response(tool_turn("ghost", &["echo", "ls"], 3));
-        let step = machine.next_step();
+        let _ = machine.next_step(test_policy(5));
+        machine.model_response(tool_response("ghost", &["echo", "ls"], 3));
+        let step = machine.next_step(test_policy(5));
         let MachineStep::CallTools { calls } = step else {
             panic!("expected CallTools, got {step:?}");
         };
@@ -1012,9 +959,9 @@ mod tests {
     #[test]
     fn known_tool_call_emits_plain_pending_call() {
         let mut machine = small_machine(5);
-        let _ = machine.next_step();
-        machine.model_response(tool_turn("echo", &["echo", "ls"], 3));
-        let step = machine.next_step();
+        let _ = machine.next_step(test_policy(5));
+        machine.model_response(tool_response("echo", &["echo", "ls"], 3));
+        let step = machine.next_step(test_policy(5));
         let MachineStep::CallTools { calls } = step else {
             panic!("expected CallTools, got {step:?}");
         };
@@ -1028,25 +975,24 @@ mod tests {
     #[test]
     fn compaction_triggered_when_tokens_exceed_threshold() {
         // window = 100, threshold = 0.5 ⇒ compact once tokens > 50.
-        let mut machine = LoopMachine::new(
-            RunConfig {
-                max_turns: 5,
-                context_window: 100,
-                compact_threshold: 5_000,
-                auto_compact: true,
-                ..RunConfig::default()
-            },
-            "hello",
-        );
-        // First step: no tokens yet (0 > 50 is false) ⇒ CallLLM, not Compact.
-        assert!(matches!(machine.next_step(), MachineStep::CallLLM { .. }));
-        // A tool-call turn keeps the run going and accumulates 60 input tokens
-        // (exceeds 50). A text-only turn would complete the run instead.
-        machine.model_response(tool_turn("echo", &["echo"], 60));
-        assert!(matches!(machine.next_step(), MachineStep::CallTools { .. }));
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: true,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::CallLLM { .. }
+        ));
+        machine.model_response(tool_response("echo", &["echo"], 60));
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::CallTools { .. }
+        ));
         machine.tool_results(vec![Message::user("tool-out")]);
-        // The next step must compact before calling the model again.
-        match machine.next_step() {
+        match machine.next_step(policy) {
             MachineStep::Compact { reason } => {
                 assert_eq!(reason, CompactReason::ThresholdExceeded);
             }
@@ -1055,24 +1001,51 @@ mod tests {
     }
 
     #[test]
+    fn emergency_compaction_fires_at_95_percent() {
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: false,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::CallLLM { .. }
+        ));
+        machine.model_response(tool_response("echo", &["echo"], 96));
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::CallTools { .. }
+        ));
+        machine.tool_results(vec![Message::user("r")]);
+        match machine.next_step(policy) {
+            MachineStep::Compact { reason } => {
+                assert_eq!(reason, CompactReason::Emergency);
+            }
+            other => panic!("expected emergency Compact, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn compaction_result_replaces_history() {
-        // window = 100, threshold = 0.5 ⇒ compact once tokens > 50.
-        let mut machine = LoopMachine::new(
-            RunConfig {
-                max_turns: 5,
-                context_window: 100,
-                compact_threshold: 5_000,
-                auto_compact: true,
-                ..RunConfig::default()
-            },
-            "hello",
-        );
+        // window = 100, threshold = 50 ⇒ compact once tokens > 50.
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: true,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
         // Drive a tool-call turn past the threshold so the next step compacts.
-        let _ = machine.next_step(); // CallLLM
-        machine.model_response(tool_turn("echo", &["echo"], 60)); // AwaitingTools
-        let _ = machine.next_step(); // CallTools
+        let _ = machine.next_step(policy); // CallLLM
+        machine.model_response(tool_response("echo", &["echo"], 60)); // AwaitingTools
+        let _ = machine.next_step(policy); // CallTools
         machine.tool_results(vec![Message::user("tool-out")]); // → Start
-        assert!(matches!(machine.next_step(), MachineStep::Compact { .. }));
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::Compact { .. }
+        ));
         let compacted = vec![Message::user("compacted-only")];
         machine.compaction_result(compacted.clone(), 0);
         // Compare by serialized form: Message is not PartialEq.
@@ -1080,15 +1053,18 @@ mod tests {
         let want = serde_json::to_string(&compacted).expect("serialize expected");
         assert_eq!(got, want, "history must be replaced by the compacted slice");
         // After compaction the next step is the deferred CallLLM.
-        assert!(matches!(machine.next_step(), MachineStep::CallLLM { .. }));
+        assert!(matches!(
+            machine.next_step(test_policy(5)),
+            MachineStep::CallLLM { .. }
+        ));
     }
 
     #[test]
     fn history_accumulates_user_assistant_tool_round() {
         let mut machine = small_machine(5);
-        let _ = machine.next_step();
-        machine.model_response(tool_turn("echo", &["echo"], 1));
-        let step = machine.next_step();
+        let _ = machine.next_step(test_policy(5));
+        machine.model_response(tool_response("echo", &["echo"], 1));
+        let step = machine.next_step(test_policy(5));
         let MachineStep::CallTools { calls } = step else {
             panic!("expected CallTools, got {step:?}");
         };
@@ -1126,5 +1102,130 @@ mod tests {
             let back: CompactReason = serde_json::from_str(&text).expect("deserialize");
             assert_eq!(back, reason);
         }
+    }
+
+    fn make_call() -> ToolCall {
+        ToolCall {
+            id: "test".to_string(),
+            tool: "Read".to_string(),
+            input: serde_json::json!({"path": "/tmp"}),
+        }
+    }
+
+    #[test]
+    fn input_fix_accepts_json_object() {
+        use crate::reflection::{Correction, CorrectionResult, CorrectionType};
+        let mut call = ToolCall {
+            id: "test".to_string(),
+            tool: "Read".to_string(),
+            input: serde_json::json!({"path": "/tmp"}),
+        };
+        let correction = Correction {
+            correction_type: CorrectionType::InputFix,
+            description: "fix path".into(),
+            modified_input: Some(serde_json::json!({"path": "/tmp/fixed"})),
+            alternative_tool: None,
+            guidance: None,
+        };
+        let result = call.apply_correction(&correction);
+        assert!(matches!(result, CorrectionResult::Applied));
+        assert_eq!(call.input, serde_json::json!({"path": "/tmp/fixed"}));
+    }
+
+    #[test]
+    fn input_fix_fails_when_modified_input_missing() {
+        use crate::reflection::{Correction, CorrectionResult, CorrectionType};
+        let mut call = make_call();
+        let correction = Correction {
+            correction_type: CorrectionType::InputFix,
+            description: "fix path".into(),
+            modified_input: None,
+            alternative_tool: None,
+            guidance: None,
+        };
+        let result = call.apply_correction(&correction);
+        assert!(matches!(result, CorrectionResult::Failed(_)));
+    }
+
+    #[test]
+    fn input_fix_fails_when_modified_input_not_object() {
+        use crate::reflection::{Correction, CorrectionResult, CorrectionType};
+        let mut call = make_call();
+        let correction = Correction {
+            correction_type: CorrectionType::InputFix,
+            description: "fix path".into(),
+            modified_input: Some(serde_json::json!("not an object")),
+            alternative_tool: None,
+            guidance: None,
+        };
+        let result = call.apply_correction(&correction);
+        assert!(matches!(result, CorrectionResult::Failed(_)));
+    }
+
+    #[test]
+    fn tool_change_swaps_tool_name() {
+        use crate::reflection::{Correction, CorrectionResult, CorrectionType};
+        let mut call = make_call();
+        let correction = Correction {
+            correction_type: CorrectionType::ToolChange,
+            description: "use alt tool".into(),
+            modified_input: None,
+            alternative_tool: Some("Write".into()),
+            guidance: None,
+        };
+        let result = call.apply_correction(&correction);
+        assert!(matches!(result, CorrectionResult::Applied));
+        assert_eq!(call.tool, "Write");
+    }
+
+    #[test]
+    fn tool_change_fails_without_alternative() {
+        use crate::reflection::{Correction, CorrectionResult, CorrectionType};
+        let mut call = make_call();
+        let correction = Correction {
+            correction_type: CorrectionType::ToolChange,
+            description: "use alt tool".into(),
+            modified_input: None,
+            alternative_tool: None,
+            guidance: None,
+        };
+        let result = call.apply_correction(&correction);
+        assert!(matches!(result, CorrectionResult::Failed(_)));
+    }
+
+    #[test]
+    fn prerequisite_fix_approach_change_escalate_all_skip() {
+        use crate::reflection::{Correction, CorrectionResult, CorrectionType};
+        let mut call = make_call();
+        for ct in [
+            CorrectionType::PrerequisiteFix,
+            CorrectionType::ApproachChange,
+            CorrectionType::Escalate,
+        ] {
+            let correction = Correction {
+                correction_type: ct,
+                description: "n/a".into(),
+                modified_input: None,
+                alternative_tool: None,
+                guidance: None,
+            };
+            let result = call.apply_correction(&correction);
+            assert!(
+                matches!(result, CorrectionResult::Skipped),
+                "{ct:?} should skip"
+            );
+        }
+    }
+
+    #[test]
+    fn configs_carry_no_model_field() {
+        use crate::config::SessionConfig;
+        let session = SessionConfig::default();
+        let _: &Option<String> = &session.system_prompt;
+        let _: u64 = session.context_window;
+
+        let run = crate::engine::RunConfig::default();
+        let _: usize = run.max_turns;
+        let _ = run.parallel_tool_dispatch;
     }
 }

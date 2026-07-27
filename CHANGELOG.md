@@ -383,15 +383,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Fixed
 
-- OpenAI streaming corrupted tool-call arguments that arrived across more
-  than one chunk. The `StreamEmitter` opened a `PartStart` for the tool
-  call on every chunk carrying a `function` field (which is all of them,
-  including argument-fragment chunks), so each fragment after the first
-  re-opened the part and wiped the previously buffered JSON in the
-  downstream `StreamAccumulator`. The emitter now tracks each tool call's
-  `index` and emits `PartStart` exactly once per call; argument fragments
-  append to the buffer as intended and the complete JSON parses at
-  `PartStop`.
+- OpenAI streaming silently dropped every multi-chunk tool-call argument
+  fragment after the first, truncating the tool input JSON. The
+  deserialization structs declared `id` (on the tool-call delta) and
+  `name` (on the function object) as required `String` fields, but the
+  real OpenAI streaming protocol omits both on continuation chunks —
+  those carry only `index` and an `arguments` fragment. Serde rejected
+  those chunks with `missing field`, `OpenAiChunk::parse` returned
+  `None`, and the stream loop silently skipped them, leaving the
+  accumulated JSON incomplete. Both fields are now `Option<String>` with
+  `#[serde(default)]`; the emitter latches `id` and `name` on the first
+  chunk for each `index` and ignores them on continuations.
+- OpenAI streaming re-opened a tool-call part on every chunk carrying a
+  `function` field. Because every chunk (including argument-fragment
+  continuations) carries `function`, the `StreamEmitter` emitted
+  `PartStart` for each one, which wiped the downstream accumulator's
+  buffered JSON. The emitter now tracks each tool call's `index` and
+  emits `PartStart` exactly once per call.
 - `StreamAccumulator` dropped parallel tool calls whose argument fragments
   arrived interleaved (the shape OpenAI streams for
   `parallel_tool_calls`). The accumulator tracked a single in-progress

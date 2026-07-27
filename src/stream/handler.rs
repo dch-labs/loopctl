@@ -1554,19 +1554,10 @@ impl StreamHandler {
     pub fn stream_turn<'a, C: ApiClient>(
         &'a self,
         client: &'a C,
-        request: crate::api::StreamRequest,
+        request: &'a crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
         cancel: &'a Arc<CancelSignal>,
     ) -> Pin<Box<dyn Stream<Item = Result<HandlerEvent, StreamHandlerError>> + Send + 'a>> {
-        let crate::api::StreamRequest {
-            messages: conversation,
-            system,
-            tools: tool_schemas,
-        } = request;
-        // `checked_add` returns `None` when the timeout (e.g. `Duration::MAX`
-        // in the passthrough handler) would overflow `Instant`. Treat that as
-        // "no total deadline" (`None`) rather than wrapping to `Instant::now()`
-        // (which would immediately fire a spurious TotalTimeout).
         let total_deadline = Instant::now().checked_add(self.timeout_config.total_stream_timeout);
         let stream_start = Instant::now();
         let max_attempts = self.retry_config.max_retries.saturating_add(1);
@@ -1598,11 +1589,6 @@ impl StreamHandler {
                 first_attempt = false;
 
                 self.gate_on_rate_limit(client, cancel, total_deadline).await?;
-                let request = crate::api::StreamRequest {
-                    messages: conversation.clone(),
-                    system: system.clone(),
-                    tools: tool_schemas.clone(),
-                };
                 let mut stream =
                     client.stream_messages_with_options(request, options.clone());
 
@@ -1667,11 +1653,6 @@ impl StreamHandler {
 
                             if transport_attempts >= max_attempts.saturating_sub(1) {
                                 if self.timeout_config.fallback_to_non_streaming {
-                                    let request = crate::api::StreamRequest {
-                                        messages: conversation.clone(),
-                                        system: system.clone(),
-                                        tools: tool_schemas.clone(),
-                                    };
                                     let (message, fallback_stop_reason) = self.fallback_non_streaming(
                                         client,
                                         request,
@@ -1939,7 +1920,7 @@ impl StreamHandler {
     async fn fallback_non_streaming<C: ApiClient>(
         &self,
         client: &C,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
         cancel: &Arc<CancelSignal>,
         stream_outcome: Option<StreamOutcome>,
     ) -> Result<(Message, StreamStopReason), StreamHandlerError> {
@@ -2072,7 +2053,7 @@ mod tests {
         async fn drive_turn<C: ApiClient>(
             &self,
             client: &C,
-            request: crate::api::StreamRequest,
+            request: &crate::api::StreamRequest,
             cancel: &Arc<CancelSignal>,
         ) -> Result<DriveResult, StreamHandlerError> {
             let mut stream = self.stream_turn(
@@ -2597,7 +2578,7 @@ mod tests {
 
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> std::pin::Pin<
             Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
         > {
@@ -2607,7 +2588,7 @@ mod tests {
 
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
         > {
@@ -2638,7 +2619,7 @@ mod tests {
         let (message, stop_reason) = handler
             .fallback_non_streaming(
                 &client,
-                crate::api::StreamRequest::new(vec![]),
+                &crate::api::StreamRequest::new(vec![]),
                 &cancel,
                 Some(StreamOutcome::InitFailed {
                     last_error: "stream failed".to_string(),
@@ -2679,7 +2660,7 @@ mod tests {
         let err = handler
             .fallback_non_streaming(
                 &client,
-                crate::api::StreamRequest::new(vec![]),
+                &crate::api::StreamRequest::new(vec![]),
                 &cancel,
                 None,
             )
@@ -2707,7 +2688,7 @@ mod tests {
         let err = handler
             .fallback_non_streaming(
                 &client,
-                crate::api::StreamRequest::new(vec![]),
+                &crate::api::StreamRequest::new(vec![]),
                 &cancel,
                 Some(StreamOutcome::InitFailed {
                     last_error: "stream timeout".to_string(),
@@ -2744,9 +2725,10 @@ mod tests {
         let client = HandlerMock::new().with_text_response("hello");
         let cancel = Arc::new(CancelSignal::new());
 
+        let req = crate::api::StreamRequest::new(vec![]);
         let mut stream = handler.stream_turn(
             &client,
-            crate::api::StreamRequest::new(vec![]),
+            &req,
             crate::structured::RequestOptions::default(),
             &cancel,
         );
@@ -2784,13 +2766,13 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            request: crate::api::StreamRequest,
+            request: &crate::api::StreamRequest,
         ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
             self.stream_messages_with_options(request, crate::structured::RequestOptions::default())
         }
         fn create_message(
             &self,
-            request: crate::api::StreamRequest,
+            request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
         > {
@@ -2798,7 +2780,7 @@ mod tests {
         }
         fn stream_messages_with_options(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
             _options: crate::structured::RequestOptions,
         ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
             use std::sync::atomic::Ordering;
@@ -2822,7 +2804,7 @@ mod tests {
         }
         fn create_message_with_options(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
             _options: crate::structured::RequestOptions,
         ) -> Pin<
             Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
@@ -2845,9 +2827,10 @@ mod tests {
         let client = RetryingMock { attempts };
         let cancel = Arc::new(CancelSignal::new());
 
+        let req = crate::api::StreamRequest::new(vec![]);
         let mut stream = handler.stream_turn(
             &client,
-            crate::api::StreamRequest::new(vec![]),
+            &req,
             crate::structured::RequestOptions::default(),
             &cancel,
         );
@@ -2870,7 +2853,7 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let result = handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("stream_turn should succeed");
 
@@ -2886,7 +2869,7 @@ mod tests {
         cancel.cancel();
 
         let err = handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("should fail on cancellation");
 
@@ -2915,7 +2898,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -2925,7 +2908,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -2952,7 +2935,7 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let err = handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("should fail when streaming errors and fallback is disabled");
 
@@ -2983,7 +2966,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
             // Always fail streaming — forces the handler to retry, then
             // fall back to create_message.
@@ -2993,7 +2976,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
         > {
@@ -3006,7 +2989,7 @@ mod tests {
         }
         fn stream_messages_with_options(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
             _options: crate::structured::RequestOptions,
         ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
             Box::pin(futures::stream::once(async {
@@ -3015,7 +2998,7 @@ mod tests {
         }
         fn create_message_with_options(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
             _options: crate::structured::RequestOptions,
         ) -> Pin<
             Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
@@ -3053,7 +3036,7 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let result = handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("fallback should succeed");
 
@@ -3458,7 +3441,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> std::pin::Pin<
             Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
         > {
@@ -3466,7 +3449,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
         > {
@@ -3601,7 +3584,7 @@ mod tests {
         let start = Instant::now();
         for _ in 0..3 {
             handler
-                .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+                .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
                 .await
                 .expect("turn should succeed");
         }
@@ -3628,7 +3611,7 @@ mod tests {
         // First turn consumes the only token.
         let cancel = Arc::new(CancelSignal::new());
         handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("first turn should succeed");
 
@@ -3637,7 +3620,7 @@ mod tests {
         cancel2.cancel();
         let start = Instant::now();
         let err = handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel2)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel2)
             .await
             .expect_err("should be cancelled, not hang for 60s");
         let elapsed = start.elapsed();
@@ -3666,14 +3649,14 @@ mod tests {
 
         // First turn consumes the only token.
         handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("first turn should succeed");
 
         // Second turn: bucket empty, wait capped at 50ms, then proceeds.
         let start = Instant::now();
         let result = handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await;
         let elapsed = start.elapsed();
 
@@ -3700,7 +3683,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -3718,7 +3701,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -3752,7 +3735,7 @@ mod tests {
 
         let start = Instant::now();
         let result = handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("second attempt should succeed");
         let elapsed = start.elapsed();
@@ -3775,7 +3758,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -3788,7 +3771,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -3810,7 +3793,7 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let err = handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("should escalate, not succeed");
         match err {
@@ -3845,7 +3828,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -3862,7 +3845,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -3899,7 +3882,7 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let err = handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("should escalate after the rate-limit budget, not fall through");
         match err {
@@ -3923,7 +3906,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -3936,7 +3919,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -3959,7 +3942,7 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let err = handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("hard-stop should fail the turn");
         match err {
@@ -3987,7 +3970,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -4005,7 +3988,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -4029,7 +4012,7 @@ mod tests {
         };
         let cancel = Arc::new(CancelSignal::new());
         handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("first call should succeed after one rate-limit retry");
 
@@ -4039,7 +4022,7 @@ mod tests {
             attempts: AtomicUsize::new(0),
         };
         handler
-            .drive_turn(&client2, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client2, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect("second call should not see leaked rate-limit state");
     }
@@ -4055,7 +4038,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -4065,7 +4048,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -4092,7 +4075,7 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let err = handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("transport errors should fail");
         assert!(
@@ -4112,7 +4095,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -4125,7 +4108,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -4163,7 +4146,7 @@ mod tests {
 
         let start = Instant::now();
         let err = handler
-            .drive_turn(&client, crate::api::StreamRequest::new(vec![]), &cancel)
+            .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
             .await
             .expect_err("tight total timeout should fail the turn");
         let elapsed = start.elapsed();
@@ -4189,7 +4172,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
             > {
@@ -4199,7 +4182,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -4230,7 +4213,7 @@ mod tests {
         let err = handler
             .drive_turn(
                 &AlwaysFailingMock,
-                crate::api::StreamRequest::new(vec![]),
+                &crate::api::StreamRequest::new(vec![]),
                 &cancel,
             )
             .await

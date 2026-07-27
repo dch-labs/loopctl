@@ -49,13 +49,17 @@ impl<C: ApiClient> BareLoop<C> {
     /// fires mid-stream.
     pub(super) async fn stream_turn(
         &self,
+        contributor_messages: Vec<Message>,
     ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
         let handler = self.managers.stream_handler();
+        let mut messages = contributor_messages;
+        messages.extend(self.machine.full_history());
+        let request = crate::api::StreamRequest::new(messages)
+            .with_system(self.session.config.system_prompt.clone())
+            .with_tools(self.build_tool_schemas());
         let mut stream = handler.stream_turn(
             &*self.client,
-            crate::api::StreamRequest::new(self.machine.history().to_vec())
-                .with_system(self.session.config.system_prompt.clone())
-                .with_tools(self.build_tool_schemas()),
+            &request,
             self.request_options.clone(),
             &self.cancelled,
         );
@@ -183,7 +187,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> std::pin::Pin<
             Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
         > {
@@ -191,7 +195,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
         > {

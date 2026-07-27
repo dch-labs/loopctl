@@ -48,7 +48,7 @@ impl<C: ApiClient> BareLoop<C> {
         turn: usize,
         reason: crate::compact::types::CompactReason,
     ) -> Result<(Vec<Message>, u64), LoopError> {
-        let history = self.machine.history().to_vec();
+        let history = self.machine.full_history();
         let Some(ctx_manager) = self.managers.context_manager() else {
             return Ok((history, 0));
         };

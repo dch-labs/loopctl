@@ -43,7 +43,7 @@ async fn run_provider_test(client: &dyn ApiClient, name: &str) {
     let req = loopctl::api::StreamRequest::new(vec![loopctl::message::Message::user(
         "Say hello in exactly 3 words.",
     )]);
-    let stream = client.stream_messages(req);
+    let stream = client.stream_messages(&req);
     let mut stream = std::pin::pin!(stream);
     let mut events = Vec::new();
 

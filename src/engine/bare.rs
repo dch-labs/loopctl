@@ -336,7 +336,7 @@ impl<C: ApiClient> BareLoop<C> {
                 s.runs.push(Run::default());
                 s
             },
-            machine: LoopMachine::from_history(vec![Message::user("")]),
+            machine: LoopMachine::from_history(Vec::new()),
             managers,
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
@@ -356,11 +356,8 @@ impl<C: ApiClient> BareLoop<C> {
     /// driving state machine; it is empty until the first
     /// [`run()`](crate::engine::core::Loop::run) call mints a machine for
     /// the run.
-    pub fn conversation(&self) -> &[Message] {
-        if self.session.session_start.is_none() {
-            return &[];
-        }
-        self.machine.history()
+    pub fn conversation(&self) -> Vec<Message> {
+        self.machine.full_history()
     }
 
     /// Get the session configuration.
@@ -1112,8 +1109,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Errors
     ///
     /// Propagates whatever [`stream_turn`](Self::stream_turn) returned.
-    async fn do_stream(&mut self) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
-        match self.stream_turn().await {
+    async fn do_stream(
+        &mut self,
+        contributor_messages: Vec<Message>,
+    ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
+        match self.stream_turn(contributor_messages).await {
             Ok((msg, usage, stop)) => {
                 self.record_stream_success(usage.as_ref());
                 Ok((msg, usage, stop))
@@ -1437,25 +1437,24 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
 }
 
 impl<C: ApiClient> BareLoop<C> {
-    /// Inject any contributor messages ahead of the next model call.
+    /// Collect transient contributor messages for the current turn.
     ///
     /// Each registered [`ContextContributor`] is consulted against the
-    /// machine-owned history snapshot; any message it returns is fed into the
-    /// machine via [`LoopMachine::inject`] in registration order. No-op when no
-    /// contributors are registered.
-    fn inject_contributors(&mut self, current_turn: usize) {
+    /// machine-owned history snapshot; the returned messages are prepended
+    /// to the outbound [`StreamRequest`](crate::api::StreamRequest) so the
+    /// model sees them, but they are **not** persisted into history — they
+    /// appear fresh each turn and never accumulate. Returns an empty vec
+    /// when no contributors are registered.
+    fn collect_contributor_messages(&self, current_turn: usize) -> Vec<Message> {
         if self.contributors.is_empty() {
-            return;
+            return Vec::new();
         }
-        let ctx = ContributorContext::new(current_turn, self.machine.history());
-        let injected: Vec<Message> = self
-            .contributors
+        let full = self.machine.full_history();
+        let ctx = ContributorContext::new(current_turn, &full);
+        self.contributors
             .iter()
             .filter_map(|contributor| contributor.contribute(&ctx))
-            .collect();
-        for message in injected {
-            self.machine.inject(message);
-        }
+            .collect()
     }
 
     /// Handle a model-call request from the machine.
@@ -1492,7 +1491,8 @@ impl<C: ApiClient> BareLoop<C> {
         };
 
         self.notify_turn_start(current_turn, &turn_input);
-        self.inject_contributors(current_turn);
+
+        let contributor_messages = self.collect_contributor_messages(current_turn);
 
         let cancel = Arc::clone(&self.cancelled);
         tokio::select! {
@@ -1509,7 +1509,7 @@ impl<C: ApiClient> BareLoop<C> {
                 );
                 Err(LoopError::Cancelled)
             }
-            stream_outcome = self.do_stream() => {
+            stream_outcome = self.do_stream(contributor_messages) => {
                 let (msg, usage, _stream_stop) = match stream_outcome {
                     Ok(triple) => triple,
                     Err(LoopError::Cancelled) => {
@@ -1696,10 +1696,9 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 self.notify_session_start();
             }
 
-            self.session.history.push(Message::user(input));
             self.session.runs.push(Run::new(input, run_config));
             self.managers.reset_all();
-            self.machine = LoopMachine::from_history(self.session.history.clone());
+            self.machine.accept_input(input);
 
             loop {
                 let policy = self.machine_policy();
@@ -1729,10 +1728,8 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                     MachineStep::Done(outcome) => match outcome {
                         MachineOutcome::Completed { final_text } => {
                             if let Some(run) = self.current_run_mut() {
-                                run.output = Some(final_text.clone());
+                                run.output = Some(final_text);
                             }
-
-                            self.session.history.push(Message::assistant(final_text));
 
                             break;
                         }
@@ -1780,6 +1777,12 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
         Box::pin(async move {
             if let Some(run) = self.current_run_mut() {
                 run.end = Some(Instant::now());
+            }
+
+            if success {
+                self.machine.commit_pending();
+            } else {
+                self.machine.discard_pending();
             }
 
             let run = self.current_run().cloned().unwrap_or_default();
@@ -2050,7 +2053,7 @@ mod tests {
 
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
             let mut guard = crate::error::recover_guard(self.responses.lock());
@@ -2067,7 +2070,7 @@ mod tests {
 
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
             Box::pin(async { Ok(json!({"content": []})) })
         }
@@ -2468,6 +2471,95 @@ mod tests {
             ["on_tool_pre", "on_tool_post", "on_tool_pre", "on_tool_post"],
             "multi-tool sequential dispatch keeps pre/post paired and ordered"
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_sees_pending_messages() {
+        let client = MockClient::new("test-model");
+        client.add_text_response(&"x".repeat(200));
+        client.add_text_response("done");
+
+        let config = make_config()
+            .with_context_window(100)
+            .with_compact_threshold(10);
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        agent.set_context_manager(Arc::new(
+            crate::compact::ContextManager::new(Arc::new(
+                crate::compact::TruncatingCompactor::new(),
+            ))
+            .with_context_window(100)
+            .with_threshold(10),
+        ));
+
+        agent
+            .run("fill it up", &RunConfig::default())
+            .await
+            .unwrap();
+
+        let conv_before = agent.conversation();
+        let size_before = conv_before.len();
+
+        agent
+            .run("second run", &RunConfig::default())
+            .await
+            .unwrap();
+
+        let conv_after = agent.conversation();
+        let size_after = conv_after.len();
+
+        assert!(
+            size_after < size_before + 4,
+            "compaction must have reduced history during second run; before={size_before} after={size_after}"
+        );
+        assert!(
+            conv_after.iter().any(|m| m.role == Role::User
+                && m.parts.iter().any(|p| matches!(
+                    p,
+                    MessagePart::Text { text } if text == "second run"
+                ))),
+            "second run's user input must be in committed history after success"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_then_failure_leaves_history_compacted() {
+        let client = MockClient::new("test-model");
+        client.add_text_response(&"x".repeat(200));
+        client.add_text_response("done");
+        client.add_text_response("second done");
+
+        let config = make_config()
+            .with_context_window(100)
+            .with_compact_threshold(10);
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        agent.set_context_manager(Arc::new(
+            crate::compact::ContextManager::new(Arc::new(
+                crate::compact::TruncatingCompactor::new(),
+            ))
+            .with_context_window(100)
+            .with_threshold(10),
+        ));
+
+        agent.run("first run", &RunConfig::default()).await.unwrap();
+
+        agent.cancel();
+        let _ = agent.run("will fail", &RunConfig::default()).await.ok();
+        agent.cancelled.reset();
+
+        let history = agent.conversation();
+        assert!(
+            !history.is_empty(),
+            "history must contain messages from the first successful run"
+        );
+        assert!(
+            !history.iter().any(|m| m.role == Role::User
+                && m.parts
+                    .iter()
+                    .any(|p| matches!(p, MessagePart::Text { text } if text == "will fail"))),
+            "failed run's user input must not persist in history"
+        );
+
+        agent.run("third run", &RunConfig::default()).await.unwrap();
     }
 
     #[tokio::test]
@@ -2960,8 +3052,8 @@ mod tests {
             .await
             .unwrap();
 
-        let user_messages: Vec<&Message> = agent
-            .conversation()
+        let conversation = agent.conversation();
+        let user_messages: Vec<&Message> = conversation
             .iter()
             .filter(|m| m.role == Role::User)
             .collect();
@@ -3986,7 +4078,7 @@ mod tests {
 
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
             let rx = crate::error::recover_guard(self.rx.lock())
@@ -3997,7 +4089,7 @@ mod tests {
 
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
             Box::pin(async { Err(ApiError::api("not implemented")) })
         }
@@ -4196,7 +4288,7 @@ mod tests {
 
             fn stream_messages(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> Pin<
                 Box<
                     dyn futures::stream::Stream<Item = Result<StreamEvent, ApiError>>
@@ -4209,7 +4301,7 @@ mod tests {
 
             fn create_message(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> Pin<
                 Box<
                     dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
@@ -4730,7 +4822,7 @@ mod tests {
             }
             fn stream_messages(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
             {
                 Box::pin(futures::stream::once(async {
@@ -4742,7 +4834,7 @@ mod tests {
             }
             fn create_message(
                 &self,
-                _request: crate::api::StreamRequest,
+                _request: &crate::api::StreamRequest,
             ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
                 Box::pin(async { Ok(json!({})) })
             }
@@ -4932,10 +5024,10 @@ mod tests {
 
         fn stream_messages(
             &self,
-            request: crate::api::StreamRequest,
+            request: &crate::api::StreamRequest,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
-            let messages = request.messages;
+            let messages = request.messages.clone();
             crate::error::recover_guard(self.seen.lock()).push(messages);
             let mut guard = crate::error::recover_guard(self.responses.lock());
             if let Some(events) = guard.pop_front() {
@@ -4950,11 +5042,11 @@ mod tests {
 
         fn stream_messages_with_options(
             &self,
-            request: crate::api::StreamRequest,
+            request: &crate::api::StreamRequest,
             options: crate::structured::RequestOptions,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
-            let messages = request.messages;
+            let messages = request.messages.clone();
             crate::error::recover_guard(self.seen.lock()).push(messages);
             crate::error::recover_guard(self.seen_options.lock()).push(options);
             let mut guard = crate::error::recover_guard(self.responses.lock());
@@ -4970,7 +5062,7 @@ mod tests {
 
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
             Box::pin(async { Ok(json!({"content": []})) })
         }
@@ -5026,8 +5118,6 @@ mod tests {
         agent.add_contributor(Box::new(StaticReminder("stay on task".into())));
         let _result = agent.run("Hi", &RunConfig::default()).await.unwrap();
 
-        // The injected message reached the model: it's in the captured inbound
-        // conversation after the user message.
         let seen = client.first_seen();
         let texts: Vec<&str> = seen
             .iter()
@@ -5039,14 +5129,19 @@ mod tests {
                 })
             })
             .collect();
-        assert!(texts.iter().any(|t| t.contains("stay on task")));
+        assert!(
+            texts.iter().any(|t| t.contains("stay on task")),
+            "contributor message must reach the model in the outbound request"
+        );
 
-        // And it persists in the loop's own conversation history.
         let persisted = agent.conversation();
-        assert!(persisted.iter().any(|m| m.role == Role::System
-            && m.parts.iter().any(
-                |p| matches!(p, MessagePart::Text { text } if text.contains("stay on task"))
-            )));
+        assert!(
+            !persisted.iter().any(|m| m.role == Role::System
+                && m.parts.iter().any(
+                    |p| matches!(p, MessagePart::Text { text } if text.contains("stay on task"))
+                )),
+            "contributor message must NOT persist in history"
+        );
     }
 
     #[tokio::test]
@@ -5067,6 +5162,61 @@ mod tests {
         // Exactly one user message (the "Hi").
         let user_count = seen.iter().filter(|m| m.role == Role::User).count();
         assert_eq!(user_count, 1, "baseline conversation has one user message");
+    }
+
+    #[tokio::test]
+    async fn failed_run_leaves_history_clean() {
+        let client = MockClient::new("test-model");
+        client.add_text_response("done");
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+
+        agent.cancel();
+        let result = agent.run("first", &RunConfig::default()).await;
+        assert!(result.is_err(), "run must fail");
+
+        let history_after_fail = agent.conversation();
+        assert!(
+            history_after_fail.is_empty(),
+            "failed run must not leave messages in committed history; \
+             got {} messages",
+            history_after_fail.len()
+        );
+
+        agent.cancelled.reset();
+        agent.run("second", &RunConfig::default()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn contributor_messages_must_not_accumulate_across_turns() {
+        let client = RecordingClient::new("test-model");
+        client.add_text_response("turn 1 done");
+        client.add_text_response("turn 2 done");
+        let config = contributor_config();
+        let mut agent = BareLoop::new(Arc::new(client.clone()), ToolRegistry::new(), config);
+        agent.add_contributor(Box::new(StaticReminder("stay on task".into())));
+
+        agent.run("first run", &RunConfig::default()).await.unwrap();
+        agent
+            .run("second run", &RunConfig::default())
+            .await
+            .unwrap();
+
+        let system_count = agent
+            .conversation()
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .filter(|m| {
+                m.parts
+                    .iter()
+                    .any(|p| matches!(p, MessagePart::Text { text } if text == "stay on task"))
+            })
+            .count();
+        assert_eq!(
+            system_count, 0,
+            "contributor messages must NOT persist in history; \
+             found {system_count} copies (accumulated across turns)"
+        );
     }
 
     #[tokio::test]
@@ -5095,10 +5245,9 @@ mod tests {
         agent.add_contributor(Box::new(StaticReminder("second".into())));
         let _result = agent.run("Hi", &RunConfig::default()).await.unwrap();
 
-        // Find positions of the two reminders in the persisted history.
-        let persisted = agent.conversation();
+        let seen = client.first_seen();
         let pos = |needle: &str| -> Option<usize> {
-            persisted.iter().position(|m| {
+            seen.iter().position(|m| {
                 m.role == Role::System
                     && m.parts
                         .iter()

@@ -178,7 +178,7 @@ mod tests {
         let mut total = 0usize;
         for prompt in corpus {
             let stream = client.stream_messages_with_options(
-                crate::api::StreamRequest::new(vec![crate::message::Message::user(prompt)])
+                &crate::api::StreamRequest::new(vec![crate::message::Message::user(prompt)])
                     .with_tools(Some(schemas.clone())),
                 opts.clone(),
             );

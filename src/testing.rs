@@ -632,14 +632,14 @@ impl ApiClient for MockApiClient {
     /// use loopctl::testing::MockApiClient;
     ///
     /// let client = MockApiClient::new("test-model").with_text_response("Hi!");
-    /// let stream = client.stream_messages(StreamRequest::new(vec![]));
+    /// let stream = client.stream_messages(&StreamRequest::new(vec![]));
     /// let events: Vec<_> = futures::StreamExt::collect(stream).await;
     /// assert!(events.len() >= 4);
     /// # });
     /// ```
     fn stream_messages(
         &self,
-        _request: crate::api::StreamRequest,
+        _request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
         if let Some(ref err) = self.error {
             let err = err.clone();
@@ -716,13 +716,13 @@ impl ApiClient for MockApiClient {
     /// use loopctl::testing::MockApiClient;
     ///
     /// let client = MockApiClient::new("test-model").with_text_response("Hi!");
-    /// let result = client.create_message(StreamRequest::new(vec![])).await;
+    /// let result = client.create_message(&StreamRequest::new(vec![])).await;
     /// assert_eq!(result.unwrap()["content"][0]["text"], "Hi!");
     /// # });
     /// ```
     fn create_message(
         &self,
-        _request: crate::api::StreamRequest,
+        _request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
         if let Some(ref err) = self.error {
             let err = err.clone();
@@ -1371,7 +1371,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_client_default_response() {
         let client = MockApiClient::new("test-model");
-        let stream = client.stream_messages(crate::api::StreamRequest {
+        let stream = client.stream_messages(&crate::api::StreamRequest {
             messages: vec![Message::user("Hi")],
             system: None,
             tools: None,
@@ -1384,7 +1384,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_client_custom_text() {
         let client = MockApiClient::new("test-model").with_text_response("Custom response");
-        let stream = client.stream_messages(crate::api::StreamRequest {
+        let stream = client.stream_messages(&crate::api::StreamRequest {
             messages: vec![Message::user("Hi")],
             system: None,
             tools: None,
@@ -1408,7 +1408,7 @@ mod tests {
             "echo",
             json!({"message": "hi"}),
         );
-        let stream = client.stream_messages(crate::api::StreamRequest {
+        let stream = client.stream_messages(&crate::api::StreamRequest {
             messages: vec![Message::user("Hi")],
             system: None,
             tools: None,
@@ -1438,7 +1438,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_client_error() {
         let client = MockApiClient::new("test-model").with_error("API error");
-        let stream = client.stream_messages(crate::api::StreamRequest {
+        let stream = client.stream_messages(&crate::api::StreamRequest {
             messages: vec![Message::user("Hi")],
             system: None,
             tools: None,
@@ -1463,7 +1463,7 @@ mod tests {
             },
         ]);
 
-        let stream1 = client.stream_messages(crate::api::StreamRequest {
+        let stream1 = client.stream_messages(&crate::api::StreamRequest {
             messages: vec![Message::user("Hi")],
             system: None,
             tools: None,
@@ -1479,7 +1479,7 @@ mod tests {
         });
         assert!(has_first);
 
-        let stream2 = client.stream_messages(crate::api::StreamRequest {
+        let stream2 = client.stream_messages(&crate::api::StreamRequest {
             messages: vec![Message::user("Hi")],
             system: None,
             tools: None,
@@ -1500,7 +1500,7 @@ mod tests {
     async fn test_mock_client_create_message() {
         let client = MockApiClient::new("test-model").with_text_response("Hello!");
         let result = client
-            .create_message(crate::api::StreamRequest {
+            .create_message(&crate::api::StreamRequest {
                 messages: vec![Message::user("Hi")],
                 system: None,
                 tools: None,

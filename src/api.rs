@@ -6,10 +6,10 @@
 //! See the sub-modules for detailed documentation.
 
 pub mod error;
-use crate::api::error::ApiError;
 use crate::message::Message;
 use crate::stream::StreamEvent;
 use crate::tool::ToolSchema;
+use error::ApiError;
 use futures::Stream;
 use std::future::Future;
 use std::pin::Pin;
@@ -229,7 +229,7 @@ pub trait ApiClient: Send + Sync {
     /// A pinned, boxed stream of [`Result<StreamEvent, ApiError>`].
     fn stream_messages(
         &self,
-        request: StreamRequest,
+        request: &StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>;
 
     /// Non-streaming message request (fallback).
@@ -249,7 +249,7 @@ pub trait ApiClient: Send + Sync {
     /// from the provider, or an [`ApiError`] if the request fails.
     fn create_message(
         &self,
-        request: StreamRequest,
+        request: &StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>;
 
     /// Streaming variant that honors [`RequestOptions`](crate::structured::RequestOptions).
@@ -263,7 +263,7 @@ pub trait ApiClient: Send + Sync {
     /// this to inject the schema.
     fn stream_messages_with_options(
         &self,
-        request: StreamRequest,
+        request: &StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
         if options.response_format.is_none() {
@@ -290,7 +290,7 @@ pub trait ApiClient: Send + Sync {
     /// on the extracted payload.
     fn create_message_with_options(
         &self,
-        request: StreamRequest,
+        request: &StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>> {
         if options.response_format.is_none() {
@@ -378,7 +378,7 @@ mod tests {
 
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &StreamRequest,
         ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
             // Return a simple stream with one event
             let events: Vec<Result<StreamEvent, ApiError>> = vec![
@@ -406,7 +406,7 @@ mod tests {
 
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
             Box::pin(async {
@@ -426,7 +426,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_client_stream() {
         let client = MockClient::new("test-model");
-        let stream = client.stream_messages(crate::api::StreamRequest {
+        let stream = client.stream_messages(&StreamRequest {
             messages: vec![Message::user("Hi")],
             system: None,
             tools: None,
@@ -456,7 +456,7 @@ mod tests {
     async fn test_mock_client_create_message() {
         let client = MockClient::new("test-model");
         let result = client
-            .create_message(crate::api::StreamRequest {
+            .create_message(&StreamRequest {
                 messages: vec![Message::user("Hi")],
                 system: None,
                 tools: None,

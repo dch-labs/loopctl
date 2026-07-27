@@ -1456,19 +1456,27 @@ impl StreamHandler {
 
     /// Set a custom [`RateLimitConfig`]. Consuming builder.
     ///
+    /// Validates the config: if it violates any constraint (zero delay,
+    /// inverted ceilings, etc.), the invalid value is logged and the
+    /// default config is used instead. This prevents silently storing a
+    /// config that would invert retry/escalation behavior.
+    ///
     /// # Example
     ///
     /// ```
     /// use loopctl::stream::handler::{StreamHandler, RateLimitConfig};
-    /// use std::time::Duration;
     ///
     /// let handler = StreamHandler::new().with_rate_limit_config(
-    ///     RateLimitConfig { max_retries: 2, ..Default::default() },
+    ///     RateLimitConfig { max_retries: 5, fallback_after_retries: 2, ..Default::default() },
     /// );
-    /// assert_eq!(handler.rate_limit_config().max_retries, 2);
+    /// assert_eq!(handler.rate_limit_config().max_retries, 5);
     /// ```
     #[must_use]
     pub fn with_rate_limit_config(mut self, rl: RateLimitConfig) -> Self {
+        if let Err(e) = rl.validate() {
+            tracing::warn!(error = %e, "invalid RateLimitConfig, falling back to default");
+            return self;
+        }
         self.rate_limit_config = rl;
         self
     }
@@ -1693,13 +1701,16 @@ impl StreamHandler {
     /// Decide how to handle a rate-limit failure on the current model.
     ///
     /// Bumps `count` and returns one of:
-    /// - [`RateLimitRetry::Escalate`] once `count` exceeds
-    ///   [`fallback_after_retries`](RateLimitConfig::fallback_after_retries) — the
-    ///   caller escalates to the model circuit breaker;
     /// - [`RateLimitRetry::HardStop`] once `count` exceeds
-    ///   [`max_retries`](RateLimitConfig::max_retries) — for when escalation is
-    ///   unavailable (e.g. no fallback model configured);
+    ///   [`max_retries`](RateLimitConfig::max_retries) — the absolute ceiling;
+    /// - [`RateLimitRetry::Escalate`] once `count` exceeds
+    ///   [`fallback_after_retries`](RateLimitConfig::fallback_after_retries)
+    ///   but is still within `max_retries` — the caller escalates to the
+    ///   model circuit breaker;
     /// - [`RateLimitRetry::Retry`] with the deadline-clamped backoff otherwise.
+    ///
+    /// `max_retries` is checked first so it is always enforced as the hard
+    /// ceiling, regardless of `fallback_after_retries`.
     fn rate_limit_retry(
         &self,
         detail: &DetectedRateLimit,
@@ -1707,14 +1718,14 @@ impl StreamHandler {
         deadline: Option<Instant>,
     ) -> RateLimitRetry {
         *count = count.saturating_add(1);
+        if *count > self.rate_limit_config.max_retries {
+            return RateLimitRetry::HardStop;
+        }
         if *count > self.rate_limit_config.fallback_after_retries {
             return RateLimitRetry::Escalate {
                 attempts: *count,
                 retry_after: detail.retry_after,
             };
-        }
-        if *count > self.rate_limit_config.max_retries {
-            return RateLimitRetry::HardStop;
         }
         let delay =
             clamp_delay_to_deadline(self.rate_limit_config.backoff(detail.retry_after), deadline);
@@ -3274,10 +3285,8 @@ mod tests {
 
     #[test]
     fn rate_limit_retry_hard_stops_after_max_retries() {
-        // fallback_after_retries high so escalation never fires; the hard-stop
-        // backstop kicks in once max_retries is exceeded.
         let handler = StreamHandler::new().with_rate_limit_config(RateLimitConfig {
-            fallback_after_retries: 100,
+            fallback_after_retries: 1,
             max_retries: 2,
             ..Default::default()
         });
@@ -3292,6 +3301,49 @@ mod tests {
             RateLimitRetry::HardStop
         ));
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn rate_limit_retry_max_retries_should_be_enforced_under_valid_config() {
+        let handler = StreamHandler::new();
+        let detail = detected_limit(None);
+        let mut count = 0u32;
+
+        for _ in 0..(handler.rate_limit_config().max_retries + 2) {
+            let _ = handler.rate_limit_retry(&detail, &mut count, None);
+        }
+        let max = handler.rate_limit_config().max_retries;
+        assert!(
+            count > max,
+            "count {count} must exceed max_retries {max} after enough calls"
+        );
+        let decision = handler.rate_limit_retry(&detail, &mut count, None);
+        assert!(
+            matches!(decision, RateLimitRetry::HardStop),
+            "max_retries={max} should be enforced as a hard ceiling, \
+             but Escalate shadows it — HardStop is dead code under valid config"
+        );
+    }
+
+    #[test]
+    fn with_rate_limit_config_should_reject_invalid() {
+        let invalid = RateLimitConfig {
+            fallback_after_retries: 10,
+            max_retries: 3,
+            ..Default::default()
+        };
+        let result = StreamHandler::new().with_rate_limit_config(invalid);
+        let detail = detected_limit(None);
+        let mut count = 0u32;
+        for _ in 0..4 {
+            let _ = result.rate_limit_retry(&detail, &mut count, None);
+        }
+        let decision = result.rate_limit_retry(&detail, &mut count, None);
+        assert!(
+            !matches!(decision, RateLimitRetry::HardStop),
+            "invalid config (fallback_after=10 > max_retries=3) must not \
+             silently invert behavior — HardStop should never fire before Escalation"
+        );
     }
 
     #[test]
@@ -3381,6 +3433,7 @@ mod tests {
 
         let custom = RateLimitConfig {
             max_retries: 2,
+            fallback_after_retries: 1,
             default_delay: Duration::from_secs(1),
             ..Default::default()
         };
@@ -3896,7 +3949,7 @@ mod tests {
         }
 
         let handler = StreamHandler::new().with_rate_limit_config(RateLimitConfig {
-            fallback_after_retries: 100,
+            fallback_after_retries: 2,
             max_retries: 2,
             default_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(1),
@@ -3913,7 +3966,7 @@ mod tests {
             StreamHandlerError::StreamFailed(StreamOutcome::RateLimited { .. })
             | StreamHandlerError::InitFailed(StreamOutcome::RateLimited { .. }) => {}
             StreamHandlerError::RateLimitEscalation { .. } => {
-                panic!("escalation must not fire when max_retries < fallback_after_retries")
+                panic!("escalation must not fire when max_retries == fallback_after_retries")
             }
             other => panic!("expected rate-limit outcome, got {other:?}"),
         }

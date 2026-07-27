@@ -31,7 +31,7 @@ use crate::api::error::ApiError;
 use crate::message::{Message, MessagePart, Role};
 use crate::stream::{
     DeltaPart, IndexedDelta, MessageDelta, MessageDeltaPayload, MessageMetadata, MessageStart,
-    PartStart, StreamEvent, StreamStopReason,
+    PartStart, StreamEvent, StreamStopReason, Usage,
 };
 use crate::structured::ToolConstraint;
 use crate::structured::tighten_json_schema;
@@ -757,6 +757,21 @@ struct StreamEmitter {
     /// symmetric to the text lane.
     thinking_part_open: bool,
 
+    /// Whether a tool-call part is currently open.
+    ///
+    /// Each `functionCall` part emits a [`PartStart`]. Without tracking,
+    /// [`extract_finish_reason`](Self::extract_finish_reason) would never
+    /// close tool parts, leaving the downstream accumulator with unbalanced
+    /// `PartStart`/`PartStop` events.
+    tool_part_open: bool,
+
+    /// Next tool-call index for multiple function calls in one response.
+    ///
+    /// Gemini can emit several `functionCall` parts in a single chunk.
+    /// Each gets its own `PartStart` at an incrementing index so the
+    /// accumulator can distinguish them.
+    next_tool_index: usize,
+
     /// Whether the terminal stop signal has been processed.
     ///
     /// Set by [`finish`](Self::finish) when it appends the synthetic
@@ -906,41 +921,54 @@ impl StreamEmitter {
             return;
         };
 
-        let Some(func_call) = parts.iter().find_map(|p| p.get("functionCall")) else {
+        let func_calls: Vec<(&Value, usize)> = parts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.get("functionCall").map(|fc| (fc, i)))
+            .collect();
+        if func_calls.is_empty() {
             return;
-        };
-        let name = func_call
-            .pointer("/name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let args = func_call.pointer("/args").cloned().unwrap_or(Value::Null);
-        let args_str = serde_json::to_string(&args).unwrap_or_default();
-
-        if self.thinking_part_open {
-            self.thinking_part_open = false;
-            self.push(StreamEvent::PartStop);
         }
 
-        if self.text_part_open {
-            self.text_part_open = false;
-            self.push(StreamEvent::PartStop);
-        }
+        for (func_call, _part_idx) in func_calls {
+            let name = func_call
+                .pointer("/name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let args = func_call.pointer("/args").cloned().unwrap_or(Value::Null);
+            let args_str = serde_json::to_string(&args).unwrap_or_default();
 
-        self.push(StreamEvent::PartStart(PartStart {
-            index: TEXT_PART_INDEX,
-            part: Some(MessagePart::ToolCall {
-                id: String::new(),
-                name,
-                input: args,
-            }),
-        }));
-        self.push(StreamEvent::IndexedDelta(IndexedDelta {
-            index: TEXT_PART_INDEX,
-            delta: DeltaPart::InputJson {
-                partial_json: args_str,
-            },
-        }));
+            if self.thinking_part_open {
+                self.thinking_part_open = false;
+                self.push(StreamEvent::PartStop);
+            }
+            if self.text_part_open {
+                self.text_part_open = false;
+                self.push(StreamEvent::PartStop);
+            }
+
+            let idx = self.next_tool_index;
+            self.next_tool_index = self.next_tool_index.saturating_add(1);
+            self.tool_part_open = true;
+
+            self.push(StreamEvent::PartStart(PartStart {
+                index: idx,
+                part: Some(MessagePart::ToolCall {
+                    id: String::new(),
+                    name,
+                    input: args,
+                }),
+            }));
+            self.push(StreamEvent::IndexedDelta(IndexedDelta {
+                index: idx,
+                delta: DeltaPart::InputJson {
+                    partial_json: args_str,
+                },
+            }));
+            self.push(StreamEvent::PartStop);
+            self.tool_part_open = false;
+        }
     }
 
     /// Extract the finish reason from the chunk and emit stop events.
@@ -972,16 +1000,40 @@ impl StreamEmitter {
             self.push(StreamEvent::PartStop);
         }
 
+        if self.tool_part_open {
+            self.tool_part_open = false;
+            self.push(StreamEvent::PartStop);
+        }
+
         if self.text_part_open {
             self.text_part_open = false;
             self.push(StreamEvent::PartStop);
         }
 
+        let usage = json.pointer("/usageMetadata").and_then(|u| {
+            let input = u
+                .get("promptTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let output = u
+                .get("candidatesTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if input == 0 && output == 0 {
+                None
+            } else {
+                Some(Usage::new(
+                    u32::try_from(input).unwrap_or(0),
+                    u32::try_from(output).unwrap_or(0),
+                ))
+            }
+        });
+
         self.push(StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some(stop.to_api_str().into()),
             },
-            usage: None,
+            usage,
         }));
     }
 
@@ -1732,7 +1784,7 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, StreamEvent::PartStop))
             .count();
-        assert_eq!(stops, 1, "text lane must be closed before tool PartStart");
+        assert_eq!(stops, 2, "text lane closed + tool part closed");
 
         // Ordering: TextDelta → PartStop → tool PartStart.
         let text_delta_idx = events
@@ -2281,5 +2333,106 @@ mod tests {
         assert_eq!(roles, vec!["user", "model", "user"]);
         assert_eq!(contents[0]["parts"][0]["text"], "first");
         assert_eq!(contents[2]["parts"][0]["text"], "third");
+    }
+
+    #[test]
+    fn emitter_multiple_function_calls_per_chunk() {
+        let mut em = StreamEmitter::default();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "search", "args": {"q": "rust"}}},
+                        {"functionCall": {"name": "write", "args": {"path": "/tmp"}}}
+                    ]
+                }
+            }]
+        }));
+        let events = em.drain();
+
+        let tool_starts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::PartStart(PartStart {
+                    index,
+                    part: Some(MessagePart::ToolCall { name, .. }),
+                }) => Some((*index, name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_starts.len(),
+            2,
+            "both function calls must emit PartStart"
+        );
+        assert_eq!(tool_starts[0].1, "search");
+        assert_eq!(tool_starts[1].1, "write");
+        assert_ne!(
+            tool_starts[0].0, tool_starts[1].0,
+            "each tool call must get a distinct index"
+        );
+
+        let stops = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .count();
+        assert_eq!(stops, 2, "each tool call must emit its own PartStop");
+    }
+
+    #[test]
+    fn emitter_finish_closes_open_tool_part() {
+        let mut em = StreamEmitter::default();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"functionCall": {"name": "search", "args": {"q": "rust"}}}]
+                }
+            }]
+        }));
+        em.drain();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let events = em.drain();
+
+        let has_message_delta = events.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::MessageDelta(MessageDelta {
+                    delta: MessageDeltaPayload {
+                        stop_reason: Some(_),
+                    },
+                    ..
+                })
+            )
+        });
+        assert!(has_message_delta, "finish must emit a MessageDelta");
+    }
+
+    #[test]
+    fn emitter_finish_extracts_usage_metadata() {
+        let mut em = StreamEmitter::default();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}]}
+            }]
+        }));
+        em.drain();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}],
+            "usageMetadata": {
+                "promptTokenCount": 42,
+                "candidatesTokenCount": 7
+            }
+        }));
+        let events = em.drain();
+
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage: Some(u), .. }) => Some(*u),
+            _ => None,
+        });
+        let usage = usage.expect("finish must include Usage from usageMetadata");
+        assert_eq!(usage.input_tokens, 42);
+        assert_eq!(usage.output_tokens, 7);
     }
 }

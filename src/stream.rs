@@ -838,53 +838,25 @@ impl Usage {
 /// calling [`new`](Self::new).
 #[derive(Debug, Default)]
 pub struct StreamAccumulator {
-    /// Accumulated parts from completed part sequences.
+    /// Fully assembled parts flushed by [`PartStop`](StreamEvent::PartStop).
     ///
-    /// Each entry is a fully assembled [`MessagePart`] produced when
-    /// a [`PartStop`](StreamEvent::PartStop) event
-    /// finalizes the current part. These are the parts that will
-    /// appear in the final [`Message`] returned by [`build`](Self::build).
-    parts: Vec<MessagePart>,
+    /// Each entry is a finished [`MessagePart`] produced when a
+    /// [`PartStop`](StreamEvent::PartStop) closes one of the entries in
+    /// [`open`](Self::open). These are the parts returned by
+    /// [`build`](Self::build).
+    completed: Vec<MessagePart>,
 
-    /// Current text being accumulated from [`DeltaPart::Text`] deltas.
+    /// Parts currently receiving deltas, in [`PartStart`] arrival order.
     ///
-    /// Grows as text deltas arrive. Cleared and flushed into [`parts`](Self::parts)
-    /// as a [`MessagePart::Text`] when
-    /// [`PartStop`](StreamEvent::PartStop) is received.
-    current_text: String,
-
-    /// The tool-call ID being accumulated for the current tool part.
-    ///
-    /// Populated from [`PartStart`] when the part
-    /// is a tool-call invocation. Cleared on the next
-    /// [`PartStart`](StreamEvent::PartStart).
-    /// Used to correlate the tool-call part with its result.
-    current_tool_id: String,
-
-    /// The tool name being accumulated for the current tool part.
-    ///
-    /// Populated from [`PartStart`] when the part
-    /// is a tool-call invocation. Cleared on the next
-    /// [`PartStart`](StreamEvent::PartStart).
-    /// Determines whether a part is text or tool-call when
-    /// [`PartStop`](StreamEvent::PartStop) arrives.
-    current_tool_name: String,
-
-    /// The raw JSON string being accumulated for the current tool input.
-    ///
-    /// Built up from [`DeltaPart::InputJson`] and
-    /// [`DeltaPart::InputJson`] deltas, then parsed into a
-    /// [`Value`](serde_json::Value) when
-    /// [`PartStop`](StreamEvent::PartStop) is received.
-    /// If parsing fails, defaults to an empty JSON object `{}`.
-    current_tool_input: String,
-
-    /// Index of the part currently being accumulated.
-    ///
-    /// `None` before the first [`PartStart`] event, then
-    /// `Some(index)` for the remainder of the stream. Used to
-    /// track which part is in progress.
-    current_index: Option<usize>,
+    /// A provider may keep several parts open at once — for example,
+    /// OpenAI streams parallel tool calls by interleaving argument
+    /// fragments across distinct `index` values and only closing them
+    /// all at the terminal `finish_reason`. Each
+    /// [`PartStart`](StreamEvent::PartStart) pushes a new slot;
+    /// [`IndexedDelta`](StreamEvent::IndexedDelta) routes to the slot
+    /// whose `index` matches; [`PartStop`](StreamEvent::PartStop)
+    /// flushes the oldest slot still open.
+    open: Vec<OpenPart>,
 
     /// The model name that produced this response.
     ///
@@ -899,6 +871,89 @@ pub struct StreamAccumulator {
     /// event. `None` until that event is processed. Access via
     /// [`usage`](Self::usage) after processing.
     usage: Option<Usage>,
+}
+
+/// Which lane an in-progress [`OpenPart`] is accumulating.
+///
+/// Distinguishes plain assistant text from a tool-call invocation so
+/// [`PartStop`](StreamEvent::PartStop) knows which buffer to flush and
+/// which [`MessagePart`] shape to build. Decided once, at
+/// [`PartStart`](StreamEvent::PartStart) time, from the carried part.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum OpenPartKind {
+    /// Assistant text, reconstructed from `delta.content` fragments.
+    ///
+    /// The default lane: a [`PartStart`](StreamEvent::PartStart) that
+    /// carries no tool-call part opens a text slot, and its buffered
+    /// string becomes a [`MessagePart::Text`] on close.
+    #[default]
+    Text,
+
+    /// A tool-call invocation, reconstructed from `function.arguments`
+    /// fragments.
+    ///
+    /// The slot latches the tool `id` and `name` from
+    /// [`PartStart::part`](crate::stream::PartStart::part) at open time
+    /// and accumulates the raw JSON arguments string; on close it parses
+    /// that string into the tool-call [`MessagePart::ToolCall`] input.
+    Tool,
+}
+
+/// A single in-progress part being accumulated between open and close.
+///
+/// Holds the buffers for one lane — assistant text or a tool call —
+/// from the [`PartStart`](StreamEvent::PartStart) that opens it to the
+/// [`PartStop`](StreamEvent::PartStop) that flushes it. The
+/// [`StreamAccumulator`] keeps a [`Vec`] of these so that providers
+/// which leave several parts open at once (OpenAI's interleaved parallel
+/// tool calls) accumulate each one independently.
+#[derive(Debug, Default)]
+struct OpenPart {
+    /// The `index` this slot was opened with.
+    ///
+    /// Copied from [`PartStart::index`](crate::stream::PartStart::index)
+    /// at open time and used to route each
+    /// [`IndexedDelta`](StreamEvent::IndexedDelta) fragment to the slot
+    /// it belongs to. Stable for the lifetime of the slot.
+    index: usize,
+
+    /// Whether this slot accumulates assistant text or a tool call.
+    ///
+    /// Set once when the slot opens and never mutated; it selects which
+    /// buffer the deltas append to and which [`MessagePart`] variant
+    /// [`PartStop`](StreamEvent::PartStop) builds from the slot.
+    kind: OpenPartKind,
+
+    /// Buffered assistant text for a text-lane slot.
+    ///
+    /// Grown one fragment at a time by [`DeltaPart::Text`] deltas and
+    /// flushed into a [`MessagePart::Text`] on close. Empty and unused
+    /// for tool-call slots.
+    text: String,
+
+    /// Server-assigned identifier of the tool call.
+    ///
+    /// Latched from [`PartStart::part`](crate::stream::PartStart::part)
+    /// when the slot opens as a tool call, then carried onto the built
+    /// [`MessagePart::ToolCall`] so the host can match the eventual
+    /// tool result back to this call. Empty for text slots.
+    tool_id: String,
+
+    /// Name of the tool being invoked.
+    ///
+    /// Latched from [`PartStart::part`](crate::stream::PartStart::part)
+    /// at open time and used both to detect that this is a tool-call
+    /// slot (non-empty) and to label the built
+    /// [`MessagePart::ToolCall`]. Empty for text slots.
+    tool_name: String,
+
+    /// Raw JSON arguments string for a tool-call slot.
+    ///
+    /// Grown fragment by fragment by [`DeltaPart::InputJson`] and
+    /// [`DeltaPart::ToolCall`] deltas and parsed into the
+    /// [`MessagePart::ToolCall`] input when the slot closes. Empty for
+    /// text slots.
+    tool_input: String,
 }
 
 impl StreamAccumulator {
@@ -924,10 +979,16 @@ impl StreamAccumulator {
     /// Process a single stream event and update internal state.
     ///
     /// Called for each [`StreamEvent`] as it arrives from the SSE
-    /// connection. The accumulator tracks the current part
-    /// being built and flushes completed parts into the internal
-    /// list when [`PartStop`](StreamEvent::PartStop)
-    /// is received.
+    /// connection. The accumulator keeps a [`Vec`] of in-progress parts
+    /// so that providers which leave several parts open at once — OpenAI
+    /// interleaves parallel tool calls — accumulate each one
+    /// independently. Each [`PartStart`](StreamEvent::PartStart) opens a
+    /// new slot keyed by its `index`; each
+    /// [`IndexedDelta`](StreamEvent::IndexedDelta) routes to the matching
+    /// slot; each [`PartStop`](StreamEvent::PartStop) flushes the oldest
+    /// open slot (FIFO by `PartStart` arrival order). Providers that only
+    /// ever hold one slot open (Anthropic, Gemini) behave exactly as on a
+    /// single-slot accumulator.
     ///
     /// # Arguments
     ///
@@ -936,12 +997,15 @@ impl StreamAccumulator {
     /// # Event Handling
     ///
     /// - [`MessageStart`](StreamEvent::MessageStart) — Captures the model name.
-    /// - [`PartStart`](StreamEvent::PartStart) — Resets buffers,
-    ///   captures tool ID/name if present.
-    /// - [`IndexedDelta`](StreamEvent::IndexedDelta) — Appends text or
-    ///   JSON fragments to the appropriate buffer.
-    /// - [`PartStop`](StreamEvent::PartStop) — Flushes the current
-    ///   buffer into an accumulated [`MessagePart`].
+    /// - [`PartStart`](StreamEvent::PartStart) — Opens a new in-progress
+    ///   slot for the given `index` (text or tool call, decided by the
+    ///   carried part). Several slots may be open at once.
+    /// - [`IndexedDelta`](StreamEvent::IndexedDelta) — Routes the
+    ///   fragment to the open slot whose `index` matches and appends it
+    ///   to that slot's buffer.
+    /// - [`PartStop`](StreamEvent::PartStop) — Flushes the oldest
+    ///   still-open slot into [`completed`](Self::completed) as a
+    ///   [`MessagePart`] and drops it.
     /// - [`MessageDelta`](StreamEvent::MessageDelta) — Captures usage statistics.
     /// - [`MessageStop`](StreamEvent::MessageStop) / [`Ping`](StreamEvent::Ping) — Ignored.
     ///
@@ -981,65 +1045,73 @@ impl StreamAccumulator {
                 Ok(())
             }
             StreamEvent::PartStart(part_start) => {
-                self.current_index = Some(part_start.index);
-                self.current_text.clear();
-                self.current_tool_id.clear();
-                self.current_tool_name.clear();
-                self.current_tool_input.clear();
-
+                let kind = match &part_start.part {
+                    Some(MessagePart::ToolCall { .. }) => OpenPartKind::Tool,
+                    _ => OpenPartKind::Text,
+                };
+                let mut slot = OpenPart {
+                    index: part_start.index,
+                    kind,
+                    ..Default::default()
+                };
                 if let Some(MessagePart::ToolCall { id, name, .. }) = &part_start.part {
-                    self.current_tool_id.clone_from(id);
-                    self.current_tool_name.clone_from(name);
+                    slot.tool_id.clone_from(id);
+                    slot.tool_name.clone_from(name);
                 }
+                self.open.push(slot);
                 Ok(())
             }
             StreamEvent::IndexedDelta(delta) => {
-                // Gracefully ignore deltas whose index doesn't match the
-                // current part — this can happen with malformed SSE or
-                // provider-specific quirks.
-                if self.current_index != Some(delta.index) {
+                let Some(slot) = self.open.iter_mut().find(|s| s.index == delta.index) else {
                     return Ok(());
-                }
+                };
                 match &delta.delta {
                     DeltaPart::Text { text } => {
-                        self.current_text.push_str(text);
+                        slot.text.push_str(text);
                     }
                     DeltaPart::InputJson { partial_json } => {
-                        self.current_tool_input.push_str(partial_json);
+                        slot.tool_input.push_str(partial_json);
                     }
                     DeltaPart::ToolCall { partial_json } => {
                         if let Some(s) = partial_json.as_str() {
-                            self.current_tool_input.push_str(s);
+                            slot.tool_input.push_str(s);
                         }
                     }
-                    // Reasoning is not part of the assistant Message. Drop it
-                    // here; observers already received it via on_thinking_delta
-                    // upstream (engine/bare/stream.rs).
                     DeltaPart::Thinking { .. } => {}
                 }
                 Ok(())
             }
             StreamEvent::PartStop => {
-                if !self.current_text.is_empty() {
-                    self.parts.push(MessagePart::text(&self.current_text));
-                } else if !self.current_tool_name.is_empty() {
-                    let input: Value = if self.current_tool_input.is_empty() {
-                        Value::Object(serde_json::Map::new())
-                    } else {
-                        serde_json::from_str(&self.current_tool_input).map_err(|e| {
-                            StreamError::InvalidToolInputJson(
-                                e,
-                                std::mem::take(&mut self.current_tool_input),
-                            )
-                        })?
-                    };
-                    self.parts.push(MessagePart::tool_call(
-                        &self.current_tool_id,
-                        &self.current_tool_name,
-                        input,
-                    ));
+                let Some(slot) = self.open.first_mut() else {
+                    return Ok(());
+                };
+                let flushed = match slot.kind {
+                    OpenPartKind::Text if !slot.text.is_empty() => {
+                        Some(MessagePart::text(std::mem::take(&mut slot.text)))
+                    }
+                    OpenPartKind::Tool if !slot.tool_name.is_empty() => {
+                        let input: Value = if slot.tool_input.is_empty() {
+                            Value::Object(serde_json::Map::new())
+                        } else {
+                            serde_json::from_str(&slot.tool_input).map_err(|e| {
+                                StreamError::InvalidToolInputJson(
+                                    e,
+                                    std::mem::take(&mut slot.tool_input),
+                                )
+                            })?
+                        };
+                        Some(MessagePart::tool_call(
+                            std::mem::take(&mut slot.tool_id),
+                            std::mem::take(&mut slot.tool_name),
+                            input,
+                        ))
+                    }
+                    _ => None,
+                };
+                self.open.remove(0);
+                if let Some(part) = flushed {
+                    self.completed.push(part);
                 }
-                self.current_text.clear();
                 Ok(())
             }
             StreamEvent::MessageDelta(delta) => {
@@ -1057,7 +1129,7 @@ impl StreamAccumulator {
     /// received before the stream times out.
     #[must_use]
     pub fn peek_parts(&self) -> &[MessagePart] {
-        &self.parts
+        &self.completed
     }
 
     /// Consume the accumulator and produce the final [`Message`].
@@ -1087,7 +1159,7 @@ impl StreamAccumulator {
     pub fn build(self) -> Message {
         Message {
             role: crate::message::Role::Assistant,
-            parts: self.parts,
+            parts: self.completed,
         }
     }
 
@@ -1245,6 +1317,79 @@ mod tests {
     }
 
     #[test]
+    fn test_accumulator_interleaved_tool_calls() {
+        // Reproduces OpenAI's parallel-tool-call wire shape: two tool
+        // calls opened up front, argument fragments interleaved across
+        // their indices, both closed by bare PartStops at the end.
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::tool_call(
+                "call_a",
+                "echo",
+                Value::Object(serde_json::Map::new()),
+            )),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 1,
+            part: Some(MessagePart::tool_call(
+                "call_b",
+                "search",
+                Value::Object(serde_json::Map::new()),
+            )),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::InputJson {
+                partial_json: r#"{"msg":"#.to_string(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 1,
+            delta: DeltaPart::InputJson {
+                partial_json: r#"{"q":"#.to_string(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::InputJson {
+                partial_json: r#""a"}"#.to_string(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 1,
+            delta: DeltaPart::InputJson {
+                partial_json: r#""b"}"#.to_string(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop).unwrap();
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 2);
+        match &msg.parts[0] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "echo");
+                assert_eq!(input, &serde_json::json!({"msg": "a"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match &msg.parts[1] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "search");
+                assert_eq!(input, &serde_json::json!({"q": "b"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_accumulator_empty() {
         let acc = StreamAccumulator::new();
         let msg = acc.build();
@@ -1264,7 +1409,6 @@ mod tests {
 
     #[test]
     fn test_stream_event_variants() {
-        // Just verify all variants can be constructed
         let _ = StreamEvent::Ping;
         let _ = StreamEvent::MessageStop;
         let _ = StreamEvent::PartStop;
@@ -1337,7 +1481,6 @@ mod tests {
         }))
         .unwrap();
 
-        // Delta with correct index 0 — should be applied.
         acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
             index: 0,
             delta: DeltaPart::Text {
@@ -1374,7 +1517,6 @@ mod tests {
         acc.process(&StreamEvent::PartStop).unwrap();
 
         let msg = acc.build();
-        // Empty text → no parts.
         assert!(msg.parts.is_empty());
     }
 
@@ -1387,7 +1529,6 @@ mod tests {
         }))
         .unwrap();
 
-        // DeltaPart::ToolCall carries a string JSON value.
         acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
             index: 0,
             delta: DeltaPart::ToolCall {
@@ -1416,7 +1557,6 @@ mod tests {
         }))
         .unwrap();
 
-        // Non-string JSON value — should be silently ignored.
         acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
             index: 0,
             delta: DeltaPart::ToolCall {
@@ -1468,7 +1608,6 @@ mod tests {
     fn test_accumulator_multiple_text_parts() {
         let mut acc = StreamAccumulator::new();
 
-        // First text part at index 0.
         acc.process(&StreamEvent::PartStart(PartStart {
             index: 0,
             part: Some(MessagePart::text("")),
@@ -1483,7 +1622,6 @@ mod tests {
         .unwrap();
         acc.process(&StreamEvent::PartStop).unwrap();
 
-        // Second text part at index 1.
         acc.process(&StreamEvent::PartStart(PartStart {
             index: 1,
             part: Some(MessagePart::text("")),

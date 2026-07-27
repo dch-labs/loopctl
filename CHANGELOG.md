@@ -381,6 +381,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 - `StreamHandlerError::RateLimitEscalation.prior: StreamOutcome` field (never
   read by any consumer).
 
+### Fixed
+
+- OpenAI streaming corrupted tool-call arguments that arrived across more
+  than one chunk. The `StreamEmitter` opened a `PartStart` for the tool
+  call on every chunk carrying a `function` field (which is all of them,
+  including argument-fragment chunks), so each fragment after the first
+  re-opened the part and wiped the previously buffered JSON in the
+  downstream `StreamAccumulator`. The emitter now tracks each tool call's
+  `index` and emits `PartStart` exactly once per call; argument fragments
+  append to the buffer as intended and the complete JSON parses at
+  `PartStop`.
+- `StreamAccumulator` dropped parallel tool calls whose argument fragments
+  arrived interleaved (the shape OpenAI streams for
+  `parallel_tool_calls`). The accumulator tracked a single in-progress
+  part, so a second `PartStart` arriving before the first `PartStop`
+  overwrote the first call's buffer, and `IndexedDelta` fragments whose
+  `index` did not match the single current slot were silently dropped.
+  It now holds a `Vec` of open slots keyed by `index`, routes each delta
+  to the matching slot, and flushes slots in `PartStart` arrival order
+  (FIFO) on `PartStop`. Anthropic (strictly sequential) and Gemini
+  (atomic per-chunk tool calls) are unaffected.
+
 ## [0.1.0] - 2025-07-01
 
 Initial crates.io release.

@@ -1031,12 +1031,24 @@ struct StreamEmitter {
     /// to the text lane.
     thinking_part_open: bool,
 
+    /// Tool-call indices that have already had their
+    /// [`StreamEvent::PartStart`] emitted.
+    ///
+    /// OpenAI streams a single tool call across many chunks, all sharing
+    /// the same `index`: the first carries the call `id` and function
+    /// `name`, and every later chunk carries only an `arguments`
+    /// fragment (still under `function`). Gating `PartStart` on
+    /// `function.is_some()` would re-emit it on every fragment and wipe
+    /// the accumulator's buffered arguments. Tracking seen indices lets
+    /// the emitter open each part exactly once.
+    seen_tool_indices: Vec<usize>,
+
     /// Number of tool-call parts currently open.
     ///
-    /// Each `delta.tool_calls` entry with a `function` field opens a new
-    /// tool part via [`StreamEvent::PartStart`]. The counter drives the
-    /// matching batch of `PartStop` emissions on finish (one per open
-    /// tool) so callers see balanced part lifecycles.
+    /// Each distinct tool `index` opens one tool part via
+    /// [`StreamEvent::PartStart`]. The counter drives the matching batch
+    /// of `PartStop` emissions on finish (one per open tool) so callers
+    /// see balanced part lifecycles.
     open_tool_count: usize,
 
     /// Whether the terminal stop signal has been processed.
@@ -1153,15 +1165,18 @@ impl StreamEmitter {
 
     /// Handle a single tool-call delta from the stream.
     ///
-    /// On the first delta for a tool call (when `function` is present),
-    /// emits a [`PartStart`](StreamEvent::PartStart) with a
-    /// [`ToolCall`](crate::message::MessagePart::ToolCall) part carrying the
-    /// tool ID and name. Subsequent deltas carrying `function.arguments`
-    /// fragments emit [`InputJson`](crate::stream::DeltaPart::InputJson)
-    /// events so the caller can accumulate the full JSON input.
+    /// OpenAI streams one tool call across many chunks that share an
+    /// `index`: the first carries the call `id` and function `name`
+    /// under `function`; every later chunk carries only an `arguments`
+    /// fragment (still under `function`). The emitter opens the part
+    /// with [`StreamEvent::PartStart`] exactly once per `index` (on the
+    /// first chunk it sees for that index), then forwards every
+    /// non-empty `arguments` fragment as an
+    /// [`InputJson`](crate::stream::DeltaPart::InputJson) delta so the
+    /// caller can concatenate them into the full JSON input.
     fn process_tool_call(&mut self, tc: &OpenAiToolCallDelta) {
-        if tc.function.is_some() {
-            // New tool call — emit PartStart.
+        if tc.function.is_some() && !self.seen_tool_indices.contains(&tc.index) {
+            self.seen_tool_indices.push(tc.index);
             self.push(StreamEvent::PartStart(PartStart {
                 index: tc.index,
                 part: Some(MessagePart::ToolCall {
@@ -1177,7 +1192,6 @@ impl StreamEmitter {
             self.open_tool_count = self.open_tool_count.saturating_add(1);
         }
 
-        // Stream argument fragments.
         if let Some(func) = &tc.function
             && !func.arguments.is_empty()
         {
@@ -1205,17 +1219,14 @@ impl StreamEmitter {
         }
         self.finished = true;
 
-        // Close any open text part.
         if self.text_part_open {
             self.push(StreamEvent::PartStop);
         }
 
-        // Close any open reasoning (thinking) part.
         if self.thinking_part_open {
             self.push(StreamEvent::PartStop);
         }
 
-        // Close each open tool-call part.
         for _ in 0..self.open_tool_count {
             self.push(StreamEvent::PartStop);
         }
@@ -1581,6 +1592,127 @@ mod tests {
             events[1],
             StreamEvent::IndexedDelta(ref d) if d.index == 1
         ));
+    }
+
+    #[test]
+    fn emitter_multi_chunk_tool_call_emits_part_start_once() {
+        let mut em = StreamEmitter::default();
+        let chunk0 = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":null},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&chunk0);
+        em.drain();
+
+        let header = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&header);
+        em.drain();
+
+        let fragment = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"echo","arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&fragment);
+        let events = em.drain();
+        let deltas: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::IndexedDelta(_)))
+            .collect();
+        assert_eq!(
+            deltas.len(),
+            1,
+            "follow-up chunk must emit only an argument delta, not a PartStart"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, StreamEvent::PartStart(_)))
+        );
+        assert_eq!(em.open_tool_count, 1);
+    }
+
+    #[test]
+    fn emitter_multi_chunk_tool_call_accumulates_through_accumulator() {
+        use crate::stream::StreamAccumulator;
+        let mut em = StreamEmitter::default();
+        let mut acc = StreamAccumulator::new();
+        let chunks = [
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":null},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"echo","arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
+        ];
+        for raw in chunks {
+            let chunk = OpenAiChunk::parse(raw).unwrap();
+            em.process_chunk(&chunk);
+            for ev in em.drain() {
+                acc.process(&ev).unwrap();
+            }
+        }
+        for ev in em.finish() {
+            acc.process(&ev).unwrap();
+        }
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 1);
+        match &msg.parts[0] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "echo");
+                assert_eq!(input, &serde_json::json!({"msg": "hi"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emitter_two_interleaved_multi_chunk_tool_calls_accumulate() {
+        use crate::stream::StreamAccumulator;
+
+        let mut em = StreamEmitter::default();
+        let mut acc = StreamAccumulator::new();
+        let chunks = [
+            // Message start.
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":null},"finish_reason":null}]}"#,
+            // Call A (index 0): header + first fragment.
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
+            // Call B (index 1): header + first fragment.
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"search","arguments":"{\"q\":"}}]},"finish_reason":null}]}"#,
+            // Call A: remaining fragment.
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"echo","arguments":"\"a\"}"}}]},"finish_reason":null}]}"#,
+            // Call B: remaining fragment.
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"search","arguments":"\"b\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
+        ];
+        for raw in chunks {
+            let chunk = OpenAiChunk::parse(raw).unwrap();
+            em.process_chunk(&chunk);
+            for ev in em.drain() {
+                acc.process(&ev).unwrap();
+            }
+        }
+        for ev in em.finish() {
+            acc.process(&ev).unwrap();
+        }
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 2, "two tool calls expected");
+        match &msg.parts[0] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "echo");
+                assert_eq!(input, &serde_json::json!({"msg": "a"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match &msg.parts[1] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "search");
+                assert_eq!(input, &serde_json::json!({"q": "b"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
     }
 
     #[test]

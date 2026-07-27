@@ -46,10 +46,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// ===================================================
-// StreamTimeoutConfig
-// ===================================================
-
 /// Configuration for the [`StreamHandler`]'s timeout behaviour.
 ///
 /// Controls how long the handler waits for events at each phase of the
@@ -182,10 +178,6 @@ impl StreamTimeoutConfig {
         Ok(())
     }
 }
-
-// ===================================================
-// StreamRetryConfig
-// ===================================================
 
 /// Configuration for retry behaviour when stream initialization fails.
 ///
@@ -321,10 +313,6 @@ impl StreamRetryConfig {
     }
 }
 
-// ===================================================
-// RateLimitConfig + detection
-// ===================================================
-
 /// Policy for handling 429 / 503 rate-limit responses from LLM providers.
 ///
 /// Governs backoff and retry behaviour when the server signals that the client
@@ -442,6 +430,12 @@ impl RateLimitConfig {
         }
         if self.max_retries == 0 {
             return Err("max_retries must be >= 1".into());
+        }
+        if self.fallback_after_retries > self.max_retries {
+            return Err(format!(
+                "fallback_after_retries ({}) must be <= max_retries ({})",
+                self.fallback_after_retries, self.max_retries
+            ));
         }
         Ok(())
     }
@@ -831,10 +825,6 @@ impl EventDiagnostics {
     }
 }
 
-// ===================================================
-// StreamOutcome
-// ===================================================
-
 /// Why the stream ended.
 ///
 /// Each variant captures the relevant context for how streaming
@@ -856,9 +846,19 @@ pub enum StreamOutcome {
     /// Happy path. The [`StreamAccumulator`]
     /// contains the full response.
     Completed {
-        /// Number of SSE events processed.
+        /// Number of SSE events processed before `MessageStop`.
+        ///
+        /// Counts every event the accumulator accepted, including
+        /// keep-alive heartbeats and metadata events. Useful as a
+        /// throughput signal alongside `duration`.
         events_processed: u64,
-        /// Wall-clock duration of the stream.
+
+        /// Wall-clock duration of the stream from first byte to
+        /// `MessageStop`.
+        ///
+        /// Measured inside the handler; divide `events_processed` by
+        /// this to get the average events-per-second rate for
+        /// telemetry.
         duration: Duration,
     },
 
@@ -868,11 +868,26 @@ pub enum StreamOutcome {
     /// [`total_stream_timeout`](StreamTimeoutConfig::total_stream_timeout).
     /// Partial data may be available in the accumulator.
     TotalTimeout {
-        /// Whether partial content was accumulated before timeout.
+        /// Whether partial content was accumulated before the timeout.
+        ///
+        /// `true` when at least one content event arrived before the
+        /// deadline; the caller may inspect the accumulator to decide
+        /// whether the partial result is usable.
         has_partial_data: bool,
-        /// Events processed before timeout.
+
+        /// Events processed before the timeout fired.
+        ///
+        /// How many SSE events the accumulator accepted before the
+        /// overall stream deadline elapsed — zero implies the stream
+        /// stalled immediately.
         events_processed: u64,
-        /// Duration before timeout was triggered.
+
+        /// Elapsed time from stream start to the timeout trigger.
+        ///
+        /// Approximately equal to
+        /// [`total_stream_timeout`](StreamTimeoutConfig::total_stream_timeout),
+        /// reported for diagnostics so callers can correlate the
+        /// observed wait with the configured ceiling.
         duration: Duration,
     },
 
@@ -882,9 +897,21 @@ pub enum StreamOutcome {
     /// [`per_event_timeout`](StreamTimeoutConfig::per_event_timeout).
     /// Partial data may be available.
     EventTimeout {
-        /// Whether partial content was accumulated.
+        /// Whether partial content was accumulated before the failure.
+        ///
+        /// `true` when at least one content event arrived before the
+        /// consecutive-timeout threshold was reached; the caller may
+        /// inspect the accumulator to decide whether the partial result
+        /// is usable.
         has_partial_data: bool,
-        /// Consecutive timeouts that triggered the failure.
+
+        /// Consecutive per-event timeouts that triggered the failure.
+        ///
+        /// Reaches
+        /// [`max_consecutive_timeouts`](StreamTimeoutConfig::max_consecutive_timeouts)
+        /// when the handler gives up. Each individual timeout equals
+        /// [`per_event_timeout`](StreamTimeoutConfig::per_event_timeout);
+        /// this count tells the caller how many gaps were observed.
         consecutive_timeouts: u32,
     },
 
@@ -895,11 +922,27 @@ pub enum StreamOutcome {
     /// [`DetectedRateLimit`] carries the parsed `Retry-After`, if the server
     /// provided one.
     RateLimited {
-        /// Decoded rate-limit detail (kind + parsed `Retry-After`).
+        /// Decoded rate-limit detail.
+        ///
+        /// Carries the rate-limit kind (429 / 503 / 529) and the parsed
+        /// `Retry-After` hint, if the server provided one. Downstream
+        /// layers (the fallback manager, the retry loop) read this to
+        /// honour the provider's back-off guidance without re-parsing
+        /// the response.
         detail: DetectedRateLimit,
+
         /// Whether partial content was accumulated before the rate limit.
+        ///
+        /// `true` when the stream produced content events before the
+        /// provider started rate-limiting; the caller may inspect the
+        /// accumulator to decide whether the partial result is usable.
         has_partial_data: bool,
+
         /// Events processed before the rate limit fired.
+        ///
+        /// How many SSE events the accumulator accepted before the
+        /// 429/503/529 response arrived — zero implies the provider
+        /// rejected the stream early.
         events_processed: u64,
     },
 
@@ -909,8 +952,19 @@ pub enum StreamOutcome {
     /// No data was accumulated.
     InitFailed {
         /// The last error from the final retry attempt.
+        ///
+        /// Rendered to a string for diagnostics; typically the
+        /// underlying transport or HTTP error that prevented the
+        /// handler from receiving a first event. Surface this in logs
+        /// so the caller can see why the stream never started.
         last_error: String,
-        /// Number of retry attempts made.
+
+        /// Number of retry attempts made before giving up.
+        ///
+        /// Counts the (re-)connection attempts up to
+        /// [`StreamRetryConfig`]'s ceiling; reaching this count without
+        /// a first event means the provider was unreachable or
+        /// rejecting the request outright.
         attempts: u32,
     },
 
@@ -1007,10 +1061,6 @@ impl fmt::Display for StreamOutcome {
     }
 }
 
-// ===================================================
-// StreamHandlerError
-// ===================================================
-
 /// Errors produced by [`StreamHandler`].
 ///
 /// Each variant captures the specific failure mode, allowing callers
@@ -1036,9 +1086,21 @@ pub enum StreamHandlerError {
     /// The handler attempted a fallback `create_message()` call after
     /// streaming failed, but the fallback also produced an error.
     FallbackFailed {
-        /// The streaming failure that triggered the fallback.
+        /// The streaming failure that triggered the fallback attempt.
+        ///
+        /// Preserved verbatim so the caller can see both halves of the
+        /// double failure — why streaming gave up (timeout, mid-stream
+        /// error, rate limit) and why the non-streaming retry then
+        /// failed — without losing the original context.
         stream_outcome: StreamOutcome,
-        /// The error from the fallback request.
+
+        /// The error returned by the non-streaming fallback request.
+        ///
+        /// Rendered to a string for diagnostics; typically the
+        /// underlying transport or HTTP error from the
+        /// `create_message()` call. Surface both this and
+        /// `stream_outcome` in logs so the caller can see the full
+        /// chain of failures.
         fallback_error: String,
     },
 
@@ -1057,8 +1119,21 @@ pub enum StreamHandlerError {
     /// same-model non-streaming fallback.
     RateLimitEscalation {
         /// Number of rate-limit retries honored before escalating.
+        ///
+        /// Counts the 429/503/529 responses the handler retried
+        /// (honoring the provider's `Retry-After`) before giving up on
+        /// the current model and handing control to the model circuit
+        /// breaker. Reaching
+        /// [`RateLimitConfig::fallback_after_retries`] triggers this
+        /// variant.
         attempts: u32,
-        /// Last server-advised `Retry-After` hint, after clamping. `None` when no header sent.
+
+        /// Last server-advised `Retry-After` hint, after clamping.
+        ///
+        /// Preserved for diagnostics and back-off tuning so the caller
+        /// can correlate the escalation with the provider's last
+        /// guidance. `None` when the provider sent no `Retry-After`
+        /// header on the final rate-limited response.
         retry_after: Option<Duration>,
     },
 }
@@ -1090,10 +1165,6 @@ impl fmt::Display for StreamHandlerError {
 }
 
 impl std::error::Error for StreamHandlerError {}
-
-// ===================================================
-// StreamProgress
-// ===================================================
 
 /// A snapshot of stream progress for external reporting.
 ///
@@ -1132,10 +1203,6 @@ pub struct StreamProgress {
     /// stream before a timeout fires.
     pub events_processed: u64,
 }
-
-// ===================================================
-// StreamHandler
-// ===================================================
 
 /// Holds configuration for the streaming resilience layer.
 ///
@@ -1218,6 +1285,13 @@ pub struct StreamHandler {
     /// than risking a 429. `None` (the default) means reactive-only handling:
     /// no pre-throttling, server 429s still handled via `rate_limit_config`.
     rate_limiter: Option<Arc<crate::stream::rate_limit::RateLimiter>>,
+
+    /// Upper bound on how long `gate_on_rate_limit` blocks for a token.
+    ///
+    /// When the limiter's `acquire` returns a wait exceeding this, the
+    /// handler proceeds anyway rather than hanging the agent. Defaults
+    /// to 30 seconds.
+    rate_limit_max_wait: Duration,
 }
 
 impl fmt::Debug for StreamHandler {
@@ -1227,6 +1301,7 @@ impl fmt::Debug for StreamHandler {
             .field("retry_config", &self.retry_config)
             .field("rate_limit_config", &self.rate_limit_config)
             .field("rate_limiter", &self.rate_limiter)
+            .field("rate_limit_max_wait", &self.rate_limit_max_wait)
             .finish()
     }
 }
@@ -1290,6 +1365,7 @@ impl StreamHandler {
                 ..Default::default()
             },
             rate_limiter: None,
+            rate_limit_max_wait: Duration::from_secs(30),
         }
     }
 
@@ -1328,6 +1404,7 @@ impl StreamHandler {
             retry_config: StreamRetryConfig::default(),
             rate_limit_config: RateLimitConfig::default(),
             rate_limiter: None,
+            rate_limit_max_wait: Duration::from_secs(30),
         }
     }
 
@@ -1432,9 +1509,16 @@ impl StreamHandler {
         self
     }
 
-    // ==================================================
-    // Runtime methods
-    // ==================================================
+    /// Set the max-wait ceiling for `gate_on_rate_limit` (builder style).
+    ///
+    /// Defaults to 30 seconds. When the limiter's `acquire` returns a
+    /// wait exceeding this, the handler proceeds anyway rather than
+    /// hanging the agent.
+    #[must_use]
+    pub fn with_rate_limit_max_wait(mut self, max_wait: Duration) -> Self {
+        self.rate_limit_max_wait = max_wait;
+        self
+    }
 
     /// Drive one turn as a stream of [`HandlerEvent`]s.
     ///
@@ -1476,12 +1560,13 @@ impl StreamHandler {
         // "no total deadline" (`None`) rather than wrapping to `Instant::now()`
         // (which would immediately fire a spurious TotalTimeout).
         let total_deadline = Instant::now().checked_add(self.timeout_config.total_stream_timeout);
+        let stream_start = Instant::now();
         let max_attempts = self.retry_config.max_retries.saturating_add(1);
 
         Box::pin(async_stream::try_stream! {
             let mut rate_limit_retries: u32 = 0;
             let mut transport_attempts: u32 = 0;
-            let mut attempt: u32 = 0;
+            let mut first_attempt = true;
             // Shadow accumulator tracks partial-data presence for diagnostics.
             let mut shadow = StreamAccumulator::new();
 
@@ -1493,16 +1578,16 @@ impl StreamHandler {
                         StreamOutcome::TotalTimeout {
                             has_partial_data: !shadow.peek_parts().is_empty(),
                             events_processed: 0,
-                            duration: self.timeout_config.total_stream_timeout,
+                            duration: stream_start.elapsed(),
                         },
                     ))?;
                 }
 
-                attempt = attempt.saturating_add(1);
-                if attempt > 1 {
+                if !first_attempt {
                     shadow = StreamAccumulator::new();
                     yield HandlerEvent::AttemptReset;
                 }
+                first_attempt = false;
 
                 self.gate_on_rate_limit(client, cancel, total_deadline).await?;
                 let request = crate::api::StreamRequest {
@@ -1536,7 +1621,7 @@ impl StreamHandler {
                             if let Err(e) = shadow.process(&event) {
                                 Err(StreamHandlerError::StreamFailed(
                                     StreamOutcome::InitFailed {
-                                        attempts: 1,
+                                        attempts: transport_attempts.saturating_add(1),
                                         last_error: e.to_string(),
                                     },
                                 ))?;
@@ -1678,7 +1763,7 @@ impl StreamHandler {
             return Ok(());
         };
         let key = client.base_url();
-        let max_wait = limiter.max_wait();
+        let max_wait = self.rate_limit_max_wait;
         let mut waited = Duration::ZERO;
         loop {
             match limiter.acquire(&key) {
@@ -1930,12 +2015,23 @@ pub enum HandlerEvent {
     /// Always the last event before the stream ends (when the fallback path
     /// is taken).
     Fallback {
-        /// The fallback assistant message (text extracted from the JSON
-        /// response's first text part).
+        /// The fallback assistant message produced by the non-streaming
+        /// request.
+        ///
+        /// Built from the first text part of the
+        /// [`create_message`](crate::api::ApiClient::create_message) JSON
+        /// response. The engine should treat this as the authoritative
+        /// turn output — the streaming accumulator's partial state from
+        /// failed attempts is discarded on this path.
         message: Message,
-        /// Stop reason parsed from the JSON response’s `stop_reason` field,
-        /// defaulting to [`EndTurn`](StreamStopReason::EndTurn) when absent
-        /// or unrecognized.
+
+        /// Stop reason parsed from the JSON response's `stop_reason`
+        /// field.
+        ///
+        /// Defaults to [`EndTurn`](StreamStopReason::EndTurn) when the
+        /// field is absent or holds an unrecognized value, so the engine
+        /// always has a concrete reason to act on. Drives the same
+        /// downstream behaviour as a streaming `MessageStop`.
         stop_reason: StreamStopReason,
     },
 }
@@ -3367,8 +3463,10 @@ mod tests {
         // process_events deadline checks report the actual TotalTimeout — the
         // gate's job is just to not overrun the budget.
         use crate::stream::rate_limit::RateLimiter;
-        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_mins(2)));
-        let handler = StreamHandler::new().with_rate_limiter(Arc::clone(&limiter));
+        let limiter = Arc::new(RateLimiter::new(1));
+        let handler = StreamHandler::new()
+            .with_rate_limiter(Arc::clone(&limiter))
+            .with_rate_limit_max_wait(Duration::from_mins(2));
         let client = GateMock { url: "openai" };
         let cancel = Arc::new(CancelSignal::new());
 
@@ -3404,8 +3502,10 @@ mod tests {
         // after ~80ms — proving it honors the turn ceiling rather than the
         // 60s refill wait or the 120s max_wait.
         use crate::stream::rate_limit::RateLimiter;
-        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_mins(2)));
-        let handler = StreamHandler::new().with_rate_limiter(Arc::clone(&limiter));
+        let limiter = Arc::new(RateLimiter::new(1));
+        let handler = StreamHandler::new()
+            .with_rate_limiter(Arc::clone(&limiter))
+            .with_rate_limit_max_wait(Duration::from_mins(2));
         let client = GateMock { url: "openai" };
         let cancel = Arc::new(CancelSignal::new());
 
@@ -3439,7 +3539,9 @@ mod tests {
         // back-to-back through stream_turn (end-to-end wiring).
         use crate::stream::rate_limit::RateLimiter;
         let limiter = Arc::new(RateLimiter::new(60));
-        let handler = StreamHandler::new().with_rate_limiter(Arc::clone(&limiter));
+        let handler = StreamHandler::new()
+            .with_rate_limiter(Arc::clone(&limiter))
+            .with_rate_limit_max_wait(Duration::from_mins(2));
         let client = GateMock { url: "openai" };
         let cancel = Arc::new(CancelSignal::new());
 
@@ -3464,8 +3566,10 @@ mod tests {
         // second turn must wait ~60s. Cancelling during that wait should return
         // promptly.
         use crate::stream::rate_limit::RateLimiter;
-        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_mins(2)));
-        let handler = StreamHandler::new().with_rate_limiter(limiter);
+        let limiter = Arc::new(RateLimiter::new(1));
+        let handler = StreamHandler::new()
+            .with_rate_limiter(limiter)
+            .with_rate_limit_max_wait(Duration::from_millis(50));
         let client = GateMock { url: "openai" };
 
         // First turn consumes the only token.
@@ -3500,8 +3604,10 @@ mod tests {
         // 1 RPM but max_wait = 50ms. The second turn must wait ~60s for a token,
         // but the clamp caps the cumulative wait at 50ms, so the turn proceeds.
         use crate::stream::rate_limit::RateLimiter;
-        let limiter = Arc::new(RateLimiter::new(1).with_max_wait(Duration::from_millis(50)));
-        let handler = StreamHandler::new().with_rate_limiter(limiter);
+        let limiter = Arc::new(RateLimiter::new(1));
+        let handler = StreamHandler::new()
+            .with_rate_limiter(limiter)
+            .with_rate_limit_max_wait(Duration::from_millis(50));
         let client = GateMock { url: "openai" };
         let cancel = Arc::new(CancelSignal::new());
 

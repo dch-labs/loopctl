@@ -1,27 +1,27 @@
 //! Capability traits for the agent loop runtime.
 //!
 //! Each trait represents a single infrastructure capability that the
-//! agent loop can depend on. [`LoopRuntime`](crate::runtime::LoopRuntime)
+//! agent loop can depend on. [`LoopManagers`](crate::managers::LoopManagers)
 //! implements all of them, but consumers can narrow their bounds to
 //! only the capabilities they need.
 //!
 //! # Traits
 //!
-//! | Trait | Purpose |
-//! |-------|---------|
-//! | [`Observable`] | Lifecycle event observation |
-//! | [`Detectable`] | Loop and convergence detection |
-//! | [`FallbackCapable`] | Model fallback / circuit breaker |
-//! | [`Compactable`] | Context compaction |
-//! | [`StreamCapable`] | Resilient LLM streaming |
-//! | `Hookable` | Bidirectional lifecycle hooks *(requires `hooks` feature)* |
-//! | [`PipelineAware`] | Middleware pipeline dispatch |
-//! | `HealthTrackable` | Per-tool health monitoring *(requires `tool_health` feature)* |
+//! | Trait               | Purpose |
+//! |---------------------|---------------------------------------------------------------|
+//! | [`Observable`]      | Lifecycle event observation                                   |
+//! | [`Detectable`]      | Loop and convergence detection                                |
+//! | [`FallbackCapable`] | Model fallback / circuit breaker                              |
+//! | [`Compactable`]     | Context compaction                                            |
+//! | [`StreamCapable`]   | Resilient LLM streaming                                       |
+//! | [`PipelineAware`]   | Middleware pipeline dispatch                                  |
+//! | `Hookable`          | Bidirectional lifecycle hooks *(requires `hooks` feature)*    |
+//! | `HealthTrackable`   | Per-tool health monitoring *(requires `tool_health` feature)* |
 //!
 //! # When to use
 //!
 //! Use these traits as bounds when you need a specific capability
-//! without pulling in the full [`LoopRuntime`](crate::runtime::LoopRuntime):
+//! without pulling in the full [`LoopManagers`](crate::managers::LoopManagers):
 //!
 //! ```rust,ignore
 //! fn check_patterns(runtime: &impl Detectable) {
@@ -42,10 +42,6 @@ use crate::stream::handler::StreamHandler;
 #[cfg(feature = "tool_health")]
 use crate::tool::health::ToolHealthRegistry;
 
-// ==================================================
-// Capability Traits
-// ==================================================
-
 /// Capability to emit lifecycle events to registered observers.
 ///
 /// Observers receive read-only notifications at well-defined hook points
@@ -54,7 +50,7 @@ use crate::tool::health::ToolHealthRegistry;
 ///
 /// # Implementors
 ///
-/// - [`LoopRuntime`](crate::runtime::LoopRuntime) — the framework's default implementation.
+/// - [`LoopManagers`](crate::managers::LoopManagers) — the framework's default implementation.
 ///
 /// # When to use
 ///
@@ -62,7 +58,7 @@ use crate::tool::health::ToolHealthRegistry;
 /// events but don't need any other infrastructure capabilities.
 ///
 /// ```rust,ignore
-/// fn process_turn(runtime: &impl Observable) {
+/// fn run_step(runtime: &impl Observable) {
 ///     runtime.observers().on_turn_start(&ctx);
 ///     // ... do work ...
 ///     runtime.observers().on_turn_end(&ctx);
@@ -70,6 +66,10 @@ use crate::tool::health::ToolHealthRegistry;
 /// ```
 pub trait Observable {
     /// Returns the observer host for lifecycle event fan-out.
+    ///
+    /// The observer host holds every registered observer and dispatches
+    /// all lifecycle events (turn start/end, stream deltas, tool dispatch,
+    /// compaction) to them.
     fn observers(&self) -> &ObserverHost;
 }
 
@@ -82,7 +82,7 @@ pub trait Observable {
 ///
 /// # Implementors
 ///
-/// - [`LoopRuntime`](crate::runtime::LoopRuntime) — the framework's default implementation.
+/// - [`LoopManagers`](crate::managers::LoopManagers) — the framework's default implementation.
 ///
 /// # When to use
 ///
@@ -99,6 +99,9 @@ pub trait Observable {
 /// ```
 pub trait Detectable {
     /// Returns the detection manager for loop and convergence detection.
+    ///
+    /// Use this to record tool calls or model responses and check whether
+    /// the agent is repeating itself or converging on a stable answer.
     fn detection(&self) -> &DetectionManager;
 }
 
@@ -110,7 +113,7 @@ pub trait Detectable {
 ///
 /// # Implementors
 ///
-/// - [`LoopRuntime`](crate::runtime::LoopRuntime) — the framework's default implementation.
+/// - [`LoopManagers`](crate::managers::LoopManagers) — the framework's default implementation.
 ///
 /// # When to use
 ///
@@ -129,6 +132,9 @@ pub trait Detectable {
 /// ```
 pub trait FallbackCapable {
     /// Returns the fallback manager (circuit breaker) for API model fallback.
+    ///
+    /// Use this to record API failures and check whether the circuit
+    /// breaker has tripped, indicating the primary model is unavailable.
     fn fallback(&self) -> &FallbackManager;
 }
 
@@ -141,7 +147,7 @@ pub trait FallbackCapable {
 ///
 /// # Implementors
 ///
-/// - [`LoopRuntime`](crate::runtime::LoopRuntime) — the framework's default implementation.
+/// - [`LoopManagers`](crate::managers::LoopManagers) — the framework's default implementation.
 ///
 /// # When to use
 ///
@@ -150,6 +156,9 @@ pub trait FallbackCapable {
 /// implementations that need to manage the context window directly.
 pub trait Compactable {
     /// Returns the context manager, if compaction is configured.
+    ///
+    /// Returns `None` when no compactor is set — the loop will not
+    /// auto-compact, and the host must manage context size manually.
     fn context_manager(&self) -> Option<&Arc<ContextManager>>;
 }
 
@@ -162,7 +171,7 @@ pub trait Compactable {
 ///
 /// # Implementors
 ///
-/// - [`LoopRuntime`](crate::runtime::LoopRuntime) — the framework's default implementation.
+/// - [`LoopManagers`](crate::managers::LoopManagers) — the framework's default implementation.
 ///
 /// # When to use
 ///
@@ -190,7 +199,7 @@ pub trait StreamCapable {
 ///
 /// # Implementors
 ///
-/// - [`LoopRuntime`](crate::runtime::LoopRuntime) — the framework's default implementation.
+/// - [`LoopManagers`](crate::managers::LoopManagers) — the framework's default implementation.
 ///
 /// # When to use
 ///
@@ -199,6 +208,9 @@ pub trait StreamCapable {
 #[cfg(feature = "hooks")]
 pub trait Hookable {
     /// Returns the hook executor, if hooks are configured.
+    ///
+    /// Returns `None` when no hook executor is set — no pre/post hooks
+    /// will fire. Hooks can approve or reject actions, unlike observers.
     fn hook_executor(&self) -> Option<&HookExecutor>;
 }
 
@@ -209,7 +221,7 @@ pub trait Hookable {
 ///
 /// # Implementors
 ///
-/// - [`LoopRuntime`](crate::runtime::LoopRuntime) — the framework's default implementation.
+/// - [`LoopManagers`](crate::managers::LoopManagers) — the framework's default implementation.
 ///
 /// # When to use
 ///
@@ -227,6 +239,10 @@ pub trait Hookable {
 /// ```
 pub trait PipelineAware {
     /// Returns the tool middleware pipeline, if configured.
+    ///
+    /// Returns `None` when no pipeline is set — tool calls go directly
+    /// to the registry. When set, every tool call passes through the
+    /// pipeline's middleware layers before reaching the tool.
     fn pipeline(&self) -> Option<&ToolPipeline>;
 }
 
@@ -240,9 +256,13 @@ pub trait PipelineAware {
 ///
 /// # Implementors
 ///
-/// - [`LoopRuntime`](crate::runtime::LoopRuntime) — the framework's default implementation.
+/// - [`LoopManagers`](crate::managers::LoopManagers) — the framework's default implementation.
 #[cfg(feature = "tool_health")]
 pub trait HealthTrackable {
     /// Returns the tool health registry, if health tracking is configured.
+    ///
+    /// Returns `None` when no health registry is set — per-tool circuit
+    /// breakers will not fire. When set, records success/failure counts
+    /// and opens breakers for unhealthy tools.
     fn health_registry(&self) -> Option<&ToolHealthRegistry>;
 }

@@ -14,10 +14,6 @@ use crate::message::Message;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// ===================================================
-// CompactReason
-// ===================================================
-
 /// Why compaction was triggered.
 ///
 /// Different triggers may warrant different compaction strategies.
@@ -60,10 +56,6 @@ impl fmt::Display for CompactReason {
     }
 }
 
-// ===================================================
-// CompactionContext
-// ===================================================
-
 /// Metadata passed to [`ContextCompactor::compact`](super::ContextCompactor::compact)
 /// describing the compaction trigger and current state.
 ///
@@ -100,10 +92,6 @@ pub struct CompactionContext {
     /// the turn that triggered it in logs.
     pub turn: usize,
 }
-
-// ===================================================
-// CompactionOutcome
-// ===================================================
 
 /// Result of a single compaction pass.
 ///
@@ -193,10 +181,6 @@ impl CompactionOutcome {
         super::ContextManager::estimate_tokens(messages)
     }
 }
-
-// ===================================================
-// CompactTelemetry
-// ===================================================
 
 /// Telemetry data for a single compaction operation.
 ///
@@ -290,18 +274,21 @@ pub struct PostCompactStats {
     /// [`total_messages`](PreCompactStats::total_messages) when compaction
     /// removed or summarized messages; equal when it made no change.
     pub total_messages: usize,
+
     /// Estimated token count after compaction.
     ///
     /// The post-compaction token estimate, comparable to
     /// [`estimated_tokens`](PreCompactStats::estimated_tokens) from the
     /// pre-compaction snapshot. The difference is [`tokens_saved`](Self::tokens_saved).
     pub estimated_tokens: u64,
+
     /// Tokens removed by compaction.
     ///
     /// How many tokens the pass reclaimed: the pre-compaction estimate minus
     /// the post-compaction estimate. Saturates at zero, so it never goes
     /// negative even if a summary injection made the conversation larger.
     pub tokens_saved: u64,
+
     /// Percentage of tokens saved (0–100).
     ///
     /// [`tokens_saved`](Self::tokens_saved) as a share of the pre-compaction
@@ -309,10 +296,6 @@ pub struct PostCompactStats {
     /// `0` when nothing was saved or when the pre-compaction estimate was zero.
     pub percent_saved: u8,
 }
-
-// ===================================================
-// ContextOverflow error
-// ===================================================
 
 /// Error returned when the conversation cannot fit within the context
 /// window, even after compaction.
@@ -359,13 +342,20 @@ pub struct ContextOverflow {
 }
 
 impl ContextOverflow {
-    /// How many tokens the conversation exceeds the window by.
+    /// How many tokens the conversation exceeds the context window by.
+    ///
+    /// Returns zero when the conversation fits within the window. Uses
+    /// saturating subtraction so an underflow never panics.
     #[must_use]
     pub fn overflow(&self) -> u64 {
         self.tokens_used.saturating_sub(self.context_window)
     }
 
-    /// The fraction of the context window used (0.0–1.0+).
+    /// The fraction of the context window currently consumed.
+    ///
+    /// Returns a value between `0.0` and `1.0` when the conversation fits,
+    /// or above `1.0` when it overflows. Returns infinity when the context
+    /// window is zero (division by zero).
     #[must_use]
     pub fn utilization(&self) -> f64 {
         if self.context_window == 0 {
@@ -391,10 +381,6 @@ impl fmt::Display for ContextOverflow {
 
 impl std::error::Error for ContextOverflow {}
 
-// ===================================================
-// EnsureContextResult
-// ===================================================
-
 /// Result of [`ContextManager::ensure_context_fits`](super::ContextManager::ensure_context_fits).
 ///
 /// Tells the caller whether compaction occurred and provides the
@@ -419,6 +405,11 @@ pub enum EnsureContextResult {
 
 impl EnsureContextResult {
     /// Extract the message list from this result, regardless of variant.
+    ///
+    /// Returns the compacted messages from [`Compacted`](Self::Compacted) or
+    /// the unchanged messages from [`NoAction`](Self::NoAction). Use this when
+    /// you only care about the resulting history and not whether compaction
+    /// actually occurred.
     #[must_use]
     pub fn into_messages(self) -> Vec<Message> {
         match self {

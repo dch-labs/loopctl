@@ -13,10 +13,6 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
-// ===================================================
-// TruncatingCompactor
-// ===================================================
-
 /// A simple compactor that drops the oldest messages.
 ///
 /// Keeps the first message (typically the system prompt) and a configurable
@@ -51,21 +47,25 @@ use std::pin::Pin;
 /// ```
 #[derive(Debug, Clone)]
 pub struct TruncatingCompactor {
-    /// Number of recent messages to always preserve.
+    /// Number of recent messages to always preserve during compaction.
+    ///
+    /// This many messages from the end of the conversation are kept intact;
+    /// everything before them is dropped. Defaults to 4.
     preserve_recent: usize,
-    /// Minimum messages before compaction is considered.
+
+    /// Minimum number of messages before compaction is attempted.
+    ///
+    /// If the conversation has fewer messages than this, compaction is
+    /// skipped entirely. Prevents aggressive truncation of short
+    /// conversations. Defaults to 6.
     min_messages: usize,
 }
 
 impl TruncatingCompactor {
     /// Create a new truncating compactor with sensible defaults.
     ///
-    /// Defaults:
-    ///
-    /// | Setting           | Default |
-    /// |-------------------|---------|
-    /// | `preserve_recent` | 4       |
-    /// | `min_messages`    | 6       |
+    /// Preserves the 4 most recent messages and requires at least 6 messages
+    /// before compaction is attempted.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -95,13 +95,17 @@ impl TruncatingCompactor {
         self
     }
 
-    /// Number of recent messages that will be preserved.
+    /// Number of recent messages that will be preserved during compaction.
+    ///
+    /// This many messages from the end of the conversation are always kept.
     #[must_use]
     pub fn preserve_recent(&self) -> usize {
         self.preserve_recent
     }
 
-    /// Minimum messages before compaction is attempted.
+    /// Minimum number of messages required before compaction is attempted.
+    ///
+    /// Conversations shorter than this are left untouched.
     #[must_use]
     pub fn min_messages(&self) -> usize {
         self.min_messages
@@ -164,10 +168,6 @@ impl ContextCompactor for TruncatingCompactor {
         })
     }
 }
-
-// ===================================================
-// Tool-call/result pair protection
-// ==================================================
 
 impl TruncatingCompactor {
     /// Adjust the split index to avoid orphaning tool-call/result pairs.
@@ -235,10 +235,6 @@ impl TruncatingCompactor {
     }
 }
 
-// ===================================================
-// TokenSplitter
-// ===================================================
-
 /// Splits a conversation into "old" and "recent" at a turn boundary.
 ///
 /// Used by compactors (and agent-side code) that need to know which
@@ -276,36 +272,59 @@ impl TruncatingCompactor {
 /// ```
 #[derive(Debug, Clone)]
 pub struct TokenSplitter {
-    /// Number of recent messages to always preserve.
+    /// Number of recent messages to always preserve during a split.
+    ///
+    /// This many messages from the end of the conversation are kept in the
+    /// preserved portion. Defaults to 4.
     preserve_recent: usize,
-    /// Minimum messages before considering a split.
+
+    /// Minimum number of messages before a split is attempted.
+    ///
+    /// Conversations shorter than this go entirely into the preserved
+    /// portion. Defaults to 6.
     min_messages: usize,
 }
 
 /// Result of splitting a conversation into old and recent portions.
 #[derive(Debug, Clone)]
 pub struct SplitResult {
-    /// Messages to compact or summarize (the "old" part).
+    /// Messages to compact or summarize (the old portion).
+    ///
+    /// These are the messages before the split point. They are candidates
+    /// for summarization, truncation, or removal by the compactor.
     pub to_compact: Vec<Message>,
-    /// Messages to preserve as-is (the "recent" part).
+
+    /// Messages to preserve as-is (the recent portion).
+    ///
+    /// These are the messages after the split point. They are kept
+    /// untouched in the conversation history.
     pub preserved: Vec<Message>,
-    /// Estimated tokens in `to_compact`.
+
+    /// Estimated token count of the old portion ([`to_compact`](Self::to_compact)).
+    ///
+    /// Approximate token usage of the messages eligible for summarization or
+    /// removal, computed from the pre-split history so callers can budget how
+    /// much context compaction should reclaim.
     pub compact_tokens: u64,
-    /// Estimated tokens in `preserved`.
+
+    /// Estimated token count of the recent portion ([`preserved`](Self::preserved)).
+    ///
+    /// Approximate token usage of the messages kept intact after the split,
+    /// giving callers the residual context footprint that will carry into the
+    /// next model call.
     pub preserved_tokens: u64,
+
     /// The index in the original message list where the split occurred.
+    ///
+    /// Zero when no split was needed (the entire conversation was preserved).
     pub split_index: usize,
 }
 
 impl TokenSplitter {
     /// Create a new splitter with sensible defaults.
     ///
-    /// Defaults:
-    ///
-    /// | Setting           | Default |
-    /// |-------------------|---------|
-    /// | `preserve_recent` | 4       |
-    /// | `min_messages`    | 6       |
+    /// Preserves the 4 most recent messages and requires at least 6 messages
+    /// before a split is attempted.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -314,14 +333,20 @@ impl TokenSplitter {
         }
     }
 
-    /// Set how many recent messages to preserve.
+    /// Set how many recent messages to preserve during a split.
+    ///
+    /// This many messages from the end of the conversation are kept in the
+    /// preserved portion. The rest are candidates for compaction.
     #[must_use]
     pub fn with_preserve_recent(mut self, count: usize) -> Self {
         self.preserve_recent = count.max(1);
         self
     }
 
-    /// Set the minimum messages before splitting is considered.
+    /// Set the minimum number of messages before a split is attempted.
+    ///
+    /// Conversations shorter than this are returned entirely as preserved.
+    /// Prevents splitting very short conversations into meaningless fragments.
     #[must_use]
     pub fn with_min_messages(mut self, count: usize) -> Self {
         self.min_messages = count.max(2);

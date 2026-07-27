@@ -2,9 +2,9 @@
 //!
 //! Fires observer callbacks and hook notifications when a session begins and
 //! ends. Other observer events (`on_turn_start`, `on_response`, etc.) are fired
-//! directly at their call sites in `process_turn`.
+//! directly at their call sites in the driver loop.
 
-use super::{ApiClient, BareLoop, Duration, SessionResult};
+use super::{ApiClient, BareLoop, Duration, Run};
 #[cfg(feature = "hooks")]
 use crate::capabilities::Hookable;
 #[cfg(feature = "hooks")]
@@ -14,69 +14,83 @@ use crate::hooks::context::{
 };
 use crate::observer::{SessionEndContext, SessionStartContext};
 
-// ==================================================
-// Session lifecycle notifications
-// ==================================================
-
 impl<C: ApiClient> BareLoop<C> {
     /// Notify all observers and hooks that the session has started.
+    ///
+    /// Fires [`on_session_start`](crate::observer::LoopObserver::on_session_start)
+    /// on every registered observer with the session id, then fires the
+    /// `on_session_start` hook (when the `hooks` feature is enabled and a
+    /// hook executor is configured). Called once at the beginning of a
+    /// run, before the first turn.
     pub(super) fn notify_session_start(&self) {
         self.managers
             .observers()
             .on_session_start(&SessionStartContext {
-                session_id: self.config.session_id,
+                session_id: self.session.id,
             });
         self.notify_session_start_hook();
     }
 
     /// Notify all observers and hooks that the session has ended.
-    pub(super) fn notify_session_end(&self, result: &SessionResult, duration: Duration) {
+    ///
+    /// Fires [`on_session_end`](crate::observer::LoopObserver::on_session_end)
+    /// on every registered observer, then fires the `on_session_end` hook
+    /// (when the `hooks` feature is enabled). The [`Run`] supplies the
+    /// per-run totals (turn count, tokens); `success` distinguishes a
+    /// normal exit from a failure so observers and hooks can branch on
+    /// the outcome, and `duration` is the wall-clock run length.
+    pub(super) fn notify_session_end(&self, result: &Run, success: bool, duration: Duration) {
         self.managers
             .observers()
             .on_session_end(&SessionEndContext {
-                success: result.success,
-                error: result.error.clone(),
-                total_turns: result.total_turns,
+                success,
+                error: if success {
+                    None
+                } else {
+                    Some("run failed".to_string())
+                },
+                total_turns: result.turn_count(),
                 duration_ms: Self::millis_u64(duration),
             });
-        self.notify_session_end_hook(result, duration);
+        self.notify_session_end_hook(result, success, duration);
     }
 
     /// Derive the structured [`SessionEndReason`] from the loop's
     /// terminal state.
     ///
-    /// Unlike a simple `success` boolean, this distinguishes
-    /// cancellation, max-turns exhaustion, and context overflow.
+    /// Maps the boolean `success` plus the cancellation flag and the
+    /// turn cap into the richer hook-level enum: cancellation wins over
+    /// every other outcome, then failure, then the turn cap, finally
+    /// normal completion. Used only to populate the hook end-context —
+    /// observers receive the simpler boolean `success` field.
     #[cfg(feature = "hooks")]
     fn session_end_reason(&self, success: bool) -> SessionEndReason {
         if self.is_cancelled() {
             SessionEndReason::Cancelled
         } else if !success {
-            if self
-                .budget
-                .error
-                .as_ref()
-                .is_some_and(|e| e.contains("context") || e.contains("overflow"))
-            {
-                SessionEndReason::ContextOverflow
-            } else {
-                SessionEndReason::Error
-            }
-        } else if self.budget.total_turns >= self.config.max_turns {
+            SessionEndReason::Error
+        } else if self.current_run().map_or(0, Run::turn_count) >= self.run_config().max_turns {
             SessionEndReason::MaxTurns
         } else {
             SessionEndReason::Complete
         }
     }
 
+    /// Fire the `on_session_start` hook when a hook executor is
+    /// configured.
+    ///
+    /// Builds a [`HookSessionStartContext`] from the session id, the
+    /// client's current model, and the process working directory, then
+    /// dispatches it to every registered session-start hook. No-op when
+    /// no hook executor is set.
     #[cfg(feature = "hooks")]
     fn notify_session_start_hook(&self) {
         let Some(executor) = self.managers.hook_executor() else {
             return;
         };
         let ctx = HookSessionStartContext {
-            session_id: self.config.session_id,
-            model: self.config.model.clone(),
+            session_id: self.session.id,
+            model: self.client.model(),
             working_directory: std::env::current_dir()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
@@ -84,29 +98,54 @@ impl<C: ApiClient> BareLoop<C> {
         executor.notify_session_start(&ctx);
     }
 
+    /// No-op session-start hook for builds without the `hooks` feature.
+    ///
+    /// Does nothing — there are no hooks to notify. Kept so
+    /// [`notify_session_start`](Self::notify_session_start) compiles
+    /// identically with and without the feature.
     #[cfg(not(feature = "hooks"))]
     fn notify_session_start_hook(&self) {}
 
+    /// Fire the `on_session_end` hook when a hook executor is
+    /// configured.
+    ///
+    /// Derives the [`SessionEndReason`] via
+    /// [`session_end_reason`](Self::session_end_reason), then builds a
+    /// [`HookSessionEndContext`] from the session id, reason, turn
+    /// count, total tokens, and run duration, and dispatches it to
+    /// every registered session-end hook. No-op when no hook executor
+    /// is set.
     #[cfg(feature = "hooks")]
-    fn notify_session_end_hook(&self, result: &SessionResult, duration: Duration) {
+    fn notify_session_end_hook(&self, result: &Run, success: bool, duration: Duration) {
         let Some(executor) = self.managers.hook_executor() else {
             return;
         };
-        let reason = self.session_end_reason(result.success);
+        let reason = self.session_end_reason(success);
         let ctx = HookSessionEndContext {
-            session_id: result.session_id,
+            session_id: self.session.id,
             reason,
-            total_turns: result.total_turns,
-            total_tokens: result.input_tokens.saturating_add(result.output_tokens),
+            total_turns: result.turn_count(),
+            total_tokens: result.total_tokens(),
             duration_secs: duration.as_secs(),
         };
         executor.notify_session_end(&ctx);
     }
 
+    /// No-op session-end hook for builds without the `hooks` feature.
+    ///
+    /// Does nothing — there are no hooks to notify. Kept so
+    /// [`notify_session_end`](Self::notify_session_end) compiles
+    /// identically with and without the feature.
     #[cfg(not(feature = "hooks"))]
-    fn notify_session_end_hook(&self, _result: &SessionResult, _duration: Duration) {}
+    fn notify_session_end_hook(&self, _result: &Run, _success: bool, _duration: Duration) {}
 
-    /// Convert a [`Duration`] to milliseconds as `u64`.
+    /// Convert a [`Duration`] to milliseconds as a `u64`.
+    ///
+    /// Saturates at `u64::MAX` if the duration exceeds the `u64` range
+    /// (only possible with a platform-specific `u128` millisecond count
+    /// far beyond any realistic run length). Used to populate the
+    /// observer/hook end-context `duration_ms` fields from a
+    /// [`Duration`].
     pub(super) fn millis_u64(duration: Duration) -> u64 {
         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
     }

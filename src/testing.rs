@@ -40,9 +40,7 @@
 //! - [`test_assistant_message`] — Create a test assistant [`Message`].
 //! - [`test_tool_use_message`] — Create an assistant [`Message`] with
 //!   tool-call content blocks.
-//! - [`test_config`] — Create a test [`LoopConfig`] with sensible defaults.
-//! - [`test_config_with_id`] — Create a test [`LoopConfig`] with a specific
-//!   session ID.
+//! - [`test_config`] — Create a test [`SessionConfig`] with sensible defaults.
 //!
 //! # Quick Start
 //!
@@ -91,7 +89,7 @@
 
 use crate::api::ApiClient;
 use crate::api::error::ApiError;
-use crate::config::LoopConfig;
+use crate::config::SessionConfig;
 use crate::message::{Message, MessagePart, Role};
 use crate::stream::{
     DeltaPart, IndexedDelta, MessageDelta, MessageDeltaPayload, MessageMetadata, MessageStart,
@@ -105,11 +103,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use std::sync::Mutex;
-use uuid::Uuid;
-
-// ==================================================
-// MockApiClient
-// ==================================================
 
 /// A mock [`ApiClient`] that returns preconfigured streaming responses.
 ///
@@ -304,10 +297,6 @@ pub struct MockToolCall {
     /// (in a real scenario; the mock itself ignores it).
     pub input: Value,
 }
-
-// ===================================================
-// MockApiClient — construction & builder methods
-// ===================================================
 
 /// Construction and builder methods for [`MockApiClient`].
 ///
@@ -547,10 +536,6 @@ impl MockApiClient {
     }
 }
 
-// ===================================================
-// MockApiClient — ApiClient trait implementation
-// ===================================================
-
 /// Trait implementation that turns canned [`MockResponse`] values into
 /// real [`StreamEvent`] sequences and JSON payloads.
 ///
@@ -598,6 +583,14 @@ impl ApiClient for MockApiClient {
         crate::error::recover_guard(self.model_name.lock()).clone()
     }
 
+    /// Hot-swap the mock's model name at runtime.
+    ///
+    /// Unlike the trait default (which returns `false`), the mock stores
+    /// its model behind a mutex and updates it in place so tests can
+    /// exercise [`BareLoop::switch_model`](crate::engine::BareLoop::switch_model)
+    /// and verify the new name is observed by subsequent [`model`](Self::model)
+    /// calls. Returns `false` (no-op) when `model` is empty or whitespace,
+    /// matching the trait contract that an empty model is not a valid switch.
     fn set_model(&self, model: &str) -> bool {
         if model.trim().is_empty() {
             return false;
@@ -745,10 +738,6 @@ impl ApiClient for MockApiClient {
     }
 }
 
-// ==================================================
-// MockTool
-// ==================================================
-
 /// A mock [`Tool`] that returns a fixed result or error when called.
 ///
 /// Useful for testing tool dispatch, registries, and agent-loop tool
@@ -876,10 +865,6 @@ pub struct MockTool {
     /// them to the agent's system message before sending to the model.
     system_prompt: Option<String>,
 }
-
-// ===================================================
-// MockTool — construction & builder methods
-// ===================================================
 
 /// Construction and builder methods for [`MockTool`].
 ///
@@ -1104,10 +1089,6 @@ impl MockTool {
     }
 }
 
-// ===================================================
-// MockTool — Tool trait implementation
-// ===================================================
-
 /// Trait implementation that returns canned tool metadata and results.
 ///
 /// Every method delegates to the fields configured via the builder
@@ -1243,10 +1224,6 @@ impl Tool for MockTool {
     }
 }
 
-// ==================================================
-// Fixture Factories
-// ==================================================
-
 /// Create a test user [`Message`] with the given text.
 ///
 /// Shorthand for `Message::user(text)`. Useful when building message
@@ -1340,26 +1317,15 @@ pub fn test_tool_use_message(calls: &[(&str, &str, Value)]) -> Message {
     Message::new(Role::Assistant, blocks)
 }
 
-/// Create a test [`LoopConfig`] with sensible defaults.
+/// Create a test [`SessionConfig`] with sensible defaults.
 ///
 /// The returned config has:
 ///
-/// - A random [`Uuid`] session ID.
-/// - `max_turns` set to `10`.
 /// - `system_prompt` set to `"You are a test assistant."`.
 /// - All other fields at their [`Default`] values.
 ///
 /// Useful as a starting point when you don't care about specific
-/// configuration values. If you need a deterministic session ID for
-/// log correlation or assertion, use [`test_config_with_id`] instead.
-///
-/// # Fields
-///
-/// ```text
-/// session_id    → Uuid::new_v4()
-/// max_turns     → 10
-/// system_prompt → Some("You are a test assistant.")
-/// ```
+/// configuration values.
 ///
 /// # Example
 ///
@@ -1367,56 +1333,15 @@ pub fn test_tool_use_message(calls: &[(&str, &str, Value)]) -> Message {
 /// use loopctl::testing::test_config;
 ///
 /// let config = test_config();
-/// assert_eq!(config.max_turns, 10);
+/// assert_eq!(config.system_prompt.as_deref(), Some("You are a test assistant."));
 /// ```
 #[must_use]
-pub fn test_config() -> LoopConfig {
-    LoopConfig {
-        session_id: Uuid::new_v4(),
-        max_turns: 10,
+pub fn test_config() -> SessionConfig {
+    SessionConfig {
         system_prompt: Some("You are a test assistant.".to_string()),
-        ..Default::default()
+        ..SessionConfig::default()
     }
 }
-
-/// Create a test [`LoopConfig`] with a specific session ID.
-///
-/// Same as [`test_config`] but with a caller-supplied session ID.
-/// Useful when tests need to assert on the ID — for example verifying
-/// log correlation, session persistence, or that a session resumes
-/// with the correct identity after a restart.
-///
-/// # Fields
-///
-/// ```text
-/// session_id    → <caller-supplied>
-/// max_turns     → 10
-/// system_prompt → Some("You are a test assistant.")
-/// ```
-///
-/// # Example
-///
-/// ```rust
-/// use loopctl::testing::test_config_with_id;
-/// use uuid::Uuid;
-///
-/// let id = Uuid::new_v4();
-/// let config = test_config_with_id(id);
-/// assert_eq!(config.session_id, id);
-/// ```
-#[must_use]
-pub fn test_config_with_id(id: Uuid) -> LoopConfig {
-    LoopConfig {
-        session_id: id,
-        max_turns: 10,
-        system_prompt: Some("You are a test assistant.".to_string()),
-        ..Default::default()
-    }
-}
-
-// ==================================================
-// Tests
-// ==================================================
 
 /// Unit tests for the testing module itself.
 ///
@@ -1644,8 +1569,10 @@ mod tests {
     #[test]
     fn test_fixture_test_config() {
         let config = test_config();
-        assert_eq!(config.max_turns, 10);
-        assert!(config.system_prompt.is_some());
+        assert_eq!(
+            config.system_prompt.as_deref(),
+            Some("You are a test assistant.")
+        );
     }
 
     #[test]

@@ -22,8 +22,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use futures::stream::{Stream, StreamExt};
-use reqwest::Response;
+use futures::stream::Stream;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -38,22 +37,12 @@ use crate::structured::ToolConstraint;
 use crate::structured::tighten_json_schema;
 use crate::tool::ToolSchema;
 
-// ==================================================
-// Constants
-// ==================================================
-
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_MODEL: &str = "gemini-2.0-flash";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const THINKING_PART_INDEX: usize = 1;
-const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
-const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
-
-// ==================================================
-// Client
-// ==================================================
 
 /// A Google Gemini API client with streaming support.
 ///
@@ -257,7 +246,7 @@ impl ApiClient for GeminiClient {
             let mut sse = SseReader::from_response(resp);
             let mut emitter = StreamEmitter::default();
 
-            while let Some(data) = sse.next_data().await? {
+            while let Some(data) = sse.next_gemini_data().await? {
                 emitter.process_chunk(&data);
                 for ev in emitter.drain() {
                     yield ev;
@@ -295,13 +284,7 @@ impl ApiClient for GeminiClient {
                 .bytes()
                 .await
                 .map_err(|e| ApiError::http(e.to_string()))?;
-            if resp.len() > MAX_RESPONSE_BODY {
-                return Err(ApiError::http(format!(
-                    "response body too large: {} bytes (max {})",
-                    resp.len(),
-                    MAX_RESPONSE_BODY
-                )));
-            }
+            super::check_response_body(resp.len())?;
             serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
@@ -334,7 +317,7 @@ impl ApiClient for GeminiClient {
             let mut sse = SseReader::from_response(resp);
             let mut emitter = StreamEmitter::default();
 
-            while let Some(data) = sse.next_data().await? {
+            while let Some(data) = sse.next_gemini_data().await? {
                 emitter.process_chunk(&data);
                 for ev in emitter.drain() {
                     yield ev;
@@ -373,13 +356,7 @@ impl ApiClient for GeminiClient {
                 .bytes()
                 .await
                 .map_err(|e| ApiError::http(e.to_string()))?;
-            if resp.len() > MAX_RESPONSE_BODY {
-                return Err(ApiError::http(format!(
-                    "response body too large: {} bytes (max {})",
-                    resp.len(),
-                    MAX_RESPONSE_BODY
-                )));
-            }
+            super::check_response_body(resp.len())?;
             serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
@@ -395,9 +372,6 @@ impl ApiClient for GeminiClient {
             .unwrap_or_else(|| Value::String(text.to_string()))
     }
 }
-// ==================================================
-// Builder
-// ==================================================
 
 /// Builder for [`GeminiClient`].
 ///
@@ -583,10 +557,6 @@ impl GeminiClientBuilder {
     }
 }
 
-// ==================================================
-// Request body construction
-// ==================================================
-
 /// Build the JSON request body for the Gemini Generate Content API.
 ///
 /// Unlike OpenAI/Anthropic, Gemini puts the model in the URL, not the
@@ -726,40 +696,9 @@ fn convert_tools(tools: &[ToolSchema], strict: bool) -> Vec<Value> {
         .collect()
 }
 
-// ==================================================
-// SSE line reader
-// ==================================================
-
-/// Minimal SSE line reader over an HTTP byte stream.
-///
-/// Buffers raw bytes from the response, splits on newlines, and yields
-/// the JSON `data` payload of each SSE event. Gemini SSE uses only
-/// `data:` lines (no `event:` type headers).
-struct SseReader {
-    bytes: Pin<Box<dyn Stream<Item = Result<String, ApiError>> + Send>>,
-    buf: String,
-}
+use super::sse::SseReader;
 
 impl SseReader {
-    /// Wrap a streaming HTTP response into an SSE reader.
-    ///
-    /// Takes the response body's byte stream and converts it into a
-    /// line-oriented reader that yields SSE event data. Used by
-    /// [`stream_messages`](crate::api::ApiClient::stream_messages) and its
-    /// `*_with_options` variant to parse Gemini's streaming
-    /// `streamGenerateContent` responses.
-    fn from_response(resp: Response) -> Self {
-        let bytes = resp.bytes_stream().map(|res| {
-            res.map(|b| String::from_utf8_lossy(&b).into_owned())
-                .map_err(|e| ApiError::http(e.to_string()))
-        });
-
-        Self {
-            bytes: Box::pin(bytes),
-            buf: String::new(),
-        }
-    }
-
     /// Extract the next SSE `data:` payload as parsed JSON.
     ///
     /// Returns `Ok(None)` at end-of-stream.
@@ -767,13 +706,12 @@ impl SseReader {
     /// # Errors
     ///
     /// Returns [`ApiError`] if the underlying HTTP stream fails.
-    async fn next_data(&mut self) -> Result<Option<Value>, ApiError> {
+    async fn next_gemini_data(&mut self) -> Result<Option<Value>, ApiError> {
         loop {
             while let Some(line) = self.take_line() {
                 if line.is_empty() {
                     continue;
                 }
-
                 if let Some(data) = line.strip_prefix(SSE_DATA_PREFIX) {
                     match serde_json::from_str::<Value>(data) {
                         Ok(json) => return Ok(Some(json)),
@@ -787,41 +725,12 @@ impl SseReader {
                     }
                 }
             }
-
-            match self.bytes.next().await {
-                Some(Ok(chunk)) => {
-                    self.buf.push_str(&chunk);
-                    if self.buf.len() > SSE_MAX_BUFFER {
-                        return Err(ApiError::http(format!(
-                            "SSE buffer exceeded {SSE_MAX_BUFFER} bytes"
-                        )));
-                    }
-                }
-                Some(Err(e)) => return Err(e),
-                None => return Ok(None),
+            if self.next_chunk().await?.is_none() {
+                return Ok(None);
             }
         }
     }
-
-    /// Pop the first `\n`-terminated line from the internal buffer.
-    ///
-    /// Returns the line (trimmed) if a newline is present, and removes it
-    /// (plus the newline) from the buffer. Returns `None` if the buffer
-    /// does not yet contain a complete line — the caller should wait for
-    /// more bytes from the HTTP stream.
-    fn take_line(&mut self) -> Option<String> {
-        let pos = self.buf.find('\n')?;
-        let line = self.buf[..pos].trim().to_string();
-        let rest_start = pos.saturating_add(1);
-        self.buf = self.buf.get(rest_start..).unwrap_or_default().to_string();
-
-        Some(line)
-    }
 }
-
-// ==================================================
-// Stream event emitter
-// ==================================================
 
 /// Stateful translator that converts Gemini SSE chunks into
 /// [`StreamEvent`]s.
@@ -865,11 +774,14 @@ struct StreamEmitter {
     /// Set by [`finish`](Self::finish) when it appends the synthetic
     /// [`StreamEvent::MessageStop`]. Guards against emitting a second
     /// `MessageStop` if `finish` is called again after the stream ends.
-    /// (Note: unlike the OpenAI/Anthropic emitters, Gemini's finish
-    /// reason arrives inside a regular data chunk and is handled by
-    /// [`extract_finish_reason`](Self::extract_finish_reason); this flag
-    /// only governs the final `MessageStop` synthesis.)
-    finished: bool,
+    message_stop_emitted: bool,
+
+    /// Whether `finishReason` has already been processed.
+    ///
+    /// Guards against a second `finishReason` chunk (e.g. from proxies that
+    /// re-emit). Distinct from `message_stop_emitted` — the finish-reason
+    /// processing and the terminal `MessageStop` synthesis are independent.
+    finish_reason_processed: bool,
 
     /// Buffered [`StreamEvent`]s waiting to be yielded to the consumer.
     ///
@@ -1050,9 +962,9 @@ impl StreamEmitter {
     /// [`PartStop`](StreamEvent::PartStop), then emits a
     /// [`MessageDelta`](StreamEvent::MessageDelta) carrying the mapped
     /// [`StreamStopReason`]. No-op on a second `finishReason` chunk (the
-    /// `finished` guard defends against proxies/gateways that re-emit).
+    /// `finish_reason_processed` guard defends against proxies/gateways that re-emit).
     fn extract_finish_reason(&mut self, json: &Value) {
-        if self.finished {
+        if self.finish_reason_processed {
             return;
         }
         let Some(reason) = json
@@ -1061,7 +973,7 @@ impl StreamEmitter {
         else {
             return;
         };
-        self.finished = true;
+        self.finish_reason_processed = true;
         let stop = match reason {
             "MAX_TOKENS" => StreamStopReason::MaxTokens,
             _ => StreamStopReason::EndTurn,
@@ -1100,11 +1012,11 @@ impl StreamEmitter {
     ///
     /// Drains any remaining pending events and appends the stop event.
     /// Safe to call exactly once at the end of the stream; subsequent calls
-    /// return an empty vec (the `finished` flag guards against double-stop).
+    /// return an empty vec (the `message_stop_emitted` flag guards against double-stop).
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = self.drain();
-        if self.started && !self.finished {
-            self.finished = true;
+        if self.started && !self.message_stop_emitted {
+            self.message_stop_emitted = true;
             out.push(StreamEvent::MessageStop);
         }
         out
@@ -1120,10 +1032,6 @@ impl StreamEmitter {
         self.pending.push(ev);
     }
 }
-
-// ==================================================
-// Tests
-// ==================================================
 
 #[cfg(test)]
 mod tests {
@@ -1932,7 +1840,7 @@ mod tests {
     fn emitter_finish_emits_message_stop_if_needed() {
         let mut em = StreamEmitter::default();
         em.started = true;
-        em.finished = false;
+        em.message_stop_emitted = false;
 
         let events = em.finish();
         assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop)));
@@ -1942,10 +1850,30 @@ mod tests {
     fn emitter_finish_noop_if_already_stopped() {
         let mut em = StreamEmitter::default();
         em.started = true;
-        em.finished = true;
+        em.message_stop_emitted = true;
 
         let events = em.finish();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn emitter_finish_reason_does_not_suppress_message_stop() {
+        // Regression: extract_finish_reason sets finish_reason_processed,
+        // but finish() must still emit MessageStop. Previously both used the
+        // same `finished` flag, causing finish() to skip MessageStop after
+        // a finishReason chunk.
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        em.drain();
+        assert!(em.finish_reason_processed);
+        let events = em.finish();
+        assert!(
+            events.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
+            "MessageStop must be emitted even after finishReason was processed"
+        );
     }
 
     #[test]
@@ -2025,7 +1953,7 @@ mod tests {
     async fn sse_reader_take_line_splits_on_newline() {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
-            buf: "data: {\"candidates\":[]}\n\n".to_string(),
+            buf: "data: {\"candidates\":[]}\n\n".to_string().into_bytes(),
         };
         assert_eq!(
             reader.take_line(),
@@ -2038,12 +1966,13 @@ mod tests {
     #[tokio::test]
     async fn sse_reader_next_data_extracts_payload() {
         let chunk = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n";
-        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(chunk.to_string())]);
+        let stream =
+            futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(chunk.to_string().into())]);
         let mut reader = SseReader {
             bytes: Box::pin(stream),
-            buf: String::new(),
+            buf: Vec::new(),
         };
-        let result = reader.next_data().await.unwrap();
+        let result = reader.next_gemini_data().await.unwrap();
         assert!(result.is_some());
         let json = result.unwrap();
         assert!(json["candidates"].is_array());
@@ -2052,13 +1981,14 @@ mod tests {
     #[tokio::test]
     async fn sse_reader_next_data_malformed_returns_none() {
         let chunk = "data: not valid json\n\ndata: {\"ok\":true}\n\n";
-        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(chunk.to_string())]);
+        let stream =
+            futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(chunk.to_string().into())]);
         let mut reader = SseReader {
             bytes: Box::pin(stream),
-            buf: String::new(),
+            buf: Vec::new(),
         };
         // First call should skip malformed and return the valid one.
-        let result = reader.next_data().await.unwrap();
+        let result = reader.next_gemini_data().await.unwrap();
         assert!(result.is_some());
         let json = result.unwrap();
         assert_eq!(json["ok"], true);
@@ -2066,13 +1996,13 @@ mod tests {
 
     #[tokio::test]
     async fn sse_reader_buffer_overflow_returns_error() {
-        let huge = "x".repeat(SSE_MAX_BUFFER + 1);
-        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(huge)]);
-        let mut reader = SseReader {
+        let huge = "x".repeat(2 * 1024 * 1024);
+        let stream = futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(huge.into())]);
+        let mut reader = super::SseReader {
             bytes: Box::pin(stream),
-            buf: String::new(),
+            buf: Vec::new(),
         };
-        let result = reader.next_data().await;
+        let result = reader.next_gemini_data().await;
         assert!(result.is_err(), "should error on buffer overflow");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -2083,7 +2013,7 @@ mod tests {
 
     #[test]
     fn max_response_body_is_ten_mb() {
-        assert_eq!(MAX_RESPONSE_BODY, 10 * 1024 * 1024);
+        assert_eq!(super::super::MAX_RESPONSE_BODY, 10 * 1024 * 1024);
     }
 
     #[test]

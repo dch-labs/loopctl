@@ -35,8 +35,6 @@
 //!
 //! - **[`handler`]** — [`handler::StreamHandler`] with retry, timeout,
 //!   and fallback for resilient streaming.
-//! - **[`heartbeat`]** — [`heartbeat::HeartbeatStream`] composable heartbeat
-//!   and timeout wrapper for any stream.
 //!
 //! # Quick Start
 //!
@@ -61,15 +59,10 @@ use serde_json::Value;
 use std::fmt;
 
 pub mod handler;
-pub mod heartbeat;
 pub mod rate_limit;
 
 pub use handler::{DetectedRateLimit, RateLimitConfig, RateLimitKind};
 pub use rate_limit::{RateLimiter, TokenBucket};
-
-// ==================================================
-// StreamError
-// ==================================================
 
 /// Errors that can occur during stream event processing.
 ///
@@ -103,10 +96,6 @@ impl std::error::Error for StreamError {
         }
     }
 }
-
-// ==================================================
-// StreamEvent
-// ==================================================
 
 /// An event from a streaming LLM API response.
 ///
@@ -218,10 +207,6 @@ pub enum StreamEvent {
     Ping,
 }
 
-// ==================================================
-// MessageStart
-// ==================================================
-
 /// The start of a new message from the API.
 ///
 /// Wraps [`MessageMetadata`] and is always the first event in a
@@ -254,10 +239,6 @@ pub struct MessageStart {
     /// `"assistant"` for streaming responses), and the model name.
     pub message: MessageMetadata,
 }
-
-// ==================================================
-// MessageMetadata
-// ==================================================
 
 /// Metadata about a message from the API.
 ///
@@ -308,10 +289,6 @@ pub struct MessageMetadata {
     pub model: String,
 }
 
-// ==================================================
-// PartStart
-// ==================================================
-
 /// The start of a new part within the response.
 ///
 /// Emitted once per part, before any [`IndexedDelta`]
@@ -354,10 +331,6 @@ pub struct PartStart {
     pub part: Option<MessagePart>,
 }
 
-// ==================================================
-// IndexedDelta
-// ==================================================
-
 /// A delta (incremental update) for the current part.
 ///
 /// Carries a [`DeltaPart`] payload that should be appended to the
@@ -391,10 +364,6 @@ pub struct IndexedDelta {
     /// [`current_tool_input`](StreamAccumulator) based on this value.
     pub delta: DeltaPart,
 }
-
-// ==================================================
-// DeltaPart
-// ==================================================
 
 /// A delta (incremental update) for content within a streaming response.
 ///
@@ -517,10 +486,6 @@ pub enum DeltaPart {
     },
 }
 
-// ==================================================
-// StreamStopReason
-// ==================================================
-
 /// Reason why the model stopped generating tokens.
 ///
 /// Streaming / API-level stop reason returned by the LLM
@@ -562,10 +527,9 @@ pub enum StreamStopReason {
 
     /// The model reached the configured maximum token limit.
     ///
-    /// The response was truncated. The caller may want to request
-    /// continuation or increase the token budget.
-    ///
-    /// *Note: `LoopConfig` will be available once the builder module is complete.*
+    /// The response was truncated because the model produced `max_tokens` of
+    /// output before finishing. The caller may want to request continuation or
+    /// raise the provider's max-tokens limit.
     MaxTokens,
 
     /// The model hit a configured stop sequence.
@@ -672,10 +636,6 @@ impl StreamStopReason {
     }
 }
 
-// ==================================================
-// MessageDelta
-// ==================================================
-
 /// A delta update for the message, typically emitted at the end of the stream.
 ///
 /// Carries the final [`StreamStopReason`] (why the model stopped) and
@@ -716,10 +676,6 @@ pub struct MessageDelta {
     pub usage: Option<Usage>,
 }
 
-// ==================================================
-// MessageDeltaPayload
-// ==================================================
-
 /// The delta details within a [`MessageDelta`] event.
 ///
 /// Contains the stop reason string that explains why the model
@@ -752,10 +708,6 @@ pub struct MessageDeltaPayload {
     /// stop reason (e.g. on error or incomplete responses).
     pub stop_reason: Option<String>,
 }
-
-// ==================================================
-// Usage
-// ==================================================
 
 /// Token usage statistics from an API response.
 ///
@@ -852,10 +804,6 @@ impl Usage {
         self.input_tokens.saturating_add(self.output_tokens)
     }
 }
-
-// ==================================================
-// Stream accumulator
-// ==================================================
 
 /// Accumulates streaming events into a complete [`Message`].
 ///
@@ -1169,10 +1117,6 @@ impl StreamAccumulator {
         self.usage.as_ref()
     }
 }
-
-// ==================================================
-// Tests
-// ==================================================
 
 #[cfg(test)]
 mod tests {

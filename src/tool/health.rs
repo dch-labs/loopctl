@@ -63,10 +63,6 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-// ===================================================
-// HealthStatus
-// ===================================================
-
 /// Classified health status for a tool.
 ///
 /// Determined by combining the tool's composite [`ToolStats::health_score`]
@@ -83,11 +79,25 @@ use std::time::{Duration, Instant};
 /// | Any | Open | [`Unhealthy`](HealthStatus::Unhealthy) |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HealthStatus {
-    /// Tool is operating normally (health score ≥ 0.8, breaker closed).
+    /// Tool is operating normally.
+    ///
+    /// Assigned when the composite health score is ≥ 0.8 and the
+    /// circuit breaker is `Closed`. The router routes calls to this
+    /// tool without hesitation.
     Healthy,
-    /// Tool is experiencing elevated errors or latency (score 0.5–0.8).
+
+    /// Tool is experiencing elevated errors or latency.
+    ///
+    /// Assigned when the health score is in the 0.5–0.8 band. The tool
+    /// is still called (the breaker has not tripped), but the router
+    /// may prefer a healthy alternative when one is available.
     Degraded,
-    /// Tool is failing frequently or circuit breaker is open (score < 0.5).
+
+    /// Tool is failing frequently or its circuit breaker is open.
+    ///
+    /// Assigned when the health score drops below 0.5, or whenever the
+    /// breaker is `Open` regardless of score. The router treats the
+    /// tool as unavailable and redirects to a fallback.
     Unhealthy,
 }
 
@@ -100,10 +110,6 @@ impl fmt::Display for HealthStatus {
         }
     }
 }
-
-// ===================================================
-// ToolStats — Lock-free Atomic Counters
-// ===================================================
 
 /// Fixed-point scale for the EWMA success rate.
 ///
@@ -150,11 +156,46 @@ const EWMA_SCALE: u64 = 1_000_000;
 /// assert!(stats.health_score() > 0.0);
 /// ```
 pub struct ToolStats {
+    /// Total number of calls recorded (successes + failures).
+    ///
+    /// Incremented once per `record_success` / `record_failure` call;
+    /// the denominator for [`success_rate`](Self::success_rate).
     total_calls: AtomicU64,
+
+    /// Number of calls that completed successfully.
+    ///
+    /// Incremented by [`record_success`](Self::record_success); paired
+    /// with `total_calls` to compute the all-time success rate.
     success_count: AtomicU64,
+
+    /// Number of calls that failed.
+    ///
+    /// Incremented by [`record_failure`](Self::record_failure). Kept
+    /// separately from `success_count` so both rates are available
+    /// without re-deriving from the total.
     failure_count: AtomicU64,
+
+    /// Sum of per-call durations in nanoseconds, across all calls.
+    ///
+    /// Accumulated by both record methods; divided by `total_calls` in
+    /// [`avg_duration`](Self::avg_duration). Saturates at `u64::MAX` on
+    /// overflow rather than wrapping.
     total_duration_ns: AtomicU64,
+
+    /// High-water mark for the longest single-call duration, in
+    /// nanoseconds.
+    ///
+    /// Updated via `fetch_max` so it only ever grows; exposed by
+    /// [`max_duration`](Self::max_duration). Useful for spotting
+    /// tail-latency outliers.
     max_duration_ns: AtomicU64,
+
+    /// Exponentially-weighted moving average of success, in fixed-point.
+    ///
+    /// Stored as `u64` on a `1.0 = EWMA_SCALE` scale so it can be
+    /// updated atomically without floating-point atomics. Decays with a
+    /// 0.7 factor on every call, making the health score responsive to
+    /// recent degradation.
     ewma_success: AtomicU64,
 }
 
@@ -216,18 +257,28 @@ impl ToolStats {
     }
 
     /// Total number of calls recorded (successes + failures).
+    ///
+    /// Lock-free relaxed load of the counter incremented on every
+    /// record call. Use as the denominator when computing custom rates.
     #[must_use]
     pub fn total_calls(&self) -> u64 {
         self.total_calls.load(Ordering::Relaxed)
     }
 
-    /// Number of successful calls.
+    /// Number of calls that completed successfully.
+    ///
+    /// Lock-free relaxed load. Pair with [`total_calls`](Self::total_calls)
+    /// to derive the all-time success rate, or use
+    /// [`success_rate`](Self::success_rate) directly.
     #[must_use]
     pub fn success_count(&self) -> u64 {
         self.success_count.load(Ordering::Relaxed)
     }
 
-    /// Number of failed calls.
+    /// Number of calls that failed.
+    ///
+    /// Lock-free relaxed load. Pair with [`total_calls`](Self::total_calls)
+    /// to derive the all-time failure rate.
     #[must_use]
     pub fn failure_count(&self) -> u64 {
         self.failure_count.load(Ordering::Relaxed)
@@ -314,31 +365,36 @@ fn update_ewma(prev: u64, is_success: bool) -> u64 {
     next.min(EWMA_SCALE)
 }
 
-// ===================================================
-// CircuitState + ToolCircuitBreaker
-// ===================================================
-
 /// Circuit breaker state.
 ///
-/// The breaker follows the standard three-state pattern:
-///
-/// ```text
-/// Closed ──(threshold failures)──► Open
-///    ▲                               │
-///    │                               │ (recovery_duration elapsed)
-///    │                               ▼
-///    └──(probe succeeds)──────── HalfOpen
-///                                    │
-///                  (probe fails) ────►│──► Open
-/// ```
+/// The breaker follows the standard three-state pattern. Starting from
+/// `Closed`, `failure_threshold` consecutive failures transition it to
+/// `Open`, where requests are blocked. Once `recovery_duration`
+/// elapses the next `allow_request` moves it to `HalfOpen` and lets a
+/// single probe call through. A successful probe closes the breaker; a
+/// failed probe reopens it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 enum CircuitState {
     /// Normal operation — requests are allowed.
+    ///
+    /// The resting state. Consecutive failures are counted toward
+    /// `failure_threshold`; reaching it transitions to [`Open`](Self::Open).
     Closed = 0,
+
     /// Too many failures — requests are blocked.
+    ///
+    /// Entered after `failure_threshold` consecutive failures (or when
+    /// a [`HalfOpen`](Self::HalfOpen) probe fails). Requests are
+    /// refused until `recovery_duration` elapses, after which the next
+    /// `allow_request` transitions to `HalfOpen`.
     Open = 1,
+
     /// Recovery probe — one request is allowed to test recovery.
+    ///
+    /// A single probe call runs; a success closes the breaker, a
+    /// failure reopens it. Additional probes are refused to avoid a
+    /// thundering herd.
     HalfOpen = 2,
 }
 
@@ -372,6 +428,7 @@ pub struct CircuitBreakerConfig {
     ///
     /// Defaults to 3.
     pub failure_threshold: u64,
+
     /// How long to wait in the `Open` state before transitioning to `HalfOpen`.
     ///
     /// Defaults to 30 seconds.
@@ -419,10 +476,37 @@ impl Default for CircuitBreakerConfig {
 /// assert!(!breaker.allow_request());
 /// ```
 pub struct ToolCircuitBreaker {
+    /// Current circuit-breaker state, encoded as a [`CircuitState`] in
+    /// an `AtomicU32`.
+    ///
+    /// Read on every `allow_request` check and mutated only on state
+    /// transitions; atomic so the hot path is lock-free.
     state: AtomicU32,
+
+    /// Consecutive failures recorded since the last success.
+    ///
+    /// Reset to zero by [`record_success`](Self::record_success);
+    /// reaching `failure_threshold` while in `Closed` transitions the
+    /// breaker to `Open`.
     consecutive_failures: AtomicU64,
+
+    /// Number of consecutive failures that trips the breaker.
+    ///
+    /// Set at construction and immutable thereafter; compared against
+    /// `consecutive_failures` on each `record_failure`.
     failure_threshold: u64,
+
+    /// How long to remain `Open` before allowing a `HalfOpen` probe.
+    ///
+    /// Set at construction and immutable thereafter; compared against
+    /// the elapsed time since `last_failure_time` in `allow_request`.
     recovery_duration: Duration,
+
+    /// Instant of the most recent failure, or `None` if none yet.
+    ///
+    /// Guarded by a `Mutex` because `Instant` is not atomic and this is
+    /// only written on the failure cold path; the read-only
+    /// `allow_request` check acquires the lock briefly.
     last_failure_time: Mutex<Option<Instant>>,
 }
 
@@ -443,6 +527,10 @@ impl ToolCircuitBreaker {
     }
 
     /// Create a circuit breaker from a [`CircuitBreakerConfig`].
+    ///
+    /// Convenience constructor that unpacks the threshold and recovery
+    /// duration from a config struct, delegating to [`new`](Self::new).
+    /// Useful when many breakers share a single config.
     #[must_use]
     pub fn from_config(config: &CircuitBreakerConfig) -> Self {
         Self::new(config.recovery_duration, config.failure_threshold)
@@ -523,9 +611,11 @@ impl ToolCircuitBreaker {
         }
     }
 
-    /// Current state of the breaker as a string.
+    /// Current state of the breaker as a human-readable string.
     ///
-    /// Returns `"closed"`, `"open"`, or `"half-open"`.
+    /// Returns `"closed"`, `"open"`, or `"half-open"`. Intended for
+    /// logs and metrics where a string label is preferable to the
+    /// numeric encoding.
     #[must_use]
     pub fn state_label(&self) -> &'static str {
         match self.state.load(Ordering::Acquire).into() {
@@ -536,12 +626,19 @@ impl ToolCircuitBreaker {
     }
 
     /// Number of consecutive failures recorded since the last success.
+    ///
+    /// Lock-free relaxed load of the counter reset to zero on every
+    /// success; reaching `failure_threshold` trips the breaker.
     #[must_use]
     pub fn consecutive_failures(&self) -> u64 {
         self.consecutive_failures.load(Ordering::Relaxed)
     }
 
     /// Whether the breaker is currently in the Closed (healthy) state.
+    ///
+    /// `true` when requests are allowed unconditionally. Note a breaker
+    /// that just closed may still have a low health score, so callers
+    /// that want the composite picture should consult the registry.
     #[must_use]
     pub fn is_closed(&self) -> bool {
         matches!(
@@ -551,6 +648,10 @@ impl ToolCircuitBreaker {
     }
 
     /// Whether the breaker is currently in the Open (blocking) state.
+    ///
+    /// `true` when requests are refused outright (subject to the
+    /// recovery-duration transition handled inside
+    /// [`allow_request`](Self::allow_request)).
     #[must_use]
     pub fn is_open(&self) -> bool {
         matches!(
@@ -559,7 +660,11 @@ impl ToolCircuitBreaker {
         )
     }
 
-    /// Whether the breaker is currently in the `HalfOpen` (probing) state.
+    /// Whether the breaker is currently in the `HalfOpen` (probing)
+    /// state.
+    ///
+    /// `true` when a single probe call is in flight and additional
+    /// probes are refused to avoid a thundering herd.
     #[must_use]
     pub fn is_half_open(&self) -> bool {
         matches!(
@@ -568,10 +673,6 @@ impl ToolCircuitBreaker {
         )
     }
 }
-
-// ===================================================
-// ToolHealthRegistry
-// ===================================================
 
 /// Global health registry for all tools.
 ///
@@ -617,8 +718,26 @@ impl ToolCircuitBreaker {
 /// assert!(*score > 0.9);
 /// ```
 pub struct ToolHealthRegistry {
+    /// Per-tool statistics, keyed by tool name.
+    ///
+    /// Lazily populated on first sighting of a tool; entries hold
+    /// `Arc<ToolStats>` so callers can read counters without holding the
+    /// lock. The `Mutex` is only acquired on the cold path of inserting
+    /// a previously-unseen tool.
     stats: Mutex<HashMap<String, Arc<ToolStats>>>,
+
+    /// Per-tool circuit breakers, keyed by tool name.
+    ///
+    /// Lazily populated alongside `stats`; each entry is configured from
+    /// `breaker_config` at insertion time. Same cold-path locking
+    /// strategy as `stats`.
     breakers: Mutex<HashMap<String, Arc<ToolCircuitBreaker>>>,
+
+    /// Configuration applied to every newly-created circuit breaker.
+    ///
+    /// Set at construction (default 3 failures / 30 s recovery) and
+    /// cloned into each breaker on first sight of a tool; changing it
+    /// after the fact does not retroactively update existing breakers.
     breaker_config: CircuitBreakerConfig,
 }
 
@@ -641,7 +760,11 @@ impl ToolHealthRegistry {
         }
     }
 
-    /// Set custom circuit-breaker configuration.
+    /// Set custom circuit-breaker configuration (builder style).
+    ///
+    /// Overrides the default (3 failures / 30 s recovery). Applied only
+    /// to breakers created *after* this call — existing per-tool
+    /// breakers keep their original thresholds.
     #[must_use]
     pub fn with_config(mut self, config: CircuitBreakerConfig) -> Self {
         self.breaker_config = config;
@@ -769,15 +892,15 @@ impl ToolHealthRegistry {
     }
 
     /// Number of distinct tools currently tracked.
+    ///
+    /// Lock-free in the sense that it briefly acquires the stats map's
+    /// `Mutex` to read its length. Returns the count of tools seen at
+    /// least once via `record_*` / `get_stats` / `get_circuit_breaker`.
     #[must_use]
     pub fn tool_count(&self) -> usize {
         crate::error::recover_guard(self.stats.lock()).len()
     }
 }
-
-// ===================================================
-// HealthRouterMiddleware
-// ===================================================
 
 /// A mapping from primary tool names to alternative tool names.
 ///
@@ -802,11 +925,20 @@ impl ToolHealthRegistry {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct HealthRouter {
+    /// Primary tool name → ordered list of fallback tool names.
+    ///
+    /// Populated via [`HealthRouterBuilder`]; the router consults this
+    /// map (in order) when the primary tool is unavailable, returning
+    /// the first healthy alternative.
     fallbacks: HashMap<String, Vec<String>>,
 }
 
 impl HealthRouter {
     /// Create an empty router with no fallback mappings.
+    ///
+    /// Equivalent to [`HealthRouter::default`]. An empty router always
+    /// resolves to the primary tool name since no fallbacks are
+    /// configured.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -817,7 +949,8 @@ impl HealthRouter {
     /// Get the ordered list of fallback tool names for a primary tool.
     ///
     /// Returns an empty slice if no fallbacks are configured for the
-    /// given tool name.
+    /// given tool name. The order matches the order supplied to
+    /// [`HealthRouterBuilder::add_fallback`].
     #[must_use]
     pub fn fallbacks_for(&self, tool_name: &str) -> &[String] {
         self.fallbacks.get(tool_name).map_or(&[], Vec::as_slice)
@@ -864,11 +997,18 @@ impl HealthRouter {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct HealthRouterBuilder {
+    /// In-progress fallback map, mutated by each `add_fallback` call.
+    ///
+    /// Consumed by [`build`](Self::build) to produce the immutable
+    /// [`HealthRouter`].
     fallbacks: HashMap<String, Vec<String>>,
 }
 
 impl HealthRouterBuilder {
     /// Create an empty builder.
+    ///
+    /// Equivalent to [`HealthRouterBuilder::default`]; every primary
+    /// starts with no fallbacks until `add_fallback` is called.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -878,7 +1018,9 @@ impl HealthRouterBuilder {
 
     /// Register a list of fallback tools for a primary tool name.
     ///
-    /// Fallbacks are tried in the order provided.
+    /// Replaces any previously-registered fallbacks for `primary`.
+    /// Fallbacks are tried in the order provided when
+    /// [`HealthRouter::resolve_tool`] walks the list.
     #[must_use]
     pub fn add_fallback(mut self, primary: &str, alternatives: Vec<String>) -> Self {
         self.fallbacks.insert(primary.to_string(), alternatives);
@@ -886,6 +1028,10 @@ impl HealthRouterBuilder {
     }
 
     /// Build the [`HealthRouter`].
+    ///
+    /// Consumes the builder and freezes the fallback map into an
+    /// immutable router. The returned router is cheap to clone for
+    /// sharing across dispatch paths.
     #[must_use]
     pub fn build(self) -> HealthRouter {
         HealthRouter {
@@ -893,10 +1039,6 @@ impl HealthRouterBuilder {
         }
     }
 }
-
-// ===================================================
-// Tests
-// ===================================================
 
 #[cfg(test)]
 mod tests {

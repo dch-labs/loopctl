@@ -15,9 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   history, cancellation). `Serialize + Deserialize`, with no `async`, no
   `tokio`, and no `ApiClient` in its surface. Includes `RunConfig`,
   `MachineStep` (`CallLLM`/`CallTools`/`Compact`/`Done`), `ModelTurn`,
-  `PendingToolCall`, `MachineOutcome`, and `MachineState`. The machine is not
-  yet wired into `BareLoop` in this release; it is public so a driver can be
-  written against it.
+  `PendingToolCall`, `MachineOutcome`, and `MachineState`. `BareLoop` now drives
+  a `LoopMachine` internally (`run()` is a `match machine.next_step()` loop); the
+  machine is exposed via `BareLoop::machine()` / `into_machine()` /
+  `from_machine()` for inspection and serialize-and-resume.
+- `LoopMachine::inject(message)` — add an arbitrary message to the machine's
+  history (host steering, or `ContextContributor` goal re-injection).
+- `Session`/`Run`/`Turn`/`Run` lifetime types (`engine::core`) —
+  the Session ⊃ [Run ⊃ [Turn]] hierarchy: one `Session` spans the process,
+  one `Run` per `run()` prompt, one `Turn` per loop iteration. `Session`
+  derives per-session totals (`total_turns`/`total_duration`/
+  `total_input_tokens`/`total_output_tokens`) from its run list. `Run`
+  is the result of a `run()`; `Run::turn_count()`/`duration()`/`total_tokens()`.
+- `SessionConfig` (`config`) — the session-scoped config slice (`session_id`,
+  `system_prompt`, `context_window`) with `with_*` builders, replacing the
+  session fields that lived on the old `LoopConfig`.
 - `LoopError` now derives `Serialize`, `Deserialize`, `PartialEq`, and `Eq`.
 - `compact::types::CompactReason` now derives `Serialize` and `Deserialize`.
 - `DeltaPart::Thinking { text }` variant + `on_thinking_delta` observer event
@@ -196,17 +208,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Changed
 
-- **Breaking (compaction thresholds → basis points):** the compaction trigger
-  threshold and compaction-target fraction are now integers in basis points
-  (0–10_000; 10_000 = 100%) instead of `f64` fractions. This removes lossy
-  `u64 → f64` casts from the threshold arithmetic. Affected APIs:
-  `ContextManager::with_threshold(u16)` and `with_compact_target_pct(u16)`
-  (were `f64`); `ContextManager::threshold() -> u16` and
-  `compact_target_pct() -> u16` (were `f64`);
-  `LoopConfig::with_compact_threshold(u16)` and the `compact_threshold` field
-  (were `f64`). The default is `8_000` (was `0.80`); the clamp range is
-  `[1_000, 10_000]` (was `[0.1, 1.0]`). Migration: multiply existing `f64`
-  values by `10_000` and round — `0.80 → 8_000`, `0.50 → 5_000`, `0.70 → 7_000`.
+- **Breaking (machine-driven engine):** `BareLoop::run()` is now a
+  `match machine.next_step()` loop driving a `LoopMachine`. The machine owns the
+  conversation history and every loop decision (turn count, max-turn, tool-call
+  validity, compaction trigger, cancellation); the driver owns IO (LLM call,
+  tool dispatch, compaction execution) and fires observers from the match-arms.
+  Observer event ordering is unchanged (pinned by golden tests). The
+  conversation is owned by the machine — read it via `BareLoop::conversation()`
+  (delegates to the machine) or `BareLoop::machine().history()`.
+- **Breaking (Session/Run lifetime model):** the agent-loop lifetime is now
+  explicit. `LoopConfig` is **removed**; construction splits into
+  `SessionConfig` (session-scoped: `session_id`, `system_prompt`,
+  `context_window`) and `engine::RunConfig` (per-run: turn/token budgets,
+  compaction policy, dispatch mode). `SessionResult` is **removed** and unified
+  with the new `Run`/`Run` (`engine::core`): the per-run accumulator
+  is `Run`-shaped (`turns: Vec<Turn>`, `error: Option<LoopError>`). The `model`
+  field is gone from config entirely — it lives on the `ApiClient`
+  (`ApiClient::model` / `set_model`). Migration: build `BareLoop::new` with a
+  `SessionConfig`; read `session_id`/`system_prompt`/`context_window` from
+  `SessionConfig`, run budgets from `RunConfig`, the model from the client.
+- **Breaking (`Loop::run` signature + `initialize` removed):** `Loop::run` now
+  takes the per-run config — `run(&mut self, user_input: &str, run_config:
+  &RunConfig)` — and returns `Result<Run, LoopError>`. Session
+  initialization happens once at construction (not per `run()`); each `run()`
+  receives a fresh `RunConfig`. `Loop::initialize` and `Loop::config()` are
+  removed. Migration: pass `&RunConfig::default()` (or a specific run config)
+  as the second `run()` argument; move any `initialize` setup into
+  construction.
+- **Breaking (compaction thresholds → percentages):** the compaction trigger
+  threshold and compaction-target fraction are now `u8` percentages (0–100;
+  100 = 100%) instead of `f64` fractions. Affected APIs:
+  `ContextManager::with_threshold(u8)` and `with_compact_target_pct(u8)`
+  (were `f64`); `ContextManager::threshold() -> u8` and
+  `compact_target_pct() -> u8` (were `f64`);
+  `SessionConfig::with_compact_threshold(u8)` and the `compact_threshold` field
+  (were `f64`). The default is `80` (was `0.80`); the clamp range is
+  `[1, 100]` (was `[0.1, 1.0]`). Migration: multiply existing `f64`
+  values by 100 and round — `0.80 → 80`, `0.50 → 50`, `0.70 → 70`.
 - **Breaking (renames):** consuming builder methods that return `Self` are now
   uniformly prefixed `with_`, matching the crate-wide convention. The old
   no-prefix names are removed. Affected types and methods (old → new):
@@ -332,6 +370,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Removed
 
+- `Loop::process_turn` trait method and `BareLoop::run_turn_body` — the
+  machine-driven `run()` replaces the old per-turn execution path. The
+  `LoopMachine` is the new turn unit; drive it via `BareLoop::run()` (or
+  `LoopMachine::next_step()` directly for a custom driver).
 - `StreamTurnResult` (the handler no longer accumulates; the engine assembles
   the result from the event stream).
 - `StreamHandler::with_request_options` builder (options now flow via

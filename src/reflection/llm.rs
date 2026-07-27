@@ -237,28 +237,26 @@ fn validate_modified_input(
         return Ok(());
     }
 
-    let Some(correction) = &analysis.correction else {
-        return Ok(());
-    };
-    let Some(modified_input) = &correction.modified_input else {
-        return Ok(());
-    };
-    let Some(schema) = tool_schema else {
-        // No schema available — the engine couldn't resolve the tool.
-        // Skip validation rather than reject a possibly-correct fix.
-        return Ok(());
-    };
-
     #[cfg(feature = "schema_validation")]
     {
+        let Some(correction) = &analysis.correction else {
+            return Ok(());
+        };
+        let Some(modified_input) = &correction.modified_input else {
+            return Ok(());
+        };
+        let Some(schema) = tool_schema else {
+            return Ok(());
+        };
+
         if !jsonschema::is_valid(schema, modified_input) {
             return Err(ReflectionError::Internal(
                 "corrected input does not match the tool's schema".to_string(),
             ));
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
 }
 
 #[cfg(test)]

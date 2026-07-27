@@ -112,7 +112,8 @@ impl UnknownToolMiddleware {
             0.0
         };
 
-        f64::from(lcs_u32) / f64::from(max_len) + prefix_bonus
+        let score = f64::from(lcs_u32) / f64::from(max_len) + prefix_bonus;
+        score.clamp(0.0, 1.0)
     }
 
     /// Compute the length of the longest common subsequence of two character slices.

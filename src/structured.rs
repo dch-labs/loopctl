@@ -340,6 +340,7 @@ pub enum StructuredError {
 ///
 /// Returns `None` if the content cannot be parsed as JSON (even after the
 /// lenient rescue).
+#[cfg(any(feature = "openai", feature = "gemini"))]
 pub(crate) fn parse_json_lenient(text: &str) -> Option<serde_json::Value> {
     if let Ok(v) = serde_json::from_str(text) {
         return Some(v);
@@ -354,6 +355,7 @@ pub(crate) fn parse_json_lenient(text: &str) -> Option<serde_json::Value> {
 /// the substring up to the matching close. String-aware: braces/brackets
 /// inside JSON string literals (`"..."`) do not affect depth, and `\"`
 /// escapes are honored.
+#[cfg(any(feature = "openai", feature = "gemini"))]
 pub(crate) fn extract_json_substring(text: &str) -> Option<serde_json::Value> {
     let bytes = text.as_bytes();
     let mut start = None;
@@ -451,6 +453,12 @@ pub(crate) fn extract_json_substring(text: &str) -> Option<serde_json::Value> {
 /// assert_eq!(tightened["properties"]["filter"]["additionalProperties"], false);
 /// assert_eq!(tightened["properties"]["filter"]["required"], json!(["lang"]));
 /// ```
+#[cfg(any(
+    feature = "anthropic",
+    feature = "grammar",
+    feature = "openai",
+    feature = "gemini"
+))]
 pub(crate) fn tighten_json_schema(schema: &serde_json::Value) -> serde_json::Value {
     let mut out = schema.clone();
     tighten_in_place(&mut out);
@@ -489,6 +497,12 @@ pub(crate) fn tighten_json_schema(schema: &serde_json::Value) -> serde_json::Val
 ///   are returned unchanged.
 ///
 /// Idempotent: re-running on an already-tight schema leaves it unchanged.
+#[cfg(any(
+    feature = "anthropic",
+    feature = "grammar",
+    feature = "openai",
+    feature = "gemini"
+))]
 fn tighten_in_place(schema: &mut serde_json::Value) {
     let Some(obj) = schema.as_object_mut() else {
         return;

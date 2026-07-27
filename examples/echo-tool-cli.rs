@@ -11,9 +11,10 @@
 
 use std::sync::Arc;
 
-use loopctl::config::LoopConfig;
+use loopctl::config::SessionConfig;
 use loopctl::engine::BareLoop;
-use loopctl::engine::loop_core::Loop;
+use loopctl::engine::RunConfig;
+use loopctl::engine::core::Loop;
 use loopctl::testing::{MockApiClient, MockResponse, MockToolCall};
 use loopctl::tool::{FnTool, ToolOutput, ToolRegistry};
 use serde_json::json;
@@ -78,7 +79,7 @@ async fn main() {
     );
 
     // 3. Construct and run the loop.
-    let mut agent = BareLoop::new(Arc::new(client), tools, LoopConfig::default());
+    let mut agent = BareLoop::new(Arc::new(client), tools, SessionConfig::default());
 
     // Ctrl-C interrupts the in-flight turn via loopctl's CancelSignal.
     let cancel_signal = agent.cancel_signal();
@@ -89,11 +90,11 @@ async fn main() {
     });
 
     let result = agent
-        .run("Please echo something.")
+        .run("Please echo something.", &RunConfig::default())
         .await
         .expect("session should succeed");
 
-    println!("Turns:      {}", result.total_turns);
-    println!("Tool calls: {}", result.tool_calls);
-    println!("Output:     {}", result.final_output.unwrap_or_default());
+    println!("Turns:      {}", result.turn_count());
+    println!("Tool calls: {}", result.tool_call_count());
+    println!("Output:     {}", result.output.unwrap_or_default());
 }

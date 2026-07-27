@@ -337,12 +337,26 @@ pub struct MachinePolicy {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopMachine {
-    /// The append-only conversation history.
+    /// The committed conversation history from previous runs.
     ///
-    /// The complete record of the run: the opening user message, every
-    /// assistant response, and every tool result. The driver derives the LLM
-    /// feed from it on each call; compaction replaces it wholesale.
+    /// Immutable during a run — the driver derives the LLM feed from
+    /// `history + pending`. Only modified by compaction (which replaces it
+    /// wholesale with a compacted version) and by [`commit_pending`]
+    /// (which appends the current run's messages on success).
+    ///
+    /// [`commit_pending`]: Self::commit_pending
     history: Vec<Message>,
+
+    /// Messages accumulated by the current run.
+    ///
+    /// The user input, assistant responses, and tool results from the
+    /// in-flight run. Cleared by [`accept_input`] at the start of each
+    /// run. On success, [`commit_pending`] moves these into `history`; on
+    /// failure they are discarded so `history` stays clean.
+    ///
+    /// [`accept_input`]: Self::accept_input
+    /// [`commit_pending`]: Self::commit_pending
+    pending: Vec<Message>,
 
     /// Where the machine is in its request/respond cycle.
     ///
@@ -396,12 +410,34 @@ impl LoopMachine {
     pub fn from_history(history: Vec<Message>) -> Self {
         Self {
             history,
+            pending: Vec::new(),
             state: MachineState::Start,
             turns_taken: 0,
             context_tokens: 0,
             cancelled: false,
             pending_tools: Vec::new(),
         }
+    }
+
+    /// Begin a new run on this machine, preserving the accumulated history.
+    ///
+    /// Pushes the user's input message onto the history, then resets the
+    /// per-run state (turn counter, context tokens, cancellation flag,
+    /// pending tools, state machine position) so the machine is ready for
+    /// a fresh `CallLLM` → tool → ... → `Done` cycle. The conversation
+    /// history from previous runs is untouched — the model sees the full
+    /// cross-run context.
+    ///
+    /// This replaces the old pattern of cloning `session.history` into a
+    /// fresh `LoopMachine::from_history` at every `run()` call.
+    pub fn accept_input(&mut self, input: &str) {
+        self.pending.clear();
+        self.pending.push(Message::user(input));
+        self.state = MachineState::Start;
+        self.turns_taken = 0;
+        self.context_tokens = 0;
+        self.cancelled = false;
+        self.pending_tools.clear();
     }
 
     /// Return the next step the driver must perform.
@@ -530,13 +566,13 @@ impl LoopMachine {
                 input: input.clone(),
             })
             .collect();
-        self.history.push(message);
+        self.pending.push(message);
         self.context_tokens = response.input_tokens;
         self.turns_taken = self.turns_taken.saturating_add(1);
 
         if tool_calls.is_empty() {
             let final_text = self
-                .history
+                .pending
                 .last()
                 .map(Message::text_content)
                 .unwrap_or_default();
@@ -563,7 +599,7 @@ impl LoopMachine {
         if self.is_terminal() {
             return;
         }
-        self.history.extend(messages);
+        self.pending.extend(messages);
         self.pending_tools.clear();
         self.state = MachineState::Start;
     }
@@ -582,7 +618,7 @@ impl LoopMachine {
         if self.is_terminal() {
             return;
         }
-        self.history.push(message);
+        self.pending.push(message);
     }
 
     /// Feed compacted history back into the machine.
@@ -598,6 +634,7 @@ impl LoopMachine {
             return;
         }
         self.history = compacted;
+        self.pending.clear();
         self.context_tokens = tokens_after;
         self.state = MachineState::Start;
     }
@@ -639,13 +676,45 @@ impl LoopMachine {
         self.cancelled
     }
 
-    /// The append-only conversation history.
+    /// The committed conversation history from previous runs.
     ///
-    /// Read-only access to the record the machine owns. The driver builds the
-    /// LLM feed from this on each [`MachineStep::CallLLM`].
+    /// Does not include the current run's pending messages. Use
+    /// [`full_history`](Self::full_history) when you need the complete
+    /// conversation for an API call.
     #[must_use]
     pub fn history(&self) -> &[Message] {
         &self.history
+    }
+
+    /// The full conversation: committed history plus the current run's pending messages.
+    ///
+    /// Allocates a merged `Vec` each call — use when sending the outbound
+    /// `StreamRequest` or when a contributor needs to see the full context.
+    #[must_use]
+    pub fn full_history(&self) -> Vec<Message> {
+        let mut merged = self.history.clone();
+        merged.extend_from_slice(&self.pending);
+        merged
+    }
+
+    /// Move the current run's pending messages into the committed history.
+    ///
+    /// Called by the driver on successful run completion. After this,
+    /// the pending buffer is empty and the committed history contains the
+    /// full conversation. On failure the driver simply clears pending
+    /// via [`accept_input`](Self::accept_input) on the next run,
+    /// leaving the committed history untouched.
+    pub fn commit_pending(&mut self) {
+        self.history.append(&mut self.pending);
+    }
+
+    /// Discard the current run's pending messages without committing.
+    ///
+    /// Called by the driver on run failure. The committed history stays
+    /// clean — no orphaned tool calls, model responses, or tool results
+    /// from the abandoned run leak into the next run's context.
+    pub fn discard_pending(&mut self) {
+        self.pending.clear();
     }
 
     /// The current state of the step protocol.
@@ -785,7 +854,7 @@ mod tests {
         // A text-only turn completes the run, so the machine is terminal.
         assert!(machine.is_terminal());
         assert_eq!(machine.turns_taken(), 1);
-        assert_eq!(machine.history().len(), 2);
+        assert_eq!(machine.full_history().len(), 2);
         assert!(matches!(
             machine.state(),
             MachineState::Terminal(MachineOutcome::Completed { .. })
@@ -1049,7 +1118,7 @@ mod tests {
         let compacted = vec![Message::user("compacted-only")];
         machine.compaction_result(compacted.clone(), 0);
         // Compare by serialized form: Message is not PartialEq.
-        let got = serde_json::to_string(machine.history()).expect("serialize history");
+        let got = serde_json::to_string(&machine.full_history()).expect("serialize history");
         let want = serde_json::to_string(&compacted).expect("serialize expected");
         assert_eq!(got, want, "history must be replaced by the compacted slice");
         // After compaction the next step is the deferred CallLLM.
@@ -1057,6 +1126,60 @@ mod tests {
             machine.next_step(test_policy(5)),
             MachineStep::CallLLM { .. }
         ));
+    }
+
+    #[test]
+    fn compaction_includes_pending_messages() {
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: true,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user("from previous run")]);
+        machine.accept_input("current run input");
+        machine.model_response(tool_response("echo", &["echo"], 60));
+        let _ = machine.next_step(policy);
+        machine.tool_results(vec![Message::user("tool-out")]);
+
+        let full = machine.full_history();
+        assert!(
+            full.len() >= 4,
+            "full_history must include both committed history and pending messages; \
+             got {} messages",
+            full.len()
+        );
+    }
+
+    #[test]
+    fn compaction_result_clears_pending() {
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: true,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        let _ = machine.next_step(policy);
+        machine.model_response(tool_response("echo", &["echo"], 60));
+        let _ = machine.next_step(policy);
+        machine.tool_results(vec![Message::user("tool-out")]);
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::Compact { .. }
+        ));
+        machine.compaction_result(vec![Message::user("compacted")], 0);
+
+        assert_eq!(
+            machine.history().len(),
+            1,
+            "history must contain only the compacted message"
+        );
+        assert_eq!(
+            machine.full_history().len(),
+            1,
+            "pending must be cleared after compaction"
+        );
     }
 
     #[test]
@@ -1083,7 +1206,7 @@ mod tests {
         );
         machine.tool_results(vec![result]);
 
-        let roles: Vec<Role> = machine.history().iter().map(|m| m.role).collect();
+        let roles: Vec<Role> = machine.full_history().iter().map(|m| m.role).collect();
         assert_eq!(
             roles,
             vec![Role::User, Role::Assistant, Role::User],

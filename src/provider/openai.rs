@@ -210,17 +210,14 @@ impl ApiClient for OpenAiClient {
 
     fn stream_messages(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let crate::api::StreamRequest {
-            messages,
-            system,
-            tools,
-        } = request;
+        let system = request.system.clone();
+        let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let body = RequestBody::build(
             &model,
-            &messages,
+            &request.messages,
             system.as_deref(),
             tools.as_deref(),
             None,
@@ -253,17 +250,14 @@ impl ApiClient for OpenAiClient {
 
     fn create_message(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let crate::api::StreamRequest {
-            messages,
-            system,
-            tools,
-        } = request;
+        let system = request.system.clone();
+        let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let body = RequestBody::build(
             &model,
-            &messages,
+            &request.messages,
             system.as_deref(),
             tools.as_deref(),
             None,
@@ -286,19 +280,16 @@ impl ApiClient for OpenAiClient {
 
     fn stream_messages_with_options(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let crate::api::StreamRequest {
-            messages,
-            system,
-            tools,
-        } = request;
+        let system = request.system.clone();
+        let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = RequestBody::build(
             &model,
-            &messages,
+            &request.messages,
             system.as_deref(),
             tools.as_deref(),
             rf,
@@ -331,19 +322,16 @@ impl ApiClient for OpenAiClient {
 
     fn create_message_with_options(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let crate::api::StreamRequest {
-            messages,
-            system,
-            tools,
-        } = request;
+        let system = request.system.clone();
+        let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = RequestBody::build(
             &model,
-            &messages,
+            &request.messages,
             system.as_deref(),
             tools.as_deref(),
             rf,

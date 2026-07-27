@@ -64,7 +64,7 @@ async fn strict_mode_produces_valid_tool_calls() {
         let req = loopctl::api::StreamRequest::new(vec![loopctl::message::Message::user(prompt)])
             .with_tools(Some(tools.clone()));
         let opts = RequestOptions::default().with_tool_constraint(ToolConstraint::Strict);
-        let stream = client.stream_messages_with_options(req, opts);
+        let stream = client.stream_messages_with_options(&req, opts);
 
         let events = match helpers::collect_events(Box::pin(stream)).await {
             Some(events) => events,

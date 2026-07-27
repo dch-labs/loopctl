@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crate::config::ParallelDispatchConfig;
 use crate::engine::core::machine::MachineState;
 use crate::error::LoopError;
-use crate::message::Message;
+
 use crate::reflection::{Correction, CorrectionResult, CorrectionType};
 
 /// Provide a fresh `Instant` for serde-deserialized fields.
@@ -501,9 +501,6 @@ pub struct Session {
     /// (turns, tokens, duration) sum over this list. The last entry is the
     /// in-flight run (or the most recently completed one).
     pub runs: Vec<Run>,
-
-    /// TODO: add docs
-    pub history: Vec<Message>,
 }
 
 impl Session {
@@ -518,7 +515,6 @@ impl Session {
             config,
             session_start: None,
             runs: Vec::new(),
-            history: Vec::new(),
         }
     }
 

@@ -604,7 +604,7 @@ pub async fn request_structured<T: StructuredOutput + serde::de::DeserializeOwne
         tools: None,
     };
     let raw = client
-        .create_message_with_options(request, opts)
+        .create_message_with_options(&request, opts)
         .await
         .map_err(StructuredError::Api)?;
     let value = client.extract_structured(&raw);
@@ -748,7 +748,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<
@@ -761,7 +761,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
@@ -779,7 +779,7 @@ mod tests {
         let opts =
             RequestOptions::new().with_response_format(ResponseFormat::from_type::<Action>());
         let request = crate::api::StreamRequest::new(vec![]);
-        let result = client.create_message_with_options(request, opts).await;
+        let result = client.create_message_with_options(&request, opts).await;
         assert!(
             result.is_err(),
             "client without structured-output support should reject response_format"
@@ -796,7 +796,7 @@ mod tests {
         let client = PlainMockClient;
         let opts = RequestOptions::new();
         let request = crate::api::StreamRequest::new(vec![]);
-        let result = client.create_message_with_options(request, opts).await;
+        let result = client.create_message_with_options(&request, opts).await;
         assert!(result.is_ok(), "empty options should delegate normally");
     }
 
@@ -807,7 +807,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<
@@ -820,7 +820,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
@@ -832,7 +832,7 @@ mod tests {
         }
         fn create_message_with_options(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
             _options: RequestOptions,
         ) -> Pin<
             Box<
@@ -866,7 +866,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<
@@ -879,7 +879,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
@@ -891,7 +891,7 @@ mod tests {
         }
         fn create_message_with_options(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
             _options: RequestOptions,
         ) -> Pin<
             Box<

@@ -212,34 +212,31 @@ impl ApiClient for AnthropicClient {
 
     fn stream_messages(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
         self.stream_messages_with_options(request, crate::structured::RequestOptions::default())
     }
 
     fn create_message(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
         self.create_message_with_options(request, crate::structured::RequestOptions::default())
     }
 
     fn stream_messages_with_options(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let crate::api::StreamRequest {
-            messages,
-            system,
-            tools,
-        } = request;
+        let system = request.system.clone();
+        let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = build_request_body(
             &RequestBodySpec {
                 model: &model,
-                messages: &messages,
+                messages: &request.messages,
                 system: system.as_deref(),
                 tools: tools.as_deref(),
                 response_format: rf,
@@ -272,20 +269,17 @@ impl ApiClient for AnthropicClient {
 
     fn create_message_with_options(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let crate::api::StreamRequest {
-            messages,
-            system,
-            tools,
-        } = request;
+        let system = request.system.clone();
+        let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = build_request_body(
             &RequestBodySpec {
                 model: &model,
-                messages: &messages,
+                messages: &request.messages,
                 system: system.as_deref(),
                 tools: tools.as_deref(),
                 response_format: rf,

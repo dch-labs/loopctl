@@ -1004,8 +1004,7 @@ impl StreamAccumulator {
     ///   fragment to the open slot whose `index` matches and appends it
     ///   to that slot's buffer.
     /// - [`PartStop`](StreamEvent::PartStop) — Flushes the oldest
-    ///   still-open slot into [`completed`](Self::completed) as a
-    ///   [`MessagePart`] and drops it.
+    ///   still-open slot into a finished [`MessagePart`] and drops it.
     /// - [`MessageDelta`](StreamEvent::MessageDelta) — Captures usage statistics.
     /// - [`MessageStop`](StreamEvent::MessageStop) / [`Ping`](StreamEvent::Ping) — Ignored.
     ///

@@ -425,6 +425,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   that arrives *before* a run still cancels that run (the signal is
   cleared only after the run observes it and returns), preserving the
   pre-run-cancel contract.
+- A turn's tool results were split across multiple consecutive user
+  messages instead of merged into one. Unknown-tool results (preresolved
+  by the machine) each arrived as their own user `Message`, and the
+  dispatched known-tool results arrived as another, so the loop pushed
+  them into history as separate entries. `BareLoop::handle_call_tools`
+  now collects all tool-result parts for a turn — preresolved plus
+  dispatched — into a single user `Message` before feeding it to the
+  machine, so a turn with any mix of unknown and known tools produces
+  exactly one user message regardless of how the results were produced.
+  `build_tool_result_message` is renamed to `build_tool_result_parts`
+  and now returns `Vec<MessagePart>` (it no longer wraps the parts in a
+  throwaway `Message`).
 
 ### Security
 

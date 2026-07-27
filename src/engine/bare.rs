@@ -1063,12 +1063,12 @@ impl<C: ApiClient> BareLoop<C> {
         turn_start: Instant,
         turn_input_tokens: u64,
         turn_output_tokens: u64,
-    ) -> Result<Message, LoopError> {
+    ) -> Result<Vec<MessagePart>, LoopError> {
         let result = self.dispatch_tools(tool_calls, turn_index).await;
         let turn_duration = turn_start.elapsed();
         match result {
             Ok(results) => {
-                let tool_result_msg = Self::build_tool_result_message(results);
+                let parts = Self::build_tool_result_parts(results);
                 self.notify_turn_end(
                     turn_index,
                     true,
@@ -1077,7 +1077,7 @@ impl<C: ApiClient> BareLoop<C> {
                     turn_input_tokens,
                     turn_output_tokens,
                 );
-                Ok(tool_result_msg)
+                Ok(parts)
             }
             Err(e) => {
                 let err_str = e.to_string();
@@ -1585,9 +1585,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// Handle a tool-dispatch request from the machine.
     ///
     /// Fires `on_tool_call_received`, dispatches the calls that are not
-    /// preresolved, feeds every tool-result message (dispatched plus
-    /// preresolved) back to the machine, and keeps the run budget in sync.
-    /// Cancellation races the dispatch via a biased `select!`.
+    /// preresolved, then assembles every tool result for the turn —
+    /// preresolved unknown-tool results plus dispatched known-tool
+    /// results — into a single user [`Message`] and feeds it back to the
+    /// machine. One turn yields one user message regardless of how the
+    /// results were produced, which is the shape providers expect. Keeps
+    /// the run budget in sync. Cancellation races the dispatch via a
+    /// biased `select!`.
     ///
     /// # Errors
     ///
@@ -1606,11 +1610,11 @@ impl<C: ApiClient> BareLoop<C> {
             .map_or((0, 0), |t| (t.input_tokens, t.output_tokens));
         let mut tool_calls: Vec<ToolCall> = Vec::with_capacity(calls.len());
         let mut dispatch_calls: Vec<ToolCall> = Vec::new();
-        let mut preresolved: Vec<Message> = Vec::new();
+        let mut preresolved_parts: Vec<MessagePart> = Vec::new();
         for pending in calls {
             tool_calls.push(pending.call.clone());
             match &pending.preresolved_result {
-                Some(msg) => preresolved.push(msg.clone()),
+                Some(msg) => preresolved_parts.extend(msg.parts.iter().cloned()),
                 None => dispatch_calls.push(pending.call.clone()),
             }
         }
@@ -1623,7 +1627,7 @@ impl<C: ApiClient> BareLoop<C> {
                 .await
         };
 
-        let dispatched: Message = tokio::select! {
+        let mut parts: Vec<MessagePart> = tokio::select! {
             biased;
             () = cancel.notified() => {
                 self.machine.cancel();
@@ -1638,7 +1642,7 @@ impl<C: ApiClient> BareLoop<C> {
                 return Err(LoopError::Cancelled);
             }
             result = dispatch => match result {
-                Ok(msg) => msg,
+                Ok(parts) => parts,
                 Err(e) => {
                     self.set_error_state(&e);
                     return Err(e);
@@ -1646,8 +1650,9 @@ impl<C: ApiClient> BareLoop<C> {
             },
         };
 
-        preresolved.push(dispatched);
-        self.machine.tool_results(preresolved);
+        preresolved_parts.append(&mut parts);
+        self.machine
+            .tool_results(vec![Message::new(Role::User, preresolved_parts)]);
         Ok(())
     }
 
@@ -2825,11 +2830,10 @@ mod tests {
             display_hint: None,
         }];
 
-        let msg = BareLoop::<MockClient>::build_tool_result_message(results);
-        assert_eq!(msg.role, Role::User);
-        assert_eq!(msg.parts.len(), 1);
+        let parts = BareLoop::<MockClient>::build_tool_result_parts(results);
+        assert_eq!(parts.len(), 1);
 
-        match &msg.parts[0] {
+        match &parts[0] {
             MessagePart::ToolResult {
                 call_id,
                 output,
@@ -2901,6 +2905,78 @@ mod tests {
 
         assert_eq!(result.turn_count(), 2);
         assert_eq!(result.tool_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_mixed_known_unknown_tools_merge_into_one_user_message() {
+        let client = MockClient::new("test-model");
+
+        // One known tool call (echo) and one unknown (nonexistent) in the
+        // same turn. The unknown result is preresolved; the known one is
+        // dispatched. Both must land in a single user Message in history.
+        let tool_events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg_mixed".into(),
+                    role: "assistant".into(),
+                    model: "test-model".into(),
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(MessagePart::tool_call(
+                    "t1",
+                    "echo",
+                    json!({"message": "hi"}),
+                )),
+            }),
+            StreamEvent::PartStop,
+            StreamEvent::PartStart(PartStart {
+                index: 1,
+                part: Some(MessagePart::tool_call("t2", "nonexistent", json!({}))),
+            }),
+            StreamEvent::PartStop,
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("tool_call".to_string()),
+                },
+                usage: Some(Usage::new(50, 20)),
+            }),
+            StreamEvent::MessageStop,
+        ];
+        crate::error::recover_guard(client.responses.lock()).push(tool_events);
+        client.add_text_response("done");
+
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+        agent
+            .run("mixed tools", &RunConfig::default())
+            .await
+            .unwrap();
+
+        let user_messages: Vec<&Message> = agent
+            .conversation()
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .collect();
+        assert_eq!(
+            user_messages.len(),
+            2,
+            "expected [prompt, one merged tool-result message], got {} user messages",
+            user_messages.len()
+        );
+        let tool_results: Vec<&MessagePart> = user_messages[1]
+            .parts
+            .iter()
+            .filter(|p| p.is_tool_result())
+            .collect();
+        assert_eq!(
+            tool_results.len(),
+            2,
+            "merged user message must hold both tool-result parts"
+        );
     }
 
     #[tokio::test]

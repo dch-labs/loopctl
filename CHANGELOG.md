@@ -426,6 +426,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   cleared only after the run observes it and returns), preserving the
   pre-run-cancel contract.
 
+### Security
+
+- The auto-commit hook's `GitExecutor::stage_files` ran `git add -A`
+  when called with an empty file list — the default configuration
+  (`AutoCommitConfig::files` defaults to `vec![]`, and a session with no
+  recorded modifications passes `None`, which falls back to that empty
+  list). This staged and committed the entire working tree on every
+  session end: unrelated user edits, scratch files, and secrets such as
+  `.env` and credentials. The empty-list branch now refuses with a
+  `GitExecutorError::GitError` instead of broadening scope; callers must
+  populate `AutoCommitConfig::files` or rely on the hook's per-session
+  modification tracking. Misconfiguration now fails loudly rather than
+  silently committing everything.
+
 ## [0.1.0] - 2025-07-01
 
 Initial crates.io release.

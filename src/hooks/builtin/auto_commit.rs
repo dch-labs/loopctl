@@ -215,22 +215,32 @@ impl GitExecutor {
 
     /// Stage files for commit.
     ///
-    /// Each path in `files` is passed to `git add` individually. Passing
-    /// an empty slice stages every change in the working tree
-    /// (`git add -A`), which is convenient for "commit everything"
-    /// semantics but will include unrelated modifications.
+    /// Each path in `files` is passed to `git add -- <path>` individually,
+    /// scoping staging to exactly the listed paths. An empty slice is
+    /// refused with an error rather than falling through to `git add -A`:
+    /// the auto-commit hook is meant to commit only the agent's own
+    /// recorded modifications, so staging the entire working tree would
+    /// silently sweep up unrelated edits and secret files (`.env`,
+    /// credentials, scratch buffers). Misconfiguration must fail loudly,
+    /// not broaden scope.
     ///
     /// # Errors
     ///
-    /// Returns [`GitExecutorError`] if any `git add` invocation fails;
-    /// earlier files in the list may already be staged.
+    /// Returns [`GitExecutorError::GitError`] if `files` is empty —
+    /// populate `AutoCommitConfig::files` or record modifications through
+    /// the hook. Returns [`GitExecutorError`] if any individual `git add`
+    /// invocation fails; earlier files in the list may already be staged.
     pub fn stage_files(files: &[String]) -> Result<(), GitExecutorError> {
         if files.is_empty() {
-            Self::run_git(&["add", "-A"])?;
-        } else {
-            for file in files {
-                Self::run_git(&["add", "--", file])?;
-            }
+            return Err(GitExecutorError::GitError(
+                "refusing to stage with empty file list (would run `git add -A` \
+                 and commit unrelated changes); populate `AutoCommitConfig::files` \
+                 or record modifications via the hook"
+                    .to_string(),
+            ));
+        }
+        for file in files {
+            Self::run_git(&["add", "--", file])?;
         }
         Ok(())
     }
@@ -483,10 +493,16 @@ pub struct AutoCommitConfig {
     /// session end.
     pub commit_on_tools: Vec<String>,
 
-    /// Files to add before commit (empty = all files).
+    /// Files to add before commit.
     ///
-    /// Explicit allow-list of paths to `git add`. An empty vector stages every
-    /// change in the working tree (`git add -A`).
+    /// Explicit allow-list of paths passed to `git add`. When the hook
+    /// records no per-session modifications, this list is what gets
+    /// staged. An empty list is **not** a "commit everything" wildcard:
+    /// [`stage_files`](GitExecutor::stage_files) refuses it with an error
+    /// rather than running `git add -A`, so the default configuration
+    /// commits nothing instead of sweeping up unrelated or secret files.
+    /// Populate this list, or rely on the hook's per-session modification
+    /// tracking, to stage exactly the agent's own changes.
     pub files: Vec<String>,
 }
 
@@ -874,5 +890,105 @@ mod tests {
 
         hook.clear_modifications();
         assert!(hook.modified_files.lock().unwrap().is_empty());
+    }
+
+    /// An empty file list must be refused, not staged as `git add -A`.
+    ///
+    /// Reproduces the footgun: a real git repo with a tracked file that
+    /// has an uncommitted modification, then `stage_files(&[])`. The
+    /// fixed code returns `Err` and leaves the file unstaged; the buggy
+    /// code ran `git add -A` and staged the unrelated change.
+    struct RepoGuard(std::path::PathBuf);
+    impl Drop for RepoGuard {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    #[test]
+    fn stage_files_empty_list_does_not_stage_unrelated_changes() {
+        use std::fs;
+        use std::process::Command;
+
+        if Command::new("git")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+
+        let mut repo_dir = std::env::temp_dir();
+        repo_dir.push(format!(
+            "loopctl-stage-files-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::create_dir_all(&repo_dir).expect("created temp repo dir");
+        let guard = RepoGuard(repo_dir.clone());
+        let prev_dir = std::env::current_dir().expect("cwd readable");
+
+        for (label, args) in [
+            ("init", vec!["init"]),
+            ("config user.name", vec!["config", "user.name", "test"]),
+            ("config user.email", vec!["config", "user.email", "t@t"]),
+        ] {
+            let status = Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap_or_else(|e| panic!("git {label} spawn failed: {e}"));
+            assert!(status.success(), "git {label} failed");
+        }
+
+        let sentinel = repo_dir.join("unrelated.txt");
+        fs::write(&sentinel, "v1\n").expect("wrote sentinel v1");
+        for (label, args) in [
+            ("add", vec!["add", "unrelated.txt"]),
+            ("commit", vec!["commit", "-m", "init"]),
+        ] {
+            let status = Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap_or_else(|e| panic!("git {label} spawn failed: {e}"));
+            assert!(status.success(), "git {label} failed");
+        }
+
+        fs::write(&sentinel, "v2-uncommitted\n").expect("wrote sentinel v2");
+
+        std::env::set_current_dir(&repo_dir).expect("cd into repo");
+        let result = GitExecutor::stage_files(&[]);
+        std::env::set_current_dir(&prev_dir).expect("restored cwd");
+
+        assert!(
+            result.is_err(),
+            "stage_files(&[]) must refuse to run, got {result:?}"
+        );
+
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&repo_dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git status spawn failed: {e}"));
+        let status_text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            status_text.contains(" M unrelated.txt"),
+            "unrelated.txt must remain unstaged after stage_files(&[]), \
+             but git status was:\n{status_text}\n\
+             (this means stage_files ran `git add -A` — the empty-list \
+             footgun is still present)"
+        );
+
+        drop(guard);
     }
 }

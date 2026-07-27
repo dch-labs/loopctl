@@ -1135,7 +1135,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// `(Message, Option<Usage>, StreamStopReason)` and just needs the
     /// side-effects.
     fn record_stream_success(&mut self, usage: Option<&Usage>) {
-        self.managers.fallback().record_model_success();
+        self.managers.fallback().record_success();
         let (in_tok, out_tok) = Self::usage_tokens(usage);
 
         self.managers.observers().on_stream_success(&StreamContext {
@@ -1173,9 +1173,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// handles cancellation before reaching [`do_stream`](Self::do_stream).
     fn record_stream_failure(&mut self, e: LoopError) -> LoopError {
         let tripped = if matches!(e, LoopError::RateLimitEscalation { .. }) {
-            self.managers.fallback().record_model_failure()
+            self.managers
+                .fallback()
+                .record_failure(crate::fallback::FailureKind::RateLimit)
         } else {
-            self.managers.fallback().record_api_failure()
+            self.managers
+                .fallback()
+                .record_failure(crate::fallback::FailureKind::Transient)
         };
 
         if tripped {

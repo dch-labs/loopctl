@@ -710,7 +710,9 @@ mod tests {
     #[test]
     fn test_reset_all_clears_fallback() {
         let managers = LoopManagers::new();
-        let _ = managers.fallback().record_api_failure();
+        let _ = managers
+            .fallback()
+            .record_failure(crate::fallback::FailureKind::Transient);
         managers.reset_all();
         assert!(managers.fallback().active_model().is_none());
     }

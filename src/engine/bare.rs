@@ -1234,7 +1234,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// per-turn counter increment). `query` is the user's message on the first
     /// turn and `""` on continuation turns (the previous turn's tool results
     /// are already in the conversation history).
-    fn fire_turn_start(&self, turn: usize, query: &str) {
+    fn notify_turn_start(&self, turn: usize, query: &str) {
         self.managers.observers().on_turn_start(&TurnStartContext {
             turn,
             query: query.to_string(),
@@ -1245,9 +1245,9 @@ impl<C: ApiClient> BareLoop<C> {
     /// the assembled assistant text for the turn that just streamed.
     ///
     /// `turn` is the same 0-indexed current turn passed to
-    /// [`fire_turn_start`](Self::fire_turn_start). `usage` is `None` when the
+    /// [`notify_turn_start`](Self::notify_turn_start). `usage` is `None` when the
     /// provider did not report token counts for the turn.
-    fn fire_response(&self, turn: usize, text: &str, usage: Option<crate::stream::Usage>) {
+    fn notify_response(&self, turn: usize, text: &str, usage: Option<crate::stream::Usage>) {
         self.managers.observers().on_response(&ResponseContext {
             turn,
             text: text.to_string(),
@@ -1261,9 +1261,9 @@ impl<C: ApiClient> BareLoop<C> {
     /// Fires once per call regardless of how many recovery retries the call
     /// later undergoes (the retry loop lives in dispatch and re-fires only
     /// `on_tool_pre`/`on_tool_post`). `turn` is the same 0-indexed current
-    /// turn passed to [`fire_turn_start`](Self::fire_turn_start); it reaches
+    /// turn passed to [`notify_turn_start`](Self::notify_turn_start); it reaches
     /// the dispatch path as `turn_idx`, so the two events correlate.
-    fn fire_tool_calls_received(&self, turn: usize, tool_calls: &[ToolCall]) {
+    fn notify_tool_calls_received(&self, turn: usize, tool_calls: &[ToolCall]) {
         for tc in tool_calls {
             self.managers
                 .observers()
@@ -1491,7 +1491,7 @@ impl<C: ApiClient> BareLoop<C> {
                 .unwrap_or_default()
         };
 
-        self.fire_turn_start(current_turn, &turn_input);
+        self.notify_turn_start(current_turn, &turn_input);
         self.inject_contributors(current_turn);
 
         let cancel = Arc::clone(&self.cancelled);
@@ -1529,7 +1529,7 @@ impl<C: ApiClient> BareLoop<C> {
                 let text = msg.text_content();
                 let (turn_in, turn_out) = Self::usage_tokens(usage.as_ref());
                 let pattern = self.managers.detection().record_response(&text);
-                self.fire_response(current_turn, &text, usage);
+                self.notify_response(current_turn, &text, usage);
 
                 if let Some(e) = self.apply_loop_detection(current_turn, &pattern) {
                     return Err(e);
@@ -1623,7 +1623,7 @@ impl<C: ApiClient> BareLoop<C> {
             }
         }
 
-        self.fire_tool_calls_received(current_turn, &tool_calls);
+        self.notify_tool_calls_received(current_turn, &tool_calls);
 
         let cancel = Arc::clone(&self.cancelled);
         let dispatch = async {

@@ -89,7 +89,7 @@ use std::sync::Arc;
 # struct MyClient;
 # use loopctl::api::ApiClient;
 # impl ApiClient for MyClient {
-#     fn model(&self) -> &str { "llm-70b" }
+#     fn model(&self) -> String { "llm-70b".to_string() }
 #     fn stream_messages(&self, _req: &loopctl::api::StreamRequest)
 #         -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<loopctl::stream::StreamEvent, loopctl::api::error::ApiError>> + Send>> {
 #         unimplemented!()
@@ -152,7 +152,7 @@ let agent = BareLoop::new(
 | `ollama` | No | `providers`, `openai` | Ollama local model client (OpenAI-compatible) |
 | `deepseek` | No | `providers`, `openai` | DeepSeek API client (OpenAI-compatible) |
 | `grok` | No | `providers`, `openai` | Grok (xAI) API client (OpenAI-compatible) |
-| `xai` | No | `grok` | Alias for `grok` (xAI API client)
+| `xai` | No | `grok` | Alias for `grok` (xAI API client) |
 | `gemini` | No | `providers` | Google Gemini API client (`provider::gemini`) |
 | `zai` | No | `providers`, `anthropic` | Z.AI API client (Anthropic-compatible) |
 | `grammar` | No | `providers` | Tool-call grammar providers for grammar-aware samplers (vLLM `guided_json`); enables the `Grammar` mode of `ToolConstraint` |

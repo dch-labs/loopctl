@@ -1710,7 +1710,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                     MachineStep::CallLLM { turn } => {
                         if let Err(e) = self.handle_call_llm(turn).await {
                             self.set_error_state(&e);
-                            self.finalize(false).await?;
+                            self.finalize(Some(&e)).await?;
                             return Err(e);
                         }
                     }
@@ -1718,14 +1718,14 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                         let turn = self.machine.turns_taken();
                         if let Err(e) = self.handle_call_tools(turn, &calls).await {
                             self.set_error_state(&e);
-                            self.finalize(false).await?;
+                            self.finalize(Some(&e)).await?;
                             return Err(e);
                         }
                     }
                     MachineStep::Compact { reason } => {
                         if let Err(e) = self.handle_compact(reason).await {
                             self.set_error_state(&e);
-                            self.finalize(false).await?;
+                            self.finalize(Some(&e)).await?;
                             return Err(e);
                         }
                     }
@@ -1741,22 +1741,22 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                             let err = LoopError::MaxTurnsExceeded {
                                 max: self.run_config().max_turns,
                             };
-                            self.finalize(false).await?;
+                            self.finalize(Some(&err)).await?;
                             return Err(err);
                         }
                         MachineOutcome::Cancelled => {
-                            self.finalize(false).await?;
+                            self.finalize(Some(&LoopError::Cancelled)).await?;
                             return Err(LoopError::Cancelled);
                         }
                         MachineOutcome::Failed { error } => {
-                            self.finalize(false).await?;
+                            self.finalize(Some(&error)).await?;
                             return Err(error);
                         }
                     },
                 }
             }
 
-            self.finalize(true).await
+            self.finalize(None).await
         })
     }
 
@@ -1776,14 +1776,14 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
     /// so the agent is never left permanently dead after one cancel.
     fn finalize<'a>(
         &'a mut self,
-        success: bool,
+        error: Option<&'a LoopError>,
     ) -> Pin<Box<dyn Future<Output = RunResult> + Send + 'a>> {
         Box::pin(async move {
             if let Some(run) = self.current_run_mut() {
                 run.end = Some(Instant::now());
             }
 
-            if success {
+            if error.is_none() {
                 self.machine.commit_pending();
             } else {
                 self.machine.discard_pending();
@@ -1792,7 +1792,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             let run = self.current_run().cloned().unwrap_or_default();
             let duration = run.duration();
 
-            self.notify_run_end(&run, success, duration);
+            self.notify_run_end(&run, duration, error);
             self.cancelled.reset();
 
             Ok(run)
@@ -4555,8 +4555,8 @@ mod tests {
 
         loop_.notify_run_end(
             &loop_.current_run().unwrap().clone(),
-            true,
             Duration::from_millis(100),
+            None,
         );
 
         assert_eq!(hook.captured(), Some(RunEndReason::Complete));
@@ -4589,8 +4589,8 @@ mod tests {
 
         loop_.notify_run_end(
             &loop_.current_run().unwrap().clone(),
-            true,
             Duration::from_millis(100),
+            None,
         );
 
         assert_eq!(hook.captured(), Some(RunEndReason::Cancelled));
@@ -4614,8 +4614,8 @@ mod tests {
 
         loop_.notify_run_end(
             &loop_.current_run().unwrap().clone(),
-            true,
             Duration::from_millis(100),
+            None,
         );
 
         assert_eq!(hook.captured(), Some(RunEndReason::MaxTurns));
@@ -4625,11 +4625,12 @@ mod tests {
     #[tokio::test]
     async fn run_end_reason_error() {
         let (loop_, hook) = loop_with_reason_hook();
+        let err = LoopError::Api("something went wrong".into());
 
         loop_.notify_run_end(
             &loop_.current_run().unwrap().clone(),
-            false,
             Duration::from_millis(100),
+            Some(&err),
         );
 
         assert_eq!(hook.captured(), Some(RunEndReason::Error));
@@ -4639,14 +4640,18 @@ mod tests {
     #[tokio::test]
     async fn run_end_reason_context_overflow() {
         let (loop_, hook) = loop_with_reason_hook();
+        let err = LoopError::ContextExceeded {
+            used: 100_000,
+            limit: 50_000,
+        };
 
         loop_.notify_run_end(
             &loop_.current_run().unwrap().clone(),
-            false,
             Duration::from_millis(100),
+            Some(&err),
         );
 
-        assert_eq!(hook.captured(), Some(RunEndReason::Error));
+        assert_eq!(hook.captured(), Some(RunEndReason::ContextOverflow));
     }
 
     #[tokio::test]

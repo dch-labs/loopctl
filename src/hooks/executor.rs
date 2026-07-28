@@ -187,16 +187,15 @@ impl HookExecutor {
         Box::pin(async move { action })
     }
 
-    /// Check pre-compact hooks, merging every hook's [`CompactResult`].
+    /// Check pre-compact hooks, merging results until the first abort.
     ///
-    /// Unlike [`check_pre_tool_use`](Self::check_pre_tool_use), there is
-    /// no short-circuit on the first result — all hooks run, and their
-    /// results are combined: if any hook returns
-    /// [`abort: true`](CompactResult::abort), the merged result is that
-    /// abort (the first one wins, returned immediately); otherwise the
-    /// last hook's `new_instructions` overrides earlier ones, and every
-    /// hook's `additional_context` entries accumulate in registration
-    /// order.
+    /// Hooks run in registration order. Each hook's
+    /// [`CompactResult`] is merged
+    /// into the accumulated result: `new_instructions` overrides earlier
+    /// values, and `additional_context` entries accumulate. If any hook
+    /// returns [`abort: true`](CompactResult::abort), execution stops
+    /// immediately and that abort result is returned — remaining hooks
+    /// are not called.
     #[must_use]
     pub fn check_pre_compact(&self, ctx: &PreCompactContext) -> CompactResult {
         let mut result = CompactResult::allow();

@@ -627,11 +627,7 @@ impl ToolCircuitBreaker {
     /// numeric encoding.
     #[must_use]
     pub fn state_label(&self) -> &'static str {
-        match self
-            .state
-            .lock()
-            .map_or(CircuitState::Closed, |s| s.circuit)
-        {
+        match crate::error::recover_guard(self.state.lock()).circuit {
             CircuitState::Closed => "closed",
             CircuitState::Open => "open",
             CircuitState::HalfOpen => "half-open",

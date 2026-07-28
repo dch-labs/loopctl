@@ -23,7 +23,7 @@
 //!
 //! # Post-hook Execution Model
 //!
-//! For `on_post_*` and session hooks, the executor calls **all** hooks.
+//! For `on_post_*` and run hooks, the executor calls **all** hooks.
 //! There's no short-circuit because post-hooks are notification-only.
 //!
 //! # Thread Safety
@@ -40,7 +40,7 @@ use crate::hooks::HookAction;
 use crate::hooks::Interactivity;
 use crate::hooks::context::{
     CompactResult, PostCompactContext, PostToolUseContext, PreCompactContext, PreToolUseContext,
-    SessionEndContext, SessionStartContext,
+    RunEndContext, RunStartContext,
 };
 
 /// Executes hooks in registration order with short-circuit semantics.
@@ -268,28 +268,28 @@ impl HookExecutor {
         }
     }
 
-    /// Notify every registered session-start hook.
+    /// Notify every registered run-start hook.
     ///
-    /// Fires [`Hook::on_session_start`] on each hook in registration
-    /// order, once, at the beginning of a session. Notification-only —
-    /// every hook always runs. Use it to initialize per-session state
+    /// Fires [`Hook::on_run_start`] on each hook in registration
+    /// order, once, at the beginning of a run. Notification-only —
+    /// every hook always runs. Use it to initialize per-run state
     /// (open resources, reset counters, emit a start log line).
-    pub fn notify_session_start(&self, ctx: &SessionStartContext) {
+    pub fn notify_run_start(&self, ctx: &RunStartContext) {
         for hook in &self.hooks {
-            hook.on_session_start(ctx);
+            hook.on_run_start(ctx);
         }
     }
 
-    /// Notify every registered session-end hook.
+    /// Notify every registered run-end hook.
     ///
-    /// Fires [`Hook::on_session_end`] on each hook in registration
+    /// Fires [`Hook::on_run_end`] on each hook in registration
     /// order, once, after the loop has terminated. Notification-only —
     /// every hook always runs. Use it to flush resources, finalize
     /// tracking, and emit a summary log line keyed off
-    /// [`SessionEndContext::reason`].
-    pub fn notify_session_end(&self, ctx: &SessionEndContext) {
+    /// [`RunEndContext::reason`].
+    pub fn notify_run_end(&self, ctx: &RunEndContext) {
         for hook in &self.hooks {
-            hook.on_session_end(ctx);
+            hook.on_run_end(ctx);
         }
     }
 
@@ -306,29 +306,29 @@ impl HookExecutor {
         Box::pin(async {})
     }
 
-    /// Async wrapper for [`notify_session_start`](Self::notify_session_start).
+    /// Async wrapper for [`notify_run_start`](Self::notify_run_start).
     ///
-    /// Runs all session-start hooks synchronously and wraps completion
+    /// Runs all run-start hooks synchronously and wraps completion
     /// in a `Pin<Box<Future>>` for async compatibility.
     #[must_use]
-    pub fn notify_session_start_async(
+    pub fn notify_run_start_async(
         &self,
-        ctx: &SessionStartContext,
+        ctx: &RunStartContext,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        self.notify_session_start(ctx);
+        self.notify_run_start(ctx);
         Box::pin(async {})
     }
 
-    /// Async wrapper for [`notify_session_end`](Self::notify_session_end).
+    /// Async wrapper for [`notify_run_end`](Self::notify_run_end).
     ///
-    /// Runs all session-end hooks synchronously and wraps completion
+    /// Runs all run-end hooks synchronously and wraps completion
     /// in a `Pin<Box<Future>>` for async compatibility.
     #[must_use]
-    pub fn notify_session_end_async(
+    pub fn notify_run_end_async(
         &self,
-        ctx: &SessionEndContext,
+        ctx: &RunEndContext,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        self.notify_session_end(ctx);
+        self.notify_run_end(ctx);
         Box::pin(async {})
     }
 }
@@ -336,7 +336,7 @@ impl HookExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::context::{CompactTrigger, SessionEndReason};
+    use crate::hooks::context::{CompactTrigger, RunEndReason};
     use serde_json::json;
 
     struct AllowHook;
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn session_start_end_notify_all() {
+    fn run_start_end_notify_all() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct CounterHook {
             starts: AtomicUsize,
@@ -548,10 +548,10 @@ mod tests {
             fn name(&self) -> &'static str {
                 "counter"
             }
-            fn on_session_start(&self, _ctx: &SessionStartContext) {
+            fn on_run_start(&self, _ctx: &RunStartContext) {
                 self.starts.fetch_add(1, Ordering::Relaxed);
             }
-            fn on_session_end(&self, _ctx: &SessionEndContext) {
+            fn on_run_end(&self, _ctx: &RunEndContext) {
                 self.ends.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -562,15 +562,15 @@ mod tests {
         let executor = HookExecutor::new()
             .with_hook(counter.clone())
             .with_hook(counter.clone());
-        executor.notify_session_start(&SessionStartContext {
+        executor.notify_run_start(&RunStartContext {
             session_id: uuid::Uuid::nil(),
             model: "test".to_string(),
             working_directory: "/tmp".to_string(),
         });
         assert_eq!(counter.starts.load(Ordering::Relaxed), 2);
-        executor.notify_session_end(&SessionEndContext {
+        executor.notify_run_end(&RunEndContext {
             session_id: uuid::Uuid::nil(),
-            reason: SessionEndReason::Complete,
+            reason: RunEndReason::Complete,
             total_turns: 5,
             total_tokens: 1000,
             duration_secs: 30,
@@ -638,9 +638,9 @@ mod tests {
     }
 
     #[test]
-    fn notify_session_start_empty_executor() {
+    fn notify_run_start_empty_executor() {
         let executor = HookExecutor::new();
-        executor.notify_session_start(&SessionStartContext {
+        executor.notify_run_start(&RunStartContext {
             session_id: uuid::Uuid::nil(),
             model: "test".to_string(),
             working_directory: "/tmp".to_string(),
@@ -648,11 +648,11 @@ mod tests {
     }
 
     #[test]
-    fn notify_session_end_empty_executor() {
+    fn notify_run_end_empty_executor() {
         let executor = HookExecutor::new();
-        executor.notify_session_end(&SessionEndContext {
+        executor.notify_run_end(&RunEndContext {
             session_id: uuid::Uuid::nil(),
-            reason: SessionEndReason::Complete,
+            reason: RunEndReason::Complete,
             total_turns: 0,
             total_tokens: 0,
             duration_secs: 0,

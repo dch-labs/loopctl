@@ -77,7 +77,7 @@ use crate::hooks::context::{
     CompactTrigger, PostCompactContext, PostToolUseContext, PreCompactContext, PreToolUseContext,
 };
 #[cfg(all(test, feature = "hooks"))]
-use crate::hooks::context::{SessionEndContext as HookSessionEndContext, SessionEndReason};
+use crate::hooks::context::{RunEndContext as HookRunEndContext, RunEndReason};
 #[cfg(feature = "hooks")]
 use crate::hooks::{HookAction, HookExecutor};
 use crate::managers::LoopManagers;
@@ -196,7 +196,8 @@ pub struct BareLoop<C: ApiClient> {
     /// - Optional [`HookExecutor`] — bidirectional lifecycle hooks.
     /// - Optional [`ToolHealthRegistry`] — per-tool health tracking.
     ///
-    /// Reset at the start of every session via [`LoopManagers::reset_all`].
+    /// Fresh on construction; call [`LoopManagers::reset_all`] to
+    /// reinitialise mid-session.
     ///
     /// [`FallbackManager`]: crate::fallback::FallbackManager
     /// [`DetectionManager`]: crate::detection::DetectionManager
@@ -663,7 +664,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Set the [`HookExecutor`] for lifecycle interception.
     ///
     /// When set, the executor runs registered hooks before and after
-    /// tool dispatch, compaction, and session start/end. Hooks can
+    /// tool dispatch, compaction, and run start/end. Hooks can
     /// short-circuit with [`HookAction::Block`].
     /// [`HookAction::Ask`] is automatically downgraded to `Block` by the
     /// executor in [`crate::hooks::Interactivity::Headless`] mode (the default).
@@ -1693,11 +1694,14 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             let session_is_new = self.session.session_start.is_none();
             if session_is_new {
                 self.session.session_start = Some(Instant::now());
-                self.notify_session_start();
+            }
+
+            if run_config.reset_managers {
+                self.managers.reset_all();
             }
 
             self.session.runs.push(Run::new(input, run_config));
-            self.managers.reset_all();
+            self.notify_run_start();
             self.machine.accept_input(input);
 
             loop {
@@ -1764,7 +1768,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
     ///
     /// Every `run()` exit path — clean completion, error, max-turns,
     /// cancellation — funnels through here. Records the run's end
-    /// timestamp, fires the session-end observers, and re-arms the
+    /// timestamp, fires the run-end observers, and re-arms the
     /// cancel signal so the next `run()` starts clean. Re-arming here
     /// (rather than at the top of `run()`) preserves a cancel that
     /// arrived before the run: the run observes it and returns
@@ -1788,7 +1792,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             let run = self.current_run().cloned().unwrap_or_default();
             let duration = run.duration();
 
-            self.notify_session_end(&run, success, duration);
+            self.notify_run_end(&run, success, duration);
             self.cancelled.reset();
 
             Ok(run)
@@ -2203,8 +2207,8 @@ mod tests {
     }
 
     struct CountingObserver {
-        session_starts: AtomicUsize,
-        session_ends: AtomicUsize,
+        run_starts: AtomicUsize,
+        run_ends: AtomicUsize,
         turn_starts: AtomicUsize,
         turn_ends: AtomicUsize,
         tool_calls_received: AtomicUsize,
@@ -2215,8 +2219,8 @@ mod tests {
     impl CountingObserver {
         fn new() -> Self {
             Self {
-                session_starts: AtomicUsize::new(0),
-                session_ends: AtomicUsize::new(0),
+                run_starts: AtomicUsize::new(0),
+                run_ends: AtomicUsize::new(0),
                 turn_starts: AtomicUsize::new(0),
                 turn_ends: AtomicUsize::new(0),
                 tool_calls_received: AtomicUsize::new(0),
@@ -2231,12 +2235,12 @@ mod tests {
             "counting"
         }
 
-        fn on_session_start(&self, _ctx: &crate::observer::SessionStartContext) {
-            self.session_starts.fetch_add(1, Ordering::SeqCst);
+        fn on_run_start(&self, _ctx: &crate::observer::RunStartContext) {
+            self.run_starts.fetch_add(1, Ordering::SeqCst);
         }
 
-        fn on_session_end(&self, _ctx: &crate::observer::SessionEndContext) {
-            self.session_ends.fetch_add(1, Ordering::SeqCst);
+        fn on_run_end(&self, _ctx: &crate::observer::RunEndContext) {
+            self.run_ends.fetch_add(1, Ordering::SeqCst);
         }
 
         fn on_turn_start(&self, _ctx: &crate::observer::TurnStartContext) {
@@ -2833,10 +2837,38 @@ mod tests {
 
         let _result = agent.run("Hi", &RunConfig::default()).await.unwrap();
 
-        assert_eq!(plugin.session_starts.load(Ordering::SeqCst), 1);
-        assert_eq!(plugin.session_ends.load(Ordering::SeqCst), 1);
+        assert_eq!(plugin.run_starts.load(Ordering::SeqCst), 1);
+        assert_eq!(plugin.run_ends.load(Ordering::SeqCst), 1);
         assert_eq!(plugin.turn_starts.load(Ordering::SeqCst), 1);
         assert_eq!(plugin.turn_ends.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_observer_run_start_end_symmetry_across_multiple_runs() {
+        let client = MockClient::new("test-model");
+        client.add_text_response("first");
+        client.add_text_response("second");
+        client.add_text_response("third");
+
+        let plugin = Arc::new(CountingObserver::new());
+        let config = make_config();
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+        agent.register_observer(plugin.clone());
+
+        for _ in 0..3 {
+            let _ = agent.run("Hi", &RunConfig::default()).await.unwrap();
+        }
+
+        assert_eq!(
+            plugin.run_starts.load(Ordering::SeqCst),
+            3,
+            "on_run_start must fire once per run"
+        );
+        assert_eq!(
+            plugin.run_ends.load(Ordering::SeqCst),
+            3,
+            "on_run_end must fire once per run"
+        );
     }
 
     #[tokio::test]
@@ -4450,7 +4482,7 @@ mod tests {
 
     #[cfg(feature = "hooks")]
     struct ReasonCaptureHook {
-        reason: Mutex<Option<SessionEndReason>>,
+        reason: Mutex<Option<RunEndReason>>,
     }
 
     #[cfg(feature = "hooks")]
@@ -4461,7 +4493,7 @@ mod tests {
             })
         }
 
-        fn captured(&self) -> Option<SessionEndReason> {
+        fn captured(&self) -> Option<RunEndReason> {
             *crate::error::recover_guard(self.reason.lock())
         }
     }
@@ -4472,7 +4504,7 @@ mod tests {
             "ReasonCaptureHook"
         }
 
-        fn on_session_end(&self, ctx: &HookSessionEndContext) {
+        fn on_run_end(&self, ctx: &HookRunEndContext) {
             *crate::error::recover_guard(self.reason.lock()) = Some(ctx.reason);
         }
     }
@@ -4499,7 +4531,7 @@ mod tests {
 
     #[cfg(feature = "hooks")]
     #[tokio::test]
-    async fn session_end_reason_complete() {
+    async fn run_end_reason_complete() {
         let (mut loop_, hook) = loop_with_reason_hook();
         // Normal completion: success true, not cancelled, under max_turns.
         loop_.current_run_mut().unwrap().turns = vec![
@@ -4521,18 +4553,18 @@ mod tests {
             },
         ];
 
-        loop_.notify_session_end(
+        loop_.notify_run_end(
             &loop_.current_run().unwrap().clone(),
             true,
             Duration::from_millis(100),
         );
 
-        assert_eq!(hook.captured(), Some(SessionEndReason::Complete));
+        assert_eq!(hook.captured(), Some(RunEndReason::Complete));
     }
 
     #[cfg(feature = "hooks")]
     #[tokio::test]
-    async fn session_end_reason_cancelled() {
+    async fn run_end_reason_cancelled() {
         let (mut loop_, hook) = loop_with_reason_hook();
         // Cancel signal fired — success is true (not Failed) but cancelled.
         loop_.current_run_mut().unwrap().turns = vec![
@@ -4555,18 +4587,18 @@ mod tests {
         ];
         loop_.cancelled.cancel();
 
-        loop_.notify_session_end(
+        loop_.notify_run_end(
             &loop_.current_run().unwrap().clone(),
             true,
             Duration::from_millis(100),
         );
 
-        assert_eq!(hook.captured(), Some(SessionEndReason::Cancelled));
+        assert_eq!(hook.captured(), Some(RunEndReason::Cancelled));
     }
 
     #[cfg(feature = "hooks")]
     #[tokio::test]
-    async fn session_end_reason_max_turns() {
+    async fn run_end_reason_max_turns() {
         let (mut loop_, hook) = loop_with_reason_hook();
         // Hit max_turns: turn count == max_turns, not cancelled, success true.
         loop_.current_run_mut().unwrap().turns = (0..5)
@@ -4580,41 +4612,41 @@ mod tests {
             })
             .collect();
 
-        loop_.notify_session_end(
+        loop_.notify_run_end(
             &loop_.current_run().unwrap().clone(),
             true,
             Duration::from_millis(100),
         );
 
-        assert_eq!(hook.captured(), Some(SessionEndReason::MaxTurns));
+        assert_eq!(hook.captured(), Some(RunEndReason::MaxTurns));
     }
 
     #[cfg(feature = "hooks")]
     #[tokio::test]
-    async fn session_end_reason_error() {
+    async fn run_end_reason_error() {
         let (loop_, hook) = loop_with_reason_hook();
 
-        loop_.notify_session_end(
+        loop_.notify_run_end(
             &loop_.current_run().unwrap().clone(),
             false,
             Duration::from_millis(100),
         );
 
-        assert_eq!(hook.captured(), Some(SessionEndReason::Error));
+        assert_eq!(hook.captured(), Some(RunEndReason::Error));
     }
 
     #[cfg(feature = "hooks")]
     #[tokio::test]
-    async fn session_end_reason_context_overflow() {
+    async fn run_end_reason_context_overflow() {
         let (loop_, hook) = loop_with_reason_hook();
 
-        loop_.notify_session_end(
+        loop_.notify_run_end(
             &loop_.current_run().unwrap().clone(),
             false,
             Duration::from_millis(100),
         );
 
-        assert_eq!(hook.captured(), Some(SessionEndReason::Error));
+        assert_eq!(hook.captured(), Some(RunEndReason::Error));
     }
 
     #[tokio::test]
@@ -4727,9 +4759,9 @@ mod tests {
             "on_turn_end(false) must fire on cancel during dispatch",
         );
         assert_eq!(
-            observer.session_ends.load(Ordering::SeqCst),
+            observer.run_ends.load(Ordering::SeqCst),
             1,
-            "on_session_end must fire via finalize after cancel",
+            "on_run_end must fire via finalize after cancel",
         );
     }
 
@@ -5341,7 +5373,7 @@ mod tests {
         let config = contributor_config();
         let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
         // The first run() establishes the session (capturing the start time
-        // and firing on_session_start), moving the loop out of Idle. A
+        // and firing on_run_start), moving the loop out of Idle. A
         // subsequent add_contributor must panic in debug builds (matches
         // set_reflector's contract).
         // Box the future so we can drop it without awaiting; the session-init

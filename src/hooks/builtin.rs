@@ -13,7 +13,7 @@
 //! | [`LoggingHook`] | Logs pre/post tool use and compact events via `tracing`. |
 //! | [`BlocklistHook`] | Blocks or allows tools by name (denylist/allowlist). |
 //! | [`ConfirmationHook`] | Requires interactive confirmation for specific tools. |
-//! | [`AutoCommitHook`] | Tracks file modifications and auto-commits at session end. |
+//! | [`AutoCommitHook`] | Tracks file modifications and auto-commits at run end. |
 
 mod auto_commit;
 mod blocklist_hook;

@@ -1,6 +1,6 @@
-//! Session lifecycle notifications — start and end events.
+//! Run lifecycle notifications — start and end events.
 //!
-//! Fires observer callbacks and hook notifications when a session begins and
+//! Fires observer callbacks and hook notifications when a run begins and
 //! ends. Other observer events (`on_turn_start`, `on_response`, etc.) are fired
 //! directly at their call sites in the driver loop.
 
@@ -9,53 +9,48 @@ use super::{ApiClient, BareLoop, Duration, Run};
 use crate::capabilities::Hookable;
 #[cfg(feature = "hooks")]
 use crate::hooks::context::{
-    SessionEndContext as HookSessionEndContext, SessionEndReason,
-    SessionStartContext as HookSessionStartContext,
+    RunEndContext as HookRunEndContext, RunEndReason, RunStartContext as HookRunStartContext,
 };
-use crate::observer::{SessionEndContext, SessionStartContext};
+use crate::observer::{RunEndContext, RunStartContext};
 
 impl<C: ApiClient> BareLoop<C> {
-    /// Notify all observers and hooks that the session has started.
+    /// Notify all observers and hooks that a run has started.
     ///
-    /// Fires [`on_session_start`](crate::observer::LoopObserver::on_session_start)
+    /// Fires [`on_run_start`](crate::observer::LoopObserver::on_run_start)
     /// on every registered observer with the session id, then fires the
-    /// `on_session_start` hook (when the `hooks` feature is enabled and a
+    /// `on_run_start` hook (when the `hooks` feature is enabled and a
     /// hook executor is configured). Called once at the beginning of a
     /// run, before the first turn.
-    pub(super) fn notify_session_start(&self) {
-        self.managers
-            .observers()
-            .on_session_start(&SessionStartContext {
-                session_id: self.session.id,
-            });
-        self.notify_session_start_hook();
+    pub(super) fn notify_run_start(&self) {
+        self.managers.observers().on_run_start(&RunStartContext {
+            session_id: self.session.id,
+        });
+        self.notify_run_start_hook();
     }
 
-    /// Notify all observers and hooks that the session has ended.
+    /// Notify all observers and hooks that a run has ended.
     ///
-    /// Fires [`on_session_end`](crate::observer::LoopObserver::on_session_end)
-    /// on every registered observer, then fires the `on_session_end` hook
+    /// Fires [`on_run_end`](crate::observer::LoopObserver::on_run_end)
+    /// on every registered observer, then fires the `on_run_end` hook
     /// (when the `hooks` feature is enabled). The [`Run`] supplies the
     /// per-run totals (turn count, tokens); `success` distinguishes a
     /// normal exit from a failure so observers and hooks can branch on
     /// the outcome, and `duration` is the wall-clock run length.
-    pub(super) fn notify_session_end(&self, result: &Run, success: bool, duration: Duration) {
-        self.managers
-            .observers()
-            .on_session_end(&SessionEndContext {
-                success,
-                error: if success {
-                    None
-                } else {
-                    Some("run failed".to_string())
-                },
-                total_turns: result.turn_count(),
-                duration_ms: Self::millis_u64(duration),
-            });
-        self.notify_session_end_hook(result, success, duration);
+    pub(super) fn notify_run_end(&self, result: &Run, success: bool, duration: Duration) {
+        self.managers.observers().on_run_end(&RunEndContext {
+            success,
+            error: if success {
+                None
+            } else {
+                Some("run failed".to_string())
+            },
+            total_turns: result.turn_count(),
+            duration_ms: Self::millis_u64(duration),
+        });
+        self.notify_run_end_hook(result, success, duration);
     }
 
-    /// Derive the structured [`SessionEndReason`] from the loop's
+    /// Derive the structured [`RunEndReason`] from the loop's
     /// terminal state.
     ///
     /// Maps the boolean `success` plus the cancellation flag and the
@@ -64,80 +59,80 @@ impl<C: ApiClient> BareLoop<C> {
     /// normal completion. Used only to populate the hook end-context —
     /// observers receive the simpler boolean `success` field.
     #[cfg(feature = "hooks")]
-    fn session_end_reason(&self, success: bool) -> SessionEndReason {
+    fn run_end_reason(&self, success: bool) -> RunEndReason {
         if self.is_cancelled() {
-            SessionEndReason::Cancelled
+            RunEndReason::Cancelled
         } else if !success {
-            SessionEndReason::Error
+            RunEndReason::Error
         } else if self.current_run().map_or(0, Run::turn_count) >= self.run_config().max_turns {
-            SessionEndReason::MaxTurns
+            RunEndReason::MaxTurns
         } else {
-            SessionEndReason::Complete
+            RunEndReason::Complete
         }
     }
 
-    /// Fire the `on_session_start` hook when a hook executor is
+    /// Fire the `on_run_start` hook when a hook executor is
     /// configured.
     ///
-    /// Builds a [`HookSessionStartContext`] from the session id, the
+    /// Builds a [`HookRunStartContext`] from the session id, the
     /// client's current model, and the process working directory, then
-    /// dispatches it to every registered session-start hook. No-op when
+    /// dispatches it to every registered run-start hook. No-op when
     /// no hook executor is set.
     #[cfg(feature = "hooks")]
-    fn notify_session_start_hook(&self) {
+    fn notify_run_start_hook(&self) {
         let Some(executor) = self.managers.hook_executor() else {
             return;
         };
-        let ctx = HookSessionStartContext {
+        let ctx = HookRunStartContext {
             session_id: self.session.id,
             model: self.client.model(),
             working_directory: std::env::current_dir()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         };
-        executor.notify_session_start(&ctx);
+        executor.notify_run_start(&ctx);
     }
 
-    /// No-op session-start hook for builds without the `hooks` feature.
+    /// No-op run-start hook for builds without the `hooks` feature.
     ///
     /// Does nothing — there are no hooks to notify. Kept so
-    /// [`notify_session_start`](Self::notify_session_start) compiles
+    /// [`notify_run_start`](Self::notify_run_start) compiles
     /// identically with and without the feature.
     #[cfg(not(feature = "hooks"))]
-    fn notify_session_start_hook(&self) {}
+    fn notify_run_start_hook(&self) {}
 
-    /// Fire the `on_session_end` hook when a hook executor is
+    /// Fire the `on_run_end` hook when a hook executor is
     /// configured.
     ///
-    /// Derives the [`SessionEndReason`] via
-    /// [`session_end_reason`](Self::session_end_reason), then builds a
-    /// [`HookSessionEndContext`] from the session id, reason, turn
+    /// Derives the [`RunEndReason`] via
+    /// [`run_end_reason`](Self::run_end_reason), then builds a
+    /// [`HookRunEndContext`] from the session id, reason, turn
     /// count, total tokens, and run duration, and dispatches it to
-    /// every registered session-end hook. No-op when no hook executor
+    /// every registered run-end hook. No-op when no hook executor
     /// is set.
     #[cfg(feature = "hooks")]
-    fn notify_session_end_hook(&self, result: &Run, success: bool, duration: Duration) {
+    fn notify_run_end_hook(&self, result: &Run, success: bool, duration: Duration) {
         let Some(executor) = self.managers.hook_executor() else {
             return;
         };
-        let reason = self.session_end_reason(success);
-        let ctx = HookSessionEndContext {
+        let reason = self.run_end_reason(success);
+        let ctx = HookRunEndContext {
             session_id: self.session.id,
             reason,
             total_turns: result.turn_count(),
             total_tokens: result.total_tokens(),
             duration_secs: duration.as_secs(),
         };
-        executor.notify_session_end(&ctx);
+        executor.notify_run_end(&ctx);
     }
 
-    /// No-op session-end hook for builds without the `hooks` feature.
+    /// No-op run-end hook for builds without the `hooks` feature.
     ///
     /// Does nothing — there are no hooks to notify. Kept so
-    /// [`notify_session_end`](Self::notify_session_end) compiles
+    /// [`notify_run_end`](Self::notify_run_end) compiles
     /// identically with and without the feature.
     #[cfg(not(feature = "hooks"))]
-    fn notify_session_end_hook(&self, _result: &Run, _success: bool, _duration: Duration) {}
+    fn notify_run_end_hook(&self, _result: &Run, _success: bool, _duration: Duration) {}
 
     /// Convert a [`Duration`] to milliseconds as a `u64`.
     ///

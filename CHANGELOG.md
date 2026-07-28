@@ -214,6 +214,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Changed
 
+- **Breaking (session→run lifecycle rename):** the observer and hook events
+  formerly named `on_session_start` / `on_session_end` are renamed to
+  `on_run_start` / `on_run_end`. These events fire once per `run()` call and
+  carry per-run data (turn count, per-run duration, per-run tokens), so the
+  new names match their actual semantics. The Session ⊃ Run ⊃ Turn hierarchy
+  is unchanged: a Session spans the agent's lifetime, a Run is one `run()`
+  call, a Turn is one loop iteration. Affected APIs (old → new):
+  `LoopObserver::on_session_start` → `on_run_start`,
+  `LoopObserver::on_session_end` → `on_run_end`,
+  `observer::SessionStartContext` → `observer::RunStartContext`,
+  `observer::SessionEndContext` → `observer::RunEndContext`,
+  `Hook::on_session_start` → `on_run_start`,
+  `Hook::on_session_end` → `on_run_end`,
+  `hooks::context::SessionStartContext` → `hooks::context::RunStartContext`,
+  `hooks::context::SessionEndContext` → `hooks::context::RunEndContext`,
+  `hooks::context::SessionEndReason` → `hooks::context::RunEndReason`,
+  `HookExecutor::notify_session_start` → `notify_run_start`,
+  `HookExecutor::notify_session_end` → `notify_run_end`,
+  `HookExecutor::notify_session_start_async` → `notify_run_start_async`,
+  `HookExecutor::notify_session_end_async` → `notify_run_end_async`,
+  `ObserverHost::on_session_start` → `on_run_start`,
+  `ObserverHost::on_session_end` → `on_run_end`.
+  Migration: rename the method/trait impl in every `impl LoopObserver` and
+  `impl Hook`; rename every `SessionStartContext` / `SessionEndContext` /
+  `SessionEndReason` reference. The `session_id` field on the renamed context
+  types is unchanged (a run belongs to a session).
+- **Breaking (per-run manager reset):** `LoopManagers::reset_all` is no
+  longer called automatically from `run()`. Previously it fired on every
+  `run()` call, wiping session-scoped manager state (fallback circuit
+  breaker, loop detection, observers) between runs. On a fresh session
+  the managers are already in their default state, so the call was a
+  no-op on the first run and a correctness bug on subsequent runs (it
+  discarded accumulated circuit-breaker and detection state). To
+  reinitialise mid-session, call `managers.reset_all()` explicitly.
+- `RunConfig` gains a `reset_managers: bool` field (default `false`). Set it
+  to `true` when a run is logically independent from the previous one and you
+  want fresh circuit-breaker / detection / observer state for that run. This
+  replaces the removed automatic `reset_all` with explicit, per-run control.
+  Because `RunConfig` is `#[non_exhaustive]`, existing code that constructs it
+  via `Default::default()` or `RunConfig { .. }` continues to work unchanged.
+- `on_run_start` (the renamed `on_session_start`) now fires at the start of
+  **every** `run()` call, matching `on_run_end` which already fired on every
+  `run()` call. Previously it fired only once (on the first `run()`), creating
+  an asymmetry where a multi-run session saw 1 start event but N end events.
+  The session-scoped bookkeeping (`session_start` timestamp, `reset_all`) is
+  unaffected — it still runs only once, on the first `run()`.
+
 - **Breaking (machine-driven engine):** `BareLoop::run()` is now a
   `match machine.next_step()` loop driving a `LoopMachine`. The machine owns the
   conversation history and every loop decision (turn count, max-turn, tool-call

@@ -8,7 +8,7 @@
 //!
 //! Each callback receives a typed context struct with relevant fields:
 //!
-//! - [`SessionStartContext`] / [`SessionEndContext`] — session boundaries
+//! - [`RunStartContext`] / [`RunEndContext`] — run boundaries (one per `run()` call)
 //! - [`TurnStartContext`] / [`TurnEndContext`] — turn boundaries
 //! - [`StreamContext`] / [`StreamFailureContext`] — stream success/failure
 //! - [`ResponseContext`] — model response text and usage
@@ -24,14 +24,14 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use loopctl::observer::{LoopObserver, SessionStartContext};
+//! use loopctl::observer::{LoopObserver, RunStartContext};
 //!
 //! struct MetricsObserver;
 //!
 //! impl LoopObserver for MetricsObserver {
 //!     fn name(&self) -> &str { "metrics" }
 //!
-//!     fn on_session_start(&self, ctx: &SessionStartContext) {
+//!     fn on_run_start(&self, ctx: &RunStartContext) {
 //!         println!("session {} started", ctx.session_id);
 //!     }
 //! }
@@ -43,7 +43,7 @@ pub mod context;
 
 pub use context::{
     CompactedContext, ConvergenceDetectedContext, FallbackContext, LoopDetectedContext,
-    ModelSwitchedContext, ResponseContext, SessionEndContext, SessionStartContext, StreamContext,
+    ModelSwitchedContext, ResponseContext, RunEndContext, RunStartContext, StreamContext,
     StreamFailureContext, TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext,
     ToolPostContext, ToolPreContext, TurnEndContext, TurnStartContext,
 };
@@ -63,16 +63,18 @@ pub trait LoopObserver: Send + Sync {
     /// produced a side-effect.
     fn name(&self) -> &str;
 
-    /// Called when an agent session begins.
+    /// Called when a run begins.
     ///
-    /// Fired once per session, before the first turn starts.
-    fn on_session_start(&self, _ctx: &SessionStartContext) {}
+    /// Fired at the start of each `run()` call, before the first turn of
+    /// that run. A session may contain many runs.
+    fn on_run_start(&self, _ctx: &RunStartContext) {}
 
-    /// Called when an agent session ends.
+    /// Called when a run ends.
     ///
-    /// Fired after the last turn completes or when a fatal error stops the loop.
-    /// Check [`SessionEndContext::success`] to distinguish normal exit from failure.
-    fn on_session_end(&self, _ctx: &SessionEndContext) {}
+    /// Fired after the run completes — whether normally, by error, or by
+    /// cancellation. Check [`RunEndContext::success`] to distinguish normal
+    /// exit from failure.
+    fn on_run_end(&self, _ctx: &RunEndContext) {}
 
     /// Called at the start of processing a turn.
     ///
@@ -238,8 +240,9 @@ pub trait LoopObserver: Send + Sync {
 
     /// Reset observer state for a new session.
     ///
-    /// Called before [`on_session_start`](Self::on_session_start) to allow
-    /// observers to clear per-session accumulators.
+    /// Called once per session (on the first `run()`), before
+    /// [`on_run_start`](Self::on_run_start), to allow observers to clear
+    /// per-session accumulators.
     fn reset(&self) {}
 }
 
@@ -323,23 +326,23 @@ impl ObserverHost {
         self.dispatch(|obs| obs.reset());
     }
 
-    /// Dispatch [`LoopObserver::on_session_start`] to all observers.
+    /// Dispatch [`LoopObserver::on_run_start`] to all observers.
     ///
-    /// Fired once per session, before the first turn begins. Iterates
-    /// registered observers in registration order; use it to initialize
-    /// per-session observer state.
-    pub fn on_session_start(&self, ctx: &SessionStartContext) {
-        self.dispatch(|obs| obs.on_session_start(ctx));
+    /// Fired at the start of each `run()` call, before the first turn
+    /// begins. Iterates registered observers in registration order; use it
+    /// to initialize per-run observer state.
+    pub fn on_run_start(&self, ctx: &RunStartContext) {
+        self.dispatch(|obs| obs.on_run_start(ctx));
     }
 
-    /// Dispatch [`LoopObserver::on_session_end`] to all observers.
+    /// Dispatch [`LoopObserver::on_run_end`] to all observers.
     ///
-    /// Fired once per session, after the loop has terminated. Iterates
-    /// registered observers in registration order; check
-    /// [`SessionEndContext::success`] in each observer to distinguish a
+    /// Fired at the end of each `run()` call, after the loop has
+    /// terminated. Iterates registered observers in registration order;
+    /// check [`RunEndContext::success`] in each observer to distinguish a
     /// normal exit from a failure.
-    pub fn on_session_end(&self, ctx: &SessionEndContext) {
-        self.dispatch(|obs| obs.on_session_end(ctx));
+    pub fn on_run_end(&self, ctx: &RunEndContext) {
+        self.dispatch(|obs| obs.on_run_end(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_turn_start`] to all observers.

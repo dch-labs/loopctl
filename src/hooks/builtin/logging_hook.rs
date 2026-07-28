@@ -68,8 +68,8 @@ impl Hook for LoggingHook {
 mod tests {
     use super::*;
     use crate::hooks::context::{
-        CompactTrigger, PostCompactContext, PostToolUseContext, SessionEndContext,
-        SessionEndReason, SessionStartContext,
+        CompactTrigger, PostCompactContext, PostToolUseContext, RunEndContext, RunEndReason,
+        RunStartContext,
     };
     use serde_json::json;
 
@@ -129,26 +129,26 @@ mod tests {
     }
 
     #[test]
-    fn logging_hook_session_start_no_panic() {
+    fn logging_hook_run_start_no_panic() {
         let hook = LoggingHook;
-        let ctx = SessionStartContext {
+        let ctx = RunStartContext {
             session_id: uuid::Uuid::nil(),
             model: "test".to_string(),
             working_directory: "/tmp".to_string(),
         };
-        hook.on_session_start(&ctx);
+        hook.on_run_start(&ctx);
     }
 
     #[test]
-    fn logging_hook_session_end_no_panic() {
+    fn logging_hook_run_end_no_panic() {
         let hook = LoggingHook;
-        let ctx = SessionEndContext {
+        let ctx = RunEndContext {
             session_id: uuid::Uuid::nil(),
-            reason: SessionEndReason::Complete,
+            reason: RunEndReason::Complete,
             total_turns: 5,
             total_tokens: 1000,
             duration_secs: 30,
         };
-        hook.on_session_end(&ctx);
+        hook.on_run_end(&ctx);
     }
 }

@@ -760,11 +760,6 @@ struct StreamEmitter {
     /// Whether a tool-call part is currently open.
     ///
     /// Each `functionCall` part emits a [`PartStart`]. Without tracking,
-    /// [`extract_finish_reason`](Self::extract_finish_reason) would never
-    /// close tool parts, leaving the downstream accumulator with unbalanced
-    /// `PartStart`/`PartStop` events.
-    tool_part_open: bool,
-
     /// Next tool-call index for multiple function calls in one response.
     ///
     /// Gemini can emit several `functionCall` parts in a single chunk.
@@ -950,7 +945,6 @@ impl StreamEmitter {
 
             let idx = self.next_tool_index;
             self.next_tool_index = self.next_tool_index.saturating_add(1);
-            self.tool_part_open = true;
 
             self.push(StreamEvent::PartStart(PartStart {
                 index: idx,
@@ -967,7 +961,6 @@ impl StreamEmitter {
                 },
             }));
             self.push(StreamEvent::PartStop);
-            self.tool_part_open = false;
         }
     }
 
@@ -1000,11 +993,6 @@ impl StreamEmitter {
             self.push(StreamEvent::PartStop);
         }
 
-        if self.tool_part_open {
-            self.tool_part_open = false;
-            self.push(StreamEvent::PartStop);
-        }
-
         if self.text_part_open {
             self.text_part_open = false;
             self.push(StreamEvent::PartStop);
@@ -1019,12 +1007,17 @@ impl StreamEmitter {
                 .get("candidatesTokenCount")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            if input == 0 && output == 0 {
+            let thoughts = u
+                .get("thoughtsTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let total_output = output.saturating_add(thoughts);
+            if input == 0 && total_output == 0 {
                 None
             } else {
                 Some(Usage::new(
                     u32::try_from(input).unwrap_or(0),
-                    u32::try_from(output).unwrap_or(0),
+                    u32::try_from(total_output).unwrap_or(0),
                 ))
             }
         });

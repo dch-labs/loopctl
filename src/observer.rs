@@ -289,9 +289,14 @@ impl ObserverHost {
         for obs in &self.observers {
             let obs: &dyn LoopObserver = obs.as_ref();
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| f(obs))) {
+                let msg = payload
+                    .downcast_ref::<&'static str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
                 tracing::error!(
                     observer = obs.name(),
-                    payload_downcast = payload.is::<&str>(),
+                    panic_message = %msg,
                     "observer panicked; continuing with remaining observers"
                 );
             }

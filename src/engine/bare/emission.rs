@@ -4,7 +4,7 @@
 //! ends. Other observer events (`on_turn_start`, `on_response`, etc.) are fired
 //! directly at their call sites in the driver loop.
 
-use super::{ApiClient, BareLoop, Duration, Run};
+use super::{ApiClient, BareLoop, Duration, LoopError, Run};
 #[cfg(feature = "hooks")]
 use crate::capabilities::Hookable;
 #[cfg(feature = "hooks")]
@@ -36,18 +36,19 @@ impl<C: ApiClient> BareLoop<C> {
     /// per-run totals (turn count, tokens); `success` distinguishes a
     /// normal exit from a failure so observers and hooks can branch on
     /// the outcome, and `duration` is the wall-clock run length.
-    pub(super) fn notify_run_end(&self, result: &Run, success: bool, duration: Duration) {
+    pub(super) fn notify_run_end(
+        &self,
+        result: &Run,
+        duration: Duration,
+        error: Option<&LoopError>,
+    ) {
+        self.notify_run_end_hook(result, error, duration);
         self.managers.observers().on_run_end(&RunEndContext {
-            success,
-            error: if success {
-                None
-            } else {
-                Some("run failed".to_string())
-            },
+            success: error.is_none(),
+            error: error.map_or_else(|| None, |e| Some(e.to_string())),
             total_turns: result.turn_count(),
             duration_ms: Self::millis_u64(duration),
         });
-        self.notify_run_end_hook(result, success, duration);
     }
 
     /// Derive the structured [`RunEndReason`] from the loop's
@@ -59,11 +60,15 @@ impl<C: ApiClient> BareLoop<C> {
     /// normal completion. Used only to populate the hook end-context —
     /// observers receive the simpler boolean `success` field.
     #[cfg(feature = "hooks")]
-    fn run_end_reason(&self, success: bool) -> RunEndReason {
+    fn run_end_reason(&self, error: Option<&LoopError>) -> RunEndReason {
         if self.is_cancelled() {
             RunEndReason::Cancelled
-        } else if !success {
-            RunEndReason::Error
+        } else if let Some(e) = error {
+            if matches!(e, LoopError::ContextExceeded { .. }) {
+                RunEndReason::ContextOverflow
+            } else {
+                RunEndReason::Error
+            }
         } else if self.current_run().map_or(0, Run::turn_count) >= self.run_config().max_turns {
             RunEndReason::MaxTurns
         } else {
@@ -111,11 +116,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// every registered run-end hook. No-op when no hook executor
     /// is set.
     #[cfg(feature = "hooks")]
-    fn notify_run_end_hook(&self, result: &Run, success: bool, duration: Duration) {
+    fn notify_run_end_hook(&self, result: &Run, error: Option<&LoopError>, duration: Duration) {
         let Some(executor) = self.managers.hook_executor() else {
             return;
         };
-        let reason = self.run_end_reason(success);
+        let reason = self.run_end_reason(error);
         let ctx = HookRunEndContext {
             session_id: self.session.id,
             reason,
@@ -132,7 +137,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`notify_run_end`](Self::notify_run_end) compiles
     /// identically with and without the feature.
     #[cfg(not(feature = "hooks"))]
-    fn notify_run_end_hook(&self, _result: &Run, _success: bool, _duration: Duration) {}
+    fn notify_run_end_hook(&self, _result: &Run, _error: Option<&LoopError>, _duration: Duration) {}
 
     /// Convert a [`Duration`] to milliseconds as a `u64`.
     ///

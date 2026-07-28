@@ -685,7 +685,7 @@ pub trait Loop: Send + Sync {
     /// and produce a final [`Run`].
     fn finalize<'a>(
         &'a mut self,
-        success: bool,
+        error: Option<&'a LoopError>,
     ) -> Pin<Box<dyn Future<Output = RunResult> + Send + 'a>>;
 
     /// Get the current state of the agent.

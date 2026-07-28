@@ -674,30 +674,40 @@ mod tests {
         assert_eq!(opts.response_format.as_ref().unwrap().name, "action");
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_plain_json() {
         let v = parse_json_lenient(r#"{"a": 1}"#).unwrap();
         assert_eq!(v["a"], 1);
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_with_prefix() {
         let v = parse_json_lenient(r#"Here is the JSON: {"a": 1}"#).unwrap();
         assert_eq!(v["a"], 1);
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_markdown_fences() {
         let v = parse_json_lenient("```json\n{\"a\": 1}\n```").unwrap();
         assert_eq!(v["a"], 1);
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_array() {
         let v = parse_json_lenient(r#"prefix [1, 2, 3] suffix"#).unwrap();
         assert_eq!(v[0], 1);
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_no_json() {
         let result = parse_json_lenient("just prose, nothing here");
@@ -711,30 +721,40 @@ mod tests {
         assert!(err.to_string().contains("schema"));
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_brace_inside_string() {
         let v = parse_json_lenient(r#"prefix {"a": "}"} suffix"#).unwrap();
         assert_eq!(v["a"], "}");
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_bracket_inside_string() {
         let v = parse_json_lenient(r#"before {"x": "]"} after"#).unwrap();
         assert_eq!(v["x"], "]");
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_escaped_quote_in_string() {
         let v = parse_json_lenient(r#"here {"a": "he said \"hi\""} there"#).unwrap();
         assert_eq!(v["a"], "he said \"hi\"");
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_nested_objects_in_prose() {
         let v = parse_json_lenient(r#"result: {"outer": {"inner": 42}}"#).unwrap();
         assert_eq!(v["outer"]["inner"], 42);
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_mismatched_delimiter_then_valid() {
         let v = parse_json_lenient(r#"{oops] then {"a":1}"#).unwrap();
@@ -949,6 +969,18 @@ mod tests {
         assert!(matches!(cloned.tool_constraint, ToolConstraint::Strict));
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_sets_additional_properties_false() {
         let schema = serde_json::json!({
@@ -959,6 +991,18 @@ mod tests {
         assert_eq!(tightened["additionalProperties"], false);
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_enumerates_required() {
         let schema = serde_json::json!({
@@ -976,6 +1020,18 @@ mod tests {
         assert!(keys.contains(&"b"));
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_recurses_into_nested_objects() {
         let schema = serde_json::json!({
@@ -999,6 +1055,18 @@ mod tests {
         assert_eq!(inner_required[0], "x");
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_preserves_non_object_schemas() {
         let schema = serde_json::json!({"type": "string"});
@@ -1009,6 +1077,18 @@ mod tests {
         assert!(tightened.get("required").is_none());
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_idempotent_on_already_strict() {
         let schema = serde_json::json!({
@@ -1022,6 +1102,18 @@ mod tests {
         assert_eq!(once, twice);
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_object_without_properties() {
         let schema = serde_json::json!({"type": "object"});
@@ -1031,6 +1123,18 @@ mod tests {
         assert_eq!(tightened["required"].as_array().unwrap().len(), 0);
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_recurses_into_local_defs() {
         // A property that $refs a local definition: the reference itself
@@ -1071,6 +1175,18 @@ mod tests {
         assert_eq!(tightened["properties"]["filter"]["$ref"], "#/$defs/Filter");
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_recurses_into_legacy_definitions() {
         // The Draft 07 keyword `definitions` should be walked the same way

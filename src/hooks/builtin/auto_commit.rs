@@ -497,7 +497,7 @@ pub struct AutoCommitConfig {
 
     /// Tools that trigger file tracking (e.g., `"Write"`, `"Edit"`).
     ///
-    /// Tool names whose output should be watched for a `file_path`; when one
+    /// Tool names whose `input` is read for a `file_path`; when one
     /// of these tools runs, the touched file is recorded and staged at
     /// run end.
     pub commit_on_tools: Vec<String>,
@@ -586,8 +586,9 @@ impl AutoCommitConfigBuilder {
 
     /// Set the explicit file allow-list to stage before commit.
     ///
-    /// Mirrors [`AutoCommitConfig::files`]; an empty vector stages every
-    /// change in the working tree.
+    /// Mirrors [`AutoCommitConfig::files`]; an empty vector is rejected by
+    /// [`stage_files`](GitExecutor::stage_files) to avoid sweeping up
+    /// unrelated or secret files.
     #[must_use]
     pub fn with_files(mut self, files: Vec<String>) -> Self {
         self.config.files = files;

@@ -28,14 +28,14 @@ impl<C: ApiClient> BareLoop<C> {
         self.notify_run_start_hook();
     }
 
-    /// Notify all observers and hooks that a run has ended.
+    /// Notify hooks and observers that a run has ended.
     ///
-    /// Fires [`on_run_end`](crate::observer::LoopObserver::on_run_end)
-    /// on every registered observer, then fires the `on_run_end` hook
-    /// (when the `hooks` feature is enabled). The [`Run`] supplies the
-    /// per-run totals (turn count, tokens); `success` distinguishes a
-    /// normal exit from a failure so observers and hooks can branch on
-    /// the outcome, and `duration` is the wall-clock run length.
+    /// Fires `on_run_end` hooks first (when the `hooks` feature is
+    /// enabled), then fires
+    /// [`on_run_end`](crate::observer::LoopObserver::on_run_end) on
+    /// every registered observer. The [`Run`] supplies per-run totals;
+    /// `error` carries the terminal [`LoopError`] when the run failed,
+    /// or `None` on success; `duration` is the wall-clock run length.
     pub(super) fn notify_run_end(
         &self,
         result: &Run,
@@ -51,14 +51,15 @@ impl<C: ApiClient> BareLoop<C> {
         });
     }
 
-    /// Derive the structured [`RunEndReason`] from the loop's
-    /// terminal state.
+    /// Derive the structured [`RunEndReason`] from the terminal error.
     ///
-    /// Maps the boolean `success` plus the cancellation flag and the
-    /// turn cap into the richer hook-level enum: cancellation wins over
-    /// every other outcome, then failure, then the turn cap, finally
-    /// normal completion. Used only to populate the hook end-context —
-    /// observers receive the simpler boolean `success` field.
+    /// Cancellation takes precedence over every other outcome. Then:
+    /// [`LoopError::ContextExceeded`] maps to
+    /// [`ContextOverflow`](RunEndReason::ContextOverflow), any other
+    /// error maps to [`Error`](RunEndReason::Error). When `error` is
+    /// `None`, reaching `max_turns` maps to
+    /// [`MaxTurns`](RunEndReason::MaxTurns), otherwise the run
+    /// completed normally ([`Complete`](RunEndReason::Complete)).
     #[cfg(feature = "hooks")]
     fn run_end_reason(&self, error: Option<&LoopError>) -> RunEndReason {
         if self.is_cancelled() {

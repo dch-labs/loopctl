@@ -28,16 +28,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use loopctl::api::ApiClient;
-use loopctl::config::LoopConfig;
+use loopctl::config::SessionConfig;
 use loopctl::engine::BareLoop;
-use loopctl::engine::loop_core::Loop;
+use loopctl::engine::RunConfig;
+use loopctl::engine::core::Loop;
 use loopctl::observer::{LoopObserver, ToolPostContext, ToolPreContext};
 use loopctl::tool::{FnTool, ToolContext, ToolOutput, ToolRegistry};
 use serde_json::json;
-
-// ==================================================
-// Type alias for tool function signatures
-// ==================================================
 
 /// Shorthand for the boxed-future signature required by [`FnTool`].
 type ToolFuture = std::pin::Pin<
@@ -47,10 +44,6 @@ type ToolFuture = std::pin::Pin<
             + 'static,
     >,
 >;
-
-// ==================================================
-// Observer
-// ==================================================
 
 /// A simple observer that prints tool calls and responses to stderr.
 struct PrintingObserver;
@@ -74,10 +67,6 @@ impl LoopObserver for PrintingObserver {
     }
 }
 
-// ==================================================
-// Usage
-// ==================================================
-
 fn print_usage_and_exit() -> ! {
     eprintln!("No provider configured.\n");
     eprintln!("Set one of:");
@@ -95,10 +84,6 @@ fn print_usage_and_exit() -> ! {
     );
     std::process::exit(1);
 }
-
-// ==================================================
-// Tool functions
-// ==================================================
 
 fn echo_fn(input: serde_json::Value, _ctx: &ToolContext) -> ToolFuture {
     Box::pin(async move {
@@ -179,11 +164,6 @@ fn build_tools() -> ToolRegistry {
 
     tools
 }
-
-// ==================================================
-// Minimal arithmetic expression evaluator
-// (recursive descent: + - * / and parentheses)
-// ==================================================
 
 #[derive(Debug, Clone)]
 enum Token {
@@ -342,17 +322,14 @@ fn parse_factor(tokens: &[Token], pos: &mut usize) -> Result<f64, String> {
     }
 }
 
-// ==================================================
-// REPL
-// ==================================================
-
 #[allow(dead_code)]
 async fn run_repl<C: ApiClient>(client: Arc<C>) {
     eprintln!("Connected to: {}\n", client.model());
     println!("Type a message and press Enter. Type 'quit' to exit.\n");
 
     // Create the agent once — conversation history persists across inputs.
-    let config = LoopConfig::default().with_max_turns(10);
+    let config = SessionConfig::default();
+    let run_config = RunConfig::default().with_max_turns(10);
     let mut agent = BareLoop::new(client, build_tools(), config);
     agent.register_observer(Arc::new(PrintingObserver));
 
@@ -377,8 +354,6 @@ async fn run_repl<C: ApiClient>(client: Arc<C>) {
     });
 
     let stdin = io::stdin();
-    let mut total_input: u64 = 0;
-    let mut total_output: u64 = 0;
 
     loop {
         print!("> ");
@@ -397,25 +372,19 @@ async fn run_repl<C: ApiClient>(client: Arc<C>) {
             break;
         }
 
-        match agent.run(input).await {
+        match agent.run(input, &run_config).await {
             Ok(result) => {
-                total_input += result.input_tokens;
-                total_output += result.output_tokens;
                 // Text was already streamed live. Just print stats.
-                if result
-                    .final_output
-                    .as_deref()
-                    .map_or(true, |s| s.is_empty())
-                {
+                if result.output.as_deref().map_or(true, |s| s.is_empty()) {
                     println!("  (empty response)");
                 }
                 println!(
                     "\n\n  (turns: {}, tokens: {}+{} | total: {}+{})\n",
-                    result.total_turns,
-                    result.input_tokens,
-                    result.output_tokens,
-                    total_input,
-                    total_output
+                    result.turn_count(),
+                    result.input_tokens(),
+                    result.output_tokens(),
+                    agent.session().total_input_tokens(),
+                    agent.session().total_output_tokens(),
                 );
             }
             Err(e) => {
@@ -428,14 +397,6 @@ async fn run_repl<C: ApiClient>(client: Arc<C>) {
         }
     }
 }
-
-// ==================================================
-// Provider detection & main
-//
-// Each provider produces a different concrete type, so we can't unify
-// them into a single return. Instead, the `try_provider!` macro wraps
-// the repeated "check env → build-or-die → run_repl → return" pattern.
-// ==================================================
 
 /// Build a client from the given expression, or print the error and exit.
 macro_rules! build_or_die {

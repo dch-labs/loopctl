@@ -8,7 +8,8 @@
 //! of the small-model machinery installed.
 //!
 //! Apply a profile with [`ConstrainedProfile::apply`] (pipeline + contributor)
-//! or compose the individual pieces ([`ConstrainedProfile::loop_config`],
+//! or compose the individual pieces ([`ConstrainedProfile::session_config`],
+//! [`ConstrainedProfile::run_config`],
 //! [`ConstrainedProfile::pipeline_builder`],
 //! [`ConstrainedProfile::request_options`]) by hand.
 //!
@@ -21,14 +22,15 @@
 //! use std::sync::Arc;
 //!
 //! // `client` is any ApiClient impl; `registry` is your tool set.
-//! let mut agent = BareLoop::new(client, registry, ConstrainedProfile::loop_config());
+//! let mut agent = BareLoop::new(client, registry, ConstrainedProfile::session_config());
 //! agent.set_request_options(ConstrainedProfile::request_options());
 //! ConstrainedProfile::apply(&mut agent).unwrap();
 //! ```
 
 use std::sync::Arc;
 
-use crate::config::LoopConfig;
+use crate::config::SessionConfig;
+use crate::engine::RunConfig;
 use crate::engine::{BareLoop, ContextContributor, ContributorContext};
 use crate::error::LoopError;
 use crate::message::{Message, MessagePart, Role};
@@ -48,10 +50,6 @@ const GOAL_REMINDER_EVERY_N_TURNS: usize = 5;
 const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit"];
 /// Default memoized tool names the preset wires into its middleware. Advisory.
 const MEMOIZED_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
-
-// ===================================================
-// ConstrainedProfile
-// ===================================================
 
 /// The small-model-tuned runtime profile.
 ///
@@ -76,20 +74,32 @@ const MEMOIZED_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
 pub struct ConstrainedProfile;
 
 impl ConstrainedProfile {
-    /// A [`LoopConfig`] tuned for a small model.
+    /// A [`SessionConfig`] tuned for a small model.
     ///
-    /// Sets a smaller context window and fewer max turns than the v0.1.0
-    /// defaults — small models degrade faster as context fills, so the
-    /// budget is tighter. Compaction threshold is unchanged (tightness comes
-    /// from the window, not from compacting earlier).
+    /// Sets a smaller context window than the default — small models degrade
+    /// faster as context fills, so the window is tightened. Compaction
+    /// threshold is unchanged (tightness comes from the window, not from
+    /// compacting earlier).
     ///
-    /// Values: `context_window = 120_000`, `max_turns = 100`,
-    /// `max_tokens = 16_384`, `compact_threshold = 0.80`, `auto_compact = true`.
+    /// Value: `context_window = 32_768`.
     #[must_use]
-    pub fn loop_config() -> LoopConfig {
-        LoopConfig::default()
-            .with_context_window(120_000)
-            .with_max_turns(100)
+    pub fn session_config() -> SessionConfig {
+        SessionConfig::default().with_context_window(32_768)
+    }
+
+    /// A [`RunConfig`] tuned for a small model.
+    ///
+    /// Fewer max turns than the default, since small models are more prone to
+    /// non-converging tool loops. All other run-scoped knobs stay at their
+    /// defaults.
+    ///
+    /// Value: `max_turns = 100`.
+    #[must_use]
+    pub fn run_config() -> RunConfig {
+        RunConfig {
+            max_turns: 100,
+            ..RunConfig::default()
+        }
     }
 
     /// A [`ToolPipeline`] builder pre-loaded with the small-model middleware stack.
@@ -148,7 +158,7 @@ impl ConstrainedProfile {
     /// use std::sync::Arc;
     ///
     /// // `client` is any ApiClient impl.
-    /// let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), ConstrainedProfile::loop_config());
+    /// let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), ConstrainedProfile::session_config());
     /// ConstrainedProfile::apply(&mut agent).unwrap();
     /// ```
     pub fn apply<C: crate::api::ApiClient>(loop_: &mut BareLoop<C>) -> Result<(), LoopError> {
@@ -158,28 +168,33 @@ impl ConstrainedProfile {
     }
 }
 
-// ===================================================
-// FrontierProfile
-// ===================================================
-
 /// The frontier-opt-out profile.
 ///
-/// Produces default [`LoopConfig`], no small-model
+/// Produces default session/run configuration, no small-model
 /// middleware, no tool-call constraint. Named (rather than just "don't use
 /// [`ConstrainedProfile`]") so the opt-out is explicit and discoverable.
 pub struct FrontierProfile;
 
 impl FrontierProfile {
-    /// A default [`LoopConfig`] — no small-model tightening.
+    /// A default [`SessionConfig`] — no small-model tightening.
     ///
-    /// Literally [`LoopConfig::default`]: the full v0.1.0 context budget
-    /// (200k window, 200 turns), default compaction threshold, no tightening.
-    /// The opt-out counterpart to
-    /// [`ConstrainedProfile::loop_config`](ConstrainedProfile::loop_config);
+    /// Literally [`SessionConfig::default`]: the full context budget
+    /// (200k window). The opt-out counterpart to
+    /// [`ConstrainedProfile::session_config`](ConstrainedProfile::session_config);
     /// the two are swap-in replacements at the call site.
     #[must_use]
-    pub fn loop_config() -> LoopConfig {
-        LoopConfig::default()
+    pub fn session_config() -> SessionConfig {
+        SessionConfig::default()
+    }
+
+    /// A default [`RunConfig`] — no small-model tightening.
+    ///
+    /// Literally [`RunConfig::default`]: the full turn/token budget
+    /// (200 turns). The opt-out counterpart to
+    /// [`ConstrainedProfile::run_config`](ConstrainedProfile::run_config).
+    #[must_use]
+    pub fn run_config() -> RunConfig {
+        RunConfig::default()
     }
 
     /// An empty middleware pipeline — no small-model middleware installed.
@@ -205,10 +220,6 @@ impl FrontierProfile {
         RequestOptions::default()
     }
 }
-
-// ===================================================
-// GoalReminder
-// ===================================================
 
 /// A [`ContextContributor`] that re-injects the first user message as a
 /// [`Role::System`] reminder every `n` turns.
@@ -283,13 +294,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_constrained_loop_config_values() {
-        let cfg = ConstrainedProfile::loop_config();
-        assert_eq!(cfg.context_window, 120_000);
-        assert_eq!(cfg.max_turns, 100);
-        assert_eq!(cfg.max_tokens, 16_384);
-        assert_eq!(cfg.compact_threshold, 0.80);
-        assert!(cfg.auto_compact);
+    fn test_constrained_config_values() {
+        let session = ConstrainedProfile::session_config();
+        assert_eq!(session.context_window, 32_768);
+
+        let run = ConstrainedProfile::run_config();
+        assert_eq!(run.max_turns, 100);
     }
 
     #[test]
@@ -300,14 +310,16 @@ mod tests {
     }
 
     #[test]
-    fn test_frontier_loop_config_matches_default() {
-        let preset = FrontierProfile::loop_config();
-        let default = LoopConfig::default();
-        assert_eq!(preset.context_window, default.context_window);
-        assert_eq!(preset.max_turns, default.max_turns);
-        assert_eq!(preset.max_tokens, default.max_tokens);
-        assert_eq!(preset.compact_threshold, default.compact_threshold);
-        assert_eq!(preset.auto_compact, default.auto_compact);
+    fn test_frontier_config_matches_default() {
+        let session = FrontierProfile::session_config();
+        assert_eq!(
+            session.context_window,
+            SessionConfig::default().context_window
+        );
+
+        let run = FrontierProfile::run_config();
+        let default = RunConfig::default();
+        assert_eq!(run.max_turns, default.max_turns);
     }
 
     #[test]

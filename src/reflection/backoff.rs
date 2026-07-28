@@ -18,10 +18,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-// ===================================================
-// ExponentialBackoffRecovery
-// ===================================================
-
 /// A recovery strategy that retries with exponential backoff.
 ///
 /// When a tool call fails with a recoverable error, this strategy
@@ -48,10 +44,28 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct ExponentialBackoffRecovery {
     /// Maximum number of retry attempts before giving up.
+    ///
+    /// Counts only retries issued by this strategy; the framework's own
+    /// `max_attempts` budget is honoured separately and whichever ceiling
+    /// is reached first wins. Exposed via
+    /// [`max_retries`](Self::max_retries).
     max_retries: u32,
-    /// Initial delay applied to the first retry, doubled on each subsequent attempt.
+
+    /// Initial delay applied to the first retry, doubled on each
+    /// subsequent attempt.
+    ///
+    /// The delay for attempt `n` is `base_delay * 2^n` (computed in
+    /// [`delay_for_attempt`](Self::delay_for_attempt)). Exposed via
+    /// [`base_delay`](Self::base_delay).
     base_delay: Duration,
-    /// Upper bound on the computed delay, regardless of exponential growth.
+
+    /// Upper bound on the computed delay, regardless of exponential
+    /// growth.
+    ///
+    /// Once `base_delay * 2^n` would exceed this value, every subsequent
+    /// attempt returns `max_delay` instead, preventing unbounded wait
+    /// times on long retry chains. Exposed via
+    /// [`max_delay`](Self::max_delay).
     max_delay: Duration,
 }
 
@@ -70,35 +84,50 @@ impl ExponentialBackoffRecovery {
 
     /// Set a custom base delay for the exponential backoff.
     ///
-    /// The delay for attempt `n` is `base_delay * 2^n`, capped at `max_delay`.
+    /// Builder-style override of the default 100 ms base. The delay for
+    /// attempt `n` is `base_delay * 2^n`, capped at `max_delay`; raising
+    /// the base scales every subsequent attempt proportionally.
     #[must_use]
     pub fn with_base_delay(mut self, delay: Duration) -> Self {
         self.base_delay = delay;
         self
     }
 
-    /// Set a maximum delay cap.
+    /// Set the maximum delay cap.
     ///
-    /// Even as the exponential grows, the delay never exceeds this value.
+    /// Builder-style override of the default 30 s cap. Even as the
+    /// exponential grows, the computed delay never exceeds this value,
+    /// bounding the worst-case wait between retries.
     #[must_use]
     pub fn with_max_delay(mut self, delay: Duration) -> Self {
         self.max_delay = delay;
         self
     }
 
-    /// Maximum retry attempts before giving up.
+    /// Maximum retry attempts before giving up, as configured at
+    /// construction.
+    ///
+    /// Note the framework's own `max_attempts` budget is honoured
+    /// separately; whichever ceiling is reached first terminates the
+    /// retry loop.
     #[must_use]
     pub fn max_retries(&self) -> u32 {
         self.max_retries
     }
 
-    /// Base delay for exponential backoff calculation.
+    /// Base delay used as the multiplier in the exponential backoff.
+    ///
+    /// The first retry (attempt 0) waits exactly this long; each later
+    /// retry doubles it until `max_delay` is reached.
     #[must_use]
     pub fn base_delay(&self) -> Duration {
         self.base_delay
     }
 
-    /// Maximum delay cap.
+    /// Maximum delay cap that the exponential growth will not exceed.
+    ///
+    /// Once `base_delay * 2^n` surpasses this value, every subsequent
+    /// retry waits exactly `max_delay`.
     #[must_use]
     pub fn max_delay(&self) -> Duration {
         self.max_delay

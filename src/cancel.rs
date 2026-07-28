@@ -21,6 +21,8 @@
 //! }
 //! ```
 
+use std::sync::Mutex;
+
 use tokio_util::sync::CancellationToken;
 
 /// Shared cancellation signal backed by a
@@ -28,9 +30,18 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Wrap in `Arc` for sharing across tasks or threads. Create with
 /// [`CancelSignal::new`], cancel with [`CancelSignal::cancel`], and await
-/// instant notification with [`CancelSignal::notified`].
+/// instant notification with [`CancelSignal::notified`]. Re-arm between
+/// runs with [`CancelSignal::reset`](Self::reset).
+///
+/// The underlying token is intentionally one-shot — that is what makes it
+/// race-free — so [`reset`](Self::reset) swaps in a fresh token rather
+/// than trying to revive a fired one. Because every clone of an
+/// `Arc<CancelSignal>` derefs through this same struct, all existing
+/// handles observe the new token after a reset; a caller holding
+/// [`cancel_signal`](crate::engine::BareLoop::cancel_signal) across runs
+/// keeps working.
 pub struct CancelSignal {
-    inner: CancellationToken,
+    inner: Mutex<CancellationToken>,
 }
 
 impl CancelSignal {
@@ -42,7 +53,7 @@ impl CancelSignal {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: CancellationToken::new(),
+            inner: Mutex::new(CancellationToken::new()),
         }
     }
 
@@ -52,17 +63,25 @@ impl CancelSignal {
     /// awaiting [`Self::notified`]. Idempotent — calling multiple times is
     /// safe.
     pub fn cancel(&self) {
-        self.inner.cancel();
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel();
     }
 
-    /// Check whether the signal has been cancelled.
+    /// Check whether the signal has been cancelled since the last
+    /// [`reset`](Self::reset).
     ///
-    /// Performs a non-blocking check of the internal [`CancellationToken`].
-    /// Returns `true` if [`cancel`](Self::cancel) has been called since
-    /// construction.
+    /// Performs a non-blocking check of the current
+    /// [`CancellationToken`]. Returns `true` if
+    /// [`cancel`](Self::cancel) has been called and no `reset` has
+    /// followed it.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.inner.is_cancelled()
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_cancelled()
     }
 
     /// Return a future that completes **instantly** when [`Self::cancel`]
@@ -72,7 +91,10 @@ impl CancelSignal {
     /// immediately on the first `.await`.
     ///
     /// This delegates to [`CancellationToken::cancelled`], which is
-    /// race-free by construction — no flag-then-wait loop required.
+    /// race-free by construction — no flag-then-wait loop required. The
+    /// lock is held only long enough to clone the token out, so awaiting
+    /// the returned future never blocks another caller from cancelling
+    /// or resetting.
     ///
     /// Use inside `tokio::select!` alongside the actual work future:
     ///
@@ -83,7 +105,33 @@ impl CancelSignal {
     /// }
     /// ```
     pub async fn notified(&self) {
-        self.inner.cancelled().await;
+        let token = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        token.cancelled().await;
+    }
+
+    /// Re-arm the signal for a fresh run.
+    ///
+    /// Replaces the internal token with a brand-new, non-cancelled one.
+    /// Required at the start of each run because the underlying
+    /// [`CancellationToken`] is one-shot by design — once fired it stays
+    /// fired, so without a reset a single cancellation would make every
+    /// subsequent run return immediately as cancelled.
+    ///
+    /// All clones of an `Arc<CancelSignal>` observe the new token,
+    /// because they deref through this same struct; a handle returned by
+    /// [`cancel_signal`](crate::engine::BareLoop::cancel_signal) keeps
+    /// working across runs. A task already awaiting
+    /// [`notified`](Self::notified) on the previous token is unaffected —
+    /// its awaited run was cancelled, and it resolves against that token.
+    pub fn reset(&self) {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = CancellationToken::new();
     }
 }
 
@@ -159,5 +207,56 @@ mod tests {
         for handle in handles {
             assert!(handle.await.unwrap());
         }
+    }
+
+    #[test]
+    fn test_reset_clears_cancelled_state() {
+        let signal = CancelSignal::new();
+        signal.cancel();
+        assert!(signal.is_cancelled());
+
+        signal.reset();
+        assert!(
+            !signal.is_cancelled(),
+            "reset must re-arm the signal to non-cancelled"
+        );
+    }
+
+    #[test]
+    fn test_reset_is_visible_through_existing_arc_clone() {
+        let signal = Arc::new(CancelSignal::new());
+        let handle = Arc::clone(&signal);
+
+        signal.cancel();
+        assert!(handle.is_cancelled());
+
+        signal.reset();
+        assert!(!handle.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_notified_after_reset_waits_for_new_cancel() {
+        let signal = Arc::new(CancelSignal::new());
+        signal.cancel();
+        signal.reset();
+
+        let handle = {
+            let s = Arc::clone(&signal);
+            tokio::spawn(async move {
+                s.notified().await;
+                "woke"
+            })
+        };
+
+        tokio::task::yield_now().await;
+        let mut pending = tokio::time::interval(std::time::Duration::from_millis(5));
+        pending.tick().await;
+        assert!(
+            !handle.is_finished(),
+            "notified must not fire after reset until a new cancel arrives"
+        );
+
+        signal.cancel();
+        assert_eq!(handle.await.unwrap(), "woke");
     }
 }

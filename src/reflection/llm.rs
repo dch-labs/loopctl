@@ -237,28 +237,26 @@ fn validate_modified_input(
         return Ok(());
     }
 
-    let Some(correction) = &analysis.correction else {
-        return Ok(());
-    };
-    let Some(modified_input) = &correction.modified_input else {
-        return Ok(());
-    };
-    let Some(schema) = tool_schema else {
-        // No schema available — the engine couldn't resolve the tool.
-        // Skip validation rather than reject a possibly-correct fix.
-        return Ok(());
-    };
-
     #[cfg(feature = "schema_validation")]
     {
+        let Some(correction) = &analysis.correction else {
+            return Ok(());
+        };
+        let Some(modified_input) = &correction.modified_input else {
+            return Ok(());
+        };
+        let Some(schema) = tool_schema else {
+            return Ok(());
+        };
+
         if !jsonschema::is_valid(schema, modified_input) {
             return Err(ReflectionError::Internal(
                 "corrected input does not match the tool's schema".to_string(),
             ));
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -293,7 +291,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<Item = Result<crate::stream::StreamEvent, ApiError>>
@@ -305,14 +303,14 @@ mod tests {
         }
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
             Box::pin(async { Ok(serde_json::json!({})) })
         }
         fn create_message_with_options(
             &self,
-            request: crate::api::StreamRequest,
+            request: &crate::api::StreamRequest,
             _options: RequestOptions,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
@@ -327,7 +325,10 @@ mod tests {
                     _ => None,
                 })
             });
-            *self.captured.lock().unwrap() = Some(Captured { system, user });
+            *self.captured.lock().unwrap() = Some(Captured {
+                system: system.clone(),
+                user,
+            });
             let response = self.response.clone();
             Box::pin(async move { Ok(response) })
         }
@@ -344,7 +345,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<Item = Result<crate::stream::StreamEvent, ApiError>>
@@ -356,14 +357,14 @@ mod tests {
         }
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
             Box::pin(async { Ok(serde_json::json!({})) })
         }
         fn create_message_with_options(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
             _options: RequestOptions,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
@@ -380,7 +381,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            request: crate::api::StreamRequest,
+            request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<Item = Result<crate::stream::StreamEvent, ApiError>>
@@ -392,14 +393,14 @@ mod tests {
         }
         fn create_message(
             &self,
-            request: crate::api::StreamRequest,
+            request: &crate::api::StreamRequest,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {
             self.0.create_message(request)
         }
         fn create_message_with_options(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
             _options: RequestOptions,
         ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
         {

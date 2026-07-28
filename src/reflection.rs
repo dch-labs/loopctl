@@ -46,10 +46,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-// ===================================================
-// FailureSeverity
-// ===================================================
-
 /// How severe a failure is.
 ///
 /// Ordered from least to most severe. The [`RecoveryStrategy`] may use
@@ -140,10 +136,6 @@ impl fmt::Display for FailureSeverity {
     }
 }
 
-// ===================================================
-// ReflectionContext
-// ===================================================
-
 /// Context provided to [`Reflector::analyze()`] describing the retry state.
 ///
 /// Built by the framework before invoking the reflector. Carries what the
@@ -209,10 +201,6 @@ pub struct ReflectionContext {
     /// [`RecoveryAction::Fail`]: crate::reflection::RecoveryAction::Fail
     pub max_attempts: u32,
 }
-
-// ===================================================
-// Correction
-// ===================================================
 
 /// Type of correction to apply.
 ///
@@ -367,10 +355,6 @@ pub enum CorrectionResult {
     /// [`Escalate`](CorrectionType::Escalate)).
     Skipped,
 }
-
-// ===================================================
-// FailureAnalysis
-// ===================================================
 
 /// Result of analyzing a failure via [`Reflector::analyze()`].
 ///
@@ -536,10 +520,6 @@ impl crate::structured::StructuredOutput for FailureAnalysis {
     }
 }
 
-// ===================================================
-// ReflectionError
-// ===================================================
-
 /// Errors produced by [`Reflector::analyze()`].
 ///
 /// The reflector can either produce a valid analysis, skip analysis
@@ -561,10 +541,6 @@ pub enum ReflectionError {
     #[error("reflection internal error: {0}")]
     Internal(String),
 }
-
-// ===================================================
-// RecoveryAction
-// ===================================================
 
 /// What the framework should do after a failure.
 ///
@@ -735,10 +711,6 @@ impl fmt::Display for RecoveryAction {
     }
 }
 
-// ===================================================
-// Reflector trait
-// ===================================================
-
 /// Analyses failed tool calls to determine recoverability and corrections.
 ///
 /// Implement this trait to provide custom failure analysis — for example,
@@ -821,10 +793,6 @@ pub trait Reflector: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<FailureAnalysis, ReflectionError>> + Send + '_>>;
 }
 
-// ===================================================
-// RecoveryStrategy trait
-// ===================================================
-
 /// Decides what to do after a failure has been analyzed.
 ///
 /// Takes a [`FailureAnalysis`] and the current retry state, returns a
@@ -883,10 +851,6 @@ pub trait RecoveryStrategy: Send + Sync {
         max_attempts: u32,
     ) -> Pin<Box<dyn Future<Output = RecoveryAction> + Send + '_>>;
 }
-
-// ===================================================
-// NoopReflector
-// ===================================================
 
 /// A no-op reflector that marks everything as non-recoverable.
 ///

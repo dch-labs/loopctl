@@ -1,321 +1,123 @@
 //! Agent session configuration.
 //!
-//! Defines [`LoopConfig`] — the configuration struct that controls agent
-//! session parameters such as turn limits, model selection, and context
-//! window size.
+//! Defines the configuration types that control agent parameters:
+//! [`SessionConfig`] for session-scoped settings and
+//! [`RunConfig`](crate::engine::RunConfig) for per-run budgets.
 
-use uuid::Uuid;
-
-/// Configuration for an agent session.
+/// Session-scoped agent configuration.
 ///
-/// Holds generic agent configuration fields that apply to every session
-/// regardless of the specific agent type. Domain-specific configuration
-/// (e.g., ITR engine settings, `ToolShield` rules, fallback model chains)
-/// should live in production-specific config types that embed or wrap
-/// this struct.
+/// The slice of agent configuration that is stable across `run()` calls on the
+/// same agent: the session identity, system prompt, and the model's context
+/// window. These do not vary from one prompt to the next within a session, so
+/// they live here rather than on the per-run [`RunConfig`](crate::engine::core::RunConfig).
 ///
 /// # Construction
 ///
-/// Use [`LoopConfig::default`] for sensible defaults, then override individual
-/// fields either with the fluent `with_*()` builders or direct struct-literal
-/// assignment — both are supported.
+/// Use [`SessionConfig::default`] for sensible defaults, then override
+/// individual fields with the `with_*()` builders.
 ///
 /// ```
-/// use loopctl::config::LoopConfig;
+/// use loopctl::config::SessionConfig;
 ///
-/// let config = LoopConfig::default()
-///     .with_max_turns(50)
-///     .with_model("default");
+/// let config = SessionConfig::default().with_context_window(128_000);
+/// assert_eq!(config.context_window, 128_000);
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[non_exhaustive]
-pub struct LoopConfig {
-    /// Unique session identifier.
-    ///
-    /// A random UUID v4 generated on construction. Used to tag tool contexts,
-    /// session save/load paths, and observer events so a host app can correlate
-    /// turns across logs and persisted state. Two configs with the same
-    /// `session_id` are considered the same logical session.
-    pub session_id: Uuid,
-
-    /// Model identifier passed to the API client on each request.
-    ///
-    /// Provider-specific (e.g. `"gpt-4o"`, `"claude-3.5-sonnet"`). The client
-    /// may override this at runtime via
-    /// [`ApiClient::set_model`](crate::api::ApiClient::set_model) when the
-    /// [`FallbackManager`](crate::fallback::FallbackManager) trips. Must be
-    /// non-empty ([`validate`](LoopConfig::validate) rejects whitespace-only).
-    pub model: String,
-
+pub struct SessionConfig {
     /// Optional system prompt override.
     ///
     /// When `Some`, this text is sent to the provider as the turn's system
-    /// prompt. When `None` (the default), the provider receives no system
-    /// prompt for the turn. Set this to inject a custom persona or instruction
-    /// set.
+    /// prompt. When `None` (the default), the provider receives no system prompt.
     pub system_prompt: Option<String>,
-
-    /// Maximum number of turns before forcing completion.
-    ///
-    /// A safety cap: the agent loop halts with
-    /// [`LoopError::MaxTurnsExceeded`](crate::error::LoopError::MaxTurnsExceeded)
-    /// if it reaches this count without the model emitting a stop. Defaults to
-    /// `200`. Must be at least `1` ([`validate`](LoopConfig::validate)).
-    pub max_turns: usize,
-
-    /// Maximum tokens for each API response.
-    ///
-    /// Sent to the provider as the `max_tokens` parameter on every request,
-    /// capping the length of a single model response. Defaults to `16_384`.
-    /// Must be at least `1` ([`validate`](LoopConfig::validate)).
-    pub max_tokens: u32,
 
     /// Context window size in tokens.
     ///
-    /// Must match the actual window of [`model`](LoopConfig::model). Used by
-    /// the compaction subsystem to decide when conversation history exceeds
-    /// the budget (see [`compact_threshold`](LoopConfig::compact_threshold)).
-    /// Defaults to `200_000`. Must be at least `1`
-    /// ([`validate`](LoopConfig::validate)).
+    /// Must match the actual window of the configured model. Used by the
+    /// compaction subsystem to decide when the conversation exceeds the budget.
     pub context_window: u64,
 
     /// Threshold to trigger auto-compaction, as a fraction of the context
-    /// window (0.0–1.0).
+    /// window (0–100). Defaults to `80`.
     ///
-    /// When the estimated token usage of the conversation exceeds
-    /// `compact_threshold * context_window`, the compactor runs before the next
-    /// turn to avoid an overflow. Defaults to `0.80`. Must be finite and in
-    /// `[0.0, 1.0]` ([`validate`](LoopConfig::validate)).
-    pub compact_threshold: f64,
+    /// When estimated token usage reaches this percentage of
+    /// [`context_window`](Self::context_window), the compaction subsystem is
+    /// invoked to summarize or truncate older messages before the next model
+    /// call. Lower it to compact more aggressively; raise it to defer
+    /// compaction and preserve more raw history.
+    pub compact_threshold: u8,
 
-    /// Whether auto-compaction is enabled.
+    /// Whether auto-compaction is enabled. Defaults to `true`.
     ///
-    /// When `true` (the default), the compactor runs automatically when
-    /// [`compact_threshold`](LoopConfig::compact_threshold) is reached. When
-    /// `false`, the agent never auto-compacts — the host app must manage
-    /// context size manually (useful for tests or fixed-length sessions).
+    /// When `true` the loop automatically runs the compactor once the
+    /// [`compact_threshold`](Self::compact_threshold) is reached. When `false`
+    /// the loop never compacts on its own, even under token pressure, leaving
+    /// context management entirely to the caller.
     pub auto_compact: bool,
-
-    /// How independent tool calls within a single turn are dispatched.
-    ///
-    /// Defaults to [`ParallelMode::Sequential`] (one at a time).
-    /// Set [`ParallelMode::Parallel`] to run independent,
-    /// concurrency-safe calls concurrently up to
-    /// [`max_concurrency`](ParallelDispatchConfig::max_concurrency).
-    ///
-    /// Parallel mode changes observer/detection event ordering (PRE events are
-    /// batched, then POST events batched, rather than strictly paired per
-    /// call) and adds finer-grained cancellation. See
-    /// [`ParallelDispatchConfig`] and the dispatch module docs.
-    pub parallel_tool_dispatch: ParallelDispatchConfig,
 }
 
-impl Default for LoopConfig {
-    /// Produce a configuration with production-ready defaults.
-    ///
-    /// | Field | Default |
-    /// |-------|---------|
-    /// | [`session_id`](LoopConfig::session_id) | Random UUID v4 |
-    /// | [`model`](LoopConfig::model) | `"default"` |
-    /// | [`system_prompt`](LoopConfig::system_prompt) | `None` |
-    /// | [`max_turns`](LoopConfig::max_turns) | `200` |
-    /// | [`max_tokens`](LoopConfig::max_tokens) | `16_384` |
-    /// | [`context_window`](LoopConfig::context_window) | `200_000` |
-    /// | [`compact_threshold`](LoopConfig::compact_threshold) | `0.80` |
-    /// | [`auto_compact`](LoopConfig::auto_compact) | `true` |
-    /// | [`parallel_tool_dispatch`](LoopConfig::parallel_tool_dispatch) | `Sequential`, `max_concurrency: 8` |
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use loopctl::config::LoopConfig;
-    ///
-    /// let config = LoopConfig::default();
-    /// assert_eq!(config.max_turns, 200);
-    /// assert_eq!(config.model, "default");
-    /// ```
+impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            session_id: Uuid::new_v4(),
-            model: "default".to_string(),
             system_prompt: None,
-            max_turns: 200,
-            max_tokens: 16_384,
             context_window: 200_000,
-            compact_threshold: 0.80,
+            compact_threshold: 80,
             auto_compact: true,
-            parallel_tool_dispatch: ParallelDispatchConfig::default(),
         }
     }
 }
 
-impl LoopConfig {
-    /// Set the session identifier, overriding the random UUID v4 that
-    /// [`Default`](LoopConfig::default) generates.
+impl SessionConfig {
+    /// Set the optional system prompt.
     ///
-    /// Use this to resume a prior session under its existing ID, or to pin a
-    /// deterministic ID in tests.
+    /// Stores `Some(prompt)` on the config; the provider receives it as
+    /// the turn's system prompt. Accepts any `Into<String>` so string
+    /// literals work directly. Pass `None` (or skip this builder) to
+    /// leave the prompt unset, in which case the provider gets no
+    /// system prompt.
     #[must_use]
-    pub fn with_session_id(mut self, session_id: Uuid) -> Self {
-        self.session_id = session_id;
+    pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(system_prompt.into());
         self
     }
 
-    /// Set the model identifier passed to the API client on each request.
+    /// Set the model's context window size in tokens.
     ///
-    /// Accepts anything that converts into a `String` (for example `"gpt-4o"`),
-    /// so a `&str` literal works without an explicit `.to_string()`. The value
-    /// must be non-empty; see [`validate`](LoopConfig::validate).
-    #[must_use]
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = model.into();
-        self
-    }
-
-    /// Set the optional system-prompt override.
-    ///
-    /// When `Some`, this text is sent to the provider as the turn's system
-    /// prompt (verbatim). When `None` (the default), the provider receives no
-    /// system prompt for the turn. Pass `Some(prompt)` to inject a custom
-    /// persona or instructions, or `None` to revert an earlier override.
-    #[must_use]
-    pub fn with_system_prompt(mut self, system_prompt: Option<String>) -> Self {
-        self.system_prompt = system_prompt;
-        self
-    }
-
-    /// Set the maximum number of turns before the loop forces completion.
-    ///
-    /// A safety cap: the loop halts with
-    /// [`LoopError::MaxTurnsExceeded`](crate::error::LoopError::MaxTurnsExceeded)
-    /// once it is reached. Must be at least `1`; see
-    /// [`validate`](LoopConfig::validate).
-    #[must_use]
-    pub fn with_max_turns(mut self, max_turns: usize) -> Self {
-        self.max_turns = max_turns;
-        self
-    }
-
-    /// Set the maximum tokens for each API response, sent to the provider as
-    /// `max_tokens` on every request.
-    ///
-    /// Must be at least `1`; see [`validate`](LoopConfig::validate).
-    #[must_use]
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
-        self
-    }
-
-    /// Set the context window size in tokens.
-    ///
-    /// Should match the actual window of the configured
-    /// [`model`](LoopConfig::model); the compaction subsystem uses it together
-    /// with [`compact_threshold`](LoopConfig::compact_threshold) to decide when
-    /// to run. Must be at least `1`; see [`validate`](LoopConfig::validate).
+    /// Must match the actual window of the configured model — the
+    /// compaction subsystem compares estimated token usage against this
+    /// value to decide when to compact. Setting it too low triggers
+    /// premature compaction; too high risks a provider-side context
+    /// overflow.
     #[must_use]
     pub fn with_context_window(mut self, context_window: u64) -> Self {
         self.context_window = context_window;
         self
     }
 
-    /// Set the auto-compaction trigger threshold as a fraction of the context
-    /// window (0.0–1.0).
+    /// Set the compaction threshold as a percentage of the context
+    /// window (0–100).
     ///
-    /// When estimated token usage exceeds `compact_threshold * context_window`,
-    /// compaction runs before the next turn. This builder stores the value
-    /// verbatim — it does **not** clamp; the range is enforced by
-    /// [`validate`](LoopConfig::validate), which is the single source of truth
-    /// for the `[0.0, 1.0]` bound.
+    /// When estimated token usage reaches this percentage of
+    /// [`context_window`](Self::context_window), the compaction
+    /// subsystem summarizes or truncates older messages before the next
+    /// model call. Lower it to compact more aggressively; raise it to
+    /// defer compaction and preserve more raw history.
     #[must_use]
-    pub fn with_compact_threshold(mut self, compact_threshold: f64) -> Self {
-        self.compact_threshold = compact_threshold;
+    pub fn with_compact_threshold(mut self, compact_threshold: u8) -> Self {
+        self.compact_threshold = compact_threshold.min(100);
         self
     }
 
-    /// Enable or disable automatic compaction.
+    /// Enable or disable auto-compaction.
     ///
-    /// When `true` (the default), compaction runs automatically once
-    /// [`compact_threshold`](LoopConfig::compact_threshold) is reached. When
-    /// `false`, the host application must manage context size itself.
+    /// When `true` (the default) the loop runs the compactor
+    /// automatically once [`compact_threshold`](Self::compact_threshold)
+    /// is reached. When `false` the loop never compacts on its own,
+    /// even under token pressure, leaving context management entirely
+    /// to the caller.
     #[must_use]
     pub fn with_auto_compact(mut self, auto_compact: bool) -> Self {
         self.auto_compact = auto_compact;
         self
-    }
-
-    /// Set how independent tool calls within a single turn are dispatched.
-    ///
-    /// Defaults to sequential. See [`ParallelDispatchConfig`] and
-    /// [`ParallelMode`] for the observer and loop-detection ordering
-    /// implications of enabling parallel dispatch.
-    #[must_use]
-    pub fn with_parallel_tool_dispatch(mut self, config: ParallelDispatchConfig) -> Self {
-        self.parallel_tool_dispatch = config;
-        self
-    }
-
-    /// Validate the configuration fields.
-    ///
-    /// Checks that:
-    /// - `compact_threshold` is in the range `[0.0, 1.0]` (not `NaN`).
-    /// - `max_turns` is greater than zero.
-    /// - `context_window` is greater than zero.
-    /// - `max_tokens` is greater than zero.
-    /// - `model` is not empty.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`Config`](crate::error::LoopError::Config) variant describing
-    /// or `Ok(())` if all fields are valid.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use loopctl::config::LoopConfig;
-    ///
-    /// let config = LoopConfig::default();
-    /// assert!(config.validate().is_ok());
-    ///
-    /// let bad = LoopConfig::default().with_compact_threshold(1.5);
-    /// assert!(bad.validate().is_err());
-    /// ```
-    #[must_use = "validation errors should not be silently ignored"]
-    pub fn validate(&self) -> Result<(), crate::error::LoopError> {
-        if self.max_turns == 0 {
-            return Err(crate::error::LoopError::Config(
-                "max_turns must be greater than 0".to_string(),
-            ));
-        }
-        if self.context_window == 0 {
-            return Err(crate::error::LoopError::Config(
-                "context_window must be greater than 0".to_string(),
-            ));
-        }
-        if self.max_tokens == 0 {
-            return Err(crate::error::LoopError::Config(
-                "max_tokens must be greater than 0".to_string(),
-            ));
-        }
-        if self.model.trim().is_empty() {
-            return Err(crate::error::LoopError::Config(
-                "model must not be empty".to_string(),
-            ));
-        }
-        if self.compact_threshold.is_nan()
-            || self.compact_threshold < 0.0
-            || self.compact_threshold > 1.0
-        {
-            return Err(crate::error::LoopError::Config(format!(
-                "compact_threshold must be in [0.0, 1.0], got {}",
-                self.compact_threshold
-            )));
-        }
-        if self.parallel_tool_dispatch.max_concurrency == 0 {
-            return Err(crate::error::LoopError::Config(
-                "parallel_tool_dispatch.max_concurrency must be at least 1".to_string(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -323,7 +125,7 @@ impl LoopConfig {
 ///
 /// Defaults to [`Sequential`](ParallelMode::Sequential);
 /// opt into [`Parallel`](ParallelMode::Parallel)
-/// via [`LoopConfig::parallel_tool_dispatch`].
+/// via [`ParallelDispatchConfig::mode`].
 ///
 /// Parallel mode runs independent, concurrency-safe calls concurrently (up to
 /// [`ParallelDispatchConfig::max_concurrency`]). Sequential mode dispatches one
@@ -353,6 +155,18 @@ pub enum ParallelMode {
     /// in input order) then batched POST events — see the dispatch module
     /// docs for the ordering invariant. Choose this for read-heavy,
     /// multi-call turns where latency is the sum of independent operations.
+    ///
+    /// # Side-effect divergence from Sequential
+    ///
+    /// In Sequential mode, loop detection and observer events fire on
+    /// **every** retry attempt — a tool that fails twice then succeeds
+    /// produces 3 detection operations and 3 observer pairs.
+    ///
+    /// In Parallel mode, detection and observer side-effects fire **once**
+    /// on the final result only (they are not thread-safe). Health
+    /// tracking fires on **every** attempt in both modes (it uses atomic
+    /// counters). Intermediate retries during parallel dispatch are
+    /// invisible to loop detection and observers but visible to health.
     Parallel,
 }
 
@@ -365,11 +179,10 @@ pub enum ParallelMode {
 /// # Example
 ///
 /// ```
-/// use loopctl::config::{LoopConfig, ParallelDispatchConfig, ParallelMode};
+/// use loopctl::config::{ParallelDispatchConfig, ParallelMode};
 ///
-/// let config = LoopConfig::default().with_parallel_tool_dispatch(
-///     ParallelDispatchConfig { mode: ParallelMode::Parallel, max_concurrency: 4 },
-/// );
+/// let dispatch = ParallelDispatchConfig { mode: ParallelMode::Parallel, max_concurrency: 4 };
+/// assert_eq!(dispatch.max_concurrency, 4);
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParallelDispatchConfig {
@@ -388,8 +201,7 @@ pub struct ParallelDispatchConfig {
     /// Defaults to `8`. Clamped to `[1, eligible_count]` at dispatch time (a
     /// 3-call batch never tries to acquire 8 permits). Setting this to `1`
     /// makes "parallel" mode behave like sequential — useful for debugging
-    /// (same code path, no concurrency). Must be at least 1
-    /// ([`LoopConfig::validate`] rejects `0`).
+    /// (same code path, no concurrency). Must be at least 1.
     pub max_concurrency: usize,
 }
 
@@ -407,153 +219,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_default_config_is_ok() {
-        let config = LoopConfig::default();
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_zero_max_tokens() {
-        let config = LoopConfig {
-            max_tokens: 0,
-            ..LoopConfig::default()
-        };
-        let err = config.validate().unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("max_tokens"),
-            "error should mention max_tokens: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_accepts_one_max_tokens() {
-        let config = LoopConfig {
-            max_tokens: 1,
-            ..LoopConfig::default()
-        };
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_empty_model() {
-        let config = LoopConfig {
-            model: String::new(),
-            ..LoopConfig::default()
-        };
-        let err = config.validate().unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("model"), "error should mention model: {msg}");
-    }
-
-    #[test]
-    fn validate_accepts_nonempty_model() {
-        let config = LoopConfig {
-            model: "gpt-4".to_string(),
-            ..LoopConfig::default()
-        };
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_whitespace_only_model() {
-        let config = LoopConfig {
-            model: "   ".to_string(),
-            ..LoopConfig::default()
-        };
-        let err = config.validate().unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("model"), "error should mention model: {msg}");
-    }
-
-    #[test]
-    fn with_model_sets_field_and_accepts_str() {
-        let config = LoopConfig::default().with_model("gpt-4o");
-        assert_eq!(config.model, "gpt-4o");
-    }
-
-    #[test]
-    fn with_system_prompt_sets_some() {
-        let config = LoopConfig::default().with_system_prompt(Some("p".to_string()));
-        assert_eq!(config.system_prompt, Some("p".to_string()));
-    }
-
-    #[test]
-    fn with_system_prompt_none_clears_override() {
-        let config = LoopConfig::default().with_system_prompt(None);
+    fn session_config_default_context_window() {
+        let config = SessionConfig::default();
+        assert_eq!(config.context_window, 200_000);
         assert!(config.system_prompt.is_none());
     }
 
     #[test]
-    fn with_max_turns_sets_field() {
-        let config = LoopConfig::default().with_max_turns(7);
-        assert_eq!(config.max_turns, 7);
+    fn session_config_with_system_prompt_sets_some() {
+        let config = SessionConfig::default().with_system_prompt("be helpful");
+        assert_eq!(config.system_prompt.as_deref(), Some("be helpful"));
     }
 
     #[test]
-    fn with_max_tokens_sets_field() {
-        let config = LoopConfig::default().with_max_tokens(123);
-        assert_eq!(config.max_tokens, 123);
-    }
-
-    #[test]
-    fn with_context_window_sets_field() {
-        let config = LoopConfig::default().with_context_window(8192);
+    fn session_config_with_context_window_sets_field() {
+        let config = SessionConfig::default().with_context_window(8192);
         assert_eq!(config.context_window, 8192);
     }
 
     #[test]
-    fn with_compact_threshold_stores_value_without_clamping() {
-        let config = LoopConfig::default().with_compact_threshold(1.5);
-        assert!((config.compact_threshold - 1.5).abs() < f64::EPSILON);
+    fn session_config_builder_chain_composes_without_clobbering() {
+        let config = SessionConfig::default()
+            .with_system_prompt("p")
+            .with_context_window(128_000);
+        assert_eq!(config.system_prompt.as_deref(), Some("p"));
+        assert_eq!(config.context_window, 128_000);
     }
 
     #[test]
-    fn with_auto_compact_flips_default() {
-        let config = LoopConfig::default().with_auto_compact(false);
-        assert!(!config.auto_compact);
+    fn session_config_builder_does_not_mutate_source() {
+        let original = SessionConfig::default();
+        let _modified = original.clone().with_context_window(1);
+        assert_eq!(original.context_window, 200_000);
     }
 
     #[test]
-    fn with_session_id_round_trips() {
-        let id = Uuid::new_v4();
-        let config = LoopConfig::default().with_session_id(id);
-        assert_eq!(config.session_id, id);
+    fn parallel_dispatch_default_is_sequential_concurrency_8() {
+        let dispatch = ParallelDispatchConfig::default();
+        assert_eq!(dispatch.mode, ParallelMode::Sequential);
+        assert_eq!(dispatch.max_concurrency, 8);
     }
 
     #[test]
-    fn with_parallel_tool_dispatch_round_trips() {
+    fn parallel_dispatch_struct_literal_round_trips() {
         let dispatch = ParallelDispatchConfig {
             mode: ParallelMode::Parallel,
             max_concurrency: 4,
         };
-        let config = LoopConfig::default().with_parallel_tool_dispatch(dispatch);
-        assert_eq!(config.parallel_tool_dispatch.mode, ParallelMode::Parallel);
-        assert_eq!(config.parallel_tool_dispatch.max_concurrency, 4);
-    }
-
-    #[test]
-    fn builder_chain_composes_without_clobbering() {
-        let config = LoopConfig::default().with_model("x").with_max_turns(5);
-        assert_eq!(config.model, "x");
-        assert_eq!(config.max_turns, 5);
-        let defaults = LoopConfig::default();
-        assert_eq!(config.max_tokens, defaults.max_tokens);
-        assert_eq!(config.context_window, defaults.context_window);
-        assert!((config.compact_threshold - defaults.compact_threshold).abs() < f64::EPSILON);
-        assert_eq!(config.auto_compact, defaults.auto_compact);
-    }
-
-    #[test]
-    fn builder_does_not_mutate_source() {
-        let original = LoopConfig::default();
-        let _modified = original.clone().with_max_turns(1);
-        assert_eq!(original.max_turns, 200);
-    }
-
-    #[test]
-    fn validate_still_rejects_builder_built_invalid_config() {
-        let config = LoopConfig::default().with_compact_threshold(1.5);
-        assert!(config.validate().is_err());
+        assert_eq!(dispatch.mode, ParallelMode::Parallel);
+        assert_eq!(dispatch.max_concurrency, 4);
     }
 }

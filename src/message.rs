@@ -23,21 +23,13 @@
 //!
 //! # Message Flow
 //!
-//! ```text
-//! User sends text ──▶ Message::user("query")
-//!                         │
-//!                     API processes
-//!                         │
-//!         ◀── Message::assistant("thinking...")
-//!         ◀── MessagePart::ToolCall { id, name, input }
-//!                         │
-//!              Framework executes tool
-//!                         │
-//!         ──▶ MessagePart::ToolResult { call_id, output }
-//!                         │
-//!                     API continues
-//!         ◀── Message::assistant("final answer")
-//! ```
+//! A turn starts with a user message (`Message::user`), which is sent to the
+//! LLM API. The API responds with an assistant message that may contain plain
+//! text plus one or more `MessagePart::ToolCall` parts. For each tool call,
+//! the framework executes the tool and appends a user-role message carrying a
+//! `MessagePart::ToolResult` part back into the history. The API then
+//! continues, typically producing a final assistant text message that
+//! completes the turn.
 //!
 //! # Quick Start
 //!
@@ -68,10 +60,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
-
-// ==================================================
-// Message
-// ==================================================
 
 /// A message in the conversation.
 ///
@@ -197,25 +185,39 @@ impl Message {
     pub const fn new(role: Role, parts: Vec<MessagePart>) -> Self {
         Self { role, parts }
     }
+
+    /// Concatenate every text part into a single string.
+    ///
+    /// Walks the message's parts in order and joins all text content,
+    /// skipping non-text parts (tool calls, tool results, images).
+    #[must_use]
+    pub fn text_content(&self) -> String {
+        self.parts
+            .iter()
+            .filter_map(MessagePart::as_text)
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// Collect the tool calls this message requests, in order.
+    ///
+    /// Scans the message's parts for tool-call parts and maps each to a
+    /// `(id, name, input)` tuple. Returns an empty vector when the message
+    /// contains no tool calls.
+    #[must_use]
+    pub fn tool_call_parts(&self) -> Vec<(&str, &str, &serde_json::Value)> {
+        self.parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::ToolCall { id, name, input } => {
+                    Some((id.as_str(), name.as_str(), input))
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
-/// Formats a [`Message`] for display.
-///
-/// Formats each [`MessagePart`] in the message on its own line.
-/// Text parts render as-is; tool-call parts render as
-/// `[Tool: {name} with input: {input}]`; tool-result parts render
-/// as `[Tool Result: {content}]`; image parts render as
-/// `[Image: {media_type}]`.
-///
-/// For structured serialization, use [`serde_json::to_string`] instead.
-///
-/// # Example
-///
-/// ```rust
-/// use loopctl::message::{Message};
-/// let msg = Message::user("Hello");
-/// println!("{msg}"); // prints "Hello"
-/// ```
 impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut chunks = Vec::new();
@@ -240,10 +242,6 @@ impl fmt::Display for Message {
         write!(f, "{}", chunks.join("\n"))
     }
 }
-
-// ==================================================
-// Role
-// ==================================================
 
 /// The role of a message sender in the conversation.
 ///
@@ -290,19 +288,6 @@ pub enum Role {
     System,
 }
 
-/// Formats a [`Role`] as its lowercase API string.
-///
-/// This implementation is used by [`Display`](fmt::Display) to produce
-/// the string that LLM APIs expect: `"user"`, `"assistant"`, or `"system"`.
-/// It is also used for logging and building request payloads
-/// without pulling in the serde serializer.
-///
-/// # Example
-///
-/// ```rust
-/// use loopctl::message::{Role};
-/// assert_eq!(format!("Role: {}", Role::User), "Role: user");
-/// ```
 impl fmt::Display for Role {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -312,10 +297,6 @@ impl fmt::Display for Role {
         }
     }
 }
-
-// ==================================================
-// MessagePart
-// ==================================================
 
 /// A part of message content within a [`Message`].
 ///
@@ -621,10 +602,6 @@ impl MessagePart {
     }
 }
 
-// ==================================================
-// ImageSource
-// ==================================================
-
 /// Source data for an image part in loopctl API format.
 ///
 /// Represents a base64-encoded image with its MIME type. Serialized
@@ -701,10 +678,6 @@ impl ImageSource {
         }
     }
 }
-
-// ==================================================
-// ToolContent
-// ==================================================
 
 /// Content that can be returned from a tool invocation.
 ///
@@ -844,66 +817,18 @@ impl Default for ToolContent {
     }
 }
 
-/// Converts a [`String`] into a [`ToolContent::Text`].
-///
-/// This blanket conversion allows passing owned strings directly
-/// into APIs that accept [`Into<ToolContent>`], for example
-/// [`MessagePart::tool_result`].
-///
-/// # Example
-///
-/// ```rust
-/// use loopctl::message::{ToolContent};
-/// let content: ToolContent = "File found".to_string().into();
-/// assert!(content.is_string());
-/// ```
 impl From<String> for ToolContent {
     fn from(s: String) -> Self {
         Self::Text(s)
     }
 }
 
-/// Converts a `&str` into a [`ToolContent::Text`].
-///
-/// This conversion allocates a new [`String`] from the borrowed slice.
-/// It enables ergonomic usage with string literals:
-///
-/// # Example
-///
-/// ```rust
-/// use loopctl::message::{ToolContent};
-/// let content: ToolContent = "ok".into();
-/// assert!(content.is_string());
-/// ```
 impl From<&str> for ToolContent {
     fn from(s: &str) -> Self {
         Self::Text(s.to_owned())
     }
 }
 
-/// Formats a [`ToolContent`] for display.
-///
-/// For the [`String`](ToolContent::Text) variant, writes the
-/// text directly. For the [`Multipart`](ToolContent::Multipart)
-/// variant, concatenates all [`ToolContentPart::Text`] parts with
-/// newlines, silently skipping any non-text parts (e.g. images).
-///
-/// For quick debugging and logging, use [`Display`](std::fmt::Display).
-/// For full structured serialization, use [`serde_json::to_string`].
-///
-/// # Example
-///
-/// ```rust
-/// use loopctl::message::{ToolContent, ToolContentPart};
-/// let content = ToolContent::from_string("Done!");
-/// assert_eq!(content.to_string(), "Done!");
-///
-/// let multipart = ToolContent::from_multipart(vec![
-///     ToolContentPart::text("line 1"),
-///     ToolContentPart::text("line 2"),
-/// ]);
-/// assert_eq!(multipart.to_string(), "line 1\nline 2");
-/// ```
 impl fmt::Display for ToolContent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -924,10 +849,6 @@ impl fmt::Display for ToolContent {
         }
     }
 }
-
-// ==================================================
-// ToolContentPart
-// ==================================================
 
 /// A part of a Multipart [`ToolContent`].
 ///
@@ -1027,10 +948,6 @@ impl ToolContentPart {
         Self::Image { source }
     }
 }
-
-// ==================================================
-// Tests
-// ==================================================
 
 #[cfg(test)]
 mod tests {

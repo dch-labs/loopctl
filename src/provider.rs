@@ -26,7 +26,8 @@
 //! ```rust,ignore
 //! use loopctl::provider;
 //! use loopctl::engine::BareLoop;
-//! use loopctl::engine::loop_core::Loop;
+//! use loopctl::engine::RunConfig;
+//! use loopctl::engine::core::Loop;
 //!
 //! // OpenAI:
 //! let client = provider::OpenAiClient::from_env()?;
@@ -51,14 +52,43 @@
 //!     tool_registry,
 //!     config,
 //! );
-//! let result = agent.run("Hello!").await?;
+//! let result = agent.run("Hello!", &RunConfig::default()).await?;
 //! ```
 
-use crate::{
-    api::error::ApiError,
-    message::{MessagePart, Role},
-};
+use crate::api::error::ApiError;
+#[cfg(any(feature = "anthropic", feature = "gemini"))]
+use crate::message::{MessagePart, Role};
 use std::time::Duration;
+
+// SSE line-framing shared by every streaming provider. Each provider keeps
+// its own event-extraction logic (`next_data` / `next_event`); the struct,
+// `from_response`, `take_line`, and the buffer-overflow guard live here.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+mod sse;
+
+/// Maximum accepted response body size (10 MB).
+///
+/// Guards against unbounded memory growth from a misbehaving or hostile
+/// provider that returns a very large non-streaming response.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+pub(super) const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024;
+
+/// Reject a response body that exceeds [`MAX_RESPONSE_BODY`].
+///
+/// Shared guard used by every provider's non-streaming path.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] when `len` exceeds [`MAX_RESPONSE_BODY`].
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+pub(super) fn check_response_body(len: usize) -> Result<(), ApiError> {
+    if len > MAX_RESPONSE_BODY {
+        return Err(ApiError::http(format!(
+            "response body too large: {len} bytes (max {MAX_RESPONSE_BODY})"
+        )));
+    }
+    Ok(())
+}
 
 /// Shared HTTP-client configuration embedded by every provider builder.
 ///
@@ -295,10 +325,6 @@ pub use gemini::GeminiClient;
 #[cfg(feature = "grammar")]
 pub use grammar::{JsonSchemaGrammar, ToolGrammarProvider};
 
-// =======================================================
-// Default endpoints / models for convenience constructors
-// =======================================================
-
 #[cfg(feature = "ollama")]
 const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 
@@ -320,34 +346,38 @@ const ZAI_BASE_URL: &str = "https://api.z.ai/api/anthropic";
 #[cfg(feature = "zai")]
 const ZAI_DEFAULT_MODEL: &str = "glm-4.7";
 
-// ==================================================
-// Internal helpers
-// ==================================================
-
 /// Read an environment variable, falling back to a second name, then a
 /// default value.
 ///
 /// Reduces boilerplate in the convenience constructors below where a
 /// provider supports multiple env-var aliases (e.g. `XAI_API_KEY` /
 /// `GROK_API_KEY`).
+/// Read an environment variable or return a default.
+#[cfg(any(
+    feature = "ollama",
+    feature = "deepseek",
+    feature = "grok",
+    feature = "zai",
+    feature = "openai"
+))]
+fn env_or_default(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.into())
+}
+
+/// Read a primary env var, falling back to a secondary if unset.
+#[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
 fn env_or_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)
         .or_else(|_| std::env::var(fallback))
         .ok()
 }
 
-/// Read an environment variable or return a default.
-fn env_or_default(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.into())
-}
-
-/// Look up a required API key, returning [`ApiError`] if neither env
-/// var is set.
+/// Look up a required API key from the environment.
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::auth_invalid_key`] if neither environment
-/// variable is set.
+/// Returns [`ApiError::auth_invalid_key`] if neither environment variable is set.
+#[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
 fn require_api_key(primary: &str, fallback: Option<&str>) -> Result<String, ApiError> {
     if let Some(fb) = fallback {
         if let Some(val) = env_or_fallback(primary, fb) {
@@ -362,15 +392,11 @@ fn require_api_key(primary: &str, fallback: Option<&str>) -> Result<String, ApiE
 /// Separate inline `Role::System` messages from the rest of the history and
 /// fold their text into a single system string.
 ///
-/// Providers that reject an inline system role (Anthropic, Gemini) accept
-/// system content only as a top-level request field. This helper pulls every
-/// `Role::System` message out of `messages`, concatenates their text parts
-/// (newline-separated), and merges the result with an optional caller-supplied
-/// system prompt — caller prompt first, folded text appended.
-///
-/// Returns the non-system messages (in original order) and the merged system
-/// string, or `None` when neither a caller prompt nor any system message is
-/// present.
+/// Providers that reject an inline system role accept system content only as a
+/// top-level request field. This helper pulls every system message out of
+/// `messages`, concatenates their text parts (newline-separated), and merges
+/// the result with an optional caller-supplied system prompt.
+#[cfg(any(feature = "anthropic", feature = "gemini"))]
 fn fold_system_messages<'a>(
     messages: &'a [crate::message::Message],
     system: Option<&str>,
@@ -488,7 +514,9 @@ pub fn deepseek() -> Result<OpenAiClient, ApiError> {
 #[cfg(feature = "grok")]
 pub fn grok() -> Result<OpenAiClient, ApiError> {
     let api_key = require_api_key("XAI_API_KEY", Some("GROK_API_KEY"))?;
-    let model = env_or_default("GROK_MODEL", GROK_DEFAULT_MODEL);
+    let model = std::env::var("XAI_MODEL")
+        .or_else(|_| std::env::var("GROK_MODEL"))
+        .unwrap_or_else(|_| GROK_DEFAULT_MODEL.into());
 
     OpenAiClient::builder()
         .with_api_key(api_key)
@@ -559,14 +587,17 @@ pub fn self_hosted(base_url: &str, model: &str) -> Result<OpenAiClient, ApiError
         .build()
 }
 
-// ==================================================
-// Tests
-// ==================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(any(
+        feature = "ollama",
+        feature = "deepseek",
+        feature = "grok",
+        feature = "zai",
+        feature = "openai"
+    ))]
     macro_rules! env_set {
         ($($arg:tt)*) => {{
             // SAFETY: This is only used in single-threaded test code where
@@ -575,6 +606,13 @@ mod tests {
         }};
     }
 
+    #[cfg(any(
+        feature = "ollama",
+        feature = "deepseek",
+        feature = "grok",
+        feature = "zai",
+        feature = "openai"
+    ))]
     macro_rules! env_remove {
         ($($arg:tt)*) => {{
             // SAFETY: This is only used in single-threaded test code where
@@ -583,6 +621,7 @@ mod tests {
         }};
     }
 
+    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
     #[test]
     fn env_or_fallback_primary_set() {
         env_set!("LOOPCTL_TEST_PRIMARY", "primary-val");
@@ -594,6 +633,7 @@ mod tests {
         env_remove!("LOOPCTL_TEST_PRIMARY");
     }
 
+    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
     #[test]
     fn env_or_fallback_fallback_used_when_primary_missing() {
         env_remove!("LOOPCTL_TEST_PRIMARY2");
@@ -605,6 +645,7 @@ mod tests {
         env_remove!("LOOPCTL_TEST_FALLBACK2");
     }
 
+    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
     #[test]
     fn env_or_fallback_none_when_both_missing() {
         env_remove!("LOOPCTL_TEST_NEITHER_A");
@@ -615,6 +656,13 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        feature = "ollama",
+        feature = "deepseek",
+        feature = "grok",
+        feature = "zai",
+        feature = "openai"
+    ))]
     #[test]
     fn env_or_default_uses_env_when_set() {
         env_set!("LOOPCTL_TEST_DEFAULT", "from-env");
@@ -625,6 +673,13 @@ mod tests {
         env_remove!("LOOPCTL_TEST_DEFAULT");
     }
 
+    #[cfg(any(
+        feature = "ollama",
+        feature = "deepseek",
+        feature = "grok",
+        feature = "zai",
+        feature = "openai"
+    ))]
     #[test]
     fn env_or_default_uses_default_when_unset() {
         env_remove!("LOOPCTL_TEST_DEFAULT2");
@@ -634,6 +689,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
     #[test]
     fn require_api_key_primary_set() {
         env_set!("LOOPCTL_TEST_KEY_PRIMARY", "secret");
@@ -647,6 +703,7 @@ mod tests {
         env_remove!("LOOPCTL_TEST_KEY_PRIMARY");
     }
 
+    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
     #[test]
     fn require_api_key_fallback_used() {
         env_remove!("LOOPCTL_TEST_KEY_PRIMARY2");
@@ -660,6 +717,7 @@ mod tests {
         env_remove!("LOOPCTL_TEST_KEY_FALLBACK2");
     }
 
+    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
     #[test]
     fn require_api_key_no_fallback_set() {
         env_set!("LOOPCTL_TEST_KEY_ONLY", "only-val");
@@ -668,6 +726,7 @@ mod tests {
         env_remove!("LOOPCTL_TEST_KEY_ONLY");
     }
 
+    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
     #[test]
     fn require_api_key_errors_when_missing() {
         env_remove!("LOOPCTL_TEST_MISSING_KEY");
@@ -675,6 +734,7 @@ mod tests {
         assert!(err.to_string().contains("LOOPCTL_TEST_MISSING_KEY"));
     }
 
+    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
     #[test]
     fn require_api_key_errors_when_both_missing() {
         env_remove!("LOOPCTL_TEST_MISSING_A");
@@ -735,12 +795,14 @@ mod tests {
     }
 
     /// Build a `Role::System` message carrying the given text parts.
+    #[cfg(any(feature = "anthropic", feature = "gemini"))]
     fn sys_msg(texts: &[&str]) -> crate::message::Message {
         use crate::message::{MessagePart, Role};
         let parts: Vec<MessagePart> = texts.iter().map(|t| MessagePart::text(*t)).collect();
         crate::message::Message::new(Role::System, parts)
     }
 
+    #[cfg(any(feature = "anthropic", feature = "gemini"))]
     #[test]
     fn fold_system_no_system_messages_no_caller_returns_none() {
         let msgs = [crate::message::Message::user("hi")];
@@ -749,6 +811,7 @@ mod tests {
         assert!(system.is_none(), "no system content → None");
     }
 
+    #[cfg(any(feature = "anthropic", feature = "gemini"))]
     #[test]
     fn fold_system_caller_only_passes_through() {
         let msgs = [crate::message::Message::user("hi")];
@@ -757,6 +820,7 @@ mod tests {
         assert_eq!(system.as_deref(), Some("be brief"));
     }
 
+    #[cfg(any(feature = "anthropic", feature = "gemini"))]
     #[test]
     fn fold_system_single_system_message_removed_and_folded() {
         let msgs = [
@@ -769,6 +833,7 @@ mod tests {
         assert_eq!(system.as_deref(), Some("stay on task"));
     }
 
+    #[cfg(any(feature = "anthropic", feature = "gemini"))]
     #[test]
     fn fold_system_caller_prompt_prepended_to_folded() {
         let msgs = [crate::message::Message::user("hi"), sys_msg(&["reminder"])];
@@ -788,6 +853,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "anthropic", feature = "gemini"))]
     #[test]
     fn fold_system_multiple_system_messages_joined_with_newlines() {
         let msgs = [
@@ -801,6 +867,7 @@ mod tests {
         assert_eq!(system, "first reminder\nsecond reminder");
     }
 
+    #[cfg(any(feature = "anthropic", feature = "gemini"))]
     #[test]
     fn fold_system_only_text_parts_are_folded() {
         // A System message carrying a tool-call part (unusual, but defensive):
@@ -818,6 +885,7 @@ mod tests {
         assert_eq!(system.as_deref(), Some("keep this"));
     }
 
+    #[cfg(any(feature = "anthropic", feature = "gemini"))]
     #[test]
     fn fold_system_preserves_relative_order_of_non_system_messages() {
         let msgs = [
@@ -839,6 +907,7 @@ mod tests {
         assert_eq!(texts, vec!["first", "second", "third"]);
     }
 
+    #[cfg(any(feature = "anthropic", feature = "gemini"))]
     #[test]
     fn fold_system_empty_text_part_contributes_nothing() {
         // A System message whose text is empty: folded string stays empty, so
@@ -852,6 +921,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "anthropic", feature = "gemini"))]
     #[test]
     fn fold_system_multiple_text_parts_in_one_message_joined() {
         let msgs = [sys_msg(&["part one", "part two"])];

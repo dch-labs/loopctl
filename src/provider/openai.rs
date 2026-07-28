@@ -24,8 +24,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use futures::stream::{Stream, StreamExt};
-use reqwest::Response;
+use futures::stream::Stream;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -40,23 +39,13 @@ use crate::structured::ToolConstraint;
 use crate::structured::tighten_json_schema;
 use crate::tool::ToolSchema;
 
-// ==================================================
-// Constants
-// ==================================================
-
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-4o";
 const SSE_DONE: &str = "[DONE]";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const THINKING_PART_INDEX: usize = 1;
-const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
-const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
-
-// ==================================================
-// Client
-// ==================================================
 
 /// An OpenAI-compatible chat completions client with streaming support.
 ///
@@ -221,17 +210,14 @@ impl ApiClient for OpenAiClient {
 
     fn stream_messages(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let crate::api::StreamRequest {
-            messages,
-            system,
-            tools,
-        } = request;
+        let system = request.system.clone();
+        let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let body = RequestBody::build(
             &model,
-            &messages,
+            &request.messages,
             system.as_deref(),
             tools.as_deref(),
             None,
@@ -246,7 +232,7 @@ impl ApiClient for OpenAiClient {
             let mut sse = SseReader::from_response(resp);
             let mut emitter = StreamEmitter::default();
 
-            while let Some(data) = sse.next_data().await? {
+            while let Some(data) = sse.next_openai_data().await? {
                 let Some(chunk) = OpenAiChunk::parse(&data) else {
                     continue;
                 };
@@ -264,17 +250,14 @@ impl ApiClient for OpenAiClient {
 
     fn create_message(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let crate::api::StreamRequest {
-            messages,
-            system,
-            tools,
-        } = request;
+        let system = request.system.clone();
+        let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let body = RequestBody::build(
             &model,
-            &messages,
+            &request.messages,
             system.as_deref(),
             tools.as_deref(),
             None,
@@ -290,32 +273,23 @@ impl ApiClient for OpenAiClient {
                 .bytes()
                 .await
                 .map_err(|e| ApiError::http(e.to_string()))?;
-            if resp.len() > MAX_RESPONSE_BODY {
-                return Err(ApiError::http(format!(
-                    "response body too large: {} bytes (max {})",
-                    resp.len(),
-                    MAX_RESPONSE_BODY
-                )));
-            }
+            super::check_response_body(resp.len())?;
             serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
 
     fn stream_messages_with_options(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let crate::api::StreamRequest {
-            messages,
-            system,
-            tools,
-        } = request;
+        let system = request.system.clone();
+        let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = RequestBody::build(
             &model,
-            &messages,
+            &request.messages,
             system.as_deref(),
             tools.as_deref(),
             rf,
@@ -330,7 +304,7 @@ impl ApiClient for OpenAiClient {
             let mut sse = SseReader::from_response(resp);
             let mut emitter = StreamEmitter::default();
 
-            while let Some(data) = sse.next_data().await? {
+            while let Some(data) = sse.next_openai_data().await? {
                 let Some(chunk) = OpenAiChunk::parse(&data) else {
                     continue;
                 };
@@ -348,19 +322,16 @@ impl ApiClient for OpenAiClient {
 
     fn create_message_with_options(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let crate::api::StreamRequest {
-            messages,
-            system,
-            tools,
-        } = request;
+        let system = request.system.clone();
+        let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = RequestBody::build(
             &model,
-            &messages,
+            &request.messages,
             system.as_deref(),
             tools.as_deref(),
             rf,
@@ -376,13 +347,7 @@ impl ApiClient for OpenAiClient {
                 .bytes()
                 .await
                 .map_err(|e| ApiError::http(e.to_string()))?;
-            if resp.len() > MAX_RESPONSE_BODY {
-                return Err(ApiError::http(format!(
-                    "response body too large: {} bytes (max {})",
-                    resp.len(),
-                    MAX_RESPONSE_BODY
-                )));
-            }
+            super::check_response_body(resp.len())?;
             serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
@@ -404,9 +369,6 @@ impl ApiClient for OpenAiClient {
         }
     }
 }
-// ==================================================
-// Builder
-// ==================================================
 
 /// Builder for [`OpenAiClient`].
 ///
@@ -565,10 +527,6 @@ impl OpenAiClientBuilder {
     }
 }
 
-// ==================================================
-// Request body construction
-// ==================================================
-
 /// A built OpenAI Chat Completions request body.
 ///
 /// Separating construction from serialization lets us reuse the same
@@ -640,7 +598,7 @@ impl RequestBody {
         }
 
         for m in messages {
-            msgs.push(convert_message(m));
+            msgs.extend(convert_message(m));
         }
 
         let (tools, guided_json) = if response_format.is_some() {
@@ -711,8 +669,10 @@ impl RequestBody {
 ///
 /// OpenAI expects assistant messages with `tool_calls` to carry them in
 /// a dedicated array, tool results to use the `tool` role, and plain
-/// text to use a simple `{role, content}` pair.
-fn convert_message(m: &Message) -> Value {
+/// text to use a simple `{role, content}` pair. A single loopctl message
+/// with multiple tool-result parts expands to one OpenAI `tool` message per
+/// result, so the return is a vector.
+fn convert_message(m: &Message) -> Vec<Value> {
     let role = match m.role {
         Role::User => "user",
         Role::Assistant => "assistant",
@@ -749,11 +709,11 @@ fn convert_message(m: &Message) -> Value {
     }
 
     if !tool_calls.is_empty() {
-        build_assistant_message(role, &tool_calls, &text_parts)
+        vec![build_assistant_message(role, &tool_calls, &text_parts)]
     } else if !tool_results.is_empty() {
-        merge_tool_results(&tool_results)
+        tool_results
     } else {
-        serde_json::json!({ "role": role, "content": text_parts.join("") })
+        vec![serde_json::json!({ "role": role, "content": text_parts.join("") })]
     }
 }
 
@@ -776,18 +736,6 @@ fn build_assistant_message(role: &str, tool_calls: &[Value], text_parts: &[&str]
         "content": content,
         "tool_calls": tool_calls,
     })
-}
-
-/// Merge one or more tool-result entries into a single JSON value.
-///
-/// When there is only one result (the common case) we return it
-/// directly; otherwise we return a JSON array so no data is lost.
-fn merge_tool_results(results: &[Value]) -> Value {
-    if results.len() == 1 {
-        results.first().cloned().unwrap_or(Value::Null)
-    } else {
-        Value::Array(results.to_vec())
-    }
 }
 
 /// Convert framework tool schemas into the OpenAI `tools` array shape.
@@ -852,36 +800,9 @@ fn input_to_string(v: &Value) -> String {
     }
 }
 
-// ==================================================
-// SSE line reader
-// ==================================================
-
-/// Minimal SSE line reader over an HTTP byte stream.
-///
-/// Buffers raw bytes from the response, splits on newlines, and yields
-/// the payload of each `data:` line (without the `data: ` prefix).
-/// A `[DONE]` sentinel terminates the stream.
-struct SseReader {
-    bytes: Pin<Box<dyn Stream<Item = Result<String, ApiError>> + Send>>,
-    buf: String,
-}
+use super::sse::SseReader;
 
 impl SseReader {
-    /// Wrap a streaming HTTP response.
-    ///
-    /// The byte stream is mapped to `String` chunks up-front so the
-    /// rest of the reader is pure string processing.
-    fn from_response(resp: Response) -> Self {
-        let bytes = resp.bytes_stream().map(|res| {
-            res.map(|b| String::from_utf8_lossy(&b).into_owned())
-                .map_err(|e| ApiError::http(e.to_string()))
-        });
-        Self {
-            bytes: Box::pin(bytes),
-            buf: String::new(),
-        }
-    }
-
     /// Extract the next SSE `data:` payload, blocking until one is
     /// available or the stream ends.
     ///
@@ -890,9 +811,8 @@ impl SseReader {
     /// # Errors
     ///
     /// Returns [`ApiError`] if the underlying HTTP stream fails.
-    async fn next_data(&mut self) -> Result<Option<String>, ApiError> {
+    async fn next_openai_data(&mut self) -> Result<Option<String>, ApiError> {
         loop {
-            // Drain any complete lines already in the buffer.
             while let Some(line) = self.take_line() {
                 let Some(data) = line.strip_prefix(SSE_DATA_PREFIX) else {
                     continue;
@@ -902,47 +822,40 @@ impl SseReader {
                 }
                 return Ok(Some(data.into()));
             }
-
-            // Fetch the next chunk from the network.
-            match self.bytes.next().await {
-                Some(Ok(chunk)) => {
-                    self.buf.push_str(&chunk);
-                    if self.buf.len() > SSE_MAX_BUFFER {
-                        return Err(ApiError::http(format!(
-                            "SSE buffer exceeded {SSE_MAX_BUFFER} bytes"
-                        )));
-                    }
-                }
-                Some(Err(e)) => return Err(e),
-                None => return Ok(None),
+            if self.next_chunk().await?.is_none() {
+                return Ok(None);
             }
         }
     }
-
-    /// Pop the first `\n`-terminated line from the internal buffer.
-    ///
-    /// Returns the trimmed line if a newline is present, and removes it
-    /// (plus the newline) from the buffer. Returns `None` if the buffer
-    /// does not yet contain a complete line — the caller should wait for
-    /// more bytes from the HTTP stream.
-    fn take_line(&mut self) -> Option<String> {
-        let pos = self.buf.find('\n')?;
-        let line = self.buf[..pos].trim().to_string();
-        let rest_start = pos.saturating_add(1);
-        self.buf = self.buf.get(rest_start..).unwrap_or_default().to_string();
-        Some(line)
-    }
 }
 
-// ==================================================
-// OpenAI chunk types
-// ==================================================
-
 /// A single SSE chunk from the OpenAI streaming API.
+///
+/// Each `data:` line in a streamed Chat Completions response deserializes
+/// into one of these. The chunk carries the message identity, the model
+/// that produced it, and a list of [`OpenAiChoice`] deltas that the
+/// [`StreamEmitter`] assembles into [`StreamEvent`]s.
 #[derive(Deserialize)]
 struct OpenAiChunk {
+    /// Server-assigned identifier for the overall completion.
+    ///
+    /// Stable across every chunk in a single streamed response (for
+    /// example `chatcmpl-abc123`); emitted once as the message id in
+    /// the initial [`MessageStart`].
     id: String,
+
+    /// Name of the model that produced this chunk.
+    ///
+    /// Echoed back by the server on the first chunk; forwarded in the
+    /// initial [`MessageStart`] so downstream consumers know which model
+    /// answered, even after a fallback switch.
     model: String,
+
+    /// One entry per alternative the model is generating.
+    ///
+    /// In practice OpenAI streams a single choice (`n=1`), so this
+    /// vector usually holds exactly one [`OpenAiChoice`] carrying the
+    /// incremental [`OpenAiDelta`] for this chunk.
     choices: Vec<OpenAiChoice>,
 }
 
@@ -966,36 +879,112 @@ impl OpenAiChunk {
     }
 }
 
+/// A single alternative within an [`OpenAiChunk`].
+///
+/// Carries the incremental content for this turn (in `delta`) and, on
+/// the final chunk for the choice, the reason the model stopped (in
+/// `finish_reason`).
 #[derive(Deserialize)]
 struct OpenAiChoice {
+    /// Incremental content for this chunk, or `None` on the terminal
+    /// chunk that carries only a `finish_reason`.
     delta: Option<OpenAiDelta>,
+
+    /// Why the model stopped generating, present only on the last chunk.
+    ///
+    /// Common values are `"stop"`, `"tool_calls"`, and `"length"`; the
+    /// [`StreamEmitter`] maps it to a [`StreamEvent`] stop reason.
     finish_reason: Option<String>,
 }
 
+/// Incremental content delivered by one chunk.
+///
+/// Mirrors the `delta` object in OpenAI's streaming protocol. Every
+/// field is optional because a single chunk typically populates only
+/// the field it is extending (text content, reasoning, or a tool call).
 #[derive(Deserialize)]
 struct OpenAiDelta {
+    /// Incremental assistant text for this chunk.
+    ///
+    /// Concatenated across chunks to reconstruct the full message body.
     content: Option<String>,
+
+    /// Incremental chain-of-thought / reasoning text.
+    ///
+    /// Some models (e.g. o1-style reasoning models) emit their private
+    /// reasoning here under `reasoning_content`; the `reasoning` alias
+    /// covers providers that use the shorter key.
     #[serde(alias = "reasoning")]
     reasoning_content: Option<String>,
+
+    /// Incremental tool-call fragments for this chunk.
+    ///
+    /// Tool calls arrive across multiple chunks keyed by `index`; the
+    /// [`StreamEmitter`] accumulates them per index until each call's
+    /// arguments are complete.
     tool_calls: Option<Vec<OpenAiToolCallDelta>>,
 }
 
+/// Incremental fragment of a single tool call within a chunk.
+///
+/// OpenAI streams tool calls in pieces: the first chunk for a given
+/// `index` carries the call `id` and function `name`, subsequent chunks
+/// append to `arguments`. The [`StreamEmitter`] reassembles these per
+/// index.
 #[derive(Deserialize)]
 struct OpenAiToolCallDelta {
+    /// Server-assigned identifier for the tool call.
+    ///
+    /// Present only on the first chunk for this `index`; continuation
+    /// chunks omit it. The emitter latches it on the first chunk and
+    /// forwards it as the call id so the host can match the result
+    /// later. Defaults to `None` when the server omits the field.
+    #[serde(default)]
+    id: Option<String>,
+
+    /// Position of this tool call in the request's tool list.
+    ///
+    /// Used to correlate fragments across chunks — chunks with the same
+    /// `index` belong to the same tool call.
     index: usize,
-    id: String,
+
+    /// Function name and accumulated arguments for this tool call.
+    ///
+    /// `None` on chunks that carry no function update (for example a
+    /// chunk that only extends a different tool call's `arguments`).
+    /// When present, the inner [`OpenAiToolCallFunction`] holds either
+    /// the function `name` (first chunk for this `index`) or a fragment
+    /// of the JSON `arguments` (subsequent chunks) — the
+    /// [`StreamEmitter`] reassembles both per index.
+    #[serde(default)]
     function: Option<OpenAiToolCallFunction>,
 }
 
-#[derive(Deserialize)]
+/// Name and arguments of a tool call, as carried by an [`OpenAiToolCallDelta`].
+///
+/// The `name` arrives on the first chunk for a tool call; `arguments`
+/// is a JSON string that may itself arrive in fragments across several
+/// chunks and must be concatenated before parsing.
+#[derive(Deserialize, Default)]
 struct OpenAiToolCallFunction {
-    name: String,
+    /// Accumulated JSON arguments for the tool call.
+    ///
+    /// A partial JSON string that grows across chunks; the emitter
+    /// buffers it per `index` and hands the complete string to the
+    /// caller once the part stops.
+    #[serde(default)]
     arguments: String,
-}
 
-// ==================================================
-// Stream event emitter
-// ==================================================
+    /// Fully-qualified name of the tool to invoke.
+    ///
+    /// Matches the `name` the tool was registered under in the request's
+    /// `tools` array. Arrives on the first chunk for a given `index`
+    /// only; continuation chunks for the same call omit it, so the
+    /// emitter latches this value on the first chunk and ignores it on
+    /// later ones. Defaults to `None` when the server omits the field.
+    #[serde(default)]
+    name: Option<String>,
+}
 
 /// Stateful translator that converts a sequence of [`OpenAiChunk`]s
 /// into [`StreamEvent`]s.
@@ -1036,12 +1025,24 @@ struct StreamEmitter {
     /// to the text lane.
     thinking_part_open: bool,
 
+    /// Tool-call indices that have already had their
+    /// [`StreamEvent::PartStart`] emitted.
+    ///
+    /// OpenAI streams a single tool call across many chunks, all sharing
+    /// the same `index`: the first carries the call `id` and function
+    /// `name`, and every later chunk carries only an `arguments`
+    /// fragment (still under `function`). Gating `PartStart` on
+    /// `function.is_some()` would re-emit it on every fragment and wipe
+    /// the accumulator's buffered arguments. Tracking seen indices lets
+    /// the emitter open each part exactly once.
+    seen_tool_indices: Vec<usize>,
+
     /// Number of tool-call parts currently open.
     ///
-    /// Each `delta.tool_calls` entry with a `function` field opens a new
-    /// tool part via [`StreamEvent::PartStart`]. The counter drives the
-    /// matching batch of `PartStop` emissions on finish (one per open
-    /// tool) so callers see balanced part lifecycles.
+    /// Each distinct tool `index` opens one tool part via
+    /// [`StreamEvent::PartStart`]. The counter drives the matching batch
+    /// of `PartStop` emissions on finish (one per open tool) so callers
+    /// see balanced part lifecycles.
     open_tool_count: usize,
 
     /// Whether the terminal stop signal has been processed.
@@ -1158,23 +1159,26 @@ impl StreamEmitter {
 
     /// Handle a single tool-call delta from the stream.
     ///
-    /// On the first delta for a tool call (when `function` is present),
-    /// emits a [`PartStart`](StreamEvent::PartStart) with a
-    /// [`ToolCall`](crate::message::MessagePart::ToolCall) part carrying the
-    /// tool ID and name. Subsequent deltas carrying `function.arguments`
-    /// fragments emit [`InputJson`](crate::stream::DeltaPart::InputJson)
-    /// events so the caller can accumulate the full JSON input.
+    /// OpenAI streams one tool call across many chunks that share an
+    /// `index`: the first carries the call `id` and function `name`
+    /// under `function`; every later chunk carries only an `arguments`
+    /// fragment (still under `function`). The emitter opens the part
+    /// with [`StreamEvent::PartStart`] exactly once per `index` (on the
+    /// first chunk it sees for that index), then forwards every
+    /// non-empty `arguments` fragment as an
+    /// [`InputJson`](crate::stream::DeltaPart::InputJson) delta so the
+    /// caller can concatenate them into the full JSON input.
     fn process_tool_call(&mut self, tc: &OpenAiToolCallDelta) {
-        if tc.function.is_some() {
-            // New tool call — emit PartStart.
+        if tc.function.is_some() && !self.seen_tool_indices.contains(&tc.index) {
+            self.seen_tool_indices.push(tc.index);
             self.push(StreamEvent::PartStart(PartStart {
                 index: tc.index,
                 part: Some(MessagePart::ToolCall {
-                    id: tc.id.clone(),
+                    id: tc.id.clone().unwrap_or_default(),
                     name: tc
                         .function
                         .as_ref()
-                        .map(|f| f.name.clone())
+                        .and_then(|f| f.name.clone())
                         .unwrap_or_default(),
                     input: Value::Null,
                 }),
@@ -1182,7 +1186,6 @@ impl StreamEmitter {
             self.open_tool_count = self.open_tool_count.saturating_add(1);
         }
 
-        // Stream argument fragments.
         if let Some(func) = &tc.function
             && !func.arguments.is_empty()
         {
@@ -1210,17 +1213,14 @@ impl StreamEmitter {
         }
         self.finished = true;
 
-        // Close any open text part.
         if self.text_part_open {
             self.push(StreamEvent::PartStop);
         }
 
-        // Close any open reasoning (thinking) part.
         if self.thinking_part_open {
             self.push(StreamEvent::PartStop);
         }
 
-        // Close each open tool-call part.
         for _ in 0..self.open_tool_count {
             self.push(StreamEvent::PartStop);
         }
@@ -1270,10 +1270,6 @@ impl StreamEmitter {
         self.pending.push(ev);
     }
 }
-
-// ==================================================
-// Tests
-// ==================================================
 
 #[cfg(test)]
 mod tests {
@@ -1360,7 +1356,7 @@ mod tests {
     #[test]
     fn convert_message_user_text() {
         let m = Message::user("hello world");
-        let v = convert_message(&m);
+        let v = convert_message(&m).remove(0);
         assert_eq!(v["role"], "user");
         assert_eq!(v["content"], "hello world");
     }
@@ -1368,7 +1364,7 @@ mod tests {
     #[test]
     fn convert_message_assistant_text() {
         let m = Message::new(Role::Assistant, vec![MessagePart::text("hi there")]);
-        let v = convert_message(&m);
+        let v = convert_message(&m).remove(0);
         assert_eq!(v["role"], "assistant");
         assert_eq!(v["content"], "hi there");
     }
@@ -1383,7 +1379,7 @@ mod tests {
                 input: serde_json::json!({"message": "hi"}),
             }],
         );
-        let v = convert_message(&m);
+        let v = convert_message(&m).remove(0);
         assert_eq!(v["role"], "assistant");
         assert!(v["content"].is_null());
         let calls = v["tool_calls"].as_array().unwrap();
@@ -1391,7 +1387,6 @@ mod tests {
         assert_eq!(calls[0]["id"], "call_1");
         assert_eq!(calls[0]["type"], "function");
         assert_eq!(calls[0]["function"]["name"], "echo");
-        // arguments should be stringified JSON
         assert_eq!(
             calls[0]["function"]["arguments"].as_str().unwrap(),
             r#"{"message":"hi"}"#
@@ -1408,10 +1403,35 @@ mod tests {
                 is_error: None,
             }],
         );
-        let v = convert_message(&m);
+        let v = convert_message(&m).remove(0);
         assert_eq!(v["role"], "tool");
         assert_eq!(v["tool_call_id"], "call_1");
         assert!(v["content"].is_string());
+    }
+
+    #[test]
+    fn convert_message_multiple_tool_results_expand() {
+        let m = Message::new(
+            Role::User,
+            vec![
+                MessagePart::ToolResult {
+                    call_id: "call_1".into(),
+                    output: ToolContent::from_string("a"),
+                    is_error: None,
+                },
+                MessagePart::ToolResult {
+                    call_id: "call_2".into(),
+                    output: ToolContent::from_string("b"),
+                    is_error: None,
+                },
+            ],
+        );
+        let vs = convert_message(&m);
+        assert_eq!(vs.len(), 2, "two tool results expand to two messages");
+        assert_eq!(vs[0]["role"], "tool");
+        assert_eq!(vs[0]["tool_call_id"], "call_1");
+        assert_eq!(vs[1]["role"], "tool");
+        assert_eq!(vs[1]["tool_call_id"], "call_2");
     }
 
     #[test]
@@ -1510,7 +1530,6 @@ mod tests {
         em.process_chunk(&chunk);
 
         let events = em.drain();
-        // MessageStart, PartStart(0), IndexedDelta(Text)
         assert_eq!(events.len(), 3);
         assert!(matches!(
             events[1],
@@ -1544,7 +1563,6 @@ mod tests {
         em.process_chunk(&chunk0);
         em.drain();
 
-        // Tool call delta.
         let chunk = OpenAiChunk::parse(
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
         )
@@ -1552,7 +1570,6 @@ mod tests {
         em.process_chunk(&chunk);
         let events = em.drain();
 
-        // PartStart(tool) + IndexedDelta(InputJson)
         assert_eq!(events.len(), 2);
         assert!(matches!(
             events[0],
@@ -1562,6 +1579,160 @@ mod tests {
             events[1],
             StreamEvent::IndexedDelta(ref d) if d.index == 1
         ));
+    }
+
+    #[test]
+    fn emitter_multi_chunk_tool_call_emits_part_start_once() {
+        let mut em = StreamEmitter::default();
+        let chunk0 = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":null},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&chunk0);
+        em.drain();
+
+        let header = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&header);
+        em.drain();
+
+        let fragment = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&fragment);
+        let events = em.drain();
+        let deltas: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::IndexedDelta(_)))
+            .collect();
+        assert_eq!(
+            deltas.len(),
+            1,
+            "follow-up chunk must emit only an argument delta, not a PartStart"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, StreamEvent::PartStart(_)))
+        );
+        assert_eq!(em.open_tool_count, 1);
+    }
+
+    #[test]
+    fn emitter_multi_chunk_tool_call_accumulates_through_accumulator() {
+        use crate::stream::StreamAccumulator;
+        let mut em = StreamEmitter::default();
+        let mut acc = StreamAccumulator::new();
+        let chunks = [
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":null},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
+        ];
+        for raw in chunks {
+            let chunk = OpenAiChunk::parse(raw).unwrap();
+            em.process_chunk(&chunk);
+            for ev in em.drain() {
+                acc.process(&ev).unwrap();
+            }
+        }
+        for ev in em.finish() {
+            acc.process(&ev).unwrap();
+        }
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 1);
+        match &msg.parts[0] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "echo");
+                assert_eq!(input, &serde_json::json!({"msg": "hi"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emitter_two_interleaved_multi_chunk_tool_calls_accumulate() {
+        use crate::stream::StreamAccumulator;
+
+        let mut em = StreamEmitter::default();
+        let mut acc = StreamAccumulator::new();
+        let chunks = [
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":null},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"search","arguments":"{\"q\":"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"b\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
+        ];
+        for raw in chunks {
+            let chunk = OpenAiChunk::parse(raw).unwrap();
+            em.process_chunk(&chunk);
+            for ev in em.drain() {
+                acc.process(&ev).unwrap();
+            }
+        }
+        for ev in em.finish() {
+            acc.process(&ev).unwrap();
+        }
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 2, "two tool calls expected");
+        match &msg.parts[0] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "echo");
+                assert_eq!(input, &serde_json::json!({"msg": "a"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match &msg.parts[1] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "search");
+                assert_eq!(input, &serde_json::json!({"q": "b"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emitter_real_continuation_chunks_omit_id_and_name() {
+        use crate::stream::StreamAccumulator;
+
+        let mut em = StreamEmitter::default();
+        let mut acc = StreamAccumulator::new();
+        let chunks = [
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":null},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
+        ];
+        for raw in chunks {
+            let chunk = OpenAiChunk::parse(raw).expect("real chunk shape must deserialize");
+            em.process_chunk(&chunk);
+            for ev in em.drain() {
+                acc.process(&ev).expect("accumulator accepts events");
+            }
+        }
+        for ev in em.finish() {
+            acc.process(&ev).expect("accumulator accepts finish events");
+        }
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 1, "one tool call expected");
+        match &msg.parts[0] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "echo");
+                assert_eq!(
+                    input,
+                    &serde_json::json!({"msg": "hi"}),
+                    "continuation fragment must accumulate, not be dropped"
+                );
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1726,24 +1897,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_tool_results_single() {
-        let r = serde_json::json!({"role": "tool", "content": "ok"});
-        let merged = merge_tool_results(std::slice::from_ref(&r));
-        assert_eq!(merged, r);
-    }
-
-    #[test]
-    fn merge_tool_results_multiple() {
-        let results = vec![
-            serde_json::json!({"role": "tool", "content": "a"}),
-            serde_json::json!({"role": "tool", "content": "b"}),
-        ];
-        let merged = merge_tool_results(&results);
-        assert!(merged.is_array());
-        assert_eq!(merged.as_array().unwrap().len(), 2);
-    }
-
-    #[test]
     fn sse_reader_take_line_extracts_newline_terminated() {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
@@ -1797,7 +1950,7 @@ mod tests {
     async fn sse_reader_take_line_splits_on_newline() {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
-            buf: "data: hello\ndata: world\n".to_string(),
+            buf: "data: hello\ndata: world\n".to_string().into_bytes(),
         };
         assert_eq!(reader.take_line(), Some("data: hello".to_string()));
         assert_eq!(reader.take_line(), Some("data: world".to_string()));
@@ -1807,39 +1960,39 @@ mod tests {
     #[tokio::test]
     async fn sse_reader_next_data_extracts_payload() {
         let data = "data: {\"id\":\"c1\",\"model\":\"gpt-4o\",\"choices\":[]}\n\n";
-        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(data.to_string())]);
+        let stream =
+            futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(data.to_string().into())]);
         let mut reader = SseReader {
             bytes: Box::pin(stream),
-            buf: String::new(),
+            buf: Vec::new(),
         };
-        let result = reader.next_data().await.unwrap();
+        let result = reader.next_openai_data().await.unwrap();
         assert!(result.is_some());
         assert!(result.unwrap().contains("c1"));
     }
 
     #[tokio::test]
     async fn sse_reader_next_data_done_returns_none() {
-        let stream =
-            futures::stream::iter(vec![Ok::<String, ApiError>("data: [DONE]\n\n".to_string())]);
+        let stream = futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(
+            "data: [DONE]\n\n".into(),
+        )]);
         let mut reader = SseReader {
             bytes: Box::pin(stream),
-            buf: String::new(),
+            buf: Vec::new(),
         };
-        let result = reader.next_data().await.unwrap();
+        let result = reader.next_openai_data().await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn sse_reader_buffer_overflow_returns_error() {
-        // Feed a chunk larger than SSE_MAX_BUFFER without any newline so
-        // the buffer grows unbounded — the cap should catch it.
-        let huge = "x".repeat(SSE_MAX_BUFFER + 1);
-        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(huge)]);
-        let mut reader = SseReader {
+        let huge = "x".repeat(2 * 1024 * 1024);
+        let stream = futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(huge.into())]);
+        let mut reader = super::SseReader {
             bytes: Box::pin(stream),
-            buf: String::new(),
+            buf: Vec::new(),
         };
-        let result = reader.next_data().await;
+        let result = reader.next_openai_data().await;
         assert!(result.is_err(), "should error on buffer overflow");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -1850,20 +2003,20 @@ mod tests {
 
     #[test]
     fn max_response_body_is_ten_mb() {
-        assert_eq!(MAX_RESPONSE_BODY, 10 * 1024 * 1024);
+        assert_eq!(super::super::MAX_RESPONSE_BODY, 10 * 1024 * 1024);
     }
 
     #[test]
     fn body_size_check_rejects_oversized() {
         // Verify the comparison logic used in create_message.
-        let oversized = MAX_RESPONSE_BODY + 1;
-        assert!(oversized > MAX_RESPONSE_BODY);
+        let oversized = super::super::MAX_RESPONSE_BODY + 1;
+        assert!(oversized > super::super::MAX_RESPONSE_BODY);
     }
 
     #[test]
     fn body_size_check_accepts_within_limit() {
-        let within = MAX_RESPONSE_BODY;
-        assert!(within <= MAX_RESPONSE_BODY);
+        let within = super::super::MAX_RESPONSE_BODY;
+        assert!(within <= super::super::MAX_RESPONSE_BODY);
     }
 
     #[test]
@@ -2151,7 +2304,7 @@ mod tests {
         // Role::System message is emitted verbatim (not folded into a
         // top-level field).
         let msg = Message::new(Role::System, vec![MessagePart::text("stay on task")]);
-        let value = convert_message(&msg);
+        let value = convert_message(&msg).remove(0);
         assert_eq!(value["role"], "system");
         assert_eq!(value["content"], "stay on task");
     }

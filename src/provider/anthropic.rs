@@ -21,8 +21,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use futures::stream::{Stream, StreamExt};
-use reqwest::Response;
+use futures::stream::Stream;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -37,10 +36,6 @@ use crate::structured::ToolConstraint;
 use crate::structured::tighten_json_schema;
 use crate::tool::ToolSchema;
 
-// ==================================================
-// Constants
-// ==================================================
-
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -48,13 +43,7 @@ const SSE_EVENT_PREFIX: &str = "event: ";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
-const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 Mb
-const SSE_MAX_BUFFER: usize = 1024 * 1024; // 1 Mb
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
-
-// ==================================================
-// Client
-// ==================================================
 
 /// An Anthropic Claude chat client with streaming support.
 ///
@@ -223,34 +212,31 @@ impl ApiClient for AnthropicClient {
 
     fn stream_messages(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
         self.stream_messages_with_options(request, crate::structured::RequestOptions::default())
     }
 
     fn create_message(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
         self.create_message_with_options(request, crate::structured::RequestOptions::default())
     }
 
     fn stream_messages_with_options(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let crate::api::StreamRequest {
-            messages,
-            system,
-            tools,
-        } = request;
+        let system = request.system.clone();
+        let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = build_request_body(
             &RequestBodySpec {
                 model: &model,
-                messages: &messages,
+                messages: &request.messages,
                 system: system.as_deref(),
                 tools: tools.as_deref(),
                 response_format: rf,
@@ -283,20 +269,17 @@ impl ApiClient for AnthropicClient {
 
     fn create_message_with_options(
         &self,
-        request: crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-        let crate::api::StreamRequest {
-            messages,
-            system,
-            tools,
-        } = request;
+        let system = request.system.clone();
+        let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
         let rf = options.response_format.as_ref();
         let body = build_request_body(
             &RequestBodySpec {
                 model: &model,
-                messages: &messages,
+                messages: &request.messages,
                 system: system.as_deref(),
                 tools: tools.as_deref(),
                 response_format: rf,
@@ -312,13 +295,7 @@ impl ApiClient for AnthropicClient {
                 .bytes()
                 .await
                 .map_err(|e| ApiError::http(e.to_string()))?;
-            if resp.len() > MAX_RESPONSE_BODY {
-                return Err(ApiError::http(format!(
-                    "response body too large: {} bytes (max {})",
-                    resp.len(),
-                    MAX_RESPONSE_BODY
-                )));
-            }
+            super::check_response_body(resp.len())?;
             serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
@@ -338,10 +315,6 @@ impl ApiClient for AnthropicClient {
             .unwrap_or_else(|| raw.clone())
     }
 }
-
-// ==================================================
-// Builder
-// ==================================================
 
 /// Builder for [`AnthropicClient`].
 ///
@@ -523,10 +496,6 @@ impl AnthropicClientBuilder {
         })
     }
 }
-
-// ==================================================
-// Request body construction
-// ==================================================
 
 /// The per-request inputs to [`build_request_body`].
 ///
@@ -775,33 +744,9 @@ fn convert_tools(tools: &[ToolSchema], strict: bool) -> Vec<Value> {
         .collect()
 }
 
-// ==================================================
-// SSE line reader
-// ==================================================
-
-/// Minimal SSE line reader over an HTTP byte stream.
-///
-/// Buffers raw bytes from the response, splits on newlines, and yields
-/// `(event_type, data)` pairs. Anthropic SSE uses separate `event:` and
-/// `data:` lines for each event.
-struct SseReader {
-    bytes: Pin<Box<dyn Stream<Item = Result<String, ApiError>> + Send>>,
-    buf: String,
-}
+use super::sse::SseReader;
 
 impl SseReader {
-    /// Wrap a streaming HTTP response.
-    fn from_response(resp: Response) -> Self {
-        let bytes = resp.bytes_stream().map(|res| {
-            res.map(|b| String::from_utf8_lossy(&b).into_owned())
-                .map_err(|e| ApiError::http(e.to_string()))
-        });
-        Self {
-            bytes: Box::pin(bytes),
-            buf: String::new(),
-        }
-    }
-
     /// Extract the next SSE event as `(event_type, data_json)`.
     ///
     /// Returns `Ok(None)` at end-of-stream.
@@ -817,24 +762,8 @@ impl SseReader {
         loop {
             while let Some(line) = self.take_line() {
                 if line.is_empty() {
-                    // Blank line = event boundary. Emit if we have one.
                     if have_event {
-                        let parsed = if data.is_empty() {
-                            None
-                        } else {
-                            match serde_json::from_str(&data) {
-                                Ok(v) => Some(v),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        event_type = %event_type,
-                                        data_len = data.len(),
-                                        "failed to parse Anthropic SSE data, skipping"
-                                    );
-                                    None
-                                }
-                            }
-                        };
+                        let parsed = Self::parse_event_data(&data, &event_type);
                         return Ok(Some((event_type, parsed)));
                     }
                     continue;
@@ -844,10 +773,6 @@ impl SseReader {
                     event_type = ev.into();
                     have_event = true;
                 } else if let Some(d) = line.strip_prefix(SSE_DATA_PREFIX) {
-                    // Per the SSE specification, multiple consecutive `data:`
-                    // lines must be concatenated with `\n` to form a single
-                    // event payload.  Using assignment here would silently
-                    // discard earlier data lines.
                     if data.is_empty() {
                         data = d.into();
                     } else {
@@ -858,56 +783,35 @@ impl SseReader {
                 }
             }
 
-            match self.bytes.next().await {
-                Some(Ok(chunk)) => {
-                    self.buf.push_str(&chunk);
-                    if self.buf.len() > SSE_MAX_BUFFER {
-                        return Err(ApiError::http(format!(
-                            "SSE buffer exceeded {SSE_MAX_BUFFER} bytes"
-                        )));
-                    }
+            if self.next_chunk().await?.is_none() {
+                if have_event {
+                    let parsed = Self::parse_event_data(&data, &event_type);
+                    return Ok(Some((event_type, parsed)));
                 }
-                Some(Err(e)) => return Err(e),
-                None => {
-                    // End of stream — emit any pending event.
-                    if have_event {
-                        let parsed = if data.is_empty() {
-                            None
-                        } else {
-                            match serde_json::from_str(&data) {
-                                Ok(v) => Some(v),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        event_type = %event_type,
-                                        data_len = data.len(),
-                                        "failed to parse Anthropic SSE data (stream end), skipping"
-                                    );
-                                    None
-                                }
-                            }
-                        };
-                        return Ok(Some((event_type, parsed)));
-                    }
-                    return Ok(None);
-                }
+                return Ok(None);
             }
         }
     }
 
-    /// Pop the first `\n`-terminated line from the buffer, if present.
-    fn take_line(&mut self) -> Option<String> {
-        let pos = self.buf.find('\n')?;
-        let line = self.buf[..pos].trim().to_string();
-        let rest_start = pos.saturating_add(1);
-        self.buf = self.buf.get(rest_start..).unwrap_or_default().to_string();
-        Some(line)
+    /// Parse the accumulated `data` string into JSON, logging on failure.
+    fn parse_event_data(data: &str, event_type: &str) -> Option<Value> {
+        if data.is_empty() {
+            return None;
+        }
+        match serde_json::from_str(data) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    event_type = %event_type,
+                    data_len = data.len(),
+                    "failed to parse Anthropic SSE data, skipping"
+                );
+                None
+            }
+        }
     }
 }
-
-// ==================================================
-// Stream event emitter
-// ==================================================
 
 /// Stateful translator that converts Anthropic SSE events into
 /// [`StreamEvent`]s.
@@ -1323,10 +1227,6 @@ impl StreamEmitter {
         self.pending.push(ev);
     }
 }
-
-// ==================================================
-// Tests
-// ==================================================
 
 #[cfg(test)]
 mod tests {
@@ -1878,7 +1778,9 @@ mod tests {
     async fn sse_reader_take_line_splits_on_newline() {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
-            buf: "event: message_start\ndata: {}\n\n".to_string(),
+            buf: "event: message_start\ndata: {}\n\n"
+                .to_string()
+                .into_bytes(),
         };
         assert_eq!(reader.take_line(), Some("event: message_start".to_string()));
         assert_eq!(reader.take_line(), Some("data: {}".to_string()));
@@ -1888,10 +1790,11 @@ mod tests {
     #[tokio::test]
     async fn sse_reader_next_event_extracts_payload() {
         let chunk = "event: content_block_delta\ndata: {\"type\":\"text_delta\"}\n\n";
-        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(chunk.to_string())]);
+        let stream =
+            futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(chunk.to_string().into())]);
         let mut reader = SseReader {
             bytes: Box::pin(stream),
-            buf: String::new(),
+            buf: Vec::new(),
         };
         let result = reader.next_event().await.unwrap();
         assert!(result.is_some());
@@ -1903,10 +1806,11 @@ mod tests {
     #[tokio::test]
     async fn sse_reader_next_event_concatenates_multiline_data() {
         let chunk = "event: content_block_delta\ndata: {\"type\":\"text_delta\",\ndata: \"text\":\"hello\"}\n\n";
-        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(chunk.to_string())]);
+        let stream =
+            futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(chunk.to_string().into())]);
         let mut reader = SseReader {
             bytes: Box::pin(stream),
-            buf: String::new(),
+            buf: Vec::new(),
         };
         let result = reader.next_event().await.unwrap();
         assert!(result.is_some());
@@ -1926,10 +1830,11 @@ mod tests {
         // Malformed JSON data should be logged and returned as None for the
         // data payload, but the event_type is still captured (H4).
         let chunk = "event: ping\ndata: not valid json\n\n";
-        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(chunk.to_string())]);
+        let stream =
+            futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(chunk.to_string().into())]);
         let mut reader = SseReader {
             bytes: Box::pin(stream),
-            buf: String::new(),
+            buf: Vec::new(),
         };
         let result = reader.next_event().await.unwrap();
         assert!(result.is_some());
@@ -1940,11 +1845,11 @@ mod tests {
 
     #[tokio::test]
     async fn sse_reader_buffer_overflow_returns_error() {
-        let huge = "x".repeat(SSE_MAX_BUFFER + 1);
-        let stream = futures::stream::iter(vec![Ok::<String, ApiError>(huge)]);
-        let mut reader = SseReader {
+        let huge = "x".repeat(2 * 1024 * 1024);
+        let stream = futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(huge.into())]);
+        let mut reader = super::SseReader {
             bytes: Box::pin(stream),
-            buf: String::new(),
+            buf: Vec::new(),
         };
         let result = reader.next_event().await;
         assert!(result.is_err(), "should error on buffer overflow");
@@ -1957,7 +1862,7 @@ mod tests {
 
     #[test]
     fn max_response_body_is_ten_mb() {
-        assert_eq!(MAX_RESPONSE_BODY, 10 * 1024 * 1024);
+        assert_eq!(super::super::MAX_RESPONSE_BODY, 10 * 1024 * 1024);
     }
 
     #[test]

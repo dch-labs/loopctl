@@ -10,10 +10,24 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct TimeoutConfig {
     /// Per-tool execution deadline.
+    ///
+    /// Each tool invocation is given this long to complete before it is
+    /// cancelled and (optionally) retried. Set to [`Duration::MAX`] via
+    /// [`TimeoutMiddleware::none`] to disable the timeout entirely.
     pub timeout: Duration,
+
     /// Retry with exponential backoff up to [`max_retries`](TimeoutConfig::max_retries) times.
+    ///
+    /// When `true`, a timed-out call is retried with a doubled deadline
+    /// rather than failing immediately; when `false` the first timeout
+    /// produces the final error.
     pub retry_on_timeout: bool,
+
     /// Maximum number of retries (0 = no retry). Total attempts = `1 + max_retries`.
+    ///
+    /// Upper bound on additional attempts after the initial one. Each retry
+    /// doubles the deadline, so this also bounds how long the middleware will
+    /// keep trying before giving up.
     pub max_retries: u32,
 }
 

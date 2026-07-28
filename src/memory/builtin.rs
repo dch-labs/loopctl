@@ -122,10 +122,6 @@ pub struct InMemoryStore {
     entries: RwLock<Vec<MemoryEntry>>,
 }
 
-// ===================================================
-// Construction
-// ===================================================
-
 impl InMemoryStore {
     /// Create a new empty store.
     ///
@@ -176,10 +172,6 @@ impl Default for InMemoryStore {
         Self::new()
     }
 }
-
-// ===================================================
-// LoopMemory implementation
-// ===================================================
 
 #[allow(clippy::manual_async_fn)]
 impl LoopMemory for InMemoryStore {

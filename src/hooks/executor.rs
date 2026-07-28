@@ -23,7 +23,7 @@
 //!
 //! # Post-hook Execution Model
 //!
-//! For `on_post_*` and session hooks, the executor calls **all** hooks.
+//! For `on_post_*` and run hooks, the executor calls **all** hooks.
 //! There's no short-circuit because post-hooks are notification-only.
 //!
 //! # Thread Safety
@@ -40,7 +40,7 @@ use crate::hooks::HookAction;
 use crate::hooks::Interactivity;
 use crate::hooks::context::{
     CompactResult, PostCompactContext, PostToolUseContext, PreCompactContext, PreToolUseContext,
-    SessionEndContext, SessionStartContext,
+    RunEndContext, RunStartContext,
 };
 
 /// Executes hooks in registration order with short-circuit semantics.
@@ -55,7 +55,21 @@ use crate::hooks::context::{
 /// - [`Interactivity::Interactive`] — `Ask` passes through unchanged,
 ///   allowing the agent to present a prompt to the user.
 pub struct HookExecutor {
+    /// Registered hooks in the order they will be invoked.
+    ///
+    /// Stored as `Arc<dyn Hook>` so a single hook instance can be
+    /// shared across executors cheaply, and so the executor itself is
+    /// `Send + Sync`. The vector is append-only after construction and
+    /// never reordered.
     hooks: Vec<Arc<dyn Hook>>,
+
+    /// How [`HookAction::Ask`] results are handled.
+    ///
+    /// Set at construction (default
+    /// [`Interactivity::Headless`]) and applied by
+    /// [`apply_interactivity`](Self::apply_interactivity) to every
+    /// pre-tool-use result. Headless downgrades `Ask` to `Block`;
+    /// interactive passes it through unchanged.
     interactivity: Interactivity,
 }
 
@@ -78,30 +92,38 @@ impl HookExecutor {
         }
     }
 
-    /// Set the interactivity mode.
+    /// Set the interactivity mode (builder style).
     ///
-    /// Use this builder method to change the mode after construction, or
-    /// [`with_hook`](Self::with_hook) to add hooks via the builder pattern.
+    /// Overrides the default [`Interactivity::Headless`] set by
+    /// [`new`](Self::new). Switch to [`Interactivity::Interactive`] when
+    /// a human is available to confirm [`HookAction::Ask`] prompts, so
+    /// they pass through unchanged instead of being downgraded to
+    /// [`HookAction::Block`].
     #[must_use]
     pub fn with_interactivity(mut self, interactivity: Interactivity) -> Self {
         self.interactivity = interactivity;
         self
     }
 
-    /// Register a hook (builder pattern).
+    /// Register a hook via the builder pattern.
     ///
-    /// Hooks are called in registration order. Returns `self`
-    /// for chaining: `HookExecutor::new().with_hook(a).with_hook(b)`.
+    /// Appends `hook` to the end of the execution list, so hooks fire
+    /// in registration order. Returns `self` for chaining — for example
+    /// `HookExecutor::new().with_hook(a).with_hook(b)`. Use
+    /// [`register`](Self::register) instead when you need to mutate an
+    /// existing executor.
     #[must_use]
     pub fn with_hook(mut self, hook: Arc<dyn Hook>) -> Self {
         self.hooks.push(hook);
         self
     }
 
-    /// Register a hook (mutating).
+    /// Register a hook by mutating the executor in place.
     ///
-    /// Appends a hook to the end of the execution list.
-    /// Unlike [`with_hook`](Self::with_hook), this takes `&mut self`.
+    /// Appends `hook` to the end of the execution list, mirroring
+    /// [`with_hook`](Self::with_hook) but taking `&mut self` instead of
+    /// consuming the executor. Useful when hooks are registered
+    /// conditionally after construction.
     pub fn register(&mut self, hook: Arc<dyn Hook>) {
         self.hooks.push(hook);
     }
@@ -120,17 +142,15 @@ impl HookExecutor {
         }
     }
 
-    /// Number of registered hooks.
+    /// Number of hooks currently registered.
     ///
-    /// Returns 0 for a freshly constructed executor.
+    /// Returns `0` for a freshly constructed executor. Cheap (`O(1)`)
+    /// since it reads the vector length directly; safe to call from
+    /// hot paths.
     #[must_use]
     pub fn hook_count(&self) -> usize {
         self.hooks.len()
     }
-
-    // ==================================================
-    // Pre-hook checks (short-circuit on first non-None)
-    // ==================================================
 
     /// Check pre-tool-use hooks.
     ///
@@ -167,10 +187,15 @@ impl HookExecutor {
         Box::pin(async move { action })
     }
 
-    /// Check pre-compact hooks. Merges results from all hooks:
-    /// - If any hook aborts, returns immediately with abort.
-    /// - Instructions from later hooks override earlier ones.
-    /// - Additional contexts accumulate.
+    /// Check pre-compact hooks, merging results until the first abort.
+    ///
+    /// Hooks run in registration order. Each hook's
+    /// [`CompactResult`] is merged
+    /// into the accumulated result: `new_instructions` overrides earlier
+    /// values, and `additional_context` entries accumulate. If any hook
+    /// returns [`abort: true`](CompactResult::abort), execution stops
+    /// immediately and that abort result is returned — remaining hooks
+    /// are not called.
     #[must_use]
     pub fn check_pre_compact(&self, ctx: &PreCompactContext) -> CompactResult {
         let mut result = CompactResult::allow();
@@ -203,13 +228,13 @@ impl HookExecutor {
         Box::pin(async move { result })
     }
 
-    // ==================================================
-    // Post-hook notifications (all hooks run)
-    // ==================================================
-
-    /// Notify all post-tool-use hooks.
+    /// Notify every registered post-tool-use hook.
     ///
-    /// All registered hooks are called regardless of return value.
+    /// Fires [`Hook::on_post_tool_use`] on each hook in registration
+    /// order. There is no short-circuit and no return value —
+    /// post-hooks are notification-only, so every hook always runs.
+    /// Use this for logging, metrics, and side-effects like file
+    /// tracking.
     pub fn notify_post_tool_use(&self, ctx: &PostToolUseContext) {
         for hook in &self.hooks {
             hook.on_post_tool_use(ctx);
@@ -229,30 +254,41 @@ impl HookExecutor {
         Box::pin(async {})
     }
 
-    /// Notify all post-compact hooks.
+    /// Notify every registered post-compact hook.
     ///
-    /// All registered hooks are called regardless of return value.
+    /// Fires [`Hook::on_post_compact`] on each hook in registration
+    /// order with the compaction outcome (messages removed, tokens
+    /// saved, duration). Notification-only — every hook always runs,
+    /// regardless of any prior hook's behaviour. Use it for budget
+    /// tracking and post-compaction logging.
     pub fn notify_post_compact(&self, ctx: &PostCompactContext) {
         for hook in &self.hooks {
             hook.on_post_compact(ctx);
         }
     }
 
-    /// Notify all session-start hooks.
+    /// Notify every registered run-start hook.
     ///
-    /// All registered hooks are called regardless of return value.
-    pub fn notify_session_start(&self, ctx: &SessionStartContext) {
+    /// Fires [`Hook::on_run_start`] on each hook in registration
+    /// order, once, at the beginning of a run. Notification-only —
+    /// every hook always runs. Use it to initialize per-run state
+    /// (open resources, reset counters, emit a start log line).
+    pub fn notify_run_start(&self, ctx: &RunStartContext) {
         for hook in &self.hooks {
-            hook.on_session_start(ctx);
+            hook.on_run_start(ctx);
         }
     }
 
-    /// Notify all session-end hooks.
+    /// Notify every registered run-end hook.
     ///
-    /// All registered hooks are called regardless of return value.
-    pub fn notify_session_end(&self, ctx: &SessionEndContext) {
+    /// Fires [`Hook::on_run_end`] on each hook in registration
+    /// order, once, after the loop has terminated. Notification-only —
+    /// every hook always runs. Use it to flush resources, finalize
+    /// tracking, and emit a summary log line keyed off
+    /// [`RunEndContext::reason`].
+    pub fn notify_run_end(&self, ctx: &RunEndContext) {
         for hook in &self.hooks {
-            hook.on_session_end(ctx);
+            hook.on_run_end(ctx);
         }
     }
 
@@ -269,29 +305,29 @@ impl HookExecutor {
         Box::pin(async {})
     }
 
-    /// Async wrapper for [`notify_session_start`](Self::notify_session_start).
+    /// Async wrapper for [`notify_run_start`](Self::notify_run_start).
     ///
-    /// Runs all session-start hooks synchronously and wraps completion
+    /// Runs all run-start hooks synchronously and wraps completion
     /// in a `Pin<Box<Future>>` for async compatibility.
     #[must_use]
-    pub fn notify_session_start_async(
+    pub fn notify_run_start_async(
         &self,
-        ctx: &SessionStartContext,
+        ctx: &RunStartContext,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        self.notify_session_start(ctx);
+        self.notify_run_start(ctx);
         Box::pin(async {})
     }
 
-    /// Async wrapper for [`notify_session_end`](Self::notify_session_end).
+    /// Async wrapper for [`notify_run_end`](Self::notify_run_end).
     ///
-    /// Runs all session-end hooks synchronously and wraps completion
+    /// Runs all run-end hooks synchronously and wraps completion
     /// in a `Pin<Box<Future>>` for async compatibility.
     #[must_use]
-    pub fn notify_session_end_async(
+    pub fn notify_run_end_async(
         &self,
-        ctx: &SessionEndContext,
+        ctx: &RunEndContext,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        self.notify_session_end(ctx);
+        self.notify_run_end(ctx);
         Box::pin(async {})
     }
 }
@@ -299,7 +335,7 @@ impl HookExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::context::{CompactTrigger, SessionEndReason};
+    use crate::hooks::context::{CompactTrigger, RunEndReason};
     use serde_json::json;
 
     struct AllowHook;
@@ -501,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn session_start_end_notify_all() {
+    fn run_start_end_notify_all() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct CounterHook {
             starts: AtomicUsize,
@@ -511,10 +547,10 @@ mod tests {
             fn name(&self) -> &'static str {
                 "counter"
             }
-            fn on_session_start(&self, _ctx: &SessionStartContext) {
+            fn on_run_start(&self, _ctx: &RunStartContext) {
                 self.starts.fetch_add(1, Ordering::Relaxed);
             }
-            fn on_session_end(&self, _ctx: &SessionEndContext) {
+            fn on_run_end(&self, _ctx: &RunEndContext) {
                 self.ends.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -525,15 +561,15 @@ mod tests {
         let executor = HookExecutor::new()
             .with_hook(counter.clone())
             .with_hook(counter.clone());
-        executor.notify_session_start(&SessionStartContext {
+        executor.notify_run_start(&RunStartContext {
             session_id: uuid::Uuid::nil(),
             model: "test".to_string(),
             working_directory: "/tmp".to_string(),
         });
         assert_eq!(counter.starts.load(Ordering::Relaxed), 2);
-        executor.notify_session_end(&SessionEndContext {
+        executor.notify_run_end(&RunEndContext {
             session_id: uuid::Uuid::nil(),
-            reason: SessionEndReason::Complete,
+            reason: RunEndReason::Complete,
             total_turns: 5,
             total_tokens: 1000,
             duration_secs: 30,
@@ -601,9 +637,9 @@ mod tests {
     }
 
     #[test]
-    fn notify_session_start_empty_executor() {
+    fn notify_run_start_empty_executor() {
         let executor = HookExecutor::new();
-        executor.notify_session_start(&SessionStartContext {
+        executor.notify_run_start(&RunStartContext {
             session_id: uuid::Uuid::nil(),
             model: "test".to_string(),
             working_directory: "/tmp".to_string(),
@@ -611,11 +647,11 @@ mod tests {
     }
 
     #[test]
-    fn notify_session_end_empty_executor() {
+    fn notify_run_end_empty_executor() {
         let executor = HookExecutor::new();
-        executor.notify_session_end(&SessionEndContext {
+        executor.notify_run_end(&RunEndContext {
             session_id: uuid::Uuid::nil(),
-            reason: SessionEndReason::Complete,
+            reason: RunEndReason::Complete,
             total_turns: 0,
             total_tokens: 0,
             duration_secs: 0,

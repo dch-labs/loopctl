@@ -32,7 +32,7 @@ and tool implementations; the framework handles the rest.
 | [`middleware`](https://docs.rs/loopctl/latest/loopctl/middleware/index.html) | Tool dispatch pipeline: timeouts, permissions, output limits, unknown-tool handling |
 | [`observer`](https://docs.rs/loopctl/latest/loopctl/observer/index.html) | `LoopObserver` trait and `ObserverHost` for lifecycle event observation |
 | [`reflection`](https://docs.rs/loopctl/latest/loopctl/reflection/index.html) | Failure reflection and recovery strategies (`Reflector`, `RecoveryStrategy`) |
-| [`runtime`](https://docs.rs/loopctl/latest/loopctl/runtime/index.html) | `LoopRuntime` — the default infrastructure bundle |
+| [`managers`](https://docs.rs/loopctl/latest/loopctl/managers/index.html) | `LoopManagers` — the default infrastructure bundle |
 | [`stream`](https://docs.rs/loopctl/latest/loopctl/stream/index.html) | Streaming event types, accumulator, stop reasons, usage tracking |
 | [`tool`](https://docs.rs/loopctl/latest/loopctl/tool/index.html) | `Tool` trait, `ToolRegistry`, `ToolSchema`, `ToolOutput`, `FnTool` adapter |
 | [`hooks`](https://docs.rs/loopctl/latest/loopctl/hooks/index.html) | Bidirectional lifecycle control (allow/block/ask before tool use). *Requires `hooks` feature.* |
@@ -79,18 +79,19 @@ impl Tool for EchoTool {
 
 ```rust,no_run
 use loopctl::engine::BareLoop;
-use loopctl::engine::loop_core::Loop;
+use loopctl::engine::core::Loop;
+use loopctl::engine::RunConfig;
 use loopctl::tool::ToolRegistry;
-use loopctl::config::LoopConfig;
+use loopctl::config::SessionConfig;
 use std::sync::Arc;
 
 // 1. Bring your own API client (implements ApiClient trait)
 # struct MyClient;
 # use loopctl::api::ApiClient;
 # impl ApiClient for MyClient {
-#     fn model(&self) -> &str { "llm-70b" }
-#     fn stream_messages(&self, _req: loopctl::api::StreamRequest)
-#         -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<loopctl::stream::StreamEvent, loopctl::stream::StreamError>> + Send>> {
+#     fn model(&self) -> String { "llm-70b".to_string() }
+#     fn stream_messages(&self, _req: &loopctl::api::StreamRequest)
+#         -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<loopctl::stream::StreamEvent, loopctl::api::error::ApiError>> + Send>> {
 #         unimplemented!()
 #     }
 # }
@@ -101,16 +102,12 @@ let mut registry = ToolRegistry::new();
 // registry.register(EchoTool);
 
 // 3. Configure
-let config = LoopConfig {
-    max_turns: 50,
-    model: "llm-70b".into(),
-    ..Default::default()
-};
+let config = SessionConfig::default();
 
 // 4. Run
-let agent = BareLoop::new(client, registry, config);
-// let result = agent.run("Use the echo tool to say hello").await?;
-// println!("Completed in {} turns", result.total_turns);
+let mut agent = BareLoop::new(client, registry, config);
+// let result = agent.run("Use the echo tool to say hello", &RunConfig::default()).await?;
+// println!("Completed in {} turns", result.turn_count());
 ```
 
 ### Use the Testing Module
@@ -123,7 +120,7 @@ loopctl = { version = "0.1", features = ["testing"] }
 ```rust,no_run
 use loopctl::testing::{MockApiClient, MockTool, test_config};
 use loopctl::engine::BareLoop;
-use loopctl::engine::loop_core::Loop;
+use loopctl::engine::core::Loop;
 use loopctl::tool::ToolRegistry;
 use std::sync::Arc;
 
@@ -155,6 +152,7 @@ let agent = BareLoop::new(
 | `ollama` | No | `providers`, `openai` | Ollama local model client (OpenAI-compatible) |
 | `deepseek` | No | `providers`, `openai` | DeepSeek API client (OpenAI-compatible) |
 | `grok` | No | `providers`, `openai` | Grok (xAI) API client (OpenAI-compatible) |
+| `xai` | No | `grok` | Alias for `grok` (xAI API client) |
 | `gemini` | No | `providers` | Google Gemini API client (`provider::gemini`) |
 | `zai` | No | `providers`, `anthropic` | Z.AI API client (Anthropic-compatible) |
 | `grammar` | No | `providers` | Tool-call grammar providers for grammar-aware samplers (vLLM `guided_json`); enables the `Grammar` mode of `ToolConstraint` |

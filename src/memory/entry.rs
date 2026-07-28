@@ -27,20 +27,58 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     /// UUID v4 for deduplication and stable reference during consolidation.
+    ///
+    /// Generated at construction by [`MemoryEntry::new`] and never reused, so
+    /// two entries are distinct even if their text is identical. Used as the
+    /// stable key when merging or pruning the store.
     pub id: Uuid,
+
     /// Entry category, influencing ranking and consolidation rules.
+    ///
+    /// The [`MemoryCategory`] this entry belongs to (insight, error pattern,
+    /// strategy, etc.), which retrieval and consolidation strategies use to
+    /// weight or group entries differently.
     pub category: MemoryCategory,
+
     /// What the agent learned — free-form text.
+    ///
+    /// The actual knowledge payload, in whatever natural-language form the
+    /// agent captured it. This is the primary content returned by retrieval.
     pub memory: String,
+
     /// Arbitrary labels for categorization and retrieval (e.g. `"performance"`, `"security"`).
+    ///
+    /// User- or agent-supplied tags that broaden retrieval beyond the formal
+    /// [`category`](Self::category), letting queries filter by topic without
+    /// parsing the free-form `memory` text.
     pub tags: Vec<String>,
+
     /// Timestamp set by [`MemoryEntry::new`]. Recency-based strategies use this.
+    ///
+    /// Wall-clock time the entry was created, captured once at construction.
+    /// Recency-aware ranking and consolidation use the age derived from it to
+    /// favour fresher knowledge.
     pub created_at: SystemTime,
+
     /// Relevance score (0.0–1.0). Starts at 1.0; implementations may decay over time.
+    ///
+    /// Numeric prominence used to rank entries during retrieval and decide
+    /// which to prune. New entries begin at `1.0`; stores may decay it over
+    /// time or boost it on repeated access.
     pub relevance: f32,
+
     /// Number of times this entry has been retrieved.
+    ///
+    /// Popularity counter incremented each time the entry is surfaced,
+    /// feeding into ranking (frequently retrieved entries are deemed more
+    /// useful) and protecting high-traffic entries from pruning.
     pub access_count: usize,
+
     /// Whether this entry has been validated. Consolidation prefers keeping validated entries.
+    ///
+    /// Confidence flag set via the [`validated`](MemoryEntry::validated)
+    /// builder. Consolidation treats validated entries as higher-trust and is
+    /// less likely to prune them during a cleanup pass.
     pub validated: bool,
 }
 
@@ -202,13 +240,34 @@ pub enum MemoryCategory {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConsolidationStats {
     /// Number of entries before consolidation.
+    ///
+    /// Size of the store at the start of the consolidation pass, giving the
+    /// baseline against which `entries_after`, `pruned`, and `merged` are
+    /// compared to measure the pass's effect.
     pub entries_before: usize,
+
     /// Number of entries after consolidation.
+    ///
+    /// Resulting store size once pruning and merging are complete, so callers
+    /// can see the net footprint change at a glance.
     pub entries_after: usize,
+
     /// Entries removed (low relevance, stale, superseded).
+    ///
+    /// Count of entries discarded outright during the pass — typically those
+    /// whose relevance decayed below a threshold or that were superseded by
+    /// newer entries.
     pub pruned: usize,
+
     /// Entries merged (duplicates combined).
+    ///
+    /// Count of duplicate or near-duplicate entries folded into single
+    /// consolidated entries, rather than removed entirely.
     pub merged: usize,
+
     /// Estimated storage reclaimed in bytes.
+    ///
+    /// Rough byte savings from pruning and merging, useful for reporting how
+    /// much memory or disk the consolidation pass freed up.
     pub bytes_saved: usize,
 }

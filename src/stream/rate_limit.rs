@@ -26,9 +26,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Default upper bound on how long a single turn waits for a token (30s).
-const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(30);
-
 /// A continuous-fill token bucket: the standard client-side rate-limiting algorithm.
 ///
 /// - **Capacity** = max burst size.
@@ -41,16 +38,41 @@ const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(30);
 /// `Mutex` critical section (a few float ops + one `Instant::now()`).
 #[derive(Debug)]
 pub struct TokenBucket {
+    /// Maximum burst size, in tokens.
+    ///
+    /// The bucket starts full at this value and never refills above it,
+    /// so a long idle period always restores the full burst budget.
     capacity: f64,
+
+    /// Continuous refill rate in tokens per second.
+    ///
+    /// Computed once at construction as `capacity / 60.0`, so a
+    /// 60-token bucket refills at one token per second. Float-valued
+    /// to preserve sub-second refill precision on each lazy update.
     refill_per_sec: f64,
+
+    /// Mutable bucket state behind a short-lived mutex.
+    ///
+    /// Held only for the few float ops and one `Instant::now()` of each
+    /// [`take`](Self::take) / [`available`](Self::available) call, so
+    /// contention is negligible under normal turn rates.
     state: Mutex<BucketState>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct BucketState {
-    /// Current token count (float for sub-second refill precision).
+    /// Current token count.
+    ///
+    /// Float-valued for sub-second refill precision: a partial token
+    /// accrues between calls and is banked on the next one. Capped at
+    /// the bucket's `capacity` by [`elapsed_refill`].
     tokens: f64,
-    /// Last instant at which `tokens` was updated.
+
+    /// Instant at which `tokens` was last reconciled with elapsed time.
+    ///
+    /// Each call to [`elapsed_refill`] advances this to the current
+    /// `at`, so the next caller only accounts for the gap since the
+    /// previous call rather than recomputing from construction.
     last_refill: Instant,
 }
 
@@ -141,7 +163,11 @@ impl TokenBucket {
         elapsed_refill(&mut state, at, self.capacity, self.refill_per_sec)
     }
 
-    /// Tokens available right now. See [`available_at`](Self::available_at).
+    /// Tokens available right now (after a lazy refill). Non-consuming.
+    ///
+    /// Thin wrapper around [`available_at`](Self::available_at) that
+    /// plugs in `Instant::now()`. Useful for observability — reporting
+    /// the current budget without consuming a token.
     #[must_use]
     pub fn available(&self) -> f64 {
         self.available_at(Instant::now())
@@ -175,14 +201,26 @@ fn elapsed_refill(state: &mut BucketState, at: Instant, capacity: f64, refill_pe
 /// This is the type [`StreamHandler`](super::handler::StreamHandler) holds.
 #[derive(Debug)]
 pub struct RateLimiter {
+    /// Per-provider token buckets, keyed by base URL.
+    ///
+    /// Lazily populated: the first [`acquire`](Self::acquire) for a
+    /// given `base_url` creates its bucket at the configured
+    /// `requests_per_minute`; later acquires for the same URL share it
+    /// via [`Arc`]. Guarded by a `Mutex` so concurrent turns acquire
+    /// safely.
     buckets: Mutex<HashMap<String, Arc<TokenBucket>>>,
+
+    /// Configured request budget per provider, in requests per minute.
+    ///
+    /// `0` disables the limiter entirely — [`acquire`](Self::acquire)
+    /// short-circuits to `Ok(())` and never allocates a bucket. Stored
+    /// as `u32` because it doubles as each bucket's capacity.
     requests_per_minute: u32,
-    max_wait: Duration,
 }
 
 impl RateLimiter {
     /// Build a limiter allowing `requests_per_minute` requests per minute per
-    /// provider. `0` disables. The `max_wait` ceiling defaults to 30s.
+    /// provider. `0` disables.
     ///
     /// # Example
     ///
@@ -197,17 +235,7 @@ impl RateLimiter {
         Self {
             buckets: Mutex::new(HashMap::new()),
             requests_per_minute,
-            max_wait: DEFAULT_MAX_WAIT,
         }
-    }
-
-    /// Override the max-wait ceiling: the longest a single turn will block
-    /// waiting for a token before proceeding anyway ("better to risk a 429 than
-    /// hang the agent").
-    #[must_use]
-    pub fn with_max_wait(mut self, max_wait: Duration) -> Self {
-        self.max_wait = max_wait;
-        self
     }
 
     /// Get (or lazily create) the bucket for `base_url`, then take one token.
@@ -236,16 +264,14 @@ impl RateLimiter {
         bucket.take()
     }
 
-    /// Whether this limiter is active (`requests_per_minute > 0`).
+    /// Whether this limiter is active.
+    ///
+    /// Returns `true` when `requests_per_minute > 0`. When `false`,
+    /// [`acquire`](Self::acquire) short-circuits to `Ok(())` and never
+    /// allocates a bucket, so the limiter is effectively a no-op.
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.requests_per_minute > 0
-    }
-
-    /// The configured max-wait ceiling.
-    #[must_use]
-    pub fn max_wait(&self) -> Duration {
-        self.max_wait
     }
 }
 

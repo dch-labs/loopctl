@@ -66,10 +66,6 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
-// ===================================================
-// RiskLevel
-// ===================================================
-
 /// Risk classification produced by shield evaluation.
 ///
 /// Each dimension of the shield (single-turn, multi-turn, combination)
@@ -144,10 +140,6 @@ impl std::fmt::Display for RiskLevel {
     }
 }
 
-// ===================================================
-// SafetyAction
-// ===================================================
-
 /// The action the shield recommends for a tool call.
 ///
 /// Produced as the [`SafetyDecision::action`] field. The middleware is
@@ -193,10 +185,6 @@ pub enum SafetyAction {
     /// [`SafetyDecision`]: crate::tool::shield::SafetyDecision
     Block,
 }
-
-// ===================================================
-// SafetyDecision
-// ===================================================
 
 /// The shield's decision for a single tool invocation.
 ///
@@ -312,10 +300,6 @@ impl SafetyDecision {
     }
 }
 
-// ===================================================
-// ShieldContext
-// ===================================================
-
 /// Context provided to the shield for evaluation.
 ///
 /// Constructed by the middleware before each tool call. Carries what the
@@ -368,10 +352,6 @@ pub struct ShieldContext {
     pub recent_calls: Vec<(String, usize)>,
 }
 
-// ===================================================
-// RiskPattern
-// ===================================================
-
 /// A named risk pattern matched against a tool's input.
 ///
 /// Patterns are stored per tool name. When a tool call is evaluated,
@@ -413,10 +393,6 @@ pub struct RiskPattern {
     /// type-level docs on matching.
     pub pattern: &'static str,
 }
-
-// ===================================================
-// CombinationRule
-// ===================================================
 
 /// A rule that scores a dangerous *sequence* of tool calls.
 ///
@@ -465,10 +441,6 @@ pub struct CombinationRule {
     /// tool".
     pub triggers: &'static [(&'static str, Option<&'static str>)],
 }
-
-// ===================================================
-// ToolSafetyShield trait
-// ===================================================
 
 /// Trait for evaluating tool call safety.
 ///
@@ -530,10 +502,6 @@ pub trait ToolSafetyShield: Send + Sync {
     /// [`NullShield`]: crate::tool::shield::NullShield
     fn watched_tools(&self) -> HashSet<String>;
 }
-
-// ===================================================
-// UnixShield
-// ===================================================
 
 /// Reference shield implementation with Unix shell pattern matching.
 ///
@@ -930,10 +898,6 @@ impl ToolSafetyShield for UnixShield {
     }
 }
 
-// ===================================================
-// UnixShieldBuilder
-// ===================================================
-
 /// Builder for constructing a [`UnixShield`] with custom configuration.
 ///
 /// # Example
@@ -1083,10 +1047,6 @@ impl Default for UnixShieldBuilder {
         Self::new()
     }
 }
-
-// ===================================================
-// NullShield
-// ===================================================
 
 /// A no-op [`ToolSafetyShield`] that allows every call and watches no
 /// tools.

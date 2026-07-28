@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Added
 
+- `engine::machine::LoopMachine` and supporting types — a sans-IO, serializable
+  state machine that owns every agent-loop decision (turn counting, max-turn
+  enforcement, tool-call validity, stop-reason routing, compaction trigger,
+  history, cancellation). `Serialize + Deserialize`, with no `async`, no
+  `tokio`, and no `ApiClient` in its surface. Includes `RunConfig`,
+  `MachineStep` (`CallLLM`/`CallTools`/`Compact`/`Done`), `ModelTurn`,
+  `PendingToolCall`, `MachineOutcome`, and `MachineState`. `BareLoop` now drives
+  a `LoopMachine` internally (`run()` is a `match machine.next_step()` loop); the
+  machine is exposed via `BareLoop::machine()` / `into_machine()` /
+  `from_machine()` for inspection and serialize-and-resume.
+- `LoopMachine::inject(message)` — add an arbitrary message to the machine's
+  history (host steering, or `ContextContributor` goal re-injection).
+- `Session`/`Run`/`Turn`/`RunResult` lifetime types (`engine::core`) —
+  the Session ⊃ [Run ⊃ [Turn]] hierarchy: one `Session` spans the process,
+  one `Run` per `run()` prompt, one `Turn` per loop iteration. `Session`
+  derives per-session totals (`total_turns`/`total_duration`/
+  `total_input_tokens`/`total_output_tokens`) from its run list. `Run`
+  is the result of a `run()`; `Run::turn_count()`/`duration()`/`total_tokens()`.
+- `SessionConfig` (`config`) — the session-scoped config slice (`session_id`,
+  `system_prompt`, `context_window`) with `with_*` builders, replacing the
+  session fields that lived on the old `LoopConfig`.
+- `LoopError` now derives `Serialize`, `Deserialize`, `PartialEq`, and `Eq`.
+- `compact::types::CompactReason` now derives `Serialize` and `Deserialize`.
 - `DeltaPart::Thinking { text }` variant + `on_thinking_delta` observer event
   (`ThinkingDeltaContext`): reasoning-model tokens (Claude extended-thinking,
   DeepSeek-R1, OpenAI o-series, Gemini 2.5+) are now routed as their own
@@ -182,9 +205,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   `Result<Self, LoopError>` — chain with `?`), `with_observer`,
   `with_text_streamer`, `with_contributor`, `with_request_options`. The
   original `set_*`/`register_*` setters are unchanged and remain available.
+- `CancelSignal::reset()` — re-arm a fired signal by swapping in a fresh
+  underlying `CancellationToken`. Required because the token is one-shot
+  by design; once fired it cannot be revived. All clones of an
+  `Arc<CancelSignal>` observe the new token, so a handle returned by
+  `BareLoop::cancel_signal()` keeps working across resets. `BareLoop`
+  calls this in `finalize()` so each `run()` starts with a clean signal.
 
 ### Changed
 
+- **Breaking (session→run lifecycle rename):** the observer and hook events
+  formerly named `on_session_start` / `on_session_end` are renamed to
+  `on_run_start` / `on_run_end`. These events fire once per `run()` call and
+  carry per-run data (turn count, per-run duration, per-run tokens), so the
+  new names match their actual semantics. The Session ⊃ Run ⊃ Turn hierarchy
+  is unchanged: a Session spans the agent's lifetime, a Run is one `run()`
+  call, a Turn is one loop iteration. Affected APIs (old → new):
+  `LoopObserver::on_session_start` → `on_run_start`,
+  `LoopObserver::on_session_end` → `on_run_end`,
+  `observer::SessionStartContext` → `observer::RunStartContext`,
+  `observer::SessionEndContext` → `observer::RunEndContext`,
+  `Hook::on_session_start` → `on_run_start`,
+  `Hook::on_session_end` → `on_run_end`,
+  `hooks::context::SessionStartContext` → `hooks::context::RunStartContext`,
+  `hooks::context::SessionEndContext` → `hooks::context::RunEndContext`,
+  `hooks::context::SessionEndReason` → `hooks::context::RunEndReason`,
+  `HookExecutor::notify_session_start` → `notify_run_start`,
+  `HookExecutor::notify_session_end` → `notify_run_end`,
+  `HookExecutor::notify_session_start_async` → `notify_run_start_async`,
+  `HookExecutor::notify_session_end_async` → `notify_run_end_async`,
+  `ObserverHost::on_session_start` → `on_run_start`,
+  `ObserverHost::on_session_end` → `on_run_end`.
+  Migration: rename the method/trait impl in every `impl LoopObserver` and
+  `impl Hook`; rename every `SessionStartContext` / `SessionEndContext` /
+  `SessionEndReason` reference. The `session_id` field on the renamed context
+  types is unchanged (a run belongs to a session).
+- **Breaking (per-run manager reset):** `LoopManagers::reset_all` is no
+  longer called automatically from `run()`. Previously it fired on every
+  `run()` call, wiping session-scoped manager state (fallback circuit
+  breaker, loop detection, observers) between runs. On a fresh session
+  the managers are already in their default state, so the call was a
+  no-op on the first run and a correctness bug on subsequent runs (it
+  discarded accumulated circuit-breaker and detection state). To
+  reinitialise mid-session, call `managers.reset_all()` explicitly.
+- `RunConfig` gains a `reset_managers: bool` field (default `false`). Set it
+  to `true` when a run is logically independent from the previous one and you
+  want fresh circuit-breaker / detection / observer state for that run. This
+  replaces the removed automatic `reset_all` with explicit, per-run control.
+  Because `RunConfig` is `#[non_exhaustive]`, existing code that constructs it
+  via `Default::default()` or `RunConfig { .. }` continues to work unchanged.
+- `on_run_start` (the renamed `on_session_start`) now fires at the start of
+  **every** `run()` call, matching `on_run_end` which already fired on every
+  `run()` call. Previously it fired only once (on the first `run()`), creating
+  an asymmetry where a multi-run session saw 1 start event but N end events.
+  The session-scoped bookkeeping (`session_start` timestamp, `reset_all`) is
+  unaffected — it still runs only once, on the first `run()`.
+
+- **Breaking (machine-driven engine):** `BareLoop::run()` is now a
+  `match machine.next_step()` loop driving a `LoopMachine`. The machine owns the
+  conversation history and every loop decision (turn count, max-turn, tool-call
+  validity, compaction trigger, cancellation); the driver owns IO (LLM call,
+  tool dispatch, compaction execution) and fires observers from the match-arms.
+  Observer event ordering is unchanged (pinned by golden tests). The
+  conversation is owned by the machine — read it via `BareLoop::conversation()`
+  (delegates to the machine) or `BareLoop::machine().history()`.
+- **Breaking (Session/Run lifetime model):** the agent-loop lifetime is now
+  explicit. `LoopConfig` is **removed**; construction splits into
+  `SessionConfig` (session-scoped: `session_id`, `system_prompt`,
+  `context_window`) and `engine::RunConfig` (per-run: turn/token budgets,
+  compaction policy, dispatch mode). `SessionResult` is **removed** and unified
+  with the new `Run`/`Run` (`engine::core`): the per-run accumulator
+  is `Run`-shaped (`turns: Vec<Turn>`, `error: Option<LoopError>`). The `model`
+  field is gone from config entirely — it lives on the `ApiClient`
+  (`ApiClient::model` / `set_model`). Migration: build `BareLoop::new` with a
+  `SessionConfig`; read `session_id`/`system_prompt`/`context_window` from
+  `SessionConfig`, run budgets from `RunConfig`, the model from the client.
+- **Breaking (`Loop::run` signature + `initialize` removed):** `Loop::run` now
+  takes the per-run config — `run(&mut self, user_input: &str, run_config:
+  &RunConfig)` — and returns `Result<Run, LoopError>`. Session
+  initialization happens once at construction (not per `run()`); each `run()`
+  receives a fresh `RunConfig`. `Loop::initialize` and `Loop::config()` are
+  removed. Migration: pass `&RunConfig::default()` (or a specific run config)
+  as the second `run()` argument; move any `initialize` setup into
+  construction.
+- **Breaking (compaction thresholds → percentages):** the compaction trigger
+  threshold and compaction-target fraction are now `u8` percentages (0–100;
+  100 = 100%) instead of `f64` fractions. Affected APIs:
+  `ContextManager::with_threshold(u8)` and `with_compact_target_pct(u8)`
+  (were `f64`); `ContextManager::threshold() -> u8` and
+  `compact_target_pct() -> u8` (were `f64`);
+  `SessionConfig::with_compact_threshold(u8)` and the `compact_threshold` field
+  (were `f64`). The default is `80` (was `0.80`); the clamp range is
+  `[1, 100]` (was `[0.1, 1.0]`). Migration: multiply existing `f64`
+  values by 100 and round — `0.80 → 80`, `0.50 → 50`, `0.70 → 70`.
 - **Breaking (renames):** consuming builder methods that return `Self` are now
   uniformly prefixed `with_`, matching the crate-wide convention. The old
   no-prefix names are removed. Affected types and methods (old → new):
@@ -307,15 +420,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 - Internally-built `reqwest::Client`s now set `tcp_nodelay(true)` by default.
   SSE streaming emits many small packets; disabling Nagle's algorithm reduces
   per-delta latency. No correctness impact.
+- `FallbackManager`'s circuit-breaker state is now unified behind a single
+  `Mutex<BreakerState>`. Previously it was split across four independent
+  `Relaxed` atomics (`fallback_state`, `consecutive_failures`,
+  `primary_success_count`, `fallback_activated`) plus a `Mutex<FallbackInner>`,
+  which left a TOCTOU window between the state read and the
+  transition/counter-reset. The read-decide-transition in `record_failure` /
+  `record_success` now runs while holding the one lock, so the race is closed
+  by construction. Internal refactor — no public-API change beyond the method
+  merges noted under `### Removed`.
 
 ### Removed
 
+- `FallbackManager::record_api_failure` and
+  `FallbackManager::record_model_failure` — merged into a single
+  [`FallbackManager::record_failure(FailureKind)`](crate::fallback::FallbackManager::record_failure).
+  The two methods differed only in how a failure during
+  [`Recovering`](crate::fallback::FallbackState::Recovering) was treated:
+  a sustained rate-limit re-trips the breaker, a transient error leaves
+  the half-open probe in place. That distinction is now an explicit
+  [`FailureKind`](crate::fallback::FailureKind) argument (`RateLimit` vs
+  `Transient`) instead of two near-identical methods. Migration: pass
+  `FailureKind::RateLimit` where you called `record_model_failure`,
+  `FailureKind::Transient` where you called `record_api_failure`.
+- `FallbackManager::record_failure` / `record_success` zero-body aliases
+  for `record_api_failure` / `record_model_success` — removed alongside
+  the merge. `record_success` is the new canonical name for the success
+  path (was `record_model_success`).
+- `FallbackEntry` and `AttemptRecord` are now `pub(crate)` — they were
+  `pub` with no external users and ~400 lines of speculative accessors.
+  The `fallback_entry(name)` lookup method (which leaked the internal
+  type) is removed. These types were never part of the documented public
+  API surface; only `FallbackManager`, `FallbackState`, `FallbackConfig`,
+  and `FailureKind` are public in the `fallback` module now.
+- `FallbackState::From<u8>` impl and the `= 0`/`= 1`/`= 2` discriminants
+  — dead weight from when state round-tripped through an `AtomicU8`.
+  State is now a plain field on an internal struct; no `u8` casting
+  remains.
+- `Loop::process_turn` trait method and `BareLoop::run_turn_body` — the
+  machine-driven `run()` replaces the old per-turn execution path. The
+  `LoopMachine` is the new turn unit; drive it via `BareLoop::run()` (or
+  `LoopMachine::next_step()` directly for a custom driver).
 - `StreamTurnResult` (the handler no longer accumulates; the engine assembles
   the result from the event stream).
 - `StreamHandler::with_request_options` builder (options now flow via
   `stream_turn`'s parameter; configure via `BareLoop::set_request_options`).
 - `StreamHandlerError::RateLimitEscalation.prior: StreamOutcome` field (never
   read by any consumer).
+
+### Fixed
+
+- Tool dispatch had three separate code paths (sequential, small-batch
+  parallel, and wave-parallel) each with its own copy of the recovery
+  loop, PRE/POST side-effect logic, and cancel handling. Two bugs came
+  from this split: the small-batch path called `dispatch_tool` directly
+  with no recovery (a flaky tool failed permanently where it would
+  recover elsewhere), and the parallel paths fired observer/detection/
+  hook side-effects once on the final result while sequential fired
+  them per retry attempt — diverging loop-detection sensitivity, health
+  inputs, and observer event counts by dispatch mode. The entire
+  dispatch machinery is now one function (`execute_tool_call`) that owns
+  the full lifecycle (PRE → dispatch → POST → recovery loop) with
+  mid-flight cancel via `tokio::select!`. Sequential and parallel both
+  call it, so there is exactly one definition of "execute a tool call"
+  — no divergence is possible. Six functions (`parallel_pre_phase`,
+  `parallel_exec_phase`, `parallel_post_phase`, `parallel_run_remaining`,
+  `run_parallel_task`, `dispatch_tool_with_recovery`) collapsed into one
+  `execute_tool_call` + two thin dispatch loops.
+- OpenAI streaming silently dropped every multi-chunk tool-call argument
+  fragment after the first, truncating the tool input JSON. The
+  deserialization structs declared `id` (on the tool-call delta) and
+  `name` (on the function object) as required `String` fields, but the
+  real OpenAI streaming protocol omits both on continuation chunks —
+  those carry only `index` and an `arguments` fragment. Serde rejected
+  those chunks with `missing field`, `OpenAiChunk::parse` returned
+  `None`, and the stream loop silently skipped them, leaving the
+  accumulated JSON incomplete. Both fields are now `Option<String>` with
+  `#[serde(default)]`; the emitter latches `id` and `name` on the first
+  chunk for each `index` and ignores them on continuations.
+- OpenAI streaming re-opened a tool-call part on every chunk carrying a
+  `function` field. Because every chunk (including argument-fragment
+  continuations) carries `function`, the `StreamEmitter` emitted
+  `PartStart` for each one, which wiped the downstream accumulator's
+  buffered JSON. The emitter now tracks each tool call's `index` and
+  emits `PartStart` exactly once per call.
+- `StreamAccumulator` dropped parallel tool calls whose argument fragments
+  arrived interleaved (the shape OpenAI streams for
+  `parallel_tool_calls`). The accumulator tracked a single in-progress
+  part, so a second `PartStart` arriving before the first `PartStop`
+  overwrote the first call's buffer, and `IndexedDelta` fragments whose
+  `index` did not match the single current slot were silently dropped.
+  It now holds a `Vec` of open slots keyed by `index`, routes each delta
+  to the matching slot, and flushes slots in `PartStart` arrival order
+  (FIFO) on `PartStop`. Anthropic (strictly sequential) and Gemini
+  (atomic per-chunk tool calls) are unaffected.
+- `BareLoop` was permanently dead after a single cancellation. Once
+  `cancel()` fired, the `CancelSignal` (a one-shot
+  `CancellationToken`) stayed cancelled forever, so every subsequent
+  `run()` returned `LoopError::Cancelled` immediately. `run()` now
+  re-arms the signal in `finalize()` — the single chokepoint every run
+  exit path passes through — so the next `run()` starts clean. A cancel
+  that arrives *before* a run still cancels that run (the signal is
+  cleared only after the run observes it and returns), preserving the
+  pre-run-cancel contract.
+- A turn's tool results were split across multiple consecutive user
+  messages instead of merged into one. Unknown-tool results (preresolved
+  by the machine) each arrived as their own user `Message`, and the
+  dispatched known-tool results arrived as another, so the loop pushed
+  them into history as separate entries. `BareLoop::handle_call_tools`
+  now collects all tool-result parts for a turn — preresolved plus
+  dispatched — into a single user `Message` before feeding it to the
+  machine, so a turn with any mix of unknown and known tools produces
+  exactly one user message regardless of how the results were produced.
+  `build_tool_result_message` is renamed to `build_tool_result_parts`
+  and now returns `Vec<MessagePart>` (it no longer wraps the parts in a
+  throwaway `Message`).
+
+### Security
+
+- The auto-commit hook's `GitExecutor::stage_files` ran `git add -A`
+  when called with an empty file list — the default configuration
+  (`AutoCommitConfig::files` defaults to `vec![]`, and a session with no
+  recorded modifications passes `None`, which falls back to that empty
+  list). This staged and committed the entire working tree on every
+  session end: unrelated user edits, scratch files, and secrets such as
+  `.env` and credentials. The empty-list branch now refuses with a
+  `GitExecutorError::GitError` instead of broadening scope; callers must
+  populate `AutoCommitConfig::files` or rely on the hook's per-session
+  modification tracking. Misconfiguration now fails loudly rather than
+  silently committing everything.
 
 ## [0.1.0] - 2025-07-01
 

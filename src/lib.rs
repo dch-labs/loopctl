@@ -7,7 +7,7 @@
 //!
 //! - **[`message`]** — Core conversation types: messages, parts, tool results.
 //! - **[`error`]** — Central error enum ([`LoopError`](error::LoopError)) for all framework operations.
-//! - **[`config`]** — Session configuration ([`LoopConfig`](config::LoopConfig)).
+//! - **[`config`]** — Session configuration ([`SessionConfig`](config::SessionConfig)).
 //! - **[`cancel`]** — Cooperative cancellation signal (`CancelSignal`).
 //!
 //! ## Subsystems
@@ -30,7 +30,7 @@
 //! ## Runtime & Capabilities
 //!
 //! - **[`capabilities`]** — Capability traits ([`Observable`](capabilities::Observable), [`Detectable`](capabilities::Detectable), etc.).
-//! - **[`runtime`]** — [`LoopRuntime`](runtime::LoopRuntime) — the default infrastructure bundle.
+//! - **[`managers`]** — [`LoopManagers`](managers::LoopManagers) — the default infrastructure bundle.
 //!
 //! ## Engine
 //!
@@ -74,6 +74,7 @@ pub mod error;
 pub mod fallback;
 #[cfg(feature = "hooks")]
 pub mod hooks;
+pub mod managers;
 pub mod memory;
 pub mod message;
 pub mod middleware;
@@ -82,7 +83,6 @@ pub mod presets;
 #[cfg(feature = "providers")]
 pub mod provider;
 pub mod reflection;
-pub mod runtime;
 pub mod stream;
 pub mod structured;
 #[cfg(feature = "testing")]

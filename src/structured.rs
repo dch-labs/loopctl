@@ -340,6 +340,7 @@ pub enum StructuredError {
 ///
 /// Returns `None` if the content cannot be parsed as JSON (even after the
 /// lenient rescue).
+#[cfg(any(feature = "openai", feature = "gemini"))]
 pub(crate) fn parse_json_lenient(text: &str) -> Option<serde_json::Value> {
     if let Ok(v) = serde_json::from_str(text) {
         return Some(v);
@@ -354,6 +355,7 @@ pub(crate) fn parse_json_lenient(text: &str) -> Option<serde_json::Value> {
 /// the substring up to the matching close. String-aware: braces/brackets
 /// inside JSON string literals (`"..."`) do not affect depth, and `\"`
 /// escapes are honored.
+#[cfg(any(feature = "openai", feature = "gemini"))]
 pub(crate) fn extract_json_substring(text: &str) -> Option<serde_json::Value> {
     let bytes = text.as_bytes();
     let mut start = None;
@@ -451,6 +453,12 @@ pub(crate) fn extract_json_substring(text: &str) -> Option<serde_json::Value> {
 /// assert_eq!(tightened["properties"]["filter"]["additionalProperties"], false);
 /// assert_eq!(tightened["properties"]["filter"]["required"], json!(["lang"]));
 /// ```
+#[cfg(any(
+    feature = "anthropic",
+    feature = "grammar",
+    feature = "openai",
+    feature = "gemini"
+))]
 pub(crate) fn tighten_json_schema(schema: &serde_json::Value) -> serde_json::Value {
     let mut out = schema.clone();
     tighten_in_place(&mut out);
@@ -489,6 +497,12 @@ pub(crate) fn tighten_json_schema(schema: &serde_json::Value) -> serde_json::Val
 ///   are returned unchanged.
 ///
 /// Idempotent: re-running on an already-tight schema leaves it unchanged.
+#[cfg(any(
+    feature = "anthropic",
+    feature = "grammar",
+    feature = "openai",
+    feature = "gemini"
+))]
 fn tighten_in_place(schema: &mut serde_json::Value) {
     let Some(obj) = schema.as_object_mut() else {
         return;
@@ -590,7 +604,7 @@ pub async fn request_structured<T: StructuredOutput + serde::de::DeserializeOwne
         tools: None,
     };
     let raw = client
-        .create_message_with_options(request, opts)
+        .create_message_with_options(&request, opts)
         .await
         .map_err(StructuredError::Api)?;
     let value = client.extract_structured(&raw);
@@ -660,30 +674,40 @@ mod tests {
         assert_eq!(opts.response_format.as_ref().unwrap().name, "action");
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_plain_json() {
         let v = parse_json_lenient(r#"{"a": 1}"#).unwrap();
         assert_eq!(v["a"], 1);
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_with_prefix() {
         let v = parse_json_lenient(r#"Here is the JSON: {"a": 1}"#).unwrap();
         assert_eq!(v["a"], 1);
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_markdown_fences() {
         let v = parse_json_lenient("```json\n{\"a\": 1}\n```").unwrap();
         assert_eq!(v["a"], 1);
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_array() {
         let v = parse_json_lenient(r#"prefix [1, 2, 3] suffix"#).unwrap();
         assert_eq!(v[0], 1);
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_no_json() {
         let result = parse_json_lenient("just prose, nothing here");
@@ -697,30 +721,40 @@ mod tests {
         assert!(err.to_string().contains("schema"));
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_brace_inside_string() {
         let v = parse_json_lenient(r#"prefix {"a": "}"} suffix"#).unwrap();
         assert_eq!(v["a"], "}");
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_bracket_inside_string() {
         let v = parse_json_lenient(r#"before {"x": "]"} after"#).unwrap();
         assert_eq!(v["x"], "]");
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_escaped_quote_in_string() {
         let v = parse_json_lenient(r#"here {"a": "he said \"hi\""} there"#).unwrap();
         assert_eq!(v["a"], "he said \"hi\"");
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_nested_objects_in_prose() {
         let v = parse_json_lenient(r#"result: {"outer": {"inner": 42}}"#).unwrap();
         assert_eq!(v["outer"]["inner"], 42);
     }
 
+    #[cfg(any(feature = "openai", feature = "gemini"))]
+    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_mismatched_delimiter_then_valid() {
         let v = parse_json_lenient(r#"{oops] then {"a":1}"#).unwrap();
@@ -734,7 +768,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<
@@ -747,7 +781,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
@@ -765,7 +799,7 @@ mod tests {
         let opts =
             RequestOptions::new().with_response_format(ResponseFormat::from_type::<Action>());
         let request = crate::api::StreamRequest::new(vec![]);
-        let result = client.create_message_with_options(request, opts).await;
+        let result = client.create_message_with_options(&request, opts).await;
         assert!(
             result.is_err(),
             "client without structured-output support should reject response_format"
@@ -782,7 +816,7 @@ mod tests {
         let client = PlainMockClient;
         let opts = RequestOptions::new();
         let request = crate::api::StreamRequest::new(vec![]);
-        let result = client.create_message_with_options(request, opts).await;
+        let result = client.create_message_with_options(&request, opts).await;
         assert!(result.is_ok(), "empty options should delegate normally");
     }
 
@@ -793,7 +827,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<
@@ -806,7 +840,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
@@ -818,7 +852,7 @@ mod tests {
         }
         fn create_message_with_options(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
             _options: RequestOptions,
         ) -> Pin<
             Box<
@@ -852,7 +886,7 @@ mod tests {
         }
         fn stream_messages(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn futures::Stream<
@@ -865,7 +899,7 @@ mod tests {
         }
         fn create_message(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
                 dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
@@ -877,7 +911,7 @@ mod tests {
         }
         fn create_message_with_options(
             &self,
-            _request: crate::api::StreamRequest,
+            _request: &crate::api::StreamRequest,
             _options: RequestOptions,
         ) -> Pin<
             Box<
@@ -935,6 +969,18 @@ mod tests {
         assert!(matches!(cloned.tool_constraint, ToolConstraint::Strict));
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_sets_additional_properties_false() {
         let schema = serde_json::json!({
@@ -945,6 +991,18 @@ mod tests {
         assert_eq!(tightened["additionalProperties"], false);
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_enumerates_required() {
         let schema = serde_json::json!({
@@ -962,6 +1020,18 @@ mod tests {
         assert!(keys.contains(&"b"));
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_recurses_into_nested_objects() {
         let schema = serde_json::json!({
@@ -985,6 +1055,18 @@ mod tests {
         assert_eq!(inner_required[0], "x");
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_preserves_non_object_schemas() {
         let schema = serde_json::json!({"type": "string"});
@@ -995,6 +1077,18 @@ mod tests {
         assert!(tightened.get("required").is_none());
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_idempotent_on_already_strict() {
         let schema = serde_json::json!({
@@ -1008,6 +1102,18 @@ mod tests {
         assert_eq!(once, twice);
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_object_without_properties() {
         let schema = serde_json::json!({"type": "object"});
@@ -1017,6 +1123,18 @@ mod tests {
         assert_eq!(tightened["required"].as_array().unwrap().len(), 0);
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_recurses_into_local_defs() {
         // A property that $refs a local definition: the reference itself
@@ -1057,6 +1175,18 @@ mod tests {
         assert_eq!(tightened["properties"]["filter"]["$ref"], "#/$defs/Filter");
     }
 
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
     #[test]
     fn tighten_recurses_into_legacy_definitions() {
         // The Draft 07 keyword `definitions` should be walked the same way

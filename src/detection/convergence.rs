@@ -84,10 +84,6 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-// ===================================================
-// ConvergenceAction
-// ===================================================
-
 /// Action to take when convergence is detected.
 ///
 /// When the [`ConvergenceDetector`] determines that the agent's recent responses
@@ -182,10 +178,6 @@ pub enum ConvergenceAction {
     Compact,
 }
 
-// ===================================================
-// ConvergenceConfigError
-// ===================================================
-
 /// Error returned when [`ConvergenceConfig`] validation fails.
 ///
 /// [`ConvergenceDetector::new`] validates the configuration before
@@ -214,6 +206,11 @@ pub enum ConvergenceConfigError {
     #[error("window_size must be at least 2, got {actual}")]
     WindowTooSmall {
         /// The invalid window size that was provided.
+        ///
+        /// Captured verbatim from
+        /// [`ConvergenceConfig::window_size`] so the diagnostic can
+        /// report the offending value (e.g. `0` or `1`) alongside the
+        /// required minimum of `2`.
         actual: usize,
     },
 
@@ -224,13 +221,14 @@ pub enum ConvergenceConfigError {
     #[error("similarity_threshold must be in [0.0, 1.0], got {actual}")]
     ThresholdOutOfRange {
         /// The invalid threshold value that was provided.
+        ///
+        /// Captured verbatim from
+        /// [`ConvergenceConfig::similarity_threshold`] so the diagnostic
+        /// can report the out-of-range value (e.g. `1.5` or `-0.2`)
+        /// alongside the required `[0.0, 1.0]` interval.
         actual: f32,
     },
 }
-
-// ===================================================
-// ConvergenceConfig
-// ===================================================
 
 /// Configuration for convergence detection.
 ///
@@ -273,12 +271,32 @@ pub enum ConvergenceConfigError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConvergenceConfig {
     /// Whether convergence detection is active. Defaults to `true`.
+    ///
+    /// Master switch: when `false` the detector returns a "no convergence"
+    /// status for every response without inspecting the window, so the
+    /// subsystem can be disabled without removing it from the pipeline.
     pub enabled: bool,
+
     /// Consecutive similar responses required to declare convergence. Must be ≥ 2. Defaults to `3`.
+    ///
+    /// The streak length that, once reached by consecutive similar responses,
+    /// sets [`ConvergenceStatus::detected`] to `true`. A larger value requires
+    /// longer repetition streaks before firing, reducing false positives.
     pub window_size: usize,
+
     /// Jaccard similarity threshold (0.0–1.0). Defaults to `0.95`.
+    ///
+    /// Minimum Jaccard similarity a response must share with the immediately
+    /// preceding one to extend the consecutive-similar streak. Lower it to
+    /// catch paraphrased repetition; raise it toward `1.0` to demand
+    /// near-verbatim matches.
     pub similarity_threshold: f32,
+
     /// Action on convergence. Defaults to [`ConvergenceAction::Stop`].
+    ///
+    /// The [`ConvergenceAction`] returned inside [`ConvergenceStatus`] once
+    /// convergence is detected, telling the caller whether to halt, warn,
+    /// switch phase, ask the user, or compact the history.
     #[serde(default)]
     pub on_converge: ConvergenceAction,
 }
@@ -313,10 +331,6 @@ impl Default for ConvergenceConfig {
         }
     }
 }
-
-// ===================================================
-// ConvergenceStatus
-// ===================================================
 
 /// Convergence status with details.
 ///
@@ -354,14 +368,39 @@ impl Default for ConvergenceConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ConvergenceStatus {
     /// `true` when `consecutive_count >= window_size`. Other fields still valid when `false`.
+    ///
+    /// The headline result of a convergence check: `true` only once the
+    /// consecutive-similar streak has grown to the configured
+    /// [`ConvergenceConfig::window_size`]. The remaining fields remain
+    /// populated even when this is `false`, so callers can monitor trends.
     pub detected: bool,
+
     /// Resets to `1` when similarity falls below threshold.
+    ///
+    /// Current length of the consecutive-similar streak. Grows by one each
+    /// time a response matches its predecessor above the threshold, and snaps
+    /// back to `1` as soon as a dissimilar response breaks the streak.
     pub consecutive_count: usize,
+
     /// Highest Jaccard similarity (0.0–1.0). `0.0` when no comparison was made.
+    ///
+    /// Peak similarity observed between the latest response and any prior
+    /// response in the window during the most recent
+    /// [`add_response`](ConvergenceDetector::add_response) call, for
+    /// diagnostics and threshold tuning.
     pub similarity_score: f32,
+
     /// Responses that exceeded the similarity threshold. Cleared on dissimilar response.
+    ///
+    /// Deduplicated set of responses that contributed to the current streak.
+    /// Emptied whenever a dissimilar response resets the streak, so it always
+    /// reflects the active run rather than historical matches.
     pub similar_responses: Vec<String>,
+
     /// Forwarded from [`ConvergenceConfig::on_converge`]; see [`ConvergenceAction`].
+    ///
+    /// The action the caller should take when [`detected`](Self::detected) is
+    /// `true`, copied verbatim from the detector's configuration.
     pub action: ConvergenceAction,
 }
 
@@ -394,10 +433,6 @@ impl ConvergenceStatus {
         }
     }
 }
-
-// ===================================================
-// ConvergenceDetector
-// ===================================================
 
 /// Detects when agent responses have converged (become semantically similar).
 ///
@@ -432,13 +467,38 @@ impl ConvergenceStatus {
 /// ```
 #[derive(Debug)]
 pub struct ConvergenceDetector {
-    /// Immutable config set at construction.
+    /// Immutable configuration set at construction.
+    ///
+    /// Holds the validated [`ConvergenceConfig`] (window size,
+    /// similarity threshold, action) for the lifetime of the detector.
+    /// Exposed to callers via [`config`](ConvergenceDetector::config).
     config: ConvergenceConfig,
-    /// Bounded by `window_size`, ordered oldest→newest.
-    pub(super) window: VecDeque<String>,
-    /// Resets to `1` on dissimilar response; convergence at `window_size`.
-    pub(super) consecutive_count: usize,
-    /// Deduplicated similar responses; cleared when streak breaks.
+
+    /// Sliding window of recent responses, ordered oldest to newest.
+    ///
+    /// Bounded to [`ConvergenceConfig::window_size`] entries. Each
+    /// call to [`add_response`](ConvergenceDetector::add_response)
+    /// pushes the new response and evicts the oldest when full. The
+    /// front of the deque is the oldest kept response. Exposed to
+    /// callers via [`window`](ConvergenceDetector::window).
+    window: VecDeque<String>,
+
+    /// Current length of the ongoing similar-response streak.
+    ///
+    /// Resets to `1` whenever a new response is dissimilar to its
+    /// predecessor; otherwise it increments. Convergence is declared
+    /// once this counter reaches
+    /// [`window_size`](ConvergenceConfig::window_size). Exposed to
+    /// callers via
+    /// [`consecutive_count`](ConvergenceDetector::consecutive_count).
+    consecutive_count: usize,
+
+    /// Deduplicated set of responses in the current similar streak.
+    ///
+    /// Populated while the streak continues and cleared whenever the
+    /// streak breaks. Drives the `similar_responses` field of
+    /// [`ConvergenceStatus`] so callers can inspect what the detector
+    /// considered "the same" before acting.
     similar_responses: Vec<String>,
 }
 

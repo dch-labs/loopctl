@@ -96,10 +96,6 @@ pub use super::convergence::ConvergenceAction;
 pub use super::convergence::ConvergenceConfigError;
 pub use super::loop_detector::LoopStatus;
 
-// ==================================================
-// Detected Pattern
-// ==================================================
-
 /// Represents a pattern detected in agent behavior.
 ///
 /// Returned by [`DetectionManager::record_operation`],
@@ -166,11 +162,24 @@ pub enum DetectedPattern {
     /// }
     /// ```
     LoopDetected {
-        /// Equal to [`LoopStatus::repetition_count`].
+        /// How many times the repeated operation has been observed.
+        ///
+        /// Equal to [`LoopStatus::repetition_count`] at the moment the
+        /// loop crossed
+        /// [`DetectionConfig::loop_threshold`]. Callers can compare it
+        /// against the threshold to decide between a soft warning and a
+        /// hard stop.
         repetitions: usize,
-        /// Formatted as `"ToolName(primary_param)"`.
+
+        /// Human-readable summary of the repeated operation.
+        ///
+        /// Formatted as `"ToolName(primary_param)"` (for example
+        /// `"Read(/etc/hosts)"` or `"Bash(ls -la)"`) using the
+        /// tool-signature extractor. Suitable for log lines and
+        /// user-facing diagnostics.
         pattern_description: String,
     },
+
     /// The agent's responses have become semantically similar.
     ///
     /// Emitted by [`DetectionManager::record_response`] when the internal
@@ -191,11 +200,24 @@ pub enum DetectedPattern {
     /// - `consecutive_count` — how many consecutive response pairs exceeded
     ///   the threshold.
     ConvergenceDetected {
-        /// Jaccard similarity (0.0–1.0) of the most recent response pair.
+        /// Jaccard similarity of the most recent response pair.
+        ///
+        /// A value in `[0.0, 1.0]` where `1.0` means identical
+        /// token sets. The detector fires once this score meets or
+        /// exceeds
+        /// [`DetectionConfig::convergence_threshold`]; callers can log
+        /// it to show *how* similar the converged responses were.
         similarity: f32,
-        /// Consecutive similar responses.
+
+        /// Number of consecutive response pairs above the threshold.
+        ///
+        /// Reaches
+        /// [`DetectionConfig::convergence_count`] when convergence is
+        /// declared. A higher count means a longer run of near-identical
+        /// replies, which is a stronger signal that the agent is stuck.
         consecutive_count: usize,
     },
+
     /// Neither the loop detector nor the convergence detector has fired.
     ///
     /// The agent's tool calls are varying and/or its responses are diverging,
@@ -203,10 +225,6 @@ pub enum DetectedPattern {
     /// turn loop when they receive this variant.
     NoPattern,
 }
-
-// ==================================================
-// Configuration
-// ==================================================
 
 /// Configuration for the [`DetectionManager`].
 ///
@@ -250,20 +268,62 @@ pub enum DetectedPattern {
 #[derive(Debug, Clone)]
 pub struct DetectionConfig {
     /// Consecutive similar operations before declaring a loop. Default: **3**.
+    ///
+    /// Number of times the same `(tool, primary_param, result_hash)`
+    /// signature must recur within the window before
+    /// [`DetectedPattern::LoopDetected`] is reported. Lower it to catch loops
+    /// sooner at the cost of more false positives.
     pub loop_threshold: usize,
+
     /// Repetitions triggering forced stop (0 = disabled). Default: **10**.
+    ///
+    /// When a single operation's repetition count reaches this value, the
+    /// detector sets [`LoopStatus::should_stop`] so the caller halts the
+    /// agent. Setting it to `0` disables forced stops entirely while still
+    /// issuing warnings.
     pub stop_threshold: usize,
+
     /// Whether loop detection is enabled. Default: **true**.
+    ///
+    /// Master switch for the tool-loop subsystem. When `false`,
+    /// [`DetectionManager::record_operation`] short-circuits and returns
+    /// [`DetectedPattern::NoPattern`] without consulting the loop detector.
     pub enable_loop_detection: bool,
+
     /// Max operations kept in loop detector history. Default: **100**.
+    ///
+    /// Size of the sliding window the loop detector retains. A larger window
+    /// catches slower loops that span many interleaved operations; a smaller
+    /// one uses less memory and forgets stale patterns faster.
     pub max_history: usize,
+
     /// Jaccard similarity threshold for convergence (0.0–1.0). Default: **0.95**.
+    ///
+    /// Minimum Jaccard similarity a response must share with its predecessor
+    /// to extend the convergence streak. Lower it to catch paraphrased
+    /// repetition; raise it toward `1.0` to demand near-verbatim matches.
     pub convergence_threshold: f32,
+
     /// Consecutive similar responses for convergence. Default: **3**.
+    ///
+    /// Streak length of consecutive similar responses required before
+    /// [`DetectedPattern::ConvergenceDetected`] is reported. Maps to the
+    /// convergence detector's window size.
     pub convergence_count: usize,
+
     /// Whether convergence detection is enabled. Default: **true**.
+    ///
+    /// Master switch for the response-convergence subsystem. When `false`,
+    /// [`DetectionManager::record_response`] short-circuits and returns
+    /// [`DetectedPattern::NoPattern`] without consulting the convergence
+    /// detector.
     pub enable_convergence_detection: bool,
+
     /// Action on convergence. Default: [`ConvergenceAction::default()`].
+    ///
+    /// The [`ConvergenceAction`] forwarded to callers once convergence is
+    /// detected — stop, warn, switch phase, ask the user, or compact the
+    /// history. Drives how the agent responds to a detected stall.
     pub on_converge: ConvergenceAction,
 }
 
@@ -287,12 +347,12 @@ impl DetectionConfig {
     ///
     /// # Field Mapping
     ///
-    /// | `DetectionConfig` field        | [`ConvergenceConfig`] field            |
-    /// |--------------------------------|----------------------------------------|
-    /// | `enable_convergence_detection` | `enabled`                              |
-    /// | `convergence_count`            | `window_size`                          |
-    /// | `convergence_threshold`        | `similarity_threshold`                 |
-    /// | `on_converge`                  | `on_converge`                          |
+    /// | `DetectionConfig` field        | [`ConvergenceConfig`] field |
+    /// |--------------------------------|-----------------------------|
+    /// | `enable_convergence_detection` | `enabled`                   |
+    /// | `convergence_count`            | `window_size`               |
+    /// | `convergence_threshold`        | `similarity_threshold`      |
+    /// | `on_converge`                  | `on_converge`               |
     #[must_use]
     pub fn to_convergence_config(&self) -> ConvergenceConfig {
         ConvergenceConfig {
@@ -323,10 +383,6 @@ impl DetectionConfig {
     }
 }
 
-// ==================================================
-// Statistics
-// ==================================================
-
 /// Cumulative statistics from the [`DetectionManager`].
 ///
 /// Returned by [`DetectionManager::stats`] for observability and
@@ -353,18 +409,33 @@ impl DetectionConfig {
 #[derive(Debug, Clone, Default)]
 pub struct DetectionStats {
     /// Tool-call operations recorded via `record_operation`. Reset by `reset`.
+    ///
+    /// Total count of operations fed into the loop detector since the last
+    /// [`DetectionManager::reset`], giving the denominator for loop-rate
+    /// calculations.
     pub turns_analyzed: usize,
+
     /// Subset of `turns_analyzed` that returned `LoopDetected`. Reset by `reset`.
+    ///
+    /// How many of the recorded operations resulted in a
+    /// [`DetectedPattern::LoopDetected`] verdict, so callers can gauge how
+    /// frequently the agent gets stuck in tool loops.
     pub loops_detected: usize,
+
     /// Times `record_response` returned `ConvergenceDetected`. Reset by `reset`.
+    ///
+    /// How many assistant responses triggered a
+    /// [`DetectedPattern::ConvergenceDetected`] verdict, indicating how often
+    /// the agent's replies collapsed into repetition.
     pub convergences_detected: usize,
+
     /// Mirrors `LoopStatus::repetition_count`. Triggers `LoopDetected` at `loop_threshold`. Reset by `reset`.
+    ///
+    /// Live snapshot of the most-repeated operation's count, so observers can
+    /// watch a potential loop build up before it actually trips the
+    /// [`DetectionConfig::loop_threshold`].
     pub current_streak: usize,
 }
-
-// ==================================================
-// Detection Manager
-// ==================================================
 
 /// Unified manager combining loop detection and convergence detection.
 ///
@@ -377,9 +448,9 @@ pub struct DetectionStats {
 ///
 /// Choose a constructor based on your needs:
 ///
-/// | Constructor                              | Use case                                  |
-/// |------------------------------------------|-------------------------------------------|
-/// | [`DetectionManager::new`]                | Quick start with defaults                 |
+/// | Constructor                                  | Use case                                  |
+/// |----------------------------------------------|-------------------------------------------|
+/// | [`DetectionManager::new`]                    | Quick start with defaults                 |
 /// | [`DetectionManager::new_with_config`]        | Custom thresholds via [`DetectionConfig`] |
 /// | [`DetectionManager::new_with_loop_detector`] | Inject a pre-built [`LoopDetector`]       |
 /// | [`DetectionManager::new_with_signature`]     | Custom [`ToolSignature`] for JSON parsing |
@@ -449,12 +520,37 @@ pub struct DetectionStats {
 /// - [`DetectionStats`] — cumulative observability counters.
 pub struct DetectionManager {
     /// Configuration thresholds and feature flags.
+    ///
+    /// Holds the validated [`DetectionConfig`] (loop threshold, stop
+    /// threshold, convergence settings) for the manager's lifetime. It
+    /// is set in the constructor and never mutated, so threshold checks
+    /// are a single field access with no locking.
     config: DetectionConfig,
+
     /// Loop detector shared across compaction and analysis phases.
+    ///
+    /// Held behind [`Arc`] so callers that need direct access to the
+    /// tool-call window (for example, an observer that reports on
+    /// repetition independently of the manager) can clone the handle
+    /// rather than routing every query through the manager. The
+    /// detector's own internal state is `Mutex`-guarded.
     loop_detector: Arc<LoopDetector>,
+
     /// Convergence detector guarded by interior mutability.
+    ///
+    /// [`ConvergenceDetector`] mutates its sliding window on every
+    /// recorded response, so it is wrapped in a [`Mutex`] to keep the
+    /// manager's public methods `&self`. This lets the manager be
+    /// shared across threads without an outer `mut` reference.
     convergence_detector: Mutex<ConvergenceDetector>,
+
     /// Cumulative detection statistics.
+    ///
+    /// Counters for turns analysed, loops detected, and convergences
+    /// observed since construction or the last
+    /// [`reset`](DetectionManager::reset). Updated under the
+    /// [`Mutex`] and snapshotted via
+    /// [`stats`](DetectionManager::stats) for observability dashboards.
     stats: Mutex<DetectionStats>,
 }
 
@@ -589,10 +685,6 @@ impl DetectionManager {
             stats,
         })
     }
-
-    // ==================================================
-    // Loop detection (delegated to LoopDetector)
-    // ==================================================
 
     /// Record an [`Operation`] for loop detection and return the current
     /// [`DetectedPattern`].
@@ -878,10 +970,6 @@ impl DetectionManager {
         &self.convergence_detector
     }
 
-    // ==================================================
-    // Convergence detection
-    // ==================================================
-
     /// Record an assistant response for convergence detection.
     ///
     /// Forwards `response` to the [`ConvergenceDetector`] via
@@ -992,10 +1080,6 @@ impl DetectionManager {
             .check_convergence()
     }
 
-    // ==================================================
-    // Pattern check
-    // ==================================================
-
     /// Inspect the current detection state without recording new data.
     ///
     /// Checks both the loop detector and the convergence detector in
@@ -1067,10 +1151,6 @@ impl DetectionManager {
         DetectedPattern::NoPattern
     }
 
-    // ==================================================
-    // Accessors
-    // ==================================================
-
     /// Take a snapshot of the cumulative detection statistics.
     ///
     /// Clones the [`DetectionStats`] struct via the `Mutex`,
@@ -1138,10 +1218,6 @@ impl DetectionManager {
     pub fn config(&self) -> &DetectionConfig {
         &self.config
     }
-
-    // ==================================================
-    // Reset
-    // ==================================================
 
     /// Reset all internal detection state, as if the manager were freshly
     /// constructed.
@@ -1214,10 +1290,6 @@ impl Default for DetectionManager {
     }
 }
 
-// ==================================================
-// Tests
-// ==================================================
-
 /// Tests for [`DetectionManager`].
 ///
 /// Verifies loop detection, convergence detection, result-aware detection,
@@ -1239,7 +1311,6 @@ mod tests {
     #[test]
     fn test_loop_detection() {
         let dm = DetectionManager::new().unwrap();
-        // Same operation repeated many times
         for _ in 0..5 {
             let result = dm.record_tool_call("read_file", 42);
             if matches!(result, DetectedPattern::LoopDetected { .. }) {
@@ -1256,7 +1327,7 @@ mod tests {
         for _ in 0..5 {
             let result = dm.record_response(response);
             if matches!(result, DetectedPattern::ConvergenceDetected { .. }) {
-                return; // test passes
+                return;
             }
         }
         panic!("Expected convergence detection after 5 identical responses");
@@ -1299,7 +1370,6 @@ mod tests {
         };
         let dm = DetectionManager::new_with_config(config).unwrap();
 
-        // Record 5 identical operations
         for _ in 0..5 {
             dm.record_tool_call("read_file", 42);
         }
@@ -1315,7 +1385,6 @@ mod tests {
     fn test_record_operation_with_operation_struct() {
         let dm = DetectionManager::new().unwrap();
 
-        // Record operations using the rich Operation API
         for _ in 0..5 {
             dm.record_operation(Operation::new("Read", "/test/file.txt"));
         }

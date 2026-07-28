@@ -12,10 +12,6 @@ use std::pin::Pin;
 
 use super::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 
-// ===================================================
-// ToolRegistry
-// ===================================================
-
 /// Registry of available tools for dynamic lookup by name.
 ///
 /// The agent loop creates a [`ToolRegistry`] at session start, registers
@@ -26,9 +22,11 @@ use super::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 ///
 /// # Thread safety
 ///
-/// The registry itself is not `Sync` — it is created once during session
-/// setup and then accessed immutably during tool dispatch. If you need
-/// cross-thread sharing, wrap it in an `Arc<RwLock<ToolRegistry>>`.
+/// `ToolRegistry` is `Send + Sync` because [`Tool`] requires `Send + Sync`.
+/// The registry is created once during session setup and then shared via
+/// `Arc<ToolRegistry>` for read-only access during dispatch, including
+/// concurrent reads in parallel tool dispatch. No wrapping in `RwLock` is
+/// needed.
 ///
 /// # Example
 ///
@@ -45,7 +43,14 @@ use super::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 /// let schemas = registry.all_schemas();
 /// ```
 pub struct ToolRegistry {
-    /// `Box<dyn Tool>` keyed by [`Tool::name`].
+    /// Registered tools, keyed by their [`Tool::name`].
+    ///
+    /// Each value is a boxed trait object so the registry can hold
+    /// tools of different concrete types uniformly. Insertion
+    /// ([`register`](ToolRegistry::register)) overwrites any existing
+    /// entry under the same name; lookup
+    /// ([`get`](ToolRegistry::get)) and schema enumeration
+    /// ([`all_schemas`](ToolRegistry::all_schemas)) iterate this map.
     tools: HashMap<String, Box<dyn Tool>>,
 }
 
@@ -206,28 +211,24 @@ impl ToolRegistry {
     }
 }
 
+/// Produce an empty registry (equivalent to [`ToolRegistry::new`]).
+///
+/// Allows `ToolRegistry` to be used in contexts that require
+/// [`Default`], such as struct initialization with `..Default::default()`.
+///
+/// # Example
+///
+/// ```rust
+/// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
+///
+/// let registry = ToolRegistry::default();
+/// assert!(registry.is_empty());
+/// ```
 impl Default for ToolRegistry {
-    /// Produce an empty registry (equivalent to [`ToolRegistry::new`]).
-    ///
-    /// Allows `ToolRegistry` to be used in contexts that require
-    /// [`Default`], such as struct initialization with `..Default::default()`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::tool::{ToolOutput, ToolError, ToolSchema, ToolContext, PermissionCheck, ToolRegistry};
-    ///
-    /// let registry = ToolRegistry::default();
-    /// assert!(registry.is_empty());
-    /// ```
     fn default() -> Self {
         Self::new()
     }
 }
-
-// ===================================================
-// FnTool adapter
-// ===================================================
 
 /// Type alias for an async tool function pointer.
 ///
@@ -530,24 +531,15 @@ impl FnTool {
     }
 }
 
-/// [`Tool`] trait implementation for [`FnTool`].
-///
-/// Delegates each trait method to the corresponding field or function
-/// pointer stored in the [`FnTool`] adapter.
 impl Tool for FnTool {
-    /// Returns the tool's unique identifier stored in [`name`](FnTool::name).
     fn name(&self) -> &str {
         &self.name
     }
 
-    /// Returns the human-readable description stored in
-    /// [`description`](FnTool::description).
     fn description(&self) -> &str {
         &self.description
     }
 
-    /// Builds a [`ToolSchema`] from the stored name, description, and
-    /// input schema.
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             tool: self.name.clone(),
@@ -556,8 +548,6 @@ impl Tool for FnTool {
         }
     }
 
-    /// Delegates execution to the stored [`tool_fn`](FnTool::tool_fn)
-    /// function pointer, forwarding the input and context unchanged.
     fn call(
         &self,
         input: Value,
@@ -566,34 +556,23 @@ impl Tool for FnTool {
         (self.tool_fn)(input, context)
     }
 
-    /// Returns the static concurrency-safety flag set via
-    /// [`concurrency_safe`](FnTool::concurrency_safe).
     fn is_concurrency_safe(&self) -> bool {
         self.is_concurrency_safe
     }
 
-    /// Delegates to [`concurrency_check_fn`](FnTool::concurrency_check_fn)
-    /// when set, otherwise falls back to the static
-    /// [`is_concurrency_safe`](Tool::is_concurrency_safe) flag.
     fn is_safe_for_concurrent_execution(&self, input: &Value) -> bool {
         self.concurrency_check_fn
             .map_or(self.is_concurrency_safe, |f| f(input))
     }
 
-    /// Delegates to [`resource_key_fn`](FnTool::resource_key_fn) when set,
-    /// otherwise returns `None` (no declarable resource).
     fn resource_key(&self, input: &Value) -> Option<String> {
         self.resource_key_fn.and_then(|f| f(input))
     }
 
-    /// Returns whether this tool only reads data and has no side effects,
-    /// as configured via [`read_only`](FnTool::read_only).
     fn is_read_only(&self) -> bool {
         self.is_read_only
     }
 
-    /// Returns the optional system prompt set via
-    /// [`with_system_prompt`](FnTool::with_system_prompt).
     fn system_prompt(&self) -> Option<String> {
         self.system_prompt.clone()
     }

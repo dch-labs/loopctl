@@ -4,44 +4,46 @@
 //! Observers receive shared references (`&Context`) — the structs are
 //! notification-only data carriers.
 
-/// Context for [`LoopObserver::on_session_start`](crate::observer::LoopObserver::on_session_start).
+/// Context for [`LoopObserver::on_run_start`](crate::observer::LoopObserver::on_run_start).
 ///
-/// Carries the session identifier so observers can correlate
-/// lifecycle events with a specific agent run.
+/// Carries the session identifier so observers can correlate lifecycle
+/// events with a specific agent run. One run is one `run()` call on the
+/// loop; a session may contain many runs.
 #[derive(Debug, Clone)]
-pub struct SessionStartContext {
+pub struct RunStartContext {
     /// Unique session identifier.
     ///
-    /// Correlates all lifecycle events belonging to the same agent run.
+    /// Correlates all lifecycle events belonging to the same agent session.
+    /// Stable across every `run()` call on the same loop.
     pub session_id: uuid::Uuid,
 }
 
-/// Context for [`LoopObserver::on_session_end`](crate::observer::LoopObserver::on_session_end).
+/// Context for [`LoopObserver::on_run_end`](crate::observer::LoopObserver::on_run_end).
 ///
-/// Captures the session's completion status, optional error description,
-/// total turns executed, and wall-clock duration in milliseconds.
+/// Captures the run's completion status, optional error description, total
+/// turns executed, and wall-clock duration in milliseconds.
 #[derive(Debug, Clone)]
-pub struct SessionEndContext {
-    /// Whether the session completed successfully.
+pub struct RunEndContext {
+    /// Whether the run completed successfully.
     ///
-    /// `true` when the loop exited normally, `false` on error or cancellation.
+    /// `true` when the run exited normally, `false` on error or cancellation.
     pub success: bool,
 
-    /// Error description, if the session ended due to an error.
+    /// Error description, if the run ended due to an error.
     ///
     /// `None` when [`success`](Self::success) is `true`.
     pub error: Option<String>,
 
-    /// Total turns completed during the session.
+    /// Total turns completed during this run.
     ///
     /// Counts only turns that finished; an in-flight turn at the time of
     /// a fatal error is not included.
     pub total_turns: usize,
 
-    /// Total session duration in milliseconds.
+    /// Run duration in milliseconds.
     ///
-    /// Measured wall-clock from [`on_session_start`](crate::observer::LoopObserver::on_session_start)
-    /// to [`on_session_end`](crate::observer::LoopObserver::on_session_end).
+    /// Measured wall-clock from [`on_run_start`](crate::observer::LoopObserver::on_run_start)
+    /// to [`on_run_end`](crate::observer::LoopObserver::on_run_end).
     pub duration_ms: u64,
 }
 

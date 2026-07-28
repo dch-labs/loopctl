@@ -204,7 +204,7 @@ pub trait StreamCapable {
 /// # When to use
 ///
 /// Use this trait bound when you need to run hooks before or after
-/// tool dispatch, compaction, or session start/end.
+/// tool dispatch, compaction, or run start/end.
 #[cfg(feature = "hooks")]
 pub trait Hookable {
     /// Returns the hook executor, if hooks are configured.

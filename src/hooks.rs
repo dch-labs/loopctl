@@ -49,7 +49,7 @@ use std::fmt;
 
 use context::{
     CompactResult, PostCompactContext, PostToolUseContext, PreCompactContext, PreToolUseContext,
-    SessionEndContext, SessionStartContext,
+    RunEndContext, RunStartContext,
 };
 
 /// Hook trait for bidirectional lifecycle control.
@@ -136,17 +136,17 @@ pub trait Hook: Send + Sync {
     /// Notification-only; cannot alter the compaction result.
     fn on_post_compact(&self, _ctx: &PostCompactContext) {}
 
-    /// Called when an agent session starts.
+    /// Called when a run starts.
     ///
-    /// Fires once at session start. Use for initialization,
+    /// Fires at the start of each `run()` call. Use for initialization,
     /// credential setup, or state restoration.
-    fn on_session_start(&self, _ctx: &SessionStartContext) {}
+    fn on_run_start(&self, _ctx: &RunStartContext) {}
 
-    /// Called when an agent session ends.
+    /// Called when a run ends.
     ///
-    /// Fires once at session end. Use for cleanup, teardown,
+    /// Fires at the end of each `run()` call. Use for cleanup, teardown,
     /// or final metric emission.
-    fn on_session_end(&self, _ctx: &SessionEndContext) {}
+    fn on_run_end(&self, _ctx: &RunEndContext) {}
 }
 
 /// Whether the session can interact with a human operator.

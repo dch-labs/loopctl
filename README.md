@@ -80,8 +80,9 @@ impl Tool for EchoTool {
 ```rust,no_run
 use loopctl::engine::BareLoop;
 use loopctl::engine::core::Loop;
+use loopctl::engine::RunConfig;
 use loopctl::tool::ToolRegistry;
-use loopctl::config::LoopConfig;
+use loopctl::config::SessionConfig;
 use std::sync::Arc;
 
 // 1. Bring your own API client (implements ApiClient trait)
@@ -89,8 +90,8 @@ use std::sync::Arc;
 # use loopctl::api::ApiClient;
 # impl ApiClient for MyClient {
 #     fn model(&self) -> &str { "llm-70b" }
-#     fn stream_messages(&self, _req: loopctl::api::StreamRequest)
-#         -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<loopctl::stream::StreamEvent, loopctl::stream::StreamError>> + Send>> {
+#     fn stream_messages(&self, _req: &loopctl::api::StreamRequest)
+#         -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<loopctl::stream::StreamEvent, loopctl::api::error::ApiError>> + Send>> {
 #         unimplemented!()
 #     }
 # }
@@ -101,16 +102,12 @@ let mut registry = ToolRegistry::new();
 // registry.register(EchoTool);
 
 // 3. Configure
-let config = LoopConfig {
-    max_turns: 50,
-    model: "llm-70b".into(),
-    ..Default::default()
-};
+let config = SessionConfig::default();
 
 // 4. Run
-let agent = BareLoop::new(client, registry, config);
-// let result = agent.run("Use the echo tool to say hello").await?;
-// println!("Completed in {} turns", result.total_turns);
+let mut agent = BareLoop::new(client, registry, config);
+// let result = agent.run("Use the echo tool to say hello", &RunConfig::default()).await?;
+// println!("Completed in {} turns", result.turn_count());
 ```
 
 ### Use the Testing Module

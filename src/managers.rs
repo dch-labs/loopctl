@@ -124,8 +124,8 @@ pub struct LoopManagers {
     /// Circuit breaker for API model fallback.
     ///
     /// Tracks consecutive API failures and, when the threshold is exceeded,
-    /// switches to a configured backup model. Reset at the start of each run
-    /// via [`reset_all`](Self::reset_all).
+    /// switches to a configured backup model. Fresh on construction; call
+    /// [`reset_all`](Self::reset_all) to reinitialise mid-session.
     fallback: FallbackManager,
 
     /// Loop and convergence detection orchestrator.
@@ -399,16 +399,20 @@ impl LoopManagers {
 
     /// Reset all managers and observers to their initial state.
     ///
-    /// Delegates to each manager's `reset()` method and calls
-    /// [`ObserverHost::reset_all`]. Typically called at the start of
-    /// a new agent task or session.
+    /// Clears the fallback circuit breaker, loop/convergence detection
+    /// history, and per-observer accumulators. Call this when you want a
+    /// clean slate mid-session — for example after a provider outage
+    /// resolves (so the circuit breaker does not stay tripped) or when
+    /// switching to an unrelated task (so stale detection history does not
+    /// skew the next run). The engine does not call this automatically;
+    /// manager state persists across `run()` calls within a session.
     ///
     /// # Example
     ///
     /// ```
     /// # use loopctl::managers::LoopManagers;
     /// let managers = LoopManagers::new();
-    /// // ... after a session ...
+    /// // ... after several runs ...
     /// managers.reset_all();
     /// // All managers are back to their initial state
     /// ```

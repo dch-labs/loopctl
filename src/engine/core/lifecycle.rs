@@ -61,10 +61,12 @@ fn instant_now() -> Instant {
 /// Per-run configuration.
 ///
 /// The slice of agent configuration that varies across `run()` calls on the
-/// same agent (turn/token budgets, compaction policy, dispatch mode). It is
-/// owned by the machine so that the machine's decisions are self-contained and
-/// a serialized machine carries its configuration with it.
+/// same agent (turn/token budgets, compaction policy, dispatch mode, manager
+/// reset). It is owned by the machine so that the machine's decisions are
+/// self-contained and a serialized machine carries its configuration with
+/// it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RunConfig {
     /// Maximum number of turns before forcing completion.
     ///
@@ -80,6 +82,20 @@ pub struct RunConfig {
     /// sequentially or in parallel, up to a concurrency limit. See
     /// [`ParallelDispatchConfig`].
     pub parallel_tool_dispatch: ParallelDispatchConfig,
+
+    /// Whether to reset all managers to their initial state before this run.
+    ///
+    /// When `true`, [`LoopManagers::reset_all`] is called at the top of
+    /// `run()`, clearing the fallback circuit breaker, loop/convergence
+    /// detection history, and per-observer accumulators. Use this when a
+    /// run is logically independent from the previous one (different task,
+    /// fresh context) and you do not want accumulated state to carry over.
+    /// Defaults to `false` — manager state persists across runs within a
+    /// session, which is usually the right behavior (e.g. a tripped
+    /// circuit breaker should stay tripped).
+    ///
+    /// [`LoopManagers::reset_all`]: crate::managers::LoopManagers::reset_all
+    pub reset_managers: bool,
 }
 
 impl Default for RunConfig {
@@ -87,7 +103,26 @@ impl Default for RunConfig {
         Self {
             max_turns: 200,
             parallel_tool_dispatch: ParallelDispatchConfig::default(),
+            reset_managers: false,
         }
+    }
+}
+
+impl RunConfig {
+    /// Set the maximum number of turns for this run.
+    ///
+    /// Builder-style convenience for `#[non_exhaustive]` compliance.
+    ///
+    /// ```
+    /// use loopctl::engine::RunConfig;
+    ///
+    /// let config = RunConfig::default().with_max_turns(50);
+    /// assert_eq!(config.max_turns, 50);
+    /// ```
+    #[must_use]
+    pub fn with_max_turns(mut self, max_turns: usize) -> Self {
+        self.max_turns = max_turns;
+        self
     }
 }
 

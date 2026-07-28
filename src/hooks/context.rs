@@ -7,13 +7,13 @@
 //!
 //! # Lifecycle
 //!
-//! Every session opens with [`SessionStartContext`], then interleaves
+//! Every run opens with [`RunStartContext`], then interleaves
 //! any number of tool calls (`PreToolUse` → tool → `PostToolUse`) and
 //! compaction passes (`PreCompact` → compact → `PostCompact`), and
-//! finally closes with [`SessionEndContext`]. Every callback receives a
+//! finally closes with [`RunEndContext`]. Every callback receives a
 //! context whose fields mirror the moment it fires: pre-contexts carry
 //! the *about-to-happen* inputs, post-contexts carry the
-//! *what-happened* results, and the session contexts bracket the whole
+//! *what-happened* results, and the run contexts bracket the whole
 //! run.
 
 use serde::{Deserialize, Serialize};
@@ -339,15 +339,15 @@ impl CompactResult {
     }
 }
 
-/// Why the session ended.
+/// Why the run ended.
 ///
-/// Carried by [`SessionEndContext::reason`] so end-hooks can branch on
-/// the terminal condition. The variants cover the four ways a session
+/// Carried by [`RunEndContext::reason`] so end-hooks can branch on
+/// the terminal condition. The variants cover the four ways a run
 /// can stop — normal completion, cancellation, an unrecoverable error,
 /// hitting a turn cap — plus context overflow when compaction could not
 /// recover. Use this for outcome-specific logging and cleanup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionEndReason {
+pub enum RunEndReason {
     /// The agent finished normally.
     ///
     /// The agent declared its task complete (for example the model
@@ -355,10 +355,10 @@ pub enum SessionEndReason {
     /// This is the "happy path" outcome.
     Complete,
 
-    /// The user interrupted the session.
+    /// The user interrupted the run.
     ///
     /// A cancel signal — Ctrl+C in an interactive host, or a programmatic
-    /// cancellation — stopped the loop. The session may have partial
+    /// cancellation — stopped the loop. The run may have partial
     /// results available in its state at the time of interruption.
     Cancelled,
 
@@ -387,19 +387,19 @@ pub enum SessionEndReason {
     ContextOverflow,
 }
 
-/// Context provided to `on_session_start` hooks.
+/// Context provided to `on_run_start` hooks.
 ///
-/// Fires exactly once per session, before any turns run. Carries the
-/// session identifier, the model that will handle the first request,
-/// and the working directory the agent treats as its root.
-/// Notification-only — use it to initialize per-session state (open
+/// Fires at the start of each `run()` call, before any turns run. Carries
+/// the session identifier, the model that will handle the first
+/// request, and the working directory the agent treats as its root.
+/// Notification-only — use it to initialize per-run state (open
 /// resources, set up tracking, log the start).
 #[derive(Debug, Clone)]
-pub struct SessionStartContext {
+pub struct RunStartContext {
     /// Session ID.
     ///
-    /// Unique identifier for the agent session that is starting, letting hooks
-    /// initialize any per-session state they track.
+    /// Unique identifier for the agent session that owns this run, letting
+    /// hooks initialize any per-session state they track.
     pub session_id: uuid::Uuid,
 
     /// Model identifier.
@@ -416,43 +416,43 @@ pub struct SessionStartContext {
     pub working_directory: String,
 }
 
-/// Context provided to `on_session_end` hooks.
+/// Context provided to `on_run_end` hooks.
 ///
-/// Fires exactly once per session, after the loop has terminated.
+/// Fires at the end of each `run()` call, after the loop has terminated.
 /// Carries the session identifier, the terminal
-/// [`SessionEndReason`], and aggregate counters (turns, tokens,
+/// [`RunEndReason`], and aggregate counters (turns, tokens,
 /// duration) for bookkeeping and cost accounting. Notification-only —
 /// use it to flush resources, finalize tracking, and emit a summary log
 /// line.
 #[derive(Debug, Clone)]
-pub struct SessionEndContext {
+pub struct RunEndContext {
     /// Session ID.
     ///
-    /// Unique identifier for the session that is ending, matching the value
-    /// carried by [`SessionStartContext::session_id`].
+    /// Unique identifier for the session that owns this run, matching the
+    /// value carried by [`RunStartContext::session_id`].
     pub session_id: uuid::Uuid,
 
-    /// Why the session ended.
+    /// Why the run ended.
     ///
     /// The terminal condition — normal completion, cancellation, error, turn
     /// cap, or context overflow — so hooks can branch on the outcome.
-    pub reason: SessionEndReason,
+    pub reason: RunEndReason,
 
     /// Total turns executed.
     ///
-    /// How many turns ran to completion during the session, for bookkeeping
+    /// How many turns ran to completion during this run, for bookkeeping
     /// and budget reporting.
     pub total_turns: usize,
 
     /// Total tokens consumed (input + output across all turns).
     ///
-    /// Aggregate token usage over the whole session, combining input and
+    /// Aggregate token usage over the whole run, combining input and
     /// output tokens from every turn for cost accounting.
     pub total_tokens: u64,
 
-    /// Wall-clock session duration in seconds.
+    /// Wall-clock run duration in seconds.
     ///
-    /// Elapsed time from session start to session end, rounded to whole
+    /// Elapsed time from run start to run end, rounded to whole
     /// seconds, for latency and uptime reporting.
     pub duration_secs: u64,
 }
@@ -498,17 +498,17 @@ mod tests {
     }
 
     #[test]
-    fn session_end_reason_serialization() {
+    fn run_end_reason_serialization() {
         let reasons = [
-            SessionEndReason::Complete,
-            SessionEndReason::Cancelled,
-            SessionEndReason::Error,
-            SessionEndReason::MaxTurns,
-            SessionEndReason::ContextOverflow,
+            RunEndReason::Complete,
+            RunEndReason::Cancelled,
+            RunEndReason::Error,
+            RunEndReason::MaxTurns,
+            RunEndReason::ContextOverflow,
         ];
         for reason in reasons {
             let json = serde_json::to_string(&reason).expect("serialize");
-            let back: SessionEndReason = serde_json::from_str(&json).expect("deserialize");
+            let back: RunEndReason = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(back, reason);
         }
     }

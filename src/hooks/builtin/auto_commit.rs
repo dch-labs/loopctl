@@ -1,13 +1,13 @@
 //! Auto-commit hook — automatically commits file changes during agent sessions.
 //!
 //! Tracks file modifications from tool calls (Write, Edit) and commits
-//! them at session end. Useful for keeping a git trail of agent actions.
+//! them at run end. Useful for keeping a git trail of agent actions.
 //!
 //! # How it fits together
 //!
 //! 1. [`AutoCommitHook`] observes post-tool-use events, recording each
 //!    `file_path` touched by the configured tracking tools.
-//! 2. At session end the hook hands the recorded paths (plus the
+//! 2. At run end the hook hands the recorded paths (plus the
 //!    [`AutoCommitConfig`]) to [`GitExecutor`], which shells out to
 //!    `git` to stage, commit, and optionally push.
 //! 3. [`AutoCommitResult`] describes the outcome so callers can log
@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::hooks::Hook;
-use crate::hooks::context::{PostToolUseContext, SessionEndContext, SessionStartContext};
+use crate::hooks::context::{PostToolUseContext, RunEndContext, RunStartContext};
 
 /// Default timeout for git subprocess invocations.
 ///
@@ -455,7 +455,7 @@ pub struct AutoCommitConfig {
     /// Commit message template (supports `{{tool}}`, `{{session}}` placeholders).
     ///
     /// Template string used to build the commit message; `{{tool}}` and
-    /// `{{session}}` are expanded at session end into the triggering tool
+    /// `{{session}}` are expanded at run end into the triggering tool
     /// name and the session identifier respectively.
     pub message_template: String,
 
@@ -490,7 +490,7 @@ pub struct AutoCommitConfig {
     ///
     /// Tool names whose output should be watched for a `file_path`; when one
     /// of these tools runs, the touched file is recorded and staged at
-    /// session end.
+    /// run end.
     pub commit_on_tools: Vec<String>,
 
     /// Files to add before commit.
@@ -558,7 +558,7 @@ impl AutoCommitConfigBuilder {
     ///
     /// Accepts any `Into<String>` so literals work directly. The
     /// template may include `{{tool}}` and `{{session}}` placeholders
-    /// expanded at session end.
+    /// expanded at run end.
     #[must_use]
     pub fn with_message_template(mut self, template: impl Into<String>) -> Self {
         self.config.message_template = template.into();
@@ -602,7 +602,7 @@ impl Default for AutoCommitConfigBuilder {
 }
 
 /// A hook that tracks file modifications from tool calls and commits
-/// them at session end.
+/// them at run end.
 ///
 /// Useful for keeping a git trail of agent actions. Configure which
 /// tools trigger tracking via [`AutoCommitConfig::commit_on_tools`].
@@ -678,7 +678,7 @@ impl AutoCommitHook {
 
     /// Clear all recorded file modifications.
     ///
-    /// Called at session start so a fresh session does not inherit
+    /// Called at run start so a fresh run does not inherit
     /// modifications from the previous one. Lock failures are silently
     /// ignored.
     fn clear_modifications(&self) {
@@ -711,11 +711,11 @@ impl Hook for AutoCommitHook {
         }
     }
 
-    fn on_session_start(&self, _ctx: &SessionStartContext) {
+    fn on_run_start(&self, _ctx: &RunStartContext) {
         self.clear_modifications();
     }
 
-    fn on_session_end(&self, _ctx: &SessionEndContext) {
+    fn on_run_end(&self, _ctx: &RunEndContext) {
         let files = self.modified_files.lock().ok().filter(|f| !f.is_empty());
         let result = GitExecutor::auto_commit_with_files(
             &self.config,

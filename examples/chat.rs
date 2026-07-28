@@ -329,10 +329,7 @@ async fn run_repl<C: ApiClient>(client: Arc<C>) {
 
     // Create the agent once — conversation history persists across inputs.
     let config = SessionConfig::default();
-    let run_config = RunConfig {
-        max_turns: 10,
-        ..RunConfig::default()
-    };
+    let run_config = RunConfig::default().with_max_turns(10);
     let mut agent = BareLoop::new(client, build_tools(), config);
     agent.register_observer(Arc::new(PrintingObserver));
 

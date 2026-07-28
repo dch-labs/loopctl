@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   `from_machine()` for inspection and serialize-and-resume.
 - `LoopMachine::inject(message)` — add an arbitrary message to the machine's
   history (host steering, or `ContextContributor` goal re-injection).
-- `Session`/`Run`/`Turn`/`Run` lifetime types (`engine::core`) —
+- `Session`/`Run`/`Turn`/`RunResult` lifetime types (`engine::core`) —
   the Session ⊃ [Run ⊃ [Turn]] hierarchy: one `Session` spans the process,
   one `Run` per `run()` prompt, one `Turn` per loop iteration. `Session`
   derives per-session totals (`total_turns`/`total_duration`/

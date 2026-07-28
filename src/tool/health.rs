@@ -570,9 +570,7 @@ impl ToolCircuitBreaker {
     ///   (returns `false` to prevent thundering-herd).
     #[must_use]
     pub fn allow_request(&self) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
+        let mut state = crate::error::recover_guard(self.state.lock());
         match state.circuit {
             CircuitState::Closed => true,
             CircuitState::HalfOpen => false,
@@ -595,10 +593,9 @@ impl ToolCircuitBreaker {
     /// Resets consecutive failures to zero and transitions the breaker
     /// to Closed.
     pub fn record_success(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.consecutive_failures = 0;
-            state.circuit = CircuitState::Closed;
-        }
+        let mut state = crate::error::recover_guard(self.state.lock());
+        state.consecutive_failures = 0;
+        state.circuit = CircuitState::Closed;
     }
 
     /// Record a failed call.
@@ -607,9 +604,7 @@ impl ToolCircuitBreaker {
     /// `failure_threshold`, the breaker transitions to Open. In the
     /// `HalfOpen` state, a single failure reopens the breaker.
     pub fn record_failure(&self) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
+        let mut state = crate::error::recover_guard(self.state.lock());
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         state.last_failure_time = Some(Instant::now());
         match state.circuit {
@@ -649,7 +644,7 @@ impl ToolCircuitBreaker {
     /// trips the breaker.
     #[must_use]
     pub fn consecutive_failures(&self) -> u64 {
-        self.state.lock().map_or(0, |s| s.consecutive_failures)
+        crate::error::recover_guard(self.state.lock()).consecutive_failures
     }
 
     /// Whether the breaker is currently in the Closed (healthy) state.
@@ -657,9 +652,7 @@ impl ToolCircuitBreaker {
     /// `true` when requests are allowed unconditionally.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.state
-            .lock()
-            .is_ok_and(|s| s.circuit == CircuitState::Closed)
+        crate::error::recover_guard(self.state.lock()).circuit == CircuitState::Closed
     }
 
     /// Whether the breaker is currently in the Open (blocking) state.
@@ -669,9 +662,7 @@ impl ToolCircuitBreaker {
     /// [`allow_request`](Self::allow_request)).
     #[must_use]
     pub fn is_open(&self) -> bool {
-        self.state
-            .lock()
-            .is_ok_and(|s| s.circuit == CircuitState::Open)
+        crate::error::recover_guard(self.state.lock()).circuit == CircuitState::Open
     }
 
     /// Whether the breaker is currently in the `HalfOpen` (probing)
@@ -681,9 +672,7 @@ impl ToolCircuitBreaker {
     /// probes are refused to avoid a thundering herd.
     #[must_use]
     pub fn is_half_open(&self) -> bool {
-        self.state
-            .lock()
-            .is_ok_and(|s| s.circuit == CircuitState::HalfOpen)
+        crate::error::recover_guard(self.state.lock()).circuit == CircuitState::HalfOpen
     }
 }
 

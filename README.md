@@ -32,7 +32,7 @@ and tool implementations; the framework handles the rest.
 | [`middleware`](https://docs.rs/loopctl/latest/loopctl/middleware/index.html) | Tool dispatch pipeline: timeouts, permissions, output limits, unknown-tool handling |
 | [`observer`](https://docs.rs/loopctl/latest/loopctl/observer/index.html) | `LoopObserver` trait and `ObserverHost` for lifecycle event observation |
 | [`reflection`](https://docs.rs/loopctl/latest/loopctl/reflection/index.html) | Failure reflection and recovery strategies (`Reflector`, `RecoveryStrategy`) |
-| [`runtime`](https://docs.rs/loopctl/latest/loopctl/runtime/index.html) | `LoopManagers` — the default infrastructure bundle |
+| [`managers`](https://docs.rs/loopctl/latest/loopctl/managers/index.html) | `LoopManagers` — the default infrastructure bundle |
 | [`stream`](https://docs.rs/loopctl/latest/loopctl/stream/index.html) | Streaming event types, accumulator, stop reasons, usage tracking |
 | [`tool`](https://docs.rs/loopctl/latest/loopctl/tool/index.html) | `Tool` trait, `ToolRegistry`, `ToolSchema`, `ToolOutput`, `FnTool` adapter |
 | [`hooks`](https://docs.rs/loopctl/latest/loopctl/hooks/index.html) | Bidirectional lifecycle control (allow/block/ask before tool use). *Requires `hooks` feature.* |
@@ -152,6 +152,7 @@ let agent = BareLoop::new(
 | `ollama` | No | `providers`, `openai` | Ollama local model client (OpenAI-compatible) |
 | `deepseek` | No | `providers`, `openai` | DeepSeek API client (OpenAI-compatible) |
 | `grok` | No | `providers`, `openai` | Grok (xAI) API client (OpenAI-compatible) |
+| `xai` | No | `grok` | Alias for `grok` (xAI API client)
 | `gemini` | No | `providers` | Google Gemini API client (`provider::gemini`) |
 | `zai` | No | `providers`, `anthropic` | Z.AI API client (Anthropic-compatible) |
 | `grammar` | No | `providers` | Tool-call grammar providers for grammar-aware samplers (vLLM `guided_json`); enables the `Grammar` mode of `ToolConstraint` |

@@ -380,6 +380,17 @@ pub struct LoopMachine {
     /// policy to decide whether to emit a [`MachineStep::Compact`].
     context_tokens: u64,
 
+    /// Context tokens at the time of the last compaction request.
+    ///
+    /// When the machine emits `Compact`, it records `context_tokens`
+    /// here. After `compaction_result`, if `tokens_after` has not
+    /// decreased below this value, the machine transitions to
+    /// [`MachineOutcome::Failed`] with
+    /// [`LoopError::ContextExceeded`] instead of requesting another
+    /// compaction — preventing an infinite compaction cycle when the
+    /// compactor cannot reduce the context.
+    last_compaction_tokens: Option<u64>,
+
     /// Whether [`Self::cancel`] has been called.
     ///
     /// A cancellation request from the driver. Once set, the next
@@ -414,6 +425,7 @@ impl LoopMachine {
             state: MachineState::Start,
             turns_taken: 0,
             context_tokens: 0,
+            last_compaction_tokens: None,
             cancelled: false,
             pending_tools: Vec::new(),
         }
@@ -499,11 +511,13 @@ impl LoopMachine {
         }
         if self.is_emergency(policy) {
             let reason = CompactReason::Emergency;
+            self.last_compaction_tokens = Some(self.context_tokens);
             self.state = MachineState::AwaitingCompaction { reason };
             return MachineStep::Compact { reason };
         }
         if policy.auto_compact && self.should_compact(policy) {
             let reason = CompactReason::ThresholdExceeded;
+            self.last_compaction_tokens = Some(self.context_tokens);
             self.state = MachineState::AwaitingCompaction { reason };
             return MachineStep::Compact { reason };
         }
@@ -633,6 +647,19 @@ impl LoopMachine {
         if self.is_terminal() {
             return;
         }
+        if let Some(before) = self.last_compaction_tokens
+            && tokens_after >= before
+        {
+            self.state = MachineState::Terminal(MachineOutcome::Failed {
+                error: LoopError::ContextExceeded {
+                    used: tokens_after,
+                    limit: before,
+                },
+            });
+            self.last_compaction_tokens = None;
+            return;
+        }
+        self.last_compaction_tokens = None;
         self.history = compacted;
         self.pending.clear();
         self.context_tokens = tokens_after;
@@ -1179,6 +1206,60 @@ mod tests {
             machine.full_history().len(),
             1,
             "pending must be cleared after compaction"
+        );
+    }
+
+    #[test]
+    fn compaction_no_progress_terminates_not_loops() {
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: true,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        let _ = machine.next_step(policy);
+        machine.model_response(tool_response("echo", &["echo"], 60));
+        let _ = machine.next_step(policy);
+        machine.tool_results(vec![Message::user("tool-out")]);
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::Compact { .. }
+        ));
+        machine.compaction_result(vec![Message::user("compacted")], 70);
+
+        match machine.next_step(policy) {
+            MachineStep::Done(MachineOutcome::Failed {
+                error: LoopError::ContextExceeded { .. },
+            }) => {}
+            other => {
+                panic!("no-progress compaction must terminate with ContextExceeded, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_progress_continues_normally() {
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: true,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        let _ = machine.next_step(policy);
+        machine.model_response(tool_response("echo", &["echo"], 60));
+        let _ = machine.next_step(policy);
+        machine.tool_results(vec![Message::user("tool-out")]);
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::Compact { .. }
+        ));
+        machine.compaction_result(vec![Message::user("compacted")], 30);
+
+        assert!(
+            matches!(machine.next_step(policy), MachineStep::CallLLM { .. }),
+            "compaction that reduced tokens must continue to CallLLM"
         );
     }
 

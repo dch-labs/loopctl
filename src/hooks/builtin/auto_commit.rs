@@ -170,6 +170,8 @@ impl GitExecutor {
             .spawn()
             .map_err(|e| GitExecutorError::ExecutionFailed(e.to_string()))?;
 
+        let pid = child.id();
+
         let (tx, rx) = std::sync::mpsc::channel::<Result<Output, std::io::Error>>();
         std::thread::spawn(move || {
             let result = child.wait_with_output();
@@ -187,6 +189,13 @@ impl GitExecutor {
             }
             Ok(Err(e)) => Err(GitExecutorError::ExecutionFailed(e.to_string())),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let _ = Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .ok();
+                let _ = rx.recv().ok();
                 Err(GitExecutorError::Timeout(GIT_TIMEOUT))
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(

@@ -1818,12 +1818,16 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
         if self.is_cancelled() {
             return Some(LoopError::Cancelled);
         }
-        let max_turns = self.run_config().max_turns;
-        let turns = self.current_run().map_or(0, Run::turn_count);
-        if turns >= max_turns {
-            return Some(LoopError::MaxTurnsExceeded { max: max_turns });
+        match self.machine.state() {
+            MachineState::Terminal(MachineOutcome::Failed { error }) => Some(error),
+            MachineState::Terminal(MachineOutcome::MaxTurnsExceeded) => {
+                Some(LoopError::MaxTurnsExceeded {
+                    max: self.run_config().max_turns,
+                })
+            }
+            MachineState::Terminal(MachineOutcome::Cancelled) => Some(LoopError::Cancelled),
+            _ => None,
         }
-        None
     }
 }
 
@@ -4645,11 +4649,32 @@ mod tests {
         assert_eq!(hook.captured(), Some(RunEndReason::Cancelled));
     }
 
+    /// A genuine max-turns run exits via the machine's
+    /// `MaxTurnsExceeded` arm, which carries the typed error through
+    /// finalize — not a turn-count heuristic.
     #[cfg(feature = "hooks")]
     #[tokio::test]
     async fn run_end_reason_max_turns() {
+        let (loop_, hook) = loop_with_reason_hook();
+        let err = LoopError::MaxTurnsExceeded { max: 5 };
+
+        loop_.notify_run_end(
+            &loop_.current_run().unwrap().clone(),
+            Duration::from_millis(100),
+            Some(&err),
+        );
+
+        assert_eq!(hook.captured(), Some(RunEndReason::MaxTurns));
+    }
+
+    /// A run that legitimately completes on exactly the `max_turns`-th
+    /// turn reaches finalize with `error = None`. The turn count is a
+    /// red herring: the machine emitted `Completed`, not
+    /// `MaxTurnsExceeded`, so the reason must be `Complete`.
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn run_end_reason_complete_on_max_turn_boundary() {
         let (mut loop_, hook) = loop_with_reason_hook();
-        // Hit max_turns: turn count == max_turns, not cancelled, success true.
         loop_.current_run_mut().unwrap().turns = (0..5)
             .map(|i| crate::engine::core::Turn {
                 turn: i,
@@ -4667,7 +4692,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(hook.captured(), Some(RunEndReason::MaxTurns));
+        assert_eq!(hook.captured(), Some(RunEndReason::Complete));
     }
 
     #[cfg(feature = "hooks")]
@@ -4701,6 +4726,112 @@ mod tests {
         );
 
         assert_eq!(hook.captured(), Some(RunEndReason::ContextOverflow));
+    }
+
+    #[test]
+    fn stop_reason_is_none_before_terminal() {
+        use crate::engine::core::Loop;
+        let loop_ = BareLoop::new(
+            Arc::new(MockClient::new("test")),
+            ToolRegistry::new(),
+            SessionConfig::default(),
+        );
+        assert_eq!(loop_.stop_reason(), None);
+    }
+
+    #[test]
+    fn stop_reason_reports_terminal_outcome() {
+        use crate::engine::core::Loop;
+        let mut loop_ = BareLoop::new(
+            Arc::new(MockClient::new("test")),
+            ToolRegistry::new(),
+            SessionConfig::default(),
+        );
+        loop_.machine.fail(LoopError::Api("boom".into()));
+        assert_eq!(loop_.stop_reason(), Some(LoopError::Api("boom".into())));
+
+        let mut loop_ = BareLoop::new(
+            Arc::new(MockClient::new("test")),
+            ToolRegistry::new(),
+            SessionConfig::default(),
+        );
+        loop_.machine.cancel();
+        let policy = loop_.machine_policy();
+        let _ = loop_.machine.next_step(policy);
+        assert_eq!(loop_.stop_reason(), Some(LoopError::Cancelled));
+
+        // Drive the machine to a genuine MaxTurnsExceeded terminal state
+        // by exhausting a budget of one: request the model, respond with
+        // a tool call, then request again — the third next_step hits the
+        // cap. stop_reason must surface the typed error. The machine is
+        // policy-free, so the budget is passed directly to next_step.
+        let mut loop_ = BareLoop::new(
+            Arc::new(MockClient::new("test")),
+            ToolRegistry::new(),
+            SessionConfig::default(),
+        );
+        loop_.session.runs.push(Run::new(
+            "",
+            &RunConfig {
+                max_turns: 1,
+                ..RunConfig::default()
+            },
+        ));
+        let policy = loop_.machine_policy();
+        let _ = loop_.machine.next_step(policy);
+        let part = MessagePart::tool_call("c1", "echo", serde_json::Value::Null);
+        let response = ModelResponse {
+            message: Message::new(Role::Assistant, vec![part]),
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: StopReason::ToolCall,
+            available_tools: vec!["echo".to_string()],
+        };
+        loop_.machine.model_response(response);
+        let _ = loop_.machine.next_step(policy);
+        loop_.machine.tool_results(vec![Message::user("r")]);
+        let step = loop_.machine.next_step(policy);
+        assert!(matches!(
+            step,
+            MachineStep::Done(MachineOutcome::MaxTurnsExceeded)
+        ));
+        assert_eq!(
+            loop_.stop_reason(),
+            Some(LoopError::MaxTurnsExceeded { max: 1 })
+        );
+    }
+
+    #[test]
+    fn stop_reason_completion_on_max_turn_boundary_is_none() {
+        use crate::engine::core::Loop;
+        let mut loop_ = BareLoop::new(
+            Arc::new(MockClient::new("test")),
+            ToolRegistry::new(),
+            SessionConfig::default(),
+        );
+        // A run that legitimately completes on exactly the max_turns-th
+        // turn ends with the machine in the Completed terminal state, not
+        // MaxTurnsExceeded. stop_reason must reflect that: None, not
+        // MaxTurnsExceeded. This is the regression the old turn-count
+        // heuristic got wrong.
+        let final_msg = Message::assistant("done");
+        let response = ModelResponse {
+            message: final_msg,
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: StopReason::EndTurn,
+            available_tools: Vec::new(),
+        };
+        let policy = MachinePolicy {
+            max_turns: 1,
+            context_window: 200_000,
+            compact_threshold: 80,
+            auto_compact: true,
+        };
+        let _ = loop_.machine.next_step(policy);
+        loop_.machine.model_response(response);
+        assert!(loop_.machine.is_terminal());
+        assert_eq!(loop_.stop_reason(), None);
     }
 
     #[tokio::test]

@@ -53,27 +53,29 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Derive the structured [`RunEndReason`] from the terminal error.
     ///
-    /// Cancellation takes precedence over every other outcome. Then:
-    /// [`LoopError::ContextExceeded`] maps to
-    /// [`ContextOverflow`](RunEndReason::ContextOverflow), any other
-    /// error maps to [`Error`](RunEndReason::Error). When `error` is
-    /// `None`, reaching `max_turns` maps to
-    /// [`MaxTurns`](RunEndReason::MaxTurns), otherwise the run
-    /// completed normally ([`Complete`](RunEndReason::Complete)).
+    /// Maps the authoritative terminal [`LoopError`] carried out of
+    /// [`run`](crate::engine::core::Loop::run) — never the turn count,
+    /// since a run that legitimately completes on exactly the
+    /// `max_turns`-th turn reaches `error = None` and must read as
+    /// [`Complete`](RunEndReason::Complete), not `MaxTurns`. Cancellation
+    /// (signalled or carried by [`LoopError::Cancelled`]) takes
+    /// precedence; then [`LoopError::ContextExceeded`] maps to
+    /// [`ContextOverflow`](RunEndReason::ContextOverflow),
+    /// [`LoopError::MaxTurnsExceeded`] to
+    /// [`MaxTurns`](RunEndReason::MaxTurns), any other error to
+    /// [`Error`](RunEndReason::Error), and `None` to
+    /// [`Complete`](RunEndReason::Complete).
     #[cfg(feature = "hooks")]
     fn run_end_reason(&self, error: Option<&LoopError>) -> RunEndReason {
         if self.is_cancelled() {
-            RunEndReason::Cancelled
-        } else if let Some(e) = error {
-            if matches!(e, LoopError::ContextExceeded { .. }) {
-                RunEndReason::ContextOverflow
-            } else {
-                RunEndReason::Error
-            }
-        } else if self.current_run().map_or(0, Run::turn_count) >= self.run_config().max_turns {
-            RunEndReason::MaxTurns
-        } else {
-            RunEndReason::Complete
+            return RunEndReason::Cancelled;
+        }
+        match error {
+            Some(LoopError::ContextExceeded { .. }) => RunEndReason::ContextOverflow,
+            Some(LoopError::MaxTurnsExceeded { .. }) => RunEndReason::MaxTurns,
+            Some(LoopError::Cancelled) => RunEndReason::Cancelled,
+            Some(_) => RunEndReason::Error,
+            None => RunEndReason::Complete,
         }
     }
 

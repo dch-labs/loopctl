@@ -1511,7 +1511,7 @@ impl<C: ApiClient> BareLoop<C> {
                 Err(LoopError::Cancelled)
             }
             stream_outcome = self.do_stream(contributor_messages) => {
-                let (msg, usage, _stream_stop) = match stream_outcome {
+                let (msg, usage, stream_stop) = match stream_outcome {
                     Ok(triple) => triple,
                     Err(LoopError::Cancelled) => {
                         self.notify_turn_end(
@@ -1545,10 +1545,17 @@ impl<C: ApiClient> BareLoop<C> {
                         input: input.clone(),
                     })
                     .collect();
-                let stop_reason = if tool_calls.is_empty() {
-                    StopReason::EndTurn
-                } else {
-                    StopReason::ToolCall
+                let stop_reason = match stream_stop {
+                    StreamStopReason::ToolCall => StopReason::ToolCall,
+                    StreamStopReason::MaxTokens => StopReason::MaxTokens,
+                    StreamStopReason::StopSequence => StopReason::StopSequence,
+                    StreamStopReason::EndTurn => {
+                        if tool_calls.is_empty() {
+                            StopReason::EndTurn
+                        } else {
+                            StopReason::ToolCall
+                        }
+                    }
                 };
                 let model_response = ModelResponse {
                     message: msg,
@@ -2025,6 +2032,37 @@ mod tests {
                 StreamEvent::MessageStop,
             ];
             crate::error::recover_guard(self.responses.lock()).push(tool_events);
+        }
+
+        fn add_max_tokens_response(&self, text: &str) {
+            let events = vec![
+                StreamEvent::MessageStart(MessageStart {
+                    message: MessageMetadata {
+                        id: "msg_mt".into(),
+                        role: "assistant".into(),
+                        model: crate::error::recover_guard(self.model_name.lock()).clone(),
+                    },
+                }),
+                StreamEvent::PartStart(PartStart {
+                    index: 0,
+                    part: Some(MessagePart::text(text)),
+                }),
+                StreamEvent::IndexedDelta(IndexedDelta {
+                    index: 0,
+                    delta: DeltaPart::Text {
+                        text: text.to_string(),
+                    },
+                }),
+                StreamEvent::PartStop,
+                StreamEvent::MessageDelta(MessageDelta {
+                    delta: MessageDeltaPayload {
+                        stop_reason: Some("max_tokens".to_string()),
+                    },
+                    usage: Some(Usage::new(10, 20)),
+                }),
+                StreamEvent::MessageStop,
+            ];
+            crate::error::recover_guard(self.responses.lock()).push(events);
         }
 
         #[expect(dead_code)]
@@ -2725,6 +2763,17 @@ mod tests {
         assert_eq!(first_session, second_session, "session_id is stable");
         // Each run mints a fresh id.
         assert_ne!(first_run, second_run, "id rotates per run");
+    }
+
+    #[tokio::test]
+    async fn max_tokens_stop_reason_preserved() {
+        let client = MockClient::new("test-model");
+        client.add_max_tokens_response("truncated");
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        let result = agent.run("generate", &RunConfig::default()).await.unwrap();
+
+        assert_eq!(result.turn_count(), 1);
     }
 
     #[tokio::test]

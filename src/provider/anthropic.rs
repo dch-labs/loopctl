@@ -41,7 +41,6 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const SSE_EVENT_PREFIX: &str = "event: ";
 const SSE_DATA_PREFIX: &str = "data: ";
-const TEXT_PART_INDEX: usize = 0;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
 
@@ -831,14 +830,17 @@ struct StreamEmitter {
     /// ignores any subsequent duplicates.
     started: bool,
 
-    /// Whether a text content block is currently open.
+    /// Index of the text content block currently open, if any.
     ///
     /// Anthropic signals the start of a text block with
     /// `content_block_start` (`type: "text"`) and its end with
-    /// `content_block_stop`. This flag tracks the open state so the
-    /// matching `content_block_stop` emits exactly one
-    /// [`StreamEvent::PartStop`].
-    text_part_open: bool,
+    /// `content_block_stop`. This holds the server-supplied block index
+    /// while the block is open and `None` when no text block is open, so
+    /// the matching `content_block_stop` emits exactly one
+    /// [`StreamEvent::PartStop`] and `text_delta` fragments route to the
+    /// correct part. Mirrors [`current_tool_index`](Self::current_tool_index)
+    /// and [`thinking_index`](Self::thinking_index) for the text lane.
+    text_index: Option<usize>,
 
     /// Number of tool-use content blocks currently open.
     ///
@@ -1001,9 +1003,9 @@ impl StreamEmitter {
                 self.tool_parts_open = self.tool_parts_open.saturating_add(1);
             }
             Some("text") => {
-                self.text_part_open = true;
+                self.text_index = Some(index);
                 self.push(StreamEvent::PartStart(PartStart {
-                    index: TEXT_PART_INDEX,
+                    index,
                     part: Some(MessagePart::text("")),
                 }));
             }
@@ -1049,8 +1051,9 @@ impl StreamEmitter {
                     .unwrap_or("")
                     .to_string();
                 if !text.is_empty() {
+                    let text_index = self.text_index.unwrap_or(0);
                     self.push(StreamEvent::IndexedDelta(IndexedDelta {
-                        index: TEXT_PART_INDEX,
+                        index: text_index,
                         delta: DeltaPart::Text { text },
                     }));
                 }
@@ -1063,7 +1066,7 @@ impl StreamEmitter {
                     .to_string();
                 if !json.is_empty() {
                     // Use the index from the corresponding content_block_start.
-                    let tool_index = self.current_tool_index.unwrap_or(TEXT_PART_INDEX);
+                    let tool_index = self.current_tool_index.unwrap_or(0);
                     self.push(StreamEvent::IndexedDelta(IndexedDelta {
                         index: tool_index,
                         delta: DeltaPart::InputJson { partial_json: json },
@@ -1078,7 +1081,7 @@ impl StreamEmitter {
                     .to_string();
                 if !text.is_empty() {
                     // Use the index from the corresponding content_block_start.
-                    let thinking_index = self.thinking_index.unwrap_or(TEXT_PART_INDEX);
+                    let thinking_index = self.thinking_index.unwrap_or(0);
                     self.push(StreamEvent::IndexedDelta(IndexedDelta {
                         index: thinking_index,
                         delta: DeltaPart::Thinking { text },
@@ -1099,8 +1102,8 @@ impl StreamEmitter {
     /// does not carry useful information on this event beyond the
     /// implicit close).
     fn on_block_stop(&mut self, _data: Option<Value>) {
-        if self.text_part_open {
-            self.text_part_open = false;
+        if self.text_index.is_some() {
+            self.text_index = None;
             self.push(StreamEvent::PartStop);
         } else if self.thinking_part_open {
             self.thinking_part_open = false;
@@ -1183,7 +1186,7 @@ impl StreamEmitter {
         if self.thinking_part_open {
             self.push(StreamEvent::PartStop);
         }
-        if self.text_part_open {
+        if self.text_index.is_some() {
             self.push(StreamEvent::PartStop);
         }
         for _ in 0..self.tool_parts_open {
@@ -1192,7 +1195,7 @@ impl StreamEmitter {
         self.thinking_part_open = false;
         self.thinking_index = None;
         self.tool_parts_open = 0;
-        self.text_part_open = false;
+        self.text_index = None;
         self.push(StreamEvent::MessageStop);
     }
 
@@ -1612,6 +1615,47 @@ mod tests {
     }
 
     #[test]
+    fn emitter_text_after_tool_uses_server_index_not_zero() {
+        let mut em = StreamEmitter::default();
+
+        // Tool-use block at server index 0.
+        em.on_block_start(Some(serde_json::json!({
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "t1", "name": "echo"}
+        })));
+        em.drain();
+
+        // Text block at server index 1 — must NOT collide with the tool at 0.
+        em.on_block_start(Some(serde_json::json!({
+            "index": 1,
+            "content_block": {"type": "text"}
+        })));
+        let starts = em.drain();
+        let text_start = starts
+            .iter()
+            .find(|e| matches!(e, StreamEvent::PartStart(ps) if ps.index == 1))
+            .expect("text PartStart must carry the server index 1");
+
+        // Text delta must route to index 1, not the hardcoded 0 that would
+        // collide with the tool-use part.
+        em.on_block_delta(Some(serde_json::json!({
+            "delta": {"type": "text_delta", "text": "after"}
+        })));
+        let deltas = em.drain();
+        match &deltas[0] {
+            StreamEvent::IndexedDelta(d) => {
+                assert_eq!(d.index, 1, "text delta must use the server index, not 0");
+            }
+            other => panic!("expected IndexedDelta, got {other:?}"),
+        }
+        // Confirm the PartStart we matched above really is a text part.
+        let StreamEvent::PartStart(ps) = text_start else {
+            panic!("matched event must be a PartStart");
+        };
+        assert!(ps.part.as_ref().is_some_and(crate::message::MessagePart::is_text));
+    }
+
+    #[test]
     fn emitter_tool_use_block() {
         let mut em = StreamEmitter::default();
 
@@ -1638,12 +1682,12 @@ mod tests {
     #[test]
     fn emitter_block_stop_closes_text() {
         let mut em = StreamEmitter::default();
-        em.text_part_open = true;
+        em.text_index = Some(0);
 
         em.on_block_stop(None);
         let events = em.drain();
         assert!(matches!(events[0], StreamEvent::PartStop));
-        assert!(!em.text_part_open);
+        assert!(em.text_index.is_none());
     }
 
     #[test]
@@ -1668,7 +1712,7 @@ mod tests {
     #[test]
     fn emitter_message_stop_closes_parts() {
         let mut em = StreamEmitter::default();
-        em.text_part_open = true;
+        em.text_index = Some(0);
         em.tool_parts_open = 2;
 
         em.on_message_stop();

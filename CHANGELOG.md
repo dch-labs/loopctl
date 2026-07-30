@@ -585,6 +585,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   and blocked the real dispatch that followed. It now uses pure-read
   helpers (`would_allow_request` / `would_be_half_open`) that observe the
   decision without the transition.
+- The Anthropic provider hardcoded text content blocks to part index 0,
+  ignoring the server-supplied block index. Tool and thinking blocks used
+  the real index, so a response ordering like `[tool_use@0, text@1]` made
+  the text deltas collide with the tool-call's index 0. Text blocks now
+  track and emit at the server index (mirroring the tool/thinking lanes),
+  eliminating the collision.
 
 ### Security
 

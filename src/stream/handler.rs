@@ -25,12 +25,11 @@
 //! let handler = StreamHandler::new();
 //!
 //! // Or with custom config:
-//! let handler = StreamHandler::new().with_config(
+//! let handler = StreamHandler::new().with_timeout_config(
 //!     StreamTimeoutConfig {
 //!         initial_event_timeout: std::time::Duration::from_secs(60),
 //!         ..Default::default()
 //!     },
-//!     Default::default(),
 //! );
 //! ```
 
@@ -101,12 +100,6 @@ pub struct StreamTimeoutConfig {
     /// threshold is used: `min(2, max_consecutive_timeouts)`.
     pub max_consecutive_timeouts: u32,
 
-    /// Interval for progress callbacks during long streams.
-    ///
-    /// The handler calls the progress callback at this interval to report
-    /// elapsed time and event count.
-    pub progress_interval: Duration,
-
     /// Whether to fall back to [`ApiClient::create_message`]
     /// when streaming exhausts all retries.
     ///
@@ -122,7 +115,6 @@ impl Default for StreamTimeoutConfig {
             per_event_timeout: Duration::from_mins(5),
             total_stream_timeout: Duration::from_mins(15),
             max_consecutive_timeouts: 10,
-            progress_interval: Duration::from_secs(30),
             fallback_to_non_streaming: true,
         }
     }
@@ -167,9 +159,6 @@ impl StreamTimeoutConfig {
                 "total_stream_timeout ({:?}) must be >= initial_event_timeout ({:?})",
                 self.total_stream_timeout, self.initial_event_timeout
             ));
-        }
-        if self.progress_interval.is_zero() {
-            return Err("progress_interval must be non-zero".to_string());
         }
 
         if self.max_consecutive_timeouts == 0 {
@@ -243,8 +232,10 @@ impl StreamRetryConfig {
     /// Calculate the backoff delay for a given attempt number (0-indexed).
     ///
     /// Returns the delay as a [`Duration`], capped at
-    /// [`max_delay_ms`](Self::max_delay_ms). Does not apply jitter —
-    /// callers should add jitter based on [`jitter_factor`](Self::jitter_factor).
+    /// [`max_delay_ms`](Self::max_delay_ms). This is the *raw* exponential
+    /// backoff with no jitter; for the jittered delay used by
+    /// [`StreamHandler`] on transport retries, use
+    /// [`jittered_base_delay`](Self::jittered_base_delay).
     ///
     /// # Example
     ///
@@ -263,6 +254,57 @@ impl StreamRetryConfig {
             .base_delay_ms
             .saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX));
         Duration::from_millis(delay_ms.min(self.max_delay_ms))
+    }
+
+    /// The raw exponential backoff with [`jitter_factor`](Self::jitter_factor) applied.
+    ///
+    /// Returns [`base_delay`](Self::base_delay)`(attempt)` scaled by a
+    /// deterministic factor in `[1 - jitter_factor, 1 + jitter_factor]`. The
+    /// factor is derived from the attempt number via a shift-based mix, so the
+    /// same attempt always yields the same delay (reproducible in tests) while
+    /// successive attempts still spread their backoffs — avoiding a
+    /// thundering herd where every retry lands on the same tick. When
+    /// [`jitter_factor`](Self::jitter_factor) is `0.0`, returns
+    /// [`base_delay`](Self::base_delay) unchanged.
+    ///
+    /// This is the delay [`StreamHandler`] sleeps between transport-retry
+    /// attempts; [`base_delay`](Self::base_delay) is the deterministic core
+    /// it composes on.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::stream::handler::StreamRetryConfig;
+    /// use std::time::Duration;
+    ///
+    /// let config = StreamRetryConfig { jitter_factor: 0.0, ..Default::default() };
+    /// // With no jitter, the jittered delay equals the raw backoff exactly.
+    /// assert_eq!(config.jittered_base_delay(1), config.base_delay(1));
+    /// ```
+    #[must_use]
+    pub fn jittered_base_delay(&self, attempt: u32) -> Duration {
+        let base = self.base_delay(attempt);
+        if self.jitter_factor == 0.0 {
+            return base;
+        }
+        let f = Self::jitter_fraction(attempt) * self.jitter_factor;
+        base.mul_f64(1.0 + f)
+    }
+
+    /// A deterministic signed fraction in `[-1.0, 1.0)` derived from `attempt`.
+    ///
+    /// Shifts and mixes the attempt bits so successive attempts map to
+    /// well-spread fractions; the same attempt always yields the same value.
+    /// Used by [`jittered_base_delay`](Self::jittered_base_delay) to scale
+    /// the backoff without pulling in a randomness dependency.
+    #[must_use]
+    fn jitter_fraction(attempt: u32) -> f64 {
+        let mixed = attempt
+            .wrapping_mul(2_654_435_761)
+            .rotate_left(13)
+            .wrapping_add(0x9E37_79B9);
+        let scaled = f64::from(mixed >> 8) / f64::from(1u32 << 24);
+        (scaled - 0.5) * 2.0
     }
 
     /// Validates the configuration, returning an error message if invalid.
@@ -705,6 +747,29 @@ async fn sleep_cancellable(
     tokio::select! {
         () = tokio::time::sleep(delay) => Ok(()),
         () = cancel.notified() => Err(StreamHandlerError::Cancelled),
+    }
+}
+
+/// A future that completes at `deadline`, or never if it is `None`.
+///
+/// Shared by the deadline-driven arms of
+/// [`next_event`](StreamHandler::next_event)'s `tokio::select!` (the
+/// per-event timeout and the total-stream deadline). Each arm computes its
+/// [`Option<Instant>`] deadline and hands it here, so this function owns the
+/// single definition of "sleep until the instant, or stay pending forever
+/// when disabled."
+///
+/// `None` disables the arm: the returned future never resolves, so the
+/// `select!` branch stays inert. This is how
+/// [`passthrough`](StreamHandler::passthrough) (which sets every timeout to
+/// [`Duration::MAX`], yielding `None` deadlines) disables resilience without
+/// a separate code path. A `Some(deadline)` already in the past resolves
+/// immediately, letting a lapsed deadline fire on the next poll rather than
+/// being missed.
+async fn deadline_future(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -1166,44 +1231,6 @@ impl fmt::Display for StreamHandlerError {
 
 impl std::error::Error for StreamHandlerError {}
 
-/// A snapshot of stream progress for external reporting.
-///
-/// Plain data struct carrying the two progress signals a consumer is likely
-/// to want (elapsed time and events processed). `StreamHandler` does not
-/// itself emit `StreamProgress` — it has no built-in progress callback. The
-/// struct is shipped so a downstream consumer that drives its own progress
-/// reporting (metrics observer, TUI heartbeat, deadline watcher) has a
-/// shared shape to read or fill.
-///
-/// # Example
-///
-/// ```rust
-/// use loopctl::stream::handler::StreamProgress;
-/// use std::time::Duration;
-///
-/// let progress = StreamProgress {
-///     elapsed: Duration::from_secs(45),
-///     events_processed: 127,
-/// };
-/// assert_eq!(progress.events_processed, 127);
-/// ```
-#[derive(Debug, Clone)]
-pub struct StreamProgress {
-    /// Time elapsed since the stream started.
-    ///
-    /// Wall-clock duration from stream open to the snapshot point. Useful for
-    /// heartbeat-style reporting (“still streaming after Ns”) and for
-    /// deadline-aware consumers that compare it against their own budget.
-    pub elapsed: Duration,
-
-    /// Number of SSE events processed so far.
-    ///
-    /// Count of stream events successfully accumulated up to the snapshot
-    /// point. A flat or slow-growing count is the early signal of a stalled
-    /// stream before a timeout fires.
-    pub events_processed: u64,
-}
-
 /// Holds configuration for the streaming resilience layer.
 ///
 /// `StreamHandler` wraps an [`ApiClient`]'s streaming path with timeout,
@@ -1244,12 +1271,11 @@ pub struct StreamProgress {
 /// let handler = StreamHandler::new();
 /// assert_eq!(handler.timeout_config().initial_event_timeout, std::time::Duration::from_secs(120));
 ///
-/// let handler = StreamHandler::new().with_config(
+/// let handler = StreamHandler::new().with_timeout_config(
 ///     StreamTimeoutConfig {
 ///         initial_event_timeout: std::time::Duration::from_secs(60),
 ///         ..Default::default()
 ///     },
-///     Default::default(),
 /// );
 /// assert_eq!(handler.timeout_config().initial_event_timeout, std::time::Duration::from_secs(60));
 /// ```
@@ -1328,12 +1354,11 @@ impl StreamHandler {
     /// ```rust,no_run
     /// # use loopctl::stream::handler::{StreamHandler, StreamTimeoutConfig};
     /// let handler = StreamHandler::passthrough()
-    ///     .with_config(
+    ///     .with_timeout_config(
     ///         StreamTimeoutConfig {
     ///             total_stream_timeout: std::time::Duration::from_secs(60),
     ///             ..Default::default()
     ///         },
-    ///         Default::default(),
     ///     );
     /// ```
     ///
@@ -1352,7 +1377,6 @@ impl StreamHandler {
                 total_stream_timeout: NEVER_TIME_OUT,
                 // validate() rejects 0; value is irrelevant since timeouts never fire.
                 max_consecutive_timeouts: 1,
-                progress_interval: NEVER_TIME_OUT,
                 fallback_to_non_streaming: false,
             },
             retry_config: StreamRetryConfig {
@@ -1408,19 +1432,47 @@ impl StreamHandler {
         }
     }
 
-    /// Create a handler with custom configuration.
+    /// Set the timeout configuration, consuming `self`.
+    ///
+    /// Validates `timeout`: if it violates any constraint, the invalid
+    /// value is logged and the default config is kept instead. See
+    /// [`StreamTimeoutConfig::validate`] for the constraints enforced.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use loopctl::stream::handler::{StreamHandler, StreamTimeoutConfig, StreamRetryConfig};
+    /// use loopctl::stream::handler::{StreamHandler, StreamTimeoutConfig};
     /// use std::time::Duration;
     ///
-    /// let handler = StreamHandler::new().with_config(
+    /// let handler = StreamHandler::new().with_timeout_config(
     ///     StreamTimeoutConfig {
     ///         initial_event_timeout: Duration::from_secs(60),
     ///         ..Default::default()
     ///     },
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_timeout_config(mut self, timeout: StreamTimeoutConfig) -> Self {
+        if let Err(e) = timeout.validate() {
+            tracing::warn!(error = %e, "invalid StreamTimeoutConfig, falling back to default");
+        } else {
+            self.timeout_config = timeout;
+        }
+        self
+    }
+
+    /// Set the retry configuration, consuming `self`.
+    ///
+    /// Validates `retry`: if it violates any constraint, the invalid
+    /// value is logged and the default config is kept instead. See
+    /// [`StreamRetryConfig::validate`] for the constraints enforced.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::stream::handler::{StreamHandler, StreamRetryConfig};
+    ///
+    /// let handler = StreamHandler::new().with_retry_config(
     ///     StreamRetryConfig {
     ///         max_retries: 5,
     ///         ..Default::default()
@@ -1428,17 +1480,20 @@ impl StreamHandler {
     /// );
     /// ```
     #[must_use]
-    pub fn with_config(mut self, timeout: StreamTimeoutConfig, retry: StreamRetryConfig) -> Self {
-        self.timeout_config = timeout;
-        self.retry_config = retry;
+    pub fn with_retry_config(mut self, retry: StreamRetryConfig) -> Self {
+        if let Err(e) = retry.validate() {
+            tracing::warn!(error = %e, "invalid StreamRetryConfig, falling back to default");
+        } else {
+            self.retry_config = retry;
+        }
         self
     }
 
     /// Returns a reference to the timeout configuration.
     ///
     /// Read-only access to the [`StreamTimeoutConfig`] stored on the handler.
-    /// Mutate via [`with_config`](StreamHandler::with_config) (which replaces
-    /// both timeout and retry together); there is no per-field setter.
+    /// Mutate via
+    /// [`with_timeout_config`](Self::with_timeout_config).
     #[must_use]
     pub fn timeout_config(&self) -> &StreamTimeoutConfig {
         &self.timeout_config
@@ -1447,7 +1502,8 @@ impl StreamHandler {
     /// Returns a reference to the retry configuration.
     ///
     /// Read-only access to the [`StreamRetryConfig`] stored on the handler.
-    /// Mutate via [`with_config`](StreamHandler::with_config) (which replaces
+    /// Mutate via
+    /// [`with_retry_config`](Self::with_retry_config).
     /// both retry and timeout together); there is no per-field setter.
     #[must_use]
     pub fn retry_config(&self) -> &StreamRetryConfig {
@@ -1668,7 +1724,7 @@ impl StreamHandler {
                                 Err(err)?;
                                 return;
                             }
-                            let delay = self.retry_config.base_delay(transport_attempts);
+                            let delay = self.retry_config.jittered_base_delay(transport_attempts);
                             transport_attempts = transport_attempts.saturating_add(1);
                             sleep_cancellable(delay, cancel).await?;
                             continue 'outer;
@@ -1824,13 +1880,8 @@ impl StreamHandler {
             let event_result = tokio::select! {
                 event = stream.next() => EventPoll::Next(event),
                 () = cancel.notified() => return Err(StreamHandlerError::Cancelled),
-                () = async {
-                    match event_deadline {
-                        Some(d) => tokio::time::sleep_until(d.into()).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => EventPoll::TimedOut,
-                () = Self::total_deadline_future(total_deadline) => {
+                () = deadline_future(event_deadline) => EventPoll::TimedOut,
+                () = deadline_future(total_deadline) => {
                     return Err(StreamHandlerError::StreamFailed(diagnostics.total_timeout()));
                 }
             };
@@ -1853,15 +1904,17 @@ impl StreamHandler {
         }
     }
 
-    /// The deadline for the next stream event, or `None` if per-event
-    /// timeouts are disabled (the timeout is `Duration::MAX`, which
-    /// overflows `Instant::now() + it`).
+    /// The deadline for the next stream event, or `None` if disabled.
     ///
-    /// Uses [`initial_event_timeout`](StreamTimeoutConfig::initial_event_timeout)
+    /// Computes the instant at which the per-event timeout fires for the
+    /// current poll: [`initial_event_timeout`](StreamTimeoutConfig::initial_event_timeout)
     /// before any event has arrived (the model may need time to begin
-    /// generating), then switches to
-    /// [`per_event_timeout`](StreamTimeoutConfig::per_event_timeout) once
-    /// events are flowing.
+    /// generating), then [`per_event_timeout`](StreamTimeoutConfig::per_event_timeout)
+    /// once events are flowing. A disabled timeout ([`Duration::MAX`])
+    /// overflows `Instant::now() + timeout`, so `checked_add` returns `None`
+    /// and the caller arms a never-firing `select!` branch. `events_processed`
+    /// is the same counter [`next_event`](Self::next_event) maintains, so the
+    /// deadline always matches the timeout phase the stream is in.
     fn event_deadline(&self, events_processed: u64) -> Option<Instant> {
         let base_timeout = if events_processed == 0 {
             self.timeout_config.initial_event_timeout
@@ -1877,9 +1930,9 @@ impl StreamHandler {
     /// loop, before the per-event `select!` commits to another wait. This
     /// catches a deadline that elapsed while the loop was processing the
     /// previous event (or building diagnostics) — the
-    /// [`total_deadline_future`](Self::total_deadline_future) `select!` arm
-    /// only fires *during* a wait, so without this check a long event handler
-    /// could overshoot the deadline by up to one event's processing time.
+    /// [`deadline_future`] `select!` arm only fires *during* a wait, so
+    /// without this check a long event handler could overshoot the deadline
+    /// by up to one event's processing time.
     ///
     /// `None` means no total-stream deadline is configured (the turn is
     /// bounded only by the per-event timeout) and the function returns
@@ -1888,21 +1941,6 @@ impl StreamHandler {
         match total_deadline {
             Some(deadline) => Instant::now() >= deadline,
             None => false,
-        }
-    }
-
-    /// A future that completes when the overall total-stream deadline elapses.
-    ///
-    /// Returns a future that never resolves when there is no total deadline,
-    /// so the `tokio::select!` branch stays inert in that case.
-    async fn total_deadline_future(total_deadline: Option<Instant>) {
-        match total_deadline {
-            Some(deadline) => {
-                if let Some(duration) = deadline.checked_duration_since(Instant::now()) {
-                    tokio::time::sleep(duration).await;
-                }
-            }
-            None => std::future::pending::<()>().await,
         }
     }
 
@@ -2116,7 +2154,6 @@ mod tests {
         assert_eq!(config.per_event_timeout, Duration::from_mins(5));
         assert_eq!(config.total_stream_timeout, Duration::from_mins(15));
         assert_eq!(config.max_consecutive_timeouts, 10);
-        assert_eq!(config.progress_interval, Duration::from_secs(30));
         assert!(config.fallback_to_non_streaming);
     }
 
@@ -2149,7 +2186,6 @@ mod tests {
             per_event_timeout: Duration::from_mins(1),
             total_stream_timeout: Duration::from_mins(5),
             max_consecutive_timeouts: 5,
-            progress_interval: Duration::from_secs(10),
             fallback_to_non_streaming: false,
         };
         assert_eq!(config.initial_event_timeout, Duration::from_secs(30));
@@ -2181,8 +2217,75 @@ mod tests {
             max_delay_ms: 5000,
             ..Default::default()
         };
-        // 1000 * 2^3 = 8000, capped at 5000
         assert_eq!(config.base_delay(3), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn jittered_base_delay_zero_jitter_equals_raw() {
+        let config = StreamRetryConfig {
+            jitter_factor: 0.0,
+            ..Default::default()
+        };
+        for attempt in 0..5 {
+            assert_eq!(
+                config.jittered_base_delay(attempt),
+                config.base_delay(attempt),
+                "zero jitter must reproduce the raw backoff exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn jittered_base_delay_stays_within_jitter_band() {
+        let config = StreamRetryConfig {
+            base_delay_ms: 100,
+            max_delay_ms: 100_000,
+            jitter_factor: 0.2,
+            ..Default::default()
+        };
+        for attempt in 0..64 {
+            let base = config.base_delay(attempt);
+            let delay = config.jittered_base_delay(attempt);
+            let lo = base.mul_f64(0.8);
+            let hi = base.mul_f64(1.2);
+            assert!(
+                delay >= lo && delay <= hi,
+                "attempt {attempt}: jittered delay {delay:?} outside [{lo:?}, {hi:?}]"
+            );
+        }
+    }
+
+    #[test]
+    fn jittered_base_delay_is_deterministic() {
+        let config = StreamRetryConfig {
+            jitter_factor: 0.3,
+            ..Default::default()
+        };
+        for attempt in 0..16 {
+            assert_eq!(
+                config.jittered_base_delay(attempt),
+                config.jittered_base_delay(attempt),
+                "jitter must be deterministic per attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn jittered_base_delay_max_jitter_stays_non_negative() {
+        let config = StreamRetryConfig {
+            base_delay_ms: 100,
+            max_delay_ms: 100_000,
+            jitter_factor: 1.0,
+            ..Default::default()
+        };
+        for attempt in 0..256 {
+            let delay = config.jittered_base_delay(attempt);
+            let hi = config.base_delay(attempt).mul_f64(2.0);
+            assert!(
+                delay <= hi,
+                "attempt {attempt}: delay {delay:?} exceeds 2x base under max jitter"
+            );
+        }
     }
 
     #[test]
@@ -2303,16 +2406,6 @@ mod tests {
     }
 
     #[test]
-    fn progress_fields() {
-        let progress = StreamProgress {
-            elapsed: Duration::from_secs(45),
-            events_processed: 127,
-        };
-        assert_eq!(progress.elapsed, Duration::from_secs(45));
-        assert_eq!(progress.events_processed, 127);
-    }
-
-    #[test]
     fn handler_new_defaults() {
         let handler = StreamHandler::new();
         assert_eq!(
@@ -2323,17 +2416,16 @@ mod tests {
     }
 
     #[test]
-    fn handler_with_config() {
-        let handler = StreamHandler::new().with_config(
-            StreamTimeoutConfig {
+    fn handler_with_timeout_and_retry_config() {
+        let handler = StreamHandler::new()
+            .with_timeout_config(StreamTimeoutConfig {
                 initial_event_timeout: Duration::from_mins(1),
                 ..Default::default()
-            },
-            StreamRetryConfig {
+            })
+            .with_retry_config(StreamRetryConfig {
                 max_retries: 5,
                 ..Default::default()
-            },
-        );
+            });
         assert_eq!(
             handler.timeout_config().initial_event_timeout,
             Duration::from_mins(1),
@@ -2403,16 +2495,6 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(err.contains("total_stream_timeout"));
         assert!(err.contains("initial_event_timeout"));
-    }
-
-    #[test]
-    fn timeout_config_validate_zero_progress() {
-        let config = StreamTimeoutConfig {
-            progress_interval: Duration::ZERO,
-            ..Default::default()
-        };
-        let err = config.validate().unwrap_err();
-        assert!(err.contains("progress_interval"));
     }
 
     #[test]
@@ -2606,13 +2688,10 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_non_streaming_success() {
-        let handler = StreamHandler::new().with_config(
-            StreamTimeoutConfig {
-                fallback_to_non_streaming: true,
-                ..Default::default()
-            },
-            StreamRetryConfig::default(),
-        );
+        let handler = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+            fallback_to_non_streaming: true,
+            ..Default::default()
+        });
         let client = HandlerMock::new().with_text_response("fallback works");
         let cancel = Arc::new(CancelSignal::new());
 
@@ -2646,13 +2725,10 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_non_streaming_cancelled_before_start() {
-        let handler = StreamHandler::new().with_config(
-            StreamTimeoutConfig {
-                fallback_to_non_streaming: true,
-                ..Default::default()
-            },
-            StreamRetryConfig::default(),
-        );
+        let handler = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+            fallback_to_non_streaming: true,
+            ..Default::default()
+        });
         let client = HandlerMock::new().with_text_response("fallback works");
         let cancel = Arc::new(CancelSignal::new());
         cancel.cancel();
@@ -2675,13 +2751,10 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_non_streaming_error() {
-        let handler = StreamHandler::new().with_config(
-            StreamTimeoutConfig {
-                fallback_to_non_streaming: true,
-                ..Default::default()
-            },
-            StreamRetryConfig::default(),
-        );
+        let handler = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+            fallback_to_non_streaming: true,
+            ..Default::default()
+        });
         let client = HandlerMock::new().with_create_error("service unavailable");
         let cancel = Arc::new(CancelSignal::new());
 
@@ -2920,16 +2993,15 @@ mod tests {
             }
         }
 
-        let handler = StreamHandler::new().with_config(
-            StreamTimeoutConfig {
+        let handler = StreamHandler::new()
+            .with_timeout_config(StreamTimeoutConfig {
                 fallback_to_non_streaming: false,
                 ..Default::default()
-            },
-            StreamRetryConfig {
+            })
+            .with_retry_config(StreamRetryConfig {
                 max_retries: 0,
                 ..Default::default()
-            },
-        );
+            });
 
         let client = ErrorMock;
         let cancel = Arc::new(CancelSignal::new());
@@ -3022,16 +3094,15 @@ mod tests {
         // non-streaming JSON response (not the streaming accumulator's stale
         // values). Regression test for an earlier bug where Fallback dropped
         // stop_reason.
-        let handler = StreamHandler::new().with_config(
-            StreamTimeoutConfig {
+        let handler = StreamHandler::new()
+            .with_timeout_config(StreamTimeoutConfig {
                 fallback_to_non_streaming: true,
                 ..Default::default()
-            },
-            StreamRetryConfig {
+            })
+            .with_retry_config(StreamRetryConfig {
                 max_retries: 0,
                 ..Default::default()
-            },
-        );
+            });
         let client = StreamingFailingFallbackMock;
         let cancel = Arc::new(CancelSignal::new());
 
@@ -3107,6 +3178,96 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    #[test]
+    fn with_timeout_config_rejects_invalid_falls_back_to_default() {
+        let bad = StreamTimeoutConfig {
+            initial_event_timeout: Duration::ZERO,
+            ..Default::default()
+        };
+        let handler = StreamHandler::new().with_timeout_config(bad);
+        assert_eq!(
+            handler.timeout_config().initial_event_timeout,
+            StreamTimeoutConfig::default().initial_event_timeout,
+            "invalid timeout config must fall back to default"
+        );
+    }
+
+    #[test]
+    fn with_timeout_config_keeps_valid() {
+        let good = StreamTimeoutConfig {
+            initial_event_timeout: Duration::from_secs(45),
+            ..Default::default()
+        };
+        let handler = StreamHandler::new().with_timeout_config(good);
+        assert_eq!(
+            handler.timeout_config().initial_event_timeout,
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn with_retry_config_rejects_invalid_falls_back_to_default() {
+        let bad = StreamRetryConfig {
+            base_delay_ms: 0,
+            ..Default::default()
+        };
+        let handler = StreamHandler::new().with_retry_config(bad);
+        assert_eq!(
+            handler.retry_config().base_delay_ms,
+            StreamRetryConfig::default().base_delay_ms,
+            "invalid retry config must fall back to default"
+        );
+    }
+
+    #[test]
+    fn with_retry_config_keeps_valid() {
+        let good = StreamRetryConfig {
+            max_retries: 7,
+            ..Default::default()
+        };
+        let handler = StreamHandler::new().with_retry_config(good);
+        assert_eq!(handler.retry_config().max_retries, 7);
+    }
+
+    #[test]
+    fn with_timeout_and_retry_config_are_independent() {
+        let good_timeout = StreamTimeoutConfig {
+            initial_event_timeout: Duration::from_mins(1),
+            ..Default::default()
+        };
+        let bad_retry = StreamRetryConfig {
+            jitter_factor: 2.0,
+            ..Default::default()
+        };
+        let handler = StreamHandler::new()
+            .with_timeout_config(good_timeout)
+            .with_retry_config(bad_retry);
+        assert_eq!(
+            handler.timeout_config().initial_event_timeout,
+            Duration::from_mins(1),
+            "valid timeout must be kept when retry config is invalid"
+        );
+        assert_eq!(
+            handler.retry_config().max_retries,
+            StreamRetryConfig::default().max_retries,
+            "invalid retry config must fall back to default"
+        );
+    }
+
+    #[test]
+    fn with_rate_limit_config_rejects_invalid_falls_back_to_default() {
+        let bad = RateLimitConfig {
+            max_retries: 0,
+            ..Default::default()
+        };
+        let handler = StreamHandler::new().with_rate_limit_config(bad);
+        assert_eq!(
+            handler.rate_limit_config().max_retries,
+            RateLimitConfig::default().max_retries,
+            "invalid rate-limit config must fall back to default"
         );
     }
 
@@ -3716,14 +3877,11 @@ mod tests {
         // Rate-limit delay tiny; transport retry delay large. If the retry
         // loop honours the rate-limit outcome, the test finishes in ~1ms; if
         // it falls back to the transport base_delay, it sleeps 2s.
-        let handler = StreamHandler::new().with_config(
-            StreamTimeoutConfig::default(),
-            StreamRetryConfig {
-                max_retries: 1,
-                base_delay_ms: 2_000,
-                ..Default::default()
-            },
-        );
+        let handler = StreamHandler::new().with_retry_config(StreamRetryConfig {
+            max_retries: 1,
+            base_delay_ms: 2_000,
+            ..Default::default()
+        });
         let handler = handler.with_rate_limit_config(RateLimitConfig {
             default_delay: Duration::from_millis(1),
             ..Default::default()
@@ -3858,17 +4016,15 @@ mod tests {
         }
 
         let handler = StreamHandler::new()
-            .with_config(
-                StreamTimeoutConfig {
-                    fallback_to_non_streaming: false,
-                    ..Default::default()
-                },
-                StreamRetryConfig {
-                    max_retries: 1,
-                    base_delay_ms: 1,
-                    ..Default::default()
-                },
-            )
+            .with_timeout_config(StreamTimeoutConfig {
+                fallback_to_non_streaming: false,
+                ..Default::default()
+            })
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 1,
+                base_delay_ms: 1,
+                ..Default::default()
+            })
             .with_rate_limit_config(RateLimitConfig {
                 fallback_after_retries: 3,
                 default_delay: Duration::from_millis(1),
@@ -4060,17 +4216,16 @@ mod tests {
             }
         }
 
-        let handler = StreamHandler::new().with_config(
-            StreamTimeoutConfig {
+        let handler = StreamHandler::new()
+            .with_timeout_config(StreamTimeoutConfig {
                 fallback_to_non_streaming: false,
                 ..Default::default()
-            },
-            StreamRetryConfig {
+            })
+            .with_retry_config(StreamRetryConfig {
                 max_retries: 1,
                 base_delay_ms: 1,
                 ..Default::default()
-            },
-        );
+            });
         let client = AlwaysFailingMock;
         let cancel = Arc::new(CancelSignal::new());
 
@@ -4121,17 +4276,17 @@ mod tests {
         }
 
         let handler = StreamHandler::new()
-            .with_config(
-                StreamTimeoutConfig {
-                    total_stream_timeout: Duration::from_millis(80),
-                    ..Default::default()
-                },
-                StreamRetryConfig {
-                    max_retries: 10,
-                    base_delay_ms: 1,
-                    ..Default::default()
-                },
-            )
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_millis(40),
+                per_event_timeout: Duration::from_millis(40),
+                total_stream_timeout: Duration::from_millis(80),
+                ..Default::default()
+            })
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 10,
+                base_delay_ms: 1,
+                ..Default::default()
+            })
             .with_rate_limit_config(RateLimitConfig {
                 // Honour the hint, but max_delay lets the 600s through so the
                 // deadline clamp is what must bound the sleep.
@@ -4194,14 +4349,11 @@ mod tests {
             }
         }
 
-        let handler = StreamHandler::new().with_config(
-            StreamTimeoutConfig::default(),
-            StreamRetryConfig {
-                max_retries: 5,
-                base_delay_ms: 60_000,
-                ..Default::default()
-            },
-        );
+        let handler = StreamHandler::new().with_retry_config(StreamRetryConfig {
+            max_retries: 5,
+            base_delay_ms: 60_000,
+            ..Default::default()
+        });
         let cancel = Arc::new(CancelSignal::new());
         let cancel_clone = Arc::clone(&cancel);
         tokio::spawn(async move {

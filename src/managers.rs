@@ -54,9 +54,9 @@
 //! let managers = LoopManagers::new()
 //!     .with_fallback(FallbackManager::for_model("llm-70b"))
 //!     .with_detection(DetectionManager::default())
-//!     .with_observer(Arc::new(logging_observer))
+//!     .with_observer(Arc::new(logging_observer));
 //!
-//! let agent = BareLoop::new_with_managers(client, tools, runtime, config);
+//! let agent = BareLoop::new_with_managers(client, tools, config, managers);
 //! ```
 //!
 //! Every capability is optional. A bundle with no `.with_*()` calls still

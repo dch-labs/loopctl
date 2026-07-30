@@ -143,7 +143,7 @@ impl ToolRegistry {
     /// ```rust,ignore
     /// let schemas = registry.all_schemas();
     /// for schema in &schemas {
-    ///     println!("  - {}: {}", schema.name, schema.description);
+    ///     println!("  - {}: {}", schema.tool, schema.description);
     /// }
     /// ```
     #[must_use]

@@ -30,7 +30,7 @@
 //! let strategy = ExponentialBackoffRecovery::new(3);
 //!
 //! // Usage (in BareLoop):
-//! // let analysis = reflector.analyze(error, tool_name, input, &context).await?;
+//! // let analysis = reflector.analyze(error, tool_name, input, None, &context).await?;
 //! // let action = strategy.decide(&analysis, attempt, max_attempts).await;
 //! ```
 
@@ -868,7 +868,10 @@ pub trait RecoveryStrategy: Send + Sync {
 ///     max_attempts: 3,
 /// };
 ///
-/// let analysis = reflector.analyze("error", "tool", &json!({}), &context).await.unwrap();
+/// let analysis = reflector
+///     .analyze("error", "tool", &json!({}), None, &context)
+///     .await
+///     .unwrap();
 /// assert!(!analysis.is_recoverable);
 /// # });
 /// ```

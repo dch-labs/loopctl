@@ -1888,7 +1888,11 @@ impl StreamHandler {
             match event_result {
                 EventPoll::TimedOut => {
                     *consecutive_timeouts = consecutive_timeouts.saturating_add(1);
-                    let max_consecutive = self.timeout_config.max_consecutive_timeouts as usize;
+                    let max_consecutive = if diagnostics.events_processed == 0 {
+                        self.timeout_config.max_consecutive_timeouts.min(2) as usize
+                    } else {
+                        self.timeout_config.max_consecutive_timeouts as usize
+                    };
                     if *consecutive_timeouts >= max_consecutive {
                         return Err(StreamHandlerError::StreamFailed(diagnostics.event_timeout(
                             u32::try_from(*consecutive_timeouts).unwrap_or(u32::MAX),
@@ -2818,6 +2822,76 @@ mod tests {
         assert!(saw_stream_events > 0, "should yield Stream events");
         assert!(!saw_attempt_reset, "happy path must not emit AttemptReset");
         assert!(!saw_fallback, "happy path must not emit Fallback");
+    }
+
+    #[tokio::test]
+    async fn empty_stream_fast_fails_after_lower_threshold() {
+        struct NeverYieldingMock;
+        impl ApiClient for NeverYieldingMock {
+            fn model(&self) -> String {
+                "stuck".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                Box::pin(futures::stream::pending())
+            }
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(serde_json::json!({})) })
+            }
+        }
+
+        let handler = StreamHandler::new()
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_millis(10),
+                per_event_timeout: Duration::from_millis(10),
+                total_stream_timeout: Duration::from_secs(10),
+                max_consecutive_timeouts: 10,
+                fallback_to_non_streaming: false,
+            })
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            });
+        let client = NeverYieldingMock;
+        let cancel = Arc::new(CancelSignal::new());
+        let req = crate::api::StreamRequest::new(vec![]);
+        let mut stream = handler.stream_turn(
+            &client,
+            &req,
+            crate::structured::RequestOptions::default(),
+            &cancel,
+        );
+        let start = Instant::now();
+        let mut got = None;
+        while let Some(item) = stream.next().await {
+            if item.is_err() {
+                got = Some(item);
+                break;
+            }
+        }
+        let elapsed = start.elapsed();
+        match got.expect("stream must terminate with an error") {
+            Err(StreamHandlerError::StreamFailed(StreamOutcome::EventTimeout { .. })) => {}
+            other => panic!("expected EventTimeout on dead stream, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(60),
+            "empty-stream fast-fail (2×10ms) must beat the full threshold (10×10ms); \
+             elapsed {elapsed:?}",
+        );
     }
 
     /// Mock that fails its first streaming attempt with a transport error,

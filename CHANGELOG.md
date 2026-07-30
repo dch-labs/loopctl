@@ -570,6 +570,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   jitter, so concurrent retries landed on the same tick (thundering herd).
   `jittered_base_delay` now applies the factor and is the delay
   `StreamHandler` sleeps between attempts.
+- The empty-stream fast-fail promised in the `max_consecutive_timeouts`
+  docs was never implemented: `next_event` applied the full threshold
+  unconditionally, so a stream that never produced a single event could
+  hang for `max_consecutive_timeouts` × `initial_event_timeout` (~20 min
+  with defaults) before failing. The lower threshold (`min(2,
+  max_consecutive_timeouts)`) is now applied when zero events have been
+  received, matching the documented behavior.
 
 ### Security
 

@@ -645,12 +645,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// ```rust,ignore
     /// use loopctl::stream::handler::{StreamHandler, StreamTimeoutConfig};
     ///
-    /// let handler = StreamHandler::with_config(
+    /// let handler = StreamHandler::new().with_timeout_config(
     ///     StreamTimeoutConfig {
     ///         initial_event_timeout: Duration::from_secs(60),
     ///         ..Default::default()
     ///     },
-    ///     Default::default(),
     /// );
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
@@ -5026,9 +5025,7 @@ mod tests {
     async fn test_rate_limit_escalation_feeds_circuit_breaker() {
         use crate::fallback::FallbackManager;
         use crate::managers::LoopManagers;
-        use crate::stream::handler::{
-            RateLimitConfig, StreamHandler, StreamRetryConfig, StreamTimeoutConfig,
-        };
+        use crate::stream::handler::{RateLimitConfig, StreamHandler, StreamTimeoutConfig};
 
         // Every stream attempt is rate-limited, so the handler escalates on the
         // first 429 (fallback_after_retries = 0).
@@ -5058,13 +5055,10 @@ mod tests {
         }
 
         let handler = StreamHandler::new()
-            .with_config(
-                StreamTimeoutConfig {
-                    fallback_to_non_streaming: false,
-                    ..Default::default()
-                },
-                StreamRetryConfig::default(),
-            )
+            .with_timeout_config(StreamTimeoutConfig {
+                fallback_to_non_streaming: false,
+                ..Default::default()
+            })
             .with_rate_limit_config(RateLimitConfig {
                 fallback_after_retries: 0,
                 default_delay: Duration::from_millis(1),

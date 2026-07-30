@@ -211,6 +211,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   `Arc<CancelSignal>` observe the new token, so a handle returned by
   `BareLoop::cancel_signal()` keeps working across resets. `BareLoop`
   calls this in `finalize()` so each `run()` starts with a clean signal.
+- `StreamHandler::with_timeout_config(config)` and
+  `with_retry_config(config)` — independent, self-validating builders for
+  the streaming timeout and retry configs (mirroring the existing
+  `with_rate_limit_config`). Each validates its config and falls back to
+  the default on an invalid value, replacing the coupled
+  `with_config(timeout, retry)` builder.
+- `StreamRetryConfig::jittered_base_delay(attempt)` — the exponential
+  backoff with [`jitter_factor`](crate::stream::handler::StreamRetryConfig::jitter_factor)
+  applied, used by `StreamHandler` between transport-retry attempts. The
+  jitter is deterministic (derived from the attempt number via a
+  shift-based mix) so the same attempt always yields the same delay while
+  successive attempts spread their backoffs — no randomness dependency.
+  `base_delay` (the raw exponential core) remains public.
 
 ### Changed
 
@@ -432,6 +445,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Removed
 
+- `StreamHandler::with_config(timeout, retry)` — set each config
+  independently via
+  [`with_timeout_config`](crate::stream::handler::StreamHandler::with_timeout_config)
+  and
+  [`with_retry_config`](crate::stream::handler::StreamHandler::with_retry_config)
+  instead. The coupled builder forced both configs to be passed in lockstep
+  even when only one changed; the two new builders each validate their own
+  config (an invalid value is logged and falls back to the default).
 - `FallbackManager::record_api_failure` and
   `FallbackManager::record_model_failure` — merged into a single
   [`FallbackManager::record_failure(FailureKind)`](crate::fallback::FallbackManager::record_failure).
@@ -535,6 +556,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   `build_tool_result_message` is renamed to `build_tool_result_parts`
   and now returns `Vec<MessagePart>` (it no longer wraps the parts in a
   throwaway `Message`).
+- `StreamHandler` silently accepted invalid timeout and retry configs.
+  `StreamTimeoutConfig::validate` and `StreamRetryConfig::validate`
+  existed but were never called in production — only
+  `RateLimitConfig::validate` was wired into its builder. A
+  misconfiguration that disabled timeouts or inverted the retry ceiling
+  (e.g. `total_stream_timeout` less than `initial_event_timeout`, zero
+  delays) was stored as-is. The new `with_timeout_config` and
+  `with_retry_config` builders validate each config and fall back to the
+  default on an invalid value.
+- `StreamRetryConfig::jitter_factor` was validated but never applied —
+  the transport-retry backoff used the raw exponential delay with no
+  jitter, so concurrent retries landed on the same tick (thundering herd).
+  `jittered_base_delay` now applies the factor and is the delay
+  `StreamHandler` sleeps between attempts.
 
 ### Security
 

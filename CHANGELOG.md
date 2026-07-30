@@ -605,6 +605,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   populate `AutoCommitConfig::files` or rely on the hook's per-session
   modification tracking. Misconfiguration now fails loudly rather than
   silently committing everything.
+- The `MAX_RESPONSE_BODY` guard (10 MB) on non-streaming provider responses
+  fired *after* the body was fully materialized — every provider called
+  `resp.bytes().await` then checked the length, so a hostile or misbehaving
+  server returning a multi-GB body could exhaust memory before the guard
+  rejected it. A shared `read_bounded_body` now pre-checks `Content-Length`
+  (rejecting without reading a byte when it exceeds the cap) and reads
+  chunked-transfer responses with a running cap, so peak memory never
+  exceeds the limit by more than one chunk. Replaces the post-hoc
+  `check_response_body` across OpenAI, Anthropic, and Gemini.
 
 ## [0.1.0] - 2025-07-01
 

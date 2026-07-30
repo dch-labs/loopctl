@@ -588,6 +588,49 @@ impl ToolCircuitBreaker {
         }
     }
 
+    /// Whether a request *would* be allowed, without the `Open`→`HalfOpen` side effect.
+    ///
+    /// Pure read mirroring [`allow_request`](Self::allow_request)'s decision
+    /// logic: returns `true` for `Closed`, `false` for `HalfOpen`, and for
+    /// `Open` returns `true` only if the recovery duration has elapsed (i.e.
+    /// the next [`allow_request`](Self::allow_request) call would transition
+    /// to `HalfOpen` and grant the probe). Crucially, this performs **no**
+    /// state transition — use it for availability checks
+    /// ([`is_tool_available`](ToolHealthRegistry::is_tool_available)) so a
+    /// read does not consume the single `HalfOpen` probe slot that belongs to
+    /// the real dispatch path.
+    #[must_use]
+    pub fn would_allow_request(&self) -> bool {
+        let state = crate::error::recover_guard(self.state.lock());
+        match state.circuit {
+            CircuitState::Closed => true,
+            CircuitState::HalfOpen => false,
+            CircuitState::Open => state
+                .last_failure_time
+                .is_some_and(|t| t.elapsed() >= self.recovery_duration),
+        }
+    }
+
+    /// Whether the breaker would treat the next call as a `HalfOpen` probe.
+    ///
+    /// Pure read: `true` when the breaker is already `HalfOpen`, or when it
+    /// is `Open` but the recovery duration has elapsed (so the next
+    /// [`allow_request`](Self::allow_request) would transition to
+    /// `HalfOpen`). Lets an availability check report "a recovery probe is
+    /// pending" without performing the transition. Complements
+    /// [`would_allow_request`](Self::would_allow_request).
+    #[must_use]
+    pub fn would_be_half_open(&self) -> bool {
+        let state = crate::error::recover_guard(self.state.lock());
+        match state.circuit {
+            CircuitState::HalfOpen => true,
+            CircuitState::Open => state
+                .last_failure_time
+                .is_some_and(|t| t.elapsed() >= self.recovery_duration),
+            CircuitState::Closed => false,
+        }
+    }
+
     /// Record a successful call.
     ///
     /// Resets consecutive failures to zero and transitions the breaker
@@ -809,18 +852,24 @@ impl ToolHealthRegistry {
 
     /// Quick health check: is this tool available for use?
     ///
-    /// Combines the circuit-breaker state (Open = unavailable) with the
-    /// health score (Unhealthy = unavailable). Returns `true` when:
-    /// - the breaker is not Open and the health score is not Unhealthy, or
-    /// - the breaker has transitioned to `HalfOpen` (allowing a recovery probe
-    ///   even if the health score is still Unhealthy).
+    /// Combines the circuit-breaker state (`Open` = unavailable) with the
+    /// health score (`Unhealthy` = unavailable). Returns `true` when:
+    /// - the breaker is not `Open` and the health score is not `Unhealthy`, or
+    /// - the breaker would treat the next call as a `HalfOpen` recovery probe
+    ///   (available even if the health score is still `Unhealthy`).
+    ///
+    /// This is a **pure read** — it observes whether a request would be
+    /// allowed without performing the `Open`→`HalfOpen` transition, so a
+    /// bare availability check does not consume the single probe slot that
+    /// belongs to the real dispatch path
+    /// ([`allow_request`](ToolCircuitBreaker::allow_request)).
     #[must_use]
     pub fn is_tool_available(&self, tool_name: &str) -> bool {
         let breaker = self.get_circuit_breaker(tool_name);
-        if !breaker.allow_request() {
+        if !breaker.would_allow_request() {
             return false;
         }
-        if breaker.is_half_open() {
+        if breaker.would_be_half_open() {
             return true;
         }
         self.get_health_status(tool_name) != HealthStatus::Unhealthy
@@ -1341,6 +1390,36 @@ mod tests {
         registry.record_failure("tool_b", Duration::from_millis(10));
         registry.record_failure("tool_b", Duration::from_millis(10));
         assert!(!registry.is_tool_available("tool_b"));
+    }
+
+    #[test]
+    fn is_tool_available_does_not_consume_half_open_probe() {
+        let registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
+            failure_threshold: 1,
+            recovery_duration: Duration::from_millis(40),
+        });
+        registry.record_failure("tool", Duration::from_millis(1));
+        assert!(
+            !registry.is_tool_available("tool"),
+            "Open breaker must be unavailable"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+
+        // An availability check on the recovered-Open breaker must report
+        // available (the next dispatch would probe) WITHOUT performing the
+        // Open→HalfOpen transition — otherwise the read consumes the probe
+        // and the real dispatch is blocked.
+        assert!(
+            registry.is_tool_available("tool"),
+            "recovered breaker must report available"
+        );
+        let breaker = registry.get_circuit_breaker("tool");
+        assert!(
+            breaker.allow_request(),
+            "is_tool_available must not consume the HalfOpen probe slot; \
+             the real dispatch path must still get it"
+        );
+        assert_eq!(breaker.state_label(), "half-open");
     }
 
     #[test]

@@ -577,6 +577,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   with defaults) before failing. The lower threshold (`min(2,
   max_consecutive_timeouts)`) is now applied when zero events have been
   received, matching the documented behavior.
+- `ToolHealthRegistry::is_tool_available` consumed the HalfOpen recovery
+  probe as a side effect of the read: it called
+  [`allow_request`](ToolCircuitBreaker::allow_request), which performs the
+  Open→HalfOpen transition, so a bare availability check (or
+  [`resolve_tool`](HealthRouter::resolve_tool)) wasted the single probe slot
+  and blocked the real dispatch that followed. It now uses pure-read
+  helpers (`would_allow_request` / `would_be_half_open`) that observe the
+  decision without the transition.
 
 ### Security
 

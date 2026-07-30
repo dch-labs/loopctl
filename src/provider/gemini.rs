@@ -274,11 +274,7 @@ impl ApiClient for GeminiClient {
 
         Box::pin(async move {
             let resp = Self::post_content(&self.http, &url, &self.api_key, &body).await?;
-            let resp = resp
-                .bytes()
-                .await
-                .map_err(|e| ApiError::http(e.to_string()))?;
-            super::check_response_body(resp.len())?;
+            let resp = super::read_bounded_body(resp).await?;
             serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
@@ -340,11 +336,7 @@ impl ApiClient for GeminiClient {
         let url = self.generate_url();
         Box::pin(async move {
             let resp = Self::post_content(&self.http, &url, &self.api_key, &body).await?;
-            let resp = resp
-                .bytes()
-                .await
-                .map_err(|e| ApiError::http(e.to_string()))?;
-            super::check_response_body(resp.len())?;
+            let resp = super::read_bounded_body(resp).await?;
             serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }

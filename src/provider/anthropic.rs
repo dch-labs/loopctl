@@ -290,11 +290,7 @@ impl ApiClient for AnthropicClient {
         let url = self.messages_url();
         Box::pin(async move {
             let resp = Self::post_messages(&self.http, &url, &self.api_key, &body).await?;
-            let resp = resp
-                .bytes()
-                .await
-                .map_err(|e| ApiError::http(e.to_string()))?;
-            super::check_response_body(resp.len())?;
+            let resp = super::read_bounded_body(resp).await?;
             serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
         })
     }
@@ -1652,7 +1648,11 @@ mod tests {
         let StreamEvent::PartStart(ps) = text_start else {
             panic!("matched event must be a PartStart");
         };
-        assert!(ps.part.as_ref().is_some_and(crate::message::MessagePart::is_text));
+        assert!(
+            ps.part
+                .as_ref()
+                .is_some_and(crate::message::MessagePart::is_text)
+        );
     }
 
     #[test]

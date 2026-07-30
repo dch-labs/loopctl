@@ -349,14 +349,19 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Get the conversation history.
+    /// Get the conversation as the driving state machine currently holds it.
     ///
-    /// Returns a slice of [`Message`] representing the full conversation
-    /// so far: the opening user message, contributor injections, assistant
-    /// responses, and tool-result messages. The history is owned by the
-    /// driving state machine; it is empty until the first
-    /// [`run()`](crate::engine::core::Loop::run) call mints a machine for
-    /// the run.
+    /// Returns the machine's
+    /// [`full_history`](crate::engine::core::LoopMachine::full_history):
+    /// committed history plus the current run's pending messages, merged into
+    /// one [`Vec`]. This is the complete view the next model call would see.
+    ///
+    /// After a compaction pass the committed history is the compacted slice,
+    /// not the original messages — a compactor is free to summarize or drop
+    /// entries, so the opening user message and early turns may no longer be
+    /// present verbatim. Contributor messages are transient by design and are
+    /// never persisted into history. Empty until the first
+    /// [`run()`](crate::engine::core::Loop::run) call mints a machine.
     pub fn conversation(&self) -> Vec<Message> {
         self.machine.full_history()
     }

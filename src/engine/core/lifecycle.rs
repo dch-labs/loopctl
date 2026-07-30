@@ -253,23 +253,6 @@ impl ToolCall {
     }
 }
 
-/// The result of one `run(prompt)` call.
-///
-/// One prompt → tool loop → final answer. Fresh per call: `id` and the
-/// accounting fields rotate with each run, while the owning
-/// [`Session`] keeps its identity stable.
-///
-/// `Run` is a type alias for [`Run`], so the two are interchangeable in
-/// ```
-/// use loopctl::engine::core::Run;
-///
-/// fn summarize(result: &Run) -> String {
-///     format!("{} turns", result.turn_count())
-/// }
-///
-/// let run: Run = Run::new("hello", &Default::default());
-/// assert_eq!(summarize(&run), "0 turns");
-/// ```
 /// One iteration of the agent loop — a single LLM call and any tools it
 /// triggered.
 ///
@@ -604,6 +587,9 @@ impl Session {
     }
 }
 
+/// The result of a `run()` call — either the completed [`Run`] or a [`LoopError`].
+pub type RunResult = Result<Run, LoopError>;
+
 /// The core agent lifecycle trait.
 ///
 /// Implement this trait to create a new type of agent. The framework
@@ -643,12 +629,6 @@ impl Session {
 ///     fn cancel(&self) {}
 /// }
 /// ```
-/// The result of a `run()` call — either the completed [`Run`] or a [`LoopError`].
-pub type RunResult = Result<Run, LoopError>;
-
-/// The core agent lifecycle trait.
-///
-/// Implement this trait to create a new type of agent.
 pub trait Loop: Send + Sync {
     /// Drive one run of the agent loop for the given user prompt.
     ///

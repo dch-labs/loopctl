@@ -177,7 +177,7 @@ pub trait ContextCompactor: Send + Sync {
 pub enum CompactBase {
     /// Target is a percentage of the full context window.
     ///
-    /// `target = context_window × compact_target_pct`
+    /// `target = context_window × compact_target_pct / 100`
     ///
     /// Use this when you want compaction to aim for a fixed fraction
     /// of the model's total capacity regardless of the trigger threshold.
@@ -185,11 +185,11 @@ pub enum CompactBase {
 
     /// Target is a percentage of the trigger threshold.
     ///
-    /// `target = compact_threshold_tokens × compact_target_pct / 10_000`
+    /// `target = compact_threshold_tokens × compact_target_pct / 100`
     ///
     /// This is the default. With the default `threshold = 80` (80%) and
     /// `compact_target_pct = 70` (70%), compaction targets 56% of the
-    /// context window.
+    /// context window (`0.8 × 0.7 = 0.56`).
     #[default]
     Threshold,
 }
@@ -418,8 +418,8 @@ impl ContextManager {
     /// Computed from [`compact_target`](Self::compact_target) and
     /// [`compact_target_pct`](Self::compact_target_pct):
     ///
-    /// - [`CompactBase::Threshold`]: `compact_threshold_tokens × pct`
-    /// - [`CompactBase::Context`]: `context_window × pct`
+    /// - [`CompactBase::Threshold`]: `compact_threshold_tokens × pct / 100`
+    /// - [`CompactBase::Context`]: `context_window × pct / 100`
     #[must_use]
     pub fn compact_target_tokens(&self) -> u64 {
         let base: u64 = match self.compact_base {

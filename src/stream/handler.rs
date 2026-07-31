@@ -258,14 +258,13 @@ impl StreamRetryConfig {
 
     /// The raw exponential backoff with [`jitter_factor`](Self::jitter_factor) applied.
     ///
-    /// Returns [`base_delay`](Self::base_delay)`(attempt)` scaled by a
-    /// deterministic factor in `[1 - jitter_factor, 1 + jitter_factor]`. The
-    /// factor is derived from the attempt number via a shift-based mix, so the
-    /// same attempt always yields the same delay (reproducible in tests) while
-    /// successive attempts still spread their backoffs — avoiding a
-    /// thundering herd where every retry lands on the same tick. When
-    /// [`jitter_factor`](Self::jitter_factor) is `0.0`, returns
-    /// [`base_delay`](Self::base_delay) unchanged.
+    /// Returns [`base_delay`](Self::base_delay)`(attempt)` scaled by a random
+    /// factor in `[1 - jitter_factor, 1 + jitter_factor]`, drawn from
+    /// [`fastrand`]. Concurrent retries with the same attempt number get
+    /// different delays — avoiding a thundering herd where every client
+    /// retries on the same tick. When [`jitter_factor`](Self::jitter_factor)
+    /// is `0.0`, returns [`base_delay`](Self::base_delay) unchanged (no
+    /// randomness, no allocation).
     ///
     /// This is the delay [`StreamHandler`] sleeps between transport-retry
     /// attempts; [`base_delay`](Self::base_delay) is the deterministic core
@@ -287,24 +286,18 @@ impl StreamRetryConfig {
         if self.jitter_factor == 0.0 {
             return base;
         }
-        let f = Self::jitter_fraction(attempt) * self.jitter_factor;
+        let f = Self::random_signed_fraction() * self.jitter_factor;
         base.mul_f64(1.0 + f)
     }
 
-    /// A deterministic signed fraction in `[-1.0, 1.0)` derived from `attempt`.
+    /// A random signed fraction in `[-1.0, 1.0)` from [`fastrand`].
     ///
-    /// Shifts and mixes the attempt bits so successive attempts map to
-    /// well-spread fractions; the same attempt always yields the same value.
-    /// Used by [`jittered_base_delay`](Self::jittered_base_delay) to scale
-    /// the backoff without pulling in a randomness dependency.
+    /// Draws a uniform `f64` in `[0.0, 1.0)` from fastrand's thread-local
+    /// Wyrand PRNG and remaps it to `[-1.0, 1.0)`. Each call produces a
+    /// different result, so concurrent retries spread their backoffs.
     #[must_use]
-    fn jitter_fraction(attempt: u32) -> f64 {
-        let mixed = attempt
-            .wrapping_mul(2_654_435_761)
-            .rotate_left(13)
-            .wrapping_add(0x9E37_79B9);
-        let scaled = f64::from(mixed >> 8) / f64::from(1u32 << 24);
-        (scaled - 0.5) * 2.0
+    fn random_signed_fraction() -> f64 {
+        (fastrand::f64() - 0.5) * 2.0
     }
 
     /// Validates the configuration, returning an error message if invalid.
@@ -2261,18 +2254,23 @@ mod tests {
     }
 
     #[test]
-    fn jittered_base_delay_is_deterministic() {
+    fn jittered_base_delay_concurrent_calls_produce_different_delays() {
         let config = StreamRetryConfig {
-            jitter_factor: 0.3,
+            base_delay_ms: 100,
+            max_delay_ms: 100_000,
+            jitter_factor: 0.5,
             ..Default::default()
         };
-        for attempt in 0..16 {
-            assert_eq!(
-                config.jittered_base_delay(attempt),
-                config.jittered_base_delay(attempt),
-                "jitter must be deterministic per attempt"
-            );
-        }
+        let attempt = 1;
+        let mut delays: Vec<_> = (0..10)
+            .map(|_| config.jittered_base_delay(attempt))
+            .collect();
+        delays.sort();
+        delays.dedup();
+        assert!(
+            delays.len() > 1,
+            "concurrent calls with the same attempt must produce varied delays"
+        );
     }
 
     #[test]

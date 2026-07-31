@@ -36,10 +36,11 @@
 use crate::api::ApiClient;
 use crate::api::error::{ApiError, http_status_is_overload};
 use crate::cancel::CancelSignal;
-use crate::message::Message;
+use crate::message::{Message, MessagePart};
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason};
 use futures::StreamExt;
 use futures::stream::Stream;
+use serde_json::Value;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -707,7 +708,43 @@ enum RateLimitRetry {
     Retry(Duration),
 }
 
-/// Pull the carried [`StreamOutcome`] out of a [`StreamHandlerError`], if any.
+/// What `stream_turn`'s error arm should do after a failed stream event.
+///
+/// Produced by [`decide_rate_limit_error`](StreamHandler::decide_rate_limit_error)
+/// and [`decide_transport_error`](StreamHandler::decide_transport_error). The
+/// generator body matches on this to propagate the error, try a non-streaming
+/// fallback, or sleep and retry — keeping the decision logic out of the
+/// `async_stream` body.
+///
+/// This indirection exists because `async_stream::try_stream!` forbids
+/// extracting `yield` / `?` into helper functions. The helpers return a
+/// plain enum; the generator body is the only place the actual side-effect
+/// (`yield`, `return`, `continue`) happens.
+enum ErrorAction {
+    /// Propagate the error and end the stream immediately.
+    ///
+    /// Carries the [`StreamHandlerError`] the caller propagates via `?`. The
+    /// generator yields nothing further — the stream terminates with this
+    /// error as the final item.
+    Fail(StreamHandlerError),
+
+    /// Attempt a non-streaming fallback before giving up.
+    ///
+    /// Carries the [`StreamOutcome`] from the failed stream attempt, which
+    /// [`fallback_non_streaming`](StreamHandler::fallback_non_streaming) uses
+    /// to build a diagnostic if the fallback also fails. The generator calls
+    /// the fallback, yields a [`HandlerEvent::Fallback`] on success, and
+    /// returns. On fallback failure the error propagates as if `Fail`.
+    TryFallback(Option<StreamOutcome>),
+
+    /// Sleep for the delay, then retry the outer stream loop.
+    ///
+    /// The delay is already clamped to the total-stream deadline by the
+    /// decision method, so the generator just calls `sleep_cancellable` and
+    /// `continue 'outer`. The retry counter has already been incremented.
+    Retry(Duration),
+}
+
 ///
 /// Only [`InitFailed`](StreamHandlerError::InitFailed) and
 /// [`StreamFailed`](StreamHandlerError::StreamFailed) carry one (the outcome
@@ -1674,54 +1711,50 @@ impl StreamHandler {
                         Ok(None) => return,
                         Err(err) => {
                             let last_stream_outcome = carried_outcome(&err);
-
-                            if let Some(StreamOutcome::RateLimited { detail, .. }) = &last_stream_outcome {
-                                let rate_limit_decision = self.rate_limit_retry(
+                            let action = if let Some(StreamOutcome::RateLimited { detail, .. }) =
+                                &last_stream_outcome
+                            {
+                                self.decide_rate_limit_error(
+                                    err,
                                     detail,
                                     &mut rate_limit_retries,
                                     total_deadline,
-                                );
-                                match rate_limit_decision {
-                                    RateLimitRetry::Escalate { attempts, retry_after } => {
-                                        Err(StreamHandlerError::RateLimitEscalation {
-                                            attempts,
-                                            retry_after,
-                                        })?;
-                                        return;
-                                    }
-                                    RateLimitRetry::HardStop => {
-                                        Err(err)?;
-                                        return;
-                                    }
-                                    RateLimitRetry::Retry(delay) => {
-                                        sleep_cancellable(delay, cancel).await?;
-                                        continue 'outer;
-                                    }
+                                    last_stream_outcome.clone(),
+                                )
+                            } else {
+                                self.decide_transport_error(
+                                    err,
+                                    &mut transport_attempts,
+                                    max_attempts,
+                                    last_stream_outcome.clone(),
+                                    total_deadline,
+                                )
+                            };
+                            match action {
+                                ErrorAction::Fail(e) => {
+                                    Err(e)?;
+                                    return;
                                 }
-                            }
-
-                            if transport_attempts >= max_attempts.saturating_sub(1) {
-                                if self.timeout_config.fallback_to_non_streaming {
-                                    let (message, fallback_stop_reason) = self.fallback_non_streaming(
-                                        client,
-                                        request,
-                                        cancel,
-                                        last_stream_outcome.clone(),
-                                    ).await?;
+                                ErrorAction::TryFallback(outcome) => {
+                                    let (message, fallback_stop_reason) = self
+                                        .fallback_non_streaming(
+                                            client,
+                                            request,
+                                            cancel,
+                                            outcome,
+                                        )
+                                        .await?;
                                     yield HandlerEvent::Fallback {
                                         message,
                                         stop_reason: fallback_stop_reason,
                                     };
                                     return;
                                 }
-                                Err(err)?;
-                                return;
+                                ErrorAction::Retry(delay) => {
+                                    sleep_cancellable(delay, cancel).await?;
+                                    continue 'outer;
+                                }
                             }
-                            let delay = self.retry_config.jittered_base_delay(transport_attempts);
-                            let delay = clamp_delay_to_deadline(delay, total_deadline);
-                            transport_attempts = transport_attempts.saturating_add(1);
-                            sleep_cancellable(delay, cancel).await?;
-                            continue 'outer;
                         }
                     }
                 }
@@ -1742,6 +1775,78 @@ impl StreamHandler {
     ///
     /// `max_retries` is checked first so it is always enforced as the hard
     /// ceiling, regardless of `fallback_after_retries`.
+    /// Decide how to handle a rate-limit stream error.
+    ///
+    /// Delegates to [`rate_limit_retry`](Self::rate_limit_retry) for the
+    /// retry/escalate/hard-stop decision, then maps the result to an
+    /// [`ErrorAction`] the generator body can act on.
+    ///
+    /// When `HardStop` fires and
+    /// [`fallback_to_non_streaming`](StreamTimeoutConfig::fallback_to_non_streaming)
+    /// is enabled, returns [`ErrorAction::TryFallback`] instead of failing —
+    /// so rate-limit exhaustion gets the same fallback chance as transport
+    /// exhaustion. This is the symmetry fix: both exhaustion paths route
+    /// through the non-streaming fallback when it is configured.
+    fn decide_rate_limit_error(
+        &self,
+        err: StreamHandlerError,
+        detail: &DetectedRateLimit,
+        rate_limit_retries: &mut u32,
+        total_deadline: Option<Instant>,
+        last_outcome: Option<StreamOutcome>,
+    ) -> ErrorAction {
+        match self.rate_limit_retry(detail, rate_limit_retries, total_deadline) {
+            RateLimitRetry::Escalate {
+                attempts,
+                retry_after,
+            } => ErrorAction::Fail(StreamHandlerError::RateLimitEscalation {
+                attempts,
+                retry_after,
+            }),
+            RateLimitRetry::HardStop => {
+                if self.timeout_config.fallback_to_non_streaming {
+                    ErrorAction::TryFallback(last_outcome)
+                } else {
+                    ErrorAction::Fail(err)
+                }
+            }
+            RateLimitRetry::Retry(delay) => ErrorAction::Retry(delay),
+        }
+    }
+
+    /// Decide how to handle a non-rate-limit transport stream error.
+    ///
+    /// Checks whether the transport-retry budget is exhausted:
+    ///
+    /// - **Exhausted + fallback enabled** → [`ErrorAction::TryFallback`]:
+    ///   the non-streaming path gets one last chance, carrying the stream
+    ///   outcome for diagnostics if it also fails.
+    /// - **Exhausted + fallback disabled** → [`ErrorAction::Fail`]:
+    ///   propagate the error.
+    /// - **Retries remaining** → [`ErrorAction::Retry`]: sleep for the
+    ///   jittered backoff (clamped to the total-stream deadline), then
+    ///   retry. Increments `transport_attempts` so the next call knows
+    ///   how many attempts have been spent.
+    fn decide_transport_error(
+        &self,
+        err: StreamHandlerError,
+        transport_attempts: &mut u32,
+        max_attempts: u32,
+        last_outcome: Option<StreamOutcome>,
+        total_deadline: Option<Instant>,
+    ) -> ErrorAction {
+        if *transport_attempts >= max_attempts.saturating_sub(1) {
+            if self.timeout_config.fallback_to_non_streaming {
+                return ErrorAction::TryFallback(last_outcome);
+            }
+            return ErrorAction::Fail(err);
+        }
+        let delay = self.retry_config.jittered_base_delay(*transport_attempts);
+        let delay = clamp_delay_to_deadline(delay, total_deadline);
+        *transport_attempts = transport_attempts.saturating_add(1);
+        ErrorAction::Retry(delay)
+    }
+
     fn rate_limit_retry(
         &self,
         detail: &DetectedRateLimit,
@@ -1973,14 +2078,27 @@ impl StreamHandler {
 
         match result {
             Ok(value) => {
-                // Best-effort extraction of text content from the JSON response.
-                let text = value
+                let parts = value
                     .get("content")
                     .and_then(|c| c.as_array())
-                    .and_then(|parts| {
-                        parts
+                    .map(|blocks| {
+                        blocks
                             .iter()
-                            .find_map(|p| p.get("text").and_then(|t| t.as_str()).map(String::from))
+                            .filter_map(|block| match block.get("type").and_then(|t| t.as_str()) {
+                                Some("text") => block
+                                    .get("text")
+                                    .and_then(|t| t.as_str())
+                                    .map(MessagePart::text),
+                                Some("tool_use") => {
+                                    let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let name =
+                                        block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let input = block.get("input").cloned().unwrap_or(Value::Null);
+                                    Some(MessagePart::tool_call(id, name, input))
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
                 let stop_reason = value
@@ -1988,7 +2106,19 @@ impl StreamHandler {
                     .and_then(|r| r.as_str())
                     .and_then(StreamStopReason::from_api_str)
                     .unwrap_or(StreamStopReason::EndTurn);
-                Ok((Message::assistant(&text), stop_reason))
+                let message = if parts.is_empty() {
+                    let text = value
+                        .get("choices")
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("message"))
+                        .and_then(|m| m.get("content"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    Message::assistant(text)
+                } else {
+                    Message::new(crate::message::Role::Assistant, parts)
+                };
+                Ok((message, stop_reason))
             }
             Err(e) => Err(StreamHandlerError::FallbackFailed {
                 stream_outcome: stream_outcome.unwrap_or(StreamOutcome::InitFailed {
@@ -2891,6 +3021,148 @@ mod tests {
             "empty-stream fast-fail (2×10ms) must beat the full threshold (10×10ms); \
              elapsed {elapsed:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn fallback_preserves_tool_call_parts() {
+        struct ToolFallbackMock;
+        impl ApiClient for ToolFallbackMock {
+            fn model(&self) -> String {
+                "test".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                Box::pin(futures::stream::once(async {
+                    Err(ApiError::api("connection refused"))
+                }))
+            }
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(serde_json::json!({
+                        "content": [
+                            {"type": "text", "text": "Let me search"},
+                            {"type": "tool_use", "id": "tc_1", "name": "search", "input": {"q": "hello"}}
+                        ],
+                        "stop_reason": "tool_use"
+                    }))
+                })
+            }
+        }
+
+        let handler = StreamHandler::new()
+            .with_timeout_config(StreamTimeoutConfig {
+                fallback_to_non_streaming: true,
+                ..Default::default()
+            })
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            });
+        let cancel = Arc::new(CancelSignal::new());
+        let req = crate::api::StreamRequest::new(vec![]);
+        let mut stream = handler.stream_turn(
+            &ToolFallbackMock,
+            &req,
+            crate::structured::RequestOptions::default(),
+            &cancel,
+        );
+        let mut got_fallback = false;
+        while let Some(item) = stream.next().await {
+            if let Ok(HandlerEvent::Fallback { message, .. }) = item {
+                got_fallback = true;
+                let has_tool = message
+                    .parts
+                    .iter()
+                    .any(|p| matches!(p, crate::message::MessagePart::ToolCall { name, .. } if name == "search"));
+                assert!(
+                    has_tool,
+                    "fallback message must preserve the tool-call part, got: {:?}",
+                    message.parts
+                );
+                let has_text = message
+                    .parts
+                    .iter()
+                    .any(|p| matches!(p, crate::message::MessagePart::Text { text } if text == "Let me search"));
+                assert!(has_text, "fallback message must preserve the text part");
+            }
+        }
+        assert!(got_fallback, "must emit a Fallback event");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_hard_stop_tries_fallback_when_enabled() {
+        struct RateLimitThenOkMock;
+        impl ApiClient for RateLimitThenOkMock {
+            fn model(&self) -> String {
+                "test".to_string()
+            }
+
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                Box::pin(futures::stream::once(async {
+                    Err(ApiError::RateLimit {
+                        retry_after: None,
+                        message: "slow down".into(),
+                    })
+                }))
+            }
+
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(serde_json::json!({
+                        "content": [{"type": "text", "text": "fallback ok"}],
+                        "stop_reason": "end_turn"
+                    }))
+                })
+            }
+        }
+
+        let handler = StreamHandler::new().with_rate_limit_config(RateLimitConfig {
+            fallback_after_retries: 2,
+            max_retries: 2,
+            default_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            ..Default::default()
+        });
+        let cancel = Arc::new(CancelSignal::new());
+        let req = crate::api::StreamRequest::new(vec![]);
+        let result = handler
+            .drive_turn(&RateLimitThenOkMock, &req, &cancel)
+            .await;
+        assert!(
+            result.is_ok(),
+            "hard-stop must try fallback when enabled, got: {:?}",
+            result.err()
+        );
+        let drive = result.unwrap();
+        assert!(drive.from_fallback);
+        assert!(drive.message.text_content().contains("fallback ok"));
     }
 
     /// Mock that fails its first streaming attempt with a transport error,
@@ -4160,13 +4432,18 @@ mod tests {
             }
         }
 
-        let handler = StreamHandler::new().with_rate_limit_config(RateLimitConfig {
-            fallback_after_retries: 2,
-            max_retries: 2,
-            default_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(1),
-            ..Default::default()
-        });
+        let handler = StreamHandler::new()
+            .with_timeout_config(StreamTimeoutConfig {
+                fallback_to_non_streaming: false,
+                ..Default::default()
+            })
+            .with_rate_limit_config(RateLimitConfig {
+                fallback_after_retries: 2,
+                max_retries: 2,
+                default_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+                ..Default::default()
+            });
         let client = AlwaysRateLimitMock;
         let cancel = Arc::new(CancelSignal::new());
 

@@ -216,7 +216,7 @@ impl<C: ApiClient> BareLoop<C> {
         tool_calls: &[ToolCall],
         turn_idx: usize,
     ) -> Result<Vec<ToolDispatchResult>, LoopError> {
-        match self.run_config().parallel_tool_dispatch.mode {
+        match self.dispatch_mode().mode {
             crate::config::ParallelMode::Parallel => {
                 self.dispatch_tools_parallel(tool_calls, turn_idx).await
             }
@@ -284,8 +284,7 @@ impl<C: ApiClient> BareLoop<C> {
 
         let plan = ToolDependencyGraph::from_calls(tool_calls, &self.tools).plan();
         let max_concurrency = self
-            .run_config()
-            .parallel_tool_dispatch
+            .dispatch_mode()
             .max_concurrency
             .clamp(1, tool_calls.len());
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrency));

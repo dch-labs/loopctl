@@ -498,6 +498,7 @@ pub fn ollama(model: &str) -> Result<OpenAiClient, ApiError> {
         .with_api_key(api_key)
         .with_base_url(base)
         .with_model(model)
+        .with_stream_usage(false)
         .build()
 }
 

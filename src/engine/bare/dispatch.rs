@@ -333,14 +333,18 @@ impl<C: ApiClient> BareLoop<C> {
 
         Ok(results
             .into_iter()
-            .map(|r| {
-                r.unwrap_or_else(|| ToolDispatchResult {
-                    tool_call_id: String::new(),
-                    output: ToolContent::Text("dispatch produced no result".to_string()),
-                    is_error: true,
-                    duration: Duration::ZERO,
-                    resolved_tool_name: String::new(),
-                    display_hint: None,
+            .enumerate()
+            .map(|(idx, r)| {
+                r.unwrap_or_else(|| {
+                    let tc = tool_calls.get(idx);
+                    ToolDispatchResult {
+                        tool_call_id: tc.map(|c| c.id.clone()).unwrap_or_default(),
+                        output: ToolContent::Text("dispatch produced no result".to_string()),
+                        is_error: true,
+                        duration: Duration::ZERO,
+                        resolved_tool_name: tc.map(|c| c.tool.clone()).unwrap_or_default(),
+                        display_hint: None,
+                    }
                 })
             })
             .collect())
@@ -983,8 +987,11 @@ mod tests {
         fn create_message(
             &self,
             _request: &crate::api::StreamRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
-        {
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
             Box::pin(async { Err(ApiError::http("not implemented")) })
         }
     }

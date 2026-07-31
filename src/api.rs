@@ -7,7 +7,7 @@
 
 pub mod error;
 use crate::message::Message;
-use crate::stream::StreamEvent;
+use crate::stream::{StreamEvent, StreamStopReason, Usage};
 use crate::tool::ToolSchema;
 use error::ApiError;
 use futures::Stream;
@@ -107,6 +107,42 @@ impl StreamRequest {
     }
 }
 
+/// A completed, non-streaming LLM response.
+///
+/// The typed counterpart to a streamed response: instead of a sequence of
+/// [`StreamEvent`]s, the complete assistant [`Message`], the reason
+/// generation stopped, and the token [`Usage`] are delivered in one shot.
+/// Each provider builds this from its own native JSON envelope, so callers
+/// never see provider-specific shapes — exactly mirroring how the streaming
+/// path emits typed events.
+///
+/// Produced by [`create_message`](ApiClient::create_message) and
+/// [`create_message_with_options`](ApiClient::create_message_with_options).
+#[derive(Debug, Clone)]
+pub struct NonStreamingResponse {
+    /// The fully assembled assistant message.
+    ///
+    /// Contains the same [`MessagePart`](crate::message::MessagePart) sequence
+    /// a stream would accumulate — text blocks, tool calls, etc. Built by the
+    /// provider from its native response shape.
+    pub message: Message,
+
+    /// Why the model stopped generating.
+    ///
+    /// Mapped by the provider from its native finish/stop field. Drives the
+    /// agent loop's decision to continue to tool execution or end the turn.
+    pub stop_reason: StreamStopReason,
+
+    /// Token counts for the request, as reported by the provider.
+    ///
+    /// Extracted from the provider's native usage field (`usage` on OpenAI and
+    /// Anthropic, `usageMetadata` on Gemini). `None` when the provider omits
+    /// usage from the response — symmetric with the `Option<Usage>` carried by
+    /// the final [`MessageDelta`](StreamEvent::MessageDelta) event on the
+    /// streaming path.
+    pub usage: Option<Usage>,
+}
+
 /// Interface for API clients that communicate with LLM providers.
 ///
 /// Defines the contract for both streaming and non-streaming
@@ -158,7 +194,7 @@ impl StreamRequest {
 ///     fn create_message(
 ///         &self,
 ///         request: StreamRequest,
-///     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>> {
+///     ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>> {
 ///         // Non-streaming fallback
 ///         todo!()
 ///     }
@@ -235,22 +271,24 @@ pub trait ApiClient: Send + Sync {
     /// Non-streaming message request (fallback).
     ///
     /// Sends the same [`StreamRequest`] as
-    /// [`stream_messages`](ApiClient::stream_messages) but returns a single
-    /// [`serde_json::Value`] instead of a stream. Useful for simple one-shot
-    /// queries where streaming overhead isn't needed, or as a fallback when
-    /// the provider does not support streaming.
+    /// [`stream_messages`](ApiClient::stream_messages) but returns a fully
+    /// assembled [`NonStreamingResponse`] instead of a stream. Useful for
+    /// simple one-shot queries where streaming overhead isn't needed, or as a
+    /// fallback when the provider does not support streaming. Each provider
+    /// builds the typed [`Message`] from its own native JSON, so no
+    /// provider-specific parsing is required at the call site.
     ///
     /// Called by utility code that needs a complete response in one shot,
     /// such as token estimation probes or health checks.
     ///
     /// # Returns
     ///
-    /// A pinned, boxed future resolving to the raw JSON response value
-    /// from the provider, or an [`ApiError`] if the request fails.
+    /// A pinned, boxed future resolving to the typed
+    /// [`NonStreamingResponse`], or an [`ApiError`] if the request fails.
     fn create_message(
         &self,
         request: &StreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>>;
 
     /// Streaming variant that honors [`RequestOptions`](crate::structured::RequestOptions).
     ///
@@ -292,7 +330,7 @@ pub trait ApiClient: Send + Sync {
         &self,
         request: &StreamRequest,
         options: crate::structured::RequestOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>> {
         if options.response_format.is_none() {
             return self.create_message(request);
         }
@@ -303,17 +341,23 @@ pub trait ApiClient: Send + Sync {
         })
     }
 
-    /// Extract the structured-output payload from a provider response.
+    /// Extract the structured-output payload from an assistant message.
     ///
-    /// Each provider knows its own response envelope shape. This method pulls
-    /// the inner JSON value that should be fed to
+    /// Returns the JSON value that should be fed to
     /// [`StructuredOutput::from_value`](crate::structured::StructuredOutput::from_value).
-    /// The default implementation returns the raw value as-is (for mock
-    /// clients and custom providers that already return the structured value
-    /// without an envelope). `OpenAiClient`, `AnthropicClient`, and
-    /// `GeminiClient` override this to navigate their respective envelopes.
-    fn extract_structured(&self, raw: &serde_json::Value) -> serde_json::Value {
-        raw.clone()
+    /// The default implementation derives this purely from the typed
+    /// [`Message`], so it works for every provider without overrides: the
+    /// first [`ToolCall`](crate::message::MessagePart::ToolCall) part's `input`
+    /// when present, otherwise the joined
+    /// [`text_content`](Message::text_content) lenient-parsed as JSON. When the
+    /// text is not valid JSON — plain prose, or an empty message — the raw text
+    /// string is returned as-is, which downstream deserialization will reject.
+    fn extract_structured(&self, message: &Message) -> serde_json::Value {
+        if let Some((_, _, input)) = message.tool_call_parts().into_iter().next() {
+            return input.clone();
+        }
+        let text = message.text_content();
+        crate::structured::parse_json_lenient(&text).unwrap_or(serde_json::Value::String(text))
     }
 }
 
@@ -407,12 +451,14 @@ mod tests {
         fn create_message(
             &self,
             _request: &StreamRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
+        ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>>
         {
             Box::pin(async {
-                Ok(serde_json::json!({
-                    "content": [{"type": "text", "text": "Hello!"}]
-                }))
+                Ok(NonStreamingResponse {
+                    message: Message::assistant("Hello!"),
+                    stop_reason: StreamStopReason::EndTurn,
+                    usage: Some(Usage::default()),
+                })
             })
         }
     }
@@ -463,8 +509,9 @@ mod tests {
             })
             .await;
         assert!(result.is_ok());
-        let json = result.unwrap();
-        assert!(json.get("content").is_some());
+        let response = result.unwrap();
+        assert!(!response.message.parts.is_empty());
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
     }
 
     #[test]
@@ -515,5 +562,100 @@ mod tests {
         let client = MockClient::new("test-model");
         assert!(!client.set_model("other-model"));
         assert_eq!(client.model(), "test-model");
+    }
+
+    #[test]
+    fn extract_structured_default_returns_tool_call_input() {
+        let client = MockClient::new("m");
+        let message = Message::new(
+            crate::message::Role::Assistant,
+            vec![crate::message::MessagePart::tool_call(
+                "tc_1",
+                "search",
+                serde_json::json!({"q": "rust"}),
+            )],
+        );
+        let value = client.extract_structured(&message);
+        assert_eq!(value, serde_json::json!({"q": "rust"}));
+    }
+
+    #[test]
+    fn extract_structured_default_returns_first_tool_call_input() {
+        let client = MockClient::new("m");
+        let message = Message::new(
+            crate::message::Role::Assistant,
+            vec![
+                crate::message::MessagePart::tool_call(
+                    "tc_1",
+                    "first",
+                    serde_json::json!({"order": 1}),
+                ),
+                crate::message::MessagePart::tool_call(
+                    "tc_2",
+                    "second",
+                    serde_json::json!({"order": 2}),
+                ),
+            ],
+        );
+        let value = client.extract_structured(&message);
+        assert_eq!(value, serde_json::json!({"order": 1}));
+    }
+
+    #[test]
+    fn extract_structured_default_parses_text_as_json() {
+        let client = MockClient::new("m");
+        let message = Message::assistant(r#"{"tool": "write", "args": {}}"#);
+        let value = client.extract_structured(&message);
+        assert_eq!(value["tool"], "write");
+    }
+
+    #[test]
+    fn extract_structured_default_lenient_parses_embedded_json() {
+        let client = MockClient::new("m");
+        let message = Message::assistant(r#"Here is the result: {"answer": 42}"#);
+        let value = client.extract_structured(&message);
+        assert_eq!(value["answer"], 42);
+    }
+
+    #[test]
+    fn extract_structured_default_prose_falls_back_to_string() {
+        let client = MockClient::new("m");
+        let message = Message::assistant("just prose, no json here");
+        let value = client.extract_structured(&message);
+        assert_eq!(value, serde_json::json!("just prose, no json here"));
+    }
+
+    #[test]
+    fn extract_structured_default_empty_message_falls_back_to_empty_string() {
+        let client = MockClient::new("m");
+        let message = Message::assistant("");
+        let value = client.extract_structured(&message);
+        assert_eq!(value, serde_json::json!(""));
+    }
+
+    #[test]
+    fn non_streaming_response_fields_are_accessible() {
+        let response = NonStreamingResponse {
+            message: Message::assistant("hello"),
+            stop_reason: StreamStopReason::EndTurn,
+            usage: Some(Usage::new(100, 50)),
+        };
+        assert_eq!(response.message.text_content(), "hello");
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+        let usage = response.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.total_tokens(), 150);
+        assert!(!response.message.parts.is_empty());
+    }
+
+    #[test]
+    fn non_streaming_response_usage_can_be_none() {
+        let response = NonStreamingResponse {
+            message: Message::assistant("hello"),
+            stop_reason: StreamStopReason::EndTurn,
+            usage: None,
+        };
+        assert!(response.usage.is_none());
     }
 }

@@ -548,12 +548,18 @@ pub enum StreamStopReason {
 }
 
 impl StreamStopReason {
-    /// Parse a stop reason from the API string representation.
+    /// Parse a stop reason from the provider's API string representation.
     ///
-    /// Called when deserializing [`MessageDeltaPayload`] events to
-    /// convert the string stop reason into a typed enum. Returns
-    /// `None` for unrecognized strings, which may indicate a new
-    /// API version has introduced additional stop reasons.
+    /// Called in two places: when deserializing [`MessageDeltaPayload`]
+    /// streaming events, and when each provider's `build_response` maps its
+    /// native finish/stop field on the non-streaming path. Returns `None` for
+    /// unrecognized strings, which may indicate a new API version has
+    /// introduced additional stop reasons.
+    ///
+    /// `"tool_use"` is accepted as an alias for `"tool_call"` because Anthropic
+    /// reports a tool-invocation stop reason as `"tool_use"` while OpenAI uses
+    /// `"tool_calls"` (handled directly in the OpenAI provider) — both map to
+    /// [`ToolCall`](Self::ToolCall).
     ///
     /// # Returns
     ///
@@ -565,12 +571,13 @@ impl StreamStopReason {
     /// use loopctl::stream::StreamStopReason;
     ///
     /// assert_eq!(StreamStopReason::from_api_str("tool_call"), Some(StreamStopReason::ToolCall));
+    /// assert_eq!(StreamStopReason::from_api_str("tool_use"), Some(StreamStopReason::ToolCall));
     /// assert_eq!(StreamStopReason::from_api_str("unknown"), None);
     /// ```
     #[must_use]
     pub fn from_api_str(s: &str) -> Option<Self> {
         match s {
-            "tool_call" => Some(Self::ToolCall),
+            "tool_call" | "tool_use" => Some(Self::ToolCall),
             "max_tokens" => Some(Self::MaxTokens),
             "stop_sequence" => Some(Self::StopSequence),
             "end_turn" => Some(Self::EndTurn),
@@ -732,7 +739,7 @@ pub struct MessageDeltaPayload {
 /// assert_eq!(usage.output_tokens, 75);
 /// assert_eq!(usage.total_tokens(), 225);
 /// ```
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Usage {
     /// Number of tokens in the input prompt.
     ///
@@ -1197,6 +1204,10 @@ mod tests {
     fn test_stream_stop_reason_from_api_str() {
         assert_eq!(
             StreamStopReason::from_api_str("tool_call"),
+            Some(StreamStopReason::ToolCall)
+        );
+        assert_eq!(
+            StreamStopReason::from_api_str("tool_use"),
             Some(StreamStopReason::ToolCall)
         );
         assert_eq!(

@@ -652,6 +652,7 @@ impl ContextManager {
             reason,
             context_window: self.context_window,
             turn,
+            counter: Arc::clone(&self.token_counter),
         };
         let outcome = self
             .compactor
@@ -729,6 +730,7 @@ impl ContextManager {
             reason,
             context_window: self.context_window,
             turn,
+            counter: Arc::clone(&self.token_counter),
         };
         let outcome = self
             .compactor
@@ -1024,6 +1026,7 @@ mod tests {
             reason: CompactReason::ThresholdExceeded,
             context_window: 1_000,
             turn: 1,
+            counter: Arc::new(HeuristicTokenCounter),
         };
         let outcome = compactor.compact(msgs.clone(), 500, context).await;
         assert!(outcome.success);
@@ -1043,6 +1046,7 @@ mod tests {
             reason: CompactReason::ThresholdExceeded,
             context_window: 1_000,
             turn: 5,
+            counter: Arc::new(HeuristicTokenCounter),
         };
         let outcome = compactor.compact(msgs, 500, context).await;
         assert!(outcome.success);

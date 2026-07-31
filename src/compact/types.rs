@@ -10,9 +10,11 @@
 //! - [`ContextOverflow`] — error when the conversation cannot fit.
 //! - [`EnsureContextResult`] — result of [`ContextManager::ensure_context_fits`](super::ContextManager::ensure_context_fits).
 
+use crate::compact::TokenCounter;
 use crate::message::Message;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 
 /// Why compaction was triggered.
 ///
@@ -62,13 +64,13 @@ impl fmt::Display for CompactReason {
 /// Compactors can use this information to decide how aggressively to
 /// compact — e.g. an emergency compaction may use more aggressive
 /// summarization than a routine threshold check.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CompactionContext {
     /// Estimated token count before compaction.
     ///
-    /// The compactor's input size, computed with the crate's standard
-    /// 4-chars-per-token heuristic. Compaction aims to bring the post-compaction
-    /// size below this so the conversation fits with headroom for the next turn.
+    /// The compactor's input size, computed by the configured
+    /// [`TokenCounter`]. Compaction aims to bring the post-compaction size
+    /// below this so the conversation fits with headroom for the next turn.
     pub tokens_before: u64,
 
     /// Why compaction was triggered.
@@ -91,6 +93,15 @@ pub struct CompactionContext {
     /// recent turns more heavily, or for correlating a compaction pass back to
     /// the turn that triggered it in logs.
     pub turn: usize,
+
+    /// The token counter for estimating message sizes.
+    ///
+    /// The same counter the driver uses for its compaction trigger — so the
+    /// compactor can self-report `tokens_after` consistently. Compact
+    /// implementations should use `context.counter.count(&messages)` instead
+    /// of the static [`CompactionOutcome::estimate_tokens`] to match the
+    /// driver's configured counter.
+    pub counter: Arc<dyn TokenCounter>,
 }
 
 /// Result of a single compaction pass.

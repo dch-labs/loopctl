@@ -52,7 +52,7 @@
 //! let tool_result_msg = Message {
 //!     role: Role::User, // tool results are sent back as "user" role
 //!     parts: vec![
-//!         MessagePart::tool_result("tool_1", ToolContent::from_string("file1.txt\nfile2.txt"), false),
+//!         MessagePart::tool_result("tool_1", "list_files", ToolContent::from_string("file1.txt\nfile2.txt"), false),
 //!     ],
 //! };
 //! ```
@@ -324,7 +324,7 @@ impl fmt::Display for Role {
 /// use loopctl::message::{MessagePart};
 /// let text_part = MessagePart::text("Hello");
 /// let tool_part = MessagePart::tool_call("id1", "search", serde_json::json!({"q": "test"}));
-/// let result_part = MessagePart::tool_result("id1", "found 3 results", false);
+/// let result_part = MessagePart::tool_result("id1", "search", "found 3 results", false);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -409,6 +409,15 @@ pub enum MessagePart {
         /// [`ToolCall`](MessagePart::ToolCall) block.
         call_id: String,
 
+        /// The name of the tool that produced this result.
+        ///
+        /// Copied from the original [`ToolCall`](MessagePart::ToolCall)'s
+        /// `name` field. Required by providers that correlate tool responses
+        /// by function name (e.g. Gemini's `functionResponse`), in addition to
+        /// the `call_id`. Always present for results built by the engine after
+        /// tool dispatch.
+        name: String,
+
         /// The output returned by the tool.
         ///
         /// Can be a simple string or a multipart response with
@@ -492,6 +501,7 @@ impl MessagePart {
     /// # Arguments
     ///
     /// - `call_id` — The ID of the tool invocation this output is for.
+    /// - `name` — The name of the tool that produced this result.
     /// - `output` — The tool output (string or multipart).
     /// - `is_error` — Whether the tool invocation failed.
     ///
@@ -505,6 +515,7 @@ impl MessagePart {
     /// use loopctl::message::{MessagePart};
     /// let part = MessagePart::tool_result(
     ///     "tool_abc",
+    ///     "read_file",
     ///     "file contents here",
     ///     false,
     /// );
@@ -512,11 +523,13 @@ impl MessagePart {
     /// ```
     pub fn tool_result(
         call_id: impl Into<String>,
+        name: impl Into<String>,
         output: impl Into<ToolContent>,
         is_error: bool,
     ) -> Self {
         Self::ToolResult {
             call_id: call_id.into(),
+            name: name.into(),
             output: output.into(),
             is_error: Some(is_error),
         }
@@ -565,7 +578,7 @@ impl MessagePart {
     ///
     /// ```rust
     /// use loopctl::message::{MessagePart};
-    /// let part = MessagePart::tool_result("id", "output", false);
+    /// let part = MessagePart::tool_result("id", "search", "output", false);
     /// assert!(part.is_tool_result());
     /// ```
     #[must_use]
@@ -1006,7 +1019,7 @@ mod tests {
         assert!(!tool_call.is_text());
         assert!(tool_call.as_text().is_none());
 
-        let tool_result = MessagePart::tool_result("id", "ok", false);
+        let tool_result = MessagePart::tool_result("id", "tool", "ok", false);
         assert!(tool_result.is_tool_result());
     }
 

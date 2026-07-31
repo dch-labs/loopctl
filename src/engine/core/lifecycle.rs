@@ -370,6 +370,14 @@ pub struct Run {
     /// `run()` call that started this run. Captured so a serialized run
     /// carries its governing config.
     pub config: RunConfig,
+
+    /// Why the run ended, if it has terminated.
+    ///
+    /// `None` while the run is in flight or completed normally. Set to the
+    /// terminal [`LoopError`] (`Cancelled`, `MaxTurnsExceeded`, etc.) when
+    /// the run ended abnormally. Populated by the engine in `finalize`.
+    #[serde(skip)]
+    pub stop_reason: Option<LoopError>,
 }
 
 impl Run {
@@ -402,6 +410,7 @@ impl Run {
             input: input.into(),
             output: None,
             config: config.clone(),
+            stop_reason: None,
         }
     }
 

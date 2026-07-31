@@ -240,6 +240,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Changed
 
+- **Breaking (`create_message` returns a typed response):**
+  `ApiClient::create_message` and `ApiClient::create_message_with_options`
+  now return `Result<NonStreamingResponse, ApiError>` instead of
+  `Result<serde_json::Value, ApiError>`. `NonStreamingResponse` carries the
+  fully assembled `message: Message`, a typed `stop_reason:
+  StreamStopReason`, and the token `usage: Usage` — the typed counterpart to
+  a streamed response. Each provider builds this from its own native JSON, so
+  no provider-specific parsing remains at the call site (the handler's
+  `fallback_non_streaming` collapsed from a 30-line JSON parser to a single
+  field access). Token usage is now extracted from each provider's native
+  usage field (`usage.prompt_tokens`/`completion_tokens` on OpenAI,
+  `usage.input_tokens`/`output_tokens` on Anthropic,
+  `usageMetadata.promptTokenCount`/`candidatesTokenCount`/`thoughtsTokenCount`
+  on Gemini), and threaded through `HandlerEvent::Fallback` so the fallback
+  path reports real token counts instead of `None`.
+  Migration: read `.message`, `.stop_reason`, and `.usage` from the returned
+  struct instead of indexing into the JSON value.
+- **Breaking (`extract_structured` takes `&Message`):**
+  `ApiClient::extract_structured` now takes `&Message` instead of
+  `&serde_json::Value` and has a default implementation that derives the
+  payload from the message (first tool-call `input`, else text lenient-parsed
+  as JSON). The per-provider overrides (`OpenAiClient`, `AnthropicClient`,
+  `GeminiClient`) and the shared `extract_structured_from_normalized` helper
+  are removed — the single default works for every provider because the
+  provider-specific envelope is gone by the time a typed `Message` exists.
+  Migration: if you override `extract_structured`, change the parameter from
+  `&serde_json::Value` to `&Message`; most overrides can be deleted in favor
+  of the default.
+- `StreamStopReason::from_api_str` now accepts `"tool_use"` as an alias for
+  `"tool_call"`. Anthropic reports a tool-invocation stop reason as
+  `"tool_use"` (while OpenAI uses `"tool_calls"`); both now map to `ToolCall`.
+  This fixes a pre-existing bug where Anthropic tool-call responses were
+  misclassified as `EndTurn` on both the streaming and non-streaming paths.
+- `Usage` now derives `PartialEq` and `Eq`.
+- **OpenAI streaming usage:** the OpenAI streaming client now sets
+  `stream_options.include_usage` on streaming requests and captures the token
+  counts from the final usage chunk. Previously the streaming path always
+  reported `usage: None` (it discarded usage), so a streamed turn reported zero
+  tokens while a non-streaming fallback reported real counts — the successful
+  path reported less than the fallback. The `StreamEmitter` now defers the
+  `MessageDelta` until either the usage chunk arrives or the stream ends,
+  emitting the stop reason and usage together. All three providers (OpenAI,
+  Anthropic, Gemini) now report usage on both streaming and non-streaming paths.
+  `stream_options.include_usage` is opt-in via
+  `OpenAiClientBuilder::with_stream_usage(false)` for OpenAI-compatible servers
+  that reject the parameter; the `ollama()` constructor disables it
+  automatically for compatibility with older Ollama versions.
+- **Breaking (`NonStreamingResponse.usage` is now `Option<Usage>`):** the field
+  changed from `Usage` to `Option<Usage>`, symmetric with the streaming path's
+  `Option<Usage>`. This lets callers distinguish "provider reported zero tokens"
+  from "provider omitted usage." `None` means the provider did not include a
+  usage object in its response. Migration: unwrap with `.unwrap_or_default()`
+  or pattern-match on `Option`.
+- **Breaking (`MessagePart::ToolResult` gains a `name` field):** tool results
+  now carry the tool's function name alongside the `call_id`. Required by Gemini
+  (and other providers) that correlate tool responses by function name in
+  `functionResponse`, not just by call id. `MessagePart::tool_result()` gains a
+  `name` parameter (second argument, after `call_id`).
+  Migration: add the tool name as the second argument to every
+  `MessagePart::tool_result()` call.
+- **Gemini tool-call ids:** the Gemini provider now parses `functionCall.id`
+  (Gemini 3 returns a unique id per call) and echoes it in
+  `functionResponse.id`, fixing tool-response correlation for parallel calls.
+  The `functionResponse` serialization now sends both `name` (the function name)
+  and `id` (the call id) instead of putting the call id in `name`.
+  Migration: none — serialization is automatic.
+- **OpenAI usage unification:** the non-streaming `build_response` path now uses
+  the same `OpenAiUsage` serde struct as the streaming path, deleting the manual
+  `extract_usage` helper. Both paths share one deserialization strategy.
 - **Breaking (session→run lifecycle rename):** the observer and hook events
   formerly named `on_session_start` / `on_session_end` are renamed to
   `on_run_start` / `on_run_end`. These events fire once per `run()` call and

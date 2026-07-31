@@ -1900,6 +1900,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
         Box::pin(async move {
             if let Some(run) = self.current_run_mut() {
                 run.end = Some(Instant::now());
+                run.stop_reason = error.cloned();
             }
 
             if error.is_none() {
@@ -2232,8 +2233,18 @@ mod tests {
         fn create_message(
             &self,
             _request: &crate::api::StreamRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-            Box::pin(async { Ok(json!({"content": []})) })
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(""),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
     }
 
@@ -2613,8 +2624,18 @@ mod tests {
         fn create_message(
             &self,
             _request: &crate::api::StreamRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-            Box::pin(async { Ok(json!({"content": []})) })
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(""),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
     }
 
@@ -3345,6 +3366,7 @@ mod tests {
         match &parts[0] {
             MessagePart::ToolResult {
                 call_id,
+                name: _,
                 output,
                 is_error,
             } => {
@@ -4503,7 +4525,11 @@ mod tests {
         fn create_message(
             &self,
             _request: &crate::api::StreamRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
             Box::pin(async { Err(ApiError::api("not implemented")) })
         }
     }
@@ -4717,12 +4743,19 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
-                Box::pin(async { Ok(serde_json::Value::Null) })
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
+                })
             }
         }
 
@@ -5378,8 +5411,20 @@ mod tests {
             fn create_message(
                 &self,
                 _request: &crate::api::StreamRequest,
-            ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-                Box::pin(async { Ok(json!({})) })
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
+                })
             }
         }
 
@@ -5603,8 +5648,18 @@ mod tests {
         fn create_message(
             &self,
             _request: &crate::api::StreamRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
-            Box::pin(async { Ok(json!({"content": []})) })
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(""),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
     }
 

@@ -304,16 +304,29 @@ mod tests {
         fn create_message(
             &self,
             _request: &crate::api::StreamRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
-        {
-            Box::pin(async { Ok(serde_json::json!({})) })
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
+            let message = crate::message::Message::assistant(self.response.to_string());
+            Box::pin(async move {
+                Ok(crate::api::NonStreamingResponse {
+                    message,
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
         fn create_message_with_options(
             &self,
             request: &crate::api::StreamRequest,
             _options: RequestOptions,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
-        {
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
             let crate::api::StreamRequest {
                 messages,
                 system,
@@ -329,11 +342,14 @@ mod tests {
                 system: system.clone(),
                 user,
             });
-            let response = self.response.clone();
-            Box::pin(async move { Ok(response) })
-        }
-        fn extract_structured(&self, raw: &serde_json::Value) -> serde_json::Value {
-            raw.clone()
+            let message = crate::message::Message::assistant(self.response.to_string());
+            Box::pin(async move {
+                Ok(crate::api::NonStreamingResponse {
+                    message,
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
     }
 
@@ -358,16 +374,28 @@ mod tests {
         fn create_message(
             &self,
             _request: &crate::api::StreamRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
-        {
-            Box::pin(async { Ok(serde_json::json!({})) })
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(""),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
         fn create_message_with_options(
             &self,
             _request: &crate::api::StreamRequest,
             _options: RequestOptions,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
-        {
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
             Box::pin(async { Err(ApiError::http("upstream 500".to_string())) })
         }
     }
@@ -394,20 +422,29 @@ mod tests {
         fn create_message(
             &self,
             request: &crate::api::StreamRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
-        {
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
             self.0.create_message(request)
         }
         fn create_message_with_options(
             &self,
             _request: &crate::api::StreamRequest,
             _options: RequestOptions,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
-        {
-            Box::pin(async { Ok(serde_json::json!("I cannot produce that.")) })
-        }
-        fn extract_structured(&self, raw: &serde_json::Value) -> serde_json::Value {
-            raw.clone()
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant("I cannot produce that."),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
     }
 

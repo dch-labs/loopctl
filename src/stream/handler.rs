@@ -36,11 +36,10 @@
 use crate::api::ApiClient;
 use crate::api::error::{ApiError, http_status_is_overload};
 use crate::cancel::CancelSignal;
-use crate::message::{Message, MessagePart};
-use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason};
+use crate::message::Message;
+use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
 use futures::StreamExt;
 use futures::stream::Stream;
-use serde_json::Value;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1736,7 +1735,7 @@ impl StreamHandler {
                                     return;
                                 }
                                 ErrorAction::TryFallback(outcome) => {
-                                    let (message, fallback_stop_reason) = self
+                                    let (message, fallback_stop_reason, fallback_usage) = self
                                         .fallback_non_streaming(
                                             client,
                                             request,
@@ -1747,6 +1746,7 @@ impl StreamHandler {
                                     yield HandlerEvent::Fallback {
                                         message,
                                         stop_reason: fallback_stop_reason,
+                                        usage: fallback_usage,
                                     };
                                     return;
                                 }
@@ -2051,7 +2051,9 @@ impl StreamHandler {
     ///
     /// Called when streaming fails (timeout, retries exhausted) and
     /// `fallback_to_non_streaming` is enabled. Uses
-    /// [`ApiClient::create_message`] to get a complete response.
+    /// [`ApiClient::create_message`] to get a complete typed response — the
+    /// message, stop reason, and token usage are returned directly, with no
+    /// JSON parsing at this layer.
     ///
     /// # Errors
     ///
@@ -2064,7 +2066,7 @@ impl StreamHandler {
         request: &crate::api::StreamRequest,
         cancel: &Arc<CancelSignal>,
         stream_outcome: Option<StreamOutcome>,
-    ) -> Result<(Message, StreamStopReason), StreamHandlerError> {
+    ) -> Result<(Message, StreamStopReason, Option<Usage>), StreamHandlerError> {
         if cancel.is_cancelled() {
             return Err(StreamHandlerError::Cancelled);
         }
@@ -2077,49 +2079,7 @@ impl StreamHandler {
         };
 
         match result {
-            Ok(value) => {
-                let parts = value
-                    .get("content")
-                    .and_then(|c| c.as_array())
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter_map(|block| match block.get("type").and_then(|t| t.as_str()) {
-                                Some("text") => block
-                                    .get("text")
-                                    .and_then(|t| t.as_str())
-                                    .map(MessagePart::text),
-                                Some("tool_use") => {
-                                    let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                    let name =
-                                        block.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                    let input = block.get("input").cloned().unwrap_or(Value::Null);
-                                    Some(MessagePart::tool_call(id, name, input))
-                                }
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let stop_reason = value
-                    .get("stop_reason")
-                    .and_then(|r| r.as_str())
-                    .and_then(StreamStopReason::from_api_str)
-                    .unwrap_or(StreamStopReason::EndTurn);
-                let message = if parts.is_empty() {
-                    let text = value
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("message"))
-                        .and_then(|m| m.get("content"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-                    Message::assistant(text)
-                } else {
-                    Message::new(crate::message::Role::Assistant, parts)
-                };
-                Ok((message, stop_reason))
-            }
+            Ok(response) => Ok((response.message, response.stop_reason, response.usage)),
             Err(e) => Err(StreamHandlerError::FallbackFailed {
                 stream_outcome: stream_outcome.unwrap_or(StreamOutcome::InitFailed {
                     attempts: 0,
@@ -2163,9 +2123,9 @@ pub enum HandlerEvent {
     /// Streaming retries are exhausted and the non-streaming fallback
     /// succeeded.
     ///
-    /// Carries the final message and stop reason extracted from the
+    /// Carries the final message, stop reason, and token usage from the
     /// non-streaming
-    /// [`create_message`](crate::api::ApiClient::create_message) JSON
+    /// [`create_message`](crate::api::ApiClient::create_message) typed
     /// response. The engine should stop accumulating and use these directly —
     /// the streaming accumulator's partial state from failed attempts is
     /// irrelevant on this path.
@@ -2176,21 +2136,28 @@ pub enum HandlerEvent {
         /// The fallback assistant message produced by the non-streaming
         /// request.
         ///
-        /// Built from the first text part of the
-        /// [`create_message`](crate::api::ApiClient::create_message) JSON
-        /// response. The engine should treat this as the authoritative
-        /// turn output — the streaming accumulator's partial state from
-        /// failed attempts is discarded on this path.
+        /// Built from the typed
+        /// [`NonStreamingResponse`](crate::api::NonStreamingResponse) returned
+        /// by [`create_message`](crate::api::ApiClient::create_message). The
+        /// engine should treat this as the authoritative turn output — the
+        /// streaming accumulator's partial state from failed attempts is
+        /// discarded on this path.
         message: Message,
 
-        /// Stop reason parsed from the JSON response's `stop_reason`
-        /// field.
+        /// Stop reason mapped from the provider's native finish/stop field.
         ///
         /// Defaults to [`EndTurn`](StreamStopReason::EndTurn) when the
         /// field is absent or holds an unrecognized value, so the engine
         /// always has a concrete reason to act on. Drives the same
         /// downstream behaviour as a streaming `MessageStop`.
         stop_reason: StreamStopReason,
+
+        /// Token usage reported by the provider for the fallback request.
+        ///
+        /// `None` when the provider omits usage from its non-streaming
+        /// response. The engine threads this into the turn's usage totals
+        /// exactly like the `MessageDelta` usage on the streaming path.
+        usage: Option<Usage>,
     },
 }
 
@@ -2254,6 +2221,7 @@ mod tests {
                     HandlerEvent::Fallback {
                         message,
                         stop_reason: fallback_stop_reason,
+                        ..
                     } => {
                         from_fallback = true;
                         return Ok(DriveResult {
@@ -2761,7 +2729,7 @@ mod tests {
 
     struct HandlerMock {
         create_error: Option<String>,
-        create_response: Option<serde_json::Value>,
+        create_response: Option<Message>,
     }
 
     impl HandlerMock {
@@ -2773,10 +2741,7 @@ mod tests {
         }
 
         fn with_text_response(mut self, text: &str) -> Self {
-            self.create_response = Some(serde_json::json!({
-                "content": [{"type": "text", "text": text}],
-                "stop_reason": "end_turn"
-            }));
+            self.create_response = Some(Message::assistant(text));
             self
         }
 
@@ -2805,17 +2770,27 @@ mod tests {
             &self,
             _request: &crate::api::StreamRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
         > {
             if let Some(ref err) = self.create_error {
                 let err = err.clone();
                 return Box::pin(async move { Err(ApiError::api(&err)) });
             }
-            let val = self.create_response.clone().unwrap_or(serde_json::json!({
-                "content": [{"type": "text", "text": "default"}],
-                "stop_reason": "end_turn"
-            }));
-            Box::pin(async move { Ok(val) })
+            let message = self
+                .create_response
+                .clone()
+                .unwrap_or_else(|| Message::assistant("default"));
+            Box::pin(async move {
+                Ok(crate::api::NonStreamingResponse {
+                    message,
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
     }
 
@@ -2828,7 +2803,7 @@ mod tests {
         let client = HandlerMock::new().with_text_response("fallback works");
         let cancel = Arc::new(CancelSignal::new());
 
-        let (message, stop_reason) = handler
+        let (message, stop_reason, usage) = handler
             .fallback_non_streaming(
                 &client,
                 &crate::api::StreamRequest::new(vec![]),
@@ -2854,6 +2829,8 @@ mod tests {
         assert!(text.contains("fallback works"), "got: {text:?}");
         // HandlerMock::with_text_response sets stop_reason: "end_turn".
         assert_eq!(stop_reason, StreamStopReason::EndTurn);
+        // HandlerMock returns Usage::default() (zero tokens).
+        assert_eq!(usage, Some(Usage::default()));
     }
 
     #[tokio::test]
@@ -2973,12 +2950,19 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
-                Box::pin(async { Ok(serde_json::json!({})) })
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
+                })
             }
         }
 
@@ -3045,19 +3029,28 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
                 Box::pin(async {
-                    Ok(serde_json::json!({
-                        "content": [
-                            {"type": "text", "text": "Let me search"},
-                            {"type": "tool_use", "id": "tc_1", "name": "search", "input": {"q": "hello"}}
-                        ],
-                        "stop_reason": "tool_use"
-                    }))
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::new(
+                            crate::message::Role::Assistant,
+                            vec![
+                                crate::message::MessagePart::text("Let me search"),
+                                crate::message::MessagePart::tool_call(
+                                    "tc_1",
+                                    "search",
+                                    serde_json::json!({"q": "hello"}),
+                                ),
+                            ],
+                        ),
+                        stop_reason: crate::stream::StreamStopReason::ToolCall,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
                 })
             }
         }
@@ -3129,16 +3122,18 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
                 Box::pin(async {
-                    Ok(serde_json::json!({
-                        "content": [{"type": "text", "text": "fallback ok"}],
-                        "stop_reason": "end_turn"
-                    }))
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant("fallback ok"),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
                 })
             }
         }
@@ -3192,7 +3187,11 @@ mod tests {
             &self,
             request: &crate::api::StreamRequest,
         ) -> Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
         > {
             self.create_message_with_options(request, crate::structured::RequestOptions::default())
         }
@@ -3225,11 +3224,21 @@ mod tests {
             _request: &crate::api::StreamRequest,
             _options: crate::structured::RequestOptions,
         ) -> Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
         > {
-            Box::pin(async { Ok(serde_json::Value::Null) })
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(""),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
-        fn extract_structured(&self, _: &serde_json::Value) -> serde_json::Value {
+        fn extract_structured(&self, _: &crate::message::Message) -> serde_json::Value {
             serde_json::Value::Null
         }
     }
@@ -3329,8 +3338,9 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
@@ -3395,13 +3405,18 @@ mod tests {
             &self,
             _request: &crate::api::StreamRequest,
         ) -> Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
         > {
             Box::pin(async {
-                Ok(serde_json::json!({
-                    "content": [{"type": "text", "text": "fallback answer"}],
-                    "stop_reason": "max_tokens",
-                }))
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant("fallback answer"),
+                    stop_reason: crate::stream::StreamStopReason::MaxTokens,
+                    usage: Some(crate::stream::Usage::default()),
+                })
             })
         }
         fn stream_messages_with_options(
@@ -3418,16 +3433,21 @@ mod tests {
             _request: &crate::api::StreamRequest,
             _options: crate::structured::RequestOptions,
         ) -> Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
         > {
             Box::pin(async {
-                Ok(serde_json::json!({
-                    "content": [{"type": "text", "text": "fallback answer"}],
-                    "stop_reason": "max_tokens",
-                }))
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant("fallback answer"),
+                    stop_reason: crate::stream::StreamStopReason::MaxTokens,
+                    usage: Some(crate::stream::Usage::default()),
+                })
             })
         }
-        fn extract_structured(&self, _: &serde_json::Value) -> serde_json::Value {
+        fn extract_structured(&self, _: &crate::message::Message) -> serde_json::Value {
             serde_json::Value::Null
         }
     }
@@ -3957,9 +3977,19 @@ mod tests {
             &self,
             _request: &crate::api::StreamRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
         > {
-            Box::pin(async { Ok(serde_json::json!({})) })
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(""),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
     }
 
@@ -4210,12 +4240,19 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
-                Box::pin(async { Ok(serde_json::json!({})) })
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
+                })
             }
         }
 
@@ -4277,12 +4314,19 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
-                Box::pin(async { Ok(serde_json::json!({})) })
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
+                })
             }
         }
 
@@ -4351,12 +4395,19 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
-                Box::pin(async { Ok(serde_json::json!({})) })
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
+                })
             }
         }
 
@@ -4423,12 +4474,19 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
-                Box::pin(async { Ok(serde_json::json!({})) })
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
+                })
             }
         }
 
@@ -4497,12 +4555,19 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
-                Box::pin(async { Ok(serde_json::json!({})) })
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
+                })
             }
         }
 
@@ -4557,12 +4622,19 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
-                Box::pin(async { Ok(serde_json::json!({})) })
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
+                })
             }
         }
 
@@ -4616,12 +4688,19 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
-                Box::pin(async { Ok(serde_json::json!({})) })
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
+                })
             }
         }
 
@@ -4690,12 +4769,19 @@ mod tests {
                 _request: &crate::api::StreamRequest,
             ) -> std::pin::Pin<
                 Box<
-                    dyn std::future::Future<Output = Result<serde_json::Value, ApiError>>
-                        + Send
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
                         + '_,
                 >,
             > {
-                Box::pin(async { Ok(serde_json::json!({})) })
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
+                })
             }
         }
 

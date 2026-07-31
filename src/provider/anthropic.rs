@@ -190,6 +190,72 @@ impl AnthropicClient {
     fn messages_url(&self) -> String {
         format!("{}/v1/messages", self.base_url)
     }
+
+    /// Build a typed [`NonStreamingResponse`] from Anthropic's native JSON.
+    ///
+    /// Anthropic's native response already carries a `content` array of typed
+    /// blocks, so this reads them directly into [`MessagePart`]s: `text` blocks
+    /// become [`MessagePart::Text`] parts and `tool_use` blocks become
+    /// [`MessagePart::ToolCall`] parts, preserving their original order. Other
+    /// block types (`thinking`, `redacted_thinking`) are skipped — reasoning is
+    /// stream-only in this crate and is not accumulated into the message.
+    /// Maps `stop_reason` via [`StreamStopReason::from_api_str`] (Anthropic
+    /// reports tool invocations as `"tool_use"`, aliased to `ToolCall`),
+    /// defaulting to `EndTurn` on an unrecognized or missing value. Reads
+    /// `usage.input_tokens` / `usage.output_tokens` into [`Usage`], defaulting
+    /// to zero when the `usage` object is absent.
+    fn build_response(raw: &Value) -> crate::api::NonStreamingResponse {
+        let mut parts: Vec<MessagePart> = Vec::new();
+        if let Some(blocks) = raw.get("content").and_then(|c| c.as_array()) {
+            for block in blocks {
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            parts.push(MessagePart::text(text));
+                        }
+                    }
+                    Some("tool_use") => {
+                        let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let input = block.get("input").cloned().unwrap_or(Value::Null);
+                        parts.push(MessagePart::tool_call(id, name, input));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let stop_reason = raw
+            .get("stop_reason")
+            .and_then(|r| r.as_str())
+            .and_then(StreamStopReason::from_api_str)
+            .unwrap_or(StreamStopReason::EndTurn);
+        let usage = extract_usage(raw);
+        crate::api::NonStreamingResponse {
+            message: Message::new(Role::Assistant, parts),
+            stop_reason,
+            usage,
+        }
+    }
+}
+
+/// Extract token [`Usage`] from Anthropic's native `usage` object.
+///
+/// Reads `usage.input_tokens` and `usage.output_tokens`. Returns `None` when
+/// the `usage` object is absent from the response. Mirrors the extraction the
+/// streaming emitter performs in `on_message_delta`.
+fn extract_usage(raw: &Value) -> Option<Usage> {
+    let usage = raw.get("usage")?;
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0);
+    Some(Usage::new(input, output))
 }
 
 impl ApiClient for AnthropicClient {
@@ -219,7 +285,8 @@ impl ApiClient for AnthropicClient {
     fn create_message(
         &self,
         request: &crate::api::StreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
         self.create_message_with_options(request, crate::structured::RequestOptions::default())
     }
 
@@ -270,7 +337,8 @@ impl ApiClient for AnthropicClient {
         &self,
         request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
         let system = request.system.clone();
         let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
@@ -291,23 +359,10 @@ impl ApiClient for AnthropicClient {
         Box::pin(async move {
             let resp = Self::post_messages(&self.http, &url, &self.api_key, &body).await?;
             let resp = super::read_bounded_body(resp).await?;
-            serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
+            let raw = serde_json::from_slice::<Value>(&resp)
+                .map_err(|e| ApiError::http(e.to_string()))?;
+            Ok(Self::build_response(&raw))
         })
-    }
-
-    fn extract_structured(&self, raw: &Value) -> Value {
-        raw.get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|blocks| {
-                blocks.iter().find_map(|block| {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        block.get("input").cloned()
-                    } else {
-                        None
-                    }
-                })
-            })
-            .unwrap_or_else(|| raw.clone())
     }
 }
 
@@ -1404,6 +1459,7 @@ mod tests {
             Role::User,
             vec![MessagePart::ToolResult {
                 call_id: "call_1".into(),
+                name: "echo".into(),
                 output: ToolContent::from_string("result text"),
                 is_error: None,
             }],
@@ -1994,36 +2050,205 @@ mod tests {
     }
 
     #[test]
-    fn extract_structured_from_tool_use_input() {
+    fn extract_structured_from_tool_call_part() {
         let client = AnthropicClient::builder()
             .with_api_key("test")
             .build()
             .unwrap();
-        let raw = serde_json::json!({
-            "content": [{
-                "type": "tool_use",
-                "name": "action",
-                "input": {"tool": "write", "args": {}}
-            }]
-        });
-        let value = client.extract_structured(&raw);
+        let message = Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call(
+                "tu_1",
+                "action",
+                serde_json::json!({"tool": "write", "args": {}}),
+            )],
+        );
+        let value = client.extract_structured(&message);
         assert_eq!(value["tool"], "write");
     }
 
     #[test]
-    fn extract_structured_text_only_falls_back_to_raw() {
+    fn extract_structured_text_only_falls_back_to_string() {
         let client = AnthropicClient::builder()
             .with_api_key("test")
             .build()
             .unwrap();
+        let message = Message::assistant("I cannot do that.");
+        let value = client.extract_structured(&message);
+        assert_eq!(value, serde_json::json!("I cannot do that."));
+    }
+
+    #[test]
+    fn build_response_maps_text_block_and_end_turn() {
         let raw = serde_json::json!({
-            "id": "msg_1",
-            "model": "claude-3",
-            "content": [{"type": "text", "text": "I cannot do that."}]
+            "content": [{"type": "text", "text": "hello there"}],
+            "stop_reason": "end_turn"
         });
-        let value = client.extract_structured(&raw);
-        // No tool_use block → returns the raw envelope; T::from_value fails.
-        assert_eq!(value["id"], "msg_1");
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.message.role, Role::Assistant);
+        assert_eq!(response.message.text_content(), "hello there");
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_maps_tool_use_block_and_tool_call() {
+        let raw = serde_json::json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "search",
+                "input": {"q": "rust"}
+            }],
+            "stop_reason": "tool_use"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.message.parts.len(), 1);
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "search");
+                assert_eq!(input, &serde_json::json!({"q": "rust"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        assert_eq!(response.stop_reason, StreamStopReason::ToolCall);
+    }
+
+    #[test]
+    fn build_response_preserves_block_order() {
+        let raw = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "thinking..."},
+                {"type": "tool_use", "id": "t1", "name": "a", "input": {}},
+                {"type": "text", "text": "done"}
+            ],
+            "stop_reason": "end_turn"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.message.parts.len(), 3);
+        assert!(response.message.parts[0].is_text());
+        assert!(response.message.parts[1].is_tool_call());
+        assert!(response.message.parts[2].is_text());
+    }
+
+    #[test]
+    fn build_response_skips_thinking_blocks() {
+        let raw = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "internal reasoning"},
+                {"type": "text", "text": "visible answer"}
+            ],
+            "stop_reason": "end_turn"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.message.parts.len(), 1);
+        assert_eq!(response.message.text_content(), "visible answer");
+    }
+
+    #[test]
+    fn build_response_maps_max_tokens_stop_reason() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "truncated"}],
+            "stop_reason": "max_tokens"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.stop_reason, StreamStopReason::MaxTokens);
+    }
+
+    #[test]
+    fn build_response_unknown_stop_reason_defaults_to_end_turn() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "something_new"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_missing_stop_reason_defaults_to_end_turn() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}]
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_empty_content_yields_empty_message() {
+        let raw = serde_json::json!({"content": [], "stop_reason": "end_turn"});
+        let response = AnthropicClient::build_response(&raw);
+        assert!(response.message.parts.is_empty());
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_extracts_usage() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 30, "output_tokens": 12}
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.usage.expect("usage").input_tokens, 30);
+        assert_eq!(response.usage.expect("usage").output_tokens, 12);
+    }
+
+    #[test]
+    fn build_response_missing_usage_is_none() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert!(response.usage.is_none());
+    }
+
+    #[test]
+    fn build_response_missing_content_yields_empty_message() {
+        let raw = serde_json::json!({"stop_reason": "end_turn"});
+        let response = AnthropicClient::build_response(&raw);
+        assert!(response.message.parts.is_empty());
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_text_block_missing_text_is_skipped() {
+        let raw = serde_json::json!({
+            "content": [
+                {"type": "text"},
+                {"type": "text", "text": "valid"}
+            ],
+            "stop_reason": "end_turn"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.message.parts.len(), 1);
+        assert_eq!(response.message.text_content(), "valid");
+    }
+
+    #[test]
+    fn build_response_tool_use_missing_input_defaults_to_null() {
+        let raw = serde_json::json!({
+            "content": [{"type": "tool_use", "id": "tu_1", "name": "search"}],
+            "stop_reason": "tool_use"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { input, .. } => {
+                assert_eq!(input, &Value::Null);
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_maps_stop_sequence_reason() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "stopped"}],
+            "stop_reason": "stop_sequence"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.stop_reason, StreamStopReason::StopSequence);
     }
 
     #[test]

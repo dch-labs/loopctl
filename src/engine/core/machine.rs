@@ -809,6 +809,7 @@ impl LoopMachine {
             Role::User,
             vec![MessagePart::tool_result(
                 call.id.clone(),
+                call.tool.clone(),
                 ToolContent::Text(message),
                 true,
             )],
@@ -931,6 +932,7 @@ mod tests {
                     Role::User,
                     vec![MessagePart::tool_result(
                         c.call.id.clone(),
+                        c.call.tool.clone(),
                         ToolContent::Text("ok".to_string()),
                         false,
                     )],
@@ -1292,6 +1294,7 @@ mod tests {
                 .map(|c| {
                     MessagePart::tool_result(
                         c.call.id.clone(),
+                        c.call.tool.clone(),
                         ToolContent::Text("ok".to_string()),
                         false,
                     )

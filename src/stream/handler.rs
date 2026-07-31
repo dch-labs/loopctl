@@ -1725,6 +1725,7 @@ impl StreamHandler {
                                 return;
                             }
                             let delay = self.retry_config.jittered_base_delay(transport_attempts);
+                            let delay = clamp_delay_to_deadline(delay, total_deadline);
                             transport_attempts = transport_attempts.saturating_add(1);
                             sleep_cancellable(delay, cancel).await?;
                             continue 'outer;

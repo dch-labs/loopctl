@@ -392,6 +392,7 @@ impl<C: ApiClient> BareLoop<C> {
             self.notify_tool_post(turn_idx, &tc, &tool_result);
             self.notify_post_tool_use_hooks(&tc, &tool_result, turn_idx);
             self.record_tool_health(tc.tool.as_str(), &tool_result);
+            self.record_tool_memory(&tc, &tool_result).await;
 
             if !tool_result.is_error {
                 return Ok(tool_result);
@@ -781,6 +782,33 @@ impl<C: ApiClient> BareLoop<C> {
     /// No-op: there is no health registry to record into.
     #[cfg(not(feature = "tool_health"))]
     fn record_tool_health(&self, _tool_name: &str, _tool_result: &ToolDispatchResult) {}
+
+    /// Store a successful tool-execution trajectory into the memory backend.
+    ///
+    /// Called after each tool dispatch that did not error. Guards on
+    /// [`RememberCapable`] — when no memory store is configured this is a
+    /// no-op. Builds a [`MemoryEntry`](crate::memory::MemoryEntry) tagged
+    /// [`Trajectory`](crate::memory::MemoryCategory::Trajectory) carrying the
+    /// tool name, input, and result, then stores it. Errors are logged and
+    /// swallowed — a memory-store failure must never crash the turn.
+    async fn record_tool_memory(&self, tc: &ToolCall, tool_result: &ToolDispatchResult) {
+        let Some(memory) = self.managers.memory() else {
+            return;
+        };
+        if tool_result.is_error {
+            return;
+        }
+        let entry = crate::memory::MemoryEntry::new(
+            crate::memory::MemoryCategory::Trajectory,
+            format!(
+                "tool={}; input={}; result={}",
+                tc.tool, tc.input, tool_result.output
+            ),
+        );
+        if let Err(e) = memory.store(entry).await {
+            tracing::warn!(error = %e, tool = %tc.tool, "memory store failed");
+        }
+    }
 
     /// Dispatch a tool call through the middleware pipeline.
     ///

@@ -611,23 +611,24 @@ impl ToolCircuitBreaker {
         }
     }
 
-    /// Whether the breaker would treat the next call as a `HalfOpen` probe.
+    /// Whether the next [`allow_request`](Self::allow_request) call would
+    /// transition an `Open` breaker into `HalfOpen`.
     ///
-    /// Pure read: `true` when the breaker is already `HalfOpen`, or when it
-    /// is `Open` but the recovery duration has elapsed (so the next
-    /// [`allow_request`](Self::allow_request) would transition to
-    /// `HalfOpen`). Lets an availability check report "a recovery probe is
-    /// pending" without performing the transition. Complements
-    /// [`would_allow_request`](Self::would_allow_request).
+    /// Pure read: `true` only when the breaker is `Open` and the recovery
+    /// duration has elapsed — i.e. the next `allow_request` would perform the
+    /// `Open`→`HalfOpen` transition and grant the probe slot. Returns `false`
+    /// for `HalfOpen` (a probe is already in flight; the next
+    /// `allow_request` refuses to avoid a thundering herd) and for `Closed`
+    /// (requests are allowed unconditionally, no transition pending).
+    /// Complements [`would_allow_request`](Self::would_allow_request).
     #[must_use]
     pub fn would_be_half_open(&self) -> bool {
         let state = crate::error::recover_guard(self.state.lock());
         match state.circuit {
-            CircuitState::HalfOpen => true,
             CircuitState::Open => state
                 .last_failure_time
                 .is_some_and(|t| t.elapsed() >= self.recovery_duration),
-            CircuitState::Closed => false,
+            CircuitState::HalfOpen | CircuitState::Closed => false,
         }
     }
 

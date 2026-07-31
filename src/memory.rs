@@ -58,29 +58,50 @@
 
 use crate::error::LoopError;
 use std::future::Future;
+use std::pin::Pin;
 
 pub use builtin::InMemoryStore;
 pub use entry::{ConsolidationStats, MemoryCategory, MemoryEntry};
+
 pub mod builtin;
 pub mod entry;
 
-/// A memory system for loops.
+/// A memory system for agent loops.
 ///
-/// Implementations can store and retrieve entries using different
-/// strategies (vector similarity, keyword matching, recency, etc.).
+/// The trait the engine uses to persist, recall, and consolidate knowledge
+/// across turns and runs. When a memory store is attached via
+/// [`BareLoop::set_memory`], the engine:
 ///
-/// # Implementing
+/// - **Stores** a [`MemoryEntry`] after every successful tool call,
+///   recording what tool ran, with what input, and what it returned.
+/// - **Retrieves** up to a few relevant entries before each turn and
+///   injects them as a system message so the model sees prior experience.
+/// - **Consolidates** the store at the end of each successful run,
+///   pruning low-relevance entries.
 ///
-/// At a minimum you must provide [`store`](LoopMemory::store),
-/// [`retrieve`](LoopMemory::retrieve), [`consolidate`](LoopMemory::consolidate),
-/// and [`len`](LoopMemory::len). The trait supplies a default
-/// [`is_empty`](LoopMemory::is_empty) implementation that delegates to `len`.
+/// All three hooks are no-ops when no store is attached, so memory is
+/// purely opt-in.
+///
+/// # Object safety
+///
+/// Async methods return [`Pin<Box<dyn Future>>`] so the trait is object-safe
+/// and a store can be held behind `Arc<dyn LoopMemory>` on
+/// [`LoopManagers`] — the same convention used by [`Reflector`] and
+/// [`RecoveryStrategy`]. Implementations wrap each method body in
+/// `Box::pin(async move { ... })`; see [`InMemoryStore`] for a reference.
+///
+/// [`BareLoop::set_memory`]: crate::engine::BareLoop::set_memory
+/// [`LoopManagers`]: crate::managers::LoopManagers
+/// [`Reflector`]: crate::reflection::Reflector
+/// [`RecoveryStrategy`]: crate::reflection::RecoveryStrategy
 ///
 /// # Example
 ///
 /// ```rust
 /// use loopctl::memory::{LoopMemory, MemoryEntry, MemoryCategory, ConsolidationStats};
 /// use loopctl::error::LoopError;
+/// use std::future::Future;
+/// use std::pin::Pin;
 /// use std::sync::RwLock;
 ///
 /// struct MyStore {
@@ -89,30 +110,30 @@ pub mod entry;
 ///
 /// impl LoopMemory for MyStore {
 ///     fn store(&self, entry: MemoryEntry)
-///         -> impl Future<Output = Result<(), LoopError>> + Send
+///         -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>>
 ///     {
-///         async move {
+///         Box::pin(async move {
 ///             self.entries.write().unwrap().push(entry);
 ///             Ok(())
-///         }
+///         })
 ///     }
 ///     fn retrieve(&self, query: &str, limit: usize)
-///         -> impl Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send
+///         -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + '_>>
 ///     {
 ///         let query = query.to_string();
-///         async move {
+///         Box::pin(async move {
 ///             let entries = self.entries.read().unwrap();
 ///             Ok(entries.iter()
 ///                 .filter(|e| e.memory.contains(&query))
 ///                 .take(limit)
 ///                 .cloned()
 ///                 .collect())
-///         }
+///         })
 ///     }
 ///     fn consolidate(&self)
-///         -> impl Future<Output = Result<ConsolidationStats, LoopError>> + Send
+///         -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>>
 ///     {
-///         async move {
+///         Box::pin(async move {
 ///             let mut entries = self.entries.write().unwrap();
 ///             let before = entries.len();
 ///             entries.retain(|e| e.relevance > 0.1);
@@ -123,7 +144,7 @@ pub mod entry;
 ///                 pruned: before - after,
 ///                 ..Default::default()
 ///             })
-///         }
+///         })
 ///     }
 ///     fn len(&self) -> usize {
 ///         self.entries.read().unwrap().len()
@@ -133,19 +154,22 @@ pub mod entry;
 pub trait LoopMemory: Send + Sync {
     /// Store a new memory entry.
     ///
-    /// Called whenever the agent encounters information worth remembering —
-    /// for example after a successful tool invocation, a resolved error, or
-    /// an insight drawn from conversation. Implementations should persist the
-    /// entry in whatever backing store they use.
+    /// Called by the engine after every successful tool call to record the
+    /// trajectory — the tool name, its input, and its result. Implementations
+    /// should persist the entry in whatever backing store they use.
     ///
-    /// Takes `&self` so that memory stores can be shared via `Arc<impl LoopMemory>`.
-    /// Implementations that need interior mutability (e.g. an in-memory `Vec`)
-    /// should use `Mutex`, `RwLock`, or lock-free structures internally.
-    fn store(&self, entry: MemoryEntry) -> impl Future<Output = Result<(), LoopError>> + Send;
+    /// Takes `&self` so that memory stores can be shared via
+    /// `Arc<dyn LoopMemory>`. Implementations that need interior mutability
+    /// (e.g. an in-memory `Vec`) should use `Mutex`, `RwLock`, or lock-free
+    /// structures internally.
+    fn store(
+        &self,
+        entry: MemoryEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>>;
 
     /// Retrieve memory entries relevant to the given query.
     ///
-    /// Called before each turn (or on demand) to surface context the agent
+    /// Called by the engine before each turn to surface context the agent
     /// can use. Returns up to `limit` entries ordered by relevance. The
     /// definition of "relevance" is left to the implementation — common
     /// strategies include vector embedding similarity, keyword overlap,
@@ -154,26 +178,30 @@ pub trait LoopMemory: Send + Sync {
     /// Implementations that track [`MemoryEntry::access_count`] must use
     /// interior mutability (e.g. `AtomicUsize`, `Mutex`) since this method
     /// takes `&self`.
-    fn retrieve(
-        &self,
-        query: &str,
+    fn retrieve<'a>(
+        &'a self,
+        query: &'a str,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + 'a>>;
 
-    /// Consolidate memory (e.g. prune, summarize, compress).
+    /// Consolidate memory (prune, summarize, compress).
     ///
-    /// Called periodically to keep the memory store healthy. Implementations
-    /// may remove low-relevance entries, merge duplicates, or produce
-    /// compressed summaries. Returns [`ConsolidationStats`] describing what
-    /// was done.
+    /// Called by the engine at the end of each successful run to keep the
+    /// store healthy. Implementations may remove low-relevance entries,
+    /// merge duplicates, or produce compressed summaries. Returns
+    /// [`ConsolidationStats`] describing what was done.
     ///
-    /// Takes `&self` so that memory stores can be shared via `Arc<impl LoopMemory>`.
-    /// Implementations should use interior mutability as needed.
-    fn consolidate(&self) -> impl Future<Output = Result<ConsolidationStats, LoopError>> + Send;
+    /// Takes `&self` so that memory stores can be shared via
+    /// `Arc<dyn LoopMemory>`. Implementations should use interior mutability
+    /// as needed.
+    fn consolidate(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>>;
 
     /// Number of entries currently stored.
     ///
-    /// Used by the framework and by [`is_empty`](LoopMemory::is_empty).
+    /// Used by [`is_empty`](Self::is_empty) and reported by the engine's
+    /// consolidate hook after each run.
     fn len(&self) -> usize;
 
     /// Whether the memory is empty.

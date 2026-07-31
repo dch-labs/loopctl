@@ -224,6 +224,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   shift-based mix) so the same attempt always yields the same delay while
   successive attempts spread their backoffs — no randomness dependency.
   `base_delay` (the raw exponential core) remains public.
+- **`LoopMemory` is now wired into the framework.** The trait was previously
+  exported and documented but consumed by nothing. The engine now:
+  - **Stores** a trajectory entry after each successful tool call (tool name,
+    input, result) via `LoopManagers::memory()`.
+  - **Retrieves** up to 3 relevant entries before each turn and injects them
+    as a system message into the conversation.
+  - **Consolidates** (prunes) the store at the end of a successful run.
+  The `LoopMemory` trait is now object-safe (`Pin<Box<dyn Future>>` returns)
+  so the store can live behind `Arc<dyn LoopMemory>` on
+  `LoopManagers`. Configure via `BareLoop::set_memory` /
+  `with_memory`, or `LoopManagers::set_memory` / `with_memory`.
+  A `RememberCapable` capability trait exposes it to trait-bounded code.
+  All three hooks are no-ops when no memory store is attached.
 
 ### Changed
 

@@ -162,6 +162,29 @@ pub trait Compactable {
     fn context_manager(&self) -> Option<&Arc<ContextManager>>;
 }
 
+/// Capability to store, retrieve, and consolidate agent memory.
+///
+/// When a [`LoopMemory`](crate::memory::LoopMemory) backend is
+/// configured, the engine stores tool-execution trajectories, retrieves
+/// relevant entries as context before each turn, and consolidates the store
+/// at the end of a successful run.
+///
+/// # Implementors
+///
+/// - [`LoopManagers`](crate::managers::LoopManagers) — the framework's default implementation.
+///
+/// # When to use
+///
+/// Use this trait bound when you need to access the memory backend during
+/// the agent loop — for example to inspect what was stored or trigger a
+/// manual consolidation.
+pub trait RememberCapable {
+    /// Returns the memory backend, if configured.
+    ///
+    /// Returns `None` when no memory store is attached.
+    fn memory(&self) -> Option<&Arc<dyn crate::memory::LoopMemory>>;
+}
+
 /// Capability to stream LLM responses with retry, timeout, and fallback.
 ///
 /// When a [`StreamHandler`] is configured, the loop delegates streaming

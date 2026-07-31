@@ -178,6 +178,15 @@ pub struct LoopManagers {
     /// breaker opened, blocking subsequent calls until recovery.
     #[cfg(feature = "tool_health")]
     health_registry: Option<Arc<ToolHealthRegistry>>,
+
+    /// Optional agent memory backend.
+    ///
+    /// When set, the engine stores a trajectory entry after each successful
+    /// tool call, retrieves relevant entries before each turn to inject as
+    /// context, and consolidates (prunes) the store at the end of a
+    /// successful run. Persists across manager resets — memory is meant to
+    /// survive a `reset_all`.
+    memory: Option<Arc<dyn crate::memory::LoopMemory>>,
 }
 
 impl LoopManagers {
@@ -204,6 +213,7 @@ impl LoopManagers {
             hook_executor: None,
             #[cfg(feature = "tool_health")]
             health_registry: None,
+            memory: None,
         }
     }
 
@@ -397,6 +407,42 @@ impl LoopManagers {
         self.health_registry = Some(registry);
     }
 
+    /// Set the agent memory backend (builder-style).
+    ///
+    /// When set, the engine stores tool-execution trajectories, retrieves
+    /// relevant entries as context before each turn, and consolidates the
+    /// store at the end of a successful run.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::memory::InMemoryStore;
+    /// use std::sync::Arc;
+    ///
+    /// let managers = LoopManagers::new()
+    ///     .with_memory(Arc::new(InMemoryStore::new()));
+    /// ```
+    #[must_use]
+    pub fn with_memory(mut self, memory: Arc<dyn crate::memory::LoopMemory>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    /// Set the agent memory backend.
+    ///
+    /// Non-consuming variant of [`with_memory`](Self::with_memory).
+    pub fn set_memory(&mut self, memory: Arc<dyn crate::memory::LoopMemory>) {
+        self.memory = Some(memory);
+    }
+
+    /// Borrow the memory backend, if configured.
+    ///
+    /// Returns `None` when no memory store is attached.
+    #[must_use]
+    pub fn memory(&self) -> Option<&Arc<dyn crate::memory::LoopMemory>> {
+        self.memory.as_ref()
+    }
+
     /// Reset all managers and observers to their initial state.
     ///
     /// Clears the fallback circuit breaker, loop/convergence detection
@@ -505,6 +551,12 @@ impl crate::capabilities::FallbackCapable for LoopManagers {
 impl crate::capabilities::Compactable for LoopManagers {
     fn context_manager(&self) -> Option<&Arc<ContextManager>> {
         self.context_manager.as_ref()
+    }
+}
+
+impl crate::capabilities::RememberCapable for LoopManagers {
+    fn memory(&self) -> Option<&Arc<dyn crate::memory::LoopMemory>> {
+        self.memory.as_ref()
     }
 }
 

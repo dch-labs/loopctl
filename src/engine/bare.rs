@@ -725,6 +725,31 @@ impl<C: ApiClient> BareLoop<C> {
         self.managers.set_health_registry(registry);
     }
 
+    /// Set the agent memory backend.
+    ///
+    /// When set, the engine stores a trajectory entry after each successful
+    /// tool call, retrieves relevant entries as context before each turn,
+    /// and consolidates the store at the end of a successful run. Must be
+    /// called before [`run()`](crate::engine::core::Loop::run).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::memory::InMemoryStore;
+    /// use std::sync::Arc;
+    ///
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_memory(Arc::new(InMemoryStore::new()));
+    /// ```
+    pub fn set_memory(&mut self, memory: Arc<dyn crate::memory::LoopMemory>) {
+        self.debug_assert_idle();
+        self.managers.set_memory(memory);
+    }
+
     /// Set the middleware pipeline for tool dispatch.
     ///
     /// Replaces the default (no pipeline) with a caller-supplied
@@ -936,6 +961,14 @@ impl<C: ApiClient> BareLoop<C> {
     #[must_use]
     pub fn with_health_registry(mut self, registry: Arc<ToolHealthRegistry>) -> Self {
         self.set_health_registry(registry);
+        self
+    }
+
+    /// Set the agent memory backend, consuming `self`. Fluent mirror of
+    /// [`set_memory`](BareLoop::set_memory).
+    #[must_use]
+    pub fn with_memory(mut self, memory: Arc<dyn crate::memory::LoopMemory>) -> Self {
+        self.set_memory(memory);
         self
     }
 
@@ -1497,7 +1530,29 @@ impl<C: ApiClient> BareLoop<C> {
 
         self.notify_turn_start(current_turn, &turn_input);
 
-        let contributor_messages = self.collect_contributor_messages(current_turn);
+        let mut contributor_messages = self.collect_contributor_messages(current_turn);
+
+        if let Some(memory) = self.managers.memory() {
+            match memory.retrieve(&turn_input, 3).await {
+                Ok(entries) if !entries.is_empty() => {
+                    let summary = entries
+                        .iter()
+                        .map(|e| e.memory.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    contributor_messages.push(Message::new(
+                        crate::message::Role::System,
+                        vec![crate::message::MessagePart::text(format!(
+                            "Relevant memory:\n{summary}"
+                        ))],
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "memory retrieve failed");
+                }
+                Ok(_) => {}
+            }
+        }
 
         let cancel = Arc::clone(&self.cancelled);
         tokio::select! {
@@ -1796,6 +1851,11 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
 
             if error.is_none() {
                 self.machine.commit_pending();
+                if let Some(memory) = self.managers.memory()
+                    && let Err(e) = memory.consolidate().await
+                {
+                    tracing::warn!(error = %e, "memory consolidate failed");
+                }
             } else {
                 self.machine.discard_pending();
             }
@@ -2356,6 +2416,191 @@ mod tests {
 
         assert_eq!(result.turn_count(), 2); // tool_call turn + end_turn
         assert_eq!(result.tool_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_stores_trajectory_after_tool_call() {
+        use crate::memory::{InMemoryStore, LoopMemory};
+
+        let client = MockClient::new("test-model");
+        client.add_tool_then_text(
+            "tool_1",
+            "echo",
+            json!({"message": "hello"}),
+            "I echoed your message.",
+        );
+
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+
+        let memory = Arc::new(InMemoryStore::new());
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+        agent.set_memory(memory.clone());
+
+        let result = agent
+            .run("Echo hello", &RunConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(result.tool_call_count(), 1);
+
+        assert_eq!(
+            memory.len(),
+            1,
+            "a successful tool call must store one trajectory entry"
+        );
+        let entries = memory.retrieve("echo", 5).await.unwrap();
+        assert!(
+            entries.iter().any(|e| e.memory.contains("tool=echo")),
+            "stored entry must carry the tool name"
+        );
+    }
+
+    struct RequestCapturingClient {
+        model: String,
+        responses: Arc<Mutex<Vec<Vec<StreamEvent>>>>,
+        captured: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RequestCapturingClient {
+        fn new(model: &str, captured: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                model: model.to_string(),
+                responses: Arc::new(Mutex::new(Vec::new())),
+                captured,
+            }
+        }
+
+        fn add_text_response(&self, text: &str) {
+            crate::error::recover_guard(self.responses.lock()).push(vec![
+                StreamEvent::MessageStart(MessageStart {
+                    message: MessageMetadata {
+                        id: "msg_test".into(),
+                        role: "assistant".into(),
+                        model: self.model.clone(),
+                    },
+                }),
+                StreamEvent::PartStart(PartStart {
+                    index: 0,
+                    part: Some(MessagePart::text(text)),
+                }),
+                StreamEvent::IndexedDelta(IndexedDelta {
+                    index: 0,
+                    delta: DeltaPart::Text {
+                        text: text.to_string(),
+                    },
+                }),
+                StreamEvent::PartStop,
+                StreamEvent::MessageDelta(MessageDelta {
+                    delta: MessageDeltaPayload {
+                        stop_reason: Some("end_turn".to_string()),
+                    },
+                    usage: None,
+                }),
+                StreamEvent::MessageStop,
+            ]);
+        }
+    }
+
+    impl ApiClient for RequestCapturingClient {
+        fn model(&self) -> String {
+            self.model.clone()
+        }
+        fn stream_messages(
+            &self,
+            request: &crate::api::StreamRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+        {
+            let texts: Vec<String> = request
+                .messages
+                .iter()
+                .flat_map(|m| {
+                    m.parts
+                        .iter()
+                        .filter_map(|p| p.as_text().map(std::string::ToString::to_string))
+                })
+                .collect();
+            crate::error::recover_guard(self.captured.lock()).extend(texts);
+            let mut guard = crate::error::recover_guard(self.responses.lock());
+            if let Some(events) = guard.pop_front() {
+                let events: Vec<Result<StreamEvent, ApiError>> =
+                    events.into_iter().map(Ok).collect();
+                Box::pin(futures::stream::iter(events))
+            } else {
+                Box::pin(futures::stream::iter(vec![Err(ApiError::api(
+                    "No more mock responses",
+                ))]))
+            }
+        }
+        fn create_message(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+            Box::pin(async { Ok(json!({"content": []})) })
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_retrieve_injects_into_request() {
+        use crate::memory::{InMemoryStore, LoopMemory, MemoryCategory, MemoryEntry};
+
+        let memory = Arc::new(InMemoryStore::new());
+        memory
+            .store(MemoryEntry::new(MemoryCategory::Fact, "the answer is 42"))
+            .await
+            .unwrap();
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let client = RequestCapturingClient::new("test", captured_clone);
+        client.add_text_response("done");
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        agent.set_memory(memory);
+
+        agent.run("answer", &RunConfig::default()).await.unwrap();
+
+        let msgs = crate::error::recover_guard(captured.lock()).clone();
+        let combined = msgs.join(" ");
+        assert!(
+            combined.contains("Relevant memory"),
+            "request must contain the injected memory message: {combined}"
+        );
+        assert!(
+            combined.contains("the answer is 42"),
+            "request must contain the stored entry text: {combined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_consolidate_prunes_on_successful_run() {
+        use crate::memory::{InMemoryStore, LoopMemory, MemoryEntry};
+
+        let memory = Arc::new(InMemoryStore::new());
+        let mut stale = MemoryEntry::new(crate::memory::MemoryCategory::Fact, "stale entry");
+        stale.relevance = 0.01;
+        memory.store(stale).await.unwrap();
+        memory
+            .store(MemoryEntry::new(
+                crate::memory::MemoryCategory::Fact,
+                "important entry",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(memory.len(), 2, "precondition: two entries");
+
+        let client = MockClient::new("test");
+        client.add_text_response("done");
+
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        agent.set_memory(memory.clone());
+
+        agent.run("go", &RunConfig::default()).await.unwrap();
+
+        assert_eq!(
+            memory.len(),
+            1,
+            "consolidate must prune the low-relevance entry on successful run"
+        );
     }
 
     struct SequenceObserver {

@@ -577,6 +577,17 @@ impl OpenAiClientBuilder {
         self
     }
 
+    /// Control whether `TCP_NODELAY` is set on connections.
+    ///
+    /// Defaults to `true` — SSE streaming benefits from disabling Nagle's
+    /// algorithm. Pass `false` to re-enable it. Ignored when a client was
+    /// supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.http = self.http.with_tcp_nodelay(enabled);
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
@@ -913,7 +924,7 @@ impl SseReader {
     /// Returns [`ApiError`] if the underlying HTTP stream fails.
     async fn next_openai_data(&mut self) -> Result<Option<String>, ApiError> {
         loop {
-            while let Some(line) = self.take_line() {
+            while let Some(line) = self.take_line()? {
                 let Some(data) = line.strip_prefix(SSE_DATA_PREFIX) else {
                     continue;
                 };
@@ -2314,7 +2325,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hello\n".into(),
         };
-        let line = reader.take_line().unwrap();
+        let line = reader.take_line().unwrap().unwrap();
         assert_eq!(line, "data: hello");
         assert!(reader.buf.is_empty());
     }
@@ -2325,7 +2336,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "partial".into(),
         };
-        assert!(reader.take_line().is_none());
+        assert!(reader.take_line().unwrap().is_none());
     }
 
     #[test]
@@ -2334,8 +2345,8 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "line1\nline2\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "line1");
-        assert_eq!(reader.take_line().unwrap(), "line2");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "line1");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "line2");
     }
 
     #[test]
@@ -2344,7 +2355,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hi\r\n".into(),
         };
-        let line = reader.take_line().unwrap();
+        let line = reader.take_line().unwrap().unwrap();
         assert_eq!(line, "data: hi");
     }
 
@@ -2364,9 +2375,9 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hello\ndata: world\n".to_string().into_bytes(),
         };
-        assert_eq!(reader.take_line(), Some("data: hello".to_string()));
-        assert_eq!(reader.take_line(), Some("data: world".to_string()));
-        assert_eq!(reader.take_line(), None);
+        assert_eq!(reader.take_line().unwrap(), Some("data: hello".to_string()));
+        assert_eq!(reader.take_line().unwrap(), Some("data: world".to_string()));
+        assert_eq!(reader.take_line().unwrap(), None);
     }
 
     #[tokio::test]

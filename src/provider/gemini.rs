@@ -257,9 +257,9 @@ impl GeminiClient {
 ///
 /// Reads `usageMetadata.promptTokenCount` for input tokens and sums
 /// `candidatesTokenCount` plus `thoughtsTokenCount` for output. Returns `None`
-/// when the `usageMetadata` object is absent from the response. This mirrors
-/// the streaming path, which reads the same fields from the finish chunk to
-/// populate the `MessageDelta` usage.
+/// when the `usageMetadata` object is absent or when all counts are zero,
+/// matching the convention used by the streaming emitter in
+/// `extract_finish_reason`.
 fn extract_usage(raw: &Value) -> Option<Usage> {
     let usage = raw.pointer("/usageMetadata")?;
     let input = usage
@@ -277,7 +277,8 @@ fn extract_usage(raw: &Value) -> Option<Usage> {
         .and_then(Value::as_u64)
         .and_then(|n| u32::try_from(n).ok())
         .unwrap_or(0);
-    Some(Usage::new(input, output.saturating_add(thoughts)))
+    let total_output = output.saturating_add(thoughts);
+    (input > 0 || total_output > 0).then(|| Usage::new(input, total_output))
 }
 
 impl ApiClient for GeminiClient {
@@ -588,6 +589,17 @@ impl GeminiClientBuilder {
         self
     }
 
+    /// Control whether `TCP_NODELAY` is set on connections.
+    ///
+    /// Defaults to `true` — SSE streaming benefits from disabling Nagle's
+    /// algorithm. Pass `false` to re-enable it. Ignored when a client was
+    /// supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.http = self.http.with_tcp_nodelay(enabled);
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
@@ -772,7 +784,7 @@ impl SseReader {
     /// Returns [`ApiError`] if the underlying HTTP stream fails.
     async fn next_gemini_data(&mut self) -> Result<Option<Value>, ApiError> {
         loop {
-            while let Some(line) = self.take_line() {
+            while let Some(line) = self.take_line()? {
                 if line.is_empty() {
                     continue;
                 }
@@ -1193,6 +1205,7 @@ mod tests {
 
         let parts = body["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["functionCall"]["name"], "echo");
+        assert_eq!(parts[0]["functionCall"]["id"], "call_1");
         assert_eq!(parts[0]["functionCall"]["args"]["msg"], "hi");
     }
 
@@ -2073,7 +2086,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hello\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "data: hello");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "data: hello");
         assert!(reader.buf.is_empty());
     }
 
@@ -2083,7 +2096,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "partial".into(),
         };
-        assert!(reader.take_line().is_none());
+        assert!(reader.take_line().unwrap().is_none());
     }
 
     #[test]
@@ -2092,8 +2105,8 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "line1\nline2\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "line1");
-        assert_eq!(reader.take_line().unwrap(), "line2");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "line1");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "line2");
     }
 
     #[test]
@@ -2102,7 +2115,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hi\r\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "data: hi");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "data: hi");
     }
 
     #[test]
@@ -2147,11 +2160,11 @@ mod tests {
             buf: "data: {\"candidates\":[]}\n\n".to_string().into_bytes(),
         };
         assert_eq!(
-            reader.take_line(),
+            reader.take_line().unwrap(),
             Some("data: {\"candidates\":[]}".to_string())
         );
-        assert_eq!(reader.take_line(), Some(String::new()));
-        assert_eq!(reader.take_line(), None);
+        assert_eq!(reader.take_line().unwrap(), Some(String::new()));
+        assert_eq!(reader.take_line().unwrap(), None);
     }
 
     #[tokio::test]

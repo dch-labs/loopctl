@@ -822,7 +822,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    fn small_machine(_max_turns: usize) -> LoopMachine {
+    fn small_machine() -> LoopMachine {
         LoopMachine::from_history(vec![Message::user("hello")])
     }
 
@@ -906,7 +906,7 @@ mod tests {
 
     #[test]
     fn resume_after_model_response_round_trips() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
         machine.model_response(tool_response("echo", &["echo"], 10), 0);
         let snapshot = serde_json::to_string(&machine).expect("serialize");
@@ -918,7 +918,7 @@ mod tests {
 
     #[test]
     fn resume_after_tool_results_round_trips() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
         machine.model_response(tool_response("echo", &["echo"], 10), 0);
         let step = machine.next_step(test_policy(5));
@@ -974,7 +974,7 @@ mod tests {
 
     #[test]
     fn max_turns_enforced_by_machine() {
-        let mut machine = small_machine(2);
+        let mut machine = small_machine();
         // Turn 1.
         assert!(matches!(
             machine.next_step(test_policy(2)),
@@ -1001,7 +1001,7 @@ mod tests {
 
     #[test]
     fn cancel_returns_done_cancelled_at_next_step() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
         machine.cancel();
         match machine.next_step(test_policy(5)) {
@@ -1017,7 +1017,7 @@ mod tests {
 
     #[test]
     fn fail_returns_done_failed_at_next_step() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
         let err = LoopError::Api("stream failed".to_string());
         machine.fail(err.clone());
@@ -1032,7 +1032,7 @@ mod tests {
 
     #[test]
     fn failed_outcome_survives_round_trip() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
         let err = LoopError::Api("stream failed".to_string());
         machine.fail(err.clone());
@@ -1048,7 +1048,7 @@ mod tests {
 
     #[test]
     fn unknown_tool_call_gets_preresolved_result() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
         machine.model_response(tool_response("ghost", &["echo", "ls"], 3), 0);
         let step = machine.next_step(test_policy(5));
@@ -1069,7 +1069,7 @@ mod tests {
 
     #[test]
     fn known_tool_call_emits_plain_pending_call() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
         machine.model_response(tool_response("echo", &["echo", "ls"], 3), 0);
         let step = machine.next_step(test_policy(5));
@@ -1280,7 +1280,7 @@ mod tests {
 
     #[test]
     fn history_accumulates_user_assistant_tool_round() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
         machine.model_response(tool_response("echo", &["echo"], 1), 0);
         let step = machine.next_step(test_policy(5));

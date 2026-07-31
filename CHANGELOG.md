@@ -309,6 +309,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 - **OpenAI usage unification:** the non-streaming `build_response` path now uses
   the same `OpenAiUsage` serde struct as the streaming path, deleting the manual
   `extract_usage` helper. Both paths share one deserialization strategy.
+- **SSE invalid-UTF-8 handling:** `SseReader::take_line` now returns
+  `Result<Option<String>, ApiError>` and surfaces genuinely invalid UTF-8 as a
+  protocol error instead of silently replacing bytes with `U+FFFD` via
+  `String::from_utf8_lossy`. Callers (`next_openai_data`, `next_anthropic_data`,
+  `next_gemini_data`) propagate the error via `?`.
+- **`with_tcp_nodelay` setter:** all three provider builders
+  (`OpenAiClientBuilder`, `AnthropicClientBuilder`, `GeminiClientBuilder`) and
+  `HttpClientConfig` now expose `with_tcp_nodelay(bool)`. The field was
+  previously hardcoded to `true` with no escape hatch. Default remains `true`.
 - **Breaking (session→run lifecycle rename):** the observer and hook events
   formerly named `on_session_start` / `on_session_end` are renamed to
   `on_run_start` / `on_run_end`. These events fire once per `run()` call and

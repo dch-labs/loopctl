@@ -231,11 +231,6 @@ pub struct BareLoop<C: ApiClient> {
     /// will wake up mid-stream when cancelled.
     cancelled: Arc<CancelSignal>,
 
-    /// Fallback config for [`run_config`](Self::run_config) before the first
-    /// `run()` call. Unreachable in practice (constructors seed a placeholder
-    /// run), but needed so the accessor returns `&RunConfig` without panicking.
-    fallback_config: RunConfig,
-
     /// Optional callback invoked for each text delta during streaming.
     ///
     /// Set via [`set_text_streamer`](BareLoop::set_text_streamer).
@@ -332,17 +327,12 @@ impl<C: ApiClient> BareLoop<C> {
         Self {
             client,
             tools: Arc::new(tools),
-            session: {
-                let mut s = Session::new(session_config);
-                s.runs.push(Run::default());
-                s
-            },
+            session: Session::new(session_config),
             machine: LoopMachine::from_history(Vec::new()),
             managers,
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
-            fallback_config: RunConfig::default(),
             text_streamer: None,
             contributors: Vec::new(),
             request_options: RequestOptions::default(),
@@ -405,15 +395,27 @@ impl<C: ApiClient> BareLoop<C> {
         self.session.runs.get_mut(len.saturating_sub(1))
     }
 
-    /// Get the run configuration for the current run.
+    /// Get the run configuration for the current run, if a run has started.
     ///
     /// Returns a reference to the [`RunConfig`] stored on the in-flight
     /// [`Run`], governing per-run budgets (turn/token limits, compaction
-    /// policy, dispatch mode). This is the configuration applied to the
-    /// most recent `run()` call.
-    pub fn run_config(&self) -> &RunConfig {
-        self.current_run()
-            .map_or(&self.fallback_config, |run| &run.config)
+    /// policy, dispatch mode). Returns `None` before the first `run()` call
+    /// (no run has been created yet).
+    pub fn run_config(&self) -> Option<&RunConfig> {
+        self.current_run().map(|run| &run.config)
+    }
+
+    /// The parallel-dispatch config for the current run, or the default.
+    ///
+    /// Returns the [`ParallelDispatchConfig`](crate::config::ParallelDispatchConfig)
+    /// from the in-flight run, falling back to its default when no run has
+    /// started. Used by the dispatch path, which always runs inside `run()`
+    /// (where a run is guaranteed).
+    fn dispatch_mode(&self) -> crate::config::ParallelDispatchConfig {
+        self.run_config()
+            .map_or(crate::config::ParallelDispatchConfig::default(), |rc| {
+                rc.parallel_tool_dispatch.clone()
+            })
     }
 
     /// Build the policy struct the machine needs for `next_step()`.
@@ -422,7 +424,9 @@ impl<C: ApiClient> BareLoop<C> {
     /// into a single [`MachinePolicy`] passed fresh each call.
     fn machine_policy(&self) -> MachinePolicy {
         MachinePolicy {
-            max_turns: self.run_config().max_turns,
+            max_turns: self
+                .current_run()
+                .map_or(usize::MAX, |r| r.config.max_turns),
             context_window: self.session.config.context_window,
             compact_threshold: self.session.config.compact_threshold,
             auto_compact: self.session.config.auto_compact,
@@ -469,17 +473,12 @@ impl<C: ApiClient> BareLoop<C> {
         Self {
             client,
             tools: Arc::new(tools),
-            session: {
-                let mut s = Session::new(session_config);
-                s.runs.push(Run::default());
-                s
-            },
+            session: Session::new(session_config),
             machine,
             managers: LoopManagers::new(),
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
-            fallback_config: RunConfig::default(),
             text_streamer: None,
             contributors: Vec::new(),
             request_options: RequestOptions::default(),
@@ -1770,6 +1769,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             self.notify_run_start();
             self.machine.accept_input(input);
 
+            let max_turns = run_config.max_turns;
             loop {
                 let policy = self.machine_policy();
                 match self.machine.next_step(policy) {
@@ -1804,9 +1804,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                             break;
                         }
                         MachineOutcome::MaxTurnsExceeded => {
-                            let err = LoopError::MaxTurnsExceeded {
-                                max: self.run_config().max_turns,
-                            };
+                            let err = LoopError::MaxTurnsExceeded { max: max_turns };
                             self.finalize(Some(&err)).await?;
                             return Err(err);
                         }
@@ -1884,11 +1882,9 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
         }
         match self.machine.state() {
             MachineState::Terminal(MachineOutcome::Failed { error }) => Some(error),
-            MachineState::Terminal(MachineOutcome::MaxTurnsExceeded) => {
-                Some(LoopError::MaxTurnsExceeded {
-                    max: self.run_config().max_turns,
-                })
-            }
+            MachineState::Terminal(MachineOutcome::MaxTurnsExceeded) => self
+                .run_config()
+                .map(|rc| LoopError::MaxTurnsExceeded { max: rc.max_turns }),
             MachineState::Terminal(MachineOutcome::Cancelled) => Some(LoopError::Cancelled),
             _ => None,
         }
@@ -2392,6 +2388,34 @@ mod tests {
 
         assert_eq!(result.turn_count(), 1);
         assert_eq!(result.output.as_deref(), Some("Hello! I'm done."));
+    }
+
+    #[test]
+    fn run_config_is_none_before_first_run() {
+        let client = MockClient::new("test-model");
+        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        assert!(
+            agent.run_config().is_none(),
+            "run_config must be None before the first run() call"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_config_is_some_after_run() {
+        let client = MockClient::new("test-model");
+        client.add_text_response("done");
+
+        let config = RunConfig {
+            max_turns: 42,
+            ..RunConfig::default()
+        };
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        agent.run("hi", &config).await.unwrap();
+
+        let rc = agent
+            .run_config()
+            .expect("run_config must be Some after run()");
+        assert_eq!(rc.max_turns, 42);
     }
 
     #[tokio::test]

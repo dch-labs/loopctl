@@ -241,8 +241,8 @@ impl AnthropicClient {
 /// Extract token [`Usage`] from Anthropic's native `usage` object.
 ///
 /// Reads `usage.input_tokens` and `usage.output_tokens`. Returns `None` when
-/// the `usage` object is absent from the response. Mirrors the extraction the
-/// streaming emitter performs in `on_message_delta`.
+/// the `usage` object is absent or when both counts are zero, matching the
+/// convention used by the streaming emitter in `on_message_delta`.
 fn extract_usage(raw: &Value) -> Option<Usage> {
     let usage = raw.get("usage")?;
     let input = usage
@@ -255,7 +255,7 @@ fn extract_usage(raw: &Value) -> Option<Usage> {
         .and_then(Value::as_u64)
         .and_then(|n| u32::try_from(n).ok())
         .unwrap_or(0);
-    Some(Usage::new(input, output))
+    (input > 0 || output > 0).then(|| Usage::new(input, output))
 }
 
 impl ApiClient for AnthropicClient {
@@ -519,6 +519,17 @@ impl AnthropicClientBuilder {
     #[must_use]
     pub fn with_tcp_keepalive(mut self, d: Duration) -> Self {
         self.http = self.http.with_tcp_keepalive(d);
+        self
+    }
+
+    /// Control whether `TCP_NODELAY` is set on connections.
+    ///
+    /// Defaults to `true` — SSE streaming benefits from disabling Nagle's
+    /// algorithm. Pass `false` to re-enable it. Ignored when a client was
+    /// supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.http = self.http.with_tcp_nodelay(enabled);
         self
     }
 
@@ -810,7 +821,7 @@ impl SseReader {
         let mut have_event = false;
 
         loop {
-            while let Some(line) = self.take_line() {
+            while let Some(line) = self.take_line()? {
                 if line.is_empty() {
                     if have_event {
                         let parsed = Self::parse_event_data(&data, &event_type);
@@ -1832,7 +1843,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "event: ping\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "event: ping");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "event: ping");
         assert!(reader.buf.is_empty());
     }
 
@@ -1842,7 +1853,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "partial".into(),
         };
-        assert!(reader.take_line().is_none());
+        assert!(reader.take_line().unwrap().is_none());
     }
 
     #[test]
@@ -1851,8 +1862,8 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "line1\nline2\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "line1");
-        assert_eq!(reader.take_line().unwrap(), "line2");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "line1");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "line2");
     }
 
     #[test]
@@ -1861,7 +1872,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hi\r\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "data: hi");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "data: hi");
     }
 
     #[test]
@@ -1882,9 +1893,12 @@ mod tests {
                 .to_string()
                 .into_bytes(),
         };
-        assert_eq!(reader.take_line(), Some("event: message_start".to_string()));
-        assert_eq!(reader.take_line(), Some("data: {}".to_string()));
-        assert_eq!(reader.take_line(), Some(String::new()));
+        assert_eq!(
+            reader.take_line().unwrap(),
+            Some("event: message_start".to_string())
+        );
+        assert_eq!(reader.take_line().unwrap(), Some("data: {}".to_string()));
+        assert_eq!(reader.take_line().unwrap(), Some(String::new()));
     }
 
     #[tokio::test]

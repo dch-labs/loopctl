@@ -388,20 +388,18 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Borrow the in-flight run (the last entry in `session.runs`).
     ///
-    /// Constructors seed `session.runs` with a placeholder, and `run()`
-    /// pushes a fresh [`Run`] before any access — so the last entry is
-    /// always present.
+    /// Returns `None` before the first `run()` call — the session starts
+    /// with an empty run list, and `run()` pushes a fresh [`Run`] before
+    /// any access.
     fn current_run(&self) -> Option<&Run> {
-        let len = self.session.runs.len();
-        self.session.runs.get(len.saturating_sub(1))
+        self.session.runs.last()
     }
 
     /// Mutably borrow the in-flight run.
     ///
     /// Same contract as [`current_run`](Self::current_run) but `&mut`.
     fn current_run_mut(&mut self) -> Option<&mut Run> {
-        let len = self.session.runs.len();
-        self.session.runs.get_mut(len.saturating_sub(1))
+        self.session.runs.last_mut()
     }
 
     /// Get the run configuration for the current run, if a run has started.
@@ -2463,6 +2461,16 @@ mod tests {
         assert!(
             agent.run_config().is_none(),
             "run_config must be None before the first run() call"
+        );
+    }
+
+    #[test]
+    fn session_starts_with_empty_runs() {
+        let client = MockClient::new("test-model");
+        let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        assert!(
+            agent.session.runs.is_empty(),
+            "a never-run session must have zero runs, not a placeholder"
         );
     }
 

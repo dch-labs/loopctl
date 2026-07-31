@@ -62,15 +62,23 @@ impl SseReader {
     ///
     /// Returns the trimmed line as a `String` if a newline is present,
     /// removing it (plus the newline) from the buffer. Returns `None` if
-    /// the buffer does not yet contain a complete line. Uses
-    /// `String::from_utf8_lossy` on the complete line only — by this point
-    /// any split multi-byte sequence has been reassembled.
-    pub(super) fn take_line(&mut self) -> Option<String> {
-        let pos = self.buf.iter().position(|&b| b == b'\n')?;
+    /// the buffer does not yet contain a complete line.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] if the complete line contains invalid UTF-8.
+    /// Split multi-byte sequences are reassembled by this point (buffering is
+    /// byte-oriented), so an error indicates genuinely malformed data from
+    /// the provider — not a chunk-boundary artifact.
+    pub(super) fn take_line(&mut self) -> Result<Option<String>, ApiError> {
+        let Some(pos) = self.buf.iter().position(|&b| b == b'\n') else {
+            return Ok(None);
+        };
         let rest_start = pos.saturating_add(1);
         let line_bytes: Vec<u8> = self.buf.drain(..rest_start).collect();
-        let line = String::from_utf8_lossy(&line_bytes);
-        Some(line.trim().to_string())
+        let line = String::from_utf8(line_bytes)
+            .map_err(|e| ApiError::http(format!("SSE line is not valid UTF-8: {e}")))?;
+        Ok(Some(line.trim().to_string()))
     }
 
     /// Fetch the next chunk from the HTTP stream and append it to the buffer.
@@ -96,5 +104,31 @@ impl SseReader {
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn take_line_invalid_utf8_returns_error() {
+        let mut reader = SseReader {
+            bytes: Box::pin(futures::stream::empty()),
+            buf: vec![0xFF, 0xFE, 0xFD, b'\n'],
+        };
+        let result = reader.take_line();
+        assert!(result.is_err(), "invalid UTF-8 must surface as an error");
+    }
+
+    #[test]
+    fn take_line_valid_utf8_returns_ok() {
+        let mut reader = SseReader {
+            bytes: Box::pin(futures::stream::empty()),
+            buf: b"data: hello\n".to_vec(),
+        };
+        let line = reader.take_line().unwrap().unwrap();
+        assert_eq!(line, "data: hello");
     }
 }

@@ -276,6 +276,18 @@ impl HttpClientConfig {
         self
     }
 
+    /// Control whether `TCP_NODELAY` is set on connections.
+    ///
+    /// Defaults to `true` — SSE streaming emits many small packets, and
+    /// Nagle's algorithm coalesces them, adding latency per delta. Pass
+    /// `false` to re-enable Nagle's algorithm (rarely needed). Ignored when
+    /// an external client was supplied.
+    #[must_use]
+    pub(super) fn with_tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.tcp_nodelay = enabled;
+        self
+    }
+
     /// Build a `reqwest::Client` from this configuration.
     ///
     /// If an external client was supplied via
@@ -1000,6 +1012,12 @@ mod tests {
     #[test]
     fn tcp_nodelay_default_is_true() {
         assert!(HttpClientConfig::default().tcp_nodelay);
+    }
+
+    #[test]
+    fn with_tcp_nodelay_can_disable() {
+        let config = HttpClientConfig::default().with_tcp_nodelay(false);
+        assert!(!config.tcp_nodelay);
     }
 
     #[test]

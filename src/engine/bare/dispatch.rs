@@ -4,6 +4,16 @@
 //! errors, hook interception, health recording, and middleware pipeline
 //! support.
 
+/// Truncate a string to `max_len` chars, appending `…` when truncated.
+fn truncate_to(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        return s.to_string();
+    }
+    let mut cut = s.char_indices().take(max_len).last().map_or(0, |(i, _)| i);
+    cut = cut.saturating_add(s[cut..].chars().next().map_or(0, char::len_utf8));
+    format!("{}…", &s[..cut])
+}
+
 #[cfg(feature = "hooks")]
 use super::HookAction;
 use super::{
@@ -791,18 +801,18 @@ impl<C: ApiClient> BareLoop<C> {
     /// tool name, input, and result, then stores it. Errors are logged and
     /// swallowed — a memory-store failure must never crash the turn.
     async fn record_tool_memory(&self, tc: &ToolCall, tool_result: &ToolDispatchResult) {
+        const MAX_FIELD_LEN: usize = 500;
         let Some(memory) = self.managers.memory() else {
             return;
         };
         if tool_result.is_error {
             return;
         }
+        let input = truncate_to(&tc.input.to_string(), MAX_FIELD_LEN);
+        let result = truncate_to(&tool_result.output.to_string(), MAX_FIELD_LEN);
         let entry = crate::memory::MemoryEntry::new(
             crate::memory::MemoryCategory::Trajectory,
-            format!(
-                "tool={}; input={}; result={}",
-                tc.tool, tc.input, tool_result.output
-            ),
+            format!("tool={}; input={input}; result={result}", tc.tool),
         );
         if let Err(e) = memory.store(entry).await {
             tracing::warn!(error = %e, tool = %tc.tool, "memory store failed");

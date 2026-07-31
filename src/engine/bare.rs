@@ -255,6 +255,14 @@ pub struct BareLoop<C: ApiClient> {
     /// the prior (unconstrained) behavior. Set via
     /// [`set_request_options`](BareLoop::set_request_options).
     request_options: RequestOptions,
+
+    /// Token counter for context-size estimates.
+    ///
+    /// Used by the driver to estimate the context size after each model
+    /// response, which the machine compares against the compaction threshold.
+    /// Synced with the [`ContextManager`]'s counter when one is set, so
+    /// the trigger and post-compaction paths use the same estimation.
+    token_counter: Arc<dyn crate::compact::TokenCounter>,
 }
 
 impl<C: ApiClient> BareLoop<C> {
@@ -336,6 +344,7 @@ impl<C: ApiClient> BareLoop<C> {
             text_streamer: None,
             contributors: Vec::new(),
             request_options: RequestOptions::default(),
+            token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
         }
     }
 
@@ -482,6 +491,7 @@ impl<C: ApiClient> BareLoop<C> {
             text_streamer: None,
             contributors: Vec::new(),
             request_options: RequestOptions::default(),
+            token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
         }
     }
 
@@ -630,7 +640,51 @@ impl<C: ApiClient> BareLoop<C> {
         let synced = Arc::try_unwrap(manager)
             .unwrap_or_else(|arc| (*arc).clone())
             .with_context_window(self.session.config.context_window);
+        self.token_counter = Arc::clone(synced.token_counter());
         self.managers.set_context_manager(Arc::new(synced));
+    }
+
+    /// Set the token counter for context-size estimates.
+    ///
+    /// The counter is used to estimate the conversation's token cost after
+    /// each model response, which drives the compaction trigger. Defaults to
+    /// [`HeuristicTokenCounter`](crate::compact::HeuristicTokenCounter) (a
+    /// characters-per-token heuristic); swap in a real tokenizer (e.g.
+    /// `tiktoken` for OpenAI) for better accuracy.
+    ///
+    /// When a [`ContextManager`] is also set, its counter should match — use
+    /// [`ContextManager::with_token_counter`] on the manager before passing
+    /// it to [`set_context_manager`](Self::set_context_manager), which syncs
+    /// the two automatically. If this method is called *after*
+    /// `set_context_manager`, only the driver-side estimate changes (the
+    /// compactor keeps its own counter).
+    ///
+    /// Must be called before [`run()`](crate::engine::core::Loop::run).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::compact::HeuristicTokenCounter;
+    /// use std::sync::Arc;
+    ///
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// agent.set_token_counter(Arc::new(HeuristicTokenCounter::anthropic()));
+    /// ```
+    pub fn set_token_counter(&mut self, counter: Arc<dyn crate::compact::TokenCounter>) {
+        self.debug_assert_idle();
+        self.token_counter = counter;
+    }
+
+    /// Set the token counter, consuming `self`. Fluent mirror of
+    /// [`set_token_counter`](Self::set_token_counter).
+    #[must_use]
+    pub fn with_token_counter(mut self, counter: Arc<dyn crate::compact::TokenCounter>) -> Self {
+        self.set_token_counter(counter);
+        self
     }
 
     /// Set the [`StreamHandler`] for resilient streaming with retries,
@@ -1622,7 +1676,8 @@ impl<C: ApiClient> BareLoop<C> {
                     stop_reason,
                     available_tools: self.tools.tool_names(),
                 };
-                self.machine.model_response(model_response);
+                let context_tokens = self.token_counter.count(&self.machine.full_history());
+                self.machine.model_response(model_response, context_tokens);
 
                 let turn_index = current_turn;
                 let is_empty = tool_calls.is_empty();
@@ -5060,7 +5115,7 @@ mod tests {
             stop_reason: StopReason::ToolCall,
             available_tools: vec!["echo".to_string()],
         };
-        loop_.machine.model_response(response);
+        loop_.machine.model_response(response, 0);
         let _ = loop_.machine.next_step(policy);
         loop_.machine.tool_results(vec![Message::user("r")]);
         let step = loop_.machine.next_step(policy);
@@ -5102,7 +5157,7 @@ mod tests {
             auto_compact: true,
         };
         let _ = loop_.machine.next_step(policy);
-        loop_.machine.model_response(response);
+        loop_.machine.model_response(response, 0);
         assert!(loop_.machine.is_terminal());
         assert_eq!(loop_.stop_reason(), None);
     }

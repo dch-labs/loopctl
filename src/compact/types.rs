@@ -174,11 +174,17 @@ impl CompactionOutcome {
 
     /// Estimate the token count for a slice of messages.
     ///
-    /// Uses the standard 4-chars-per-token heuristic, the same
-    /// heuristic used by [`ContextManager::estimate_tokens`](super::ContextManager::estimate_tokens).
+    /// Convenience static method for compactor implementations that need to
+    /// self-report token counts. Uses the default
+    /// [`HeuristicTokenCounter`](super::HeuristicTokenCounter). The
+    /// [`ContextManager`](super::ContextManager) re-counts the result with
+    /// its own configured counter after compaction, so the self-reported
+    /// value is a hint — only the manager's count is authoritative for the
+    /// before/after comparison.
     #[must_use]
     pub fn estimate_tokens(messages: &[Message]) -> u64 {
-        super::ContextManager::estimate_tokens(messages)
+        use super::TokenCounter;
+        super::HeuristicTokenCounter.count(messages)
     }
 }
 

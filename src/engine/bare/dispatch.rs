@@ -6,7 +6,7 @@
 
 /// Truncate a string to `max_len` chars, appending `…` when truncated.
 fn truncate_to(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         return s.to_string();
     }
     let mut cut = s.char_indices().take(max_len).last().map_or(0, |(i, _)| i);
@@ -948,6 +948,27 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn truncate_to_short_string_unchanged() {
+        assert_eq!(truncate_to("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_to_exact_length_unchanged() {
+        assert_eq!(truncate_to("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_to_longer_string_appends_ellipsis() {
+        assert_eq!(truncate_to("hello world", 5), "hello…");
+    }
+
+    #[test]
+    fn truncate_to_multibyte_chars_counts_characters_not_bytes() {
+        assert_eq!(truncate_to("héllo", 3), "hél…");
+        assert_eq!(truncate_to("日本語テスト", 3), "日本語…");
+    }
 
     struct MockClient {
         model_name: Arc<Mutex<String>>,

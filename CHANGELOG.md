@@ -7,704 +7,158 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-01
+
 ### Added
 
-- `engine::machine::LoopMachine` and supporting types — a sans-IO, serializable
-  state machine that owns every agent-loop decision (turn counting, max-turn
-  enforcement, tool-call validity, stop-reason routing, compaction trigger,
-  history, cancellation). `Serialize + Deserialize`, with no `async`, no
-  `tokio`, and no `ApiClient` in its surface. Includes `RunConfig`,
-  `MachineStep` (`CallLLM`/`CallTools`/`Compact`/`Done`), `ModelTurn`,
-  `PendingToolCall`, `MachineOutcome`, and `MachineState`. `BareLoop` now drives
-  a `LoopMachine` internally (`run()` is a `match machine.next_step()` loop); the
-  machine is exposed via `BareLoop::machine()` / `into_machine()` /
-  `from_machine()` for inspection and serialize-and-resume.
-- `LoopMachine::inject(message)` — add an arbitrary message to the machine's
-  history (host steering, or `ContextContributor` goal re-injection).
-- `Session`/`Run`/`Turn`/`RunResult` lifetime types (`engine::core`) —
-  the Session ⊃ [Run ⊃ [Turn]] hierarchy: one `Session` spans the process,
-  one `Run` per `run()` prompt, one `Turn` per loop iteration. `Session`
-  derives per-session totals (`total_turns`/`total_duration`/
-  `total_input_tokens`/`total_output_tokens`) from its run list. `Run`
-  is the result of a `run()`; `Run::turn_count()`/`duration()`/`total_tokens()`.
-- `SessionConfig` (`config`) — the session-scoped config slice (`session_id`,
-  `system_prompt`, `context_window`) with `with_*` builders, replacing the
-  session fields that lived on the old `LoopConfig`.
-- `LoopError` now derives `Serialize`, `Deserialize`, `PartialEq`, and `Eq`.
-- `compact::types::CompactReason` now derives `Serialize` and `Deserialize`.
-- `DeltaPart::Thinking { text }` variant + `on_thinking_delta` observer event
-  (`ThinkingDeltaContext`): reasoning-model tokens (Claude extended-thinking,
-  DeepSeek-R1, OpenAI o-series, Gemini 2.5+) are now routed as their own
-  stream kind instead of being dropped or misrouted into text. Stream-only —
-  reasoning is not accumulated into the `Message` and does not reach
-  `ResponseContext.text`; consume it via `on_thinking_delta` or the raw
-  `IndexedDelta(Thinking)` stream event. Anthropic parses `thinking_delta`
-  (and emits an empty Thinking delta for `redacted_thinking`); OpenAI parses
-  `reasoning_content` (aliased to `reasoning`); Gemini parses per-part
-  `thought: true` flags. An empty `delta` signals redacted reasoning (render
-  a placeholder). For Gemini, `GeminiClientBuilder::include_thoughts(true)`
-  opts into `generationConfig.thinkingConfig.includeThoughts` on the request
-  side — opt-in because the Gemini API rejects `thinkingConfig` with
-  `400 INVALID_ARGUMENT` on non-reasoning models; defaults to `false`.
-- `DisplayHint` advisory rendering hint on `ToolOutput` (`with_hint()` builder),
-  threaded through `ToolDispatchResult` and `ToolPostContext` so presentation
-  layers (TUI, headless console) can render a tool result by the tool's own
-  declaration instead of inferring the strategy from the tool name. Six
-  variants: `Text`, `Diff`, `Json`, `Code { language }`, `Suppress`,
-  `Markdown`. Advisory only — compaction, loop-detection hashing, and loop
-  semantics are unaffected (the hint terminates at the observer context and
-  never enters the message model).
-- `ConstrainedProfile`, `FrontierProfile`, and `GoalReminder` (`presets`
-  module): a named small-model-tuned runtime profile and its frontier opt-out
-  counterpart. `ConstrainedProfile::apply(&mut loop_)` wires the small-model
-  middleware stack (verify with `NoopVerifier`, memoize with
-  `NoopPathExtractor`, output cap) and registers a `GoalReminder` contributor;
-  `loop_config()` returns a tighter `LoopConfig` (120k window, 100 turns) and
-  `request_options()` returns `tool_constraint: Strict`. Compose the pieces
-  individually via `pipeline_builder()` / `loop_config()` / `request_options()`.
-- `NoopVerifier` (`middleware::verify`): a `Verifier` that always passes,
-  co-located with the `Verifier` trait. Default verifier for
-  `ConstrainedProfile`; swap in a real build/lint step when available.
-- `NoopPathExtractor` (`middleware::memoize`): a `PathExtractor` that extracts
-  no paths, disabling path-based cache invalidation (TTL-only caching).
-  Default extractor for `ConstrainedProfile`.
-- `BareLoop::set_request_options(opts)` builder: set the per-turn
-  `RequestOptions` (carrying `tool_constraint`) applied to every provider call.
-  Default is `RequestOptions::default()` (no constraint), reproducing prior
-  behavior.
-- `StreamHandler::passthrough()` constructor + `passthrough_default()` — a
-  no-resilience handler (no retries, no timeouts, no fallback) used as the
-  engine default when no handler is configured.
-- `HandlerEvent` enum (`stream::handler`): events yielded by the new
-  stream-based `StreamHandler::stream_turn`. Variants: `Stream(StreamEvent)`
-  for raw provider events, `AttemptReset` on retry, `Fallback { message,
-  stop_reason }` on non-streaming fallback.
-- `StreamRequest` struct (`api`): bundles `(messages, system, tools)` into a
-  single parameter for `ApiClient` methods. Replaces the positional
-  `(Vec<Message>, Option<String>, Option<Vec<ToolSchema>>)` parameter lists on
-  `stream_messages`, `create_message`, and their `_with_options` variants.
-  Builders: `new`, `with_system`, `with_tools` (both take `Option`).
-- `GeminiClientBuilder::include_thoughts(bool)` builder: opt into Gemini's
-  `thinkingConfig.includeThoughts` for reasoning-capable models (2.5 Pro/Flash,
-  Gemini 3). Defaults to `false` — the Gemini API rejects `thinkingConfig`
-  with `400 INVALID_ARGUMENT` on non-reasoning models, so the caller must opt
-  in once they know their model supports thinking.
-- HTTP connection-pool injection and tuning on all three provider builders
-  (`OpenAiClientBuilder`, `AnthropicClientBuilder`, `GeminiClientBuilder`):
-  `.http_client(reqwest::Client)` injects a shared client so multiple providers
-  can reuse one connection pool. `.pool_max_idle_per_host(usize)`,
-  `.pool_idle_timeout(Duration)`, and `.tcp_keepalive(Duration)` expose the
-  underlying `reqwest` pool knobs (default to reqwest's built-in defaults when
-  unset). When an injected client is used, these knobs and `.timeout()` /
-  `.connect_timeout()` are ignored — configure them on the injected client.
-- `ContextContributor` trait and `ContributorContext<'a>` (`engine::contributor`
-  module): a write-side hook at the turn boundary. Implementors return an
-  optional `Message` that the loop appends to the conversation before the next
-  model call. Register on `BareLoop` via `add_contributor`; with no contributors
-  registered, the loop behaves identically to before (the turn-top consultation
-  is a single cheap branch).
-- `Role::System` variant on `message::Role`. Serialized as `"system"`. Used for
-  framework-injected context such as a turn-boundary reminder. Providers map it
-  to their native system representation: an inline `{role: "system"}` message on
-  OpenAI, or the top-level system field on Anthropic and Gemini (which do not
-  accept an inline system role mid-conversation).
-- `ApiError::rate_limited(message, retry_after)` constructor for the structured
-  rate-limit carrier variant.
-- `LoopError::RateLimitEscalation { attempts, retry_after }` variant,
-  recoverable, raised when the stream handler exhausts rate-limit retries on a
-  model and escalates to the circuit breaker.
-- `StreamHandlerError::RateLimitEscalation { attempts, retry_after }`
-  variant. After `RateLimitConfig::fallback_after_retries` rate-limit retries,
-  `stream_turn` yields this as a stream error instead of looping
-  indefinitely or falling back to the same model's non-streaming endpoint.
-- Rate-limit backoff sleeps are now clamped to the turn's `total_stream_timeout`
-  so a large `Retry-After` cannot overrun the turn budget.
-- The engine routes `RateLimitEscalation` to
-  `FallbackManager::record_model_failure`, so a sustained rate limit on one
-  model trips the circuit breaker and subsequent turns route to the fallback
-  model.
-- `TokenBucket` and `RateLimiter` (`stream::rate_limit`): a proactive
-  client-side token-bucket rate limiter, one bucket per provider `base_url`.
-  Attaches to `StreamHandler` via `with_rate_limiter`; gates each stream
-  attempt before it fires, with a `max_wait` ceiling that degrades to reactive
-  (proceed, risk the 429) rather than hang.
-- `ApiClient::base_url()` trait method (default `""`), overridden by the
-  OpenAI, Anthropic, and Gemini clients to expose their configured endpoint for
-  per-provider bucket keying.
-- `ParallelMode` + `ParallelDispatchConfig` in `config.rs`: opt-in parallel
-  tool dispatch for independent, concurrency-safe calls within a single turn.
-  `LoopConfig` is now `#[non_exhaustive]`; the new `parallel_tool_dispatch`
-  field defaults to `Sequential` (v0.1.0 behaviour unchanged).
-- `Tool::resource_key(&self, &Value) -> Option<String>` trait method (default
-  `None`) for parallel-dispatch resource-conflict detection, plus the
-  `FnTool::with_resource_key` builder.
-- `MockTool::with_delay(Duration)` builder for timing-sensitive tests.
-- `StructuredOutput` trait, `ResponseFormat`, `RequestOptions`, and
-  `StructuredError` (`structured` module): request guaranteed-schema JSON
-  responses from the model. Includes a lenient JSON extraction helper (handles
-  markdown fences/prose prefixes) and a `request_structured::<T>()`
-  convenience function.
-- `ApiClient::stream_messages_with_options` and
-  `create_message_with_options` default methods (additive — existing impls
-  compile unchanged). `OpenAiClient`, `AnthropicClient`, and `GeminiClient`
-  override both to inject the schema (OpenAI via native `response_format`,
-  Anthropic via forced-tool tool-forcing, Gemini via `generationConfig`
-  `responseMimeType` + `responseSchema`).
-- `ToolOutput::structured<T>`, `structured_value()`, and
-  `structured_as::<T>()` for typed tool results that round-trip through JSON.
-- `ToolConstraint` enum (`structured` module, `#[non_exhaustive]`,
-  default `None`) and `RequestOptions::tool_constraint` field + builder for
-  constraining the model's tool-call output to the registered tool schemas.
-  `ToolConstraint::Strict` makes malformed tool calls structurally impossible
-  via the provider's native strict-tool mode; `ToolConstraint::Grammar`
-  (requires the new `grammar` feature) compiles the schemas into a grammar
-  for a grammar-aware sampler (vLLM `guided_json`).
-- `ToolGrammarProvider` trait and `JsonSchemaGrammar` default impl
-  (`provider::grammar` module, `grammar` feature): the extension point for
-  compiling a tool registry's schemas into a sampler grammar.
-- `grammar` feature flag (depends on `providers`): opt-in grammar / sampler
-  support for the `Grammar` mode of `ToolConstraint`.
-- `LlmReflector` (`reflection::llm` module): a `Reflector` that asks the
-  model to classify failed tool calls and suggest corrections via
-  `request_structured::<FailureAnalysis>`. First in-tree consumer of
-  `StructuredOutput`. Opt-in via `BareLoop::set_reflector`; the default
-  stays `NoopReflector`. Each analyzed failure triggers one model
-  round-trip (see its rustdoc for the latency/cost note).
-- `impl StructuredOutput for FailureAnalysis` (`reflection` module) with a
-  hand-written JSON Schema covering the 5 fields and the nested
-  `CorrectionType` snake_case enum.
-- `schema_validation` feature flag (pulls `jsonschema` as an optional
-  dependency): when enabled, `LlmReflector` validates the model's
-  `Correction::modified_input` against the failing tool's `input_schema`
-  and returns `ReflectionError::Internal` on a mismatch. When disabled,
-  validation is skipped.
-- `VerifyMiddleware`, `Verifier` trait, and `VerifyResult`
-  (`middleware::verify` module): opt-in post-execution middleware that
-  runs a caller-supplied verifier after configured write-class tools and
-  appends the pass/fail + diagnostics to the `ToolOutput` so the next
-  turn sees it. The verifier impl (`cargo check`, `tsc`) is
-  domain-specific and supplied by the consumer; loopctl ships only the
-  trait and the middleware.
-- `MemoizingMiddleware` and `PathExtractor` trait
-  (`middleware::memoize` module): opt-in middleware that caches
-  successful tool-call results keyed on `(tool_name, hash(canonical
-  input))` and returns cached output with a `[cached]` marker on hit.
-  Path-aware invalidation via the caller-supplied `PathExtractor` trait;
-  TTL-based expiry per `ttl_turns`. Default-off; only successful results
-  are cached.
-- Fluent `with_*()` builder methods on `LoopConfig` (one per public field,
-  e.g. `with_model`, `with_max_turns`, `with_session_id`,
-  `with_parallel_tool_dispatch`). Each is `#[must_use]`, consuming, and
-  returns `Self` for chaining. Purely additive — `Default`-based and direct
-  struct-literal construction are unchanged and remain first-class.
-- Consuming `with_*()` fluent builders on `BareLoop`, mirroring the existing
-  `&mut self` setters so a loop can be assembled as a chain off `BareLoop::new`:
-  `with_reflector`, `with_recovery_strategy`, `with_context_manager`,
-  `with_stream_handler`, `with_hook_executor` (`hooks` feature),
-  `with_health_registry` (`tool_health` feature), `with_pipeline` (returns
-  `Result<Self, LoopError>` — chain with `?`), `with_observer`,
-  `with_text_streamer`, `with_contributor`, `with_request_options`. The
-  original `set_*`/`register_*` setters are unchanged and remain available.
-- `CancelSignal::reset()` — re-arm a fired signal by swapping in a fresh
-  underlying `CancellationToken`. Required because the token is one-shot
-  by design; once fired it cannot be revived. All clones of an
-  `Arc<CancelSignal>` observe the new token, so a handle returned by
-  `BareLoop::cancel_signal()` keeps working across resets. `BareLoop`
-  calls this in `finalize()` so each `run()` starts with a clean signal.
-- `StreamHandler::with_timeout_config(config)` and
-  `with_retry_config(config)` — independent, self-validating builders for
-  the streaming timeout and retry configs (mirroring the existing
-  `with_rate_limit_config`). Each validates its config and falls back to
-  the default on an invalid value, replacing the coupled
-  `with_config(timeout, retry)` builder.
-- `StreamRetryConfig::jittered_base_delay(attempt)` — the exponential
-  backoff with [`jitter_factor`](crate::stream::handler::StreamRetryConfig::jitter_factor)
-  applied, used by `StreamHandler` between transport-retry attempts. The
-  jitter is deterministic (derived from the attempt number via a
-  shift-based mix) so the same attempt always yields the same delay while
-  successive attempts spread their backoffs — no randomness dependency.
-  `base_delay` (the raw exponential core) remains public.
-- **`LoopMemory` is now wired into the framework.** The trait was previously
-  exported and documented but consumed by nothing. The engine now:
-  - **Stores** a trajectory entry after each successful tool call (tool name,
-    input, result) via `LoopManagers::memory()`.
-  - **Retrieves** up to 3 relevant entries before each turn and injects them
-    as a system message into the conversation.
-  - **Consolidates** (prunes) the store at the end of a successful run.
-  The `LoopMemory` trait is now object-safe (`Pin<Box<dyn Future>>` returns)
-  so the store can live behind `Arc<dyn LoopMemory>` on
-  `LoopManagers`. Configure via `BareLoop::set_memory` /
-  `with_memory`, or `LoopManagers::set_memory` / `with_memory`.
-  A `RememberCapable` capability trait exposes it to trait-bounded code.
-  All three hooks are no-ops when no memory store is attached.
+- **Sans-IO state machine** (`engine::machine::LoopMachine`): serializable,
+  owns every agent-loop decision (turn counting, max-turn enforcement,
+  tool-call validity, compaction trigger, history, cancellation). Exposed via
+  `BareLoop::machine()` / `into_machine()` / `from_machine()` for inspection
+  and serialize-and-resume. `BareLoop::run()` now drives the machine internally.
+- **Session/Run/Turn lifetime model** (`engine::core`): one `Session` spans the
+  process, one `Run` per `run()` call, one `Turn` per loop iteration. Session
+  derives per-session totals; `Run` carries per-run turns, tokens, and error.
+  Construction splits into `SessionConfig` (session-scoped) and `RunConfig`
+  (per-run budgets).
+- **Reasoning-model support** (`DeltaPart::Thinking` + `on_thinking_delta`):
+  reasoning tokens (Claude extended-thinking, OpenAI o-series, Gemini 2.5+) are
+  routed as their own stream kind. Stream-only — not accumulated into `Message`.
+- **Structured output** (`structured` module): `StructuredOutput` trait,
+  `ResponseFormat`, `request_structured::<T>()`. All three providers override
+  `stream_messages_with_options` / `create_message_with_options` to inject the
+  schema natively.
+- **Tool constraints** (`ToolConstraint` enum): `Strict` tightens tool schemas
+  via the provider's native strict mode; `Grammar` compiles schemas into a
+  grammar for vLLM-style samplers (`grammar` feature).
+- **Tool reflection** (`LlmReflector`): asks the model to classify failed tool
+  calls and suggest corrections via `request_structured`.
+- **Parallel tool dispatch** (`ParallelDispatchConfig`): independent,
+  concurrency-safe calls within a single turn run concurrently. Sequential by
+  default.
+- **Stream resilience** (`StreamHandler`): retries, timeouts, rate-limit
+  backoff, and non-streaming fallback. Configurable via
+  `with_timeout_config` / `with_retry_config` / `with_rate_limit_config`.
+  `HandlerEvent` enum provides real-time observability during streaming.
+- **Client-side rate limiting** (`TokenBucket` / `RateLimiter`): proactive
+  per-provider token-bucket. One bucket per `base_url`.
+- **Context contributors** (`ContextContributor` trait): turn-boundary hook for
+  injecting messages before each model call.
+- **Agent memory** (`LoopMemory` trait, now wired): stores tool-call
+  trajectories, retrieves relevant entries before each turn, consolidates on
+  successful runs. Object-safe; configure via `BareLoop::set_memory`.
+- **Display hints** (`DisplayHint` on `ToolOutput`): advisory rendering hints
+  (Text, Diff, Json, Code, Suppress, Markdown) for presentation layers.
+- **Middleware**: `VerifyMiddleware` (post-execution verification),
+  `MemoizingMiddleware` (tool-call result caching with path-aware invalidation).
+- **Presets** (`ConstrainedProfile`, `FrontierProfile`, `GoalReminder`): named
+  runtime profiles for small-model-tuned and frontier configurations.
+- **`StreamRequest`**: bundles `(messages, system, tools)` into one parameter
+  for all `ApiClient` methods.
+- **`Role::System`** variant: framework-injected system context. Providers map
+  to their native representation.
+- **Pluggable `TokenCounter`**: `HeuristicTokenCounter` (4 chars/token) default;
+  swap in a real tokenizer. Synced bidirectionally with `ContextManager`.
+- **`OpenAiClientBuilder::with_stream_usage(bool)`**: controls
+  `stream_options.include_usage`. `ollama()` disables it automatically.
+- **`with_tcp_nodelay(bool)`** on all three provider builders + `HttpClientConfig`.
+- **HTTP connection-pool injection**: shared `reqwest::Client`, pool knobs
+  (`pool_max_idle_per_host`, `pool_idle_timeout`, `tcp_keepalive`).
+- **Fluent `with_*()` builders** on `LoopConfig`, `BareLoop`, and all provider
+  builders. `CancelSignal::reset()` for multi-run agents.
+- `LoopError` now derives `Serialize`, `Deserialize`, `PartialEq`, `Eq`.
 
 ### Changed
 
-- **Breaking (`create_message` returns a typed response):**
-  `ApiClient::create_message` and `ApiClient::create_message_with_options`
-  now return `Result<NonStreamingResponse, ApiError>` instead of
-  `Result<serde_json::Value, ApiError>`. `NonStreamingResponse` carries the
-  fully assembled `message: Message`, a typed `stop_reason:
-  StreamStopReason`, and the token `usage: Usage` — the typed counterpart to
-  a streamed response. Each provider builds this from its own native JSON, so
-  no provider-specific parsing remains at the call site (the handler's
-  `fallback_non_streaming` collapsed from a 30-line JSON parser to a single
-  field access). Token usage is now extracted from each provider's native
-  usage field (`usage.prompt_tokens`/`completion_tokens` on OpenAI,
-  `usage.input_tokens`/`output_tokens` on Anthropic,
-  `usageMetadata.promptTokenCount`/`candidatesTokenCount`/`thoughtsTokenCount`
-  on Gemini), and threaded through `HandlerEvent::Fallback` so the fallback
-  path reports real token counts instead of `None`.
-  Migration: read `.message`, `.stop_reason`, and `.usage` from the returned
-  struct instead of indexing into the JSON value.
-- **Breaking (`extract_structured` takes `&Message`):**
-  `ApiClient::extract_structured` now takes `&Message` instead of
-  `&serde_json::Value` and has a default implementation that derives the
-  payload from the message (first tool-call `input`, else text lenient-parsed
-  as JSON). The per-provider overrides (`OpenAiClient`, `AnthropicClient`,
-  `GeminiClient`) and the shared `extract_structured_from_normalized` helper
-  are removed — the single default works for every provider because the
-  provider-specific envelope is gone by the time a typed `Message` exists.
-  Migration: if you override `extract_structured`, change the parameter from
-  `&serde_json::Value` to `&Message`; most overrides can be deleted in favor
-  of the default.
-- `StreamStopReason::from_api_str` now accepts `"tool_use"` as an alias for
-  `"tool_call"`. Anthropic reports a tool-invocation stop reason as
-  `"tool_use"` (while OpenAI uses `"tool_calls"`); both now map to `ToolCall`.
-  This fixes a pre-existing bug where Anthropic tool-call responses were
-  misclassified as `EndTurn` on both the streaming and non-streaming paths.
-- `Usage` now derives `PartialEq` and `Eq`.
-- **OpenAI streaming usage:** the OpenAI streaming client now sets
-  `stream_options.include_usage` on streaming requests and captures the token
-  counts from the final usage chunk. Previously the streaming path always
-  reported `usage: None` (it discarded usage), so a streamed turn reported zero
-  tokens while a non-streaming fallback reported real counts — the successful
-  path reported less than the fallback. The `StreamEmitter` now defers the
-  `MessageDelta` until either the usage chunk arrives or the stream ends,
-  emitting the stop reason and usage together. All three providers (OpenAI,
-  Anthropic, Gemini) now report usage on both streaming and non-streaming paths.
-  `stream_options.include_usage` is opt-in via
-  `OpenAiClientBuilder::with_stream_usage(false)` for OpenAI-compatible servers
-  that reject the parameter; the `ollama()` constructor disables it
-  automatically for compatibility with older Ollama versions.
-- **Breaking (`NonStreamingResponse.usage` is now `Option<Usage>`):** the field
-  changed from `Usage` to `Option<Usage>`, symmetric with the streaming path's
-  `Option<Usage>`. This lets callers distinguish "provider reported zero tokens"
-  from "provider omitted usage." `None` means the provider did not include a
-  usage object in its response. Migration: unwrap with `.unwrap_or_default()`
-  or pattern-match on `Option`.
-- **Breaking (`MessagePart::ToolResult` gains a `name` field):** tool results
-  now carry the tool's function name alongside the `call_id`. Required by Gemini
-  (and other providers) that correlate tool responses by function name in
-  `functionResponse`, not just by call id. `MessagePart::tool_result()` gains a
-  `name` parameter (second argument, after `call_id`).
-  Migration: add the tool name as the second argument to every
-  `MessagePart::tool_result()` call.
-- **Gemini tool-call ids:** the Gemini provider now parses `functionCall.id`
-  (Gemini 3 returns a unique id per call) and echoes it in
-  `functionResponse.id`, fixing tool-response correlation for parallel calls.
-  The `functionResponse` serialization now sends both `name` (the function name)
-  and `id` (the call id) instead of putting the call id in `name`.
-  Migration: none — serialization is automatic.
-- **OpenAI usage unification:** the non-streaming `build_response` path now uses
-  the same `OpenAiUsage` serde struct as the streaming path, deleting the manual
-  `extract_usage` helper. Both paths share one deserialization strategy.
-- **SSE invalid-UTF-8 handling:** `SseReader::take_line` now returns
-  `Result<Option<String>, ApiError>` and surfaces genuinely invalid UTF-8 as a
-  protocol error instead of silently replacing bytes with `U+FFFD` via
-  `String::from_utf8_lossy`. Callers (`next_openai_data`, `next_anthropic_data`,
-  `next_gemini_data`) propagate the error via `?`.
-- **`with_tcp_nodelay` setter:** all three provider builders
-  (`OpenAiClientBuilder`, `AnthropicClientBuilder`, `GeminiClientBuilder`) and
-  `HttpClientConfig` now expose `with_tcp_nodelay(bool)`. The field was
-  previously hardcoded to `true` with no escape hatch. Default remains `true`.
-- **Breaking (session→run lifecycle rename):** the observer and hook events
-  formerly named `on_session_start` / `on_session_end` are renamed to
-  `on_run_start` / `on_run_end`. These events fire once per `run()` call and
-  carry per-run data (turn count, per-run duration, per-run tokens), so the
-  new names match their actual semantics. The Session ⊃ Run ⊃ Turn hierarchy
-  is unchanged: a Session spans the agent's lifetime, a Run is one `run()`
-  call, a Turn is one loop iteration. Affected APIs (old → new):
-  `LoopObserver::on_session_start` → `on_run_start`,
-  `LoopObserver::on_session_end` → `on_run_end`,
-  `observer::SessionStartContext` → `observer::RunStartContext`,
-  `observer::SessionEndContext` → `observer::RunEndContext`,
-  `Hook::on_session_start` → `on_run_start`,
-  `Hook::on_session_end` → `on_run_end`,
-  `hooks::context::SessionStartContext` → `hooks::context::RunStartContext`,
-  `hooks::context::SessionEndContext` → `hooks::context::RunEndContext`,
-  `hooks::context::SessionEndReason` → `hooks::context::RunEndReason`,
-  `HookExecutor::notify_session_start` → `notify_run_start`,
-  `HookExecutor::notify_session_end` → `notify_run_end`,
-  `HookExecutor::notify_session_start_async` → `notify_run_start_async`,
-  `HookExecutor::notify_session_end_async` → `notify_run_end_async`,
-  `ObserverHost::on_session_start` → `on_run_start`,
-  `ObserverHost::on_session_end` → `on_run_end`.
-  Migration: rename the method/trait impl in every `impl LoopObserver` and
-  `impl Hook`; rename every `SessionStartContext` / `SessionEndContext` /
-  `SessionEndReason` reference. The `session_id` field on the renamed context
-  types is unchanged (a run belongs to a session).
-- **Breaking (per-run manager reset):** `LoopManagers::reset_all` is no
-  longer called automatically from `run()`. Previously it fired on every
-  `run()` call, wiping session-scoped manager state (fallback circuit
-  breaker, loop detection, observers) between runs. On a fresh session
-  the managers are already in their default state, so the call was a
-  no-op on the first run and a correctness bug on subsequent runs (it
-  discarded accumulated circuit-breaker and detection state). To
-  reinitialise mid-session, call `managers.reset_all()` explicitly.
-- `RunConfig` gains a `reset_managers: bool` field (default `false`). Set it
-  to `true` when a run is logically independent from the previous one and you
-  want fresh circuit-breaker / detection / observer state for that run. This
-  replaces the removed automatic `reset_all` with explicit, per-run control.
-  Because `RunConfig` is `#[non_exhaustive]`, existing code that constructs it
-  via `Default::default()` or `RunConfig { .. }` continues to work unchanged.
-- `on_run_start` (the renamed `on_session_start`) now fires at the start of
-  **every** `run()` call, matching `on_run_end` which already fired on every
-  `run()` call. Previously it fired only once (on the first `run()`), creating
-  an asymmetry where a multi-run session saw 1 start event but N end events.
-  The session-scoped bookkeeping (`session_start` timestamp, `reset_all`) is
-  unaffected — it still runs only once, on the first `run()`.
-
-- **Breaking (machine-driven engine):** `BareLoop::run()` is now a
-  `match machine.next_step()` loop driving a `LoopMachine`. The machine owns the
-  conversation history and every loop decision (turn count, max-turn, tool-call
-  validity, compaction trigger, cancellation); the driver owns IO (LLM call,
-  tool dispatch, compaction execution) and fires observers from the match-arms.
-  Observer event ordering is unchanged (pinned by golden tests). The
-  conversation is owned by the machine — read it via `BareLoop::conversation()`
-  (delegates to the machine) or `BareLoop::machine().history()`.
-- **Breaking (Session/Run lifetime model):** the agent-loop lifetime is now
-  explicit. `LoopConfig` is **removed**; construction splits into
-  `SessionConfig` (session-scoped: `session_id`, `system_prompt`,
-  `context_window`) and `engine::RunConfig` (per-run: turn/token budgets,
-  compaction policy, dispatch mode). `SessionResult` is **removed** and unified
-  with the new `Run`/`Run` (`engine::core`): the per-run accumulator
-  is `Run`-shaped (`turns: Vec<Turn>`, `error: Option<LoopError>`). The `model`
-  field is gone from config entirely — it lives on the `ApiClient`
-  (`ApiClient::model` / `set_model`). Migration: build `BareLoop::new` with a
-  `SessionConfig`; read `session_id`/`system_prompt`/`context_window` from
-  `SessionConfig`, run budgets from `RunConfig`, the model from the client.
-- **Breaking (`Loop::run` signature + `initialize` removed):** `Loop::run` now
-  takes the per-run config — `run(&mut self, user_input: &str, run_config:
-  &RunConfig)` — and returns `Result<Run, LoopError>`. Session
-  initialization happens once at construction (not per `run()`); each `run()`
-  receives a fresh `RunConfig`. `Loop::initialize` and `Loop::config()` are
-  removed. Migration: pass `&RunConfig::default()` (or a specific run config)
-  as the second `run()` argument; move any `initialize` setup into
-  construction.
-- **Breaking (compaction thresholds → percentages):** the compaction trigger
-  threshold and compaction-target fraction are now `u8` percentages (0–100;
-  100 = 100%) instead of `f64` fractions. Affected APIs:
-  `ContextManager::with_threshold(u8)` and `with_compact_target_pct(u8)`
-  (were `f64`); `ContextManager::threshold() -> u8` and
-  `compact_target_pct() -> u8` (were `f64`);
-  `SessionConfig::with_compact_threshold(u8)` and the `compact_threshold` field
-  (were `f64`). The default is `80` (was `0.80`); the clamp range is
-  `[1, 100]` (was `[0.1, 1.0]`). Migration: multiply existing `f64`
-  values by 100 and round — `0.80 → 80`, `0.50 → 50`, `0.70 → 70`.
-- **Breaking (renames):** consuming builder methods that return `Self` are now
-  uniformly prefixed `with_`, matching the crate-wide convention. The old
-  no-prefix names are removed. Affected types and methods (old → new):
-  `SessionResultBuilder` (`session_id`/`total_turns`/`input_tokens`/
-  `output_tokens`/`total_duration`/`tool_calls`/`success`/`final_output`/
-  `error` → `with_*`); `ModelSwitch` (`context_window`, `max_tokens` →
-  `with_*`); `StreamRequest` (`system`, `system_opt`, `tools`, `tools_opt` →
-  `with_*`); `RequestOptions` (`response_format`, `tool_constraint` → `with_*`);
-  `UnixShieldBuilder` (`warn_threshold`, `block_threshold`, `pattern`,
-  `combination_rule` → `with_*`); `AutoCommitConfigBuilder` (`enabled`,
-  `message_template`, `auto_push`, `files` → `with_*`); `ToolPipelineBuilder`
-  (`core` → `with_core`; the middleware accumulators `with` and `with_arc` are
-  renamed to `with_middleware` and `with_middleware_arc` so they no longer read
-  ambiguously next to `with_core`). Migration: add the `with_` prefix at each
-  call site.
-- `ToolPipelineBuilder::build` now distinguishes its two failure cases:
-  `PipelineError::Empty` when neither middleware nor a core was added (the
-  builder is untouched), and `PipelineError::MissingCore` when at least one
-  middleware was added but no core registry was set. Previously both cases
-  returned `MissingCore`, and `Empty` was unreachable. The `Empty` and
-  `MissingCore` variants now carry multiline rustdoc explaining each condition.
-- **Breaking (optional-field builders unified):** builder methods that set an
-  `Option<T>` field now uniformly take `Option<T>` and drop the `_opt` suffix —
-  the parameter type already conveys "optional," so the name should not.
-  `StreamRequest` loses `with_system_opt`/`with_tools_opt`; `with_system` and
-  `with_tools` now take `Option<String>`/`Option<Vec<ToolSchema>>` (pass
-  `Some(…)` to set, `None` to clear). `LoopConfig::with_system_prompt` changes
-  from `impl Into<String>` to `Option<String>`, so it can now clear the
-  override with `None` (previously it could only set). `AttemptRecord::with_reason`
-  and `Operation::with_result_hash` already followed this shape and are
-  unchanged. Migration: wrap existing literal/value arguments in `Some(…)` (or
-  rename `with_*_opt` → `with_*`).
-- **Breaking:** `stream::DeltaPart` is now `#[non_exhaustive]`. Every
-  exhaustive `match` on `DeltaPart` in downstream code must add a `_ =>` arm
-  (or a `Thinking =>` arm for the new variant). Same-crate matches are
-  unaffected. Future variant additions (e.g. `Image`, `Audio`) will arrive
-  non-breaking.
-- **Breaking:** `ApiClient::stream_messages`, `stream_messages_with_options`,
-  `create_message`, and `create_message_with_options` now take a single
-  `StreamRequest` parameter instead of positional `(messages, system, tools)`.
-  Every `impl ApiClient` must update its signatures.
-- **Breaking:** `StreamHandler::stream_turn` now returns
-  `impl Stream<Item = Result<HandlerEvent, StreamHandlerError>>` instead of
-  `Future<Result<StreamTurnResult, _>>`. Callers must drive the stream and
-  accumulate events themselves. The engine's `stream_turn` does this internally
-  and fires observer callbacks (`on_text_delta`, `on_thinking_delta`,
-  `text_streamer`) per event — configuring a `StreamHandler` for resilience no
-  longer drops real-time observability.
-- **Breaking:** `StreamCapable::stream_handler` now returns `&StreamHandler`
-  (not `Option<&StreamHandler>`). When no handler is configured, returns a
-  shared `StreamHandler::passthrough_default()` (no-resilience default).
-- **Breaking:** `StreamHandlerError::RateLimitEscalation` lost its `prior`
-  field. The variant is now `{ attempts, retry_after }`.
-- **Breaking:** `StreamHandler::stream_turn` now takes `options:
-  RequestOptions` as an explicit parameter. `StreamHandler::with_request_options`
-  is removed — use `BareLoop::set_request_options` instead.
-- **Breaking:** All three provider builders (`OpenAiClientBuilder`,
-  `AnthropicClientBuilder`, `GeminiClientBuilder`) now use `with_` prefix on
-  consuming builder methods (e.g. `.with_api_key()`, `.with_model()`,
-  `.with_timeout()`, `.with_http_client()`). The old no-prefix names
-  (`.api_key()`, `.model()`, etc.) are removed.
-- **Breaking:** `ToolOutput`, `ToolDispatchResult`, and `ToolPostContext` are
-  now `#[non_exhaustive]`, matching `DisplayHint`. Downstream code that
-  constructs these via struct literal must switch to the named constructors
-  (`ToolOutput::text`/`success`/`error`/`error_text`, `ToolDispatchResult::ok`/
-  `err`/`from_tool_output`/`from_result`, or the `From<ToolOutput>` impl) or
-  add `..Default::default()` where a `Default` exists. Same-crate construction
-  is unaffected. Future fields on these types will now arrive non-breaking.
-- The engine now calls `ApiClient::stream_messages_with_options` instead of
-  `stream_messages` on every turn (both the inline-streaming path in
-  `engine::bare::stream` and the `StreamHandler` path), passing the loop's
-  `RequestOptions`. This is additive — the default `RequestOptions::default()`
-  has no `response_format` and `tool_constraint: None`, which reproduces the
-  prior behavior exactly. Custom `ApiClient` impls that do not override
-  `stream_messages_with_options` inherit the trait default (which delegates to
-  `stream_messages` when `response_format` is `None`), so they continue to
-  work; a `tool_constraint` other than `None` set via `set_request_options`
-  only takes effect on clients that override `_with_options` (the built-in
-  OpenAI, Anthropic, and Gemini clients do).
-- **Breaking:** `message::Role` gains a `System` variant. Every exhaustive
-  `match` on `Role` in downstream code must add a `System =>` arm (or a `_ =>`
-  wildcard). Migration: add `Role::System => /* your mapping */` to each match,
-  or switch to a wildcard arm. The three built-in providers are already
-  updated; the Anthropic and Gemini serializers fold any inline `Role::System`
-  messages into the top-level system request field (`system` / `systemInstruction`)
-  rather than emitting them inline, because those providers accept system content
-  only as a top-level field. When both a caller-supplied system prompt and inline
-  `Role::System` messages are present, they are joined (caller prompt first,
-  folded text appended, newline-separated). OpenAI emits `Role::System` as an
-  inline `{role: "system"}` message, its native form.
-- **Breaking:** `Reflector::analyze` gains a new `tool_schema:
-  Option<&ToolSchema>` parameter between `tool_input` and `context`. The
-  engine's call site now resolves the failing tool's schema from the
-  registry (passing `None` when the tool isn't found). Every `Reflector`
-  impl must add the new parameter; `NoopReflector` and the trait-doc
-  example have been updated.
-  Migration: add `_tool_schema: Option<&loopctl::tool::ToolSchema>` to
-  your `analyze` signature. Ignore it if your reflector does not validate
-  suggested corrections; otherwise use it to validate `modified_input`
-  before returning the analysis.
-- `OpenAiClient`, `AnthropicClient`, and `GeminiClient` now honor
-  `RequestOptions::tool_constraint`. Under `Strict`, each tool's schema is
-  tightened (recursive `additionalProperties: false` and full `required`);
-  OpenAI additionally sets `strict: true` on each `function` entry. Under
-  `Grammar`, the OpenAI client injects `guided_json` for vLLM-style
-  grammar-aware samplers. Default `ToolConstraint::None` reproduces prior
-  behaviour exactly; when `response_format` is also set, it wins and
-  `tool_constraint` is ignored.
-- Removed `parking_lot` dependency entirely. All `parking_lot::Mutex`
-  usages migrated to `std::sync::Mutex` with the
-  `.unwrap_or_else(std::sync::PoisonError::into_inner)` recovery pattern.
-  The crate now uses a single mutex family with no external lock
-  dependency.
-- MSRV bumped from 1.85 to 1.94. The crate uses let-chain syntax
-  (`if x && let Some(y) = ...`) which stabilized in Rust 1.88.
-- Both sequential and parallel tool dispatch now check the cancel signal
-  between calls. Previously, a Ctrl-C during a multi-tool batch was only
-  honored at the next turn boundary; now it aborts the remaining calls in the
-  batch.
-- Internally-built `reqwest::Client`s now set `tcp_nodelay(true)` by default.
-  SSE streaming emits many small packets; disabling Nagle's algorithm reduces
-  per-delta latency. No correctness impact.
-- `FallbackManager`'s circuit-breaker state is now unified behind a single
-  `Mutex<BreakerState>`. Previously it was split across four independent
-  `Relaxed` atomics (`fallback_state`, `consecutive_failures`,
-  `primary_success_count`, `fallback_activated`) plus a `Mutex<FallbackInner>`,
-  which left a TOCTOU window between the state read and the
-  transition/counter-reset. The read-decide-transition in `record_failure` /
-  `record_success` now runs while holding the one lock, so the race is closed
-  by construction. Internal refactor — no public-API change beyond the method
-  merges noted under `### Removed`.
+- **Breaking (`create_message` returns typed `NonStreamingResponse`):** no longer
+  returns raw `serde_json::Value`. The struct carries `message: Message`,
+  `stop_reason: StreamStopReason`, `usage: Option<Usage>`. Migration: read fields
+  from the struct.
+- **Breaking (`extract_structured` takes `&Message`):** default implementation
+  derives from the message; per-provider overrides removed. Migration: change
+  parameter type or delete override.
+- **Breaking (`run()` signature):** `run(&mut self, input: &str, &RunConfig)`
+  returns `Result<Run, LoopError>`. `Loop::initialize` / `config()` removed.
+- **Breaking (session→run lifecycle rename):** `on_session_start` / `on_session_end`
+  → `on_run_start` / `on_run_end`. Fire on every `run()` call. Migration: rename
+  methods and context types.
+- **Breaking (`LoopConfig` removed):** replaced by `SessionConfig` + `RunConfig`.
+  The `model` field lives on `ApiClient`.
+- **Breaking (compaction thresholds → percentages):** `f64` fractions → `u8`
+  percentages (0–100). `0.80 → 80`.
+- **Breaking (builder renames):** all consuming builders uniformly `with_`-prefixed.
+  `Option<T>` builders take `Option<T>` (no `_opt` suffix). Migration: add prefix,
+  wrap literals in `Some(...)`.
+- **Breaking (`StreamHandler::stream_turn`):** returns `impl Stream<Item =
+  Result<HandlerEvent, StreamHandlerError>>` instead of a future.
+- **Breaking (`StreamRequest` parameter):** all `ApiClient` streaming/creation
+  methods take `&StreamRequest` instead of positional params.
+- **Breaking (`DeltaPart` non-exhaustive):** add `_ =>` arm to downstream matches.
+- **Breaking (`Role::System` variant):** add `System =>` arm to downstream matches.
+- **Breaking (`ToolOutput` / `ToolDispatchResult` / `ToolPostContext`
+  non-exhaustive):** use named constructors or `..Default::default()`.
+- **Breaking (`Reflector::analyze`):** gains `tool_schema: Option<&ToolSchema>`
+  parameter.
+- **Breaking (`MessagePart::ToolResult` gains `name` field):**
+  `tool_result()` gains a `name` argument (second param). `#[serde(default)]`
+  allows deserializing older data.
+- **Breaking (`NonStreamingResponse.usage` is `Option<Usage>`):** symmetric with
+  streaming. `None` = provider omitted usage.
+- **OpenAI streaming usage:** now sets `stream_options.include_usage` and captures
+  token counts from the final chunk. All three providers report usage on both paths.
+  All-zero usage collapses to `None`.
+- **OpenAI malformed arguments:** non-empty `function.arguments` that fail JSON
+  parse now return an `ApiError` instead of silently defaulting to `{}`.
+- **Gemini tool-call ids:** `functionCall.id` is now parsed (Gemini 3) and echoed
+  in `functionResponse.id`. `functionResponse` sends both `name` and `id`.
+- **SSE invalid-UTF-8:** `take_line` surfaces invalid UTF-8 as a protocol error
+  instead of silent `U+FFFD` replacement.
+- **`StreamStopReason::from_api_str`** accepts `"tool_use"` as alias for
+  `"tool_call"` (Anthropic).
+- **`set_token_counter`** now propagates to the `ContextManager` if one is set,
+  regardless of setter order.
+- **Memory injection** uses `Role::User` (not `Role::System`) with explicit
+  "reference only" delimitation.
+- **Context token estimate** includes the model response message before counting.
+- MSRV bumped to 1.94 (let-chain syntax). Removed `parking_lot` dependency.
 
 ### Removed
 
-- `StreamHandler::with_config(timeout, retry)` — set each config
-  independently via
-  [`with_timeout_config`](crate::stream::handler::StreamHandler::with_timeout_config)
-  and
-  [`with_retry_config`](crate::stream::handler::StreamHandler::with_retry_config)
-  instead. The coupled builder forced both configs to be passed in lockstep
-  even when only one changed; the two new builders each validate their own
-  config (an invalid value is logged and falls back to the default).
-- `FallbackManager::record_api_failure` and
-  `FallbackManager::record_model_failure` — merged into a single
-  [`FallbackManager::record_failure(FailureKind)`](crate::fallback::FallbackManager::record_failure).
-  The two methods differed only in how a failure during
-  [`Recovering`](crate::fallback::FallbackState::Recovering) was treated:
-  a sustained rate-limit re-trips the breaker, a transient error leaves
-  the half-open probe in place. That distinction is now an explicit
-  [`FailureKind`](crate::fallback::FailureKind) argument (`RateLimit` vs
-  `Transient`) instead of two near-identical methods. Migration: pass
-  `FailureKind::RateLimit` where you called `record_model_failure`,
-  `FailureKind::Transient` where you called `record_api_failure`.
-- `FallbackManager::record_failure` / `record_success` zero-body aliases
-  for `record_api_failure` / `record_model_success` — removed alongside
-  the merge. `record_success` is the new canonical name for the success
-  path (was `record_model_success`).
-- `FallbackEntry` and `AttemptRecord` are now `pub(crate)` — they were
-  `pub` with no external users and ~400 lines of speculative accessors.
-  The `fallback_entry(name)` lookup method (which leaked the internal
-  type) is removed. These types were never part of the documented public
-  API surface; only `FallbackManager`, `FallbackState`, `FallbackConfig`,
-  and `FailureKind` are public in the `fallback` module now.
-- `FallbackState::From<u8>` impl and the `= 0`/`= 1`/`= 2` discriminants
-  — dead weight from when state round-tripped through an `AtomicU8`.
-  State is now a plain field on an internal struct; no `u8` casting
-  remains.
-- `Loop::process_turn` trait method and `BareLoop::run_turn_body` — the
-  machine-driven `run()` replaces the old per-turn execution path. The
-  `LoopMachine` is the new turn unit; drive it via `BareLoop::run()` (or
-  `LoopMachine::next_step()` directly for a custom driver).
-- `StreamTurnResult` (the handler no longer accumulates; the engine assembles
-  the result from the event stream).
-- `StreamHandler::with_request_options` builder (options now flow via
-  `stream_turn`'s parameter; configure via `BareLoop::set_request_options`).
-- `StreamHandlerError::RateLimitEscalation.prior: StreamOutcome` field (never
-  read by any consumer).
+- `StreamHandler::with_config(timeout, retry)` — use `with_timeout_config` /
+  `with_retry_config`.
+- `FallbackManager::record_api_failure` / `record_model_failure` — merged into
+  `record_failure(FailureKind)`.
+- `Loop::process_turn`, `BareLoop::run_turn_body` — replaced by machine-driven
+  `run()`.
+- `StreamTurnResult` — engine assembles result from event stream.
+- `StreamHandler::with_request_options` — use `BareLoop::set_request_options`.
+- `StreamHandlerError::RateLimitEscalation.prior` field (never read).
 
 ### Fixed
 
-- Tool dispatch had three separate code paths (sequential, small-batch
-  parallel, and wave-parallel) each with its own copy of the recovery
-  loop, PRE/POST side-effect logic, and cancel handling. Two bugs came
-  from this split: the small-batch path called `dispatch_tool` directly
-  with no recovery (a flaky tool failed permanently where it would
-  recover elsewhere), and the parallel paths fired observer/detection/
-  hook side-effects once on the final result while sequential fired
-  them per retry attempt — diverging loop-detection sensitivity, health
-  inputs, and observer event counts by dispatch mode. The entire
-  dispatch machinery is now one function (`execute_tool_call`) that owns
-  the full lifecycle (PRE → dispatch → POST → recovery loop) with
-  mid-flight cancel via `tokio::select!`. Sequential and parallel both
-  call it, so there is exactly one definition of "execute a tool call"
-  — no divergence is possible. Six functions (`parallel_pre_phase`,
-  `parallel_exec_phase`, `parallel_post_phase`, `parallel_run_remaining`,
-  `run_parallel_task`, `dispatch_tool_with_recovery`) collapsed into one
-  `execute_tool_call` + two thin dispatch loops.
-- OpenAI streaming silently dropped every multi-chunk tool-call argument
-  fragment after the first, truncating the tool input JSON. The
-  deserialization structs declared `id` (on the tool-call delta) and
-  `name` (on the function object) as required `String` fields, but the
-  real OpenAI streaming protocol omits both on continuation chunks —
-  those carry only `index` and an `arguments` fragment. Serde rejected
-  those chunks with `missing field`, `OpenAiChunk::parse` returned
-  `None`, and the stream loop silently skipped them, leaving the
-  accumulated JSON incomplete. Both fields are now `Option<String>` with
-  `#[serde(default)]`; the emitter latches `id` and `name` on the first
-  chunk for each `index` and ignores them on continuations.
-- OpenAI streaming re-opened a tool-call part on every chunk carrying a
-  `function` field. Because every chunk (including argument-fragment
-  continuations) carries `function`, the `StreamEmitter` emitted
-  `PartStart` for each one, which wiped the downstream accumulator's
-  buffered JSON. The emitter now tracks each tool call's `index` and
-  emits `PartStart` exactly once per call.
-- `StreamAccumulator` dropped parallel tool calls whose argument fragments
-  arrived interleaved (the shape OpenAI streams for
-  `parallel_tool_calls`). The accumulator tracked a single in-progress
-  part, so a second `PartStart` arriving before the first `PartStop`
-  overwrote the first call's buffer, and `IndexedDelta` fragments whose
-  `index` did not match the single current slot were silently dropped.
-  It now holds a `Vec` of open slots keyed by `index`, routes each delta
-  to the matching slot, and flushes slots in `PartStart` arrival order
-  (FIFO) on `PartStop`. Anthropic (strictly sequential) and Gemini
-  (atomic per-chunk tool calls) are unaffected.
-- `BareLoop` was permanently dead after a single cancellation. Once
-  `cancel()` fired, the `CancelSignal` (a one-shot
-  `CancellationToken`) stayed cancelled forever, so every subsequent
-  `run()` returned `LoopError::Cancelled` immediately. `run()` now
-  re-arms the signal in `finalize()` — the single chokepoint every run
-  exit path passes through — so the next `run()` starts clean. A cancel
-  that arrives *before* a run still cancels that run (the signal is
-  cleared only after the run observes it and returns), preserving the
-  pre-run-cancel contract.
-- A turn's tool results were split across multiple consecutive user
-  messages instead of merged into one. Unknown-tool results (preresolved
-  by the machine) each arrived as their own user `Message`, and the
-  dispatched known-tool results arrived as another, so the loop pushed
-  them into history as separate entries. `BareLoop::handle_call_tools`
-  now collects all tool-result parts for a turn — preresolved plus
-  dispatched — into a single user `Message` before feeding it to the
-  machine, so a turn with any mix of unknown and known tools produces
-  exactly one user message regardless of how the results were produced.
-  `build_tool_result_message` is renamed to `build_tool_result_parts`
-  and now returns `Vec<MessagePart>` (it no longer wraps the parts in a
-  throwaway `Message`).
-- `StreamHandler` silently accepted invalid timeout and retry configs.
-  `StreamTimeoutConfig::validate` and `StreamRetryConfig::validate`
-  existed but were never called in production — only
-  `RateLimitConfig::validate` was wired into its builder. A
-  misconfiguration that disabled timeouts or inverted the retry ceiling
-  (e.g. `total_stream_timeout` less than `initial_event_timeout`, zero
-  delays) was stored as-is. The new `with_timeout_config` and
-  `with_retry_config` builders validate each config and fall back to the
-  default on an invalid value.
-- `StreamRetryConfig::jitter_factor` was validated but never applied —
-  the transport-retry backoff used the raw exponential delay with no
-  jitter, so concurrent retries landed on the same tick (thundering herd).
-  `jittered_base_delay` now applies the factor and is the delay
-  `StreamHandler` sleeps between attempts.
-- The empty-stream fast-fail promised in the `max_consecutive_timeouts`
-  docs was never implemented: `next_event` applied the full threshold
-  unconditionally, so a stream that never produced a single event could
-  hang for `max_consecutive_timeouts` × `initial_event_timeout` (~20 min
-  with defaults) before failing. The lower threshold (`min(2,
-  max_consecutive_timeouts)`) is now applied when zero events have been
-  received, matching the documented behavior.
-- `ToolHealthRegistry::is_tool_available` consumed the HalfOpen recovery
-  probe as a side effect of the read: it called
-  [`allow_request`](ToolCircuitBreaker::allow_request), which performs the
-  Open→HalfOpen transition, so a bare availability check (or
-  [`resolve_tool`](HealthRouter::resolve_tool)) wasted the single probe slot
-  and blocked the real dispatch that followed. It now uses pure-read
-  helpers (`would_allow_request` / `would_be_half_open`) that observe the
-  decision without the transition.
-- The Anthropic provider hardcoded text content blocks to part index 0,
-  ignoring the server-supplied block index. Tool and thinking blocks used
-  the real index, so a response ordering like `[tool_use@0, text@1]` made
-  the text deltas collide with the tool-call's index 0. Text blocks now
-  track and emit at the server index (mirroring the tool/thinking lanes),
-  eliminating the collision.
+- OpenAI streaming dropped multi-chunk tool-call argument fragments after the
+  first; re-opened tool-call parts on every chunk carrying `function`.
+- `StreamAccumulator` dropped parallel tool calls whose arguments arrived
+  interleaved.
+- `BareLoop` was permanently dead after a single cancellation (`CancelSignal`
+  not re-armed). Now resets in `finalize()`.
+- Tool results were split across multiple user messages instead of merged into
+  one per turn.
+- `StreamHandler` accepted invalid timeout/retry configs (validation never
+  called); `jitter_factor` was validated but never applied.
+- Empty-stream fast-fail: zero-event streams could hang for ~20 min before
+  failing.
+- `ToolHealthRegistry::is_tool_available` consumed the HalfOpen recovery probe
+  as a side effect of a read.
+- Anthropic provider hardcoded text-block index to 0, ignoring server index.
+- Per-run manager reset wiped session-scoped state between runs.
 
 ### Security
 
-- The auto-commit hook's `GitExecutor::stage_files` ran `git add -A`
-  when called with an empty file list — the default configuration
-  (`AutoCommitConfig::files` defaults to `vec![]`, and a session with no
-  recorded modifications passes `None`, which falls back to that empty
-  list). This staged and committed the entire working tree on every
-  session end: unrelated user edits, scratch files, and secrets such as
-  `.env` and credentials. The empty-list branch now refuses with a
-  `GitExecutorError::GitError` instead of broadening scope; callers must
-  populate `AutoCommitConfig::files` or rely on the hook's per-session
-  modification tracking. Misconfiguration now fails loudly rather than
-  silently committing everything.
-- The `MAX_RESPONSE_BODY` guard (10 MB) on non-streaming provider responses
-  fired *after* the body was fully materialized — every provider called
-  `resp.bytes().await` then checked the length, so a hostile or misbehaving
-  server returning a multi-GB body could exhaust memory before the guard
-  rejected it. A shared `read_bounded_body` now pre-checks `Content-Length`
-  (rejecting without reading a byte when it exceeds the cap) and reads
-  chunked-transfer responses with a running cap, so peak memory never
-  exceeds the limit by more than one chunk. Replaces the post-hoc
-  `check_response_body` across OpenAI, Anthropic, and Gemini.
+- Auto-commit hook's `git add -A` on empty file list staged the entire working
+  tree. Now refuses with an error.
+- Non-streaming response body size guard (10 MB) fired after full
+  materialization. Now pre-checks `Content-Length` and caps streaming reads.
 
 ## [0.1.0] - 2025-07-01
 

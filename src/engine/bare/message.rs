@@ -23,7 +23,9 @@ impl<C: ApiClient> BareLoop<C> {
     pub(super) fn build_tool_result_parts(results: Vec<ToolDispatchResult>) -> Vec<MessagePart> {
         results
             .into_iter()
-            .map(|r| MessagePart::tool_result(r.tool_call_id, r.output, r.is_error))
+            .map(|r| {
+                MessagePart::tool_result(r.tool_call_id, r.resolved_tool_name, r.output, r.is_error)
+            })
             .collect()
     }
 

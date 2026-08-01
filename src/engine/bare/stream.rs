@@ -79,8 +79,9 @@ impl<C: ApiClient> BareLoop<C> {
                 HandlerEvent::Fallback {
                     message,
                     stop_reason: fallback_stop_reason,
+                    usage: fallback_usage,
                 } => {
-                    return Ok((message, None, fallback_stop_reason));
+                    return Ok((message, fallback_usage, fallback_stop_reason));
                 }
             }
         }
@@ -197,9 +198,19 @@ mod tests {
             &self,
             _request: &crate::api::StreamRequest,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
         > {
-            Box::pin(async { Ok(serde_json::json!({})) })
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(""),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
     }
 

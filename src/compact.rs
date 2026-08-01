@@ -70,8 +70,106 @@ pub use types::{
     EnsureContextResult, PostCompactStats, PreCompactStats,
 };
 
-/// Strategy trait for compacting a conversation's message history.
+/// Strategy for estimating the token cost of a message slice.
 ///
+/// The engine uses a token counter in two places: the driver estimates the
+/// context size after each model response (to decide whether to trigger
+/// compaction), and the compactor estimates the size of the compacted
+/// history (to report `tokens_after` and verify progress). Both must use the
+/// same counter so the before/after comparison is consistent — mixing a
+/// provider's billed token count with a heuristic estimate causes
+/// compaction flapping.
+///
+/// The default implementation, [`HeuristicTokenCounter`], uses a
+/// characters-per-token ratio and is intentionally conservative (it
+/// overestimates rather than underestimates). For production accuracy,
+/// implement this trait on top of a real tokenizer (e.g. `tiktoken` for
+/// OpenAI) and attach it via
+/// [`BareLoop::set_token_counter`](crate::engine::BareLoop::set_token_counter)
+/// and
+/// [`ContextManager::with_token_counter`](ContextManager::with_token_counter).
+///
+/// # Example
+///
+/// ```rust
+/// use loopctl::compact::{TokenCounter, HeuristicTokenCounter};
+/// use loopctl::message::Message;
+///
+/// let counter = HeuristicTokenCounter;
+/// let tokens = counter.count(&[Message::user("hello world")]);
+/// assert!(tokens > 0);
+/// ```
+pub trait TokenCounter: Send + Sync {
+    /// Estimate the token count for a slice of messages.
+    ///
+    /// The count should include all message content the counter considers
+    /// part of the context — text, tool calls, tool results — but the exact
+    /// set depends on the implementation. The only requirement is
+    /// consistency: the same counter must be used on both the trigger and
+    /// the post-compaction path.
+    fn count(&self, messages: &[Message]) -> u64;
+}
+
+/// A zero-dependency token estimator using a characters-per-token ratio.
+///
+/// Counts the character length of all message parts (text, tool calls, tool
+/// results), adds a fixed per-message overhead for role tags and formatting,
+/// and divides by 4 (`CHARS_PER_TOKEN`). Conservative — overestimates rather
+/// than underestimates, so compaction triggers slightly early rather than
+/// late. Accuracy is roughly ±30% on real content; for production use,
+/// swap in a real tokenizer via the [`TokenCounter`] trait.
+///
+/// # Example
+///
+/// ```rust
+/// use loopctl::compact::{HeuristicTokenCounter, TokenCounter};
+/// use loopctl::message::Message;
+///
+/// let counter = HeuristicTokenCounter;
+/// let tokens = counter.count(&[
+///     Message::user("hello"),
+///     Message::assistant("hi there"),
+/// ]);
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct HeuristicTokenCounter;
+
+impl TokenCounter for HeuristicTokenCounter {
+    fn count(&self, messages: &[Message]) -> u64 {
+        const CHARS_PER_TOKEN: u64 = 4;
+        const MESSAGE_OVERHEAD_CHARS: u64 = 20;
+        let total_chars: u64 = messages
+            .iter()
+            .map(|m| {
+                let part_chars: u64 = m
+                    .parts
+                    .iter()
+                    .map(|p| match p {
+                        MessagePart::Text { text } => text.chars().count() as u64,
+                        MessagePart::Image { .. } => 256,
+                        MessagePart::ToolCall { name, input, .. } => (name.chars().count() as u64)
+                            .saturating_add(input.to_string().chars().count() as u64),
+                        MessagePart::ToolResult { output, .. } => match output {
+                            crate::message::ToolContent::Text(s) => s.chars().count() as u64,
+                            crate::message::ToolContent::Multipart(parts) => parts
+                                .iter()
+                                .map(|p| match p {
+                                    crate::message::ToolContentPart::Text { text } => {
+                                        text.chars().count() as u64
+                                    }
+                                    crate::message::ToolContentPart::Image { .. } => 256,
+                                })
+                                .sum(),
+                        },
+                    })
+                    .sum();
+                MESSAGE_OVERHEAD_CHARS.saturating_add(part_chars)
+            })
+            .sum();
+        total_chars / CHARS_PER_TOKEN
+    }
+}
+
 /// Implementations define *how* to reduce a message list — truncation,
 /// summarization, Q&A extraction, etc. The framework calls
 /// [`compact`](ContextCompactor::compact) when the [`ContextManager`]
@@ -177,7 +275,7 @@ pub trait ContextCompactor: Send + Sync {
 pub enum CompactBase {
     /// Target is a percentage of the full context window.
     ///
-    /// `target = context_window × compact_target_pct`
+    /// `target = context_window × compact_target_pct / 100`
     ///
     /// Use this when you want compaction to aim for a fixed fraction
     /// of the model's total capacity regardless of the trigger threshold.
@@ -185,11 +283,11 @@ pub enum CompactBase {
 
     /// Target is a percentage of the trigger threshold.
     ///
-    /// `target = compact_threshold_tokens × compact_target_pct / 10_000`
+    /// `target = compact_threshold_tokens × compact_target_pct / 100`
     ///
     /// This is the default. With the default `threshold = 80` (80%) and
     /// `compact_target_pct = 70` (70%), compaction targets 56% of the
-    /// context window.
+    /// context window (`0.8 × 0.7 = 0.56`).
     #[default]
     Threshold,
 }
@@ -228,7 +326,7 @@ pub enum CompactBase {
 ///     Message::user("Hi"),
 ///     Message::assistant("Hello!"),
 /// ];
-/// let tokens = ContextManager::estimate_tokens(&messages);
+/// let tokens = manager.estimate_tokens(&messages);
 /// assert!(!manager.should_compact(tokens));
 /// ```
 #[derive(Clone)]
@@ -282,6 +380,15 @@ pub struct ContextManager {
     /// Defaults to `70` (70%); set and clamped to `[1, 100]` via
     /// [`with_compact_target_pct`](Self::with_compact_target_pct).
     compact_target: u8,
+
+    /// Token counter used for all size estimates.
+    ///
+    /// Both the compaction trigger (checked by the driver before each model
+    /// call) and the post-compaction verification use this counter, ensuring
+    /// the before/after comparison is consistent. Defaults to
+    /// [`HeuristicTokenCounter`]; swap in a real tokenizer via
+    /// [`with_token_counter`](Self::with_token_counter).
+    token_counter: Arc<dyn TokenCounter>,
 }
 
 impl ContextManager {
@@ -296,6 +403,7 @@ impl ContextManager {
     /// | `auto_compact`       | `true`                       |
     /// | `compact_target`     | [`CompactBase::Threshold`]   |
     /// | `compact_target_pct` | 70 (70%)                     |
+    /// | `token_counter`      | [`HeuristicTokenCounter`]    |
     #[must_use]
     pub fn new(compactor: Arc<dyn ContextCompactor>) -> Self {
         Self {
@@ -305,7 +413,29 @@ impl ContextManager {
             auto_compact: true,
             compact_base: CompactBase::Threshold,
             compact_target: 70,
+            token_counter: Arc::new(HeuristicTokenCounter),
         }
+    }
+
+    /// Set the token counter used for size estimates (builder-style).
+    ///
+    /// Both the compaction trigger and the post-compaction verification will
+    /// use this counter. Use this to plug in a real tokenizer (e.g.
+    /// `tiktoken` for OpenAI) for more accurate estimates than the default
+    /// [`HeuristicTokenCounter`].
+    #[must_use]
+    pub fn with_token_counter(mut self, counter: Arc<dyn TokenCounter>) -> Self {
+        self.token_counter = counter;
+        self
+    }
+
+    /// Borrow the token counter.
+    ///
+    /// Exposed so the driver can use the same counter for its pre-model
+    /// estimate, keeping the trigger and post-compaction paths consistent.
+    #[must_use]
+    pub fn token_counter(&self) -> &Arc<dyn TokenCounter> {
+        &self.token_counter
     }
 
     /// Set the model's context window size.
@@ -418,8 +548,8 @@ impl ContextManager {
     /// Computed from [`compact_target`](Self::compact_target) and
     /// [`compact_target_pct`](Self::compact_target_pct):
     ///
-    /// - [`CompactBase::Threshold`]: `compact_threshold_tokens × pct`
-    /// - [`CompactBase::Context`]: `context_window × pct`
+    /// - [`CompactBase::Threshold`]: `compact_threshold_tokens × pct / 100`
+    /// - [`CompactBase::Context`]: `context_window × pct / 100`
     #[must_use]
     pub fn compact_target_tokens(&self) -> u64 {
         let base: u64 = match self.compact_base {
@@ -429,52 +559,15 @@ impl ContextManager {
         base.saturating_mul(u64::from(self.compact_target)) / 100
     }
 
-    /// Estimate the token count for a slice of messages.
+    /// Estimate the token count for a slice of messages using the
+    /// configured [`TokenCounter`].
     ///
-    /// Uses a 4-chars-per-token heuristic based on the text content
-    /// of all message parts. Conservative — overestimates rather than underestimates.
-    ///
-    /// The estimation:
-    /// - Counts text content from all parts (text, tool calls, tool results).
-    /// - Adds a fixed overhead per message (role tags, formatting).
-    /// - Divides total character count by 4.
+    /// Delegates to [`token_counter`](Self::token_counter), so both the
+    /// compaction trigger (driver-side) and the post-compaction check
+    /// (compactor-side) use the same estimation strategy.
     #[must_use]
-    pub fn estimate_tokens(messages: &[Message]) -> u64 {
-        const CHARS_PER_TOKEN: u64 = 4;
-        const MESSAGE_OVERHEAD_CHARS: u64 = 20; // role tags, newlines, etc.
-        let total_chars: u64 = messages
-            .iter()
-            .map(|m| {
-                let part_chars: u64 = m
-                    .parts
-                    .iter()
-                    .map(|p| match p {
-                        MessagePart::Text { text } => text.chars().count() as u64,
-                        MessagePart::Image { .. } => 256, // rough base64 estimate
-                        MessagePart::ToolCall { name, input, .. } => {
-                            let name_len = name.len() as u64;
-                            let input_len = input.to_string().len() as u64;
-                            name_len.saturating_add(input_len)
-                        }
-                        MessagePart::ToolResult { output, .. } => match output {
-                            crate::message::ToolContent::Text(s) => s.len() as u64,
-                            crate::message::ToolContent::Multipart(parts) => parts
-                                .iter()
-                                .map(|p| match p {
-                                    crate::message::ToolContentPart::Text { text } => {
-                                        text.len() as u64
-                                    }
-                                    crate::message::ToolContentPart::Image { .. } => 256,
-                                })
-                                .sum(),
-                        },
-                    })
-                    .sum();
-                MESSAGE_OVERHEAD_CHARS.saturating_add(part_chars)
-            })
-            .sum();
-
-        total_chars / CHARS_PER_TOKEN
+    pub fn estimate_tokens(&self, messages: &[Message]) -> u64 {
+        self.token_counter.count(messages)
     }
 
     /// Check whether compaction should be triggered for the given token count.
@@ -533,7 +626,7 @@ impl ContextManager {
         messages: Vec<Message>,
         turn: usize,
     ) -> Result<EnsureContextResult, ContextOverflow> {
-        let tokens_before = Self::estimate_tokens(&messages);
+        let tokens_before = self.estimate_tokens(&messages);
 
         if !self.should_compact(tokens_before) {
             return Ok(EnsureContextResult::NoAction(messages));
@@ -547,6 +640,7 @@ impl ContextManager {
             reason,
             context_window: self.context_window,
             turn,
+            counter: Arc::clone(&self.token_counter),
         };
         let outcome = self
             .compactor
@@ -563,7 +657,7 @@ impl ContextManager {
             });
         }
 
-        let tokens_after = Self::estimate_tokens(&outcome.messages);
+        let tokens_after = self.estimate_tokens(&outcome.messages);
         if tokens_after > self.context_window {
             return Err(ContextOverflow {
                 tokens_used: tokens_after,
@@ -611,7 +705,7 @@ impl ContextManager {
         turn: usize,
         reason: CompactReason,
     ) -> Result<EnsureContextResult, ContextOverflow> {
-        let tokens_before = Self::estimate_tokens(&messages);
+        let tokens_before = self.estimate_tokens(&messages);
 
         if messages.is_empty() {
             return Ok(EnsureContextResult::NoAction(messages));
@@ -624,6 +718,7 @@ impl ContextManager {
             reason,
             context_window: self.context_window,
             turn,
+            counter: Arc::clone(&self.token_counter),
         };
         let outcome = self
             .compactor
@@ -668,8 +763,8 @@ impl ContextManager {
         post_messages: &[Message],
         start: Instant,
     ) -> CompactTelemetry {
-        let pre_tokens = Self::estimate_tokens(pre_messages);
-        let post_tokens = Self::estimate_tokens(post_messages);
+        let pre_tokens = CompactionOutcome::estimate_tokens(pre_messages);
+        let post_tokens = CompactionOutcome::estimate_tokens(post_messages);
         let tokens_saved = pre_tokens.saturating_sub(post_tokens);
         let percent_saved: u8 = tokens_saved
             .checked_mul(100)
@@ -734,21 +829,24 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens_empty() {
-        assert_eq!(ContextManager::estimate_tokens(&[]), 0);
+        let manager = ContextManager::new(Arc::new(TruncatingCompactor::new()));
+        assert_eq!(manager.estimate_tokens(&[]), 0);
     }
 
     #[test]
     fn test_estimate_tokens_single_message() {
+        let manager = ContextManager::new(Arc::new(TruncatingCompactor::new()));
         let msgs = vec![Message::user("Hello, world!")];
-        let tokens = ContextManager::estimate_tokens(&msgs);
-        // 13 chars + 20 overhead = 33 chars / 4 = 8 tokens
+        let tokens = manager.estimate_tokens(&msgs);
+        // 13 chars + 20 overhead = 33 chars / 4 = 8 tokens (integer division)
         assert_eq!(tokens, 8);
     }
 
     #[test]
     fn test_estimate_tokens_multi_message() {
+        let manager = ContextManager::new(Arc::new(TruncatingCompactor::new()));
         let msgs = make_conversation(3);
-        let tokens = ContextManager::estimate_tokens(&msgs);
+        let tokens = manager.estimate_tokens(&msgs);
         assert!(tokens > 0);
     }
 
@@ -912,10 +1010,11 @@ mod tests {
             .with_preserve_recent(4);
         let msgs = make_conversation(2); // 4 messages
         let context = CompactionContext {
-            tokens_before: ContextManager::estimate_tokens(&msgs),
+            tokens_before: CompactionOutcome::estimate_tokens(&msgs),
             reason: CompactReason::ThresholdExceeded,
             context_window: 1_000,
             turn: 1,
+            counter: Arc::new(HeuristicTokenCounter),
         };
         let outcome = compactor.compact(msgs.clone(), 500, context).await;
         assert!(outcome.success);
@@ -929,12 +1028,13 @@ mod tests {
             .with_preserve_recent(2);
         let msgs = make_conversation(10); // 20 messages
         let first_role = msgs.first().map(|m| m.role);
-        let tokens_before = ContextManager::estimate_tokens(&msgs);
+        let tokens_before = CompactionOutcome::estimate_tokens(&msgs);
         let context = CompactionContext {
             tokens_before,
             reason: CompactReason::ThresholdExceeded,
             context_window: 1_000,
             turn: 5,
+            counter: Arc::new(HeuristicTokenCounter),
         };
         let outcome = compactor.compact(msgs, 500, context).await;
         assert!(outcome.success);

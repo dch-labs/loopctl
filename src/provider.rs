@@ -58,6 +58,8 @@
 use crate::api::error::ApiError;
 #[cfg(any(feature = "anthropic", feature = "gemini"))]
 use crate::message::{MessagePart, Role};
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+use futures::StreamExt;
 use std::time::Duration;
 
 // SSE line-framing shared by every streaming provider. Each provider keeps
@@ -69,25 +71,57 @@ mod sse;
 /// Maximum accepted response body size (10 MB).
 ///
 /// Guards against unbounded memory growth from a misbehaving or hostile
-/// provider that returns a very large non-streaming response.
+/// provider that returns a very large non-streaming response. Enforced
+/// *before* the body is fully materialized — see
+/// [`read_bounded_body`](crate::provider::read_bounded_body).
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 pub(super) const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024;
 
-/// Reject a response body that exceeds [`MAX_RESPONSE_BODY`].
+/// Read a response body, rejecting it before peak memory is exceeded.
 ///
-/// Shared guard used by every provider's non-streaming path.
+/// Shared guard used by every provider's non-streaming path. Two checks
+/// bound memory:
+///
+/// 1. **Pre-read (`Content-Length`)** — when the header is present and
+///    exceeds [`MAX_RESPONSE_BODY`], the body is rejected without reading a
+///    single byte. A hostile provider advertising a huge body never allocates
+///    it.
+/// 2. **Streaming cap** — for responses without `Content-Length` (chunked
+///    transfer), the body is read chunk by chunk and the read aborts the
+///    moment the running total crosses [`MAX_RESPONSE_BODY`], so peak memory
+///    never exceeds the cap by more than one chunk.
+///
+/// Replaces the old `resp.bytes().await` + post-hoc length check, which
+/// materialized the full body before the guard could fire.
 ///
 /// # Errors
 ///
-/// Returns [`ApiError`] when `len` exceeds [`MAX_RESPONSE_BODY`].
+/// Returns [`ApiError`] when the body exceeds [`MAX_RESPONSE_BODY`] (either
+/// via the header pre-check or the streaming cap), or on a transport error
+/// reading the body.
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
-pub(super) fn check_response_body(len: usize) -> Result<(), ApiError> {
-    if len > MAX_RESPONSE_BODY {
+pub(super) async fn read_bounded_body(resp: reqwest::Response) -> Result<bytes::Bytes, ApiError> {
+    if let Some(len) = resp.content_length()
+        && usize::try_from(len).map_or(true, |n| n > MAX_RESPONSE_BODY)
+    {
         return Err(ApiError::http(format!(
-            "response body too large: {len} bytes (max {MAX_RESPONSE_BODY})"
+            "response body too large: declared {len} bytes (max {MAX_RESPONSE_BODY})"
         )));
     }
-    Ok(())
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| ApiError::http(format!("error reading response body: {e}")))?;
+        buf.extend_from_slice(&chunk);
+        if buf.len() > MAX_RESPONSE_BODY {
+            return Err(ApiError::http(format!(
+                "response body too large: streamed {} bytes (max {MAX_RESPONSE_BODY})",
+                buf.len()
+            )));
+        }
+    }
+    Ok(buf.into())
 }
 
 /// Shared HTTP-client configuration embedded by every provider builder.
@@ -239,6 +273,18 @@ impl HttpClientConfig {
     #[must_use]
     pub(super) fn with_tcp_keepalive(mut self, d: Duration) -> Self {
         self.tcp_keepalive = Some(d);
+        self
+    }
+
+    /// Control whether `TCP_NODELAY` is set on connections.
+    ///
+    /// Defaults to `true` — SSE streaming emits many small packets, and
+    /// Nagle's algorithm coalesces them, adding latency per delta. Pass
+    /// `false` to re-enable Nagle's algorithm (rarely needed). Ignored when
+    /// an external client was supplied.
+    #[must_use]
+    pub(super) fn with_tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.tcp_nodelay = enabled;
         self
     }
 
@@ -464,6 +510,7 @@ pub fn ollama(model: &str) -> Result<OpenAiClient, ApiError> {
         .with_api_key(api_key)
         .with_base_url(base)
         .with_model(model)
+        .with_stream_usage(false)
         .build()
 }
 
@@ -968,6 +1015,12 @@ mod tests {
     }
 
     #[test]
+    fn with_tcp_nodelay_can_disable() {
+        let config = HttpClientConfig::default().with_tcp_nodelay(false);
+        assert!(!config.tcp_nodelay);
+    }
+
+    #[test]
     fn injected_client_ignores_pool_knobs() {
         let shared = reqwest::Client::new();
         let config = HttpClientConfig::default()
@@ -975,5 +1028,70 @@ mod tests {
             .with_pool_max_idle_per_host(4)
             .with_pool_idle_timeout(Duration::from_secs(30));
         assert!(config.build().is_ok());
+    }
+
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+    async fn serve_once(
+        status: u16,
+        headers: String,
+        body: Vec<u8>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            drop(sock.read(&mut buf).await);
+            let extra = if headers.is_empty() {
+                String::new()
+            } else {
+                format!("{headers}\r\n")
+            };
+            let head = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Length: {clen}\r\n{extra}\r\n",
+                clen = body.len(),
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(&body).await);
+            drop(sock.flush().await);
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+    async fn get_response(url: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .expect("request to test server must succeed")
+    }
+
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+    #[tokio::test]
+    async fn read_bounded_body_accepts_under_limit() {
+        let body = b"{\"ok\":true}".to_vec();
+        let (url, handle) = serve_once(200, String::new(), body.clone()).await;
+        let resp = get_response(&url).await;
+        let bytes = read_bounded_body(resp).await.expect("small body must pass");
+        assert_eq!(bytes.as_ref(), body.as_slice());
+        handle.await.unwrap();
+    }
+
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+    #[tokio::test]
+    async fn read_bounded_body_rejects_oversized_content_length() {
+        let body = vec![b'x'; MAX_RESPONSE_BODY + 1];
+        let (url, handle) = serve_once(200, String::new(), body).await;
+        let resp = get_response(&url).await;
+        let err = read_bounded_body(resp)
+            .await
+            .expect_err("oversized body must reject");
+        assert!(
+            err.to_string().contains("too large"),
+            "expected a too-large error, got: {err}"
+        );
+        handle.await.unwrap();
     }
 }

@@ -40,6 +40,7 @@
 use crate::error::LoopError;
 use crate::memory::{ConsolidationStats, LoopMemory, MemoryEntry};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::RwLock;
 
 /// A simple in-memory store for loop memory entries.
@@ -173,27 +174,28 @@ impl Default for InMemoryStore {
     }
 }
 
-#[allow(clippy::manual_async_fn)]
 impl LoopMemory for InMemoryStore {
     /// Store a new memory entry by appending it to the backing list.
     ///
-    /// Called whenever the agent encounters information worth remembering —
-    /// for example after a successful tool invocation, a resolved error, or
-    /// an insight drawn from conversation.
+    /// Called by the engine after every successful tool call to record the
+    /// trajectory — what tool ran, with what input, and what it returned.
     ///
     /// # Errors
     ///
     /// This implementation never returns an error.
-    fn store(&self, entry: MemoryEntry) -> impl Future<Output = Result<(), LoopError>> + Send {
-        async move {
+    fn store(
+        &self,
+        entry: MemoryEntry,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>> {
+        Box::pin(async move {
             crate::error::recover_guard(self.entries.write()).push(entry);
             Ok(())
-        }
+        })
     }
 
     /// Retrieve memory entries relevant to the given query.
     ///
-    /// Called before each turn (or on demand) to surface context the agent
+    /// Called by the engine before each turn to surface context the agent
     /// can use. Returns up to `limit` entries ordered by a composite score
     /// that blends:
     ///
@@ -226,13 +228,13 @@ impl LoopMemory for InMemoryStore {
     /// }
     /// # });
     /// ```
-    fn retrieve(
-        &self,
-        query: &str,
+    fn retrieve<'a>(
+        &'a self,
+        query: &'a str,
         limit: usize,
-    ) -> impl Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + 'a>> {
         let query = query.to_string();
-        async move {
+        Box::pin(async move {
             let query_lower = query.to_lowercase();
             let query_words: Vec<&str> = query_lower.split_whitespace().collect();
 
@@ -269,13 +271,13 @@ impl LoopMemory for InMemoryStore {
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
             Ok(scored.into_iter().take(limit).map(|(_, e)| e).collect())
-        }
+        })
     }
 
     /// Consolidate memory by pruning low-relevance entries.
     ///
-    /// Called periodically by the framework to keep the memory store healthy.
-    /// This implementation removes entries whose
+    /// Called by the engine at the end of each successful run to keep the
+    /// memory store healthy. This implementation removes entries whose
     /// [`relevance`](MemoryEntry::relevance) score has decayed below 0.05.
     /// It does **not** perform merging — [`merged`](ConsolidationStats::merged)
     /// and [`bytes_saved`](ConsolidationStats::bytes_saved) are always zero.
@@ -297,8 +299,10 @@ impl LoopMemory for InMemoryStore {
     /// println!("Pruned {} entries", stats.pruned);
     /// # });
     /// ```
-    fn consolidate(&self) -> impl Future<Output = Result<ConsolidationStats, LoopError>> + Send {
-        async move {
+    fn consolidate(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
+        Box::pin(async move {
             let mut entries = crate::error::recover_guard(self.entries.write());
             let entries_before = entries.len();
             entries.retain(|e| e.relevance >= 0.05);
@@ -310,13 +314,13 @@ impl LoopMemory for InMemoryStore {
                 merged: 0,
                 bytes_saved: 0,
             })
-        }
+        })
     }
 
     /// Number of entries currently stored.
     ///
-    /// Used by the framework to monitor memory usage and by the
-    /// [`is_empty`](LoopMemory::is_empty) provided method.
+    /// Used by [`is_empty`](LoopMemory::is_empty) and reported by the
+    /// engine's consolidate hook after each run.
     fn len(&self) -> usize {
         crate::error::recover_guard(self.entries.read()).len()
     }
@@ -326,6 +330,7 @@ impl LoopMemory for InMemoryStore {
 mod tests {
     use super::*;
     use crate::memory::MemoryCategory;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_store_and_retrieve() {
@@ -501,5 +506,22 @@ mod tests {
         assert!((results[0].relevance - 0.95).abs() < 1e-6);
         assert!((results[1].relevance - 0.5).abs() < 1e-6);
         assert!((results[2].relevance - 0.1).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn loop_memory_round_trips() {
+        use crate::memory::{LoopMemory, MemoryCategory, MemoryEntry};
+        let store: Arc<dyn LoopMemory> = Arc::new(InMemoryStore::new());
+        store
+            .store(MemoryEntry::new(MemoryCategory::Trajectory, "tool result"))
+            .await
+            .unwrap();
+        assert_eq!(store.len(), 1);
+        let results = store.retrieve("tool", 5).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].memory.contains("tool result"));
+        let stats = store.consolidate().await.unwrap();
+        assert_eq!(stats.entries_after, 1);
+        assert!(!store.is_empty());
     }
 }

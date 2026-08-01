@@ -33,7 +33,7 @@ use crate::api::error::ApiError;
 use crate::message::{Message, MessagePart, Role};
 use crate::stream::{
     DeltaPart, IndexedDelta, MessageDelta, MessageDeltaPayload, MessageMetadata, MessageStart,
-    PartStart, StreamEvent, StreamStopReason,
+    PartStart, StreamEvent, StreamStopReason, Usage,
 };
 use crate::structured::ToolConstraint;
 use crate::structured::tighten_json_schema;
@@ -81,6 +81,13 @@ pub struct OpenAiClient {
     /// [`FallbackManager`](crate::fallback::FallbackManager) trips to a
     /// fallback model.
     model: std::sync::Mutex<String>,
+
+    /// Whether to request `stream_options.include_usage` on streaming requests.
+    ///
+    /// Defaults to `true` (real OpenAI supports it). Disabled for
+    /// OpenAI-compatible servers that reject the parameter via
+    /// [`OpenAiClientBuilder::with_stream_usage`].
+    stream_usage: bool,
 }
 
 impl OpenAiClient {
@@ -150,6 +157,75 @@ impl OpenAiClient {
     /// `*_with_options` variants) POST to this URL.
     fn completions_url(&self) -> String {
         format!("{}/chat/completions", self.base_url)
+    }
+
+    /// Build a typed [`NonStreamingResponse`] from OpenAI's native JSON.
+    ///
+    /// Reads `choices[0].message` into [`MessagePart`]s: the `content`
+    /// string becomes a [`MessagePart::Text`] part (skipped when `null`),
+    /// and each entry in `tool_calls` becomes a [`MessagePart::ToolCall`]
+    /// with its `function.arguments` JSON-string parsed into a [`Value`].
+    /// Maps `choices[0].finish_reason` to a [`StreamStopReason`] using the
+    /// same mapping the streaming emitter applies (`"tool_calls"` →
+    /// `ToolCall`, `"length"` → `MaxTokens`, anything else via
+    /// [`StreamStopReason::from_api_str`], defaulting to `EndTurn`). Reads
+    /// `usage.prompt_tokens` / `usage.completion_tokens` into [`Usage`],
+    /// returning `None` when the object is absent or all-zero. Missing or
+    /// empty `function.arguments` default to `{}`; non-empty arguments that
+    /// fail to parse as JSON return an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] if a tool call's `function.arguments` is present,
+    /// non-empty, and not valid JSON.
+    fn build_response(raw: &Value) -> Result<crate::api::NonStreamingResponse, ApiError> {
+        let choice = raw.get("choices").and_then(|c| c.get(0));
+        let message = choice.and_then(|c| c.get("message"));
+        let mut parts: Vec<MessagePart> = Vec::new();
+        if let Some(msg) = message {
+            if let Some(text) = msg.get("content").and_then(|t| t.as_str()) {
+                parts.push(MessagePart::text(text));
+            }
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                for tc in tool_calls {
+                    let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let function = tc.get("function");
+                    let name = function
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let input = match function
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|a| a.as_str())
+                    {
+                        None | Some("") => serde_json::json!({}),
+                        Some(s) => serde_json::from_str::<Value>(s).map_err(|e| {
+                            ApiError::http(format!("tool_call arguments is not valid JSON: {e}"))
+                        })?,
+                    };
+                    parts.push(MessagePart::tool_call(id, name, input));
+                }
+            }
+        }
+        let reason = choice
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("stop");
+        let stop_reason = match reason {
+            "tool_calls" => StreamStopReason::ToolCall,
+            "length" => StreamStopReason::MaxTokens,
+            other => StreamStopReason::from_api_str(other).unwrap_or(StreamStopReason::EndTurn),
+        };
+        let usage = raw
+            .get("usage")
+            .and_then(|u| OpenAiUsage::deserialize(u).ok())
+            .map(|u| Usage::from(&u))
+            .filter(|u| u.input_tokens > 0 || u.output_tokens > 0);
+        Ok(crate::api::NonStreamingResponse {
+            message: Message::new(Role::Assistant, parts),
+            stop_reason,
+            usage,
+        })
     }
 
     /// Send a POST request to the chat-completions endpoint.
@@ -222,7 +298,8 @@ impl ApiClient for OpenAiClient {
             tools.as_deref(),
             None,
             &ToolConstraint::None,
-        );
+        )
+        .with_stream_usage(self.stream_usage);
         let url = self.completions_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
@@ -251,7 +328,8 @@ impl ApiClient for OpenAiClient {
     fn create_message(
         &self,
         request: &crate::api::StreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
         let system = request.system.clone();
         let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
@@ -269,12 +347,10 @@ impl ApiClient for OpenAiClient {
             let resp =
                 Self::post_completions(&self.http, &url, &self.api_key, &body.to_json(false))
                     .await?;
-            let resp = resp
-                .bytes()
-                .await
+            let resp = super::read_bounded_body(resp).await?;
+            let raw = serde_json::from_slice::<Value>(&resp)
                 .map_err(|e| ApiError::http(e.to_string()))?;
-            super::check_response_body(resp.len())?;
-            serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
+            Self::build_response(&raw)
         })
     }
 
@@ -294,7 +370,8 @@ impl ApiClient for OpenAiClient {
             tools.as_deref(),
             rf,
             &options.tool_constraint,
-        );
+        )
+        .with_stream_usage(self.stream_usage);
         let url = self.completions_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
@@ -324,7 +401,8 @@ impl ApiClient for OpenAiClient {
         &self,
         request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
         let system = request.system.clone();
         let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
@@ -343,30 +421,11 @@ impl ApiClient for OpenAiClient {
             let resp =
                 Self::post_completions(&self.http, &url, &self.api_key, &body.to_json(false))
                     .await?;
-            let resp = resp
-                .bytes()
-                .await
+            let resp = super::read_bounded_body(resp).await?;
+            let raw = serde_json::from_slice::<Value>(&resp)
                 .map_err(|e| ApiError::http(e.to_string()))?;
-            super::check_response_body(resp.len())?;
-            serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
+            Self::build_response(&raw)
         })
-    }
-
-    fn extract_structured(&self, raw: &Value) -> Value {
-        let Some(content) = raw
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-        else {
-            return raw.clone();
-        };
-        if let Some(text) = content.as_str() {
-            crate::structured::parse_json_lenient(text)
-                .unwrap_or_else(|| Value::String(text.to_string()))
-        } else {
-            content.clone()
-        }
     }
 }
 
@@ -399,6 +458,13 @@ pub struct OpenAiClientBuilder {
     /// internally-built `reqwest::Client`, or an externally-supplied client
     /// injected via [`with_http_client`](Self::with_http_client).
     http: super::HttpClientConfig,
+
+    /// Whether to request `stream_options.include_usage` on streaming requests.
+    ///
+    /// Defaults to `true`. Disable for OpenAI-compatible servers that reject
+    /// the parameter (older Ollama, some self-hosted deployments). Read by
+    /// [`build`](Self::build) and stored on [`OpenAiClient`].
+    stream_usage: bool,
 }
 
 impl Default for OpenAiClientBuilder {
@@ -408,6 +474,7 @@ impl Default for OpenAiClientBuilder {
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
             http: super::HttpClientConfig::default(),
+            stream_usage: true,
         }
     }
 }
@@ -477,6 +544,21 @@ impl OpenAiClientBuilder {
         self
     }
 
+    /// Control whether streaming requests include `stream_options.include_usage`.
+    ///
+    /// Defaults to `true` — real OpenAI, `DeepSeek`, and Grok support it and
+    /// send a final usage chunk. Pass `false` for OpenAI-compatible servers
+    /// that reject the parameter with a validation error (older Ollama, some
+    /// self-hosted vLLM/LM Studio deployments). When disabled, streamed turns
+    /// report `usage: None` instead of real token counts.
+    ///
+    /// Ignored on non-streaming requests.
+    #[must_use]
+    pub fn with_stream_usage(mut self, enabled: bool) -> Self {
+        self.stream_usage = enabled;
+        self
+    }
+
     /// Set the maximum idle connections kept alive per host.
     ///
     /// Defaults to reqwest's built-in default (unlimited). Ignored when a
@@ -507,6 +589,17 @@ impl OpenAiClientBuilder {
         self
     }
 
+    /// Control whether `TCP_NODELAY` is set on connections.
+    ///
+    /// Defaults to `true` — SSE streaming benefits from disabling Nagle's
+    /// algorithm. Pass `false` to re-enable it. Ignored when a client was
+    /// supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.http = self.http.with_tcp_nodelay(enabled);
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
@@ -523,6 +616,7 @@ impl OpenAiClientBuilder {
             api_key,
             base_url: self.base_url,
             model: std::sync::Mutex::new(self.model),
+            stream_usage: self.stream_usage,
         })
     }
 }
@@ -565,6 +659,14 @@ struct RequestBody {
     /// and no `response_format` was set. Stored as a string so the body is
     /// serializable without re-borrowing the trait object.
     guided_json: Option<String>,
+
+    /// Whether to request `stream_options.include_usage` when streaming.
+    ///
+    /// Defaults to `true` (real OpenAI supports it). Disabled for providers
+    /// that reject the parameter (older Ollama, some self-hosted servers)
+    /// via [`with_stream_usage`](Self::with_stream_usage). Ignored on
+    /// non-streaming requests.
+    stream_usage: bool,
 }
 
 impl RequestBody {
@@ -635,15 +737,30 @@ impl RequestBody {
             tools,
             response_format: rf,
             guided_json,
+            stream_usage: true,
         }
+    }
+
+    /// Control whether streaming requests include `stream_options.include_usage`.
+    ///
+    /// Defaults to `true` after [`build`](Self::build). Pass `false` for
+    /// OpenAI-compatible servers that reject the parameter (older Ollama, some
+    /// self-hosted deployments). The flag is read by [`to_json`](Self::to_json)
+    /// and ignored on non-streaming requests.
+    #[must_use]
+    fn with_stream_usage(mut self, enabled: bool) -> Self {
+        self.stream_usage = enabled;
+        self
     }
 
     /// Serialize to a [`serde_json::Value`] for the HTTP request body.
     ///
     /// Emits `model`, `messages`, `stream` (toggled by the parameter),
-    /// and `tools`. When `response_format` is set, appends the
-    /// `response_format` key; otherwise omits it entirely (not `null`).
-    /// When a grammar was captured, appends `guided_json`.
+    /// and `tools`. When streaming and [`stream_usage`](Self::stream_usage)
+    /// is enabled, sets `stream_options.include_usage` so the server appends a
+    /// final usage chunk. When `response_format` is set, appends the
+    /// `response_format` key; otherwise omits it entirely (not `null`). When a
+    /// grammar was captured, appends `guided_json`.
     fn to_json(&self, stream: bool) -> Value {
         let mut body = serde_json::json!({
             "model": self.model,
@@ -651,6 +768,12 @@ impl RequestBody {
             "stream": stream,
         });
         if let Some(obj) = body.as_object_mut() {
+            if stream && self.stream_usage {
+                obj.insert(
+                    "stream_options".to_string(),
+                    serde_json::json!({"include_usage": true}),
+                );
+            }
             if let Some(tools) = &self.tools {
                 obj.insert("tools".to_string(), Value::Array(tools.clone()));
             }
@@ -813,7 +936,7 @@ impl SseReader {
     /// Returns [`ApiError`] if the underlying HTTP stream fails.
     async fn next_openai_data(&mut self) -> Result<Option<String>, ApiError> {
         loop {
-            while let Some(line) = self.take_line() {
+            while let Some(line) = self.take_line()? {
                 let Some(data) = line.strip_prefix(SSE_DATA_PREFIX) else {
                     continue;
                 };
@@ -833,8 +956,10 @@ impl SseReader {
 ///
 /// Each `data:` line in a streamed Chat Completions response deserializes
 /// into one of these. The chunk carries the message identity, the model
-/// that produced it, and a list of [`OpenAiChoice`] deltas that the
-/// [`StreamEmitter`] assembles into [`StreamEvent`]s.
+/// that produced it, a list of [`OpenAiChoice`] deltas that the
+/// [`StreamEmitter`] assembles into [`StreamEvent`]s, and — on the final
+/// chunk when `stream_options.include_usage` is set — the cumulative
+/// [`OpenAiUsage`] for the entire request.
 #[derive(Deserialize)]
 struct OpenAiChunk {
     /// Server-assigned identifier for the overall completion.
@@ -855,8 +980,20 @@ struct OpenAiChunk {
     ///
     /// In practice OpenAI streams a single choice (`n=1`), so this
     /// vector usually holds exactly one [`OpenAiChoice`] carrying the
-    /// incremental [`OpenAiDelta`] for this chunk.
+    /// incremental [`OpenAiDelta`] for this chunk. When
+    /// `stream_options.include_usage` is set, the final chunk carries an
+    /// empty `choices` array and the cumulative [`OpenAiUsage`] in
+    /// [`usage`](Self::usage).
     choices: Vec<OpenAiChoice>,
+
+    /// Cumulative token usage, present only on the final chunk.
+    ///
+    /// Populated when the request sets `stream_options.include_usage`;
+    /// `None` on every preceding chunk and on all chunks when the option
+    /// is not set. The [`StreamEmitter`] stores this and includes it in
+    /// the [`MessageDelta`](StreamEvent::MessageDelta) event.
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
 }
 
 impl OpenAiChunk {
@@ -895,6 +1032,35 @@ struct OpenAiChoice {
     /// Common values are `"stop"`, `"tool_calls"`, and `"length"`; the
     /// [`StreamEmitter`] maps it to a [`StreamEvent`] stop reason.
     finish_reason: Option<String>,
+}
+
+/// Token usage object carried by OpenAI's final streaming chunk.
+///
+/// Mirrors the `usage` field that appears on the last chunk when the request
+/// sets `stream_options.include_usage`. Deserialized into a [`Usage`] so the
+/// emitter can include it in the terminal [`MessageDelta`](StreamEvent::MessageDelta).
+/// Both fields default to zero via `#[serde(default)]` so a partial usage
+/// object from a non-conforming provider (e.g. one that omits
+/// `completion_tokens`) does not fail deserialization and silently drop the
+/// entire chunk.
+#[derive(Deserialize)]
+struct OpenAiUsage {
+    /// Number of tokens in the input prompt.
+    #[serde(default)]
+    prompt_tokens: u64,
+
+    /// Number of tokens in the output completion.
+    #[serde(default)]
+    completion_tokens: u64,
+}
+
+impl From<&OpenAiUsage> for Usage {
+    fn from(u: &OpenAiUsage) -> Self {
+        Usage::new(
+            u32::try_from(u.prompt_tokens).unwrap_or(0),
+            u32::try_from(u.completion_tokens).unwrap_or(0),
+        )
+    }
 }
 
 /// Incremental content delivered by one chunk.
@@ -1054,6 +1220,26 @@ struct StreamEmitter {
     /// [`StreamEvent::MessageStop`] after the stream already terminated.
     finished: bool,
 
+    /// The stop reason captured by [`process_finish`](Self::process_finish),
+    /// deferred until the usage chunk arrives or [`finish`](Self::finish)
+    /// flushes it.
+    ///
+    /// OpenAI streams usage on a separate final chunk *after* the
+    /// `finish_reason` chunk (when `stream_options.include_usage` is set).
+    /// Rather than emit a `MessageDelta` immediately on `finish_reason` and
+    /// lose the usage, the emitter stores the stop reason here and emits the
+    /// `MessageDelta` once usage is known — either from the usage chunk or
+    /// when [`finish`](Self::finish) flushes pending state at stream end.
+    pending_stop_reason: Option<StreamStopReason>,
+
+    /// Token usage captured from the final usage chunk, if the request
+    /// set `stream_options.include_usage`.
+    ///
+    /// `None` until the usage chunk arrives. When `finish` flushes the
+    /// deferred `MessageDelta`, this is converted to `Some(Usage)` (or left
+    /// as `None` if the provider never sent usage).
+    pending_usage: Option<Usage>,
+
     /// Buffered [`StreamEvent`]s waiting to be yielded to the consumer.
     ///
     /// All event-producing methods push onto this queue via
@@ -1084,16 +1270,24 @@ impl StreamEmitter {
             }));
         }
 
-        let Some(choice) = chunk.choices.first() else {
-            return;
-        };
-
-        if let Some(delta) = &choice.delta {
-            self.process_delta(delta);
+        if let Some(usage) = &chunk.usage {
+            let typed = Usage::from(usage);
+            if typed.input_tokens > 0 || typed.output_tokens > 0 {
+                self.pending_usage = Some(typed);
+            }
         }
 
-        if let Some(reason) = &choice.finish_reason {
-            self.process_finish(reason);
+        if let Some(choice) = chunk.choices.first() {
+            if let Some(delta) = &choice.delta {
+                self.process_delta(delta);
+            }
+            if let Some(reason) = &choice.finish_reason {
+                self.process_finish(reason);
+            }
+        }
+
+        if chunk.usage.is_some() {
+            self.flush_message_delta();
         }
     }
 
@@ -1198,13 +1392,17 @@ impl StreamEmitter {
         }
     }
 
-    /// Handle a finish reason, emitting the appropriate stop events.
+    /// Handle a finish reason, closing open parts and deferring the
+    /// `MessageDelta`.
     ///
     /// Closes any open text parts and tool-call parts with
-    /// [`PartStop`](StreamEvent::PartStop), then emits a
-    /// [`MessageDelta`](StreamEvent::MessageDelta) carrying the mapped
-    /// [`StreamStopReason`]. Maps `"tool_calls"` →
-    /// [`ToolCall`](StreamStopReason::ToolCall), `"length"` →
+    /// [`PartStop`](StreamEvent::PartStop), then stores the mapped
+    /// [`StreamStopReason`] as pending. The [`MessageDelta`] is not emitted
+    /// here — it is deferred until the usage chunk arrives (when
+    /// `stream_options.include_usage` is set) or flushed by
+    /// [`finish`](Self::finish) at stream end, so the `MessageDelta` carries
+    /// both the stop reason and the usage in one event. Maps `"tool_calls"`
+    /// → [`ToolCall`](StreamStopReason::ToolCall), `"length"` →
     /// [`MaxTokens`](StreamStopReason::MaxTokens), and anything else via
     /// [`StreamStopReason::from_api_str`]. No-ops if already finished.
     fn process_finish(&mut self, reason: &str) {
@@ -1230,21 +1428,37 @@ impl StreamEmitter {
             "length" => StreamStopReason::MaxTokens,
             other => StreamStopReason::from_api_str(other).unwrap_or(StreamStopReason::EndTurn),
         };
+        self.pending_stop_reason = Some(stop_reason);
+    }
 
-        self.push(StreamEvent::MessageDelta(MessageDelta {
-            delta: MessageDeltaPayload {
-                stop_reason: Some(stop_reason.to_api_str().into()),
-            },
-            usage: None,
-        }));
+    /// Emit the deferred [`MessageDelta`](StreamEvent::MessageDelta), if one
+    /// is pending.
+    ///
+    /// Called by [`process_chunk`](Self::process_chunk) when the usage chunk
+    /// arrives, and by [`finish`](Self::finish) as a last resort. Emits the
+    /// `MessageDelta` carrying the pending stop reason and whatever usage has
+    /// been captured so far, then clears the pending state so it fires at
+    /// most once.
+    fn flush_message_delta(&mut self) {
+        if let Some(stop_reason) = self.pending_stop_reason.take() {
+            self.push(StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some(stop_reason.to_api_str().into()),
+                },
+                usage: self.pending_usage,
+            }));
+        }
     }
 
     /// Finalize the stream, emitting the terminal
     /// [`MessageStop`](StreamEvent::MessageStop) if one was started.
     ///
-    /// Drains any remaining pending events and appends the stop event.
-    /// Called exactly once at the end of the SSE stream.
+    /// Flushes any deferred [`MessageDelta`](StreamEvent::MessageDelta)
+    /// (when no usage chunk arrived), drains remaining pending events, and
+    /// appends the stop event. Called exactly once at the end of the SSE
+    /// stream.
     fn finish(&mut self) -> Vec<StreamEvent> {
+        self.flush_message_delta();
         let mut out = self.drain();
         if self.started {
             out.push(StreamEvent::MessageStop);
@@ -1315,6 +1529,123 @@ mod tests {
 
         assert_eq!(body.to_json(true)["stream"], true);
         assert_eq!(body.to_json(false)["stream"], false);
+    }
+
+    #[test]
+    fn request_body_streaming_includes_usage_option() {
+        let msgs = vec![Message::user("hi")];
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None);
+
+        assert_eq!(body.to_json(true)["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn request_body_non_streaming_omits_usage_option() {
+        let msgs = vec![Message::user("hi")];
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None);
+
+        assert!(
+            body.to_json(false).get("stream_options").is_none(),
+            "stream_options should only be present when streaming"
+        );
+    }
+
+    #[test]
+    fn request_body_stream_usage_disabled_omits_stream_options() {
+        let msgs = vec![Message::user("hi")];
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None)
+            .with_stream_usage(false);
+
+        assert!(
+            body.to_json(true).get("stream_options").is_none(),
+            "stream_options should be absent when stream_usage is disabled"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "ollama")]
+    fn ollama_constructor_disables_stream_usage() {
+        let client = crate::provider::ollama("test-model").unwrap();
+        assert!(
+            !client.stream_usage,
+            "ollama() should disable stream_usage for compatibility"
+        );
+    }
+
+    #[test]
+    fn default_builder_enables_stream_usage() {
+        let client = OpenAiClient::builder()
+            .with_api_key("test")
+            .build()
+            .unwrap();
+        assert!(
+            client.stream_usage,
+            "default builder should enable stream_usage"
+        );
+    }
+
+    #[test]
+    fn emitter_usage_chunk_after_finish_carries_usage_in_delta() {
+        let mut em = StreamEmitter::default();
+
+        let text = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&text);
+        em.drain();
+
+        let finish = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&finish);
+        em.drain();
+
+        let usage_chunk = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+        )
+        .unwrap();
+        em.process_chunk(&usage_chunk);
+        let events = em.drain();
+
+        let delta = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(md) => Some(md),
+            _ => None,
+        });
+        let delta = delta.expect("MessageDelta from usage chunk");
+        assert_eq!(delta.delta.stop_reason.as_deref(), Some("end_turn"));
+        let usage = delta.usage.expect("usage should be present");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn emitter_finish_without_usage_chunk_emits_delta_with_none_usage() {
+        let mut em = StreamEmitter::default();
+
+        let text = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&text);
+        em.drain();
+
+        let finish = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&finish);
+        em.drain();
+
+        let events = em.finish();
+        let delta = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(md) => Some(md),
+            _ => None,
+        });
+        let delta = delta.expect("MessageDelta from finish");
+        assert_eq!(delta.delta.stop_reason.as_deref(), Some("end_turn"));
+        assert!(delta.usage.is_none());
     }
 
     #[test]
@@ -1399,6 +1730,7 @@ mod tests {
             Role::User,
             vec![MessagePart::ToolResult {
                 call_id: "call_1".into(),
+                name: "echo".into(),
                 output: ToolContent::from_string("result text"),
                 is_error: None,
             }],
@@ -1416,11 +1748,13 @@ mod tests {
             vec![
                 MessagePart::ToolResult {
                     call_id: "call_1".into(),
+                    name: "echo".into(),
                     output: ToolContent::from_string("a"),
                     is_error: None,
                 },
                 MessagePart::ToolResult {
                     call_id: "call_2".into(),
+                    name: "echo".into(),
                     output: ToolContent::from_string("b"),
                     is_error: None,
                 },
@@ -1500,6 +1834,108 @@ mod tests {
         assert_eq!(chunk.id, "abc");
         assert_eq!(chunk.model, "gpt-4o");
         assert_eq!(chunk.choices.len(), 1);
+        assert!(chunk.usage.is_none());
+    }
+
+    #[test]
+    fn parse_chunk_missing_usage_defaults_to_none() {
+        let data = r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#;
+        let chunk = OpenAiChunk::parse(data).unwrap();
+        assert!(chunk.usage.is_none());
+    }
+
+    #[test]
+    fn parse_final_chunk_with_partial_usage_defaults_missing_fields() {
+        let data = r#"{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":15}}"#;
+        let chunk = OpenAiChunk::parse(data).unwrap();
+        let usage = chunk.usage.as_ref().expect("usage should parse");
+        assert_eq!(usage.prompt_tokens, 15);
+        assert_eq!(usage.completion_tokens, 0);
+    }
+
+    #[test]
+    fn parse_final_chunk_with_usage() {
+        let data = r#"{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}"#;
+        let chunk = OpenAiChunk::parse(data).unwrap();
+        assert!(chunk.choices.is_empty());
+        let usage = chunk.usage.as_ref().expect("usage");
+        assert_eq!(usage.prompt_tokens, 42);
+        assert_eq!(usage.completion_tokens, 7);
+        let typed: Usage = usage.into();
+        assert_eq!(typed.input_tokens, 42);
+        assert_eq!(typed.output_tokens, 7);
+    }
+
+    #[test]
+    fn emitter_usage_and_finish_in_same_chunk() {
+        let mut em = StreamEmitter::default();
+
+        let text = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&text);
+        em.drain();
+
+        let combined = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":3}}"#,
+        )
+        .unwrap();
+        em.process_chunk(&combined);
+        let events = em.drain();
+
+        let delta = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(md) => Some(md),
+            _ => None,
+        });
+        let delta = delta.expect("MessageDelta from combined chunk");
+        assert_eq!(delta.delta.stop_reason.as_deref(), Some("end_turn"));
+        let usage = delta.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 8);
+        assert_eq!(usage.output_tokens, 3);
+    }
+
+    #[test]
+    fn emitter_tool_call_stream_with_usage_chunk() {
+        let mut em = StreamEmitter::default();
+
+        let open = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"search","arguments":""}}]},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&open);
+        em.drain();
+
+        let args = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":\"rust\"}"}}]},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&args);
+        em.drain();
+
+        let finish = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&finish);
+        em.drain();
+
+        let usage_chunk = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":20}}"#,
+        )
+        .unwrap();
+        em.process_chunk(&usage_chunk);
+        let events = em.drain();
+
+        let delta = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(md) => Some(md),
+            _ => None,
+        });
+        let delta = delta.expect("MessageDelta after usage chunk");
+        assert_eq!(delta.delta.stop_reason.as_deref(), Some("tool_call"));
+        let usage = delta.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.output_tokens, 20);
     }
 
     #[test]
@@ -1739,7 +2175,6 @@ mod tests {
     fn emitter_finish_emits_part_stops_and_message_delta() {
         let mut em = StreamEmitter::default();
 
-        // Send some text so the text part is open.
         let chunk = OpenAiChunk::parse(
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
         )
@@ -1747,18 +2182,21 @@ mod tests {
         em.process_chunk(&chunk);
         em.drain();
 
-        // Now send finish_reason=stop.
         let finish = OpenAiChunk::parse(
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"stop"}]}"#,
         )
         .unwrap();
         em.process_chunk(&finish);
-        let events = em.drain();
+        let part_stop_events = em.drain();
+        assert_eq!(part_stop_events.len(), 1);
+        assert!(matches!(part_stop_events[0], StreamEvent::PartStop));
 
-        // PartStop + MessageDelta(stop_reason)
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0], StreamEvent::PartStop));
-        assert!(matches!(events[1], StreamEvent::MessageDelta(_)));
+        let events = em.finish();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::MessageDelta(_)))
+        );
     }
 
     #[test]
@@ -1772,7 +2210,6 @@ mod tests {
         em.process_chunk(&chunk0);
         em.drain();
 
-        // Open a tool call.
         let tool_chunk = OpenAiChunk::parse(
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"echo","arguments":""}}]},"finish_reason":null}]}"#,
         )
@@ -1780,23 +2217,22 @@ mod tests {
         em.process_chunk(&tool_chunk);
         em.drain();
 
-        // Finish with tool_calls.
         let finish = OpenAiChunk::parse(
             r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
         )
         .unwrap();
         em.process_chunk(&finish);
-        let events = em.drain();
+        let part_stop_events = em.drain();
+        assert_eq!(part_stop_events.len(), 1);
+        assert!(matches!(part_stop_events[0], StreamEvent::PartStop));
 
-        // 1 PartStop (for tool) + MessageDelta
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0], StreamEvent::PartStop));
-
-        if let StreamEvent::MessageDelta(md) = &events[1] {
-            assert_eq!(md.delta.stop_reason.as_deref(), Some("tool_call"));
-        } else {
-            panic!("expected MessageDelta");
-        }
+        let events = em.finish();
+        let delta = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(md) => Some(md),
+            _ => None,
+        });
+        let delta = delta.expect("MessageDelta");
+        assert_eq!(delta.delta.stop_reason.as_deref(), Some("tool_call"));
     }
 
     #[test]
@@ -1845,13 +2281,15 @@ mod tests {
         )
         .unwrap();
         em.process_chunk(&finish);
-        let events = em.drain();
+        em.drain();
 
-        if let StreamEvent::MessageDelta(md) = &events[1] {
-            assert_eq!(md.delta.stop_reason.as_deref(), Some("max_tokens"));
-        } else {
-            panic!("expected MessageDelta");
-        }
+        let events = em.finish();
+        let delta = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(md) => Some(md),
+            _ => None,
+        });
+        let delta = delta.expect("MessageDelta");
+        assert_eq!(delta.delta.stop_reason.as_deref(), Some("max_tokens"));
     }
 
     #[test]
@@ -1902,7 +2340,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hello\n".into(),
         };
-        let line = reader.take_line().unwrap();
+        let line = reader.take_line().unwrap().unwrap();
         assert_eq!(line, "data: hello");
         assert!(reader.buf.is_empty());
     }
@@ -1913,7 +2351,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "partial".into(),
         };
-        assert!(reader.take_line().is_none());
+        assert!(reader.take_line().unwrap().is_none());
     }
 
     #[test]
@@ -1922,8 +2360,8 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "line1\nline2\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "line1");
-        assert_eq!(reader.take_line().unwrap(), "line2");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "line1");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "line2");
     }
 
     #[test]
@@ -1932,7 +2370,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hi\r\n".into(),
         };
-        let line = reader.take_line().unwrap();
+        let line = reader.take_line().unwrap().unwrap();
         assert_eq!(line, "data: hi");
     }
 
@@ -1952,9 +2390,9 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hello\ndata: world\n".to_string().into_bytes(),
         };
-        assert_eq!(reader.take_line(), Some("data: hello".to_string()));
-        assert_eq!(reader.take_line(), Some("data: world".to_string()));
-        assert_eq!(reader.take_line(), None);
+        assert_eq!(reader.take_line().unwrap(), Some("data: hello".to_string()));
+        assert_eq!(reader.take_line().unwrap(), Some("data: world".to_string()));
+        assert_eq!(reader.take_line().unwrap(), None);
     }
 
     #[tokio::test]
@@ -2004,19 +2442,6 @@ mod tests {
     #[test]
     fn max_response_body_is_ten_mb() {
         assert_eq!(super::super::MAX_RESPONSE_BODY, 10 * 1024 * 1024);
-    }
-
-    #[test]
-    fn body_size_check_rejects_oversized() {
-        // Verify the comparison logic used in create_message.
-        let oversized = super::super::MAX_RESPONSE_BODY + 1;
-        assert!(oversized > super::super::MAX_RESPONSE_BODY);
-    }
-
-    #[test]
-    fn body_size_check_accepts_within_limit() {
-        let within = super::super::MAX_RESPONSE_BODY;
-        assert!(within <= super::super::MAX_RESPONSE_BODY);
     }
 
     #[test]
@@ -2082,56 +2507,279 @@ mod tests {
     }
 
     #[test]
-    fn extract_structured_from_string_content() {
+    fn extract_structured_from_text_part() {
         let client = OpenAiClient::builder()
             .with_api_key("test")
             .build()
             .unwrap();
-        let raw = serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": r#"{"tool": "write", "args": {}}"#
-                }
-            }]
-        });
-        let value = client.extract_structured(&raw);
+        let message = Message::assistant(r#"{"tool": "write", "args": {}}"#);
+        let value = client.extract_structured(&message);
         assert_eq!(value["tool"], "write");
     }
 
     #[test]
-    fn extract_structured_from_object_content() {
+    fn extract_structured_from_tool_call_part() {
         let client = OpenAiClient::builder()
             .with_api_key("test")
             .build()
             .unwrap();
-        let raw = serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": {"tool": "read", "args": {}}
-                }
-            }]
-        });
-        let value = client.extract_structured(&raw);
+        let message = Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call(
+                "tc_1",
+                "action",
+                serde_json::json!({"tool": "read", "args": {}}),
+            )],
+        );
+        let value = client.extract_structured(&message);
         assert_eq!(value["tool"], "read");
     }
 
     #[test]
-    fn extract_structured_prose_falls_back_to_raw() {
+    fn extract_structured_prose_falls_back_to_string() {
         let client = OpenAiClient::builder()
             .with_api_key("test")
             .build()
             .unwrap();
+        let message = Message::assistant("I cannot produce that.");
+        let value = client.extract_structured(&message);
+        assert_eq!(value, serde_json::json!("I cannot produce that."));
+    }
+
+    #[test]
+    fn build_response_maps_text_and_stop_finish_reason() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {"content": "hello"},
+                "finish_reason": "stop"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        assert_eq!(response.message.role, Role::Assistant);
+        assert_eq!(response.message.text_content(), "hello");
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_maps_tool_calls_finish_reason() {
         let raw = serde_json::json!({
             "choices": [{
                 "message": {
-                    "content": "I cannot produce that."
-                }
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {"name": "search", "arguments": "{\"q\": \"x\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
             }]
         });
-        let value = client.extract_structured(&raw);
-        // When content is prose (not parseable JSON), falls back to the
-        // string value; T::from_value will then fail with Deserialize.
-        assert_eq!(value, serde_json::json!("I cannot produce that."));
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        assert_eq!(response.message.parts.len(), 1);
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { id, name, input } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "search");
+                assert_eq!(input, &serde_json::json!({"q": "x"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        assert_eq!(response.stop_reason, StreamStopReason::ToolCall);
+    }
+
+    #[test]
+    fn build_response_maps_length_to_max_tokens() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {"content": "truncated"},
+                "finish_reason": "length"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        assert_eq!(response.stop_reason, StreamStopReason::MaxTokens);
+    }
+
+    #[test]
+    fn build_response_extracts_usage() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {"content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 42, "completion_tokens": 7}
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        assert_eq!(response.usage.expect("usage").input_tokens, 42);
+        assert_eq!(response.usage.expect("usage").output_tokens, 7);
+        assert_eq!(response.usage.expect("usage").total_tokens(), 49);
+    }
+
+    #[test]
+    fn build_response_missing_usage_is_none() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {"content": "hi"},
+                "finish_reason": "stop"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        assert!(response.usage.is_none());
+    }
+
+    #[test]
+    fn build_response_zero_usage_collapses_to_none() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {"content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        assert!(
+            response.usage.is_none(),
+            "all-zero usage must collapse to None"
+        );
+    }
+
+    #[test]
+    fn build_response_text_and_tool_calls_combined() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "Let me search",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {"name": "search", "arguments": "{\"q\": \"x\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        assert_eq!(response.message.parts.len(), 2);
+        assert!(response.message.parts[0].is_text());
+        assert!(response.message.parts[1].is_tool_call());
+        assert_eq!(response.stop_reason, StreamStopReason::ToolCall);
+    }
+
+    #[test]
+    fn build_response_multiple_tool_calls_preserve_order() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [
+                        {"id": "a", "function": {"name": "first", "arguments": "{}"}},
+                        {"id": "b", "function": {"name": "second", "arguments": "{\"n\": 2}"}}
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        assert_eq!(response.message.parts.len(), 2);
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { id, name, .. } => {
+                assert_eq!(id, "a");
+                assert_eq!(name, "first");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match &response.message.parts[1] {
+            MessagePart::ToolCall { id, name, .. } => {
+                assert_eq!(id, "b");
+                assert_eq!(name, "second");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_malformed_arguments_returns_error() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {"name": "search", "arguments": "not valid json{"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let result = OpenAiClient::build_response(&raw);
+        assert!(
+            result.is_err(),
+            "malformed non-empty arguments must surface as an error, not silently default to {{}}"
+        );
+    }
+
+    #[test]
+    fn build_response_empty_arguments_defaults_to_empty_object() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {"name": "search", "arguments": ""}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { input, .. } => {
+                assert_eq!(input, &serde_json::json!({}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_missing_arguments_defaults_to_empty_object() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {"name": "search"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { input, .. } => {
+                assert_eq!(input, &serde_json::json!({}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_missing_choices_yields_empty_message() {
+        let raw = serde_json::json!({});
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        assert!(response.message.parts.is_empty());
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_unrecognized_finish_reason_defaults_to_end_turn() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {"content": "hi"},
+                "finish_reason": "content_filter"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
     }
 
     #[test]

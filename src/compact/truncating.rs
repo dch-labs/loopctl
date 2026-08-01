@@ -6,8 +6,8 @@
 //! - [`TokenSplitter`] — splits a conversation into "old" and "recent" at a turn boundary.
 //! - [`SplitResult`] — result of splitting a conversation.
 
+use crate::compact::ContextCompactor;
 use crate::compact::types::{CompactionContext, CompactionOutcome};
-use crate::compact::{ContextCompactor, ContextManager};
 use crate::message::{Message, MessagePart, Role};
 use std::collections::HashSet;
 use std::future::Future;
@@ -157,7 +157,7 @@ impl ContextCompactor for TruncatingCompactor {
                 recent
             };
 
-            let tokens_after = CompactionOutcome::estimate_tokens(&preserved);
+            let tokens_after = context.counter.count(&preserved);
             CompactionOutcome {
                 messages: preserved,
                 tokens_after,
@@ -368,7 +368,7 @@ impl TokenSplitter {
                 to_compact: vec![],
                 preserved: messages.to_vec(),
                 compact_tokens: 0,
-                preserved_tokens: ContextManager::estimate_tokens(messages),
+                preserved_tokens: CompactionOutcome::estimate_tokens(messages),
                 split_index: 0,
             };
         }
@@ -382,8 +382,8 @@ impl TokenSplitter {
         SplitResult {
             to_compact: to_compact.to_vec(),
             preserved: preserved.to_vec(),
-            compact_tokens: ContextManager::estimate_tokens(to_compact),
-            preserved_tokens: ContextManager::estimate_tokens(preserved),
+            compact_tokens: CompactionOutcome::estimate_tokens(to_compact),
+            preserved_tokens: CompactionOutcome::estimate_tokens(preserved),
             split_index,
         }
     }
@@ -444,6 +444,7 @@ mod tests {
             reason: CompactReason::ThresholdExceeded,
             context_window: 1_000,
             turn: 5,
+            counter: std::sync::Arc::new(crate::compact::HeuristicTokenCounter),
         }
     }
 
@@ -466,6 +467,7 @@ mod tests {
                 Role::User,
                 vec![MessagePart::tool_result(
                     "call_a",
+                    "search",
                     tool_text("result data"),
                     false,
                 )],
@@ -524,7 +526,12 @@ mod tests {
             ),
             Message::new(
                 Role::User,
-                vec![MessagePart::tool_result("call_b", tool_text("42"), false)],
+                vec![MessagePart::tool_result(
+                    "call_b",
+                    "calc",
+                    tool_text("42"),
+                    false,
+                )],
             ),
         ];
 
@@ -557,7 +564,12 @@ mod tests {
             ),
             Message::new(
                 Role::User,
-                vec![MessagePart::tool_result("call_c", tool_text("done"), false)],
+                vec![MessagePart::tool_result(
+                    "call_c",
+                    "tool",
+                    tool_text("done"),
+                    false,
+                )],
             ),
             Message::assistant("reply1"),
             Message::user("msg2"),
@@ -622,7 +634,12 @@ mod tests {
             ),
             Message::new(
                 Role::User,
-                vec![MessagePart::tool_result("call_d", tool_text("ok"), false)],
+                vec![MessagePart::tool_result(
+                    "call_d",
+                    "tool",
+                    tool_text("ok"),
+                    false,
+                )],
             ),
         ];
         let compactor = TruncatingCompactor::new()

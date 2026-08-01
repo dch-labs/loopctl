@@ -170,8 +170,15 @@ impl OpenAiClient {
     /// `ToolCall`, `"length"` → `MaxTokens`, anything else via
     /// [`StreamStopReason::from_api_str`], defaulting to `EndTurn`). Reads
     /// `usage.prompt_tokens` / `usage.completion_tokens` into [`Usage`],
-    /// defaulting to zero when the `usage` object is absent.
-    fn build_response(raw: &Value) -> crate::api::NonStreamingResponse {
+    /// returning `None` when the object is absent or all-zero. Missing or
+    /// empty `function.arguments` default to `{}`; non-empty arguments that
+    /// fail to parse as JSON return an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] if a tool call's `function.arguments` is present,
+    /// non-empty, and not valid JSON.
+    fn build_response(raw: &Value) -> Result<crate::api::NonStreamingResponse, ApiError> {
         let choice = raw.get("choices").and_then(|c| c.get(0));
         let message = choice.and_then(|c| c.get("message"));
         let mut parts: Vec<MessagePart> = Vec::new();
@@ -187,11 +194,15 @@ impl OpenAiClient {
                         .and_then(|f| f.get("name"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let input = function
+                    let input = match function
                         .and_then(|f| f.get("arguments"))
                         .and_then(|a| a.as_str())
-                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                        .unwrap_or_else(|| serde_json::json!({}));
+                    {
+                        None | Some("") => serde_json::json!({}),
+                        Some(s) => serde_json::from_str::<Value>(s).map_err(|e| {
+                            ApiError::http(format!("tool_call arguments is not valid JSON: {e}"))
+                        })?,
+                    };
                     parts.push(MessagePart::tool_call(id, name, input));
                 }
             }
@@ -208,12 +219,13 @@ impl OpenAiClient {
         let usage = raw
             .get("usage")
             .and_then(|u| OpenAiUsage::deserialize(u).ok())
-            .map(|u| Usage::from(&u));
-        crate::api::NonStreamingResponse {
+            .map(|u| Usage::from(&u))
+            .filter(|u| u.input_tokens > 0 || u.output_tokens > 0);
+        Ok(crate::api::NonStreamingResponse {
             message: Message::new(Role::Assistant, parts),
             stop_reason,
             usage,
-        }
+        })
     }
 
     /// Send a POST request to the chat-completions endpoint.
@@ -338,7 +350,7 @@ impl ApiClient for OpenAiClient {
             let resp = super::read_bounded_body(resp).await?;
             let raw = serde_json::from_slice::<Value>(&resp)
                 .map_err(|e| ApiError::http(e.to_string()))?;
-            Ok(Self::build_response(&raw))
+            Self::build_response(&raw)
         })
     }
 
@@ -412,7 +424,7 @@ impl ApiClient for OpenAiClient {
             let resp = super::read_bounded_body(resp).await?;
             let raw = serde_json::from_slice::<Value>(&resp)
                 .map_err(|e| ApiError::http(e.to_string()))?;
-            Ok(Self::build_response(&raw))
+            Self::build_response(&raw)
         })
     }
 }
@@ -1259,7 +1271,10 @@ impl StreamEmitter {
         }
 
         if let Some(usage) = &chunk.usage {
-            self.pending_usage = Some(Usage::from(usage));
+            let typed = Usage::from(usage);
+            if typed.input_tokens > 0 || typed.output_tokens > 0 {
+                self.pending_usage = Some(typed);
+            }
         }
 
         if let Some(choice) = chunk.choices.first() {
@@ -2539,7 +2554,7 @@ mod tests {
                 "finish_reason": "stop"
             }]
         });
-        let response = OpenAiClient::build_response(&raw);
+        let response = OpenAiClient::build_response(&raw).unwrap();
         assert_eq!(response.message.role, Role::Assistant);
         assert_eq!(response.message.text_content(), "hello");
         assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
@@ -2559,7 +2574,7 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let response = OpenAiClient::build_response(&raw);
+        let response = OpenAiClient::build_response(&raw).unwrap();
         assert_eq!(response.message.parts.len(), 1);
         match &response.message.parts[0] {
             MessagePart::ToolCall { id, name, input } => {
@@ -2580,7 +2595,7 @@ mod tests {
                 "finish_reason": "length"
             }]
         });
-        let response = OpenAiClient::build_response(&raw);
+        let response = OpenAiClient::build_response(&raw).unwrap();
         assert_eq!(response.stop_reason, StreamStopReason::MaxTokens);
     }
 
@@ -2593,7 +2608,7 @@ mod tests {
             }],
             "usage": {"prompt_tokens": 42, "completion_tokens": 7}
         });
-        let response = OpenAiClient::build_response(&raw);
+        let response = OpenAiClient::build_response(&raw).unwrap();
         assert_eq!(response.usage.expect("usage").input_tokens, 42);
         assert_eq!(response.usage.expect("usage").output_tokens, 7);
         assert_eq!(response.usage.expect("usage").total_tokens(), 49);
@@ -2607,8 +2622,24 @@ mod tests {
                 "finish_reason": "stop"
             }]
         });
-        let response = OpenAiClient::build_response(&raw);
+        let response = OpenAiClient::build_response(&raw).unwrap();
         assert!(response.usage.is_none());
+    }
+
+    #[test]
+    fn build_response_zero_usage_collapses_to_none() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {"content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        assert!(
+            response.usage.is_none(),
+            "all-zero usage must collapse to None"
+        );
     }
 
     #[test]
@@ -2625,7 +2656,7 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let response = OpenAiClient::build_response(&raw);
+        let response = OpenAiClient::build_response(&raw).unwrap();
         assert_eq!(response.message.parts.len(), 2);
         assert!(response.message.parts[0].is_text());
         assert!(response.message.parts[1].is_tool_call());
@@ -2646,7 +2677,7 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let response = OpenAiClient::build_response(&raw);
+        let response = OpenAiClient::build_response(&raw).unwrap();
         assert_eq!(response.message.parts.len(), 2);
         match &response.message.parts[0] {
             MessagePart::ToolCall { id, name, .. } => {
@@ -2665,7 +2696,7 @@ mod tests {
     }
 
     #[test]
-    fn build_response_malformed_arguments_defaults_to_empty_object() {
+    fn build_response_malformed_arguments_returns_error() {
         let raw = serde_json::json!({
             "choices": [{
                 "message": {
@@ -2678,7 +2709,51 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let response = OpenAiClient::build_response(&raw);
+        let result = OpenAiClient::build_response(&raw);
+        assert!(
+            result.is_err(),
+            "malformed non-empty arguments must surface as an error, not silently default to {{}}"
+        );
+    }
+
+    #[test]
+    fn build_response_empty_arguments_defaults_to_empty_object() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {"name": "search", "arguments": ""}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { input, .. } => {
+                assert_eq!(input, &serde_json::json!({}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_missing_arguments_defaults_to_empty_object() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {"name": "search"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).unwrap();
         match &response.message.parts[0] {
             MessagePart::ToolCall { input, .. } => {
                 assert_eq!(input, &serde_json::json!({}));
@@ -2690,7 +2765,7 @@ mod tests {
     #[test]
     fn build_response_missing_choices_yields_empty_message() {
         let raw = serde_json::json!({});
-        let response = OpenAiClient::build_response(&raw);
+        let response = OpenAiClient::build_response(&raw).unwrap();
         assert!(response.message.parts.is_empty());
         assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
     }
@@ -2703,7 +2778,7 @@ mod tests {
                 "finish_reason": "content_filter"
             }]
         });
-        let response = OpenAiClient::build_response(&raw);
+        let response = OpenAiClient::build_response(&raw).unwrap();
         assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
     }
 

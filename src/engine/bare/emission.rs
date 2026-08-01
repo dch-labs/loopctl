@@ -25,6 +25,7 @@ impl<C: ApiClient> BareLoop<C> {
         self.managers.observers().on_run_start(&RunStartContext {
             session_id: self.session.id,
         });
+        #[cfg(feature = "hooks")]
         self.notify_run_start_hook();
     }
 
@@ -42,6 +43,7 @@ impl<C: ApiClient> BareLoop<C> {
         duration: Duration,
         error: Option<&LoopError>,
     ) {
+        #[cfg(feature = "hooks")]
         self.notify_run_end_hook(result, error, duration);
         self.managers.observers().on_run_end(&RunEndContext {
             success: error.is_none(),
@@ -101,14 +103,6 @@ impl<C: ApiClient> BareLoop<C> {
         executor.notify_run_start(&ctx);
     }
 
-    /// No-op run-start hook for builds without the `hooks` feature.
-    ///
-    /// Does nothing — there are no hooks to notify. Kept so
-    /// [`notify_run_start`](Self::notify_run_start) compiles
-    /// identically with and without the feature.
-    #[cfg(not(feature = "hooks"))]
-    fn notify_run_start_hook(&self) {}
-
     /// Fire the `on_run_end` hook when a hook executor is
     /// configured.
     ///
@@ -133,14 +127,6 @@ impl<C: ApiClient> BareLoop<C> {
         };
         executor.notify_run_end(&ctx);
     }
-
-    /// No-op run-end hook for builds without the `hooks` feature.
-    ///
-    /// Does nothing — there are no hooks to notify. Kept so
-    /// [`notify_run_end`](Self::notify_run_end) compiles
-    /// identically with and without the feature.
-    #[cfg(not(feature = "hooks"))]
-    fn notify_run_end_hook(&self, _result: &Run, _error: Option<&LoopError>, _duration: Duration) {}
 
     /// Convert a [`Duration`] to milliseconds as a `u64`.
     ///

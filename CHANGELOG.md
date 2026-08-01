@@ -7,7 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-08-01
+### Added
+
+- **Non-streaming engine turn path** (`TurnMode`): the engine can now drive each
+  turn via `ApiClient::create_message` instead of streaming, selected at runtime
+  with `BareLoop::set_turn_mode` / `with_turn_mode`. The default is
+  `TurnMode::Streaming` when `streaming` is compiled in, `TurnMode::NonStreaming`
+  otherwise. Under the non-streaming path no per-delta observer callbacks fire;
+  the full assistant text still surfaces via `on_response`.
+- **`streaming` feature flag**: gates `StreamHandler`, `stream::handler`,
+  `StreamCapable`, `text_streamer`, and the `on_text_delta` / `on_thinking_delta`
+  firing sites. With `default = []`, `async-stream` is no longer pulled and the
+  engine compiles and runs without any streaming machinery.
+
+### Changed
+
+- **`default = []` now means non-streaming.** `async-stream` is an optional
+  dependency enabled by `streaming`; it is no longer pulled into a bare
+  `cargo add loopctl`. The HTTP provider features (`openai`, `anthropic`,
+  `gemini`, and anything that chains from them) now imply `streaming`, so the
+  common `features = ["openai"]` case preserves the previous streaming-by-default
+  behavior. Migration: users who enabled only `providers` (not a named provider)
+  and relied on streaming must add `streaming` explicitly.
+- **MSRV corrected to 1.94** (was misdocumented as 1.85 in `AGENTS.md`; the
+  `Cargo.toml` `rust-version` and `.clippy.toml` already required 1.94).
+- `AGENTS.md` feature table, `providers` dependency list, core-deps list, and the
+  `LoopMemory` object-safety note corrected to match the code.
+
+### Removed
+
+- The `record_stream_success` / `record_stream_failure` private methods are
+  renamed to `record_turn_success` / `record_turn_failure` (shared by both turn
+  paths). The `StreamCapable` trait and its `LoopManagers` impl now require the
+  `streaming` feature.
+
 
 ### Added
 

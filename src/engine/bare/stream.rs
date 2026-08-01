@@ -8,13 +8,11 @@
 //! a handler via [`set_stream_handler()`](BareLoop::set_stream_handler) opts into
 //! retry, timeout, fallback, and rate-limit handling.
 
-use super::{
-    ApiClient, BareLoop, LoopError, Message, Run, StreamAccumulator, StreamEvent, StreamStopReason,
-    Usage,
-};
+use super::{ApiClient, BareLoop, LoopError, Message, Run};
 use crate::capabilities::StreamCapable;
 use crate::observer::{TextDeltaContext, ThinkingDeltaContext};
 use crate::stream::handler::{HandlerEvent, StreamHandlerError};
+use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
 use futures::StreamExt;
 
 impl<C: ApiClient> BareLoop<C> {
@@ -116,7 +114,7 @@ impl<C: ApiClient> BareLoop<C> {
             && let crate::stream::DeltaPart::Text { text } = &d.delta
         {
             if let Some(streamer) = &self.text_streamer {
-                streamer(text);
+                streamer(text.as_str());
             }
             self.managers.observers().on_text_delta(&TextDeltaContext {
                 turn: self.current_run().map_or(0, Run::turn_count),

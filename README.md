@@ -4,7 +4,7 @@ A trait-based framework for building agent loops with pluggable LLM clients, too
 
 [![crates.io](https://img.shields.io/crates/v/loopctl.svg)](https://crates.io/crates/loopctl)
 [![docs.rs](https://docs.rs/loopctl/badge.svg)](https://docs.rs/loopctl)
-[![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+[![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
 ## Overview
 
@@ -146,25 +146,42 @@ let agent = BareLoop::new(
 | `testing` | No | — | Mock clients, tools, and test fixtures |
 | `tool_health` | No | — | Per-tool health monitoring, circuit breakers, and self-healing routing |
 | `tool_shield` | No | `tool_health` | Tool permission shielding and access control |
-| `providers` | No | — | Base provider support (`reqwest` + `async-stream`); enables `provider` module |
-| `openai` | No | `providers` | OpenAI-compatible API client (`provider::openai`) |
-| `anthropic` | No | `providers` | Anthropic Claude API client (`provider::anthropic`) |
+| `streaming` | No | `async-stream` | Streaming engine path: `StreamHandler` (retry, timeout, fallback), per-delta observer callbacks (`on_text_delta`, `on_thinking_delta`), `text_streamer`. Without it the engine drives each turn via `ApiClient::create_message`. |
+| `providers` | No | `reqwest`, `httpdate`, `bytes` | Base HTTP provider support; enables the `provider` module |
+| `openai` | No | `providers`, `streaming` | OpenAI-compatible API client (`provider::openai`) |
+| `anthropic` | No | `providers`, `streaming` | Anthropic Claude API client (`provider::anthropic`) |
 | `ollama` | No | `providers`, `openai` | Ollama local model client (OpenAI-compatible) |
 | `deepseek` | No | `providers`, `openai` | DeepSeek API client (OpenAI-compatible) |
 | `grok` | No | `providers`, `openai` | Grok (xAI) API client (OpenAI-compatible) |
 | `xai` | No | `grok` | Alias for `grok` (xAI API client) |
-| `gemini` | No | `providers` | Google Gemini API client (`provider::gemini`) |
+| `gemini` | No | `providers`, `streaming` | Google Gemini API client (`provider::gemini`) |
 | `zai` | No | `providers`, `anthropic` | Z.AI API client (Anthropic-compatible) |
 | `grammar` | No | `providers` | Tool-call grammar providers for grammar-aware samplers (vLLM `guided_json`); enables the `Grammar` mode of `ToolConstraint` |
 | `schema_validation` | No | — | JSON Schema validation of `Correction::modified_input` in `LlmReflector` (pulls `jsonschema`); when off, validation is skipped |
 
+### Streaming vs non-streaming
+
+By default (`default = []`) the engine drives each turn with
+[`ApiClient::create_message`] — a single request/response with no streaming
+machinery, no `async-stream` dependency, and no per-delta callbacks. The full
+assistant text still surfaces through
+[`on_response`](https://docs.rs/loopctl/latest/loopctl/observer/trait.LoopObserver.html#method.on_response).
+
+Enable the `streaming` feature (implied by every HTTP provider) to route turns
+through [`StreamHandler`](https://docs.rs/loopctl/latest/loopctl/stream/handler/struct.StreamHandler.html)
+with retry, timeout, rate-limit detection, and `on_text_delta` /
+`on_thinking_delta` callbacks for real-time token display. Switch a constructed
+loop explicitly with
+[`set_turn_mode`](https://docs.rs/loopctl/latest/loopctl/engine/struct.BareLoop.html#method.set_turn_mode).
+
 ## Architecture
 
-At the center is **BareLoop**, the default agent loop. Each turn it streams a
-response from an **ApiClient** (your LLM provider), accumulates the result, and
-dispatches any requested tool calls through a **ToolRegistry**. Results are fed
-back into the conversation and the cycle repeats until the model ends its turn
-or a configured limit is reached.
+At the center is **BareLoop**, the default agent loop. Each turn it requests a
+response from an **ApiClient** (your LLM provider) — via the streaming path
+(`StreamHandler`) when `streaming` is enabled, or via `create_message`
+otherwise — then dispatches any requested tool calls through a
+**ToolRegistry**. Results are fed back into the conversation and the cycle
+repeats until the model ends its turn or a configured limit is reached.
 
 Two cross-cutting concerns run alongside the main loop:
 

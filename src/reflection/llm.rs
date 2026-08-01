@@ -159,6 +159,7 @@ impl Reflector for LlmReflector {
             .await
             .map_err(|e| ReflectionError::Internal(format!("{e}")))?;
 
+            #[cfg(feature = "schema_validation")]
             validate_modified_input(&analysis, schema_value.as_ref())?;
             Ok(analysis)
         })
@@ -205,58 +206,41 @@ fn build_user_message(
 /// Validate the model's suggested `modified_input` against the failing
 /// tool's input schema.
 ///
-/// Returns `Ok(())` when there is nothing to validate (no correction, no
-/// `modified_input`, or no schema supplied) — these are all legitimate
-/// "skip validation" cases. When a schema is supplied and validation is
-/// enabled, returns `Ok(())` on a match or
-/// [`ReflectionError::Internal`](crate::reflection::ReflectionError::Internal)
-/// on a mismatch.
+/// Returns `Ok(())` when there is nothing to check (no correction, no
+/// `modified_input`, or no schema supplied), or
+/// [`ReflectionError::Internal`] when a supplied schema does not conform.
 ///
-/// # Feature gating
-///
-/// The schema check itself only runs when the `schema_validation` feature
-/// is enabled. Without it, this function is always `Ok(())` once the
-/// early-return skips have passed — the analysis is returned unchanged.
-/// Callers who want validation must enable the feature.
+/// The whole function (and its single call site) is gated behind the
+/// `schema_validation` feature: without it there is no validation to do,
+/// so neither the function nor the call exist. This keeps the no-feature
+/// build free of dead no-op stubs.
 ///
 /// # Errors
 ///
-/// See the body — returns `ReflectionError::Internal` only under
-/// `schema_validation` + supplied schema + non-conforming `modified_input`.
+/// Returns [`ReflectionError::Internal`] only when a schema is supplied
+/// and `modified_input` does not conform to it.
+#[cfg(feature = "schema_validation")]
 fn validate_modified_input(
     analysis: &FailureAnalysis,
     tool_schema: Option<&serde_json::Value>,
 ) -> Result<(), ReflectionError> {
-    // Without the schema_validation feature, validation never runs — bail
-    // out early so we don't bind `modified_input` / `schema` only to drop
-    // them on the floor. The signature is unchanged; the early return
-    // keeps the function a no-op under the default feature set.
-    #[cfg(not(feature = "schema_validation"))]
-    {
-        let _ = (analysis, tool_schema);
+    let Some(correction) = &analysis.correction else {
         return Ok(());
+    };
+    let Some(modified_input) = &correction.modified_input else {
+        return Ok(());
+    };
+    let Some(schema) = tool_schema else {
+        return Ok(());
+    };
+
+    if !jsonschema::is_valid(schema, modified_input) {
+        return Err(ReflectionError::Internal(
+            "corrected input does not match the tool's schema".to_string(),
+        ));
     }
 
-    #[cfg(feature = "schema_validation")]
-    {
-        let Some(correction) = &analysis.correction else {
-            return Ok(());
-        };
-        let Some(modified_input) = &correction.modified_input else {
-            return Ok(());
-        };
-        let Some(schema) = tool_schema else {
-            return Ok(());
-        };
-
-        if !jsonschema::is_valid(schema, modified_input) {
-            return Err(ReflectionError::Internal(
-                "corrected input does not match the tool's schema".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -718,6 +702,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "schema_validation")]
     fn validate_modified_input_noop_without_correction() {
         let analysis = FailureAnalysis {
             is_recoverable: false,
@@ -731,6 +716,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "schema_validation")]
     fn validate_modified_input_noop_without_modified_input() {
         let analysis = FailureAnalysis {
             is_recoverable: true,
@@ -749,6 +735,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "schema_validation")]
     fn validate_modified_input_skips_when_no_schema() {
         // Even with a modified_input present, no schema → Ok (the engine
         // passes None when the tool isn't in the registry).
@@ -769,9 +756,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_modified_input_passes_without_feature() {
-        // Without `schema_validation`, even a deliberately-mismatched
-        // modified_input must return Ok (validation is gated off).
+    #[cfg(feature = "schema_validation")]
+    fn validate_modified_input_rejects_mismatched_schema() {
         let analysis = FailureAnalysis {
             is_recoverable: true,
             root_cause: "x".to_string(),
@@ -779,7 +765,6 @@ mod tests {
             correction: Some(Correction {
                 correction_type: CorrectionType::InputFix,
                 description: "fix".to_string(),
-                // Mismatched shape — schema requires a number, input is a string.
                 modified_input: Some(serde_json::json!({"wrong": "shape"})),
                 alternative_tool: None,
                 guidance: None,
@@ -793,18 +778,9 @@ mod tests {
             "additionalProperties": false
         });
         let result = validate_modified_input(&analysis, Some(&schema));
-        // Under `schema_validation` this fails; without it, it's Ok. Pin
-        // the no-feature behavior here; the under-feature behavior is
-        // covered by llm_reflector_validates_modified_input_fail.
-        #[cfg(feature = "schema_validation")]
         assert!(
             matches!(result, Err(ReflectionError::Internal(_))),
             "with schema_validation the mismatch should fail: {result:?}"
-        );
-        #[cfg(not(feature = "schema_validation"))]
-        assert!(
-            result.is_ok(),
-            "without schema_validation validation is skipped: {result:?}"
         );
     }
 

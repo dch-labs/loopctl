@@ -17,10 +17,10 @@
 //! | [`Detectable`]           | Detect repetitive loops and convergence          |
 //! | [`FallbackCapable`]      | Circuit-breaker fallback to alternate models     |
 //! | [`Compactable`]          | Automatic context compaction when tokens exceed  |
-//! | [`StreamCapable`]        | Resilient streaming with retries and timeouts    |
-//! | [`Hookable`]             | Bidirectional hooks that can block actions       |
+//! | `StreamCapable`          | Resilient streaming with retries and timeouts    |
+//! | `Hookable`               | Bidirectional hooks that can block actions       |
 //! | [`PipelineAware`]        | Dispatch tools through a middleware pipeline     |
-//! | [`HealthTrackable`]      | Per-tool health tracking with circuit breakers   |
+//! | `HealthTrackable`        | Per-tool health tracking with circuit breakers   |
 //!
 //! # `LoopManagers`
 //!
@@ -75,6 +75,7 @@ use crate::hooks::HookExecutor;
 use crate::middleware::ToolPipeline;
 use crate::observer::{ConvergenceDetectedContext, LoopDetectedContext};
 use crate::observer::{LoopObserver, ObserverHost};
+#[cfg(feature = "streaming")]
 use crate::stream::handler::StreamHandler;
 #[cfg(feature = "tool_health")]
 use crate::tool::health::ToolHealthRegistry;
@@ -111,7 +112,7 @@ pub use crate::capabilities::*;
 /// - [`Detectable`] — via the internal [`DetectionManager`]
 /// - [`FallbackCapable`] — via the internal [`FallbackManager`]
 /// - [`Compactable`] — via an optional [`ContextManager`]
-/// - [`StreamCapable`] — via an optional [`StreamHandler`]
+/// - `StreamCapable` — via an optional `StreamHandler`
 /// - `Hookable` — via an optional `HookExecutor` *(requires `hooks` feature)*
 /// - [`PipelineAware`] — via an optional [`ToolPipeline`]
 /// - `HealthTrackable` — via an optional `ToolHealthRegistry` *(requires `tool_health` feature)*
@@ -160,7 +161,9 @@ pub struct LoopManagers {
     ///
     /// When set, wraps streaming calls with retry logic, timeout enforcement,
     /// and automatic fallback to non-streaming when the provider drops the
-    /// connection mid-stream.
+    /// connection mid-stream. Absent under `default = []`; requires the
+    /// `streaming` feature.
+    #[cfg(feature = "streaming")]
     stream_handler: Option<StreamHandler>,
 
     /// Optional hook executor for bidirectional lifecycle interception.
@@ -208,6 +211,7 @@ impl LoopManagers {
             observer_host: ObserverHost::new(),
             tool_pipeline: None,
             context_manager: None,
+            #[cfg(feature = "streaming")]
             stream_handler: None,
             #[cfg(feature = "hooks")]
             hook_executor: None,
@@ -319,6 +323,7 @@ impl LoopManagers {
     ///     .with_stream_handler(handler)
     /// ```
     #[must_use]
+    #[cfg(feature = "streaming")]
     pub fn with_stream_handler(mut self, handler: StreamHandler) -> Self {
         self.stream_handler = Some(handler);
         self
@@ -383,6 +388,7 @@ impl LoopManagers {
     /// Set the stream handler for resilient streaming.
     ///
     /// Non-consuming variant of [`with_stream_handler`](Self::with_stream_handler).
+    #[cfg(feature = "streaming")]
     pub fn set_stream_handler(&mut self, handler: StreamHandler) {
         self.stream_handler = Some(handler);
     }
@@ -560,6 +566,7 @@ impl crate::capabilities::RememberCapable for LoopManagers {
     }
 }
 
+#[cfg(feature = "streaming")]
 impl crate::capabilities::StreamCapable for LoopManagers {
     fn stream_handler(&self) -> &StreamHandler {
         self.stream_handler
@@ -654,6 +661,7 @@ mod tests {
         fn _assert_fallback(_: &dyn FallbackCapable) {}
         fn _assert_pipeline(_: &dyn PipelineAware) {}
         fn _assert_compactable(_: &dyn Compactable) {}
+        #[cfg(feature = "streaming")]
         fn _assert_stream_capable(_: &dyn StreamCapable) {}
 
         let managers = LoopManagers::new();
@@ -662,6 +670,7 @@ mod tests {
         _assert_fallback(&managers);
         _assert_pipeline(&managers);
         _assert_compactable(&managers);
+        #[cfg(feature = "streaming")]
         _assert_stream_capable(&managers);
     }
 
@@ -684,6 +693,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "streaming")]
     fn test_stream_handler_defaults_to_passthrough() {
         let managers = LoopManagers::new();
         let handler = managers.stream_handler();
@@ -720,6 +730,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "streaming")]
     fn test_set_stream_handler_overrides_passthrough() {
         use crate::stream::handler::StreamHandler;
 
@@ -800,6 +811,7 @@ mod tests {
         fn accepts_detectable(_: &impl Detectable) {}
         fn accepts_fallback(_: &impl FallbackCapable) {}
         fn accepts_compactable(_: &impl Compactable) {}
+        #[cfg(feature = "streaming")]
         fn accepts_stream_capable(_: &impl StreamCapable) {}
         fn accepts_pipeline(_: &impl PipelineAware) {}
         fn accepts_multi_bound(_: &(impl Observable + Detectable + FallbackCapable)) {}
@@ -809,6 +821,7 @@ mod tests {
         accepts_detectable(&managers);
         accepts_fallback(&managers);
         accepts_compactable(&managers);
+        #[cfg(feature = "streaming")]
         accepts_stream_capable(&managers);
         accepts_pipeline(&managers);
         accepts_multi_bound(&managers);

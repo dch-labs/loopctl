@@ -13,7 +13,7 @@
 //! | [`Detectable`]      | Loop and convergence detection                                |
 //! | [`FallbackCapable`] | Model fallback / circuit breaker                              |
 //! | [`Compactable`]     | Context compaction                                            |
-//! | [`StreamCapable`]   | Resilient LLM streaming                                       |
+//! | `StreamCapable`     | Resilient LLM streaming *(requires `streaming` feature)*      |
 //! | [`PipelineAware`]   | Middleware pipeline dispatch                                  |
 //! | `Hookable`          | Bidirectional lifecycle hooks *(requires `hooks` feature)*    |
 //! | `HealthTrackable`   | Per-tool health monitoring *(requires `tool_health` feature)* |
@@ -38,6 +38,7 @@ use crate::fallback::FallbackManager;
 use crate::hooks::HookExecutor;
 use crate::middleware::ToolPipeline;
 use crate::observer::ObserverHost;
+#[cfg(feature = "streaming")]
 use crate::stream::handler::StreamHandler;
 #[cfg(feature = "tool_health")]
 use crate::tool::health::ToolHealthRegistry;
@@ -202,6 +203,7 @@ pub trait RememberCapable {
 /// resilient streaming. Useful for custom loop implementations
 /// that need to control streaming behaviour (timeouts, retries, fallback
 /// to non-streaming mode).
+#[cfg(feature = "streaming")]
 pub trait StreamCapable {
     /// Returns the stream handler.
     ///

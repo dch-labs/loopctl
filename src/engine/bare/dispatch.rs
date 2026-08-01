@@ -385,6 +385,7 @@ impl<C: ApiClient> BareLoop<C> {
         loop {
             self.notify_tool_pre(turn_idx, &tc);
 
+            #[cfg(feature = "hooks")]
             if let Some(blocked) = self.check_pre_tool_use_hooks(&tc, turn_idx) {
                 self.notify_tool_post(turn_idx, &tc, &blocked);
                 return Ok(blocked);
@@ -403,7 +404,9 @@ impl<C: ApiClient> BareLoop<C> {
             };
             self.post_detection(&tc, &tool_result);
             self.notify_tool_post(turn_idx, &tc, &tool_result);
+            #[cfg(feature = "hooks")]
             self.notify_post_tool_use_hooks(&tc, &tool_result, turn_idx);
+            #[cfg(feature = "tool_health")]
             self.record_tool_health(tc.tool.as_str(), &tool_result);
             self.record_tool_memory(&tc, &tool_result).await;
 
@@ -707,19 +710,6 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Stub for [`check_pre_tool_use_hooks`](Self::check_pre_tool_use_hooks)
-    /// when the `hooks` feature is disabled.
-    ///
-    /// Always returns `None` (no hooks to check) so the call proceeds normally.
-    #[cfg(not(feature = "hooks"))]
-    fn check_pre_tool_use_hooks(
-        &self,
-        _tc: &ToolCall,
-        _turn_idx: usize,
-    ) -> Option<ToolDispatchResult> {
-        None
-    }
-
     /// Notify post-tool-use hooks with the execution result.
     ///
     /// If a [`HookExecutor`](crate::hooks::HookExecutor) is configured, builds
@@ -757,19 +747,6 @@ impl<C: ApiClient> BareLoop<C> {
         executor.notify_post_tool_use(&ctx);
     }
 
-    /// Stub for [`notify_post_tool_use_hooks`](Self::notify_post_tool_use_hooks)
-    /// when the `hooks` feature is disabled.
-    ///
-    /// No-op: there are no hooks to notify.
-    #[cfg(not(feature = "hooks"))]
-    fn notify_post_tool_use_hooks(
-        &self,
-        _tc: &ToolCall,
-        _tool_result: &ToolDispatchResult,
-        _turn_idx: usize,
-    ) {
-    }
-
     /// Record tool execution health (success or failure) in the health registry.
     ///
     /// If a [`ToolHealthRegistry`](crate::tool::health::ToolHealthRegistry) is
@@ -788,13 +765,6 @@ impl<C: ApiClient> BareLoop<C> {
             health.record_success(tool_name, tool_result.duration);
         }
     }
-
-    /// Stub for [`record_tool_health`](Self::record_tool_health) when the
-    /// `tool_health` feature is disabled.
-    ///
-    /// No-op: there is no health registry to record into.
-    #[cfg(not(feature = "tool_health"))]
-    fn record_tool_health(&self, _tool_name: &str, _tool_result: &ToolDispatchResult) {}
 
     /// Store a successful tool-execution trajectory into the memory backend.
     ///
@@ -928,7 +898,7 @@ impl<C: ApiClient> BareLoop<C> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "testing"))]
 #[allow(clippy::unnecessary_literal_bound)]
 mod tests {
     use crate::api::error::ApiError;

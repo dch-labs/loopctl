@@ -114,19 +114,8 @@ pub trait TokenCounter: Send + Sync {
 ///
 /// Counts the character length of all message parts (text, tool calls, tool
 /// results), adds a fixed per-message overhead for role tags and formatting,
-/// and divides by `bytes_per_token`. Conservative — overestimates rather
+/// and divides by 4 (`CHARS_PER_TOKEN`). Conservative — overestimates rather
 /// than underestimates, so compaction triggers slightly early rather than
-/// late. Accuracy is roughly ±30% on real content; for production use,
-/// swap in a real tokenizer via the [`TokenCounter`] trait.
-///
-/// # Presets
-///
-/// A zero-dependency token estimator using 4 characters per token.
-///
-/// Counts the character length of all message parts (text, tool calls, tool
-/// results), adds a fixed per-message overhead for role tags and formatting,
-/// and divides by 4. Conservative — overestimates rather than
-/// underestimates, so compaction triggers slightly early rather than
 /// late. Accuracy is roughly ±30% on real content; for production use,
 /// swap in a real tokenizer via the [`TokenCounter`] trait.
 ///
@@ -158,16 +147,15 @@ impl TokenCounter for HeuristicTokenCounter {
                     .map(|p| match p {
                         MessagePart::Text { text } => text.chars().count() as u64,
                         MessagePart::Image { .. } => 256,
-                        MessagePart::ToolCall { name, input, .. } => {
-                            (name.len() as u64).saturating_add(input.to_string().len() as u64)
-                        }
+                        MessagePart::ToolCall { name, input, .. } => (name.chars().count() as u64)
+                            .saturating_add(input.to_string().chars().count() as u64),
                         MessagePart::ToolResult { output, .. } => match output {
-                            crate::message::ToolContent::Text(s) => s.len() as u64,
+                            crate::message::ToolContent::Text(s) => s.chars().count() as u64,
                             crate::message::ToolContent::Multipart(parts) => parts
                                 .iter()
                                 .map(|p| match p {
                                     crate::message::ToolContentPart::Text { text } => {
-                                        text.len() as u64
+                                        text.chars().count() as u64
                                     }
                                     crate::message::ToolContentPart::Image { .. } => 256,
                                 })
@@ -181,7 +169,7 @@ impl TokenCounter for HeuristicTokenCounter {
         total_chars / CHARS_PER_TOKEN
     }
 }
-///
+
 /// Implementations define *how* to reduce a message list — truncation,
 /// summarization, Q&A extraction, etc. The framework calls
 /// [`compact`](ContextCompactor::compact) when the [`ContextManager`]

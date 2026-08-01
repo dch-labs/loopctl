@@ -414,8 +414,9 @@ pub enum MessagePart {
         /// Copied from the original [`ToolCall`](MessagePart::ToolCall)'s
         /// `name` field. Required by providers that correlate tool responses
         /// by function name (e.g. Gemini's `functionResponse`), in addition to
-        /// the `call_id`. Always present for results built by the engine after
-        /// tool dispatch.
+        /// the `call_id`. Defaults to an empty string when deserializing older
+        /// data that predates this field.
+        #[serde(default)]
         name: String,
 
         /// The output returned by the tool.
@@ -1035,6 +1036,20 @@ mod tests {
         let result: ToolContent = "hello".into();
         assert!(result.is_string());
         assert_eq!(result.to_string(), "hello");
+    }
+
+    #[test]
+    fn tool_result_deserializes_without_name_field() {
+        let json = r#"{"type":"tool_result","call_id":"tc_1","output":"ok","is_error":false}"#;
+        let part: MessagePart =
+            serde_json::from_str(json).expect("old data without name must parse");
+        match part {
+            MessagePart::ToolResult { call_id, name, .. } => {
+                assert_eq!(call_id, "tc_1");
+                assert_eq!(name, "");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 
     #[test]

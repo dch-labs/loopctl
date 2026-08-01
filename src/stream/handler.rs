@@ -1531,9 +1531,7 @@ impl StreamHandler {
     /// Returns a reference to the retry configuration.
     ///
     /// Read-only access to the [`StreamRetryConfig`] stored on the handler.
-    /// Mutate via
-    /// [`with_retry_config`](Self::with_retry_config).
-    /// both retry and timeout together); there is no per-field setter.
+    /// Mutate via [`with_retry_config`](Self::with_retry_config).
     #[must_use]
     pub fn retry_config(&self) -> &StreamRetryConfig {
         &self.retry_config
@@ -1762,19 +1760,6 @@ impl StreamHandler {
         })
     }
 
-    /// Decide how to handle a rate-limit failure on the current model.
-    ///
-    /// Bumps `count` and returns one of:
-    /// - [`RateLimitRetry::HardStop`] once `count` exceeds
-    ///   [`max_retries`](RateLimitConfig::max_retries) — the absolute ceiling;
-    /// - [`RateLimitRetry::Escalate`] once `count` exceeds
-    ///   [`fallback_after_retries`](RateLimitConfig::fallback_after_retries)
-    ///   but is still within `max_retries` — the caller escalates to the
-    ///   model circuit breaker;
-    /// - [`RateLimitRetry::Retry`] with the deadline-clamped backoff otherwise.
-    ///
-    /// `max_retries` is checked first so it is always enforced as the hard
-    /// ceiling, regardless of `fallback_after_retries`.
     /// Decide how to handle a rate-limit stream error.
     ///
     /// Delegates to [`rate_limit_retry`](Self::rate_limit_retry) for the
@@ -1847,6 +1832,19 @@ impl StreamHandler {
         ErrorAction::Retry(delay)
     }
 
+    /// Decide how to handle a rate-limit failure on the current model.
+    ///
+    /// Bumps `count` and returns one of:
+    /// - [`RateLimitRetry::HardStop`] once `count` exceeds
+    ///   [`max_retries`](RateLimitConfig::max_retries) — the absolute ceiling;
+    /// - [`RateLimitRetry::Escalate`] once `count` exceeds
+    ///   [`fallback_after_retries`](RateLimitConfig::fallback_after_retries)
+    ///   but is still within `max_retries` — the caller escalates to the
+    ///   model circuit breaker;
+    /// - [`RateLimitRetry::Retry`] with the deadline-clamped backoff otherwise.
+    ///
+    /// `max_retries` is checked first so it is always enforced as the hard
+    /// ceiling, regardless of `fallback_after_retries`.
     fn rate_limit_retry(
         &self,
         detail: &DetectedRateLimit,
@@ -2221,12 +2219,12 @@ mod tests {
                     HandlerEvent::Fallback {
                         message,
                         stop_reason: fallback_stop_reason,
-                        ..
+                        usage: fallback_usage,
                     } => {
                         from_fallback = true;
                         return Ok(DriveResult {
                             message,
-                            usage: None,
+                            usage: fallback_usage,
                             stop_reason: fallback_stop_reason,
                             from_fallback,
                         });
@@ -3415,7 +3413,7 @@ mod tests {
                 Ok(crate::api::NonStreamingResponse {
                     message: crate::message::Message::assistant("fallback answer"),
                     stop_reason: crate::stream::StreamStopReason::MaxTokens,
-                    usage: Some(crate::stream::Usage::default()),
+                    usage: Some(crate::stream::Usage::new(42, 13)),
                 })
             })
         }
@@ -3443,7 +3441,7 @@ mod tests {
                 Ok(crate::api::NonStreamingResponse {
                     message: crate::message::Message::assistant("fallback answer"),
                     stop_reason: crate::stream::StreamStopReason::MaxTokens,
-                    usage: Some(crate::stream::Usage::default()),
+                    usage: Some(crate::stream::Usage::new(42, 13)),
                 })
             })
         }
@@ -3500,9 +3498,11 @@ mod tests {
             text.contains("fallback answer"),
             "fallback message text, got {text:?}"
         );
-        // Usage is None on the fallback path (non-streaming JSON doesn't
-        // reliably carry token counts).
-        assert!(result.usage.is_none());
+        assert_eq!(
+            result.usage,
+            Some(Usage::new(42, 13)),
+            "fallback path must propagate usage from the non-streaming response"
+        );
     }
 
     #[test]

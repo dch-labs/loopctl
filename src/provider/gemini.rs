@@ -170,15 +170,16 @@ impl GeminiClient {
     ///
     /// Reads `candidates[0].content.parts` into [`MessagePart`]s: each `text`
     /// field becomes a [`MessagePart::Text`] part and each `functionCall`
-    /// becomes a [`MessagePart::ToolCall`] (Gemini function calls carry no
-    /// caller-side id, so the id is left empty — matching the streaming path).
-    /// A single part may hold both `text` and `functionCall`, in which case it
-    /// yields two parts. Maps `candidates[0].finishReason` to a
-    /// [`StreamStopReason`] using the same mapping the streaming emitter
-    /// applies: `"MAX_TOKENS"` → `MaxTokens`, anything else (including the
-    /// `"STOP"` default) → `EndTurn`. Reads `usageMetadata.promptTokenCount`
-    /// and `candidatesTokenCount` (plus `thoughtsTokenCount`) into [`Usage`],
-    /// defaulting to zero when the object is absent.
+    /// becomes a [`MessagePart::ToolCall`] with its `id` preserved when
+    /// present (Gemini 3 assigns a unique id per call; older versions omit
+    /// it, in which case the id defaults to an empty string). A single part
+    /// may hold both `text` and `functionCall`, in which case it yields two
+    /// parts. Maps `candidates[0].finishReason` to a [`StreamStopReason`]
+    /// using the same mapping the streaming emitter applies: `"MAX_TOKENS"` →
+    /// `MaxTokens`, anything else (including the `"STOP"` default) →
+    /// `EndTurn`. Reads `usageMetadata.promptTokenCount` and
+    /// `candidatesTokenCount` (plus `thoughtsTokenCount`) into [`Usage`],
+    /// returning `None` when the object is absent or all-zero.
     fn build_response(raw: &Value) -> crate::api::NonStreamingResponse {
         let mut parts: Vec<MessagePart> = Vec::new();
         if let Some(content_parts) = raw

@@ -4,6 +4,16 @@
 //! errors, hook interception, health recording, and middleware pipeline
 //! support.
 
+/// Truncate a string to `max_len` chars, appending `…` when truncated.
+fn truncate_to(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        return s.to_string();
+    }
+    let mut cut = s.char_indices().take(max_len).last().map_or(0, |(i, _)| i);
+    cut = cut.saturating_add(s[cut..].chars().next().map_or(0, char::len_utf8));
+    format!("{}…", &s[..cut])
+}
+
 #[cfg(feature = "hooks")]
 use super::HookAction;
 use super::{
@@ -216,7 +226,7 @@ impl<C: ApiClient> BareLoop<C> {
         tool_calls: &[ToolCall],
         turn_idx: usize,
     ) -> Result<Vec<ToolDispatchResult>, LoopError> {
-        match self.run_config().parallel_tool_dispatch.mode {
+        match self.dispatch_mode().mode {
             crate::config::ParallelMode::Parallel => {
                 self.dispatch_tools_parallel(tool_calls, turn_idx).await
             }
@@ -284,8 +294,7 @@ impl<C: ApiClient> BareLoop<C> {
 
         let plan = ToolDependencyGraph::from_calls(tool_calls, &self.tools).plan();
         let max_concurrency = self
-            .run_config()
-            .parallel_tool_dispatch
+            .dispatch_mode()
             .max_concurrency
             .clamp(1, tool_calls.len());
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrency));
@@ -324,14 +333,18 @@ impl<C: ApiClient> BareLoop<C> {
 
         Ok(results
             .into_iter()
-            .map(|r| {
-                r.unwrap_or_else(|| ToolDispatchResult {
-                    tool_call_id: String::new(),
-                    output: ToolContent::Text("dispatch produced no result".to_string()),
-                    is_error: true,
-                    duration: Duration::ZERO,
-                    resolved_tool_name: String::new(),
-                    display_hint: None,
+            .enumerate()
+            .map(|(idx, r)| {
+                r.unwrap_or_else(|| {
+                    let tc = tool_calls.get(idx);
+                    ToolDispatchResult {
+                        tool_call_id: tc.map(|c| c.id.clone()).unwrap_or_default(),
+                        output: ToolContent::Text("dispatch produced no result".to_string()),
+                        is_error: true,
+                        duration: Duration::ZERO,
+                        resolved_tool_name: tc.map(|c| c.tool.clone()).unwrap_or_default(),
+                        display_hint: None,
+                    }
                 })
             })
             .collect())
@@ -392,6 +405,7 @@ impl<C: ApiClient> BareLoop<C> {
             self.notify_tool_post(turn_idx, &tc, &tool_result);
             self.notify_post_tool_use_hooks(&tc, &tool_result, turn_idx);
             self.record_tool_health(tc.tool.as_str(), &tool_result);
+            self.record_tool_memory(&tc, &tool_result).await;
 
             if !tool_result.is_error {
                 return Ok(tool_result);
@@ -782,6 +796,33 @@ impl<C: ApiClient> BareLoop<C> {
     #[cfg(not(feature = "tool_health"))]
     fn record_tool_health(&self, _tool_name: &str, _tool_result: &ToolDispatchResult) {}
 
+    /// Store a successful tool-execution trajectory into the memory backend.
+    ///
+    /// Called after each tool dispatch that did not error. Guards on
+    /// [`RememberCapable`] — when no memory store is configured this is a
+    /// no-op. Builds a [`MemoryEntry`](crate::memory::MemoryEntry) tagged
+    /// [`Trajectory`](crate::memory::MemoryCategory::Trajectory) carrying the
+    /// tool name, input, and result, then stores it. Errors are logged and
+    /// swallowed — a memory-store failure must never crash the turn.
+    async fn record_tool_memory(&self, tc: &ToolCall, tool_result: &ToolDispatchResult) {
+        const MAX_FIELD_LEN: usize = 500;
+        let Some(memory) = self.managers.memory() else {
+            return;
+        };
+        if tool_result.is_error {
+            return;
+        }
+        let input = truncate_to(&tc.input.to_string(), MAX_FIELD_LEN);
+        let result = truncate_to(&tool_result.output.to_string(), MAX_FIELD_LEN);
+        let entry = crate::memory::MemoryEntry::new(
+            crate::memory::MemoryCategory::Trajectory,
+            format!("tool={}; input={input}; result={result}", tc.tool),
+        );
+        if let Err(e) = memory.store(entry).await {
+            tracing::warn!(error = %e, tool = %tc.tool, "memory store failed");
+        }
+    }
+
     /// Dispatch a tool call through the middleware pipeline.
     ///
     /// Builds a [`ToolDispatchContext`] and delegates to the pipeline's
@@ -908,6 +949,27 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn truncate_to_short_string_unchanged() {
+        assert_eq!(truncate_to("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_to_exact_length_unchanged() {
+        assert_eq!(truncate_to("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_to_longer_string_appends_ellipsis() {
+        assert_eq!(truncate_to("hello world", 5), "hello…");
+    }
+
+    #[test]
+    fn truncate_to_multibyte_chars_counts_characters_not_bytes() {
+        assert_eq!(truncate_to("héllo", 3), "hél…");
+        assert_eq!(truncate_to("日本語テスト", 3), "日本語…");
+    }
+
     struct MockClient {
         model_name: Arc<Mutex<String>>,
     }
@@ -946,8 +1008,11 @@ mod tests {
         fn create_message(
             &self,
             _request: &crate::api::StreamRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ApiError>> + Send + '_>>
-        {
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_,
+            >,
+        > {
             Box::pin(async { Err(ApiError::http("not implemented")) })
         }
     }

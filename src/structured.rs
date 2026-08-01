@@ -340,7 +340,6 @@ pub enum StructuredError {
 ///
 /// Returns `None` if the content cannot be parsed as JSON (even after the
 /// lenient rescue).
-#[cfg(any(feature = "openai", feature = "gemini"))]
 pub(crate) fn parse_json_lenient(text: &str) -> Option<serde_json::Value> {
     if let Ok(v) = serde_json::from_str(text) {
         return Some(v);
@@ -355,7 +354,6 @@ pub(crate) fn parse_json_lenient(text: &str) -> Option<serde_json::Value> {
 /// the substring up to the matching close. String-aware: braces/brackets
 /// inside JSON string literals (`"..."`) do not affect depth, and `\"`
 /// escapes are honored.
-#[cfg(any(feature = "openai", feature = "gemini"))]
 pub(crate) fn extract_json_substring(text: &str) -> Option<serde_json::Value> {
     let bytes = text.as_bytes();
     let mut start = None;
@@ -603,11 +601,11 @@ pub async fn request_structured<T: StructuredOutput + serde::de::DeserializeOwne
         system,
         tools: None,
     };
-    let raw = client
+    let response = client
         .create_message_with_options(&request, opts)
         .await
         .map_err(StructuredError::Api)?;
-    let value = client.extract_structured(&raw);
+    let value = client.extract_structured(&response.message);
     T::from_value(value)
 }
 
@@ -784,12 +782,22 @@ mod tests {
             _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
-                dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
-                    + Send
+                dyn Future<
+                        Output = Result<
+                            crate::api::NonStreamingResponse,
+                            crate::api::error::ApiError,
+                        >,
+                    > + Send
                     + '_,
             >,
         > {
-            Box::pin(async { Ok(serde_json::json!({})) })
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(""),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
     }
 
@@ -843,12 +851,22 @@ mod tests {
             _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
-                dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
-                    + Send
+                dyn Future<
+                        Output = Result<
+                            crate::api::NonStreamingResponse,
+                            crate::api::error::ApiError,
+                        >,
+                    > + Send
                     + '_,
             >,
         > {
-            Box::pin(async { Ok(serde_json::json!({})) })
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(""),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
         fn create_message_with_options(
             &self,
@@ -856,16 +874,23 @@ mod tests {
             _options: RequestOptions,
         ) -> Pin<
             Box<
-                dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
-                    + Send
+                dyn Future<
+                        Output = Result<
+                            crate::api::NonStreamingResponse,
+                            crate::api::error::ApiError,
+                        >,
+                    > + Send
                     + '_,
             >,
         > {
             Box::pin(async {
-                Ok(serde_json::json!({
-                    "tool": "write",
-                    "args": {"path": "/test"}
-                }))
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(
+                        r#"{"tool": "write", "args": {"path": "/test"}}"#,
+                    ),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
             })
         }
     }
@@ -902,12 +927,22 @@ mod tests {
             _request: &crate::api::StreamRequest,
         ) -> Pin<
             Box<
-                dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
-                    + Send
+                dyn Future<
+                        Output = Result<
+                            crate::api::NonStreamingResponse,
+                            crate::api::error::ApiError,
+                        >,
+                    > + Send
                     + '_,
             >,
         > {
-            Box::pin(async { Ok(serde_json::json!({})) })
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant(""),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
         fn create_message_with_options(
             &self,
@@ -915,12 +950,22 @@ mod tests {
             _options: RequestOptions,
         ) -> Pin<
             Box<
-                dyn Future<Output = Result<serde_json::Value, crate::api::error::ApiError>>
-                    + Send
+                dyn Future<
+                        Output = Result<
+                            crate::api::NonStreamingResponse,
+                            crate::api::error::ApiError,
+                        >,
+                    > + Send
                     + '_,
             >,
         > {
-            Box::pin(async { Ok(serde_json::json!("I cannot produce that.")) })
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: crate::message::Message::assistant("I cannot produce that."),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
         }
     }
 

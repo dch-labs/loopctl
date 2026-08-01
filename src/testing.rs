@@ -696,11 +696,13 @@ impl ApiClient for MockApiClient {
         Box::pin(futures::stream::iter(events))
     }
 
-    /// Return a canned non-streaming JSON response.
+    /// Return a canned non-streaming [`NonStreamingResponse`](crate::api::NonStreamingResponse).
     ///
     /// Called by code paths that use the non-streaming API. The mock
-    /// returns a JSON object with a `content` array containing a single
-    /// text block drawn from the current [`MockResponse`].
+    /// translates the current [`MockResponse`] into a typed
+    /// [`NonStreamingResponse`](crate::api::NonStreamingResponse) carrying an
+    /// assistant [`Message`] built from the response's text and optional tool
+    /// call, plus the stop reason parsed from [`MockResponse::stop_reason`].
     ///
     /// If [`with_error`](MockApiClient::with_error) was called the
     /// future resolves to an [`ApiError`] instead, bypassing the
@@ -717,13 +719,14 @@ impl ApiClient for MockApiClient {
     ///
     /// let client = MockApiClient::new("test-model").with_text_response("Hi!");
     /// let result = client.create_message(&StreamRequest::new(vec![])).await;
-    /// assert_eq!(result.unwrap()["content"][0]["text"], "Hi!");
+    /// assert_eq!(result.unwrap().message.text_content(), "Hi!");
     /// # });
     /// ```
     fn create_message(
         &self,
         _request: &crate::api::StreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
         if let Some(ref err) = self.error {
             let err = err.clone();
             return Box::pin(async move { Err(ApiError::api(&err)) });
@@ -731,9 +734,18 @@ impl ApiClient for MockApiClient {
 
         let response = self.pop_response();
         Box::pin(async move {
-            Ok(json!({
-                "content": [{"type": "text", "text": response.text}]
-            }))
+            let stop_reason = crate::stream::StreamStopReason::from_api_str(&response.stop_reason)
+                .unwrap_or(crate::stream::StreamStopReason::EndTurn);
+            let parts = if let Some(tc) = response.tool_call {
+                vec![MessagePart::tool_call(tc.id, tc.name, tc.input)]
+            } else {
+                vec![MessagePart::text(response.text)]
+            };
+            Ok(crate::api::NonStreamingResponse {
+                message: Message::new(Role::Assistant, parts),
+                stop_reason,
+                usage: Some(crate::stream::Usage::default()),
+            })
         })
     }
 }
@@ -1507,8 +1519,12 @@ mod tests {
             })
             .await;
         assert!(result.is_ok());
-        let json = result.unwrap();
-        assert_eq!(json["content"][0]["text"], "Hello!");
+        let response = result.unwrap();
+        assert_eq!(response.message.text_content(), "Hello!");
+        assert_eq!(
+            response.stop_reason,
+            crate::stream::StreamStopReason::EndTurn
+        );
     }
 
     #[tokio::test]

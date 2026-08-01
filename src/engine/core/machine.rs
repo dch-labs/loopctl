@@ -319,7 +319,7 @@ pub struct MachinePolicy {
 ///     match machine.next_step(policy) {
 ///         MachineStep::CallLLM { .. } => {
 ///             let response = build_response(&machine);
-///             machine.model_response(response);
+///             machine.model_response(response, 0);
 ///         }
 ///         MachineStep::CallTools { .. } => {
 ///             machine.tool_results(Vec::new());
@@ -565,7 +565,7 @@ impl LoopMachine {
     /// [`MachineStep::CallTools`].
     ///
     /// Has no effect once the machine is terminal.
-    pub fn model_response(&mut self, response: ModelResponse) {
+    pub fn model_response(&mut self, response: ModelResponse, context_tokens: u64) {
         if self.is_terminal() {
             return;
         }
@@ -581,7 +581,7 @@ impl LoopMachine {
             })
             .collect();
         self.pending.push(message);
-        self.context_tokens = response.input_tokens;
+        self.context_tokens = context_tokens;
         self.turns_taken = self.turns_taken.saturating_add(1);
 
         if tool_calls.is_empty() {
@@ -809,6 +809,7 @@ impl LoopMachine {
             Role::User,
             vec![MessagePart::tool_result(
                 call.id.clone(),
+                call.tool.clone(),
                 ToolContent::Text(message),
                 true,
             )],
@@ -821,7 +822,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    fn small_machine(_max_turns: usize) -> LoopMachine {
+    fn small_machine() -> LoopMachine {
         LoopMachine::from_history(vec![Message::user("hello")])
     }
 
@@ -855,6 +856,19 @@ mod tests {
         }
     }
 
+    /// A string long enough to exceed the compaction threshold in tests that
+    /// use `context_window: 100, compact_threshold: 50` (trigger at 50 tokens
+    /// = 200 chars). The machine estimates tokens from message text now, not
+    /// from the provider's `input_tokens` field.
+    fn long_text(n: usize) -> String {
+        "x".repeat(n)
+    }
+
+    fn count_tokens(machine: &LoopMachine) -> u64 {
+        use crate::compact::TokenCounter;
+        crate::compact::HeuristicTokenCounter.count(&machine.full_history())
+    }
+
     fn same_step(a: &MachineStep, b: &MachineStep) -> bool {
         serde_json::to_string(a).unwrap_or_default() == serde_json::to_string(b).unwrap_or_default()
     }
@@ -877,7 +891,7 @@ mod tests {
             machine.next_step(test_policy(5)),
             MachineStep::CallLLM { .. }
         ));
-        machine.model_response(text_response("hi", 5, 3));
+        machine.model_response(text_response("hi", 5, 3), 0);
         // A text-only turn completes the run, so the machine is terminal.
         assert!(machine.is_terminal());
         assert_eq!(machine.turns_taken(), 1);
@@ -892,9 +906,9 @@ mod tests {
 
     #[test]
     fn resume_after_model_response_round_trips() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
-        machine.model_response(tool_response("echo", &["echo"], 10));
+        machine.model_response(tool_response("echo", &["echo"], 10), 0);
         let snapshot = serde_json::to_string(&machine).expect("serialize");
         let mut restored: LoopMachine = serde_json::from_str(&snapshot).expect("deserialize");
         let a = machine.next_step(test_policy(5));
@@ -904,9 +918,9 @@ mod tests {
 
     #[test]
     fn resume_after_tool_results_round_trips() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
-        machine.model_response(tool_response("echo", &["echo"], 10));
+        machine.model_response(tool_response("echo", &["echo"], 10), 0);
         let step = machine.next_step(test_policy(5));
         let MachineStep::CallTools { calls } = &step else {
             panic!("expected CallTools, got {step:?}");
@@ -918,6 +932,7 @@ mod tests {
                     Role::User,
                     vec![MessagePart::tool_result(
                         c.call.id.clone(),
+                        c.call.tool.clone(),
                         ToolContent::Text("ok".to_string()),
                         false,
                     )],
@@ -940,11 +955,11 @@ mod tests {
             compact_threshold: 50,
             auto_compact: true,
         };
-        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(250))]);
         let _ = machine.next_step(policy); // CallLLM
-        machine.model_response(tool_response("echo", &["echo"], 60)); // AwaitingTools
+        machine.model_response(tool_response("echo", &["echo"], 0), count_tokens(&machine)); // AwaitingTools
         let _ = machine.next_step(policy); // CallTools
-        machine.tool_results(vec![Message::user("tool-out")]); // → Start
+        machine.tool_results(vec![Message::user(long_text(250))]); // → Start
         assert!(matches!(
             machine.next_step(policy),
             MachineStep::Compact { .. }
@@ -959,13 +974,13 @@ mod tests {
 
     #[test]
     fn max_turns_enforced_by_machine() {
-        let mut machine = small_machine(2);
+        let mut machine = small_machine();
         // Turn 1.
         assert!(matches!(
             machine.next_step(test_policy(2)),
             MachineStep::CallLLM { turn: 1 }
         ));
-        machine.model_response(tool_response("echo", &["echo"], 1));
+        machine.model_response(tool_response("echo", &["echo"], 1), 0);
         let _ = machine.next_step(test_policy(2));
         machine.tool_results(vec![Message::user("r")]);
         // Turn 2.
@@ -973,7 +988,7 @@ mod tests {
             machine.next_step(test_policy(2)),
             MachineStep::CallLLM { turn: 2 }
         ));
-        machine.model_response(tool_response("echo", &["echo"], 1));
+        machine.model_response(tool_response("echo", &["echo"], 1), 0);
         let _ = machine.next_step(test_policy(2));
         machine.tool_results(vec![Message::user("r")]);
         // Turn 3 must be denied.
@@ -986,7 +1001,7 @@ mod tests {
 
     #[test]
     fn cancel_returns_done_cancelled_at_next_step() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
         machine.cancel();
         match machine.next_step(test_policy(5)) {
@@ -1002,7 +1017,7 @@ mod tests {
 
     #[test]
     fn fail_returns_done_failed_at_next_step() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
         let err = LoopError::Api("stream failed".to_string());
         machine.fail(err.clone());
@@ -1017,7 +1032,7 @@ mod tests {
 
     #[test]
     fn failed_outcome_survives_round_trip() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
         let err = LoopError::Api("stream failed".to_string());
         machine.fail(err.clone());
@@ -1033,9 +1048,9 @@ mod tests {
 
     #[test]
     fn unknown_tool_call_gets_preresolved_result() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
-        machine.model_response(tool_response("ghost", &["echo", "ls"], 3));
+        machine.model_response(tool_response("ghost", &["echo", "ls"], 3), 0);
         let step = machine.next_step(test_policy(5));
         let MachineStep::CallTools { calls } = step else {
             panic!("expected CallTools, got {step:?}");
@@ -1054,9 +1069,9 @@ mod tests {
 
     #[test]
     fn known_tool_call_emits_plain_pending_call() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
-        machine.model_response(tool_response("echo", &["echo", "ls"], 3));
+        machine.model_response(tool_response("echo", &["echo", "ls"], 3), 0);
         let step = machine.next_step(test_policy(5));
         let MachineStep::CallTools { calls } = step else {
             panic!("expected CallTools, got {step:?}");
@@ -1070,24 +1085,24 @@ mod tests {
 
     #[test]
     fn compaction_triggered_when_tokens_exceed_threshold() {
-        // window = 100, threshold = 0.5 ⇒ compact once tokens > 50.
+        // window = 100, threshold = 50% ⇒ compact once estimate > 50 tokens.
         let policy = MachinePolicy {
             max_turns: 5,
             context_window: 100,
             compact_threshold: 50,
             auto_compact: true,
         };
-        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(250))]);
         assert!(matches!(
             machine.next_step(policy),
             MachineStep::CallLLM { .. }
         ));
-        machine.model_response(tool_response("echo", &["echo"], 60));
+        machine.model_response(tool_response("echo", &["echo"], 0), count_tokens(&machine));
         assert!(matches!(
             machine.next_step(policy),
             MachineStep::CallTools { .. }
         ));
-        machine.tool_results(vec![Message::user("tool-out")]);
+        machine.tool_results(vec![Message::user(long_text(250))]);
         match machine.next_step(policy) {
             MachineStep::Compact { reason } => {
                 assert_eq!(reason, CompactReason::ThresholdExceeded);
@@ -1104,17 +1119,17 @@ mod tests {
             compact_threshold: 50,
             auto_compact: false,
         };
-        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(400))]);
         assert!(matches!(
             machine.next_step(policy),
             MachineStep::CallLLM { .. }
         ));
-        machine.model_response(tool_response("echo", &["echo"], 96));
+        machine.model_response(tool_response("echo", &["echo"], 0), count_tokens(&machine));
         assert!(matches!(
             machine.next_step(policy),
             MachineStep::CallTools { .. }
         ));
-        machine.tool_results(vec![Message::user("r")]);
+        machine.tool_results(vec![Message::user(long_text(400))]);
         match machine.next_step(policy) {
             MachineStep::Compact { reason } => {
                 assert_eq!(reason, CompactReason::Emergency);
@@ -1132,12 +1147,12 @@ mod tests {
             compact_threshold: 50,
             auto_compact: true,
         };
-        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(250))]);
         // Drive a tool-call turn past the threshold so the next step compacts.
         let _ = machine.next_step(policy); // CallLLM
-        machine.model_response(tool_response("echo", &["echo"], 60)); // AwaitingTools
+        machine.model_response(tool_response("echo", &["echo"], 0), count_tokens(&machine)); // AwaitingTools
         let _ = machine.next_step(policy); // CallTools
-        machine.tool_results(vec![Message::user("tool-out")]); // → Start
+        machine.tool_results(vec![Message::user(long_text(250))]); // → Start
         assert!(matches!(
             machine.next_step(policy),
             MachineStep::Compact { .. }
@@ -1165,7 +1180,7 @@ mod tests {
         };
         let mut machine = LoopMachine::from_history(vec![Message::user("from previous run")]);
         machine.accept_input("current run input");
-        machine.model_response(tool_response("echo", &["echo"], 60));
+        machine.model_response(tool_response("echo", &["echo"], 0), count_tokens(&machine));
         let _ = machine.next_step(policy);
         machine.tool_results(vec![Message::user("tool-out")]);
 
@@ -1186,11 +1201,11 @@ mod tests {
             compact_threshold: 50,
             auto_compact: true,
         };
-        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(250))]);
         let _ = machine.next_step(policy);
-        machine.model_response(tool_response("echo", &["echo"], 60));
+        machine.model_response(tool_response("echo", &["echo"], 0), count_tokens(&machine));
         let _ = machine.next_step(policy);
-        machine.tool_results(vec![Message::user("tool-out")]);
+        machine.tool_results(vec![Message::user(long_text(250))]);
         assert!(matches!(
             machine.next_step(policy),
             MachineStep::Compact { .. }
@@ -1217,16 +1232,16 @@ mod tests {
             compact_threshold: 50,
             auto_compact: true,
         };
-        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(250))]);
         let _ = machine.next_step(policy);
-        machine.model_response(tool_response("echo", &["echo"], 60));
+        machine.model_response(tool_response("echo", &["echo"], 0), count_tokens(&machine));
         let _ = machine.next_step(policy);
-        machine.tool_results(vec![Message::user("tool-out")]);
+        machine.tool_results(vec![Message::user(long_text(250))]);
         assert!(matches!(
             machine.next_step(policy),
             MachineStep::Compact { .. }
         ));
-        machine.compaction_result(vec![Message::user("compacted")], 70);
+        machine.compaction_result(vec![Message::user("compacted")], 90);
 
         match machine.next_step(policy) {
             MachineStep::Done(MachineOutcome::Failed {
@@ -1246,11 +1261,11 @@ mod tests {
             compact_threshold: 50,
             auto_compact: true,
         };
-        let mut machine = LoopMachine::from_history(vec![Message::user("hello")]);
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(250))]);
         let _ = machine.next_step(policy);
-        machine.model_response(tool_response("echo", &["echo"], 60));
+        machine.model_response(tool_response("echo", &["echo"], 0), count_tokens(&machine));
         let _ = machine.next_step(policy);
-        machine.tool_results(vec![Message::user("tool-out")]);
+        machine.tool_results(vec![Message::user(long_text(250))]);
         assert!(matches!(
             machine.next_step(policy),
             MachineStep::Compact { .. }
@@ -1265,9 +1280,9 @@ mod tests {
 
     #[test]
     fn history_accumulates_user_assistant_tool_round() {
-        let mut machine = small_machine(5);
+        let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));
-        machine.model_response(tool_response("echo", &["echo"], 1));
+        machine.model_response(tool_response("echo", &["echo"], 1), 0);
         let step = machine.next_step(test_policy(5));
         let MachineStep::CallTools { calls } = step else {
             panic!("expected CallTools, got {step:?}");
@@ -1279,6 +1294,7 @@ mod tests {
                 .map(|c| {
                     MessagePart::tool_result(
                         c.call.id.clone(),
+                        c.call.tool.clone(),
                         ToolContent::Text("ok".to_string()),
                         false,
                     )

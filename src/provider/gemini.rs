@@ -166,6 +166,57 @@ impl GeminiClient {
         format!("{}/models/{}:generateContent", self.base_url, model)
     }
 
+    /// Build a typed [`NonStreamingResponse`] from Gemini's native JSON.
+    ///
+    /// Reads `candidates[0].content.parts` into [`MessagePart`]s: each `text`
+    /// field becomes a [`MessagePart::Text`] part and each `functionCall`
+    /// becomes a [`MessagePart::ToolCall`] with its `id` preserved when
+    /// present (Gemini 3 assigns a unique id per call; older versions omit
+    /// it, in which case the id defaults to an empty string). A single part
+    /// may hold both `text` and `functionCall`, in which case it yields two
+    /// parts. Maps `candidates[0].finishReason` to a [`StreamStopReason`]
+    /// using the same mapping the streaming emitter applies: `"MAX_TOKENS"` →
+    /// `MaxTokens`, anything else (including the `"STOP"` default) →
+    /// `EndTurn`. Reads `usageMetadata.promptTokenCount` and
+    /// `candidatesTokenCount` (plus `thoughtsTokenCount`) into [`Usage`],
+    /// returning `None` when the object is absent or all-zero.
+    fn build_response(raw: &Value) -> crate::api::NonStreamingResponse {
+        let mut parts: Vec<MessagePart> = Vec::new();
+        if let Some(content_parts) = raw
+            .pointer("/candidates/0/content/parts")
+            .and_then(|p| p.as_array())
+        {
+            for part in content_parts {
+                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    parts.push(MessagePart::text(text));
+                }
+                if let Some(fc) = part.get("functionCall") {
+                    let id = fc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let input = fc
+                        .get("args")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    parts.push(MessagePart::tool_call(id, name, input));
+                }
+            }
+        }
+        let reason = raw
+            .pointer("/candidates/0/finishReason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("STOP");
+        let stop_reason = match reason {
+            "MAX_TOKENS" => StreamStopReason::MaxTokens,
+            _ => StreamStopReason::EndTurn,
+        };
+        let usage = extract_usage(raw);
+        crate::api::NonStreamingResponse {
+            message: Message::new(Role::Assistant, parts),
+            stop_reason,
+            usage,
+        }
+    }
+
     /// Send a POST request and return the raw response.
     ///
     /// Shared by both [`ApiClient::stream_messages`] and
@@ -201,6 +252,34 @@ impl GeminiClient {
             Err(ApiError::http_with_status(status.as_u16(), text))
         }
     }
+}
+
+/// Extract token [`Usage`] from Gemini's native `usageMetadata` object.
+///
+/// Reads `usageMetadata.promptTokenCount` for input tokens and sums
+/// `candidatesTokenCount` plus `thoughtsTokenCount` for output. Returns `None`
+/// when the `usageMetadata` object is absent or when all counts are zero,
+/// matching the convention used by the streaming emitter in
+/// `extract_finish_reason`.
+fn extract_usage(raw: &Value) -> Option<Usage> {
+    let usage = raw.pointer("/usageMetadata")?;
+    let input = usage
+        .get("promptTokenCount")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0);
+    let output = usage
+        .get("candidatesTokenCount")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0);
+    let thoughts = usage
+        .get("thoughtsTokenCount")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0);
+    let total_output = output.saturating_add(thoughts);
+    (input > 0 || total_output > 0).then(|| Usage::new(input, total_output))
 }
 
 impl ApiClient for GeminiClient {
@@ -259,7 +338,8 @@ impl ApiClient for GeminiClient {
     fn create_message(
         &self,
         request: &crate::api::StreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
         let system = request.system.clone();
         let tools = request.tools.clone();
         let body = build_request_body(
@@ -274,12 +354,10 @@ impl ApiClient for GeminiClient {
 
         Box::pin(async move {
             let resp = Self::post_content(&self.http, &url, &self.api_key, &body).await?;
-            let resp = resp
-                .bytes()
-                .await
+            let resp = super::read_bounded_body(resp).await?;
+            let raw = serde_json::from_slice::<Value>(&resp)
                 .map_err(|e| ApiError::http(e.to_string()))?;
-            super::check_response_body(resp.len())?;
-            serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
+            Ok(Self::build_response(&raw))
         })
     }
 
@@ -325,7 +403,8 @@ impl ApiClient for GeminiClient {
         &self,
         request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
         let system = request.system.clone();
         let tools = request.tools.clone();
         let response_format = options.response_format.as_ref();
@@ -340,24 +419,11 @@ impl ApiClient for GeminiClient {
         let url = self.generate_url();
         Box::pin(async move {
             let resp = Self::post_content(&self.http, &url, &self.api_key, &body).await?;
-            let resp = resp
-                .bytes()
-                .await
+            let resp = super::read_bounded_body(resp).await?;
+            let raw = serde_json::from_slice::<Value>(&resp)
                 .map_err(|e| ApiError::http(e.to_string()))?;
-            super::check_response_body(resp.len())?;
-            serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
+            Ok(Self::build_response(&raw))
         })
-    }
-
-    fn extract_structured(&self, raw: &Value) -> Value {
-        let Some(text) = raw
-            .pointer("/candidates/0/content/parts/0/text")
-            .and_then(serde_json::Value::as_str)
-        else {
-            return raw.clone();
-        };
-        crate::structured::parse_json_lenient(text)
-            .unwrap_or_else(|| Value::String(text.to_string()))
     }
 }
 
@@ -524,6 +590,17 @@ impl GeminiClientBuilder {
         self
     }
 
+    /// Control whether `TCP_NODELAY` is set on connections.
+    ///
+    /// Defaults to `true` — SSE streaming benefits from disabling Nagle's
+    /// algorithm. Pass `false` to re-enable it. Ignored when a client was
+    /// supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.http = self.http.with_tcp_nodelay(enabled);
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
@@ -635,20 +712,32 @@ fn convert_message(m: &Message) -> Value {
 fn convert_part(p: &MessagePart) -> Option<Value> {
     match p {
         MessagePart::Text { text } => Some(serde_json::json!({"text": text})),
-        MessagePart::ToolCall { name, input, .. } => Some(serde_json::json!({
-            "functionCall": {
-                "name": name,
-                "args": input,
+        MessagePart::ToolCall { id, name, input } => {
+            let mut fc = serde_json::Map::new();
+            fc.insert("name".to_string(), serde_json::Value::String(name.clone()));
+            fc.insert("args".to_string(), input.clone());
+            if !id.is_empty() {
+                fc.insert("id".to_string(), serde_json::Value::String(id.clone()));
             }
-        })),
+            Some(serde_json::json!({"functionCall": fc}))
+        }
         MessagePart::ToolResult {
-            call_id, output, ..
-        } => Some(serde_json::json!({
-            "functionResponse": {
-                "name": call_id,
-                "response": {"result": output.to_string()},
+            call_id,
+            name,
+            output,
+            ..
+        } => {
+            let mut fr = serde_json::Map::new();
+            fr.insert("name".to_string(), serde_json::Value::String(name.clone()));
+            if !call_id.is_empty() {
+                fr.insert("id".to_string(), serde_json::Value::String(call_id.clone()));
             }
-        })),
+            fr.insert(
+                "response".to_string(),
+                serde_json::json!({"result": output.to_string()}),
+            );
+            Some(serde_json::json!({"functionResponse": fr}))
+        }
         MessagePart::Image { .. } => None,
     }
 }
@@ -696,7 +785,7 @@ impl SseReader {
     /// Returns [`ApiError`] if the underlying HTTP stream fails.
     async fn next_gemini_data(&mut self) -> Result<Option<Value>, ApiError> {
         loop {
-            while let Some(line) = self.take_line() {
+            while let Some(line) = self.take_line()? {
                 if line.is_empty() {
                     continue;
                 }
@@ -901,6 +990,11 @@ impl StreamEmitter {
         let Some(func_call) = part.get("functionCall") else {
             return;
         };
+        let id = func_call
+            .pointer("/id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let name = func_call
             .pointer("/name")
             .and_then(Value::as_str)
@@ -924,7 +1018,7 @@ impl StreamEmitter {
         self.push(StreamEvent::PartStart(PartStart {
             index: idx,
             part: Some(MessagePart::ToolCall {
-                id: String::new(),
+                id,
                 name,
                 input: args,
             }),
@@ -1112,6 +1206,7 @@ mod tests {
 
         let parts = body["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["functionCall"]["name"], "echo");
+        assert_eq!(parts[0]["functionCall"]["id"], "call_1");
         assert_eq!(parts[0]["functionCall"]["args"]["msg"], "hi");
     }
 
@@ -1121,6 +1216,7 @@ mod tests {
             Role::User,
             vec![MessagePart::ToolResult {
                 call_id: "call_1".into(),
+                name: "echo".into(),
                 output: ToolContent::from_string("result text"),
                 is_error: None,
             }],
@@ -1128,10 +1224,67 @@ mod tests {
         let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
 
         let parts = body["contents"][0]["parts"].as_array().unwrap();
-        assert_eq!(parts[0]["functionResponse"]["name"], "call_1");
+        assert_eq!(parts[0]["functionResponse"]["name"], "echo");
+        assert_eq!(parts[0]["functionResponse"]["id"], "call_1");
         assert_eq!(
             parts[0]["functionResponse"]["response"]["result"],
             "result text"
+        );
+    }
+
+    #[test]
+    fn request_body_function_response_includes_name_and_id() {
+        let msgs = vec![Message::new(
+            Role::User,
+            vec![MessagePart::ToolResult {
+                call_id: "fc_99".into(),
+                name: "search".into(),
+                output: ToolContent::from_string("results here"),
+                is_error: None,
+            }],
+        )];
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+
+        let fr = &body["contents"][0]["parts"][0]["functionResponse"];
+        assert_eq!(fr["name"], "search");
+        assert_eq!(fr["id"], "fc_99");
+        assert_eq!(fr["response"]["result"], "results here");
+    }
+
+    #[test]
+    fn request_body_function_response_omits_id_when_empty() {
+        let msgs = vec![Message::new(
+            Role::User,
+            vec![MessagePart::ToolResult {
+                call_id: String::new(),
+                name: "search".into(),
+                output: ToolContent::from_string("ok"),
+                is_error: None,
+            }],
+        )];
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+
+        let fr = &body["contents"][0]["parts"][0]["functionResponse"];
+        assert_eq!(fr["name"], "search");
+        assert!(
+            fr.get("id").is_none(),
+            "id should be omitted when call_id is empty"
+        );
+    }
+
+    #[test]
+    fn request_body_function_call_omits_id_when_empty() {
+        let msgs = vec![Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call("", "search", serde_json::json!({}))],
+        )];
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+
+        let fc = &body["contents"][0]["parts"][0]["functionCall"];
+        assert_eq!(fc["name"], "search");
+        assert!(
+            fc.get("id").is_none(),
+            "id should be omitted when tool-call id is empty"
         );
     }
 
@@ -1365,6 +1518,51 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, StreamEvent::IndexedDelta(_)))
         );
+    }
+
+    #[test]
+    fn emitter_function_call_includes_id() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"content": {"parts": [{"functionCall": {"id": "fc_7", "name": "search", "args": {"q": "rust"}}}]}}]
+        }));
+        let events = em.drain();
+        let start = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::PartStart(ps) => Some(ps),
+                _ => None,
+            })
+            .expect("PartStart");
+        match &start.part {
+            Some(MessagePart::ToolCall { id, name, .. }) => {
+                assert_eq!(id, "fc_7");
+                assert_eq!(name, "search");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emitter_function_call_without_id_defaults_to_empty() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"content": {"parts": [{"functionCall": {"name": "search", "args": {}}}]}}]
+        }));
+        let events = em.drain();
+        let start = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::PartStart(ps) => Some(ps),
+                _ => None,
+            })
+            .expect("PartStart");
+        match &start.part {
+            Some(MessagePart::ToolCall { id, .. }) => assert_eq!(id, ""),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1889,7 +2087,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hello\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "data: hello");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "data: hello");
         assert!(reader.buf.is_empty());
     }
 
@@ -1899,7 +2097,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "partial".into(),
         };
-        assert!(reader.take_line().is_none());
+        assert!(reader.take_line().unwrap().is_none());
     }
 
     #[test]
@@ -1908,8 +2106,8 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "line1\nline2\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "line1");
-        assert_eq!(reader.take_line().unwrap(), "line2");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "line1");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "line2");
     }
 
     #[test]
@@ -1918,7 +2116,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hi\r\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "data: hi");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "data: hi");
     }
 
     #[test]
@@ -1963,11 +2161,11 @@ mod tests {
             buf: "data: {\"candidates\":[]}\n\n".to_string().into_bytes(),
         };
         assert_eq!(
-            reader.take_line(),
+            reader.take_line().unwrap(),
             Some("data: {\"candidates\":[]}".to_string())
         );
-        assert_eq!(reader.take_line(), Some(String::new()));
-        assert_eq!(reader.take_line(), None);
+        assert_eq!(reader.take_line().unwrap(), Some(String::new()));
+        assert_eq!(reader.take_line().unwrap(), None);
     }
 
     #[tokio::test]
@@ -2082,40 +2280,279 @@ mod tests {
     }
 
     #[test]
-    fn extract_structured_from_text_field() {
+    fn extract_structured_from_text_part() {
         let client = GeminiClient::builder()
             .with_api_key("test")
             .build()
             .unwrap();
-        let raw = serde_json::json!({
-            "candidates": [{
-                "content": {
-                    "parts": [{
-                        "text": r#"{"tool": "write", "args": {}}"#
-                    }]
-                }
-            }]
-        });
-        let value = client.extract_structured(&raw);
+        let message = Message::assistant(r#"{"tool": "write", "args": {}}"#);
+        let value = client.extract_structured(&message);
         assert_eq!(value["tool"], "write");
     }
 
     #[test]
-    fn extract_structured_prose_falls_back_to_raw() {
+    fn extract_structured_prose_falls_back_to_string() {
         let client = GeminiClient::builder()
             .with_api_key("test")
             .build()
             .unwrap();
+        let message = Message::assistant("I cannot produce that.");
+        let value = client.extract_structured(&message);
+        assert_eq!(value, serde_json::json!("I cannot produce that."));
+    }
+
+    #[test]
+    fn build_response_maps_text_part_and_stop() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hello gemini"}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(response.message.role, Role::Assistant);
+        assert_eq!(response.message.text_content(), "hello gemini");
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_maps_function_call_part() {
         let raw = serde_json::json!({
             "candidates": [{
                 "content": {
-                    "parts": [{"text": "I cannot produce that."}]
-                }
+                    "parts": [{
+                        "functionCall": {"name": "search", "args": {"q": "rust"}}
+                    }]
+                },
+                "finishReason": "STOP"
             }]
         });
-        let value = client.extract_structured(&raw);
-        // Prose text not parseable as JSON → falls back to the string value.
-        assert_eq!(value, serde_json::json!("I cannot produce that."));
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(response.message.parts.len(), 1);
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { id, name, input } => {
+                assert_eq!(id, "");
+                assert_eq!(name, "search");
+                assert_eq!(input, &serde_json::json!({"q": "rust"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_parses_function_call_id() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"functionCall": {"id": "fc_42", "name": "search", "args": {}}}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { id, name, .. } => {
+                assert_eq!(id, "fc_42");
+                assert_eq!(name, "search");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_function_call_without_id_defaults_to_empty() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"functionCall": {"name": "search", "args": {}}}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { id, .. } => assert_eq!(id, ""),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_handles_text_and_function_call_in_one_part() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "Let me search",
+                        "functionCall": {"name": "search", "args": {}}
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(
+            response.message.parts.len(),
+            2,
+            "text + functionCall in one part should yield two MessageParts"
+        );
+        assert!(response.message.parts[0].is_text());
+        assert!(response.message.parts[1].is_tool_call());
+    }
+
+    #[test]
+    fn build_response_maps_max_tokens_finish_reason() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "truncated"}]},
+                "finishReason": "MAX_TOKENS"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(response.stop_reason, StreamStopReason::MaxTokens);
+    }
+
+    #[test]
+    fn build_response_safety_finish_reason_maps_to_end_turn() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "blocked"}]},
+                "finishReason": "SAFETY"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_missing_finish_reason_defaults_to_end_turn() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}]}
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_missing_candidates_yields_empty_message() {
+        let raw = serde_json::json!({});
+        let response = GeminiClient::build_response(&raw);
+        assert!(response.message.parts.is_empty());
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_extracts_usage() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 25,
+                "candidatesTokenCount": 10,
+                "thoughtsTokenCount": 5
+            }
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(response.usage.expect("usage").input_tokens, 25);
+        assert_eq!(response.usage.expect("usage").output_tokens, 15);
+    }
+
+    #[test]
+    fn build_response_usage_without_thoughts() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 8,
+                "candidatesTokenCount": 4
+            }
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(response.usage.expect("usage").input_tokens, 8);
+        assert_eq!(response.usage.expect("usage").output_tokens, 4);
+    }
+
+    #[test]
+    fn build_response_missing_usage_is_none() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert!(response.usage.is_none());
+    }
+
+    #[test]
+    fn build_response_multiple_function_calls_across_parts() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"functionCall": {"name": "first", "args": {}}},
+                    {"functionCall": {"name": "second", "args": {"n": 2}}}
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(response.message.parts.len(), 2);
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { name, .. } => assert_eq!(name, "first"),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match &response.message.parts[1] {
+            MessagePart::ToolCall { name, .. } => assert_eq!(name, "second"),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_function_call_missing_args_defaults_to_empty_object() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"functionCall": {"name": "search"}}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { input, .. } => {
+                assert_eq!(input, &serde_json::json!({}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_multiple_text_parts_preserve_order() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "hello"},
+                    {"text": " world"}
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(response.message.parts.len(), 2);
+        assert_eq!(response.message.text_content(), "hello world");
+    }
+
+    #[test]
+    fn build_response_partial_usage_with_only_input() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"promptTokenCount": 99}
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(response.usage.expect("usage").input_tokens, 99);
+        assert_eq!(response.usage.expect("usage").output_tokens, 0);
     }
 
     #[test]

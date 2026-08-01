@@ -41,7 +41,6 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const SSE_EVENT_PREFIX: &str = "event: ";
 const SSE_DATA_PREFIX: &str = "data: ";
-const TEXT_PART_INDEX: usize = 0;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
 
@@ -191,6 +190,72 @@ impl AnthropicClient {
     fn messages_url(&self) -> String {
         format!("{}/v1/messages", self.base_url)
     }
+
+    /// Build a typed [`NonStreamingResponse`] from Anthropic's native JSON.
+    ///
+    /// Anthropic's native response already carries a `content` array of typed
+    /// blocks, so this reads them directly into [`MessagePart`]s: `text` blocks
+    /// become [`MessagePart::Text`] parts and `tool_use` blocks become
+    /// [`MessagePart::ToolCall`] parts, preserving their original order. Other
+    /// block types (`thinking`, `redacted_thinking`) are skipped — reasoning is
+    /// stream-only in this crate and is not accumulated into the message.
+    /// Maps `stop_reason` via [`StreamStopReason::from_api_str`] (Anthropic
+    /// reports tool invocations as `"tool_use"`, aliased to `ToolCall`),
+    /// defaulting to `EndTurn` on an unrecognized or missing value. Reads
+    /// `usage.input_tokens` / `usage.output_tokens` into [`Usage`], defaulting
+    /// to zero when the `usage` object is absent.
+    fn build_response(raw: &Value) -> crate::api::NonStreamingResponse {
+        let mut parts: Vec<MessagePart> = Vec::new();
+        if let Some(blocks) = raw.get("content").and_then(|c| c.as_array()) {
+            for block in blocks {
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            parts.push(MessagePart::text(text));
+                        }
+                    }
+                    Some("tool_use") => {
+                        let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let input = block.get("input").cloned().unwrap_or(Value::Null);
+                        parts.push(MessagePart::tool_call(id, name, input));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let stop_reason = raw
+            .get("stop_reason")
+            .and_then(|r| r.as_str())
+            .and_then(StreamStopReason::from_api_str)
+            .unwrap_or(StreamStopReason::EndTurn);
+        let usage = extract_usage(raw);
+        crate::api::NonStreamingResponse {
+            message: Message::new(Role::Assistant, parts),
+            stop_reason,
+            usage,
+        }
+    }
+}
+
+/// Extract token [`Usage`] from Anthropic's native `usage` object.
+///
+/// Reads `usage.input_tokens` and `usage.output_tokens`. Returns `None` when
+/// the `usage` object is absent or when both counts are zero, matching the
+/// convention used by the streaming emitter in `on_message_delta`.
+fn extract_usage(raw: &Value) -> Option<Usage> {
+    let usage = raw.get("usage")?;
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0);
+    (input > 0 || output > 0).then(|| Usage::new(input, output))
 }
 
 impl ApiClient for AnthropicClient {
@@ -220,7 +285,8 @@ impl ApiClient for AnthropicClient {
     fn create_message(
         &self,
         request: &crate::api::StreamRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
         self.create_message_with_options(request, crate::structured::RequestOptions::default())
     }
 
@@ -271,7 +337,8 @@ impl ApiClient for AnthropicClient {
         &self,
         request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, ApiError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
         let system = request.system.clone();
         let tools = request.tools.clone();
         let model = crate::error::recover_guard(self.model.lock()).clone();
@@ -291,28 +358,11 @@ impl ApiClient for AnthropicClient {
         let url = self.messages_url();
         Box::pin(async move {
             let resp = Self::post_messages(&self.http, &url, &self.api_key, &body).await?;
-            let resp = resp
-                .bytes()
-                .await
+            let resp = super::read_bounded_body(resp).await?;
+            let raw = serde_json::from_slice::<Value>(&resp)
                 .map_err(|e| ApiError::http(e.to_string()))?;
-            super::check_response_body(resp.len())?;
-            serde_json::from_slice::<Value>(&resp).map_err(|e| ApiError::http(e.to_string()))
+            Ok(Self::build_response(&raw))
         })
-    }
-
-    fn extract_structured(&self, raw: &Value) -> Value {
-        raw.get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|blocks| {
-                blocks.iter().find_map(|block| {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        block.get("input").cloned()
-                    } else {
-                        None
-                    }
-                })
-            })
-            .unwrap_or_else(|| raw.clone())
     }
 }
 
@@ -469,6 +519,17 @@ impl AnthropicClientBuilder {
     #[must_use]
     pub fn with_tcp_keepalive(mut self, d: Duration) -> Self {
         self.http = self.http.with_tcp_keepalive(d);
+        self
+    }
+
+    /// Control whether `TCP_NODELAY` is set on connections.
+    ///
+    /// Defaults to `true` — SSE streaming benefits from disabling Nagle's
+    /// algorithm. Pass `false` to re-enable it. Ignored when a client was
+    /// supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.http = self.http.with_tcp_nodelay(enabled);
         self
     }
 
@@ -760,7 +821,7 @@ impl SseReader {
         let mut have_event = false;
 
         loop {
-            while let Some(line) = self.take_line() {
+            while let Some(line) = self.take_line()? {
                 if line.is_empty() {
                     if have_event {
                         let parsed = Self::parse_event_data(&data, &event_type);
@@ -831,14 +892,17 @@ struct StreamEmitter {
     /// ignores any subsequent duplicates.
     started: bool,
 
-    /// Whether a text content block is currently open.
+    /// Index of the text content block currently open, if any.
     ///
     /// Anthropic signals the start of a text block with
     /// `content_block_start` (`type: "text"`) and its end with
-    /// `content_block_stop`. This flag tracks the open state so the
-    /// matching `content_block_stop` emits exactly one
-    /// [`StreamEvent::PartStop`].
-    text_part_open: bool,
+    /// `content_block_stop`. This holds the server-supplied block index
+    /// while the block is open and `None` when no text block is open, so
+    /// the matching `content_block_stop` emits exactly one
+    /// [`StreamEvent::PartStop`] and `text_delta` fragments route to the
+    /// correct part. Mirrors [`current_tool_index`](Self::current_tool_index)
+    /// and [`thinking_index`](Self::thinking_index) for the text lane.
+    text_index: Option<usize>,
 
     /// Number of tool-use content blocks currently open.
     ///
@@ -1001,9 +1065,9 @@ impl StreamEmitter {
                 self.tool_parts_open = self.tool_parts_open.saturating_add(1);
             }
             Some("text") => {
-                self.text_part_open = true;
+                self.text_index = Some(index);
                 self.push(StreamEvent::PartStart(PartStart {
-                    index: TEXT_PART_INDEX,
+                    index,
                     part: Some(MessagePart::text("")),
                 }));
             }
@@ -1049,8 +1113,9 @@ impl StreamEmitter {
                     .unwrap_or("")
                     .to_string();
                 if !text.is_empty() {
+                    let text_index = self.text_index.unwrap_or(0);
                     self.push(StreamEvent::IndexedDelta(IndexedDelta {
-                        index: TEXT_PART_INDEX,
+                        index: text_index,
                         delta: DeltaPart::Text { text },
                     }));
                 }
@@ -1063,7 +1128,7 @@ impl StreamEmitter {
                     .to_string();
                 if !json.is_empty() {
                     // Use the index from the corresponding content_block_start.
-                    let tool_index = self.current_tool_index.unwrap_or(TEXT_PART_INDEX);
+                    let tool_index = self.current_tool_index.unwrap_or(0);
                     self.push(StreamEvent::IndexedDelta(IndexedDelta {
                         index: tool_index,
                         delta: DeltaPart::InputJson { partial_json: json },
@@ -1078,7 +1143,7 @@ impl StreamEmitter {
                     .to_string();
                 if !text.is_empty() {
                     // Use the index from the corresponding content_block_start.
-                    let thinking_index = self.thinking_index.unwrap_or(TEXT_PART_INDEX);
+                    let thinking_index = self.thinking_index.unwrap_or(0);
                     self.push(StreamEvent::IndexedDelta(IndexedDelta {
                         index: thinking_index,
                         delta: DeltaPart::Thinking { text },
@@ -1099,8 +1164,8 @@ impl StreamEmitter {
     /// does not carry useful information on this event beyond the
     /// implicit close).
     fn on_block_stop(&mut self, _data: Option<Value>) {
-        if self.text_part_open {
-            self.text_part_open = false;
+        if self.text_index.is_some() {
+            self.text_index = None;
             self.push(StreamEvent::PartStop);
         } else if self.thinking_part_open {
             self.thinking_part_open = false;
@@ -1183,7 +1248,7 @@ impl StreamEmitter {
         if self.thinking_part_open {
             self.push(StreamEvent::PartStop);
         }
-        if self.text_part_open {
+        if self.text_index.is_some() {
             self.push(StreamEvent::PartStop);
         }
         for _ in 0..self.tool_parts_open {
@@ -1192,7 +1257,7 @@ impl StreamEmitter {
         self.thinking_part_open = false;
         self.thinking_index = None;
         self.tool_parts_open = 0;
-        self.text_part_open = false;
+        self.text_index = None;
         self.push(StreamEvent::MessageStop);
     }
 
@@ -1405,6 +1470,7 @@ mod tests {
             Role::User,
             vec![MessagePart::ToolResult {
                 call_id: "call_1".into(),
+                name: "echo".into(),
                 output: ToolContent::from_string("result text"),
                 is_error: None,
             }],
@@ -1612,6 +1678,51 @@ mod tests {
     }
 
     #[test]
+    fn emitter_text_after_tool_uses_server_index_not_zero() {
+        let mut em = StreamEmitter::default();
+
+        // Tool-use block at server index 0.
+        em.on_block_start(Some(serde_json::json!({
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "t1", "name": "echo"}
+        })));
+        em.drain();
+
+        // Text block at server index 1 — must NOT collide with the tool at 0.
+        em.on_block_start(Some(serde_json::json!({
+            "index": 1,
+            "content_block": {"type": "text"}
+        })));
+        let starts = em.drain();
+        let text_start = starts
+            .iter()
+            .find(|e| matches!(e, StreamEvent::PartStart(ps) if ps.index == 1))
+            .expect("text PartStart must carry the server index 1");
+
+        // Text delta must route to index 1, not the hardcoded 0 that would
+        // collide with the tool-use part.
+        em.on_block_delta(Some(serde_json::json!({
+            "delta": {"type": "text_delta", "text": "after"}
+        })));
+        let deltas = em.drain();
+        match &deltas[0] {
+            StreamEvent::IndexedDelta(d) => {
+                assert_eq!(d.index, 1, "text delta must use the server index, not 0");
+            }
+            other => panic!("expected IndexedDelta, got {other:?}"),
+        }
+        // Confirm the PartStart we matched above really is a text part.
+        let StreamEvent::PartStart(ps) = text_start else {
+            panic!("matched event must be a PartStart");
+        };
+        assert!(
+            ps.part
+                .as_ref()
+                .is_some_and(crate::message::MessagePart::is_text)
+        );
+    }
+
+    #[test]
     fn emitter_tool_use_block() {
         let mut em = StreamEmitter::default();
 
@@ -1638,12 +1749,12 @@ mod tests {
     #[test]
     fn emitter_block_stop_closes_text() {
         let mut em = StreamEmitter::default();
-        em.text_part_open = true;
+        em.text_index = Some(0);
 
         em.on_block_stop(None);
         let events = em.drain();
         assert!(matches!(events[0], StreamEvent::PartStop));
-        assert!(!em.text_part_open);
+        assert!(em.text_index.is_none());
     }
 
     #[test]
@@ -1668,7 +1779,7 @@ mod tests {
     #[test]
     fn emitter_message_stop_closes_parts() {
         let mut em = StreamEmitter::default();
-        em.text_part_open = true;
+        em.text_index = Some(0);
         em.tool_parts_open = 2;
 
         em.on_message_stop();
@@ -1732,7 +1843,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "event: ping\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "event: ping");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "event: ping");
         assert!(reader.buf.is_empty());
     }
 
@@ -1742,7 +1853,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "partial".into(),
         };
-        assert!(reader.take_line().is_none());
+        assert!(reader.take_line().unwrap().is_none());
     }
 
     #[test]
@@ -1751,8 +1862,8 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "line1\nline2\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "line1");
-        assert_eq!(reader.take_line().unwrap(), "line2");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "line1");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "line2");
     }
 
     #[test]
@@ -1761,7 +1872,7 @@ mod tests {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hi\r\n".into(),
         };
-        assert_eq!(reader.take_line().unwrap(), "data: hi");
+        assert_eq!(reader.take_line().unwrap().unwrap(), "data: hi");
     }
 
     #[test]
@@ -1782,9 +1893,12 @@ mod tests {
                 .to_string()
                 .into_bytes(),
         };
-        assert_eq!(reader.take_line(), Some("event: message_start".to_string()));
-        assert_eq!(reader.take_line(), Some("data: {}".to_string()));
-        assert_eq!(reader.take_line(), Some(String::new()));
+        assert_eq!(
+            reader.take_line().unwrap(),
+            Some("event: message_start".to_string())
+        );
+        assert_eq!(reader.take_line().unwrap(), Some("data: {}".to_string()));
+        assert_eq!(reader.take_line().unwrap(), Some(String::new()));
     }
 
     #[tokio::test]
@@ -1950,36 +2064,205 @@ mod tests {
     }
 
     #[test]
-    fn extract_structured_from_tool_use_input() {
+    fn extract_structured_from_tool_call_part() {
         let client = AnthropicClient::builder()
             .with_api_key("test")
             .build()
             .unwrap();
-        let raw = serde_json::json!({
-            "content": [{
-                "type": "tool_use",
-                "name": "action",
-                "input": {"tool": "write", "args": {}}
-            }]
-        });
-        let value = client.extract_structured(&raw);
+        let message = Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call(
+                "tu_1",
+                "action",
+                serde_json::json!({"tool": "write", "args": {}}),
+            )],
+        );
+        let value = client.extract_structured(&message);
         assert_eq!(value["tool"], "write");
     }
 
     #[test]
-    fn extract_structured_text_only_falls_back_to_raw() {
+    fn extract_structured_text_only_falls_back_to_string() {
         let client = AnthropicClient::builder()
             .with_api_key("test")
             .build()
             .unwrap();
+        let message = Message::assistant("I cannot do that.");
+        let value = client.extract_structured(&message);
+        assert_eq!(value, serde_json::json!("I cannot do that."));
+    }
+
+    #[test]
+    fn build_response_maps_text_block_and_end_turn() {
         let raw = serde_json::json!({
-            "id": "msg_1",
-            "model": "claude-3",
-            "content": [{"type": "text", "text": "I cannot do that."}]
+            "content": [{"type": "text", "text": "hello there"}],
+            "stop_reason": "end_turn"
         });
-        let value = client.extract_structured(&raw);
-        // No tool_use block → returns the raw envelope; T::from_value fails.
-        assert_eq!(value["id"], "msg_1");
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.message.role, Role::Assistant);
+        assert_eq!(response.message.text_content(), "hello there");
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_maps_tool_use_block_and_tool_call() {
+        let raw = serde_json::json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "search",
+                "input": {"q": "rust"}
+            }],
+            "stop_reason": "tool_use"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.message.parts.len(), 1);
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "search");
+                assert_eq!(input, &serde_json::json!({"q": "rust"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        assert_eq!(response.stop_reason, StreamStopReason::ToolCall);
+    }
+
+    #[test]
+    fn build_response_preserves_block_order() {
+        let raw = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "thinking..."},
+                {"type": "tool_use", "id": "t1", "name": "a", "input": {}},
+                {"type": "text", "text": "done"}
+            ],
+            "stop_reason": "end_turn"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.message.parts.len(), 3);
+        assert!(response.message.parts[0].is_text());
+        assert!(response.message.parts[1].is_tool_call());
+        assert!(response.message.parts[2].is_text());
+    }
+
+    #[test]
+    fn build_response_skips_thinking_blocks() {
+        let raw = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "internal reasoning"},
+                {"type": "text", "text": "visible answer"}
+            ],
+            "stop_reason": "end_turn"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.message.parts.len(), 1);
+        assert_eq!(response.message.text_content(), "visible answer");
+    }
+
+    #[test]
+    fn build_response_maps_max_tokens_stop_reason() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "truncated"}],
+            "stop_reason": "max_tokens"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.stop_reason, StreamStopReason::MaxTokens);
+    }
+
+    #[test]
+    fn build_response_unknown_stop_reason_defaults_to_end_turn() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "something_new"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_missing_stop_reason_defaults_to_end_turn() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}]
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_empty_content_yields_empty_message() {
+        let raw = serde_json::json!({"content": [], "stop_reason": "end_turn"});
+        let response = AnthropicClient::build_response(&raw);
+        assert!(response.message.parts.is_empty());
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_extracts_usage() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 30, "output_tokens": 12}
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.usage.expect("usage").input_tokens, 30);
+        assert_eq!(response.usage.expect("usage").output_tokens, 12);
+    }
+
+    #[test]
+    fn build_response_missing_usage_is_none() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert!(response.usage.is_none());
+    }
+
+    #[test]
+    fn build_response_missing_content_yields_empty_message() {
+        let raw = serde_json::json!({"stop_reason": "end_turn"});
+        let response = AnthropicClient::build_response(&raw);
+        assert!(response.message.parts.is_empty());
+        assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[test]
+    fn build_response_text_block_missing_text_is_skipped() {
+        let raw = serde_json::json!({
+            "content": [
+                {"type": "text"},
+                {"type": "text", "text": "valid"}
+            ],
+            "stop_reason": "end_turn"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.message.parts.len(), 1);
+        assert_eq!(response.message.text_content(), "valid");
+    }
+
+    #[test]
+    fn build_response_tool_use_missing_input_defaults_to_null() {
+        let raw = serde_json::json!({
+            "content": [{"type": "tool_use", "id": "tu_1", "name": "search"}],
+            "stop_reason": "tool_use"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { input, .. } => {
+                assert_eq!(input, &Value::Null);
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_maps_stop_sequence_reason() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "stopped"}],
+            "stop_reason": "stop_sequence"
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.stop_reason, StreamStopReason::StopSequence);
     }
 
     #[test]

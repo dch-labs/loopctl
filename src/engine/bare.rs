@@ -67,7 +67,7 @@ use crate::engine::core::{
 
 use crate::error::LoopError;
 
-use crate::capabilities::{Detectable, FallbackCapable};
+use crate::capabilities::{Compactable, Detectable, FallbackCapable};
 use crate::detection::{ConvergenceAction, DetectedPattern};
 use crate::engine::{ContextContributor, ContributorContext};
 #[cfg(all(test, feature = "hooks"))]
@@ -650,12 +650,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// characters-per-token heuristic); swap in a real tokenizer (e.g.
     /// `tiktoken` for OpenAI) for better accuracy.
     ///
-    /// When a [`ContextManager`] is also set, its counter should match — use
-    /// [`ContextManager::with_token_counter`] on the manager before passing
-    /// it to [`set_context_manager`](Self::set_context_manager), which syncs
-    /// the two automatically. If this method is called *after*
-    /// `set_context_manager`, only the driver-side estimate changes (the
-    /// compactor keeps its own counter).
+    /// If a [`ContextManager`] has already been set, its counter is also
+    /// replaced so the driver-side estimate and the compactor stay in sync
+    /// regardless of setter order. This mirrors the reverse sync that
+    /// [`set_context_manager`](Self::set_context_manager) performs when it
+    /// copies the manager's counter onto the driver.
     ///
     /// Must be called before [`run()`](crate::engine::core::Loop::run).
     ///
@@ -674,7 +673,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// ```
     pub fn set_token_counter(&mut self, counter: Arc<dyn crate::compact::TokenCounter>) {
         self.debug_assert_idle();
-        self.token_counter = counter;
+        self.token_counter = Arc::clone(&counter);
+        if let Some(manager) = self.managers.context_manager().cloned() {
+            let synced = Arc::try_unwrap(manager)
+                .unwrap_or_else(|arc| (*arc).clone())
+                .with_token_counter(counter);
+            self.managers.set_context_manager(Arc::new(synced));
+        }
     }
 
     /// Set the token counter, consuming `self`. Fluent mirror of
@@ -2869,6 +2874,45 @@ mod tests {
         assert!(
             seen_msgs >= 2,
             "token counter must see at least 2 messages (user + model response), got {seen_msgs}"
+        );
+    }
+
+    #[test]
+    fn set_token_counter_after_context_manager_syncs_both() {
+        use crate::compact::{ContextManager, HeuristicTokenCounter, TokenCounter};
+
+        struct SentinelCounter;
+        impl TokenCounter for SentinelCounter {
+            fn count(&self, _: &[Message]) -> u64 {
+                999
+            }
+        }
+
+        let client = MockClient::new("test-model");
+        let manager = Arc::new(
+            ContextManager::new(Arc::new(crate::compact::TruncatingCompactor::new()))
+                .with_token_counter(Arc::new(HeuristicTokenCounter)),
+        );
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        agent.set_context_manager(manager);
+
+        let sentinel = Arc::new(SentinelCounter);
+        agent.set_token_counter(sentinel);
+
+        let driver_sample = agent.token_counter.count(&[Message::user("hi")]);
+        assert_eq!(
+            driver_sample, 999,
+            "driver-side counter must be the sentinel"
+        );
+        let manager_counter = agent
+            .managers
+            .context_manager()
+            .expect("context manager set")
+            .token_counter();
+        let manager_sample = manager_counter.count(&[Message::user("hi")]);
+        assert_eq!(
+            manager_sample, 999,
+            "context manager's counter must also be the sentinel after set_token_counter"
         );
     }
 

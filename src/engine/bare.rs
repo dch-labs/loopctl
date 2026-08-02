@@ -119,10 +119,12 @@ mod stream;
 ///   `StreamHandler`, emitting per-delta observer callbacks. Requires the
 ///   `streaming` feature.
 ///
-/// The default is `Streaming` when `streaming` is compiled in, otherwise
-/// `NonStreaming`. Switch modes on a constructed loop with
-/// [`set_turn_mode`](BareLoop::set_turn_mode).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The constructor default is feature-dependent: `Streaming` when `streaming`
+/// is compiled in, otherwise `NonStreaming` (see [`BareLoop::turn_mode`]). It
+/// is intentionally *not* a `Default` impl on this enum, because a single
+/// fixed `Default` could not express that feature-dependent choice. Switch
+/// modes on a constructed loop with [`set_turn_mode`](BareLoop::set_turn_mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnMode {
     /// Fulfil each turn via [`ApiClient::create_message`].
     ///
@@ -130,15 +132,13 @@ pub enum TurnMode {
     /// `on_thinking_delta`, and the text streamer never fire. The full
     /// assistant text still surfaces through
     /// [`on_response`](crate::observer::LoopObserver::on_response).
-    #[default]
     NonStreaming,
 
     /// Fulfil each turn via [`ApiClient::stream_messages`] wrapped in
     /// [`StreamHandler`](crate::stream::handler::StreamHandler).
     ///
-    /// Requires the `streaming` feature. Constructing or selecting this
-    /// mode without `streaming` enabled yields a
-    /// [`LoopError::Config`](crate::error::LoopError::Config) at turn time.
+    /// Requires the `streaming` feature: this variant only exists when the
+    /// feature is enabled, so it cannot be constructed or selected without it.
     #[cfg(feature = "streaming")]
     Streaming,
 }
@@ -1322,8 +1322,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// On a real API failure: fires
     /// [`on_stream_failure`](crate::observer::LoopObserver::on_stream_failure)
     /// (and [`on_fallback`](crate::observer::LoopObserver::on_fallback) if
-    /// the breaker trips) and returns the error. A clean cancellation is
-    /// *not* a failure — see the note below.
+    /// the breaker trips) and returns the error.
     ///
     /// # Errors
     ///
@@ -1331,15 +1330,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// the request; otherwise whatever [`ApiError`] the client returned,
     /// mapped to [`LoopError::Api`](LoopError::Api).
     ///
-    /// # Cancellation note
-    ///
-    /// When cancel wins the inner `select!` here, it would flow into
-    /// [`record_turn_failure`](Self::record_turn_failure) — but in practice
-    /// the outer `biased` `select!` in
-    /// [`handle_call_llm`](Self::handle_call_llm) wins the same race and
-    /// drops this future first, so a clean cancel never trips the breaker
-    /// or fires `on_stream_failure`. Pinned by
-    /// `cancel_during_non_streaming_turn_does_not_trip_breaker`.
+    /// The already-cancelled case is guarded once in
+    /// [`do_turn`](Self::do_turn), so this method is only reached on a live
+    /// run. A `Cancelled` that nonetheless reaches
+    /// [`record_turn_failure`](Self::record_turn_failure) (cancel winning
+    /// the `select!` mid-request) is harmless — that method guards
+    /// `Cancelled` locally and returns it without tripping the breaker or
+    /// firing `on_stream_failure`.
     async fn do_create_message(
         &mut self,
         contributor_messages: Vec<Message>,
@@ -1350,9 +1347,6 @@ impl<C: ApiClient> BareLoop<C> {
             .with_system(self.session.config.system_prompt.clone())
             .with_tools(self.build_tool_schemas());
 
-        if self.cancelled.is_cancelled() {
-            return Err(LoopError::Cancelled);
-        }
         let cancel = Arc::clone(&self.cancelled);
         let client = &self.client;
         let options = self.request_options.clone();
@@ -1380,14 +1374,9 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`on_fallback`](crate::observer::LoopObserver::on_fallback) if the
     /// circuit breaker trips), fires
     /// [`on_stream_failure`](crate::observer::LoopObserver::on_stream_failure),
-    /// sets the terminal state, and returns the error.
-    ///
-    /// On a clean cancellation the outer `cancel.notified()` arm of the
-    /// `biased` `select!` in [`handle_call_llm`](Self::handle_call_llm)
-    /// wins and drops this future before
-    /// [`record_turn_failure`](Self::record_turn_failure) runs — so a cancel
-    /// during the turn records
-    /// [`MachineOutcome::Cancelled`](crate::engine::core::MachineOutcome)
+    /// sets the terminal state, and returns the error. A `Cancelled` result
+    /// is guarded by [`record_turn_failure`](Self::record_turn_failure) and
+    /// records [`MachineOutcome::Cancelled`](crate::engine::core::MachineOutcome)
     /// without tripping the fallback or firing `on_stream_failure`.
     ///
     /// # Errors
@@ -1409,19 +1398,23 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Dispatch one LLM turn according to [`turn_mode`](self.turn_mode).
     ///
-    /// Single entry point for the run loop's `CallLLM` arm so the
-    /// cancellation `select!` in [`handle_call_llm`](Self::handle_call_llm)
-    /// races against exactly one future regardless of mode.
+    /// Single entry point for the run loop's `CallLLM` arm. Guards the
+    /// already-cancelled case once here so neither turn path polls its
+    /// provider future (and its call-time side effects) on a dead run.
     ///
     /// # Errors
     ///
-    /// Propagates whatever the selected turn path
+    /// [`LoopError::Cancelled`] if the run is already cancelled before the
+    /// turn starts; otherwise whatever the selected turn path
     /// ([`do_stream`](Self::do_stream) or
     /// [`do_create_message`](Self::do_create_message)) returns.
     async fn do_turn(
         &mut self,
         contributor_messages: Vec<Message>,
     ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
+        if self.cancelled.is_cancelled() {
+            return Err(LoopError::Cancelled);
+        }
         match self.turn_mode {
             #[cfg(feature = "streaming")]
             TurnMode::Streaming => self.do_stream(contributor_messages).await,
@@ -1474,19 +1467,18 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`MachineOutcome::Failed`](crate::engine::core::MachineOutcome) on
     /// the machine from the returned error.
     ///
-    /// `LoopError::Cancelled` is **not** routed through here in practice.
-    /// Cancellation during an in-flight turn is caught by the outer
-    /// `cancel.notified()` arm of the `biased` `select!` in
-    /// [`handle_call_llm`](Self::handle_call_llm), which resolves the turn
-    /// by *dropping* the [`do_turn`](Self::do_turn) future — cancelling the
-    /// in-flight request before this method can run. So a clean cancel
-    /// records [`MachineOutcome::Cancelled`](crate::engine::core::MachineOutcome)
-    /// without tripping the breaker or firing `on_stream_failure`. (This
-    /// method has no `Cancelled` guard of its own; it relies on that outer
-    /// select. The regression test
-    /// `cancel_during_non_streaming_turn_does_not_trip_breaker` pins the
-    /// invariant.)
+    /// [`LoopError::Cancelled`] short-circuits: a clean cancellation is not a
+    /// failure, so it returns early without touching the breaker or firing
+    /// `on_stream_failure`. This makes the cancel-vs-failure distinction
+    /// *local* to this method (mirroring [`set_error_state`](Self::set_error_state)),
+    /// so correctness no longer depends on which `select!` arm wins a cancel
+    /// race — the outer cancel `select!` in [`handle_call_llm`](Self::handle_call_llm)
+    /// is pure fast-path delivery, not a load-bearing correctness guard.
+    /// Pinned by `cancel_during_non_streaming_turn_does_not_trip_breaker`.
     fn record_turn_failure(&mut self, e: LoopError) -> LoopError {
+        if matches!(e, LoopError::Cancelled) {
+            return e;
+        }
         let tripped = if matches!(e, LoopError::RateLimitEscalation { .. }) {
             self.managers
                 .fallback()
@@ -1831,11 +1823,10 @@ impl<C: ApiClient> BareLoop<C> {
             }
         }
 
-        let cancel = Arc::clone(&self.cancelled);
-        tokio::select! {
-            biased;
-            () = cancel.notified() => {
-                self.machine.cancel();
+        let stream_outcome = self.do_turn(contributor_messages).await;
+        let (msg, usage, stream_stop) = match stream_outcome {
+            Ok(triple) => triple,
+            Err(LoopError::Cancelled) => {
                 self.notify_turn_end(
                     current_turn,
                     false,
@@ -1844,93 +1835,77 @@ impl<C: ApiClient> BareLoop<C> {
                     0,
                     0,
                 );
-                Err(LoopError::Cancelled)
+                return Err(LoopError::Cancelled);
             }
-            stream_outcome = self.do_turn(contributor_messages) => {
-                let (msg, usage, stream_stop) = match stream_outcome {
-                    Ok(triple) => triple,
-                    Err(LoopError::Cancelled) => {
-                        self.notify_turn_end(
-                            current_turn,
-                            false,
-                            Some("cancelled".into()),
-                            turn_start.elapsed(),
-                            0,
-                            0,
-                        );
-                        return Err(LoopError::Cancelled);
-                    }
-                    Err(e) => return Err(e),
-                };
+            Err(e) => return Err(e),
+        };
 
-                let text = msg.text_content();
-                let (turn_in, turn_out) = Self::usage_tokens(usage.as_ref());
-                let pattern = self.managers.detection().record_response(&text);
-                self.notify_response(current_turn, &text, usage);
+        let text = msg.text_content();
+        let (turn_in, turn_out) = Self::usage_tokens(usage.as_ref());
+        let pattern = self.managers.detection().record_response(&text);
+        self.notify_response(current_turn, &text, usage);
 
-                if let Some(e) = self.apply_loop_detection(current_turn, &pattern) {
-                    return Err(e);
-                }
-
-                let tool_calls: Vec<ToolCall> = msg
-                    .tool_call_parts()
-                    .into_iter()
-                    .map(|(id, tool, input)| ToolCall {
-                        id: id.to_string(),
-                        tool: tool.to_string(),
-                        input: input.clone(),
-                    })
-                    .collect();
-                let stop_reason = match stream_stop {
-                    StreamStopReason::ToolCall => StopReason::ToolCall,
-                    StreamStopReason::MaxTokens => StopReason::MaxTokens,
-                    StreamStopReason::StopSequence => StopReason::StopSequence,
-                    StreamStopReason::EndTurn => {
-                        if tool_calls.is_empty() {
-                            StopReason::EndTurn
-                        } else {
-                            StopReason::ToolCall
-                        }
-                    }
-                };
-                let model_response = ModelResponse {
-                    message: msg,
-                    input_tokens: turn_in,
-                    output_tokens: turn_out,
-                    stop_reason,
-                    available_tools: self.tools.tool_names(),
-                };
-                let mut context_history = self.machine.full_history();
-                context_history.push(model_response.message.clone());
-                let context_tokens = self.token_counter.count(&context_history);
-                self.machine.model_response(model_response, context_tokens);
-
-                let turn_index = current_turn;
-                let is_empty = tool_calls.is_empty();
-                if let Some(run) = self.current_run_mut() {
-                    run.turns.push(crate::engine::core::Turn {
-                        turn: turn_index,
-                        input: turn_input,
-                        output: text,
-                        tool_calls,
-                        input_tokens: turn_in,
-                        output_tokens: turn_out,
-                    });
-                }
-
-                if is_empty {
-                    self.notify_turn_end(
-                        current_turn,
-                        true,
-                        None,
-                        turn_start.elapsed(),
-                        turn_in,
-                        turn_out,
-                    );
-                }
-                Ok(())
-            }
+        if let Some(e) = self.apply_loop_detection(current_turn, &pattern) {
+            return Err(e);
         }
+
+        let tool_calls: Vec<ToolCall> = msg
+            .tool_call_parts()
+            .into_iter()
+            .map(|(id, tool, input)| ToolCall {
+                id: id.to_string(),
+                tool: tool.to_string(),
+                input: input.clone(),
+            })
+            .collect();
+        let stop_reason = match stream_stop {
+            StreamStopReason::ToolCall => StopReason::ToolCall,
+            StreamStopReason::MaxTokens => StopReason::MaxTokens,
+            StreamStopReason::StopSequence => StopReason::StopSequence,
+            StreamStopReason::EndTurn => {
+                if tool_calls.is_empty() {
+                    StopReason::EndTurn
+                } else {
+                    StopReason::ToolCall
+                }
+            }
+        };
+        let model_response = ModelResponse {
+            message: msg,
+            input_tokens: turn_in,
+            output_tokens: turn_out,
+            stop_reason,
+            available_tools: self.tools.tool_names(),
+        };
+        let mut context_history = self.machine.full_history();
+        context_history.push(model_response.message.clone());
+        let context_tokens = self.token_counter.count(&context_history);
+        self.machine.model_response(model_response, context_tokens);
+
+        let turn_index = current_turn;
+        let is_empty = tool_calls.is_empty();
+        if let Some(run) = self.current_run_mut() {
+            run.turns.push(crate::engine::core::Turn {
+                turn: turn_index,
+                input: turn_input,
+                output: text,
+                tool_calls,
+                input_tokens: turn_in,
+                output_tokens: turn_out,
+            });
+        }
+
+        if is_empty {
+            self.notify_turn_end(
+                current_turn,
+                true,
+                None,
+                turn_start.elapsed(),
+                turn_in,
+                turn_out,
+            );
+        }
+        Ok(())
     }
 
     /// Handle a tool-dispatch request from the machine.
@@ -1972,33 +1947,12 @@ impl<C: ApiClient> BareLoop<C> {
 
         self.notify_tool_calls_received(current_turn, &tool_calls);
 
-        let cancel = Arc::clone(&self.cancelled);
-        let dispatch = async {
-            self.dispatch_and_record(&dispatch_calls, current_turn, turn_start, turn_in, turn_out)
-                .await
-        };
-
-        let mut parts: Vec<MessagePart> = tokio::select! {
-            biased;
-            () = cancel.notified() => {
-                self.machine.cancel();
-                self.notify_turn_end(
-                    current_turn,
-                    false,
-                    Some("cancelled".into()),
-                    turn_start.elapsed(),
-                    0,
-                    0,
-                );
-                return Err(LoopError::Cancelled);
-            }
-            result = dispatch => match result {
-                Ok(parts) => parts,
-                Err(e) => {
-                    self.set_error_state(&e);
-                    return Err(e);
-                }
-            },
+        let mut parts: Vec<MessagePart> = match self
+            .dispatch_and_record(&dispatch_calls, current_turn, turn_start, turn_in, turn_out)
+            .await
+        {
+            Ok(parts) => parts,
+            Err(e) => return Err(e),
         };
 
         preresolved_parts.append(&mut parts);
@@ -2182,7 +2136,7 @@ mod tests {
     use crate::observer::LoopObserver;
     use crate::stream::{
         DeltaPart, IndexedDelta, MessageDelta, MessageDeltaPayload, MessageMetadata, MessageStart,
-        PartStart, StreamEvent, Usage,
+        PartStart, StreamAccumulator, StreamEvent, Usage,
     };
     use crate::tool::ToolRegistry;
     use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
@@ -2192,6 +2146,38 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use std::sync::Mutex;
+
+    /// Fold queued [`StreamEvent`]s into a [`NonStreamingResponse`].
+    ///
+    /// Shared by `MockClient` and `RecordingClient` `create_message` impls so
+    /// the non-streaming path sees the same assembled message, stop reason,
+    /// and usage the streaming path would have produced.
+    fn assemble_response(
+        events: Vec<StreamEvent>,
+    ) -> Result<crate::api::NonStreamingResponse, ApiError> {
+        let mut accumulator = StreamAccumulator::new();
+        let mut stop_reason = crate::stream::StreamStopReason::EndTurn;
+        for event in events {
+            if let crate::stream::StreamEvent::MessageDelta(delta) = &event
+                && let Some(reason) = delta
+                    .delta
+                    .stop_reason
+                    .as_deref()
+                    .and_then(crate::stream::StreamStopReason::from_api_str)
+            {
+                stop_reason = reason;
+            }
+            accumulator
+                .process(&event)
+                .map_err(|e| ApiError::api(e.to_string()))?;
+        }
+        let usage = accumulator.usage().copied();
+        Ok(crate::api::NonStreamingResponse {
+            message: accumulator.build(),
+            stop_reason,
+            usage,
+        })
+    }
 
     #[derive(Clone)]
     struct MockClient {
@@ -2471,28 +2457,7 @@ mod tests {
             drop(guard);
             Box::pin(async move {
                 let events = events.ok_or_else(|| ApiError::api("No more mock responses"))?;
-                let mut accumulator = crate::stream::StreamAccumulator::new();
-                let mut stop_reason = crate::stream::StreamStopReason::EndTurn;
-                for event in events {
-                    if let crate::stream::StreamEvent::MessageDelta(delta) = &event
-                        && let Some(reason) = delta
-                            .delta
-                            .stop_reason
-                            .as_deref()
-                            .and_then(crate::stream::StreamStopReason::from_api_str)
-                    {
-                        stop_reason = reason;
-                    }
-                    accumulator
-                        .process(&event)
-                        .map_err(|e| ApiError::api(e.to_string()))?;
-                }
-                let usage = accumulator.usage().copied();
-                Ok(crate::api::NonStreamingResponse {
-                    message: accumulator.build(),
-                    stop_reason,
-                    usage,
-                })
+                assemble_response(events)
             })
         }
     }
@@ -2706,7 +2671,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_mode_default_is_nonstreaming_without_feature() {
+    fn turn_mode_default_follows_streaming_feature() {
         let client = MockClient::new("test-model");
         let agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
         #[cfg(not(feature = "streaming"))]
@@ -2784,7 +2749,12 @@ mod tests {
             _request: &crate::api::StreamRequest,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
-            Box::pin(futures::stream::empty())
+            let started = Arc::clone(&self.started);
+            Box::pin(futures::stream::once(async move {
+                started.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                Ok(StreamEvent::MessageStop)
+            }))
         }
         fn create_message(
             &self,
@@ -2797,7 +2767,6 @@ mod tests {
             let started = Arc::clone(&self.started);
             Box::pin(async move {
                 started.store(true, Ordering::SeqCst);
-                // Park forever; only the cancel `select!` arm resolves the turn.
                 std::future::pending::<()>().await;
                 Err(ApiError::api("unreachable: cancel must win the select"))
             })
@@ -2844,6 +2813,60 @@ mod tests {
         assert!(
             started.load(Ordering::SeqCst),
             "test only proves anything if create_message was actually entered"
+        );
+        assert!(
+            matches!(run_result, Err(LoopError::Cancelled)),
+            "run must return Err(Cancelled): {run_result:?}"
+        );
+        assert!(
+            !on_stream_failure_fired.load(Ordering::SeqCst),
+            "a clean cancel must not fire on_stream_failure (it would trip the breaker)"
+        );
+    }
+
+    /// Streaming-path twin of the test above: a clean cancel during a
+    /// streaming turn must not fire `on_stream_failure`. Proves the
+    /// `record_turn_failure` Cancelled guard holds for both turn modes.
+    #[cfg(feature = "streaming")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_during_streaming_turn_does_not_trip_breaker() {
+        let client = BlockingClient {
+            started: Arc::new(AtomicBool::new(false)),
+        };
+        let started = Arc::clone(&client.started);
+        let on_stream_failure_fired = Arc::new(AtomicBool::new(false));
+        let observer = Arc::new(FailureRecorder {
+            on_stream_failure_fired: Arc::clone(&on_stream_failure_fired),
+        });
+        let managers = LoopManagers::new()
+            .with_fallback(FallbackManager::default())
+            .with_observer(observer);
+        let mut agent = BareLoop::new_with_managers(
+            Arc::new(client),
+            ToolRegistry::new(),
+            make_config(),
+            managers,
+        );
+        // turn_mode defaults to Streaming when the feature is on.
+
+        let cancel_signal = Arc::clone(&agent.cancel_signal());
+        let run_handle = tokio::spawn(async move { agent.run("Hi", &RunConfig::default()).await });
+
+        let mut waits = 0u32;
+        while !started.load(Ordering::SeqCst) {
+            waits += 1;
+            assert!(
+                waits <= 1000,
+                "stream_messages was never entered — test setup is broken"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        cancel_signal.cancel();
+        let run_result = run_handle.await.unwrap();
+
+        assert!(
+            started.load(Ordering::SeqCst),
+            "test only proves anything if stream_messages was actually entered"
         );
         assert!(
             matches!(run_result, Err(LoopError::Cancelled)),
@@ -6066,28 +6089,7 @@ mod tests {
             drop(guard);
             Box::pin(async move {
                 let events = events.ok_or_else(|| ApiError::api("No more mock responses"))?;
-                let mut accumulator = crate::stream::StreamAccumulator::new();
-                let mut stop_reason = crate::stream::StreamStopReason::EndTurn;
-                for event in events {
-                    if let crate::stream::StreamEvent::MessageDelta(delta) = &event
-                        && let Some(reason) = delta
-                            .delta
-                            .stop_reason
-                            .as_deref()
-                            .and_then(crate::stream::StreamStopReason::from_api_str)
-                    {
-                        stop_reason = reason;
-                    }
-                    accumulator
-                        .process(&event)
-                        .map_err(|e| ApiError::api(e.to_string()))?;
-                }
-                let usage = accumulator.usage().copied();
-                Ok(crate::api::NonStreamingResponse {
-                    message: accumulator.build(),
-                    stop_reason,
-                    usage,
-                })
+                assemble_response(events)
             })
         }
 

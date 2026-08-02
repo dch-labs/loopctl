@@ -6,7 +6,7 @@
 //! independent budgets.
 //!
 //! This is the proactive complement to the reactive 429 handling in
-//! [`handler`](super::handler): the bucket gates a request *before* it fires,
+//! `stream::handler`: the bucket gates a request *before* it fires,
 //! smoothing bursty multi-turn loops so most provider-imposed rate limits are
 //! never hit.
 //!
@@ -198,7 +198,8 @@ fn elapsed_refill(state: &mut BucketState, at: Instant, capacity: f64, refill_pe
 /// [`acquire`](Self::acquire) then returns `Ok(())` immediately and never
 /// allocates a bucket.
 ///
-/// This is the type [`StreamHandler`](super::handler::StreamHandler) holds.
+/// This is the type `StreamHandler` holds when the `streaming` feature is
+/// enabled.
 #[derive(Debug)]
 pub struct RateLimiter {
     /// Per-provider token buckets, keyed by base URL.

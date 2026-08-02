@@ -211,8 +211,8 @@ impl ResponseFormat {
 /// tightening; Anthropic / Gemini tightened `input_schema` / `parameters`).
 ///
 /// The enum is `#[non_exhaustive]`: future variants may be added
-/// non-breakingly, and the [`Grammar`](Self::Grammar) variant is only
-/// present under the `grammar` feature.
+/// non-breakingly, and the `Grammar` variant is only present under the
+/// `grammar` feature.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub enum ToolConstraint {

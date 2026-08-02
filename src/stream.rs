@@ -33,7 +33,7 @@
 //!
 //! # Sub-modules
 //!
-//! - **[`handler`]** — [`handler::StreamHandler`] with retry, timeout,
+//! - **`handler`** — `handler::StreamHandler` with retry, timeout,
 //!   and fallback for resilient streaming.
 //!
 //! # Quick Start
@@ -58,9 +58,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 
+#[cfg(feature = "streaming")]
 pub mod handler;
 pub mod rate_limit;
 
+#[cfg(feature = "streaming")]
 pub use handler::{DetectedRateLimit, RateLimitConfig, RateLimitKind};
 pub use rate_limit::{RateLimiter, TokenBucket};
 

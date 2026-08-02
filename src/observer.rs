@@ -115,7 +115,7 @@ pub trait LoopObserver: Send + Sync {
     /// arrival order, to reconstruct the per-turn text.
     ///
     /// This is the per-token counterpart to the raw
-    /// [`text_streamer`](crate::engine::BareLoop::set_text_streamer) callback,
+    /// `text_streamer` callback,
     /// delivered through the observer system so multiple observers each receive
     /// every chunk. The streamer remains available for simple single-consumer
     /// use.
@@ -127,7 +127,7 @@ pub trait LoopObserver: Send + Sync {
     ///
     /// # Retry caveat (handler path)
     ///
-    /// When a [`StreamHandler`](crate::stream::handler::StreamHandler) is
+    /// When a `StreamHandler` is
     /// configured, this callback fires for every event of every attempt —
     /// including partial events from a failed attempt that got cut off
     /// mid-stream. An observer that concatenates `delta` across calls will,
@@ -164,7 +164,7 @@ pub trait LoopObserver: Send + Sync {
     /// as an empty `delta` (render a placeholder, not the empty string).
     ///
     /// Inherits the same retry caveat as [`on_text_delta`](Self::on_text_delta):
-    /// under a configured [`StreamHandler`](crate::stream::handler::StreamHandler),
+    /// under a configured `StreamHandler`,
     /// partial events from a failed attempt fire here too. Buffer until
     /// [`on_turn_end`](Self::on_turn_end) if you need only committed reasoning.
     fn on_thinking_delta(&self, _ctx: &ThinkingDeltaContext) {}

@@ -1,6 +1,6 @@
 [package]
 name = "loopctl"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "A trait-based framework for building agent loops with pluggable LLM clients, tools, and memory"
@@ -30,7 +30,7 @@ tracing = "0.1"
 
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"], optional = true }
 bytes = { version = "1", optional = true }
-async-stream = "0.3"
+async-stream = { version = "0.3", optional = true }
 httpdate = { version = "1", optional = true }
 jsonschema = { version = "0.49", optional = true }
 
@@ -45,15 +45,18 @@ testing = []
 tool_health = []
 tool_shield = ["tool_health"]
 
+# Streaming engine path (StreamHandler, per-delta callbacks, async-stream codegen).
+streaming = ["dep:async-stream"]
+
 # Providers
 providers = ["dep:reqwest", "dep:httpdate", "dep:bytes"]
-openai = ["providers"]
-anthropic = ["providers"]
+openai = ["providers", "streaming"]
+anthropic = ["providers", "streaming"]
 ollama = ["providers", "openai"]
 deepseek = ["providers", "openai"]
 grok = ["providers", "openai"]
 xai = ["grok"]
-gemini = ["providers"]
+gemini = ["providers", "streaming"]
 zai = ["providers", "anthropic"]
 grammar = ["providers"]
 schema_validation = ["dep:jsonschema"]
@@ -92,3 +95,9 @@ let_underscore_must_use = "deny"
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+

@@ -8,9 +8,9 @@
 //! hook events, and returns the compacted messages plus a post-compaction token
 //! estimate for the driver to feed back into the machine.
 
-use super::{ApiClient, BareLoop, Instant, LoopError};
+use super::{ApiClient, BareLoop, LoopError};
 #[cfg(feature = "hooks")]
-use super::{CompactTrigger, PostCompactContext, PreCompactContext};
+use super::{CompactTrigger, Instant, PostCompactContext, PreCompactContext};
 use crate::compact::EnsureContextResult;
 
 use crate::capabilities::Compactable;
@@ -53,11 +53,14 @@ impl<C: ApiClient> BareLoop<C> {
             return Ok((history, 0));
         };
 
+        #[cfg(feature = "hooks")]
         if self.pre_compact_hook_aborts(&history) {
             return Ok((history, 0));
         }
 
+        #[cfg(feature = "hooks")]
         let messages_before = history.len();
+        #[cfg(feature = "hooks")]
         let compact_start = Instant::now();
         let result = ctx_manager.compact_with_reason(history, turn, reason).await;
 
@@ -65,6 +68,7 @@ impl<C: ApiClient> BareLoop<C> {
             Ok(EnsureContextResult::Compacted(outcome)) => {
                 let tokens_after = outcome.tokens_after;
                 let tokens_saved = outcome.tokens_saved;
+                #[cfg(feature = "hooks")]
                 let messages_after = outcome.messages.len();
                 let tokens_before = tokens_after.saturating_add(tokens_saved);
                 self.managers.observers().on_compaction(&CompactedContext {
@@ -72,6 +76,7 @@ impl<C: ApiClient> BareLoop<C> {
                     tokens_after,
                     tokens_saved,
                 });
+                #[cfg(feature = "hooks")]
                 self.notify_post_compact_hook(
                     messages_before,
                     messages_after,
@@ -116,16 +121,6 @@ impl<C: ApiClient> BareLoop<C> {
         executor.check_pre_compact(&ctx).abort
     }
 
-    /// No-op pre-compact hook check for builds without the `hooks` feature.
-    ///
-    /// Always returns `false` so [`run_compaction`](Self::run_compaction)
-    /// proceeds with compaction unconditionally — there are no hooks to
-    /// consult.
-    #[cfg(not(feature = "hooks"))]
-    fn pre_compact_hook_aborts(&self, _history: &[Message]) -> bool {
-        false
-    }
-
     /// Notify the post-compact hook that compaction completed.
     ///
     /// Builds a [`PostCompactContext`] from the before/after message
@@ -157,21 +152,5 @@ impl<C: ApiClient> BareLoop<C> {
             session_id: self.session.id,
         };
         executor.notify_post_compact(&ctx);
-    }
-
-    /// No-op post-compact notification for builds without the `hooks` feature.
-    ///
-    /// Does nothing — there are no hooks to notify. Kept so
-    /// [`run_compaction`](Self::run_compaction) compiles identically
-    /// with and without the feature.
-    #[cfg(not(feature = "hooks"))]
-    fn notify_post_compact_hook(
-        &self,
-        _messages_before: usize,
-        _messages_after: usize,
-        _tokens_after: u64,
-        _tokens_saved: u64,
-        _duration: std::time::Duration,
-    ) {
     }
 }

@@ -55,11 +55,13 @@
 //! let result = agent.run("Hello!", &RunConfig::default()).await?;
 //! ```
 
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 use crate::api::error::ApiError;
 #[cfg(any(feature = "anthropic", feature = "gemini"))]
 use crate::message::{MessagePart, Role};
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 use futures::StreamExt;
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 use std::time::Duration;
 
 // SSE line-framing shared by every streaming provider. Each provider keeps
@@ -132,6 +134,7 @@ pub(super) async fn read_bounded_body(resp: reqwest::Response) -> Result<bytes::
 /// [`GeminiClient`](crate::provider::GeminiClient). Each provider builder
 /// embeds this struct and delegates its HTTP-related setters to it, so the
 /// pool/TCP documentation and construction logic lives in one place.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 #[derive(Clone)]
 pub(super) struct HttpClientConfig {
     /// The total HTTP request timeout (connect + response + body).
@@ -192,6 +195,7 @@ pub(super) struct HttpClientConfig {
     tcp_nodelay: bool,
 }
 
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 impl Default for HttpClientConfig {
     fn default() -> Self {
         Self {
@@ -206,6 +210,7 @@ impl Default for HttpClientConfig {
     }
 }
 
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 impl HttpClientConfig {
     /// Set the total request timeout.
     ///
@@ -318,12 +323,14 @@ impl HttpClientConfig {
 /// for pool and TCP knobs, no-opping when `None`.
 ///
 /// Used internally by [`HttpClientConfig::build`].
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 trait ClientBuilderExt: Sized {
     fn maybe_pool_max_idle_per_host(self, val: Option<usize>) -> Self;
     fn maybe_pool_idle_timeout(self, val: Option<Duration>) -> Self;
     fn maybe_tcp_keepalive(self, val: Option<Duration>) -> Self;
 }
 
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 impl ClientBuilderExt for reqwest::ClientBuilder {
     fn maybe_pool_max_idle_per_host(self, val: Option<usize>) -> Self {
         match val {

@@ -161,25 +161,35 @@ let agent = BareLoop::new(
 
 ### Streaming vs non-streaming
 
-By default (`default = []`) the engine drives each turn with
-[`ApiClient::create_message`] — a single request/response with no streaming
-machinery, no `async-stream` dependency, and no per-delta callbacks. The full
-assistant text still surfaces through
-[`on_response`](https://docs.rs/loopctl/latest/loopctl/observer/trait.LoopObserver.html#method.on_response).
-
-Enable the `streaming` feature (implied by every HTTP provider) to route turns
-through [`StreamHandler`](https://docs.rs/loopctl/latest/loopctl/stream/handler/struct.StreamHandler.html)
-with retry, timeout, rate-limit detection, and `on_text_delta` /
-`on_thinking_delta` callbacks for real-time token display. Switch a constructed
-loop explicitly with
+The engine selects a turn mode at runtime via
+[`TurnMode`](https://docs.rs/loopctl/latest/loopctl/engine/enum.TurnMode.html)
+(`NonStreaming` or `Streaming`), set with
 [`set_turn_mode`](https://docs.rs/loopctl/latest/loopctl/engine/struct.BareLoop.html#method.set_turn_mode).
+The two modes are independent of *whether* the `streaming` feature is compiled
+in, though the feature gates what `Streaming` can do:
+
+- [`TurnMode::NonStreaming`](https://docs.rs/loopctl/latest/loopctl/engine/enum.TurnMode.html#variant.NonStreaming)
+  drives each turn via [`ApiClient::create_message`] — a single request/response
+  with no per-delta callbacks. The full assistant text surfaces through
+  [`on_response`](https://docs.rs/loopctl/latest/loopctl/observer/trait.LoopObserver.html#method.on_response).
+  Always available, even under `default = []`.
+
+- [`TurnMode::Streaming`](https://docs.rs/loopctl/latest/loopctl/engine/enum.TurnMode.html#variant.Streaming)
+  routes turns through [`StreamHandler`](https://docs.rs/loopctl/latest/loopctl/stream/handler/struct.StreamHandler.html)
+  with retry, timeout, rate-limit detection, and `on_text_delta` /
+  `on_thinking_delta` callbacks for real-time token display. Requires the
+  `streaming` feature (implied by every HTTP provider).
+
+The constructor default is `Streaming` when the `streaming` feature is enabled
+and `NonStreaming` otherwise — but a constructed loop can switch to either mode
+at runtime regardless of the default.
 
 ## Architecture
 
 At the center is **BareLoop**, the default agent loop. Each turn it requests a
 response from an **ApiClient** (your LLM provider) — via the streaming path
-(`StreamHandler`) when `streaming` is enabled, or via `create_message`
-otherwise — then dispatches any requested tool calls through a
+(`StreamHandler`) under `TurnMode::Streaming`, or via `create_message` under
+`TurnMode::NonStreaming` — then dispatches any requested tool calls through a
 **ToolRegistry**. Results are fed back into the conversation and the cycle
 repeats until the model ends its turn or a configured limit is reached.
 

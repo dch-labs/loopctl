@@ -127,7 +127,6 @@ pub(super) async fn read_bounded_body(resp: reqwest::Response) -> Result<bytes::
 }
 
 /// Shared HTTP-client configuration embedded by every provider builder.
-#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 ///
 /// Holds the timeout, connection-pool, and TCP knobs that are identical
 /// across [`OpenAiClient`](crate::provider::OpenAiClient),
@@ -135,6 +134,7 @@ pub(super) async fn read_bounded_body(resp: reqwest::Response) -> Result<bytes::
 /// [`GeminiClient`](crate::provider::GeminiClient). Each provider builder
 /// embeds this struct and delegates its HTTP-related setters to it, so the
 /// pool/TCP documentation and construction logic lives in one place.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 #[derive(Clone)]
 pub(super) struct HttpClientConfig {
     /// The total HTTP request timeout (connect + response + body).

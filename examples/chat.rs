@@ -335,21 +335,23 @@ async fn run_repl<C: ApiClient>(client: Arc<C>) {
 
     // Pick the engine turn mode at runtime. `NO_STREAM=1` drives each turn via
     // the non-streaming `create_message` path (no per-delta callbacks, the
-    // assembled response is printed after the turn). Otherwise stream text
-    // deltas live as they arrive.
-    let no_stream = std::env::var("NO_STREAM").map_or(false, |v| v == "1");
+    // assembled response is printed after the turn). Without the `streaming`
+    // feature the engine is non-streaming regardless, and `no_stream` stays
+    // true so the result-printing logic below displays each response.
+    let no_stream = if cfg!(not(feature = "streaming")) {
+        true
+    } else {
+        std::env::var("NO_STREAM").map_or(false, |v| v == "1")
+    };
     #[cfg(feature = "streaming")]
     if no_stream {
         agent.set_turn_mode(loopctl::engine::TurnMode::NonStreaming);
     } else {
+        agent.set_turn_mode(loopctl::engine::TurnMode::Streaming);
         agent.set_text_streamer(Arc::new(|delta| {
             print!("{delta}");
             let _ = std::io::stdout().flush();
         }));
-    }
-    #[cfg(not(feature = "streaming"))]
-    {
-        let _ = no_stream;
     }
 
     // Ctrl-C interrupts the in-flight turn (via loopctl's CancelSignal, which

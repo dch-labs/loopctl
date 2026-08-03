@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Fixed
 
+- Corrected the `ParallelMode::Parallel` doc, which falsely claimed detection/observer side-effects "are not thread-safe" and fire "once on the final result only" in parallel mode. They are thread-safe (`DetectionManager` and the observer registry use `Mutex`/immutable-`Vec` interiors; `ToolHealthRegistry` uses atomics) and fire on every retry attempt in both modes, exactly as the code already does. No behavior change; the code matched the corrected doc all along.
+- Fixed code-level doc contradictions: the `ApiClient` trait example showed `request: StreamRequest` (by-value) instead of `&StreamRequest` (matches the real trait), and `BareLoop::machine` was described as an "empty placeholder" rather than the real "empty machine (no history, no pending messages)".
+- Reconciled the planning docs (ROADMAP, CONTEXT, ARCHITECTURE, README, DEPENDENCIES, DCH-DESIGN, the v0.2.0 release file) to the shipped 0.2.0 reality: status Planned→Shipped, `compact_threshold` u16→u8, `Loop::process_turn` soft-deprecated→removed, `LoopRuntime`/`LoopConfig`/`SessionResult`/`run_session` → their shipped replacements (`managers`/`SessionConfig`+`RunConfig`/`Run`+`Session`/`run`), MSRV 1.85→1.94, doctest count 303→286. Added a staleness banner to `LOOPCTL-DESIGN.md`.
 - Restored the no-`#[allow(clippy::*)]` lint contract. Fixed: a private `TextStreamer` type alias, lossless integer-to-float casts (centralized in an internal `numeric` module), `PartLane`/`TerminalStage` lane enums replacing bool fields, and stale-allow deletions. No public API change.
 
 ## [0.2.0] - 2026-08-02

@@ -246,8 +246,8 @@ pub struct BareLoop<C: ApiClient> {
     /// [`compaction_result`](LoopMachine::compaction_result), and
     /// [`inject`](LoopMachine::inject). It is (re)created at the top of every
     /// [`run()`](crate::engine::core::Loop::run) call from the run config
-    /// and user prompt; before that it holds an empty placeholder so the struct
-    /// is always valid.
+    /// and user prompt; before that it holds an empty machine (no history, no
+    /// pending messages) so the struct is always valid.
     machine: LoopMachine,
 
     /// Framework managers bundle — holds all cross-cutting infrastructure.
@@ -524,7 +524,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// accumulated history, turns taken, or the machine's internal state). The
     /// machine is (re)created at the top of every
     /// [`run()`](crate::engine::core::Loop::run) call; before the first run
-    /// it holds an empty placeholder.
+    /// it holds an empty machine (no history, no pending messages).
     #[must_use]
     pub fn machine(&self) -> &LoopMachine {
         &self.machine

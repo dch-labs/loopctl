@@ -256,7 +256,7 @@ impl LoopMemory for InMemoryStore {
                     let base_score = entry.relevance;
                     let denom = query_words.len().max(1);
                     let query_bonus = if word_matches > 0 {
-                        crate::numeric::unit_ratio_f32(word_matches, denom)
+                        crate::numeric::unit_ratio(word_matches, denom)
                     } else {
                         0.0
                     };

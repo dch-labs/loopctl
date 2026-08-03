@@ -1152,6 +1152,32 @@ struct OpenAiToolCallFunction {
     name: Option<String>,
 }
 
+/// Whether a content lane (text or thinking) currently has an open part.
+///
+/// [`StreamEmitter`] separates assistant text and model reasoning into two
+/// independent lanes, each opened with a [`PartStart`](StreamEvent::PartStart)
+/// on its first non-empty fragment and closed with a
+/// [`PartStop`](StreamEvent::PartStop) when the lane switches or the stream
+/// finishes. Only one lane may be open at a time — the emitter emits a
+/// `PartStop` for the active lane before opening the other — so this enum
+/// tracks the open/closed state of each lane without a bare `bool`.
+#[derive(Default)]
+enum PartLane {
+    /// No part is open for this lane.
+    ///
+    /// The default state before the stream delivers any content for the
+    /// lane, and the state it returns to once a part has been closed.
+    #[default]
+    Closed,
+
+    /// A part is open and accumulating deltas.
+    ///
+    /// Set when the first non-empty fragment opens the lane; cleared when
+    /// [`process_finish`](StreamEmitter::process_finish) emits the matching
+    /// [`PartStop`](StreamEvent::PartStop).
+    Open,
+}
+
 /// Stateful translator that converts a sequence of [`OpenAiChunk`]s
 /// into [`StreamEvent`]s.
 ///
@@ -1164,7 +1190,6 @@ struct OpenAiToolCallFunction {
 /// Splitting this out from the `try_stream!` macro body makes the
 /// translation logic testable without a live network connection.
 #[derive(Default)]
-#[allow(clippy::struct_excessive_bools)]
 struct StreamEmitter {
     /// Whether [`StreamEvent::MessageStart`] has been emitted for the
     /// current stream.
@@ -1181,7 +1206,7 @@ struct StreamEmitter {
     /// [`StreamEvent::PartStart`] on the first non-empty fragment and
     /// tracks the open state so [`process_finish`](Self::process_finish)
     /// emits exactly one [`StreamEvent::PartStop`] to close it.
-    text_part_open: bool,
+    text: PartLane,
 
     /// Whether the reasoning (thinking) content part is currently open.
     ///
@@ -1189,7 +1214,7 @@ struct StreamEmitter {
     /// alias `delta.reasoning`). The emitter opens a thinking part on the
     /// first non-empty fragment and closes it in `process_finish`, symmetric
     /// to the text lane.
-    thinking_part_open: bool,
+    thinking: PartLane,
 
     /// Tool-call indices that have already had their
     /// [`StreamEvent::PartStart`] emitted.
@@ -1305,12 +1330,12 @@ impl StreamEmitter {
         if let Some(text) = &delta.content
             && !text.is_empty()
         {
-            if self.thinking_part_open {
-                self.thinking_part_open = false;
+            if matches!(self.thinking, PartLane::Open) {
+                self.thinking = PartLane::Closed;
                 self.push(StreamEvent::PartStop);
             }
-            if !self.text_part_open {
-                self.text_part_open = true;
+            if matches!(self.text, PartLane::Closed) {
+                self.text = PartLane::Open;
                 self.push(StreamEvent::PartStart(PartStart {
                     index: TEXT_PART_INDEX,
                     part: Some(MessagePart::text("")),
@@ -1325,12 +1350,12 @@ impl StreamEmitter {
         if let Some(reasoning) = &delta.reasoning_content
             && !reasoning.is_empty()
         {
-            if self.text_part_open {
-                self.text_part_open = false;
+            if matches!(self.text, PartLane::Open) {
+                self.text = PartLane::Closed;
                 self.push(StreamEvent::PartStop);
             }
-            if !self.thinking_part_open {
-                self.thinking_part_open = true;
+            if matches!(self.thinking, PartLane::Closed) {
+                self.thinking = PartLane::Open;
                 self.push(StreamEvent::PartStart(PartStart {
                     index: THINKING_PART_INDEX,
                     part: None,
@@ -1411,11 +1436,13 @@ impl StreamEmitter {
         }
         self.finished = true;
 
-        if self.text_part_open {
+        if matches!(self.text, PartLane::Open) {
+            self.text = PartLane::Closed;
             self.push(StreamEvent::PartStop);
         }
 
-        if self.thinking_part_open {
+        if matches!(self.thinking, PartLane::Open) {
+            self.thinking = PartLane::Closed;
             self.push(StreamEvent::PartStop);
         }
 
@@ -1490,6 +1517,15 @@ mod tests {
     use super::*;
     use crate::message::{Message, MessagePart, Role, ToolContent};
     use crate::tool::ToolSchema;
+
+    #[test]
+    fn openai_emitter_part_lane_default_closed() {
+        let em = StreamEmitter::default();
+        assert!(
+            matches!(em.text, PartLane::Closed) && matches!(em.thinking, PartLane::Closed),
+            "both content lanes must start closed"
+        );
+    }
 
     #[test]
     fn request_body_includes_system_message_first() {
@@ -2196,6 +2232,42 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, StreamEvent::MessageDelta(_)))
+        );
+    }
+
+    #[test]
+    fn emitter_finish_closes_lanes_so_late_delta_reopens() {
+        let mut em = StreamEmitter::default();
+
+        let text_chunk = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&text_chunk);
+        em.drain();
+
+        let finish = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&finish);
+        em.drain();
+        assert!(
+            matches!(em.text, PartLane::Closed),
+            "process_finish must close the text lane"
+        );
+
+        let late_delta = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"more"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&late_delta);
+        let events = em.drain();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::PartStart(_))),
+            "a delta after finish must re-open the text lane with PartStart"
         );
     }
 
@@ -3026,7 +3098,10 @@ mod tests {
             )
         });
         assert!(!has_text, "reasoning-only chunk must not emit Text deltas");
-        assert!(!em.text_part_open, "reasoning must not set text_part_open");
+        assert!(
+            matches!(em.text, PartLane::Closed),
+            "reasoning must not open the text lane"
+        );
     }
 
     #[test]

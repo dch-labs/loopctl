@@ -899,7 +899,6 @@ impl<C: ApiClient> BareLoop<C> {
 }
 
 #[cfg(all(test, feature = "testing"))]
-#[allow(clippy::unnecessary_literal_bound)]
 mod tests {
     use crate::api::error::ApiError;
     use crate::config::SessionConfig;
@@ -990,10 +989,10 @@ mod tests {
     struct PanicTool;
 
     impl Tool for PanicTool {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "panic_tool"
         }
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "Panics on call"
         }
         fn schema(&self) -> ToolSchema {

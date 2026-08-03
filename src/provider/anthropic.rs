@@ -883,7 +883,6 @@ impl SseReader {
 /// - Emitting [`PartStop`] when parts finish.
 /// - Emitting the final [`MessageDelta`] with stop reason and usage.
 #[derive(Default)]
-#[allow(clippy::struct_excessive_bools)]
 struct StreamEmitter {
     /// Whether [`MessageStart`] has been emitted for the current stream.
     ///

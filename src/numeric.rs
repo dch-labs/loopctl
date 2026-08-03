@@ -134,15 +134,19 @@ impl RatioInt for u64 {
     fn max(self, other: Self) -> Self {
         core::cmp::max(self, other)
     }
+
     fn checked_div(self, rhs: Self) -> Option<Self> {
         u64::checked_div(self, rhs)
     }
+
     fn saturating_add(self, rhs: Self) -> Self {
         u64::saturating_add(self, rhs)
     }
+
     fn try_into_narrow(self) -> Option<Self::Narrow> {
         u32::try_from(self).ok()
     }
+
     fn float_div(numerator: Self::Float, denominator: Self::Float) -> Self::Float {
         numerator / denominator
     }
@@ -165,15 +169,19 @@ impl RatioInt for usize {
     fn max(self, other: Self) -> Self {
         core::cmp::max(self, other)
     }
+
     fn checked_div(self, rhs: Self) -> Option<Self> {
         usize::checked_div(self, rhs)
     }
+
     fn saturating_add(self, rhs: Self) -> Self {
         usize::saturating_add(self, rhs)
     }
+
     fn try_into_narrow(self) -> Option<Self::Narrow> {
         u16::try_from(self).ok()
     }
+
     fn float_div(numerator: Self::Float, denominator: Self::Float) -> Self::Float {
         numerator / denominator
     }
@@ -199,14 +207,32 @@ impl RatioInt for usize {
 ///
 /// - **Zero denominator** returns `0.0` (rather than `NaN` or `inf`), matching
 ///   what every current caller wants for an empty set or window.
-/// - **Scaled numerator that floors to `0`** is clamped up to `1`, so any
-///   positive numerator yields a strictly positive result. Without this clamp,
-///   a small numerator over a large denominator (e.g. `1 / 70_000`) would
-///   floor to `0 / scaled_denom == 0.0`, silently dropping a genuine match.
+/// - **Scaled operand that floors to `0`** is clamped up to `1` — applied
+///   symmetrically to numerator and denominator. For the numerator this keeps
+///   a small positive value over a large one (e.g. `1 / 70_000`) from
+///   collapsing to `0.0`; for the denominator it keeps a large numerator over a
+///   small one (e.g. `70_000 / 1`) from producing `inf`. Either way, a positive
+///   denominator guarantees a finite result.
 ///
 /// The result is not clamped to `[0, 1]`: when the numerator exceeds the
 /// denominator it rises above `1.0` (e.g. context-window overflow reports a
 /// utilization greater than one).
+/// Divide `value` by `scale`, keeping any positive input strictly positive.
+///
+/// The integer division floors, so a small positive `value` divided by a large
+/// `scale` can drop to zero — collapsing a genuine operand of the ratio. This
+/// clamps such a floored result back up to one so that a positive numerator or
+/// denominator never vanishes (which would otherwise yield `0.0` or `inf`
+/// respectively). Used symmetrically on both operands of [`unit_ratio`].
+fn scale_operand<T: RatioInt>(value: T, scale: T) -> T {
+    let scaled = T::checked_div(value, scale).unwrap_or(value);
+    if value > T::ZERO && scaled == T::ZERO {
+        T::ONE
+    } else {
+        scaled
+    }
+}
+
 #[must_use]
 pub(crate) fn unit_ratio<T: RatioInt>(numerator: T, denominator: T) -> T::Float {
     if denominator == T::ZERO {
@@ -216,13 +242,8 @@ pub(crate) fn unit_ratio<T: RatioInt>(numerator: T, denominator: T) -> T::Float 
         T::checked_div(T::max(denominator, numerator), T::RANGE).unwrap_or(T::MAX),
         T::ONE,
     );
-    let numerator_scaled = T::checked_div(numerator, scale).unwrap_or(numerator);
-    let denominator_scaled = T::checked_div(denominator, scale).unwrap_or(denominator);
-    let numerator_scaled = if numerator > T::ZERO && numerator_scaled == T::ZERO {
-        T::ONE
-    } else {
-        numerator_scaled
-    };
+    let numerator_scaled = scale_operand(numerator, scale);
+    let denominator_scaled = scale_operand(denominator, scale);
     let numerator_narrow = numerator_scaled.try_into_narrow().unwrap_or(T::NARROW_MAX);
     let denominator_narrow = denominator_scaled
         .try_into_narrow()
@@ -348,5 +369,30 @@ mod tests {
             (ratio - 0.999_97_f32).abs() < 0.001,
             "expected ~0.99997, got {ratio}"
         );
+    }
+
+    #[test]
+    fn unit_ratio_f32_small_positive_denominator_stays_finite_at_large_scale() {
+        // A large numerator (above u16::MAX) with a small nonzero denominator
+        // triggers shared scaling; the integer division den/scale would floor
+        // to 0, producing inf (or NaN) without a denominator clamp. The result
+        // must stay finite and reflect the true large ratio.
+        let ratio = unit_ratio::<usize>(70_000, 1);
+        assert!(
+            ratio.is_finite(),
+            "positive denominator must yield a finite ratio, got {ratio}"
+        );
+        assert!(ratio > 1.0, "70_000/1 must exceed 1.0, got {ratio}");
+    }
+
+    #[test]
+    fn unit_ratio_f64_small_positive_denominator_stays_finite_at_large_scale() {
+        let over = u64::from(u32::MAX) + 1;
+        let ratio = unit_ratio::<u64>(over, 1);
+        assert!(
+            ratio.is_finite(),
+            "positive denominator must yield a finite ratio, got {ratio}"
+        );
+        assert!(ratio > 1.0, "over/1 must exceed 1.0, got {ratio}");
     }
 }

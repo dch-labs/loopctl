@@ -868,7 +868,7 @@ enum TerminalStage {
     /// Subsequent `finishReason` chunks (e.g. from proxies that re-emit)
     /// are no-ops.
     FinishReasonSeen,
-    
+
     /// Both transitions are complete.
     ///
     /// The only state from which no further terminal work is possible;

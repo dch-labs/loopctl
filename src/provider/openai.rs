@@ -1169,7 +1169,7 @@ enum PartLane {
     /// lane, and the state it returns to once a part has been closed.
     #[default]
     Closed,
-    
+
     /// A part is open and accumulating deltas.
     ///
     /// Set when the first non-empty fragment opens the lane; cleared when

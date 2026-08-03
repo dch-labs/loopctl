@@ -156,17 +156,25 @@ pub enum ParallelMode {
     /// docs for the ordering invariant. Choose this for read-heavy,
     /// multi-call turns where latency is the sum of independent operations.
     ///
-    /// # Side-effect divergence from Sequential
+    /// # Side-effects (same granularity in both modes)
     ///
-    /// In Sequential mode, loop detection and observer events fire on
-    /// **every** retry attempt — a tool that fails twice then succeeds
-    /// produces 3 detection operations and 3 observer pairs.
+    /// Detection, observer, hook, and health side-effects all fire on **every**
+    /// retry attempt in both modes. A tool that fails twice then succeeds
+    /// produces 3 detection operations, 3 observer PRE+POST pairs, and 3 health
+    /// recordings regardless of `ParallelMode`. All four side-effect targets are
+    /// thread-safe ([`DetectionManager`](crate::detection::DetectionManager)
+    /// and the observer registry use
+    /// `Mutex`/immutable-`Vec` interiors;
+    /// [`ToolHealthRegistry`](crate::tool::health::ToolHealthRegistry) uses
+    /// atomic counters), so concurrent retry attempts in Parallel mode dispatch
+    /// side-effects safely without serialization.
     ///
-    /// In Parallel mode, detection and observer side-effects fire **once**
-    /// on the final result only (they are not thread-safe). Health
-    /// tracking fires on **every** attempt in both modes (it uses atomic
-    /// counters). Intermediate retries during parallel dispatch are
-    /// invisible to loop detection and observers but visible to health.
+    /// The only retry-related difference between modes is **interleaving**, not
+    /// granularity: in Sequential the classic `[pre A, post A, pre B, post B]`
+    /// order is strict, while in Parallel the PRE/POST events for independent
+    /// calls in the same wave interleave as those calls progress concurrently.
+    /// Observers that pair `on_tool_pre`/`on_tool_post` should key on
+    /// `tool_call_id` (carried in both contexts), not on arrival order.
     Parallel,
 }
 

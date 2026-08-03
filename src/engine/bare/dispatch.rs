@@ -1484,6 +1484,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_retried_call_fires_side_effects_per_attempt() {
+        // Pins the documented contract (config.rs `ParallelMode`): detection,
+        // observer, hook, and health side-effects fire on EVERY retry attempt
+        // in BOTH modes. A retried parallel call must therefore emit multiple
+        // observer PRE+POST pairs, not one. Guards against a future change
+        // re-introducing per-mode gating that the contract explicitly disclaims
+        // (all side-effect targets are Send + Sync).
+        use crate::observer::{LoopObserver, ToolPostContext, ToolPreContext};
+        use crate::reflection::{
+            FailureAnalysis, FailureSeverity, RecoveryAction, RecoveryStrategy,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct AlwaysRecoverable;
+        impl crate::reflection::Reflector for AlwaysRecoverable {
+            fn analyze(
+                &self,
+                error: &str,
+                tool_name: &str,
+                _tool_input: &Value,
+                _tool_schema: Option<&crate::tool::ToolSchema>,
+                _context: &crate::reflection::ReflectionContext,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<FailureAnalysis, crate::reflection::ReflectionError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let error = error.to_string();
+                let tool_name = tool_name.to_string();
+                Box::pin(async move {
+                    Ok(FailureAnalysis {
+                        is_recoverable: true,
+                        root_cause: error,
+                        severity: FailureSeverity::Medium,
+                        correction: None,
+                        context: format!("tool: {tool_name}"),
+                    })
+                })
+            }
+        }
+
+        // Retry the first two attempts, then give up with a soft error so the
+        // call terminates. Each attempt is a full dispatch with PRE+POST.
+        struct RetryTwice;
+        impl RecoveryStrategy for RetryTwice {
+            fn decide(
+                &self,
+                _analysis: &FailureAnalysis,
+                attempt: u32,
+                _max_attempts: u32,
+            ) -> Pin<Box<dyn Future<Output = RecoveryAction> + Send + '_>> {
+                Box::pin(async move {
+                    if attempt < 2 {
+                        RecoveryAction::Retry {
+                            delay: std::time::Duration::ZERO,
+                        }
+                    } else {
+                        RecoveryAction::Skip("giving up".into())
+                    }
+                })
+            }
+        }
+
+        struct CountingObserver {
+            pre: Arc<AtomicU32>,
+            post: Arc<AtomicU32>,
+        }
+        impl LoopObserver for CountingObserver {
+            fn name(&self) -> &'static str {
+                "counting"
+            }
+            fn on_tool_pre(&self, _ctx: &ToolPreContext) {
+                self.pre.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_tool_post(&self, _ctx: &ToolPostContext) {
+                self.post.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // Tool that always errors; recovery drives 3 attempts (2 retries + 1 skip).
+        let error_tool = crate::tool::FnTool::new(
+            "error_tool".into(),
+            "Always errors".into(),
+            Value::Object(serde_json::Map::new()),
+            |_, _| Box::pin(async { Err(ToolError::Execution("boom".to_string())) }),
+        );
+
+        let pre_count = Arc::new(AtomicU32::new(0));
+        let post_count = Arc::new(AtomicU32::new(0));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(error_tool);
+        let mut bare = make_parallel_loop(registry);
+        bare.set_reflector(Arc::new(AlwaysRecoverable));
+        bare.set_recovery_strategy(Arc::new(RetryTwice));
+        bare.register_observer(Arc::new(CountingObserver {
+            pre: Arc::clone(&pre_count),
+            post: Arc::clone(&post_count),
+        }));
+
+        let calls = vec![make_call("1", "error_tool", Value::Null)];
+        let _ = bare.dispatch_tools(&calls, 0).await.ok();
+
+        let pres = pre_count.load(Ordering::Relaxed);
+        let posts = post_count.load(Ordering::Relaxed);
+        assert!(
+            pres >= 2 && posts >= 2,
+            "parallel retried call must fire side-effects per attempt; got pre={pres} post={posts}"
+        );
+        assert_eq!(
+            pres, posts,
+            "every PRE must have a matching POST (pairing invariant)"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_tool_call_runs_recovery_on_failure() {
         use crate::reflection::{
             FailureAnalysis, FailureSeverity, RecoveryAction, RecoveryStrategy,

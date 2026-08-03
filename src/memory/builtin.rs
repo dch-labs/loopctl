@@ -254,9 +254,10 @@ impl LoopMemory for InMemoryStore {
                         .filter(|w| memory_lower.contains(*w))
                         .count();
                     let base_score = entry.relevance;
-                    #[allow(clippy::cast_precision_loss)]
                     let query_bonus = if word_matches > 0 {
-                        word_matches as f32 / query_words.len().max(1) as f32
+                        let denom = u16::try_from(query_words.len().max(1)).unwrap_or(u16::MAX);
+                        let matches_f = f32::from(u16::try_from(word_matches).unwrap_or(u16::MAX));
+                        matches_f / f32::from(denom)
                     } else {
                         0.0
                     };

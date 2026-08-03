@@ -106,7 +106,6 @@ impl ToolCallMiddleware {
 }
 
 #[cfg(test)]
-#[allow(clippy::unnecessary_literal_bound)]
 mod tests {
     use super::*;
     use crate::cancel::CancelSignal;
@@ -130,10 +129,10 @@ mod tests {
     }
 
     impl Tool for PanickingTool {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "panic_tool"
         }
-        fn description(&self) -> &str {
+        fn description(&self) -> &'static str {
             "A tool that panics"
         }
         fn schema(&self) -> ToolSchema {

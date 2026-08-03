@@ -809,6 +809,75 @@ impl SseReader {
     }
 }
 
+/// Whether a content lane (text or thinking) currently has an open part.
+///
+/// Gemini interleaves regular text parts and reasoning (`thought: true`)
+/// parts within a single chunk's `parts[]` array. [`StreamEmitter`] opens a
+/// part for each lane with a [`PartStart`](StreamEvent::PartStart) on its
+/// first non-empty fragment and closes it with a
+/// [`PartStop`](StreamEvent::PartStop) when the lane switches or the stream
+/// finishes. The two lanes are mutually exclusive — switching emits a
+/// `PartStop` for the active lane first — so this enum tracks each lane's
+/// open/closed state without a bare `bool`.
+#[derive(Default)]
+enum PartLane {
+    /// No part is open for this lane.
+    ///
+    /// The default state before the stream delivers any content for the
+    /// lane, and the state it returns to once a part has been closed.
+    #[default]
+    Closed,
+
+    /// A part is open and accumulating deltas.
+    ///
+    /// Set when the first non-empty fragment opens the lane; cleared when
+    /// [`extract_finish_reason`](StreamEmitter::extract_finish_reason) or a
+    /// lane switch emits the matching
+    /// [`PartStop`](StreamEvent::PartStop).
+    Open,
+}
+
+/// How far the stream has progressed through its terminal sequence.
+///
+/// A Gemini stream has two independent terminal transitions:
+/// [`extract_finish_reason`](StreamEmitter::extract_finish_reason) processes a
+/// `finishReason` chunk (emitting a [`MessageDelta`](StreamEvent::MessageDelta)
+/// and closing any open parts), and [`finish`](StreamEmitter::finish) appends
+/// the synthetic [`MessageStop`](StreamEvent::MessageStop). Either may occur
+/// first — a `finishReason` chunk may arrive before stream end, and `finish`
+/// is always called at stream end — and each must fire exactly once. Because
+/// the two are independent, this enum encodes all four combinations rather
+/// than a single linear progression, advancing to [`Terminal`](Self::Terminal)
+/// only once both are complete.
+#[derive(Default)]
+enum TerminalStage {
+    /// Neither transition has run yet.
+    ///
+    /// The default state at the start of a stream.
+    #[default]
+    Pending,
+
+    /// [`finish`](StreamEmitter::finish) has emitted the synthetic
+    /// [`MessageStop`](StreamEvent::MessageStop).
+    ///
+    /// Subsequent `finish` calls are no-ops.
+    StopEmitted,
+
+    /// A `finishReason` chunk has been fully processed.
+    ///
+    /// Subsequent `finishReason` chunks (e.g. from proxies that re-emit)
+    /// are no-ops.
+    FinishReasonSeen,
+    
+    /// Both transitions are complete.
+    ///
+    /// The only state from which no further terminal work is possible;
+    /// reached from either [`StopEmitted`](Self::StopEmitted) or
+    /// [`FinishReasonSeen`](Self::FinishReasonSeen) once the other
+    /// transition fires.
+    Terminal,
+}
+
 /// Stateful translator that converts Gemini SSE chunks into
 /// [`StreamEvent`]s.
 ///
@@ -819,7 +888,6 @@ impl SseReader {
 /// with regular parts in the same `parts[]` array, flagged by a
 /// `thought: true` boolean on each thought part.
 #[derive(Default)]
-#[allow(clippy::struct_excessive_bools)]
 struct StreamEmitter {
     /// Whether [`StreamEvent::MessageStart`] has been emitted for the
     /// current stream.
@@ -836,7 +904,7 @@ struct StreamEmitter {
     /// first non-empty text fragment and tracks the open state so
     /// [`extract_finish_reason`](Self::extract_finish_reason) emits exactly
     /// one [`StreamEvent::PartStop`] to close it.
-    text_part_open: bool,
+    text: PartLane,
 
     /// Whether the reasoning (thinking) content part is currently open.
     ///
@@ -844,11 +912,8 @@ struct StreamEmitter {
     /// opens a thinking part on the first non-empty thought fragment and
     /// closes it in [`extract_finish_reason`](Self::extract_finish_reason),
     /// symmetric to the text lane.
-    thinking_part_open: bool,
+    thinking: PartLane,
 
-    /// Whether a tool-call part is currently open.
-    ///
-    /// Each `functionCall` part emits a [`PartStart`]. Without tracking,
     /// Next tool-call index for multiple function calls in one response.
     ///
     /// Gemini can emit several `functionCall` parts in a single chunk.
@@ -856,19 +921,15 @@ struct StreamEmitter {
     /// accumulator can distinguish them.
     next_tool_index: usize,
 
-    /// Whether the terminal stop signal has been processed.
+    /// How far the stream has progressed through its terminal sequence.
     ///
-    /// Set by [`finish`](Self::finish) when it appends the synthetic
-    /// [`StreamEvent::MessageStop`]. Guards against emitting a second
-    /// `MessageStop` if `finish` is called again after the stream ends.
-    message_stop_emitted: bool,
-
-    /// Whether `finishReason` has already been processed.
-    ///
-    /// Guards against a second `finishReason` chunk (e.g. from proxies that
-    /// re-emit). Distinct from `message_stop_emitted` — the finish-reason
-    /// processing and the terminal `MessageStop` synthesis are independent.
-    finish_reason_processed: bool,
+    /// Tracks two independent transitions — `finishReason` processing (by
+    /// [`extract_finish_reason`](Self::extract_finish_reason)) and the
+    /// synthetic [`StreamEvent::MessageStop`] emission (by
+    /// [`finish`](Self::finish)) — as a single field. The two are
+    /// independent: a `finishReason` chunk may arrive before or after
+    /// `MessageStop`, and each must fire exactly once.
+    terminal: TerminalStage,
 
     /// Buffered [`StreamEvent`]s waiting to be yielded to the consumer.
     ///
@@ -941,12 +1002,12 @@ impl StreamEmitter {
                 .unwrap_or(false);
 
             if is_thought {
-                if self.text_part_open {
-                    self.text_part_open = false;
+                if matches!(self.text, PartLane::Open) {
+                    self.text = PartLane::Closed;
                     self.push(StreamEvent::PartStop);
                 }
-                if !self.thinking_part_open {
-                    self.thinking_part_open = true;
+                if matches!(self.thinking, PartLane::Closed) {
+                    self.thinking = PartLane::Open;
                     self.push(StreamEvent::PartStart(PartStart {
                         index: THINKING_PART_INDEX,
                         part: None,
@@ -959,12 +1020,12 @@ impl StreamEmitter {
                     },
                 }));
             } else {
-                if self.thinking_part_open {
-                    self.thinking_part_open = false;
+                if matches!(self.thinking, PartLane::Open) {
+                    self.thinking = PartLane::Closed;
                     self.push(StreamEvent::PartStop);
                 }
-                if !self.text_part_open {
-                    self.text_part_open = true;
+                if matches!(self.text, PartLane::Closed) {
+                    self.text = PartLane::Open;
                     self.push(StreamEvent::PartStart(PartStart {
                         index: TEXT_PART_INDEX,
                         part: Some(MessagePart::text("")),
@@ -1003,12 +1064,12 @@ impl StreamEmitter {
         let args = func_call.pointer("/args").cloned().unwrap_or(Value::Null);
         let args_str = serde_json::to_string(&args).unwrap_or_default();
 
-        if self.thinking_part_open {
-            self.thinking_part_open = false;
+        if matches!(self.thinking, PartLane::Open) {
+            self.thinking = PartLane::Closed;
             self.push(StreamEvent::PartStop);
         }
-        if self.text_part_open {
-            self.text_part_open = false;
+        if matches!(self.text, PartLane::Open) {
+            self.text = PartLane::Closed;
             self.push(StreamEvent::PartStop);
         }
 
@@ -1039,9 +1100,12 @@ impl StreamEmitter {
     /// [`PartStop`](StreamEvent::PartStop), then emits a
     /// [`MessageDelta`](StreamEvent::MessageDelta) carrying the mapped
     /// [`StreamStopReason`]. No-op on a second `finishReason` chunk (the
-    /// `finish_reason_processed` guard defends against proxies/gateways that re-emit).
+    /// `terminal` stage guards against proxies/gateways that re-emit).
     fn extract_finish_reason(&mut self, json: &Value) {
-        if self.finish_reason_processed {
+        if matches!(
+            self.terminal,
+            TerminalStage::FinishReasonSeen | TerminalStage::Terminal
+        ) {
             return;
         }
         let Some(reason) = json
@@ -1050,19 +1114,22 @@ impl StreamEmitter {
         else {
             return;
         };
-        self.finish_reason_processed = true;
+        self.terminal = match self.terminal {
+            TerminalStage::StopEmitted => TerminalStage::Terminal,
+            _ => TerminalStage::FinishReasonSeen,
+        };
         let stop = match reason {
             "MAX_TOKENS" => StreamStopReason::MaxTokens,
             _ => StreamStopReason::EndTurn,
         };
 
-        if self.thinking_part_open {
-            self.thinking_part_open = false;
+        if matches!(self.thinking, PartLane::Open) {
+            self.thinking = PartLane::Closed;
             self.push(StreamEvent::PartStop);
         }
 
-        if self.text_part_open {
-            self.text_part_open = false;
+        if matches!(self.text, PartLane::Open) {
+            self.text = PartLane::Closed;
             self.push(StreamEvent::PartStop);
         }
 
@@ -1113,11 +1180,18 @@ impl StreamEmitter {
     ///
     /// Drains any remaining pending events and appends the stop event.
     /// Safe to call exactly once at the end of the stream; subsequent calls
-    /// return an empty vec (the `message_stop_emitted` flag guards against double-stop).
+    /// return an empty vec (the `terminal` stage guards against double-stop).
     fn finish(&mut self) -> Vec<StreamEvent> {
         let mut out = self.drain();
-        if self.started && !self.message_stop_emitted {
-            self.message_stop_emitted = true;
+        let stop_pending = matches!(
+            self.terminal,
+            TerminalStage::Pending | TerminalStage::FinishReasonSeen
+        );
+        if self.started && stop_pending {
+            self.terminal = match self.terminal {
+                TerminalStage::FinishReasonSeen => TerminalStage::Terminal,
+                _ => TerminalStage::StopEmitted,
+            };
             out.push(StreamEvent::MessageStop);
         }
         out
@@ -1138,6 +1212,19 @@ impl StreamEmitter {
 mod tests {
     use super::*;
     use crate::message::{Message, MessagePart, Role, ToolContent};
+
+    #[test]
+    fn gemini_terminal_stage_starts_pending() {
+        let em = StreamEmitter::default();
+        assert!(
+            matches!(em.terminal, TerminalStage::Pending),
+            "terminal stage must start pending"
+        );
+        assert!(
+            matches!(em.text, PartLane::Closed) && matches!(em.thinking, PartLane::Closed),
+            "both content lanes must start closed"
+        );
+    }
 
     #[test]
     fn request_body_user_text() {
@@ -2045,7 +2132,7 @@ mod tests {
     fn emitter_finish_emits_message_stop_if_needed() {
         let mut em = StreamEmitter::default();
         em.started = true;
-        em.message_stop_emitted = false;
+        em.terminal = TerminalStage::Pending;
 
         let events = em.finish();
         assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop)));
@@ -2055,7 +2142,7 @@ mod tests {
     fn emitter_finish_noop_if_already_stopped() {
         let mut em = StreamEmitter::default();
         em.started = true;
-        em.message_stop_emitted = true;
+        em.terminal = TerminalStage::StopEmitted;
 
         let events = em.finish();
         assert!(events.is_empty());
@@ -2063,7 +2150,7 @@ mod tests {
 
     #[test]
     fn emitter_finish_reason_does_not_suppress_message_stop() {
-        // Regression: extract_finish_reason sets finish_reason_processed,
+        // Regression: extract_finish_reason advances the terminal stage,
         // but finish() must still emit MessageStop. Previously both used the
         // same `finished` flag, causing finish() to skip MessageStop after
         // a finishReason chunk.
@@ -2073,11 +2160,52 @@ mod tests {
             "candidates": [{"finishReason": "STOP"}]
         }));
         em.drain();
-        assert!(em.finish_reason_processed);
+        assert!(matches!(em.terminal, TerminalStage::FinishReasonSeen));
         let events = em.finish();
         assert!(
             events.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
             "MessageStop must be emitted even after finishReason was processed"
+        );
+    }
+
+    #[test]
+    fn emitter_finish_reason_after_finish_advances_to_terminal() {
+        // A finishReason arriving after finish() still emits its own
+        // MessageDelta, but a *second* such chunk must be a no-op once the
+        // terminal stage reaches Terminal.
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        let stop_events = em.finish();
+        assert!(
+            stop_events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::MessageStop)),
+            "first finish must emit MessageStop"
+        );
+        assert!(matches!(em.terminal, TerminalStage::StopEmitted));
+
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        assert!(
+            matches!(em.terminal, TerminalStage::Terminal),
+            "late finishReason after finish must advance to Terminal"
+        );
+        let late_events = em.drain();
+        assert!(
+            late_events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::MessageDelta(_))),
+            "the first late finishReason still emits its MessageDelta"
+        );
+
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let duplicate_events = em.drain();
+        assert!(
+            duplicate_events.is_empty(),
+            "a second late finishReason must be a no-op once Terminal is reached"
         );
     }
 

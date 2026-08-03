@@ -106,6 +106,18 @@ mod message;
 #[cfg(feature = "streaming")]
 mod stream;
 
+/// Shared callback invoked once per text delta during streaming.
+///
+/// A clonable, thread-safe closure stored in [`BareLoop`] via
+/// [`set_text_streamer`](BareLoop::set_text_streamer) and invoked from the
+/// streaming engine path on every [`IndexedDelta`](crate::stream::IndexedDelta)
+/// whose payload is [`Text`](crate::stream::DeltaPart::Text). The bounds
+/// mirror the requirements of that path: `Send + Sync` because the engine may
+/// dispatch deltas from an async task, and `Arc` so the same callback can be
+/// shared across the engine and any observer without copying the closure.
+#[cfg(feature = "streaming")]
+type TextStreamer = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// How the engine fulfils each LLM turn.
 ///
 /// `BareLoop` drives every turn by asking the [`ApiClient`] for a response
@@ -293,8 +305,7 @@ pub struct BareLoop<C: ApiClient> {
     /// a `Text` payload, enabling real-time token display. Only read by
     /// the streaming engine path; absent under `default = []`.
     #[cfg(feature = "streaming")]
-    #[allow(clippy::type_complexity)]
-    text_streamer: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    text_streamer: Option<TextStreamer>,
 
     /// Turn-boundary context contributors.
     ///
@@ -971,7 +982,7 @@ impl<C: ApiClient> BareLoop<C> {
     ///     buf.lock().unwrap_or_else(|e| e.into_inner()).push_str(delta);
     /// }));
     /// ```
-    pub fn set_text_streamer(&mut self, f: Arc<dyn Fn(&str) + Send + Sync>) {
+    pub fn set_text_streamer(&mut self, f: TextStreamer) {
         self.debug_assert_idle();
         self.text_streamer = Some(f);
     }
@@ -1173,7 +1184,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// mirror of [`set_text_streamer`](BareLoop::set_text_streamer).
     #[cfg(feature = "streaming")]
     #[must_use]
-    pub fn with_text_streamer(mut self, f: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+    pub fn with_text_streamer(mut self, f: TextStreamer) -> Self {
         self.set_text_streamer(f);
         self
     }
@@ -2146,6 +2157,15 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use std::sync::Mutex;
+
+    #[cfg(feature = "streaming")]
+    #[test]
+    fn text_streamer_alias_compiles_unchanged() {
+        let client = MockClient::new("test-model");
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+        agent.set_text_streamer(Arc::new(|_| ()));
+        assert!(agent.text_streamer.is_some());
+    }
 
     /// Fold queued [`StreamEvent`]s into a [`NonStreamingResponse`].
     ///

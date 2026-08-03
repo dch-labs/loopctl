@@ -796,7 +796,6 @@ impl ConvergenceDetector {
     /// intersection size to union size.
     ///
     /// Returns `0.0` if either input is empty.
-    #[allow(clippy::cast_precision_loss)]
     #[must_use]
     pub fn compute_similarity(a: &str, b: &str) -> f32 {
         if a.is_empty() || b.is_empty() {
@@ -817,11 +816,7 @@ impl ConvergenceDetector {
         let intersection = a_words.intersection(&b_words).count();
         let union = a_words.union(&b_words).count();
 
-        if union == 0 {
-            return 0.0;
-        }
-
-        intersection as f32 / union as f32
+        crate::numeric::unit_ratio(intersection, union)
     }
 
     fn normalize_text(text: &str) -> String {
@@ -854,6 +849,14 @@ impl Default for ConvergenceDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_similarity_result_unchanged_after_cast_fix() {
+        let identical = ConvergenceDetector::compute_similarity("abc", "abc");
+        let disjoint = ConvergenceDetector::compute_similarity("abc", "xyz");
+        assert!((identical - 1.0).abs() < f32::EPSILON);
+        assert!(disjoint.abs() < f32::EPSILON);
+    }
 
     #[test]
     fn test_convergence_detection() {

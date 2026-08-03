@@ -288,6 +288,12 @@ impl ToolStats {
     ///
     /// Returns 1.0 when no calls have been recorded (new tools start
     /// optimistic).
+    ///
+    /// The ratio is computed as `(successes * EWMA_SCALE) / total / EWMA_SCALE`
+    /// rather than `successes / total` directly so the intermediate result
+    /// keeps six digits of integer precision before the final narrowing to
+    /// `f64` — small success rates over very large call counts would otherwise
+    /// floor to zero in pure integer arithmetic.
     #[must_use]
     pub fn success_rate(&self) -> f64 {
         let total = self.total_calls.load(Ordering::Relaxed);
@@ -295,15 +301,11 @@ impl ToolStats {
             return 1.0;
         }
         let successes = self.success_count.load(Ordering::Relaxed);
-        // Compute `successes * EWMA_SCALE / total` entirely in integers.
-        // `successes <= total`, so the result is in `[0, EWMA_SCALE]` (i.e. fits in u32).
         let rate = successes
             .saturating_mul(EWMA_SCALE)
             .checked_div(total)
             .unwrap_or(0);
-        // Result is in `[0, EWMA_SCALE]` (≤ 1_000_000), so `u32` is safe.
-        f64::from(u32::try_from(rate).unwrap_or(u32::MAX))
-            / f64::from(u32::try_from(EWMA_SCALE).unwrap_or(u32::MAX))
+        crate::numeric::unit_ratio(rate, EWMA_SCALE)
     }
 
     /// Composite health score (0.0–1.0) blending success rate with EWMA.
@@ -318,9 +320,7 @@ impl ToolStats {
     #[must_use]
     pub fn health_score(&self) -> f64 {
         let v = self.ewma_success.load(Ordering::Relaxed).min(EWMA_SCALE);
-        // `v` is clamped to `EWMA_SCALE` (1_000_000), so `u32` is safe.
-        let ewma = f64::from(u32::try_from(v).unwrap_or(u32::MAX))
-            / f64::from(u32::try_from(EWMA_SCALE).unwrap_or(u32::MAX));
+        let ewma = crate::numeric::unit_ratio(v, EWMA_SCALE);
         0.3 * self.success_rate() + 0.7 * ewma
     }
 

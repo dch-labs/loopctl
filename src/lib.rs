@@ -78,6 +78,7 @@ pub mod managers;
 pub mod memory;
 pub mod message;
 pub mod middleware;
+pub(crate) mod numeric;
 pub mod observer;
 pub mod presets;
 #[cfg(feature = "providers")]

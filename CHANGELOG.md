@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- Restored the no-`#[allow(clippy::*)]` lint contract. Fixed: a private `TextStreamer` type alias, lossless integer-to-float casts (centralized in an internal `numeric` module), `PartLane`/`TerminalStage` lane enums replacing bool fields, and stale-allow deletions. No public API change.
+
 ## [0.2.0] - 2026-08-02
 
 ### Added

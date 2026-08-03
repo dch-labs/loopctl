@@ -254,10 +254,9 @@ impl LoopMemory for InMemoryStore {
                         .filter(|w| memory_lower.contains(*w))
                         .count();
                     let base_score = entry.relevance;
+                    let denom = query_words.len().max(1);
                     let query_bonus = if word_matches > 0 {
-                        let denom = u16::try_from(query_words.len().max(1)).unwrap_or(u16::MAX);
-                        let matches_f = f32::from(u16::try_from(word_matches).unwrap_or(u16::MAX));
-                        matches_f / f32::from(denom)
+                        crate::numeric::unit_ratio_f32(word_matches, denom)
                     } else {
                         0.0
                     };
@@ -507,6 +506,26 @@ mod tests {
         assert!((results[0].relevance - 0.95).abs() < 1e-6);
         assert!((results[1].relevance - 0.5).abs() < 1e-6);
         assert!((results[2].relevance - 0.1).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn retrieve_ranks_more_word_matches_higher_at_equal_relevance() {
+        let store = InMemoryStore::new();
+
+        let mut one_match = MemoryEntry::new(MemoryCategory::Fact, "alpha only");
+        one_match.relevance = 0.5;
+        let mut many_matches = MemoryEntry::new(MemoryCategory::Fact, "alpha beta gamma");
+        many_matches.relevance = 0.5;
+
+        store.store(one_match).await.unwrap();
+        store.store(many_matches).await.unwrap();
+
+        let results = store.retrieve("alpha beta gamma", 2).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[0].memory.contains("alpha beta gamma"),
+            "the entry matching more query words must rank higher at equal relevance"
+        );
     }
 
     #[tokio::test]

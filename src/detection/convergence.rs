@@ -816,13 +816,7 @@ impl ConvergenceDetector {
         let intersection = a_words.intersection(&b_words).count();
         let union = a_words.union(&b_words).count();
 
-        if union == 0 {
-            return 0.0;
-        }
-
-        let intersection_f = f32::from(u16::try_from(intersection).unwrap_or(u16::MAX));
-        let union_f = f32::from(u16::try_from(union).unwrap_or(u16::MAX));
-        intersection_f / union_f
+        crate::numeric::unit_ratio_f32(intersection, union)
     }
 
     fn normalize_text(text: &str) -> String {

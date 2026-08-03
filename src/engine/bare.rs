@@ -115,6 +115,7 @@ mod stream;
 /// mirror the requirements of that path: `Send + Sync` because the engine may
 /// dispatch deltas from an async task, and `Arc` so the same callback can be
 /// shared across the engine and any observer without copying the closure.
+#[cfg(feature = "streaming")]
 type TextStreamer = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// How the engine fulfils each LLM turn.

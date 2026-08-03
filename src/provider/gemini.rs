@@ -1940,6 +1940,10 @@ mod tests {
         }));
         let events = em.drain();
         assert!(events.iter().any(|e| matches!(e, StreamEvent::PartStop)));
+        assert!(
+            matches!(em.text, PartLane::Closed),
+            "extract_finish_reason must close the text lane in state, not just emit PartStop"
+        );
         let md = events
             .iter()
             .find(|e| matches!(e, StreamEvent::MessageDelta(_)));

@@ -1437,10 +1437,12 @@ impl StreamEmitter {
         self.finished = true;
 
         if matches!(self.text, PartLane::Open) {
+            self.text = PartLane::Closed;
             self.push(StreamEvent::PartStop);
         }
 
         if matches!(self.thinking, PartLane::Open) {
+            self.thinking = PartLane::Closed;
             self.push(StreamEvent::PartStop);
         }
 
@@ -2230,6 +2232,42 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, StreamEvent::MessageDelta(_)))
+        );
+    }
+
+    #[test]
+    fn emitter_finish_closes_lanes_so_late_delta_reopens() {
+        let mut em = StreamEmitter::default();
+
+        let text_chunk = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&text_chunk);
+        em.drain();
+
+        let finish = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&finish);
+        em.drain();
+        assert!(
+            matches!(em.text, PartLane::Closed),
+            "process_finish must close the text lane"
+        );
+
+        let late_delta = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"more"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&late_delta);
+        let events = em.drain();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::PartStart(_))),
+            "a delta after finish must re-open the text lane with PartStart"
         );
     }
 

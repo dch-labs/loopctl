@@ -301,9 +301,7 @@ impl ToolStats {
             .saturating_mul(EWMA_SCALE)
             .checked_div(total)
             .unwrap_or(0);
-        // Result is in `[0, EWMA_SCALE]` (≤ 1_000_000), so `u32` is safe.
-        f64::from(u32::try_from(rate).unwrap_or(u32::MAX))
-            / f64::from(u32::try_from(EWMA_SCALE).unwrap_or(u32::MAX))
+        crate::numeric::unit_ratio_f64(rate, EWMA_SCALE)
     }
 
     /// Composite health score (0.0–1.0) blending success rate with EWMA.
@@ -318,9 +316,7 @@ impl ToolStats {
     #[must_use]
     pub fn health_score(&self) -> f64 {
         let v = self.ewma_success.load(Ordering::Relaxed).min(EWMA_SCALE);
-        // `v` is clamped to `EWMA_SCALE` (1_000_000), so `u32` is safe.
-        let ewma = f64::from(u32::try_from(v).unwrap_or(u32::MAX))
-            / f64::from(u32::try_from(EWMA_SCALE).unwrap_or(u32::MAX));
+        let ewma = crate::numeric::unit_ratio_f64(v, EWMA_SCALE);
         0.3 * self.success_rate() + 0.7 * ewma
     }
 

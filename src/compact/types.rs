@@ -378,8 +378,7 @@ impl ContextOverflow {
         if self.context_window == 0 {
             return f64::INFINITY;
         }
-        f64::from(u32::try_from(self.tokens_used).unwrap_or(u32::MAX))
-            / f64::from(u32::try_from(self.context_window).unwrap_or(u32::MAX))
+        crate::numeric::unit_ratio_f64(self.tokens_used, self.context_window)
     }
 }
 

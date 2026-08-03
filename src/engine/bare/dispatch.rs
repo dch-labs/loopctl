@@ -905,6 +905,7 @@ mod tests {
     use crate::engine::core::ToolCall;
     use crate::engine::{Run, RunConfig};
     use crate::message::ToolContent;
+    use crate::reflection::{FailureAnalysis, FailureSeverity};
     use crate::tool::{
         Tool, ToolContext, ToolError, ToolOutput, ToolSchema, registry::ToolRegistry,
     };
@@ -917,6 +918,37 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    /// Reflector that marks every failure recoverable, used by the recovery tests.
+    struct AlwaysRecoverable;
+    impl crate::reflection::Reflector for AlwaysRecoverable {
+        fn analyze(
+            &self,
+            error: &str,
+            tool_name: &str,
+            _tool_input: &Value,
+            _tool_schema: Option<&crate::tool::ToolSchema>,
+            _context: &crate::reflection::ReflectionContext,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<FailureAnalysis, crate::reflection::ReflectionError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let error = error.to_string();
+            let tool_name = tool_name.to_string();
+            Box::pin(async move {
+                Ok(FailureAnalysis {
+                    is_recoverable: true,
+                    root_cause: error,
+                    severity: FailureSeverity::Medium,
+                    correction: None,
+                    context: format!("tool: {tool_name}"),
+                })
+            })
+        }
+    }
 
     #[test]
     fn truncate_to_short_string_unchanged() {
@@ -1398,39 +1430,7 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_backoff_cancelled_promptly() {
-        use crate::reflection::{
-            FailureAnalysis, FailureSeverity, RecoveryAction, RecoveryStrategy,
-        };
-
-        struct AlwaysRecoverable;
-        impl crate::reflection::Reflector for AlwaysRecoverable {
-            fn analyze(
-                &self,
-                error: &str,
-                tool_name: &str,
-                _tool_input: &Value,
-                _tool_schema: Option<&crate::tool::ToolSchema>,
-                _context: &crate::reflection::ReflectionContext,
-            ) -> Pin<
-                Box<
-                    dyn Future<Output = Result<FailureAnalysis, crate::reflection::ReflectionError>>
-                        + Send
-                        + '_,
-                >,
-            > {
-                let error = error.to_string();
-                let tool_name = tool_name.to_string();
-                Box::pin(async move {
-                    Ok(FailureAnalysis {
-                        is_recoverable: true,
-                        root_cause: error,
-                        severity: FailureSeverity::Medium,
-                        correction: None,
-                        context: format!("tool: {tool_name}"),
-                    })
-                })
-            }
-        }
+        use crate::reflection::{FailureAnalysis, RecoveryAction, RecoveryStrategy};
 
         struct SlowRetry;
         impl RecoveryStrategy for SlowRetry {
@@ -1492,40 +1492,8 @@ mod tests {
         // re-introducing per-mode gating that the contract explicitly disclaims
         // (all side-effect targets are Send + Sync).
         use crate::observer::{LoopObserver, ToolPostContext, ToolPreContext};
-        use crate::reflection::{
-            FailureAnalysis, FailureSeverity, RecoveryAction, RecoveryStrategy,
-        };
+        use crate::reflection::{FailureAnalysis, RecoveryAction, RecoveryStrategy};
         use std::sync::atomic::{AtomicU32, Ordering};
-
-        struct AlwaysRecoverable;
-        impl crate::reflection::Reflector for AlwaysRecoverable {
-            fn analyze(
-                &self,
-                error: &str,
-                tool_name: &str,
-                _tool_input: &Value,
-                _tool_schema: Option<&crate::tool::ToolSchema>,
-                _context: &crate::reflection::ReflectionContext,
-            ) -> Pin<
-                Box<
-                    dyn Future<Output = Result<FailureAnalysis, crate::reflection::ReflectionError>>
-                        + Send
-                        + '_,
-                >,
-            > {
-                let error = error.to_string();
-                let tool_name = tool_name.to_string();
-                Box::pin(async move {
-                    Ok(FailureAnalysis {
-                        is_recoverable: true,
-                        root_cause: error,
-                        severity: FailureSeverity::Medium,
-                        correction: None,
-                        context: format!("tool: {tool_name}"),
-                    })
-                })
-            }
-        }
 
         // Retry the first two attempts, then give up with a soft error so the
         // call terminates. Each attempt is a full dispatch with PRE+POST.
@@ -1587,13 +1555,20 @@ mod tests {
         }));
 
         let calls = vec![make_call("1", "error_tool", Value::Null)];
-        let _ = bare.dispatch_tools(&calls, 0).await.ok();
+        let _ = bare
+            .dispatch_tools(&calls, 0)
+            .await
+            .expect("dispatch should not hard-error");
 
         let pres = pre_count.load(Ordering::Relaxed);
         let posts = post_count.load(Ordering::Relaxed);
-        assert!(
-            pres >= 2 && posts >= 2,
-            "parallel retried call must fire side-effects per attempt; got pre={pres} post={posts}"
+        assert_eq!(
+            pres, 3,
+            "RetryTwice does 2 retries + 1 final skip = 3 attempts = 3 PRE events; got {pres}"
+        );
+        assert_eq!(
+            posts, 3,
+            "matching 3 POST events for the 3 attempts; got {posts}"
         );
         assert_eq!(
             pres, posts,
@@ -1603,40 +1578,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_tool_call_runs_recovery_on_failure() {
-        use crate::reflection::{
-            FailureAnalysis, FailureSeverity, RecoveryAction, RecoveryStrategy,
-        };
+        use crate::reflection::{FailureAnalysis, RecoveryAction, RecoveryStrategy};
         use std::sync::atomic::{AtomicU32, Ordering};
-
-        struct AlwaysRecoverable;
-        impl crate::reflection::Reflector for AlwaysRecoverable {
-            fn analyze(
-                &self,
-                error: &str,
-                tool_name: &str,
-                _tool_input: &Value,
-                _tool_schema: Option<&crate::tool::ToolSchema>,
-                _context: &crate::reflection::ReflectionContext,
-            ) -> Pin<
-                Box<
-                    dyn Future<Output = Result<FailureAnalysis, crate::reflection::ReflectionError>>
-                        + Send
-                        + '_,
-                >,
-            > {
-                let error = error.to_string();
-                let tool_name = tool_name.to_string();
-                Box::pin(async move {
-                    Ok(FailureAnalysis {
-                        is_recoverable: true,
-                        root_cause: error,
-                        severity: FailureSeverity::Medium,
-                        correction: None,
-                        context: format!("tool: {tool_name}"),
-                    })
-                })
-            }
-        }
 
         struct CountingRetry {
             calls: Arc<AtomicU32>,

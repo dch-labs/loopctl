@@ -182,7 +182,7 @@ pub struct NonStreamingResponse {
 ///
 ///     fn stream_messages(
 ///         &self,
-///         request: StreamRequest,
+///         request: &StreamRequest,
 ///     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
 ///         // Clone data from &self, then build and return a stream
 ///         let model = self.model.clone();
@@ -193,7 +193,7 @@ pub struct NonStreamingResponse {
 ///
 ///     fn create_message(
 ///         &self,
-///         request: StreamRequest,
+///         request: &StreamRequest,
 ///     ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>> {
 ///         // Non-streaming fallback
 ///         todo!()

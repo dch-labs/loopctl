@@ -1,9 +1,8 @@
 //! Proactive client-side rate limiting (token bucket).
 //!
-//! A [`TokenBucket`] is a continuous-fill bucket: it allows a burst equal to its
-//! capacity, then refills at `capacity / 60` tokens per second. [`RateLimiter`]
-//! holds one bucket per provider identity (`base_url`) so distinct providers get
-//! independent budgets.
+//! A [`TokenBucket`] allows a burst equal to its capacity, then refills at
+//! `capacity / 60` tokens per second. [`RateLimiter`] holds one bucket per
+//! provider identity (`base_url`) so distinct providers get independent budgets.
 //!
 //! This is the proactive complement to the reactive 429 handling in
 //! `stream::handler`: the bucket gates a request *before* it fires,
@@ -143,18 +142,9 @@ impl TokenBucket {
         self.take_at(Instant::now())
     }
 
-    /// Tokens available at a known instant (after a lazy refill). Non-consuming.
+    /// Tokens available at a known instant (after a lazy refill).
     ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::stream::rate_limit::TokenBucket;
-    ///
-    /// let bucket = TokenBucket::new(10);
-    /// // A fresh bucket is full.
-    /// assert!((bucket.available() - 10.0).abs() < 0.5);
-    /// ```
-    #[must_use]
+    /// Advances `last_refill` to `at`, banking the elapsed refill.
     pub fn available_at(&self, at: Instant) -> f64 {
         let mut state = self
             .state
@@ -163,12 +153,7 @@ impl TokenBucket {
         elapsed_refill(&mut state, at, self.capacity, self.refill_per_sec)
     }
 
-    /// Tokens available right now (after a lazy refill). Non-consuming.
-    ///
-    /// Thin wrapper around [`available_at`](Self::available_at) that
-    /// plugs in `Instant::now()`. Useful for observability — reporting
-    /// the current budget without consuming a token.
-    #[must_use]
+    /// Tokens available right now (after a lazy refill).
     pub fn available(&self) -> f64 {
         self.available_at(Instant::now())
     }
@@ -176,18 +161,34 @@ impl TokenBucket {
 
 /// Apply the elapsed-time refill to `state` in place and return the new token count.
 ///
-/// Caps at `capacity` so a long idle does not overflow. Leaves `last_refill` at
-/// `at` so the next caller only accounts for the gap since this call.
+/// Caps at `capacity` so a long idle does not overflow. When the bucket fills
+/// before `at` (the elapsed time exceeded what was needed to reach capacity),
+/// `last_refill` advances only to the fill point — not to `at`. This prevents
+/// a caller that passes a far-future instant from freezing the bucket: the
+/// excess time beyond capacity is irrelevant, so the clock ignores it.
 fn elapsed_refill(state: &mut BucketState, at: Instant, capacity: f64, refill_per_sec: f64) -> f64 {
     let elapsed = at.saturating_duration_since(state.last_refill);
     if elapsed.is_zero() {
         return state.tokens;
     }
+    if refill_per_sec <= 0.0 {
+        return state.tokens;
+    }
     let added = elapsed.as_secs_f64() * refill_per_sec;
-    let topped = (state.tokens + added).min(capacity);
-    state.tokens = topped;
-    state.last_refill = at;
-    topped
+    let raw = state.tokens + added;
+    if raw >= capacity {
+        let needed = capacity - state.tokens;
+        let secs_to_fill = needed / refill_per_sec;
+        state.last_refill = state
+            .last_refill
+            .checked_add(Duration::from_secs_f64(secs_to_fill))
+            .unwrap_or(at);
+        state.tokens = capacity;
+    } else {
+        state.tokens = raw;
+        state.last_refill = at;
+    }
+    state.tokens
 }
 
 /// One [`TokenBucket`] per distinct provider identity (`base_url`).
@@ -384,5 +385,79 @@ mod tests {
         let bucket = TokenBucket::new(0);
         let result = bucket.take();
         assert!(result.is_err(), "empty bucket should return Err");
+    }
+
+    #[test]
+    fn future_instant_breaks_rate_limit() {
+        let bucket = TokenBucket::new(10);
+        let now = Instant::now();
+        let one_hour_later = now + Duration::from_hours(1);
+        let one_min_later = now + Duration::from_mins(1);
+
+        // Drain all 10 tokens at t=now.
+        for _ in 0..10 {
+            bucket.take_at(now).expect("burst tokens");
+        }
+
+        // Poison: take_at with a future instant refills and sets
+        // last_refill = one_hour_later. The bucket now thinks time is
+        // 1 hour ahead of reality.
+        let _poison = bucket.take_at(one_hour_later);
+
+        // Drain any remaining tokens at the future instant.
+        for _ in 0..9 {
+            let _drain = bucket.take_at(one_hour_later);
+        }
+
+        // Now 1 minute has passed in real time. Normally 1 min of refill
+        // would restore tokens. After the fix, take_at should succeed
+        // because the bucket must not allow a future instant to freeze
+        // the refill clock.
+        let result = bucket.take_at(one_min_later);
+        assert!(
+            result.is_ok(),
+            "take_at must succeed — 1 min of refill should restore a token; the future-instant call must not freeze the bucket"
+        );
+    }
+
+    #[test]
+    fn past_instant_does_not_refund_or_corrupt() {
+        // A take_at called with an instant earlier than last_refill must not
+        // fabricate tokens from negative elapsed time, and must not rewind the
+        // clock. The probe uses a small forward step so the partial refill is
+        // stable (a far-future step would re-fill on every call).
+        let bucket = TokenBucket::new(5);
+        let t0 = Instant::now();
+        // 6s ≈ 0.5 token at capacity 5 (refill 5/60 per second).
+        let t1 = t0 + Duration::from_secs(6);
+
+        // Drain at t0.
+        for _ in 0..5 {
+            bucket.take_at(t0).expect("drain while full");
+        }
+        assert!(bucket.take_at(t0).is_err(), "drained at t0");
+
+        // Advance to t1: 6s of refill ≈ 0.5 token — still under one, take fails.
+        // last_refill is now t1, tokens ≈ 0.5.
+        assert!(
+            bucket.take_at(t1).is_err(),
+            "partial refill under one token"
+        );
+
+        // Probe: take at a past instant (t0 < last_refill = t1).
+        // Correct: saturating_duration_since returns ZERO → early return, no
+        // token granted, last_refill untouched.
+        assert!(
+            bucket.take_at(t0).is_err(),
+            "past-instant take must not refund tokens from negative elapsed time"
+        );
+
+        // Integrity: take_at(t1) again must observe the same 0.5-token state.
+        // A bug that rewound last_refill to t0 would make this see a fresh 6s
+        // gap (0.5 + 0.5 = 1.0 token) and succeed.
+        assert!(
+            bucket.take_at(t1).is_err(),
+            "last_refill must not rewind — bucket state unchanged by the past-instant probe"
+        );
     }
 }

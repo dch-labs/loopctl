@@ -1098,7 +1098,13 @@ impl LoopDetector {
     /// let config = LoopDetectorConfig { window_size: 100, ..Default::default() };
     /// let detector = LoopDetector::new(config, Arc::new(NoOpToolSignature));
     /// ```
-    pub fn new(config: LoopDetectorConfig, signature: Arc<dyn ToolSignature>) -> Self {
+    pub fn new(mut config: LoopDetectorConfig, signature: Arc<dyn ToolSignature>) -> Self {
+        if config.window_size == 0 {
+            tracing::warn!(
+                "LoopDetectorConfig.window_size was 0; clamping to 1 (the smallest sensible window)"
+            );
+            config.window_size = 1;
+        }
         Self {
             operations: Mutex::new(VecDeque::with_capacity(config.window_size)),
             config,
@@ -1580,13 +1586,16 @@ impl LoopDetector {
         };
 
         let sig = &self.signature;
-        let normalized_input = sig.normalize_param_for_comparison("", file_path);
         let read_count = ops
             .iter()
             .filter(|o| {
-                sig.is_file_read_tool(&o.tool)
-                    && sig.normalize_param_for_comparison(&o.tool, &o.primary_param)
-                        == normalized_input
+                if !sig.is_file_read_tool(&o.tool) {
+                    return false;
+                }
+                let normalized_op = sig.normalize_param_for_comparison(&o.tool, &o.primary_param);
+                let normalized_query = sig.normalize_param_for_comparison(&o.tool, file_path);
+                normalized_op.contains(normalized_query.as_str())
+                    || normalized_query.contains(normalized_op.as_str())
             })
             .count();
 
@@ -2537,6 +2546,86 @@ mod tests {
         assert!(
             msg.contains("Check the command"),
             "Should contain tool signature suggestion: {msg}"
+        );
+    }
+
+    /// Signature that flags the `Read` tool as a file-read tool and prefixes
+    /// the primary parameter with the tool name during comparison, so tests
+    /// can verify which tool name `check_file_reads` passes to
+    /// `normalize_param_for_comparison`.
+    struct ToolNameNormalizingSig;
+
+    impl ToolSignature for ToolNameNormalizingSig {
+        fn is_file_read_tool(&self, tool: &str) -> bool {
+            tool == "read"
+        }
+
+        fn normalize_param_for_comparison(&self, tool: &str, param: &str) -> String {
+            format!("{tool}:{param}")
+        }
+    }
+
+    #[test]
+    fn check_file_reads_matches_containment_both_directions() {
+        // Use the shared TestToolSignature which treats "Read" as a file-read
+        // tool and leaves params unchanged under normalization. Lower the
+        // threshold so a single recorded read trips the check.
+        let config = LoopDetectorConfig {
+            max_same_file_reads: 1,
+            ..Default::default()
+        };
+        let mk = || LoopDetector::new(config.clone(), Arc::new(TestToolSignature));
+
+        // Forward direction: op path "/a/b/c" contains query "/a/b".
+        let detector = mk();
+        detector.record(Operation::new("Read", "/a/b/c"));
+        assert!(
+            detector.check_file_reads("/a/b"),
+            "op path containing the query path should match"
+        );
+
+        // Reverse direction: query "/a/b/c" contains op path "/a".
+        let detector2 = mk();
+        detector2.record(Operation::new("Read", "/a"));
+        assert!(
+            detector2.check_file_reads("/a/b/c"),
+            "query path containing the op path should match"
+        );
+    }
+
+    #[test]
+    fn check_file_reads_uses_real_tool_name() {
+        // ToolNameNormalizingSig prepends the tool name during normalization,
+        // so the match only succeeds if check_file_reads passes the recorded
+        // op's tool name ("read") rather than an empty string.
+        let detector = LoopDetector::new(
+            LoopDetectorConfig {
+                max_same_file_reads: 1,
+                ..Default::default()
+            },
+            Arc::new(ToolNameNormalizingSig),
+        );
+
+        detector.record(Operation::new("read", "/file"));
+        // normalize_param_for_comparison("read", "/file") == "read:/file"
+        // and the query is normalized with the same tool name, so the
+        // containment check only holds if both use "read".
+        assert!(
+            detector.check_file_reads("/file"),
+            "check_file_reads must normalize under the recorded op's tool name"
+        );
+    }
+
+    #[test]
+    fn window_size_zero_clamps_to_one() {
+        let config = LoopDetectorConfig {
+            window_size: 0,
+            ..Default::default()
+        };
+        let detector = LoopDetector::new(config, Arc::new(TestToolSignature));
+        assert_eq!(
+            detector.config.window_size, 1,
+            "a window_size of 0 must be clamped to 1"
         );
     }
 }

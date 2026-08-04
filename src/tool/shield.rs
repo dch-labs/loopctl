@@ -593,11 +593,20 @@ impl UnixShield {
     ///
     /// Both values are clamped to `[0.0, 1.0]` so an out-of-range
     /// configuration cannot produce a shield that never warns or never
-    /// blocks. The shield does not enforce `block >= warn`; passing an
-    /// inverted pair will produce surprising decisions, so callers
-    /// should validate their own inputs.
+    /// blocks. If `block < warn` (an inverted pair), the two values are
+    /// swapped and a warning is logged so the bands stay ordered.
     #[must_use]
     pub fn with_thresholds(mut self, warn: f32, block: f32) -> Self {
+        let (warn, block) = if block < warn {
+            tracing::warn!(
+                warn,
+                block,
+                "ToolShield block threshold < warn threshold; swapping to keep bands ordered"
+            );
+            (block, warn)
+        } else {
+            (warn, block)
+        };
         self.warn_threshold = warn.clamp(0.0, 1.0);
         self.block_threshold = block.clamp(0.0, 1.0);
         self
@@ -1272,5 +1281,21 @@ mod tests {
 
         let block = SafetyDecision::block("test".into(), "cat");
         assert!(block.is_blocked());
+    }
+
+    #[test]
+    fn with_thresholds_swaps_inverted_pair() {
+        // Pass an inverted pair (warn > block). with_thresholds should swap
+        // them so the bands stay ordered: warn_threshold becomes the smaller
+        // value (0.4) and block_threshold becomes the larger (0.7).
+        let shield = UnixShield::new().with_thresholds(0.7, 0.4);
+        assert!(
+            (shield.warn_threshold - 0.4).abs() < f32::EPSILON,
+            "inverted pair should be swapped so warn is the smaller value"
+        );
+        assert!(
+            (shield.block_threshold - 0.7).abs() < f32::EPSILON,
+            "inverted pair should be swapped so block is the larger value"
+        );
     }
 }

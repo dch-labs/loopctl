@@ -144,7 +144,11 @@ impl TokenBucket {
 
     /// Tokens available at a known instant (after a lazy refill).
     ///
-    /// Advances `last_refill` to `at`, banking the elapsed refill.
+    /// Applies the elapsed-time refill since the last call and returns the
+    /// resulting token count. When the refill reaches capacity before `at`,
+    /// `last_refill` advances only to the fill instant (the moment capacity
+    /// was hit), not to `at` — the excess time beyond capacity is irrelevant
+    /// and is discarded so a far-future `at` cannot freeze the refill clock.
     pub fn available_at(&self, at: Instant) -> f64 {
         let mut state = self
             .state

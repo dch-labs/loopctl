@@ -1594,6 +1594,11 @@ impl LoopDetector {
                 }
                 let normalized_op = sig.normalize_param_for_comparison(&o.tool, &o.primary_param);
                 let normalized_query = sig.normalize_param_for_comparison(&o.tool, file_path);
+
+                if normalized_op.is_empty() || normalized_query.is_empty() {
+                    return false;
+                }
+
                 normalized_op.contains(normalized_query.as_str())
                     || normalized_query.contains(normalized_op.as_str())
             })
@@ -2613,6 +2618,20 @@ mod tests {
         assert!(
             detector.check_file_reads("/file"),
             "check_file_reads must normalize under the recorded op's tool name"
+        );
+    }
+
+    #[test]
+    fn check_file_reads_ignores_empty_primary_param() {
+        let config = LoopDetectorConfig {
+            max_same_file_reads: 1,
+            ..Default::default()
+        };
+        let detector = LoopDetector::new(config, Arc::new(TestToolSignature));
+        detector.record(Operation::new("Read", ""));
+        assert!(
+            !detector.check_file_reads("/etc/passwd"),
+            "an empty primary param must not match every query"
         );
     }
 

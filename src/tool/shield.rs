@@ -594,9 +594,27 @@ impl UnixShield {
     /// Both values are clamped to `[0.0, 1.0]` so an out-of-range
     /// configuration cannot produce a shield that never warns or never
     /// blocks. If `block < warn` (an inverted pair), the two values are
-    /// swapped and a warning is logged so the bands stay ordered.
+    /// swapped and a warning is logged so the bands stay ordered. A
+    /// non-finite value (NaN or infinity) is rejected and replaced with
+    /// that band's default — a stored NaN would silently disable the
+    /// band because every `score >= NaN` comparison is false.
     #[must_use]
     pub fn with_thresholds(mut self, warn: f32, block: f32) -> Self {
+        let warn = if warn.is_finite() {
+            warn
+        } else {
+            tracing::warn!(warn, "ToolShield warn threshold not finite; using default");
+            self.warn_threshold
+        };
+        let block = if block.is_finite() {
+            block
+        } else {
+            tracing::warn!(
+                block,
+                "ToolShield block threshold not finite; using default"
+            );
+            self.block_threshold
+        };
         let (warn, block) = if block < warn {
             tracing::warn!(
                 warn,
@@ -1296,6 +1314,34 @@ mod tests {
         assert!(
             (shield.block_threshold - 0.7).abs() < f32::EPSILON,
             "inverted pair should be swapped so block is the larger value"
+        );
+    }
+
+    #[test]
+    fn with_thresholds_rejects_non_finite() {
+        // NaN must not be stored: `score >= NaN` is always false, so a NaN
+        // threshold would silently disable the band. Infinity would be clamped
+        // to 1.0 by clamp(), but rejecting it up-front keeps the policy uniform.
+        // Both fall back to the band's default (warn 0.4, block 0.7).
+        let shield = UnixShield::new().with_thresholds(f32::NAN, f32::INFINITY);
+        assert!(
+            (shield.warn_threshold - 0.4).abs() < f32::EPSILON,
+            "NaN warn should fall back to the default"
+        );
+        assert!(
+            (shield.block_threshold - 0.7).abs() < f32::EPSILON,
+            "infinite block should fall back to the default"
+        );
+
+        // A finite pair still routes through the normal clamp/swap path.
+        let shield = UnixShield::new().with_thresholds(0.2, 0.9);
+        assert!(
+            (shield.warn_threshold - 0.2).abs() < f32::EPSILON,
+            "finite warn should be stored (after clamp)"
+        );
+        assert!(
+            (shield.block_threshold - 0.9).abs() < f32::EPSILON,
+            "finite block should be stored (after clamp)"
         );
     }
 }

@@ -4,6 +4,8 @@
 //! [`SessionConfig`] for session-scoped settings and
 //! [`RunConfig`](crate::engine::RunConfig) for per-run budgets.
 
+use serde::Deserialize;
+
 /// Session-scoped agent configuration.
 ///
 /// The slice of agent configuration that is stable across `run()` calls on the
@@ -44,6 +46,15 @@ pub struct SessionConfig {
     /// invoked to summarize or truncate older messages before the next model
     /// call. Lower it to compact more aggressively; raise it to defer
     /// compaction and preserve more raw history.
+    ///
+    /// The `0..=100` invariant is enforced by [`Default`], by
+    /// [`with_compact_threshold`](Self::with_compact_threshold), and by the
+    /// serde deserialize path — values above `100` from any of those routes
+    /// are silently clamped to `100`. Direct struct-literal construction
+    /// (`SessionConfig { compact_threshold: 200, .. }`) bypasses the clamp
+    /// because the field is `pub`; callers using that form are responsible for
+    /// honoring the documented range.
+    #[serde(deserialize_with = "deserialize_compact_threshold")]
     pub compact_threshold: u8,
 
     /// Whether auto-compaction is enabled. Defaults to `true`.
@@ -57,16 +68,29 @@ pub struct SessionConfig {
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self {
+        let mut config = Self {
             system_prompt: None,
             context_window: 200_000,
             compact_threshold: 80,
             auto_compact: true,
-        }
+        };
+        config.clamp_compact_threshold();
+        config
     }
 }
 
 impl SessionConfig {
+    /// Clamp `compact_threshold` into the documented `0..=100` range.
+    ///
+    /// Single canonical clamp point called by [`Default`],
+    /// [`with_compact_threshold`](Self::with_compact_threshold), and the serde
+    /// deserialize path. Values above `100` are silently lowered to `100`.
+    fn clamp_compact_threshold(&mut self) {
+        if self.compact_threshold > 100 {
+            self.compact_threshold = 100;
+        }
+    }
+
     /// Set the optional system prompt.
     ///
     /// Stores `Some(prompt)` on the config; the provider receives it as
@@ -103,7 +127,8 @@ impl SessionConfig {
     /// defer compaction and preserve more raw history.
     #[must_use]
     pub fn with_compact_threshold(mut self, compact_threshold: u8) -> Self {
-        self.compact_threshold = compact_threshold.min(100);
+        self.compact_threshold = compact_threshold;
+        self.clamp_compact_threshold();
         self
     }
 
@@ -119,6 +144,28 @@ impl SessionConfig {
         self.auto_compact = auto_compact;
         self
     }
+}
+
+/// Deserialize helper that clamps [`SessionConfig::compact_threshold`] into
+/// `0..=100`, so configs deserialized from disk cannot carry an out-of-range
+/// value through to the compaction subsystem.
+///
+/// Values above `100` are silently lowered to `100` to match the
+/// [`clamp_compact_threshold`](SessionConfig::clamp_compact_threshold) clamp used by the other construction
+/// paths. Serialization still emits a JSON number, so an in-range value
+/// round-trips unchanged; an out-of-range value is normalized to `100` on
+/// deserialization and will not round-trip back to the original number.
+///
+/// # Errors
+///
+/// Returns the deserializer's error if the input is not a valid `u8` (e.g. a
+/// string, a negative number, or out of `u8` range before clamping).
+fn deserialize_compact_threshold<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u8::deserialize(deserializer)?;
+    Ok(value.min(100))
 }
 
 /// How independent tool calls within a single turn are dispatched.
@@ -276,5 +323,44 @@ mod tests {
         };
         assert_eq!(dispatch.mode, ParallelMode::Parallel);
         assert_eq!(dispatch.max_concurrency, 4);
+    }
+
+    #[test]
+    fn default_compact_threshold_is_valid() {
+        let config = SessionConfig::default();
+        assert!(
+            config.compact_threshold <= 100,
+            "default compact_threshold must be in range; got {}",
+            config.compact_threshold
+        );
+    }
+
+    #[test]
+    fn with_compact_threshold_clamps_high() {
+        let config = SessionConfig::default().with_compact_threshold(200);
+        assert_eq!(config.compact_threshold, 100);
+    }
+
+    #[test]
+    fn with_compact_threshold_preserves_low() {
+        let config = SessionConfig::default().with_compact_threshold(50);
+        assert_eq!(config.compact_threshold, 50);
+    }
+
+    #[test]
+    fn deserialize_clamps_high() {
+        let json = r#"{"system_prompt":null,"context_window":200000,"compact_threshold":200,"auto_compact":true}"#;
+        let config: SessionConfig = serde_json::from_str(json).expect("deserialize should succeed");
+        assert_eq!(
+            config.compact_threshold, 100,
+            "deserialize must clamp out-of-range compact_threshold to 100"
+        );
+    }
+
+    #[test]
+    fn deserialize_preserves_valid() {
+        let json = r#"{"system_prompt":null,"context_window":200000,"compact_threshold":80,"auto_compact":true}"#;
+        let config: SessionConfig = serde_json::from_str(json).expect("deserialize should succeed");
+        assert_eq!(config.compact_threshold, 80);
     }
 }

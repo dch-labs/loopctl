@@ -4,6 +4,8 @@
 //! [`SessionConfig`] for session-scoped settings and
 //! [`RunConfig`](crate::engine::RunConfig) for per-run budgets.
 
+use serde::Deserialize;
+
 /// Session-scoped agent configuration.
 ///
 /// The slice of agent configuration that is stable across `run()` calls on the
@@ -150,8 +152,9 @@ impl SessionConfig {
 ///
 /// Values above `100` are silently lowered to `100` to match the
 /// [`clamp_compact_threshold`](SessionConfig::clamp_compact_threshold) clamp used by the other construction
-/// paths. The serialized representation is unchanged (still a JSON number), so
-/// existing configs round-trip identically.
+/// paths. Serialization still emits a JSON number, so an in-range value
+/// round-trips unchanged; an out-of-range value is normalized to `100` on
+/// deserialization and will not round-trip back to the original number.
 ///
 /// # Errors
 ///
@@ -161,7 +164,7 @@ fn deserialize_compact_threshold<'de, D>(deserializer: D) -> Result<u8, D::Error
 where
     D: serde::Deserializer<'de>,
 {
-    let value = <u8 as serde::Deserialize>::deserialize(deserializer)?;
+    let value = u8::deserialize(deserializer)?;
     Ok(value.min(100))
 }
 

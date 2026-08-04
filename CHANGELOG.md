@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-04
+
 ### Fixed
 
+- Detection-layer long-tail correctness (six items): `check_file_reads` now normalizes the query under the recorded op's real tool name (was: empty string) and matches by bidirectional path containment (was: exact equality), and rejects empty normalized params (an empty string is a substring of every query, which would inflate the read count); `LoopDetector::new` clamps `window_size == 0` to 1 with a warning; `find_best_match` rejects zero-score candidates even at threshold 0.0 and breaks ties lexicographically; `ToolShield::with_thresholds` swaps inverted warn/block pairs with a warning and rejects non-finite (NaN/inf) values, falling back to the band's default — a stored NaN would silently disable the band because every `score >= NaN` comparison is false. All non-breaking.
 - `SessionConfig::compact_threshold` now clamps into its documented `0..=100` range on the validating construction paths (`Default`, `with_compact_threshold`, and `Deserialize`). Previously only the `with_compact_threshold` builder clamped; deserialized configs could carry an out-of-range value (e.g. `200` from disk), which the compaction subsystem would then interpret as "never compact." A single canonical clamp method plus a field-level serde deserialize helper now enforce the range silently. `Default` was already in range (80); its clamp call is defensive. Direct public struct-literal construction (`SessionConfig { compact_threshold: 200, .. }`) still bypasses normalization — the field is `pub`, and callers using that form are responsible for honoring the documented range. Non-breaking (silent clamp; no signature changes).
+- `TokenBucket` refill clock no longer jumps to a future instant. The shared `elapsed_refill` helper advances `last_refill` only to the fill point (the instant capacity is reached) instead of to `at`, so a caller that passes a far-future instant — directly or via `take`/`acquire`/`available` — can no longer freeze the refill clock on the production rate-limit path. Non-breaking (callers passing correct `Instant::now()` values see no change).
 - Corrected the `ParallelMode::Parallel` doc, which falsely claimed detection/observer side-effects "are not thread-safe" and fire "once on the final result only" in parallel mode. They are thread-safe (`DetectionManager` and the observer registry use `Mutex`/immutable-`Vec` interiors; `ToolHealthRegistry` uses atomics) and fire on every retry attempt in both modes, exactly as the code already does. No behavior change; the code matched the corrected doc all along.
 - Fixed code-level doc contradictions: the `ApiClient` trait example showed `request: StreamRequest` (by-value) instead of `&StreamRequest` (matches the real trait), and `BareLoop::machine` was described as an "empty placeholder" rather than the real "empty machine (no history, no pending messages)".
 - Reconciled the planning docs (ROADMAP, CONTEXT, ARCHITECTURE, README, DEPENDENCIES, DCH-DESIGN, the v0.2.0 release file) to the shipped 0.2.0 reality: status Planned→Shipped, `compact_threshold` u16→u8, `Loop::process_turn` soft-deprecated→removed, `LoopRuntime`/`LoopConfig`/`SessionResult`/`run_session` → their shipped replacements (`managers`/`SessionConfig`+`RunConfig`/`Run`+`Session`/`run`), MSRV 1.85→1.94, doctest count 303→286. Added a staleness banner to `LOOPCTL-DESIGN.md`.
@@ -118,5 +122,6 @@ Initial crates.io release.
 - Built-in testing utilities for writing LLM loop tests
 - Example CLIs: hello, REPL, echo tool, and multi-provider chat
 
+[0.2.1]: https://github.com/dch-labs/loopctl/releases/tag/v0.2.1
 [0.2.0]: https://github.com/dch-labs/loopctl/releases/tag/v0.2.0
 [0.1.0]: https://github.com/dch-labs/loopctl/releases/tag/v0.1.0

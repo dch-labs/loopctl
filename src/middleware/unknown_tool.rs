@@ -148,9 +148,11 @@ impl UnknownToolMiddleware {
 
     /// Find the best matching tool name from a list, given a threshold.
     ///
-    /// Returns the name with the highest similarity score that meets or
-    /// exceeds `threshold`. Returns `None` when no candidate scores high
-    /// enough.
+    /// Returns the name with the highest similarity score that exceeds zero
+    /// and meets or exceeds `threshold`. Ties (equal scores) are broken
+    /// lexicographically — the smaller name wins — so the result is
+    /// deterministic regardless of candidate order. Returns `None` when no
+    /// candidate scores high enough.
     fn find_best_match_inner<'a>(
         requested: &str,
         available: &[&'a str],
@@ -159,10 +161,18 @@ impl UnknownToolMiddleware {
         let mut best: Option<(&'a str, f64)> = None;
         for &name in available {
             let score = Self::similarity(requested, name);
-            if score >= threshold {
+            if score > 0.0 && score >= threshold {
                 match best {
-                    Some((_, best_score)) if score <= best_score => {}
-                    _ => best = Some((name, score)),
+                    None => best = Some((name, score)),
+                    Some((_, best_score)) if score > best_score => {
+                        best = Some((name, score));
+                    }
+                    Some((best_name, best_score))
+                        if (score - best_score).abs() < f64::EPSILON && name < best_name =>
+                    {
+                        best = Some((name, score));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -382,6 +392,39 @@ mod tests {
 
         assert!(
             UnknownToolMiddleware::find_best_match_inner("read_fil", &available, 1.0).is_none()
+        );
+    }
+
+    #[test]
+    fn find_best_match_threshold_zero_rejects_zero_score() {
+        let available = ["bbb"];
+        assert!(
+            UnknownToolMiddleware::find_best_match_inner("xyz", &available, 0.0).is_none(),
+            "a zero-similarity candidate must be rejected even at threshold 0.0"
+        );
+    }
+
+    #[test]
+    fn find_best_match_ties_break_lexicographically() {
+        let forward = ["toll", "toil"];
+        let (suggestion, score) =
+            UnknownToolMiddleware::find_best_match_inner("tool", &forward, 0.0).unwrap();
+        assert_eq!(
+            suggestion, "toil",
+            "tie should break to the lexicographically smaller name"
+        );
+        assert!(
+            (score - 0.8).abs() < 1e-6,
+            "expected tied score 0.8, got {score}"
+        );
+
+        // Reversed input order must yield the same winner.
+        let reversed = ["toil", "toll"];
+        let (suggestion_rev, _) =
+            UnknownToolMiddleware::find_best_match_inner("tool", &reversed, 0.0).unwrap();
+        assert_eq!(
+            suggestion_rev, "toil",
+            "tie-break must be order-independent"
         );
     }
 

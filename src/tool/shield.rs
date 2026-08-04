@@ -573,6 +573,12 @@ pub struct UnixShield {
     combination_rules: Vec<CombinationRule>,
 }
 
+/// Default warn threshold: an aggregate score at or above this produces a warn.
+const DEFAULT_WARN_THRESHOLD: f32 = 0.4;
+
+/// Default block threshold: an aggregate score at or above this produces a block.
+const DEFAULT_BLOCK_THRESHOLD: f32 = 0.7;
+
 impl UnixShield {
     /// Create a shield with default Unix shell patterns and thresholds.
     ///
@@ -581,8 +587,8 @@ impl UnixShield {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            warn_threshold: 0.4,
-            block_threshold: 0.7,
+            warn_threshold: DEFAULT_WARN_THRESHOLD,
+            block_threshold: DEFAULT_BLOCK_THRESHOLD,
             turn_history: Mutex::new(Vec::new()),
             patterns: Self::unix_patterns(),
             combination_rules: Self::unix_combination_rules(),
@@ -604,7 +610,7 @@ impl UnixShield {
             warn
         } else {
             tracing::warn!(warn, "ToolShield warn threshold not finite; using default");
-            self.warn_threshold
+            DEFAULT_WARN_THRESHOLD
         };
         let block = if block.is_finite() {
             block
@@ -613,7 +619,7 @@ impl UnixShield {
                 block,
                 "ToolShield block threshold not finite; using default"
             );
-            self.block_threshold
+            DEFAULT_BLOCK_THRESHOLD
         };
         let (warn, block) = if block < warn {
             tracing::warn!(
@@ -982,8 +988,8 @@ impl UnixShieldBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            warn_threshold: 0.4,
-            block_threshold: 0.7,
+            warn_threshold: DEFAULT_WARN_THRESHOLD,
+            block_threshold: DEFAULT_BLOCK_THRESHOLD,
             patterns: UnixShield::unix_patterns(),
             combination_rules: UnixShield::unix_combination_rules(),
         }
@@ -996,8 +1002,8 @@ impl UnixShieldBuilder {
     #[must_use]
     pub fn blank() -> Self {
         Self {
-            warn_threshold: 0.4,
-            block_threshold: 0.7,
+            warn_threshold: DEFAULT_WARN_THRESHOLD,
+            block_threshold: DEFAULT_BLOCK_THRESHOLD,
             patterns: HashMap::new(),
             combination_rules: Vec::new(),
         }
@@ -1342,6 +1348,37 @@ mod tests {
         assert!(
             (shield.block_threshold - 0.9).abs() < f32::EPSILON,
             "finite block should be stored (after clamp)"
+        );
+    }
+
+    #[test]
+    fn with_thresholds_chained_non_finite_restores_defaults() {
+        // After a finite customisation, a non-finite value must reset the band
+        // to the documented defaults (0.4 / 0.7), not inherit the previously
+        // stored custom value.
+        let shield = UnixShield::new()
+            .with_thresholds(0.1, 0.2)
+            .with_thresholds(f32::NAN, f32::INFINITY);
+        assert!(
+            (shield.warn_threshold - 0.4).abs() < f32::EPSILON,
+            "chained NaN warn should restore the default 0.4, not inherit 0.1"
+        );
+        assert!(
+            (shield.block_threshold - 0.7).abs() < f32::EPSILON,
+            "chained infinite block should restore the default 0.7, not inherit 0.2"
+        );
+
+        // One bad band, one finite band: only the bad one resets.
+        let shield = UnixShield::new()
+            .with_thresholds(0.1, 0.2)
+            .with_thresholds(f32::NAN, 0.9);
+        assert!(
+            (shield.warn_threshold - 0.4).abs() < f32::EPSILON,
+            "NaN warn should reset to default while finite block is honoured"
+        );
+        assert!(
+            (shield.block_threshold - 0.9).abs() < f32::EPSILON,
+            "finite block should be honoured alongside a NaN warn"
         );
     }
 }

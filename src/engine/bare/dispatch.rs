@@ -507,6 +507,7 @@ impl<C: ApiClient> BareLoop<C> {
         turn_idx: usize,
     ) -> Result<ToolDispatchResult, LoopError> {
         let tool_context = self.build_tool_context();
+        let original_tool = tc.tool.clone();
         let mut attempt: u32 = 0;
 
         loop {
@@ -552,7 +553,7 @@ impl<C: ApiClient> BareLoop<C> {
                     attempt = next_attempt;
                     if attempt > Self::MAX_RECOVERY_ATTEMPTS {
                         return Err(LoopError::ToolRecoveryExhausted {
-                            tool: tc.tool.clone(),
+                            tool: original_tool,
                             attempts: attempt,
                         });
                     }
@@ -769,8 +770,9 @@ impl<C: ApiClient> BareLoop<C> {
             RecoveryAction::Retry { delay } => {
                 let next_attempt = attempt.saturating_add(1);
                 tokio::select! {
-                    () = tokio::time::sleep(delay) => RecoveryDecision::Retry { next_attempt, correction },
+                    biased;
                     () = self.cancelled.notified() => RecoveryDecision::Cancelled,
+                    () = tokio::time::sleep(delay) => RecoveryDecision::Retry { next_attempt, correction },
                 }
             }
             RecoveryAction::Skip(_) | RecoveryAction::AskUser(_) | RecoveryAction::Fail(_) => {

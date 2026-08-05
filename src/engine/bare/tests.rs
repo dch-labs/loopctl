@@ -924,6 +924,75 @@ async fn memory_consolidate_prunes_on_successful_run() {
     );
 }
 
+#[tokio::test]
+async fn memory_top_k_zero_skips_retrieve() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::memory::{LoopMemory, MemoryEntry};
+
+    struct TrackingMemory {
+        retrieve_calls: Arc<AtomicUsize>,
+    }
+
+    impl LoopMemory for TrackingMemory {
+        fn store(
+            &self,
+            _entry: MemoryEntry,
+        ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn retrieve(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + '_>>
+        {
+            self.retrieve_calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn consolidate(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::memory::ConsolidationStats, LoopError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Ok(crate::memory::ConsolidationStats::default()) })
+        }
+
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
+    let retrieve_calls = Arc::new(AtomicUsize::new(0));
+    let memory = Arc::new(TrackingMemory {
+        retrieve_calls: Arc::clone(&retrieve_calls),
+    });
+
+    let client = MockClient::new("test");
+    client.add_text_response("done");
+
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    agent.set_memory(memory);
+
+    let config = RunConfig {
+        memory_top_k: 0,
+        ..Default::default()
+    };
+    agent.run("go", &config).await.unwrap();
+
+    assert_eq!(
+        retrieve_calls.load(Ordering::Relaxed),
+        0,
+        "memory_top_k == 0 must skip retrieve entirely"
+    );
+}
+
 struct SequenceObserver {
     log: Arc<Mutex<Vec<String>>>,
 }
@@ -1271,7 +1340,7 @@ async fn observer_sequence_compaction_turn() {
     // turn_end, before the next turn_start). If the estimate didn't trip,
     // the scenario is N/A — assert placement only when present.
     if let Some(idx) = events.iter().position(|e| e == "on_compaction") {
-        let before = events.get(idx.wrapping_sub(1));
+        let before = idx.checked_sub(1).and_then(|i| events.get(i));
         let after = events.get(idx + 1);
         assert!(
             before == Some(&"on_turn_end".to_string())

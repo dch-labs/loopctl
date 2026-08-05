@@ -246,11 +246,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// Record a successful LLM turn: tells the fallback manager the model is
     /// healthy and fires
     /// [`on_stream_success`](crate::observer::LoopObserver::on_stream_success).
-    pub(super) fn record_turn_success(&mut self, usage: Option<&Usage>) {
+    pub(super) fn record_turn_success(&mut self, turn: usize, usage: Option<&Usage>) {
         self.managers.fallback().record_success();
         let (in_tok, out_tok) = Self::usage_tokens(usage);
         self.managers.observers().on_stream_success(&StreamContext {
-            turn: self.session.current_run().map_or(0, Run::turn_count),
+            turn,
             model: self.client.model(),
             input_tokens: in_tok,
             output_tokens: out_tok,
@@ -266,7 +266,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`on_fallback`](crate::observer::LoopObserver::on_fallback). Always fires
     /// [`on_stream_failure`](crate::observer::LoopObserver::on_stream_failure)
     /// (except for the cancel short-circuit) and returns the original error.
-    pub(super) fn record_turn_failure(&mut self, e: LoopError) -> LoopError {
+    pub(super) fn record_turn_failure(&mut self, turn: usize, e: LoopError) -> LoopError {
         if matches!(e, LoopError::Cancelled) {
             return e;
         }
@@ -293,7 +293,7 @@ impl<C: ApiClient> BareLoop<C> {
         self.managers
             .observers()
             .on_stream_failure(&StreamFailureContext {
-                turn: self.session.current_run().map_or(0, Run::turn_count),
+                turn,
                 model: self.client.model(),
                 error: e.clone(),
             });

@@ -71,6 +71,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// otherwise propagates the selected turn path's error.
     pub(super) async fn do_turn(
         &mut self,
+        turn: usize,
         messages: Vec<Message>,
     ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
         if self.cancelled.is_cancelled() {
@@ -78,8 +79,8 @@ impl<C: ApiClient> BareLoop<C> {
         }
         match self.turn_mode {
             #[cfg(feature = "streaming")]
-            super::TurnMode::Streaming => self.do_stream(messages).await,
-            super::TurnMode::NonStreaming => self.do_create_message(messages).await,
+            super::TurnMode::Streaming => self.do_stream(turn, messages).await,
+            super::TurnMode::NonStreaming => self.do_create_message(turn, messages).await,
         }
     }
 
@@ -97,6 +98,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// otherwise the provider error mapped to [`LoopError::Api`].
     async fn do_create_message(
         &mut self,
+        turn: usize,
         messages: Vec<Message>,
     ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
         let request = self.build_turn_request(messages);
@@ -112,10 +114,10 @@ impl<C: ApiClient> BareLoop<C> {
         };
         match result {
             Ok(response) => {
-                self.record_turn_success(response.usage.as_ref());
+                self.record_turn_success(turn, response.usage.as_ref());
                 Ok((response.message, response.usage, response.stop_reason))
             }
-            Err(e) => Err(self.record_turn_failure(e)),
+            Err(e) => Err(self.record_turn_failure(turn, e)),
         }
     }
 
@@ -131,14 +133,15 @@ impl<C: ApiClient> BareLoop<C> {
     #[cfg(feature = "streaming")]
     async fn do_stream(
         &mut self,
+        turn: usize,
         messages: Vec<Message>,
     ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
         match self.stream_turn(messages).await {
             Ok((msg, usage, stop)) => {
-                self.record_turn_success(usage.as_ref());
+                self.record_turn_success(turn, usage.as_ref());
                 Ok((msg, usage, stop))
             }
-            Err(e) => Err(self.record_turn_failure(e)),
+            Err(e) => Err(self.record_turn_failure(turn, e)),
         }
     }
 

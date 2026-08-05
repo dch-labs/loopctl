@@ -825,7 +825,7 @@ impl<C: ApiClient> BareLoop<C> {
         let mut messages = self.collect_contributor_messages(turn);
         self.collect_memories(&turn_input, &mut messages).await;
 
-        let turn_outcome = self.do_turn(messages).await;
+        let turn_outcome = self.do_turn(turn, messages).await;
         let (msg, usage, stream_stop) = match turn_outcome {
             Ok(triple) => triple,
             Err(LoopError::Cancelled) => {
@@ -839,7 +839,18 @@ impl<C: ApiClient> BareLoop<C> {
                 });
                 return Err(LoopError::Cancelled);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                let err_str = e.to_string();
+                self.notify_turn_end(&TurnEnd {
+                    turn,
+                    success: false,
+                    error: Some(&err_str),
+                    duration: turn_start.elapsed(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                });
+                return Err(e);
+            }
         };
 
         let text = msg.text_content();
@@ -848,6 +859,15 @@ impl<C: ApiClient> BareLoop<C> {
         self.notify_response(turn, &text, usage);
 
         if let Some(e) = self.apply_loop_detection(turn, &pattern) {
+            let err_str = e.to_string();
+            self.notify_turn_end(&TurnEnd {
+                turn,
+                success: false,
+                error: Some(&err_str),
+                duration: turn_start.elapsed(),
+                input_tokens: turn_in,
+                output_tokens: turn_out,
+            });
             return Err(e);
         }
 
@@ -941,9 +961,11 @@ impl<C: ApiClient> BareLoop<C> {
     async fn collect_memories(&mut self, turn_input: &str, messages: &mut Vec<Message>) {
         let memory_top_k = self
             .session
-            .runs
-            .last()
+            .current_run()
             .map_or(RunConfig::default().memory_top_k, |r| r.config.memory_top_k);
+        if memory_top_k == 0 {
+            return;
+        }
         if let Some(memory) = self.managers.memory() {
             match memory.retrieve(turn_input, memory_top_k).await {
                 Ok(entries) if !entries.is_empty() => {
@@ -987,7 +1009,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// recorded message).
     ///
     /// [`build_turn_request`]: BareLoop::build_turn_request
-    fn turn_input(&mut self, turn: usize) -> String {
+    fn turn_input(&self, turn: usize) -> String {
         let is_first_turn = turn == 0;
         if is_first_turn {
             self.session
@@ -995,7 +1017,7 @@ impl<C: ApiClient> BareLoop<C> {
                 .map_or(String::new(), |r| r.input.clone())
         } else {
             self.machine
-                .history()
+                .full_history()
                 .last()
                 .map(|m| {
                     m.parts
@@ -1072,13 +1094,9 @@ impl<C: ApiClient> BareLoop<C> {
         }
 
         self.notify_tool_calls_received(turn, &tool_calls);
-        let dispatched_parts: Vec<MessagePart> = match self
+        let dispatched_parts: Vec<MessagePart> = self
             .dispatch_and_record(&dispatch_calls, turn, &accounting)
-            .await
-        {
-            Ok(parts) => parts,
-            Err(e) => return Err(e),
-        };
+            .await?;
 
         debug_assert_eq!(
             dispatch_calls.len(),

@@ -64,9 +64,15 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
 
     /// Apply the model switch.
     ///
-    /// Performs the following atomically:
+    /// Performs the following steps in order (best-effort, not transactional —
+    /// there is no rollback if an individual step fails):
     /// 1. Validates the target model is non-empty.
-    /// 2. Delegates to [`ApiClient::set_model`] on the underlying client.
+    /// 2. Delegates to [`ApiClient::set_model`] on the underlying client. When
+    ///    the client returns `false` (runtime switching unsupported), a warning
+    ///    is logged and the remaining steps still run — the client is the
+    ///    source of truth for the model name, so a rejected switch leaves the
+    ///    effective model unchanged while the session/fallback/observer state
+    ///    reflects the requested target.
     /// 3. Updates the session context window.
     /// 4. Resets the [`FallbackManager`](crate::fallback::FallbackManager)
     ///    circuit breaker to `Primary` and updates the original-model
@@ -91,7 +97,14 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
         }
 
         let from = loop_.client.model();
-        loop_.client.set_model(trimmed);
+        if !loop_.client.set_model(trimmed) {
+            tracing::warn!(
+                from = %from,
+                to = %trimmed,
+                "client rejected model switch (set_model returned false); \
+                 proceeding best-effort — the client remains the source of truth"
+            );
+        }
 
         if let Some(cw) = context_window {
             loop_.session.config.context_window = cw;

@@ -1057,6 +1057,10 @@ impl<C: ApiClient> BareLoop<C> {
             tool_calls.push(pending.call.clone());
             match &pending.preresolved_result {
                 Some(msg) => {
+                    debug_assert!(
+                        msg.parts.len() == 1,
+                        "preresolved result must be single-part"
+                    );
                     if let Some(part) = msg.parts.first().cloned()
                         && let Some(slot) = slots.get_mut(idx)
                     {
@@ -1076,6 +1080,11 @@ impl<C: ApiClient> BareLoop<C> {
             Err(e) => return Err(e),
         };
 
+        debug_assert_eq!(
+            dispatch_calls.len(),
+            dispatched_parts.len(),
+            "dispatch must return one result per call"
+        );
         let mut dispatched = dispatched_parts.into_iter();
         for slot in &mut slots {
             if slot.is_none() {

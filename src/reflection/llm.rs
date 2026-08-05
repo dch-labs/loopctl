@@ -248,7 +248,9 @@ mod tests {
     use super::*;
     use crate::api::error::ApiError;
     use crate::message::MessagePart;
-    use crate::reflection::{Correction, CorrectionType, FailureSeverity};
+    #[cfg(feature = "schema_validation")]
+    use crate::reflection::Correction;
+    use crate::reflection::{CorrectionType, FailureSeverity};
     use crate::structured::RequestOptions;
     use crate::tool::ToolSchema;
     use std::future::Future;

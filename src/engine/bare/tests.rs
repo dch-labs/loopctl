@@ -111,6 +111,7 @@ impl MockClient {
         crate::error::recover_guard(self.responses.lock()).push(events);
     }
 
+    #[cfg(feature = "streaming")]
     fn add_events(&self, events: Vec<StreamEvent>) {
         crate::error::recover_guard(self.responses.lock()).push(events);
     }
@@ -2852,11 +2853,13 @@ async fn test_cancel_during_dispatch_lands_in_cancelled_state() {
     );
 }
 
+#[cfg(feature = "streaming")]
 struct StreamingMockClient {
     model: String,
     rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<Result<StreamEvent, ApiError>>>>,
 }
 
+#[cfg(feature = "streaming")]
 impl StreamingMockClient {
     fn new(
         model: &str,
@@ -2875,6 +2878,7 @@ impl StreamingMockClient {
     }
 }
 
+#[cfg(feature = "streaming")]
 impl ApiClient for StreamingMockClient {
     fn model(&self) -> String {
         self.model.clone()
@@ -2903,10 +2907,12 @@ impl ApiClient for StreamingMockClient {
     }
 }
 
+#[cfg(feature = "streaming")]
 struct ReceiverStream<T> {
     rx: tokio::sync::mpsc::Receiver<T>,
 }
 
+#[cfg(feature = "streaming")]
 impl<T> futures::Stream for ReceiverStream<T> {
     type Item = T;
 

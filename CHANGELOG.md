@@ -36,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Fixed
 
+- Tool-result parts in a `CallTools` turn preserve **model request order** across preresolved (unknown-tool) and dispatched calls. Previously the turn's results were assembled as `[all preresolved, then all dispatched]`, which reordered the parts the model saw relative to the calls it made. Provider-safe in practice (providers match by `tool_call_id`, not position), but order-non-preserving and surprising to hosts that assume positional alignment. Pinned by `test_mixed_known_unknown_tools_preserve_request_order`.
+- The `run()` `Done` arm now matches every `MachineOutcome` variant explicitly (`Completed`, `MaxTurnsExceeded`, `Cancelled`, `Failed`) instead of using a wildcard `other => ... unwrap_or(Cancelled)` fallback. `MachineOutcome` is `#[non_exhaustive]` but defined in this crate, so the compiler proves this exhaustive — a future variant forces a compile error here rather than being silently mislabelled as `Cancelled`.
+- `handle_call_tools` doc corrected to state where cancellation is actually honored (the in-flight tool call is raced against the cancel signal in `execute_tool_call`'s `select!`; the sequential path checks the signal between calls), instead of claiming a `select!` that does not exist in the function itself.
 - `set_token_counter` doc corrected — no longer claims a sync with `ContextManager` that the code doesn't perform. The driver field is documented as a fallback used only when no manager is configured.
 - `ModelSwitch` doc corrected — removed stale "max-tokens" reference (the builder only has `context_window`).
 - `MAX_RECOVERY_ATTEMPTS` doc rewritten — states the one-knob design (strategy sees the same ceiling the driver enforces) instead of implying two independent limits.

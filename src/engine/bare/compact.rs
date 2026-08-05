@@ -148,7 +148,7 @@ impl<C: ApiClient> BareLoop<C> {
             messages_compacted: messages_before.saturating_sub(messages_after),
             tokens_saved,
             tokens_after,
-            duration_ms: u64::try_from(duration.as_millis()).unwrap_or(0),
+            duration_ms: Self::millis_u64(duration),
             session_id: self.session.id,
         };
         executor.notify_post_compact(&ctx);

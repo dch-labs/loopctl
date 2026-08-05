@@ -312,6 +312,46 @@ pub enum LoopError {
         message: String,
     },
 
+    /// Tool recovery exhausted the configured retry ceiling.
+    ///
+    /// The driver retries failed tool calls under the control of the
+    /// configured [`RecoveryStrategy`](crate::reflection::RecoveryStrategy):
+    /// each time a tool returns an error, the strategy decides whether to
+    /// retry, surface the error softly, or give up. To stop a misbehaving
+    /// strategy that always returns `Retry` from looping forever, the driver
+    /// enforces a hard ceiling (`MAX_RECOVERY_ATTEMPTS` on [`BareLoop`]) and
+    /// surfaces this variant when a strategy keeps requesting retries past it.
+    ///
+    /// A well-behaved strategy will give up before the ceiling fires, so this
+    /// variant reaching the host usually means either the strategy is
+    /// misconfigured, the tool is genuinely broken in a way no correction can
+    /// fix, or the ceiling is set too low for the tool's expected flakiness.
+    /// The run terminates on this error — partial tool results from sibling
+    /// calls in the same batch are discarded, matching the sequential path's
+    /// "first hard error wins" semantics.
+    ///
+    /// [`BareLoop`]: crate::engine::BareLoop
+    #[error("Tool recovery exhausted after {attempts} attempts: {tool}")]
+    ToolRecoveryExhausted {
+        /// The name of the tool that exhausted its retry budget, as it
+        /// appeared in the original [`ToolCall`](crate::engine::ToolCall).
+        ///
+        /// Carried verbatim (not the post-correction name) so a host can
+        /// correlate the failure back to the exact call the model made,
+        /// even if a correction changed the tool name mid-recovery.
+        tool: String,
+
+        /// The number of attempts made when the ceiling tripped, counting the
+        /// original call as attempt 0.
+        ///
+        /// For the default ceiling of 5 this is `6`: the original call is
+        /// attempt 0, retries run at attempts 1 through 5, and the check
+        /// `attempt > MAX_RECOVERY_ATTEMPTS` fires on the 6th. This is *total*
+        /// calls made (original + retries), not the retry count alone — use
+        /// `attempts.saturating_sub(1)` if you need the number of retries.
+        attempts: u32,
+    },
+
     /// A stream error occurred during response processing.
     ///
     /// Streaming responses from the LLM provider may fail mid-stream

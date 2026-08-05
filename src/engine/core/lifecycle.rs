@@ -96,6 +96,14 @@ pub struct RunConfig {
     ///
     /// [`LoopManagers::reset_all`]: crate::managers::LoopManagers::reset_all
     pub reset_managers: bool,
+
+    /// How many memory entries to retrieve and inject at the top of each turn.
+    ///
+    /// When a [`LoopMemory`](crate::memory::LoopMemory) backend is configured,
+    /// the driver retrieves this many relevant entries before each model call
+    /// and appends them as a reference user message. Defaults to `3`. Set to
+    /// `0` to disable memory retrieval entirely for the run.
+    pub memory_top_k: usize,
 }
 
 impl Default for RunConfig {
@@ -104,6 +112,7 @@ impl Default for RunConfig {
             max_turns: 200,
             parallel_tool_dispatch: ParallelDispatchConfig::default(),
             reset_managers: false,
+            memory_top_k: 3,
         }
     }
 }
@@ -158,6 +167,61 @@ pub enum StopReason {
     /// The model generated a configured stop sequence. Rare in
     /// standard usage; typically indicates custom API configuration.
     StopSequence,
+}
+
+/// How the engine fulfils each LLM turn.
+///
+/// `BareLoop` drives every turn by asking the [`ApiClient`](crate::api::ApiClient)
+/// for a response and folding the result into the conversation. Two mechanisms
+/// are available, selected per turn from this enum:
+///
+/// - `NonStreaming` calls [`ApiClient::create_message`](crate::api::ApiClient::create_message)
+///   and receives a single complete [`Message`](crate::message::Message). It
+///   compiles and runs with no streaming dependencies, so it is the default
+///   under `default = []`.
+/// - `Streaming` calls [`ApiClient::stream_messages`](crate::api::ApiClient::stream_messages)
+///   through the resilient `StreamHandler`, emitting per-delta observer
+///   callbacks. Requires the `streaming` feature.
+///
+/// The constructor default is feature-dependent: `Streaming` when `streaming`
+/// is compiled in, otherwise `NonStreaming` (see
+/// [`BareLoop::turn_mode`](crate::engine::BareLoop::turn_mode)). It is
+/// intentionally *not* a `Default` impl on this enum, because a single fixed
+/// `Default` could not express that feature-dependent choice. Switch modes on
+/// a constructed loop with
+/// [`set_turn_mode`](crate::engine::BareLoop::set_turn_mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnMode {
+    /// Fulfil each turn via [`ApiClient::create_message`](crate::api::ApiClient::create_message).
+    ///
+    /// No streaming code is exercised; `on_text_delta`, `on_thinking_delta`,
+    /// and the text streamer never fire. The full assistant text still
+    /// surfaces through [`on_response`](crate::observer::LoopObserver::on_response).
+    NonStreaming,
+
+    /// Fulfil each turn via [`ApiClient::stream_messages`](crate::api::ApiClient::stream_messages)
+    /// wrapped in [`StreamHandler`](crate::stream::handler::StreamHandler).
+    ///
+    /// Requires the `streaming` feature: this variant only exists when the
+    /// feature is enabled, so it cannot be constructed or selected without it.
+    #[cfg(feature = "streaming")]
+    Streaming,
+}
+
+/// Resolve the constructor default for [`TurnMode`].
+///
+/// Streaming when the `streaming` feature is compiled in, non-streaming
+/// otherwise. Kept as a free function so both constructors share one
+/// definition and the `cfg` lives in exactly one place.
+pub(crate) fn default_turn_mode() -> TurnMode {
+    #[cfg(feature = "streaming")]
+    {
+        TurnMode::Streaming
+    }
+    #[cfg(not(feature = "streaming"))]
+    {
+        TurnMode::NonStreaming
+    }
 }
 
 /// A tool call requested by the agent.

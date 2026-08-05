@@ -60,6 +60,7 @@
         clippy::doc_markdown,
         clippy::field_reassign_with_default,
         clippy::used_underscore_items,
+        clippy::wildcard_imports,
     )
 )]
 
@@ -68,6 +69,7 @@ pub mod cancel;
 pub mod capabilities;
 pub mod compact;
 pub mod config;
+pub mod contributor;
 pub mod detection;
 pub mod engine;
 pub mod error;

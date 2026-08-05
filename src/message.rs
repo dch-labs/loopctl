@@ -284,7 +284,7 @@ pub enum Role {
     /// Anthropic and Gemini (which do not accept an inline system role
     /// mid-conversation). Application code does not normally construct
     /// `System` messages directly — they are produced by framework machinery
-    /// like [`ContextContributor`](crate::engine::ContextContributor).
+    /// like [`ContextContributor`](crate::contributor::ContextContributor).
     System,
 }
 

@@ -30,8 +30,9 @@
 use std::sync::Arc;
 
 use crate::config::SessionConfig;
+use crate::contributor::{ContextContributor, ContributorContext};
+use crate::engine::BareLoop;
 use crate::engine::RunConfig;
-use crate::engine::{BareLoop, ContextContributor, ContributorContext};
 use crate::error::LoopError;
 use crate::message::{Message, MessagePart, Role};
 use crate::middleware::{

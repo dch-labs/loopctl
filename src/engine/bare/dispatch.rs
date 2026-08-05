@@ -30,6 +30,7 @@ use crate::capabilities::HealthTrackable;
 use crate::capabilities::Hookable;
 use crate::capabilities::PipelineAware;
 use crate::detection::loop_detector::{self, Operation};
+
 use crate::observer::{ToolPostContext, ToolPreContext};
 use crate::reflection::{Correction, CorrectionResult};
 use crate::tool::ToolRegistry;
@@ -38,21 +39,92 @@ use futures::FutureExt;
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 
-/// Result of deciding what to do after a tool error during recovery.
+/// What the recovery loop decided to do after a tool error.
 ///
-/// Distinguishes between returning a soft-error result (the tool failed, but
-/// the session should continue) and a hard cancellation (the user cancelled
-/// during the recovery backoff sleep).
-enum RecoveryOutcome {
-    /// Return this soft-error result to the caller as a successful dispatch.
+/// Produced by [`recovery_wait_or_return`](BareLoop::recovery_wait_or_return)
+/// after it consults the configured
+/// [`RecoveryStrategy`](crate::reflection::RecoveryStrategy) (and, on a `Retry`
+/// decision, races the backoff sleep against the cancel signal). Matched
+/// exhaustively at the retry-loop call site in
+/// [`execute_tool_call`](BareLoop::execute_tool_call), where each variant maps
+/// to one control-flow branch: continue the loop, return a soft result, or
+/// propagate cancellation.
+///
+/// This is a driver-internal control-flow type — it never escapes the dispatch
+/// module. None of the variants is an "error"; the loop's `Result` is reserved
+/// for actual failures. A `Soft` result carries `is_error: true` *inside* its
+/// [`ToolDispatchResult`], but at this layer it's a value being returned, not
+/// an error being raised.
+enum RecoveryDecision {
+    /// Retry the call after sleeping for the strategy's backoff delay.
     ///
-    /// The result has `is_error: true` — the model sees the failure and can
-    /// decide how to recover.
-    SoftError(ToolDispatchResult),
+    /// Produced only when the strategy returned
+    /// [`RecoveryAction::Retry`](crate::reflection::RecoveryAction::Retry) *and*
+    /// the backoff sleep completed without cancellation. The driver applies
+    /// any carried correction to the [`ToolCall`] before re-entering the
+    /// dispatch loop, then bumps its attempt counter to `next_attempt`. If
+    /// that counter crosses `MAX_RECOVERY_ATTEMPTS`, the loop gives up and
+    /// surfaces [`LoopError::ToolRecoveryExhausted`] rather than retrying
+    /// again — so receiving this variant does not guarantee another attempt
+    /// will actually run.
+    Retry {
+        /// The next attempt number, 1-indexed within the retry sequence.
+        ///
+        /// Pre-incremented by [`recovery_wait_or_return`] so the call site
+        /// just assigns `attempt = next_attempt` — there is exactly one
+        /// `saturating_add(1)` and it lives in the producer, not the
+        /// consumer. The original call is attempt `0`; the first retry is
+        /// `1`; the ceiling check `attempt > MAX_RECOVERY_ATTEMPTS` (default
+        /// 5) fires at `6`.
+        ///
+        /// [`recovery_wait_or_return`]: BareLoop::recovery_wait_or_return
+        next_attempt: u32,
 
-    /// The user cancelled during the recovery backoff sleep.
+        /// An optional correction produced by the
+        /// [`Reflector`](crate::reflection::Reflector) to apply before the
+        /// retry.
+        ///
+        /// `None` when the strategy chose to retry without consulting the
+        /// reflector, or when the reflector had no suggestion. When `Some`,
+        /// the driver routes it through
+        /// [`ToolCall::apply_correction`] before the next attempt, which may
+        /// rewrite the input JSON or swap the tool name. A correction that
+        /// fails validation is logged and dropped — the retry still runs
+        /// with the uncorrected call.
+        ///
+        /// [`ToolCall::apply_correction`]: crate::engine::ToolCall::apply_correction
+        correction: Option<Correction>,
+    },
+
+    /// Stop retrying and return this [`ToolDispatchResult`] to the model as a
+    /// soft error.
     ///
-    /// Propagated as [`LoopError::Cancelled`] so the turn aborts immediately.
+    /// Produced when the strategy chose anything other than `Retry` —
+    /// specifically [`Skip`](crate::reflection::RecoveryAction::Skip),
+    /// [`AskUser`](crate::reflection::RecoveryAction::AskUser), or
+    /// [`Fail`](crate::reflection::RecoveryAction::Fail). The carried result
+    /// is the *original* failing `ToolDispatchResult` (with `is_error: true`),
+    /// cloned verbatim — no new execution happens, the model simply sees the
+    /// failure and gets to decide how to recover on its next turn.
+    ///
+    /// Soft errors do not terminate the run. They flow back through the
+    /// normal tool-result path, the model responds, and the loop continues —
+    /// the model may retry the tool itself, try a different tool, or give up
+    /// and produce a final answer acknowledging the failure.
+    Soft(ToolDispatchResult),
+
+    /// The cancel signal fired during the recovery backoff sleep.
+    ///
+    /// Produced only on the `Retry` path, when
+    /// [`CancelSignal::notified`](crate::cancel::CancelSignal::notified) wins
+    /// the `select!` against `tokio::time::sleep(delay)`. Distinct from a
+    /// cancellation observed during tool *execution* (which surfaces as
+    /// [`LoopError::Cancelled`] directly from the dispatch `select!`): this
+    /// variant specifically means the user cancelled in the gap between
+    /// deciding-to-retry and starting-the-retry. The call site maps it to
+    /// `Err(LoopError::Cancelled)`, which the driver's error path records as
+    /// [`MachineOutcome::Cancelled`](crate::engine::core::MachineOutcome::Cancelled)
+    /// — a clean stop, not a failure.
     Cancelled,
 }
 
@@ -205,6 +277,16 @@ impl ToolDependencyGraph {
 }
 
 impl<C: ApiClient> BareLoop<C> {
+    /// Build a tool context for tool invocations.
+    ///
+    /// Creates a [`ToolContext`] pre-populated with the current session ID.
+    pub(super) fn build_tool_context(&self) -> ToolContext {
+        ToolContext {
+            session_id: self.session.id,
+            ..ToolContext::default()
+        }
+    }
+
     /// Execute a batch of tool calls and return results in input order.
     ///
     /// Routes to the sequential or parallel path based on
@@ -283,6 +365,18 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`LoopError::Cancelled`] if the cancel signal fires during dispatch.
     /// [`LoopError::LoopDetected`] on a hard stop from detection. Any hard
     /// error from an individual [`execute_tool_call`](Self::execute_tool_call).
+    ///
+    /// # Hard-error semantics
+    ///
+    /// A hard error from any call in a wave (cancellation, loop detection, or
+    /// recovery exhaustion) aborts the entire batch immediately. Results from
+    /// sibling calls in the same wave — including ones that already resolved
+    /// successfully — are **discarded**; only the error propagates. This
+    /// matches the sequential path's "first hard error wins" semantics: no
+    /// partial results are returned. Soft errors (`is_error: true`) do *not*
+    /// trigger this — they are collected alongside successful results so the
+    /// model can see all of a turn's outcomes. Pinned by
+    /// `parallel_hard_error_discards_sibling_results`.
     async fn dispatch_tools_parallel(
         &self,
         tool_calls: &[ToolCall],
@@ -335,19 +429,52 @@ impl<C: ApiClient> BareLoop<C> {
             .into_iter()
             .enumerate()
             .map(|(idx, r)| {
-                r.unwrap_or_else(|| {
-                    let tc = tool_calls.get(idx);
-                    ToolDispatchResult {
-                        tool_call_id: tc.map(|c| c.id.clone()).unwrap_or_default(),
-                        output: ToolContent::Text("dispatch produced no result".to_string()),
-                        is_error: true,
-                        duration: Duration::ZERO,
-                        resolved_tool_name: tc.map(|c| c.tool.clone()).unwrap_or_default(),
-                        display_hint: None,
-                    }
-                })
+                // Defensive: the planner invariant guarantees every slot is
+                // filled by the wave loop above. If that invariant ever breaks,
+                // this produces a soft error rather than a panic.
+                r.unwrap_or_else(|| Self::missing_result(tool_calls.get(idx)))
             })
             .collect())
+    }
+
+    /// Build the defensive soft-error result for a parallel-dispatch slot that
+    /// the wave loop did not fill.
+    ///
+    /// Reachable only if the planner invariant ("every slot is filled") breaks.
+    /// Produces a soft error (`is_error: true`, zero duration) so the model can
+    /// react, rather than panicking.
+    fn missing_result(tc: Option<&ToolCall>) -> ToolDispatchResult {
+        ToolDispatchResult {
+            tool_call_id: tc.map(|c| c.id.clone()).unwrap_or_default(),
+            output: ToolContent::Text("dispatch produced no result".to_string()),
+            is_error: true,
+            duration: Duration::ZERO,
+            resolved_tool_name: tc.map(|c| c.tool.clone()).unwrap_or_default(),
+            display_hint: None,
+        }
+    }
+
+    /// Build a [`ToolDispatchResult`] for a dispatched call.
+    ///
+    /// The `tool_call_id` and `resolved_tool_name` come from the call; the
+    /// caller supplies the elapsed `duration`, the `output`, the `is_error`
+    /// flag, and any `display_hint`. Used by the three dispatch-outcome arms
+    /// (success, error, panic) so they share one construction shape.
+    fn result_for_call(
+        tc: &ToolCall,
+        duration: Duration,
+        output: ToolContent,
+        is_error: bool,
+        display_hint: Option<crate::tool::DisplayHint>,
+    ) -> ToolDispatchResult {
+        ToolDispatchResult {
+            tool_call_id: tc.id.clone(),
+            output,
+            is_error,
+            duration,
+            resolved_tool_name: tc.tool.clone(),
+            display_hint,
+        }
     }
 
     /// Execute a single tool call end-to-end.
@@ -400,7 +527,7 @@ impl<C: ApiClient> BareLoop<C> {
             let tool_result = tokio::select! {
                 biased;
                 () = self.cancelled.notified() => return Err(LoopError::Cancelled),
-                r = self.dispatch_tool(&tc, &tool_context, start, turn_idx) => r?,
+                r = self.dispatch_tool(&tc, &tool_context, start, turn_idx) => r,
             };
             self.post_detection(&tc, &tool_result);
             self.notify_tool_post(turn_idx, &tc, &tool_result);
@@ -418,12 +545,21 @@ impl<C: ApiClient> BareLoop<C> {
                 .recovery_wait_or_return(&tc, &tool_result, attempt)
                 .await
             {
-                Ok((next_attempt, correction)) => {
+                RecoveryDecision::Retry {
+                    next_attempt,
+                    correction,
+                } => {
                     attempt = next_attempt;
+                    if attempt > Self::MAX_RECOVERY_ATTEMPTS {
+                        return Err(LoopError::ToolRecoveryExhausted {
+                            tool: tc.tool.clone(),
+                            attempts: attempt,
+                        });
+                    }
                     Self::apply_correction_if_present(&mut tc, correction);
                 }
-                Err(RecoveryOutcome::SoftError(returned_result)) => return Ok(returned_result),
-                Err(RecoveryOutcome::Cancelled) => return Err(LoopError::Cancelled),
+                RecoveryDecision::Soft(returned_result) => return Ok(returned_result),
+                RecoveryDecision::Cancelled => return Err(LoopError::Cancelled),
             }
         }
     }
@@ -497,7 +633,6 @@ impl<C: ApiClient> BareLoop<C> {
         );
         let pattern = self.managers.detection().record_operation(operation);
 
-        // Notify observers, then decide whether to abort.
         self.managers.notify_detected_pattern(&pattern, turn_idx);
         match self.decide_detected_pattern(&pattern) {
             Some(e) => Err(e),
@@ -529,53 +664,41 @@ impl<C: ApiClient> BareLoop<C> {
     /// to a direct registry lookup. Tool panics are caught and converted to
     /// error results. A tool not in the registry produces a soft error.
     ///
-    /// Observer notifications are handled by the caller
-    /// ([`execute_tool_call`](Self::execute_tool_call)).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LoopError`] if loop detection forces a hard stop.
+    /// Always returns a [`ToolDispatchResult`] — hard stops (cancellation,
+    /// loop detection, recovery exhaustion) are handled by the caller
+    /// [`execute_tool_call`](Self::execute_tool_call), which wraps this call.
     async fn dispatch_tool(
         &self,
         tc: &ToolCall,
         tool_context: &ToolContext,
         start: Instant,
         turn_idx: usize,
-    ) -> Result<ToolDispatchResult, LoopError> {
+    ) -> ToolDispatchResult {
         if let Some(pipeline) = self.managers.pipeline() {
             return self
                 .dispatch_via_pipeline(pipeline, tc, tool_context, turn_idx)
                 .await;
         }
 
-        let tool_result = if let Some(tool) = self.tools.get(&tc.tool) {
+        if let Some(tool) = self.tools.get(&tc.tool) {
             let call_result = AssertUnwindSafe(tool.call(tc.input.clone(), tool_context))
                 .catch_unwind()
                 .await;
             match call_result {
-                Ok(Ok(result)) => {
-                    let duration = start.elapsed();
-                    ToolDispatchResult {
-                        tool_call_id: tc.id.clone(),
-                        output: result.payload,
-                        is_error: result.is_error,
-                        duration,
-                        resolved_tool_name: tc.tool.clone(),
-                        display_hint: result.display_hint,
-                    }
-                }
-                Ok(Err(e)) => {
-                    let duration = start.elapsed();
-                    let error_msg = e.to_string();
-                    ToolDispatchResult {
-                        tool_call_id: tc.id.clone(),
-                        output: ToolContent::Text(error_msg),
-                        is_error: true,
-                        duration,
-                        resolved_tool_name: tc.tool.clone(),
-                        display_hint: None,
-                    }
-                }
+                Ok(Ok(result)) => Self::result_for_call(
+                    tc,
+                    start.elapsed(),
+                    result.payload,
+                    result.is_error,
+                    result.display_hint,
+                ),
+                Ok(Err(e)) => Self::result_for_call(
+                    tc,
+                    start.elapsed(),
+                    ToolContent::Text(e.to_string()),
+                    true,
+                    None,
+                ),
                 Err(panic_payload) => {
                     let duration = start.elapsed();
                     let msg = panic_payload
@@ -590,21 +713,18 @@ impl<C: ApiClient> BareLoop<C> {
                         panic_message = %msg,
                         "tool panicked during execution"
                     );
-                    ToolDispatchResult {
-                        tool_call_id: tc.id.clone(),
-                        output: ToolContent::Text(format!("Tool '{}' panicked: {msg}", tc.tool)),
-                        is_error: true,
+                    Self::result_for_call(
+                        tc,
                         duration,
-                        resolved_tool_name: tc.tool.clone(),
-                        display_hint: None,
-                    }
+                        ToolContent::Text(format!("Tool '{}' panicked: {msg}", tc.tool)),
+                        true,
+                        None,
+                    )
                 }
             }
         } else {
             self.tool_not_found(tc)
-        };
-
-        Ok(tool_result)
+        }
     }
 
     /// Build a soft-error result for a tool whose name is not in the registry.
@@ -633,34 +753,28 @@ impl<C: ApiClient> BareLoop<C> {
     /// Consults the [`Reflector`](crate::reflection::Reflector) and
     /// [`RecoveryStrategy`](crate::reflection::RecoveryStrategy). On
     /// [`Retry`](RecoveryAction::Retry), sleeps for the prescribed delay and
-    /// returns the updated attempt count and optional [`Correction`]. On all
-    /// other actions (`Skip`, `Fail`, `AskUser`), returns the original error
-    /// result as a soft error. The backoff sleep is cancel-aware: if the
-    /// cancel signal fires during the wait, returns
-    /// [`RecoveryOutcome::Cancelled`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Err(RecoveryOutcome::SoftError)`] when the recovery strategy
-    /// decides not to retry, or [`Err(RecoveryOutcome::Cancelled)`] when the
-    /// user cancels during the backoff sleep.
+    /// returns [`RecoveryDecision::Retry`] with the updated attempt count and
+    /// optional [`Correction`]. On all other actions (`Skip`, `Fail`,
+    /// `AskUser`), returns [`RecoveryDecision::Soft`] with the original error
+    /// result. The backoff sleep is cancel-aware: if the cancel signal fires
+    /// during the wait, returns [`RecoveryDecision::Cancelled`].
     async fn recovery_wait_or_return(
         &self,
         tc: &ToolCall,
         tool_result: &ToolDispatchResult,
         attempt: u32,
-    ) -> Result<(u32, Option<Correction>), RecoveryOutcome> {
+    ) -> RecoveryDecision {
         let (recovery_action, correction) = self.recover_tool_error(tc, tool_result, attempt).await;
         match recovery_action {
             RecoveryAction::Retry { delay } => {
                 let next_attempt = attempt.saturating_add(1);
                 tokio::select! {
-                    () = tokio::time::sleep(delay) => Ok((next_attempt, correction)),
-                    () = self.cancelled.notified() => Err(RecoveryOutcome::Cancelled),
+                    () = tokio::time::sleep(delay) => RecoveryDecision::Retry { next_attempt, correction },
+                    () = self.cancelled.notified() => RecoveryDecision::Cancelled,
                 }
             }
             RecoveryAction::Skip(_) | RecoveryAction::AskUser(_) | RecoveryAction::Fail(_) => {
-                Err(RecoveryOutcome::SoftError(tool_result.clone()))
+                RecoveryDecision::Soft(tool_result.clone())
             }
         }
     }
@@ -798,20 +912,16 @@ impl<C: ApiClient> BareLoop<C> {
     /// Builds a [`ToolDispatchContext`] and delegates to the pipeline's
     /// middleware chain (timeout, permissions, output limits, etc.).
     ///
-    /// Observer notifications are handled by the caller
+    /// Always returns a [`ToolDispatchResult`] — soft errors are carried as
+    /// `is_error: true`. Observer notifications are handled by the caller
     /// ([`execute_tool_call`](Self::execute_tool_call)).
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error — pipeline dispatch always produces a result
-    /// (soft errors are returned as `Ok` with `is_error: true`).
     async fn dispatch_via_pipeline(
         &self,
         pipeline: &ToolPipeline,
         tc: &ToolCall,
         tool_context: &ToolContext,
         turn_idx: usize,
-    ) -> Result<ToolDispatchResult, LoopError> {
+    ) -> ToolDispatchResult {
         let ctx = ToolDispatchContext {
             tool_name: tc.tool.clone(),
             input: tc.input.clone(),
@@ -822,7 +932,7 @@ impl<C: ApiClient> BareLoop<C> {
             tool_context: tool_context.clone(),
         };
         let dispatch_result = pipeline.invoke(ctx).await;
-        Ok(ToolDispatchResult {
+        ToolDispatchResult {
             tool_call_id: if dispatch_result.tool_call_id.is_empty() {
                 tc.id.clone()
             } else {
@@ -833,7 +943,7 @@ impl<C: ApiClient> BareLoop<C> {
             duration: dispatch_result.duration,
             resolved_tool_name: dispatch_result.resolved_tool_name,
             display_hint: dispatch_result.display_hint,
-        })
+        }
     }
 
     /// Analyse a tool error and decide on a recovery action.
@@ -1070,11 +1180,12 @@ mod tests {
         let tool_context = ToolContext::default();
         let start = Instant::now();
 
-        let result = bare.dispatch_tool(&tc, &tool_context, start, 0).await;
+        let dispatch_result = bare.dispatch_tool(&tc, &tool_context, start, 0).await;
 
-        assert!(result.is_ok(), "panic should be caught, not propagated");
-        let dispatch_result = result.unwrap();
-        assert!(dispatch_result.is_error);
+        assert!(
+            dispatch_result.is_error,
+            "panic should be caught as a soft error"
+        );
         match &dispatch_result.output {
             ToolContent::Text(text) => {
                 assert!(text.contains("panicked"), "expected panic message: {text}");
@@ -1102,10 +1213,8 @@ mod tests {
         let tool_context = ToolContext::default();
         let start = Instant::now();
 
-        let result = bare.dispatch_tool(&tc, &tool_context, start, 0).await;
+        let dispatch_result = bare.dispatch_tool(&tc, &tool_context, start, 0).await;
 
-        assert!(result.is_ok());
-        let dispatch_result = result.unwrap();
         assert!(!dispatch_result.is_error);
         match &dispatch_result.output {
             ToolContent::Text(text) => assert_eq!(text, "ok"),
@@ -1402,6 +1511,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_hard_error_discards_sibling_results() {
+        use crate::testing::MockTool;
+        let mut registry = ToolRegistry::new();
+        registry.register(
+            MockTool::new("fast", "completes immediately")
+                .with_concurrency_safe(true)
+                .with_result("done"),
+        );
+        registry.register(
+            MockTool::new("slow", "blocks until cancelled")
+                .with_concurrency_safe(true)
+                .with_delay(std::time::Duration::from_secs(10)),
+        );
+
+        let run_config = RunConfig {
+            parallel_tool_dispatch: crate::config::ParallelDispatchConfig {
+                mode: crate::config::ParallelMode::Parallel,
+                max_concurrency: 1,
+            },
+            ..RunConfig::default()
+        };
+        let mut bare = BareLoop::new(
+            Arc::new(MockClient::new("test")),
+            registry,
+            SessionConfig::default(),
+        );
+        bare.session.runs.push(Run::new("", &run_config));
+
+        let cancel_signal = bare.cancel_signal();
+        let calls = vec![
+            make_call("1", "fast", Value::Null),
+            make_call("2", "slow", Value::Null),
+        ];
+
+        // Fire cancel shortly after call #1 completes — call #2 (slow, 10s)
+        // will observe it in its `select!` and return Err(Cancelled).
+        let sig = Arc::clone(&cancel_signal);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            sig.cancel();
+        });
+
+        let err = bare
+            .dispatch_tools(&calls, 0)
+            .await
+            .expect_err("hard error should abort the batch");
+        assert!(
+            matches!(err, LoopError::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn parallel_sequential_fallback() {
         use crate::testing::MockTool;
         let config = SessionConfig::default();
@@ -1619,5 +1781,56 @@ mod tests {
             decide_calls.load(Ordering::Relaxed) > 0,
             "execute_tool_call must run recovery on failure"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_ceiling_stops_retry_forever_strategy() {
+        use crate::reflection::{FailureAnalysis, RecoveryAction, RecoveryStrategy};
+
+        struct RetryForever;
+        impl RecoveryStrategy for RetryForever {
+            fn decide(
+                &self,
+                _analysis: &FailureAnalysis,
+                _attempt: u32,
+                _max_attempts: u32,
+            ) -> Pin<Box<dyn Future<Output = RecoveryAction> + Send + '_>> {
+                Box::pin(async {
+                    RecoveryAction::Retry {
+                        delay: std::time::Duration::ZERO,
+                    }
+                })
+            }
+        }
+
+        let error_tool = crate::tool::FnTool::new(
+            "error_tool".into(),
+            "Always errors".into(),
+            Value::Object(serde_json::Map::new()),
+            |_, _| Box::pin(async { Err(ToolError::Execution("boom".to_string())) }),
+        );
+
+        let mut registry = ToolRegistry::new();
+        registry.register(error_tool);
+        let mut bare = make_loop(registry);
+        bare.set_reflector(Arc::new(AlwaysRecoverable));
+        bare.set_recovery_strategy(Arc::new(RetryForever));
+
+        let tc = make_call("1", "error_tool", Value::Null);
+        let err = bare
+            .execute_tool_call(tc, 0)
+            .await
+            .expect_err("retry-forever must hit the ceiling, not loop");
+
+        match err {
+            LoopError::ToolRecoveryExhausted { tool, attempts } => {
+                assert_eq!(tool, "error_tool");
+                assert_eq!(
+                    attempts, 6,
+                    "5 retries after the original call = attempt 6 trips the > 5 ceiling"
+                );
+            }
+            other => panic!("expected ToolRecoveryExhausted, got {other:?}"),
+        }
     }
 }

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- `LoopError::ToolRecoveryExhausted { tool, attempts }` — the driver now enforces `MAX_RECOVERY_ATTEMPTS` (5) as a hard ceiling. A recovery strategy that always returns `Retry` is stopped after 5 retries (attempt 6), returning this variant instead of looping forever. Pinned by `recovery_ceiling_stops_retry_forever_strategy`.
+- `RunConfig::memory_top_k` — configurable number of memory entries retrieved and injected per turn (default 3; was a hardcoded magic number).
+- `MachineStep::CallTools { turn, calls }` — the machine now emits the 0-indexed turn number on `CallTools` (matching `CallLLM`), so both handlers source the turn identically from the machine rather than one reading a field and the other querying a counter.
+- `parallel_hard_error_discards_sibling_results` test — pins the documented contract that a hard error in a parallel wave aborts the batch and discards already-completed sibling results.
+
+### Changed
+
+- **Breaking:** Machine turn indices are now 0-indexed (`CallLLM { turn: 0 }` for the first turn). Previously 1-indexed (`turn: 1`). `AwaitingModel { turn }` and `AwaitingTools { turn }` follow the same convention. Callers matching on these variants in tests or drivers must adjust.
+- **Breaking:** `LoopError` gains `ToolRecoveryExhausted` variant. Exhaustive matches on `LoopError` must add this arm.
+- **Breaking:** `RunConfig` gains `memory_top_k` field. Struct-literal construction must add it (use `..Default::default()` or the builders).
+- **Breaking:** `MachineStep::CallTools` gains a `turn` field. Pattern matches must update.
+- `engine/bare.rs` decomposed from 6,745 lines into a ~1,200-line facade plus focused submodules: `llm_turn` (both LLM-turn paths + shared request builder), `config` (set_*/with_* builders), `emission` (all observer/hook fan-out centralized), `model_switch`, and `tests`. Each `MachineStep` arm now maps to exactly one submodule.
+- Streaming and non-streaming LLM-turn paths merged into `llm_turn.rs` with a shared `build_turn_request`, eliminating the duplicated request-construction block.
+- Observer fan-out centralized in `emission.rs` — every `on_*` event family (run, turn, tool, stream, compaction, fallback) now lives in one module instead of scattered across five files.
+- `MachineOutcome::to_loop_error` — canonical outcome→error translator in `core/outcome.rs`, replacing three duplicated mapping sites.
+- `RecoveryDecision` enum replaces `Result<(u32, Option<Correction>), RecoveryOutcome>` — three clear variants (`Retry`, `Soft`, `Cancelled`) instead of a `Result` where `Err` meant "not an error."
+- `TurnAccounting` struct bundles the turn start + token pair forwarded through `dispatch_and_record`, shrinking the signature from 5 positional params to 3.
+- `dispatch_tool` and `dispatch_via_pipeline` return `ToolDispatchResult` directly (were `Result<ToolDispatchResult, LoopError>` but never returned `Err`).
+- `apply_loop_detection` no longer calls `set_error_state` — the single `set_error_state` in `run()`'s error path handles all terminal-state transitions, eliminating the double-invocation.
+- Tool-dispatch turn-accounting lookup keyed on `current_turn` explicitly (was `turns.last()` positional), so a future reorder produces clean `(0, 0)` rather than the wrong turn's tokens.
+- `token_counter` single-source: `set_context_manager` no longer syncs its counter onto the driver field; `count_context()` prefers the manager's counter, falling back to the driver field only when no manager is configured.
+- `millis_u64` unified across `emission.rs` and `compact.rs` (was duplicated with different overflow fallbacks: `u64::MAX` vs `0`).
+- `current_run`/`current_run_mut` wrappers removed; callers delegate to `Session`'s existing methods.
+- Loop-detection decision logic (`decide_detected_pattern`, `apply_loop_detection`) moved to `llm_turn.rs` (response-side), separating it from tool-operation detection (`pre_detection`/`post_detection`) in `dispatch.rs`.
+
+### Fixed
+
+- `set_token_counter` doc corrected — no longer claims a sync with `ContextManager` that the code doesn't perform. The driver field is documented as a fallback used only when no manager is configured.
+- `ModelSwitch` doc corrected — removed stale "max-tokens" reference (the builder only has `context_window`).
+- `MAX_RECOVERY_ATTEMPTS` doc rewritten — states the one-knob design (strategy sees the same ceiling the driver enforces) instead of implying two independent limits.
+- `dispatch_tools_parallel` doc now documents hard-error semantics: a hard error from any call in a wave discards sibling results.
+
 ## [0.2.1] - 2026-08-04
 
 ### Fixed

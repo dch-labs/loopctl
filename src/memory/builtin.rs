@@ -237,7 +237,6 @@ impl LoopMemory for InMemoryStore {
         Box::pin(async move {
             let query_lower = query.to_lowercase();
             let query_words: Vec<&str> = query_lower.split_whitespace().collect();
-
             let entries = crate::error::recover_guard(self.entries.read());
             let snapshot: Vec<MemoryEntry> = entries.iter().cloned().collect();
             drop(entries);

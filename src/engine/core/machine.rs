@@ -28,11 +28,11 @@ pub enum MachineStep {
     /// The driver builds the feed (the messages actually sent to the LLM) from
     /// [`LoopMachine::history`], calls the provider, and feeds the completed
     /// [`ModelResponse`] back via [`LoopMachine::model_response`]. `turn` is the
-    /// 1-indexed number of the turn being requested.
+    /// 0-indexed number of the turn being requested.
     CallLLM {
-        /// The 1-indexed turn number being requested.
+        /// The 0-indexed turn number being requested.
         ///
-        /// Starts at `1` on the first call after construction and increments
+        /// Starts at `0` on the first call after construction and increments
         /// with each completed model response. The driver can use it to tag
         /// observer events, logs, and rate-limit bookkeeping so each turn is
         /// correlatable back to its request.
@@ -47,6 +47,14 @@ pub enum MachineStep {
     /// driver feeds the tool-result [`Message`]s back via
     /// [`LoopMachine::tool_results`].
     CallTools {
+        /// The 0-indexed turn number whose tool calls are being dispatched.
+        ///
+        /// Matches the `turn` of the preceding [`MachineStep::CallLLM`] — the
+        /// tools belong to the model response that just completed. The driver
+        /// uses it to tag observer events so the LLM and tool events for the
+        /// same turn correlate.
+        turn: usize,
+
         /// The tool calls awaiting dispatch, with any preresolved results.
         ///
         /// Exactly the calls the model requested in the preceding
@@ -221,7 +229,7 @@ pub enum MachineState {
     /// Entered when the machine emits [`MachineStep::CallLLM`] and left when the
     /// driver feeds the [`ModelResponse`] back via [`LoopMachine::model_response`].
     AwaitingModel {
-        /// The 1-indexed turn number in flight.
+        /// The 0-indexed turn number in flight.
         ///
         /// Matches the `turn` carried on the outstanding [`MachineStep::CallLLM`].
         turn: usize,
@@ -233,7 +241,7 @@ pub enum MachineState {
     /// the driver feeds the tool-result messages back via
     /// [`LoopMachine::tool_results`].
     AwaitingTools {
-        /// The 1-indexed turn number the tool calls belong to.
+        /// The 0-indexed turn number the tool calls belong to.
         ///
         /// Lets a host correlate a dispatch back to the model response that
         /// requested it.
@@ -482,15 +490,16 @@ impl LoopMachine {
 
         let turn = match &self.state {
             MachineState::AwaitingModel { turn } => *turn,
-            _ => self.turns_taken.saturating_add(1),
+            _ => self.turns_taken,
         };
+
         match self.state.clone() {
             MachineState::Start | MachineState::AwaitingModel { .. } => {
                 self.request_model(turn, policy)
             }
-            MachineState::AwaitingTools { .. } => {
+            MachineState::AwaitingTools { turn, .. } => {
                 let calls = std::mem::take(&mut self.pending_tools);
-                MachineStep::CallTools { calls }
+                MachineStep::CallTools { turn, calls }
             }
             MachineState::AwaitingCompaction { reason } => MachineStep::Compact { reason },
             MachineState::Terminal(outcome) => MachineStep::Done(outcome),
@@ -580,6 +589,7 @@ impl LoopMachine {
                 input: input.clone(),
             })
             .collect();
+        let turn_number = self.turns_taken;
         self.pending.push(message);
         self.context_tokens = context_tokens;
         self.turns_taken = self.turns_taken.saturating_add(1);
@@ -595,7 +605,6 @@ impl LoopMachine {
             return;
         }
 
-        let turn_number = self.turns_taken;
         self.pending_tools = tool_calls
             .into_iter()
             .map(|call| Self::classify(call, &response.available_tools))
@@ -627,7 +636,7 @@ impl LoopMachine {
     /// of the record the driver builds the feed from on the next
     /// [`MachineStep::CallLLM`]. Has no effect once the machine is terminal.
     ///
-    /// [`ContextContributor`]: crate::engine::ContextContributor
+    /// [`ContextContributor`]: crate::contributor::ContextContributor
     pub fn inject(&mut self, message: Message) {
         if self.is_terminal() {
             return;
@@ -880,8 +889,8 @@ mod tests {
         let MachineStep::CallLLM { turn } = step else {
             panic!("expected CallLLM, got {step:?}");
         };
-        assert_eq!(turn, 1);
-        assert_eq!(machine.state(), MachineState::AwaitingModel { turn: 1 });
+        assert_eq!(turn, 0);
+        assert_eq!(machine.state(), MachineState::AwaitingModel { turn: 0 });
     }
 
     #[test]
@@ -922,7 +931,7 @@ mod tests {
         let _ = machine.next_step(test_policy(5));
         machine.model_response(tool_response("echo", &["echo"], 10), 0);
         let step = machine.next_step(test_policy(5));
-        let MachineStep::CallTools { calls } = &step else {
+        let MachineStep::CallTools { turn: _, calls } = &step else {
             panic!("expected CallTools, got {step:?}");
         };
         let results: Vec<Message> = calls
@@ -975,18 +984,18 @@ mod tests {
     #[test]
     fn max_turns_enforced_by_machine() {
         let mut machine = small_machine();
+        // Turn 0.
+        assert!(matches!(
+            machine.next_step(test_policy(2)),
+            MachineStep::CallLLM { turn: 0 }
+        ));
+        machine.model_response(tool_response("echo", &["echo"], 0), 0);
+        let _ = machine.next_step(test_policy(2));
+        machine.tool_results(vec![Message::user("r")]);
         // Turn 1.
         assert!(matches!(
             machine.next_step(test_policy(2)),
             MachineStep::CallLLM { turn: 1 }
-        ));
-        machine.model_response(tool_response("echo", &["echo"], 1), 0);
-        let _ = machine.next_step(test_policy(2));
-        machine.tool_results(vec![Message::user("r")]);
-        // Turn 2.
-        assert!(matches!(
-            machine.next_step(test_policy(2)),
-            MachineStep::CallLLM { turn: 2 }
         ));
         machine.model_response(tool_response("echo", &["echo"], 1), 0);
         let _ = machine.next_step(test_policy(2));
@@ -1052,7 +1061,7 @@ mod tests {
         let _ = machine.next_step(test_policy(5));
         machine.model_response(tool_response("ghost", &["echo", "ls"], 3), 0);
         let step = machine.next_step(test_policy(5));
-        let MachineStep::CallTools { calls } = step else {
+        let MachineStep::CallTools { turn: _, calls } = step else {
             panic!("expected CallTools, got {step:?}");
         };
         let call = calls.first().expect("one call");
@@ -1073,7 +1082,7 @@ mod tests {
         let _ = machine.next_step(test_policy(5));
         machine.model_response(tool_response("echo", &["echo", "ls"], 3), 0);
         let step = machine.next_step(test_policy(5));
-        let MachineStep::CallTools { calls } = step else {
+        let MachineStep::CallTools { turn: _, calls } = step else {
             panic!("expected CallTools, got {step:?}");
         };
         let call = calls.first().expect("one call");
@@ -1284,7 +1293,7 @@ mod tests {
         let _ = machine.next_step(test_policy(5));
         machine.model_response(tool_response("echo", &["echo"], 1), 0);
         let step = machine.next_step(test_policy(5));
-        let MachineStep::CallTools { calls } = step else {
+        let MachineStep::CallTools { turn: _, calls } = step else {
             panic!("expected CallTools, got {step:?}");
         };
         let result = Message::new(

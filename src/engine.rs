@@ -33,9 +33,7 @@
 //! [`MachineStep`]: crate::engine::core::MachineStep
 
 mod bare;
-pub mod contributor;
 pub mod core;
 
 pub use bare::*;
-pub use contributor::*;
 pub use core::*;

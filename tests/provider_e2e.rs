@@ -4,7 +4,21 @@
 //!
 //! Run:
 //!   `set -a; source .env; set +a; LOOPCTL_E2E=1 cargo test --features ollama,openai,anthropic,gemini,grok,deepseek,zai --test provider_e2e -- --nocapture --test-threads=1`
+//!
+//! The whole file compiles only when at least one provider feature is on;
+//! without a provider the helpers have no callers and would trip the
+//! `dead_code` lint under `-D warnings`.
 
+#![cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "ollama",
+    feature = "deepseek",
+    feature = "grok",
+    feature = "xai",
+    feature = "gemini",
+    feature = "zai",
+))]
 #![allow(
     clippy::pedantic,
     clippy::unwrap_used,

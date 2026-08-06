@@ -744,13 +744,12 @@ mod tests {
             std::time::Duration::MAX
         );
         managers.set_stream_handler(handler);
-        // After set_stream_handler, the production defaults apply (15 min total).
         assert_eq!(
             managers
                 .stream_handler()
                 .timeout_config()
                 .total_stream_timeout,
-            std::time::Duration::from_mins(15)
+            std::time::Duration::from_mins(5)
         );
     }
 

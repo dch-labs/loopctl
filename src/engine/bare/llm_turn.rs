@@ -88,13 +88,17 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Builds the request via [`build_turn_request`](Self::build_turn_request),
     /// then calls [`ApiClient::create_message_with_options`] and races it
-    /// against [`CancelSignal::notified`](crate::cancel::CancelSignal::notified)
-    /// so cancellation still wakes the turn. Records success/failure via the
-    /// shared `record_*` helpers.
+    /// against both [`CancelSignal::notified`](crate::cancel::CancelSignal::notified)
+    /// and the configured total-stream timeout. The timeout reuses
+    /// [`StreamTimeoutConfig::total_stream_timeout`] so both turn paths share one
+    /// wall-clock budget; the streaming path enforces it inside `StreamHandler`,
+    /// this path enforces it here. Records success/failure via the shared
+    /// `record_*` helpers.
     ///
     /// # Errors
     ///
     /// Returns [`LoopError::Cancelled`] if cancellation wins the `select!`;
+    /// [`LoopError::Api`] with a timeout message if the deadline elapses;
     /// otherwise the provider error mapped to [`LoopError::Api`].
     async fn do_create_message(
         &mut self,
@@ -105,9 +109,13 @@ impl<C: ApiClient> BareLoop<C> {
         let cancel = std::sync::Arc::clone(&self.cancelled);
         let client = &self.client;
         let options = self.request_options.clone();
+        let timeout = self.turn_timeout();
         let result = tokio::select! {
             biased;
             () = cancel.notified() => Err(LoopError::Cancelled),
+            () = tokio::time::sleep(timeout) => {
+                Err(LoopError::Api(format!("request timed out after {timeout:?}")))
+            }
             res = client.create_message_with_options(&request, options) => {
                 res.map_err(|e| LoopError::Api(e.to_string()))
             }

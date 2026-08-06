@@ -702,9 +702,47 @@ async fn cancel_during_non_streaming_turn_does_not_trip_breaker() {
     );
 }
 
-/// Streaming-path twin of the test above: a clean cancel during a
-/// streaming turn must not fire `on_stream_failure`. Proves the
-/// `record_turn_failure` Cancelled guard holds for both turn modes.
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn non_streaming_turn_times_out() {
+    use crate::stream::handler::{StreamHandler, StreamTimeoutConfig};
+    use std::time::Duration;
+
+    let client = BlockingClient {
+        started: Arc::new(AtomicBool::new(false)),
+    };
+
+    let handler = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+        initial_event_timeout: Duration::from_millis(10),
+        per_event_timeout: Duration::from_millis(10),
+        total_stream_timeout: Duration::from_millis(50),
+        ..Default::default()
+    });
+    let managers = LoopManagers::new()
+        .with_fallback(FallbackManager::default())
+        .with_stream_handler(handler);
+
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    agent.set_turn_mode(TurnMode::NonStreaming);
+
+    let result = agent.run("Hi", &RunConfig::default()).await;
+    let err = result.expect_err("a blocking non-streaming turn must time out");
+    match err {
+        LoopError::Api(msg) => {
+            assert!(
+                msg.contains("timed out"),
+                "expected timeout message, got: {msg}"
+            );
+        }
+        other => panic!("expected LoopError::Api with timeout, got {other:?}"),
+    }
+}
+
 #[cfg(feature = "streaming")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_during_streaming_turn_does_not_trip_breaker() {

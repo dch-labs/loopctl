@@ -84,6 +84,8 @@ use crate::hooks::context::{RunEndContext as HookRunEndContext, RunEndReason};
 #[cfg(feature = "hooks")]
 use crate::hooks::{HookAction, HookExecutor};
 use crate::managers::LoopManagers;
+#[cfg(feature = "streaming")]
+use crate::managers::StreamCapable;
 use crate::message::{Message, MessagePart, Role, ToolContent};
 use crate::middleware::{ToolDispatchContext, ToolPipeline, ToolPipelineBuilder};
 use crate::reflection::{
@@ -499,6 +501,34 @@ impl<C: ApiClient> BareLoop<C> {
             compact_threshold: self.session.config.compact_threshold,
             auto_compact: self.session.config.auto_compact,
         }
+    }
+
+    /// Wall-clock deadline for a single non-streaming turn.
+    ///
+    /// Reuses the streaming path's `total_stream_timeout` (via
+    /// [`StreamHandler`](crate::stream::handler::StreamHandler)'s config) when
+    /// the `streaming` feature is compiled in, so both turn paths share one
+    /// budget. Under `default = []` there is no `StreamHandler`, so a
+    /// 5-minute hardcoded default applies instead.
+    #[cfg(feature = "streaming")]
+    fn turn_timeout(&self) -> Duration {
+        self.managers
+            .stream_handler()
+            .timeout_config()
+            .total_stream_timeout
+    }
+
+    /// Wall-clock deadline for a single non-streaming turn (no-streaming
+    /// fallback).
+    ///
+    /// Hardcoded 5-minute default. Tighter than the streaming path's 15-minute
+    /// `total_stream_timeout` because a non-streaming turn is a single HTTP
+    /// request — if it hasn't returned in 5 minutes, something is wrong. See
+    /// the `streaming`-feature variant for the configurable path.
+    #[cfg(not(feature = "streaming"))]
+    fn turn_timeout(&self) -> Duration {
+        let _ = self;
+        Duration::from_mins(5)
     }
 
     /// Estimate the token count of `history`, preferring the configured
@@ -1184,23 +1214,20 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                             return Err(e);
                         }
                     }
-                    MachineStep::Done(outcome) => {
-                        let err = match outcome {
-                            MachineOutcome::Completed { final_text } => {
-                                if let Some(run) = self.session.current_run_mut() {
-                                    run.output = Some(final_text);
-                                }
-                                break;
+                    MachineStep::Done(outcome) => match outcome {
+                        MachineOutcome::Completed { final_text } => {
+                            if let Some(run) = self.session.current_run_mut() {
+                                run.output = Some(final_text);
                             }
-                            MachineOutcome::MaxTurnsExceeded => LoopError::MaxTurnsExceeded {
-                                max: run_config.max_turns,
-                            },
-                            MachineOutcome::Cancelled => LoopError::Cancelled,
-                            MachineOutcome::Failed { error } => error,
-                        };
-                        self.finalize(Some(&err)).await?;
-                        return Err(err);
-                    }
+                            break;
+                        }
+                        other => {
+                            if let Some(err) = other.to_loop_error(run_config.max_turns) {
+                                self.finalize(Some(&err)).await?;
+                                return Err(err);
+                            }
+                        }
+                    },
                 }
             }
 

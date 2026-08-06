@@ -113,9 +113,13 @@ impl<C: ApiClient> BareLoop<C> {
         let result = tokio::select! {
             biased;
             () = cancel.notified() => Err(LoopError::Cancelled),
-            () = tokio::time::sleep(timeout) => {
-                Err(LoopError::Api(format!("request timed out after {timeout:?}")))
-            }
+            () = async {
+                if timeout == std::time::Duration::MAX {
+                    std::future::pending::<()>().await;
+                } else {
+                    tokio::time::sleep(timeout).await;
+                }
+            } => Err(LoopError::Api(format!("request timed out after {timeout:?}"))),
             res = client.create_message_with_options(&request, options) => {
                 res.map_err(|e| LoopError::Api(e.to_string()))
             }

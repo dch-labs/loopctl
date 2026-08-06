@@ -743,6 +743,23 @@ async fn non_streaming_turn_times_out() {
     }
 }
 
+#[tokio::test]
+async fn non_streaming_turn_completes_with_timeout_disabled() {
+    let client = MockClient::new("test");
+    client.add_text_response("hello");
+
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    agent.set_turn_mode(TurnMode::NonStreaming);
+
+    let result = agent.run("Hi", &RunConfig::default()).await;
+    let run = result.expect("turn must complete when timeout is disabled");
+    assert_eq!(
+        run.output.as_deref(),
+        Some("hello"),
+        "the pending() timeout branch must not interfere with a normal response"
+    );
+}
+
 #[cfg(feature = "streaming")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_during_streaming_turn_does_not_trip_breaker() {
@@ -1028,6 +1045,28 @@ async fn memory_top_k_zero_skips_retrieve() {
         retrieve_calls.load(Ordering::Relaxed),
         0,
         "memory_top_k == 0 must skip retrieve entirely"
+    );
+
+    // Positive control: with memory_top_k > 0, retrieve IS called.
+    let client2 = MockClient::new("test");
+    client2.add_text_response("done");
+    let retrieve_calls2 = Arc::new(AtomicUsize::new(0));
+    let memory2 = Arc::new(TrackingMemory {
+        retrieve_calls: Arc::clone(&retrieve_calls2),
+    });
+    let mut agent2 = BareLoop::new(Arc::new(client2), ToolRegistry::new(), make_config());
+    agent2.set_memory(memory2);
+
+    let config2 = RunConfig {
+        memory_top_k: 3,
+        ..Default::default()
+    };
+    agent2.run("go", &config2).await.unwrap();
+
+    assert_eq!(
+        retrieve_calls2.load(Ordering::Relaxed),
+        1,
+        "memory_top_k > 0 must call retrieve exactly once per turn"
     );
 }
 

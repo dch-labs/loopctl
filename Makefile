@@ -1,9 +1,12 @@
-.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama
+.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default
 
-ci: fmt check clippy test docs examples
+ci: fmt check check-default clippy test docs examples
 
 check:
 	cargo check --all-features
+
+check-default:
+	cargo clippy --all-targets -- -D warnings
 
 test:
 	cargo test --all-features

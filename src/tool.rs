@@ -1952,12 +1952,14 @@ mod tests {
     }
 
     /// A stub tool that returns a fixed hinted `ToolOutput`.
+    #[cfg(feature = "testing")]
     struct HintedTool {
         name: &'static str,
         output_text: &'static str,
         hint: Option<DisplayHint>,
     }
 
+    #[cfg(feature = "testing")]
     impl Tool for HintedTool {
         fn name(&self) -> &'static str {
             self.name
@@ -1987,11 +1989,13 @@ mod tests {
     }
 
     /// Captures every `on_tool_post` snapshot for later assertion.
+    #[cfg(feature = "testing")]
     #[derive(Default)]
     struct PostCapture {
         posts: std::sync::Mutex<Vec<crate::observer::ToolPostContext>>,
     }
 
+    #[cfg(feature = "testing")]
     impl crate::observer::LoopObserver for PostCapture {
         fn name(&self) -> &'static str {
             "post-capture"

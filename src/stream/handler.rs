@@ -56,8 +56,8 @@ use std::time::{Duration, Instant};
 /// | Timeout                 | Phase   | Default | Purpose                       |
 /// |-------------------------|---------|---------|-------------------------------|
 /// | `initial_event_timeout` | Init    | 120s    | First event after stream open |
-/// | `per_event_timeout`     | Process | 300s    | Between consecutive events    |
-/// | `total_stream_timeout`  | Process | 900s    | Maximum total stream duration |
+/// | `per_event_timeout`     | Process | 180s    | Between consecutive events    |
+/// | `total_stream_timeout`  | Process | 300s    | Maximum total stream duration |
 ///
 /// # Example
 ///
@@ -70,7 +70,7 @@ use std::time::{Duration, Instant};
 ///     per_event_timeout: Duration::from_secs(180),
 ///     ..Default::default()
 /// };
-/// assert_eq!(config.total_stream_timeout, Duration::from_secs(900));
+/// assert_eq!(config.total_stream_timeout, Duration::from_secs(300));
 /// ```
 #[derive(Debug, Clone)]
 pub struct StreamTimeoutConfig {
@@ -112,8 +112,8 @@ impl Default for StreamTimeoutConfig {
     fn default() -> Self {
         Self {
             initial_event_timeout: Duration::from_mins(2),
-            per_event_timeout: Duration::from_mins(5),
-            total_stream_timeout: Duration::from_mins(15),
+            per_event_timeout: Duration::from_mins(3),
+            total_stream_timeout: Duration::from_mins(5),
             max_consecutive_timeouts: 10,
             fallback_to_non_streaming: true,
         }
@@ -1439,8 +1439,8 @@ impl StreamHandler {
     ///
     /// The defaults are suitable for production LLM API usage:
     /// - 120s initial event timeout
-    /// - 300s per-event timeout
-    /// - 900s total stream timeout
+    /// - 180s per-event timeout
+    /// - 300s total stream timeout
     /// - 3 retries with 100ms base delay
     ///
     /// # Example
@@ -2245,8 +2245,8 @@ mod tests {
     fn timeout_config_default_values() {
         let config = StreamTimeoutConfig::default();
         assert_eq!(config.initial_event_timeout, Duration::from_mins(2));
-        assert_eq!(config.per_event_timeout, Duration::from_mins(5));
-        assert_eq!(config.total_stream_timeout, Duration::from_mins(15));
+        assert_eq!(config.per_event_timeout, Duration::from_mins(3));
+        assert_eq!(config.total_stream_timeout, Duration::from_mins(5));
         assert_eq!(config.max_consecutive_timeouts, 10);
         assert!(config.fallback_to_non_streaming);
     }

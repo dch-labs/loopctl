@@ -2,9 +2,9 @@
 //!
 //! A [`ContextContributor`] produces an optional [`Message`] that the loop
 //! appends to the conversation before the next model call. Register one on
-//! [`BareLoop`](super::BareLoop) via
-//! [`add_contributor`](super::BareLoop::add_contributor); the loop consults
-//! every registered contributor at the top of each turn, after
+//! [`BareLoop`](crate::engine::BareLoop) via
+//! [`add_contributor`](crate::engine::BareLoop::add_contributor); the loop
+//! consults every registered contributor at the top of each turn, after
 //! [`on_turn_start`](crate::observer::LoopObserver::on_turn_start) and before
 //! the model is called. A typical use is re-emitting the agent's goal or
 //! current plan every few turns so a small model stays on-task.
@@ -34,7 +34,7 @@ use crate::message::Message;
 ///
 /// ```rust,ignore
 /// use std::sync::atomic::{AtomicUsize, Ordering};
-/// use loopctl::engine::{ContextContributor, ContributorContext};
+/// use loopctl::contributor::{ContextContributor, ContributorContext};
 /// use loopctl::message::{Message, MessagePart, Role};
 ///
 /// // Re-emit a reminder every 5 turns.

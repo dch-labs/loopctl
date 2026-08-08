@@ -1,4 +1,5 @@
-//! MCP client adapter — adapt MCP servers as loopctl [`Tool`] implementations.
+//! MCP client + server adapters — bridge loopctl and the Model Context Protocol
+//! in both directions.
 //!
 //! [Model Context Protocol][mcp] servers expose callable *tools*. This module
 //! connects one server, discovers its tools (`tools/list`), and wraps each one
@@ -75,7 +76,6 @@ const DEFAULT_MCP_CALL_TIMEOUT: Duration = Duration::from_mins(1);
 
 use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
-use rmcp::model::ContentBlock;
 use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::transport::IntoTransport;
@@ -83,9 +83,12 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::TokioChildProcess;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 
-use crate::message::ToolContent as MessageToolContent;
-use crate::message::ToolContentPart;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSchema};
+
+mod convert;
+pub mod server;
+
+pub use server::McpServerAdapter;
 
 /// Buffer size for the in-process duplex channel ([`McpClient::in_process`]).
 const DUPLEX_BUFFER: usize = 4096;
@@ -249,7 +252,7 @@ impl McpClient {
             .call_tool(params)
             .await
             .map_err(|e| ToolError::Execution(format!("MCP tools/call failed: {e}")))?;
-        bridge_result(server_name, result).map_err(|e| ToolError::Execution(e.to_string()))
+        convert::bridge_result(server_name, result).map_err(|e| ToolError::Execution(e.to_string()))
     }
 
     /// Connect to an MCP server running as a child process over stdio.
@@ -1137,96 +1140,17 @@ fn bridge_tool(
     })
 }
 
-/// Bridge a rmcp `CallToolResult` into a loopctl [`ToolOutput`].
-///
-/// Maps the result's content blocks into [`MessageToolContent`]: a single text
-/// block becomes [`MessageToolContent::Text`]; any other shape (multiple blocks,
-/// an image) becomes [`MessageToolContent::Multipart`]. `isError` becomes
-/// [`ToolOutput::is_error`] — a server-reported tool error is a *soft* failure,
-/// matching how native loopctl tools report recoverable errors. `structuredContent`,
-/// when present, is appended as one extra JSON-stringified text part (carried,
-/// not parsed). An error with no content at all becomes
-/// [`McpError::EmptyToolError`] carrying `tool_name`.
-///
-/// A successful result with zero content blocks yields an empty successful
-/// [`ToolOutput`] (no error) — the server ran the tool and returned nothing.
-///
-/// # Errors
-///
-/// [`McpError::EmptyToolError`] when the server reported an error but supplied
-/// no content to surface.
-fn bridge_result(
-    tool_name: &str,
-    res: rmcp::model::CallToolResult,
-) -> Result<ToolOutput, McpError> {
-    let is_error = res.is_error.unwrap_or(false);
-    let mut parts: Vec<ToolContentPart> = res.content.iter().map(bridge_content).collect();
-    if let Some(structured) = res.structured_content {
-        let note = serde_json::to_string(&structured)
-            .unwrap_or_else(|_| "<unserializable structuredContent>".to_string());
-        parts.push(ToolContentPart::text(note));
-    }
-    if parts.is_empty() {
-        return if is_error {
-            Err(McpError::EmptyToolError(tool_name.to_string()))
-        } else {
-            Ok(ToolOutput::text(String::new()))
-        };
-    }
-    let payload = if parts.len() == 1 {
-        match parts.pop() {
-            Some(ToolContentPart::Text { text }) => MessageToolContent::Text(text),
-            Some(single) => MessageToolContent::Multipart(vec![single]),
-            None => MessageToolContent::Text(String::new()),
-        }
-    } else {
-        MessageToolContent::Multipart(parts)
-    };
-    let output = if is_error {
-        ToolOutput::error(payload)
-    } else {
-        ToolOutput::success(payload)
-    };
-    Ok(output)
-}
-
-/// Map one rmcp content block to a loopctl [`ToolContentPart`].
-///
-/// Text and image carry through. Audio falls back to a short text note. Embedded
-/// resources and resource links are stringified with their identifying payload
-/// (uri, text/name) so the model sees *what* the server returned, not just that
-/// it returned something. Any future block kind falls back to a generic note.
-fn bridge_content(block: &ContentBlock) -> ToolContentPart {
-    match block {
-        ContentBlock::Text(text) => ToolContentPart::text(&text.text),
-        ContentBlock::Image(image) => ToolContentPart::image(
-            crate::message::ImageSource::new_base64(&image.mime_type, &image.data),
-        ),
-        ContentBlock::Resource(resource) => match &resource.resource {
-            rmcp::model::ResourceContents::TextResourceContents { uri, text, .. } => {
-                ToolContentPart::text(format!("MCP resource {uri}: {text}"))
-            }
-            rmcp::model::ResourceContents::BlobResourceContents { uri, .. } => {
-                ToolContentPart::text(format!("MCP resource {uri}: (blob)"))
-            }
-            _ => ToolContentPart::text("unsupported MCP content type: embedded resource"),
-        },
-        ContentBlock::ResourceLink(link) => {
-            ToolContentPart::text(format!("MCP resource link: {} ({})", link.name, link.uri))
-        }
-        _ => ToolContentPart::text("unsupported MCP content type"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::ToolContent as MessageToolContent;
+    use crate::message::ToolContentPart;
     use rmcp::model::{CallToolResult, ContentBlock};
 
     #[test]
     fn bridge_result_single_text_becomes_text_payload() {
         let res = CallToolResult::success(vec![ContentBlock::text("hi")]);
-        let out = bridge_result("t", res).expect("success bridges");
+        let out = convert::bridge_result("t", res).expect("success bridges");
         assert!(!out.is_error);
         assert!(matches!(out.payload, MessageToolContent::Text(_)));
         assert_eq!(out.text_content(), "hi");
@@ -1235,7 +1159,7 @@ mod tests {
     #[test]
     fn bridge_result_single_image_becomes_single_part_multipart() {
         let res = CallToolResult::success(vec![ContentBlock::image("Zm9v", "image/png")]);
-        let out = bridge_result("t", res).expect("success bridges");
+        let out = convert::bridge_result("t", res).expect("success bridges");
         assert!(!out.is_error);
         match out.payload {
             MessageToolContent::Multipart(parts) => {
@@ -1255,7 +1179,7 @@ mod tests {
             ContentBlock::image("Zg==", "image/jpeg"),
             ContentBlock::text("b"),
         ]);
-        let out = bridge_result("t", res).expect("success bridges");
+        let out = convert::bridge_result("t", res).expect("success bridges");
         let MessageToolContent::Multipart(parts) = out.payload else {
             panic!("expected Multipart");
         };
@@ -1268,7 +1192,7 @@ mod tests {
     #[test]
     fn bridge_result_soft_error_returns_ok_with_is_error() {
         let res = CallToolResult::error(vec![ContentBlock::text("boom")]);
-        let out = bridge_result("t", res).expect("soft error is Ok");
+        let out = convert::bridge_result("t", res).expect("soft error is Ok");
         assert!(out.is_error);
         assert_eq!(out.text_content(), "boom");
     }
@@ -1276,7 +1200,7 @@ mod tests {
     #[test]
     fn bridge_result_empty_error_is_hard_empty_tool_error_with_name() {
         let res = CallToolResult::error(vec![]);
-        let err = bridge_result("search", res).expect_err("empty error is hard Err");
+        let err = convert::bridge_result("search", res).expect_err("empty error is hard Err");
         match err {
             McpError::EmptyToolError(name) => assert_eq!(name, "search"),
             other => panic!("expected EmptyToolError, got {other:?}"),
@@ -1286,7 +1210,7 @@ mod tests {
     #[test]
     fn bridge_result_empty_success_yields_empty_text_output() {
         let res = CallToolResult::success(vec![]);
-        let out = bridge_result("t", res).expect("empty success is Ok");
+        let out = convert::bridge_result("t", res).expect("empty success is Ok");
         assert!(!out.is_error);
         assert_eq!(out.text_content(), "");
     }
@@ -1295,7 +1219,7 @@ mod tests {
     fn bridge_result_structured_content_appended_as_text_part() {
         let mut res = CallToolResult::success(vec![ContentBlock::text("body")]);
         res.structured_content = Some(serde_json::json!({"count": 7}));
-        let out = bridge_result("t", res).expect("success bridges");
+        let out = convert::bridge_result("t", res).expect("success bridges");
         let MessageToolContent::Multipart(parts) = out.payload else {
             panic!("text + structured must be multipart");
         };
@@ -1319,7 +1243,7 @@ mod tests {
     fn bridge_result_error_with_structured_content_is_soft_error() {
         let mut res = CallToolResult::error(vec![]);
         res.structured_content = Some(serde_json::json!({"reason": "denied"}));
-        let out = bridge_result("search", res).expect("structured error is soft Ok");
+        let out = convert::bridge_result("search", res).expect("structured error is soft Ok");
         assert!(out.is_error, "is_error flag set");
         let text = out.text_content();
         assert!(
@@ -1333,22 +1257,23 @@ mod tests {
         // Audio carries no payload loopctl can render, so it falls through to
         // the generic unsupported-note arm (the `_` fallback). It must still
         // surface as a Text part — never silently dropped.
-        let audio = bridge_content(&ContentBlock::audio("AAAA", "audio/wav"));
+        let audio = convert::bridge_content(&ContentBlock::audio("AAAA", "audio/wav"));
         assert!(
             matches!(audio, ToolContentPart::Text { .. }),
             "audio → text note (not dropped), got {audio:?}"
         );
 
-        let resource = bridge_content(&ContentBlock::Resource(rmcp::model::EmbeddedResource::new(
-            rmcp::model::ResourceContents::text("body", "mem://x"),
-        )));
+        let resource =
+            convert::bridge_content(&ContentBlock::Resource(rmcp::model::EmbeddedResource::new(
+                rmcp::model::ResourceContents::text("body", "mem://x"),
+            )));
         assert!(
             matches!(resource, ToolContentPart::Text { ref text } if text.contains("mem://x") && text.contains("body")),
             "embedded text resource surfaces its uri and text, got {resource:?}"
         );
 
         let link = rmcp::model::Resource::new("file:///a", "thing");
-        let link_part = bridge_content(&ContentBlock::ResourceLink(link));
+        let link_part = convert::bridge_content(&ContentBlock::ResourceLink(link));
         assert!(
             matches!(link_part, ToolContentPart::Text { ref text } if text.contains("thing") && text.contains("file:///a")),
             "resource link surfaces name and uri, got {link_part:?}"
@@ -1357,12 +1282,12 @@ mod tests {
 
     #[test]
     fn bridge_content_text_and_image_carry_through() {
-        let text = bridge_content(&ContentBlock::text("hello"));
+        let text = convert::bridge_content(&ContentBlock::text("hello"));
         assert!(
             matches!(&text, ToolContentPart::Text { text } if text == "hello"),
             "got {text:?}"
         );
-        let image = bridge_content(&ContentBlock::image("Zm9v", "image/png"));
+        let image = convert::bridge_content(&ContentBlock::image("Zm9v", "image/png"));
         match image {
             ToolContentPart::Image { source } => {
                 assert_eq!(source.media_type, "image/png");

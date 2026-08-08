@@ -91,6 +91,10 @@ required-features = ["mcp"]
 name = "mcp-stdio-server"
 required-features = ["mcp"]
 
+[[example]]
+name = "mcp_server"
+required-features = ["mcp"]
+
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"

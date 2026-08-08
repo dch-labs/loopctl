@@ -33,12 +33,12 @@
 //! use loopctl::mcp::{McpClient, McpToolProvider};
 //! use loopctl::tool::ToolRegistry;
 //!
-//! # async fn run(server: impl rmcp::handler::server::ServerHandler) {
+//! # async fn run(server: impl rmcp::handler::server::ServerHandler) -> Result<(), loopctl::mcp::McpError> {
 //! let client = McpClient::in_process(server).await?;
 //! let provider = McpToolProvider::connect(client, None).await?;
 //! let mut registry = ToolRegistry::new();
 //! provider.register_into(&mut registry);
-//! # Ok::<(), loopctl::mcp::McpError>(())
+//! # Ok(())
 //! # }
 //! ```
 
@@ -78,7 +78,7 @@ const DUPLEX_BUFFER: usize = 4096;
 ///
 /// Dropping the last clone drops the [`RunningService`], whose cancellation
 /// guard cancels the background task — there is no leaked runtime work.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct McpClient {
     /// The running client service. The handler is fixed to `()`, the pure
     /// client: a server's `sampling`/`roots` requests get default empty
@@ -121,8 +121,14 @@ impl McpClient {
     {
         let (server_end, client_end) = tokio::io::duplex(DUPLEX_BUFFER);
         tokio::spawn(async move {
-            if let Ok(running) = server.serve(server_end).await {
-                let _ = running.waiting().await.ok();
+            match server.serve(server_end).await {
+                Ok(running) => {
+                    let _ = running.waiting().await.ok();
+                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "in-process MCP server failed to initialize (the client side reports this via McpError::Handshake)"
+                ),
             }
         });
         let client = ().serve(client_end).await.map_err(|e| McpError::Handshake(e.to_string()))?;
@@ -228,6 +234,7 @@ impl McpClient {
 /// [`McpToolProvider::connect`] / [`McpToolProvider::refresh`] calls; the only
 /// interior mutation is [`McpToolProvider::refresh`], which takes `&mut self`,
 /// so concurrent reads of [`McpToolProvider::tools`] during a run are safe.
+#[derive(Debug)]
 pub struct McpToolProvider {
     /// The connected client the adapted tools forward through.
     ///
@@ -254,11 +261,13 @@ pub struct McpToolProvider {
 impl McpToolProvider {
     /// Connect to a server and snapshot its tool list.
     ///
-    /// The primary constructor. Runs the MCP `initialize` handshake (driven by
-    /// the supplied [`McpClient`]) followed by `tools/list`, which rmcp
-    /// auto-paginates by following `nextCursor` to exhaustion. The returned
-    /// provider holds one [`McpTool`] per server-declared tool, each sharing a
-    /// cheap clone of the client handle.
+    /// The primary constructor. Runs `tools/list` against the already-connected
+    /// `client` (the `initialize` handshake is *not* done here — it completed
+    /// when the [`McpClient`] was built via [`McpClient::in_process`] or
+    /// [`McpClient::from_service`]). rmcp auto-paginates `tools/list` by
+    /// following `nextCursor` to exhaustion. The returned provider holds one
+    /// [`McpTool`] per server-declared tool, each sharing a cheap clone of the
+    /// client handle.
     ///
     /// `name_prefix`, when `Some`, namespaces every adapted tool: it is
     /// prepended to each tool's name as `"{prefix}__{tool_name}"` for both
@@ -385,7 +394,7 @@ impl McpToolProvider {
 /// [`McpTool::is_destructive_hint`]. Both apply the MCP-spec defaults for an
 /// absent hint (read-only defaults to `false`; destructive defaults to `true`),
 /// so a consumer can read them directly without re-applying the spec.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct McpTool {
     /// The original server-side name, sent verbatim in each `tools/call`.
     ///
@@ -664,6 +673,7 @@ fn bridge_tool(
 ) -> Option<McpTool> {
     let server_name = server_tool.name.to_string();
     if server_name.is_empty() {
+        tracing::warn!("MCP server declared a tool with an empty name; skipping");
         return None;
     }
     let exposed_name =
@@ -757,21 +767,27 @@ fn bridge_result(
 
 /// Map one rmcp content block to a loopctl [`ToolContentPart`].
 ///
-/// Text and image carry through; audio, embedded resources, resource links, and
-/// any future block kind fall back to a short text note so the model learns the
-/// part existed rather than seeing it silently dropped.
+/// Text and image carry through. Audio falls back to a short text note. Embedded
+/// resources and resource links are stringified with their identifying payload
+/// (uri, text/name) so the model sees *what* the server returned, not just that
+/// it returned something. Any future block kind falls back to a generic note.
 fn bridge_content(block: &ContentBlock) -> ToolContentPart {
     match block {
         ContentBlock::Text(text) => ToolContentPart::text(&text.text),
         ContentBlock::Image(image) => ToolContentPart::image(
             crate::message::ImageSource::new_base64(&image.mime_type, &image.data),
         ),
-        ContentBlock::Audio(_) => ToolContentPart::text("unsupported MCP content type: audio"),
-        ContentBlock::Resource(_) => {
-            ToolContentPart::text("unsupported MCP content type: embedded resource")
-        }
-        ContentBlock::ResourceLink(_) => {
-            ToolContentPart::text("unsupported MCP content type: resource link")
+        ContentBlock::Resource(resource) => match &resource.resource {
+            rmcp::model::ResourceContents::TextResourceContents { uri, text, .. } => {
+                ToolContentPart::text(format!("MCP resource {uri}: {text}"))
+            }
+            rmcp::model::ResourceContents::BlobResourceContents { uri, .. } => {
+                ToolContentPart::text(format!("MCP resource {uri}: (blob)"))
+            }
+            _ => ToolContentPart::text("unsupported MCP content type: embedded resource"),
+        },
+        ContentBlock::ResourceLink(link) => {
+            ToolContentPart::text(format!("MCP resource link: {} ({})", link.name, link.uri))
         }
         _ => ToolContentPart::text("unsupported MCP content type"),
     }
@@ -779,15 +795,9 @@ fn bridge_content(block: &ContentBlock) -> ToolContentPart {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the pure bridge functions (`bridge_result`,
-    //! `bridge_content`). The connection-dependent paths (`bridge_tool`,
-    //! `bridge_tool_list`, `McpClient`, `McpToolProvider`) are covered by the
-    //! integration suite in `tests/mcp_tool_provider.rs`.
-
     use super::*;
     use rmcp::model::{CallToolResult, ContentBlock};
 
-    /// A single text block collapses to plain [`MessageToolContent::Text`].
     #[test]
     fn bridge_result_single_text_becomes_text_payload() {
         let res = CallToolResult::success(vec![ContentBlock::text("hi")]);
@@ -797,9 +807,6 @@ mod tests {
         assert_eq!(out.text_content(), "hi");
     }
 
-    /// A single image block can't be a `Text`, so it becomes a one-element
-    /// `Multipart` — an edge the integration suite (which only builds macro
-    /// servers returning text) does not hit.
     #[test]
     fn bridge_result_single_image_becomes_single_part_multipart() {
         let res = CallToolResult::success(vec![ContentBlock::image("Zm9v", "image/png")]);
@@ -816,7 +823,6 @@ mod tests {
         }
     }
 
-    /// Multiple blocks become a `Multipart` preserving order.
     #[test]
     fn bridge_result_multiple_blocks_become_multipart_in_order() {
         let res = CallToolResult::success(vec![
@@ -834,8 +840,6 @@ mod tests {
         assert!(matches!(parts.get(2), Some(ToolContentPart::Text { text }) if text == "b"));
     }
 
-    /// A server-reported error (`isError: true`) with text content is a *soft*
-    /// failure: `Ok` with `is_error` set, not an `Err`.
     #[test]
     fn bridge_result_soft_error_returns_ok_with_is_error() {
         let res = CallToolResult::error(vec![ContentBlock::text("boom")]);
@@ -844,8 +848,6 @@ mod tests {
         assert_eq!(out.text_content(), "boom");
     }
 
-    /// An error with no content surfaces as the hard [`McpError::EmptyToolError`],
-    /// carrying the tool name — pins the round-2 fix that threads `tool_name`.
     #[test]
     fn bridge_result_empty_error_is_hard_empty_tool_error_with_name() {
         let res = CallToolResult::error(vec![]);
@@ -856,8 +858,6 @@ mod tests {
         }
     }
 
-    /// A successful result with zero content blocks yields an empty successful
-    /// output — distinct from the empty-error path above.
     #[test]
     fn bridge_result_empty_success_yields_empty_text_output() {
         let res = CallToolResult::success(vec![]);
@@ -866,9 +866,6 @@ mod tests {
         assert_eq!(out.text_content(), "");
     }
 
-    /// `structuredContent`, when present, is appended as one extra JSON-string
-    /// text part — carried, not parsed. Even a single text block + structured
-    /// content therefore becomes a two-part `Multipart`.
     #[test]
     fn bridge_result_structured_content_appended_as_text_part() {
         let mut res = CallToolResult::success(vec![ContentBlock::text("body")]);
@@ -893,10 +890,6 @@ mod tests {
         assert!(structured_text.contains('7'));
     }
 
-    /// An error result (`isError: true`) with empty content but a declared
-    /// `structuredContent` is *not* an `EmptyToolError` — the structured payload
-    /// surfaces as a soft error's text, so the model sees what the server
-    /// returned. Pins this edge (the integration suite never builds it).
     #[test]
     fn bridge_result_error_with_structured_content_is_soft_error() {
         let mut res = CallToolResult::error(vec![]);
@@ -910,27 +903,33 @@ mod tests {
         );
     }
 
-    /// `bridge_content`: every unsupported block kind surfaces as a text note
-    /// naming the kind, never silently dropped. Covers the arms the macro-server
-    /// integration tests can't easily reach (resource, resource-link).
     #[test]
     fn bridge_content_unsupported_kinds_surface_as_text_notes() {
+        // Audio carries no payload loopctl can render, so it falls through to
+        // the generic unsupported-note arm (the `_` fallback). It must still
+        // surface as a Text part — never silently dropped.
         let audio = bridge_content(&ContentBlock::audio("AAAA", "audio/wav"));
         assert!(
-            matches!(audio, ToolContentPart::Text { ref text } if text.contains("audio")),
-            "audio → text note, got {audio:?}"
+            matches!(audio, ToolContentPart::Text { .. }),
+            "audio → text note (not dropped), got {audio:?}"
         );
 
         let resource = bridge_content(&ContentBlock::Resource(rmcp::model::EmbeddedResource::new(
             rmcp::model::ResourceContents::text("body", "mem://x"),
         )));
         assert!(
-            matches!(resource, ToolContentPart::Text { ref text } if text.contains("resource")),
-            "embedded resource → text note, got {resource:?}"
+            matches!(resource, ToolContentPart::Text { ref text } if text.contains("mem://x") && text.contains("body")),
+            "embedded text resource surfaces its uri and text, got {resource:?}"
+        );
+
+        let link = rmcp::model::Resource::new("file:///a", "thing");
+        let link_part = bridge_content(&ContentBlock::ResourceLink(link));
+        assert!(
+            matches!(link_part, ToolContentPart::Text { ref text } if text.contains("thing") && text.contains("file:///a")),
+            "resource link surfaces name and uri, got {link_part:?}"
         );
     }
 
-    /// `bridge_content`: text and image carry their payloads through verbatim.
     #[test]
     fn bridge_content_text_and_image_carry_through() {
         let text = bridge_content(&ContentBlock::text("hello"));

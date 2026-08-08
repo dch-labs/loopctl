@@ -158,7 +158,7 @@ let agent = BareLoop::new(
 | `zai` | No | `providers`, `anthropic` | Z.AI API client (Anthropic-compatible) |
 | `grammar` | No | `providers` | Tool-call grammar providers for grammar-aware samplers (vLLM `guided_json`); enables the `Grammar` mode of `ToolConstraint` |
 | `schema_validation` | No | — | JSON Schema validation of `Correction::modified_input` in `LlmReflector` (pulls `jsonschema`); when off, validation is skipped |
-| `mcp` | No | `rmcp` | MCP client adapter (`mcp::McpToolProvider`) — adapt any MCP server's tools as loopctl `Tool` impls |
+| `mcp` | No | `rmcp` | MCP client adapter (`mcp::McpToolProvider`) — adapt an MCP server's tools as loopctl `Tool` impls (in-process; stdio/HTTP/SSE transports land in a later release) |
 
 ### Streaming vs non-streaming
 

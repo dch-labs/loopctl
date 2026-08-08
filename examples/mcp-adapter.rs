@@ -22,7 +22,7 @@ use loopctl::mcp::{McpClient, McpToolProvider};
 use loopctl::tool::{ToolContext, ToolRegistry};
 use rmcp::handler::server::ServerHandler;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::{ServiceExt, tool, tool_handler, tool_router};
+use rmcp::{tool, tool_handler, tool_router};
 use serde_json::json;
 
 /// An rmcp server exposing one `greet` tool.
@@ -50,21 +50,12 @@ impl ServerHandler for GreetServer {}
 
 #[tokio::main]
 async fn main() {
-    // 1. Start the server on one end of a duplex, a pure rmcp client on the
-    //    other, and wrap the client as an McpClient.
-    let (server_end, client_end) = tokio::io::duplex(4096);
-    tokio::spawn(async move {
-        let running = GreetServer::new()
-            .serve(server_end)
-            .await
-            .expect("server initialize");
-        running.waiting().await.ok();
-    });
-    let client =
-        ().serve(client_end)
-            .await
-            .map(McpClient::from_service)
-            .expect("client initialize");
+    // 1. Connect an rmcp client to the in-process server and run the MCP
+    //    initialize handshake. This is the only constructor L-12 ships; real
+    //    transports (stdio, HTTP/SSE) arrive in a later release.
+    let client = McpClient::in_process(GreetServer::new())
+        .await
+        .expect("client initialize");
 
     // 2. Discover the server's tools and register them.
     let provider = McpToolProvider::connect(client, None)

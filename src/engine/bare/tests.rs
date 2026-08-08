@@ -4457,11 +4457,17 @@ fn test_add_contributor_panics_after_session_start() {
     // subsequent add_contributor must panic in debug builds (matches
     // set_reflector's contract).
     // Box the future so we can drop it without awaiting; the session-init
-    // side effect is the state transition under test.
+    // side effect is the state transition under test. The turn path uses
+    // `tokio::select!`/`tokio::time::sleep`, which require a tokio reactor
+    // context, so enter a runtime guard before block_on polls (the guard only
+    // makes a reactor available on this thread — we do not drive via the
+    // runtime's own block_on, which would run the loop to completion).
     {
         let run_config = RunConfig::default();
         let fut = agent.run("seed", &run_config);
         let mut fut = std::pin::pin!(fut);
+        let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
+        let _guard = rt.enter();
         let outcome = futures::executor::block_on(fut.as_mut());
         drop(outcome);
     }
@@ -4548,10 +4554,14 @@ fn test_set_request_options_panics_after_session_start() {
     let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
     // The first run() establishes the session and moves the loop out of
     // Idle; a subsequent set_request_options must panic in debug builds.
+    // The turn path uses `tokio::select!`/`tokio::time::sleep`, which require a
+    // tokio reactor context, so enter a runtime guard before block_on polls.
     {
         let run_config = RunConfig::default();
         let fut = agent.run("seed", &run_config);
         let mut fut = std::pin::pin!(fut);
+        let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
+        let _guard = rt.enter();
         let outcome = futures::executor::block_on(fut.as_mut());
         drop(outcome);
     }

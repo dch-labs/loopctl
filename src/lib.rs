@@ -22,6 +22,7 @@
 //! - **[`middleware`]** — Tool dispatch middleware pipeline (timeouts, permissions, output limits).
 //! - **[`tool`]** — Tool trait, registry, and supporting types.
 //! - **`tool::health`** — Per-tool health monitoring, circuit breakers, and self-healing routing. *Requires `tool_health` feature.*
+//! - **[`mcp`]** — MCP client adapter ([`McpToolProvider`](mcp::McpToolProvider)) — adapt any MCP server's tools as `Tool` impls. *Requires `mcp` feature.*
 //!
 //! ## API Layer
 //!
@@ -77,6 +78,8 @@ pub mod fallback;
 #[cfg(feature = "hooks")]
 pub mod hooks;
 pub mod managers;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod memory;
 pub mod message;
 pub mod middleware;

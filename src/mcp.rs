@@ -10,8 +10,8 @@
 //! # The adapter surface
 //!
 //! - [`McpClient`] — a connected, initialized client handle. The
-//!   transport-agnostic boundary: obtain one from [`McpClient::in_process`] or,
-//!   in a later release, from a transport constructor.
+//!   transport-agnostic boundary: obtain one from [`McpClient::stdio`],
+//!   [`McpClient::http_sse`], or [`McpClient::in_process`].
 //! - [`McpToolProvider`] — owns a [`McpClient`] and a snapshot of the server's
 //!   tool list; [`McpToolProvider::connect`] discovers,
 //!   [`register_into`](McpToolProvider::register_into) registers the batch into
@@ -21,6 +21,24 @@
 //!
 //! No rmcp type appears in any of these public signatures; an rmcp upgrade is
 //! a one-file change (this one).
+//!
+//! # Transports
+//!
+//! Three ways to obtain an [`McpClient`], all yielding the same type so
+//! [`McpToolProvider`] is indifferent to how the client was built:
+//!
+//! - **stdio** — [`McpClient::stdio`] spawns an MCP server as a child process
+//!   (NDJSON JSON-RPC over the child's stdin/stdout). The common local
+//!   deployment shape (Claude Desktop, Cursor, the reference clients).
+//! - **Streamable HTTP/SSE** — [`McpClient::http_sse`] (rmcp's default HTTP
+//!   client) or [`McpClient::http_sse_with_client`] (caller-supplied
+//!   `reqwest::Client`) connect to a remote server. rmcp handles
+//!   `Mcp-Session-Id`, JSON-vs-SSE response splitting, and DELETE-on-close.
+//! - **in-process** — [`McpClient::in_process`] for tests and bundled servers.
+//!
+//! A dropped connection can be re-established via [`McpClient::reconnect`],
+//! which reuses loopctl's [`StreamRetryConfig`](crate::stream::handler::StreamRetryConfig)
+//! backoff — the one retry strategy for the crate, not a second one for MCP.
 //!
 //! [mcp]: https://modelcontextprotocol.io
 //!
@@ -51,6 +69,13 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::ContentBlock;
 use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
+use rmcp::transport::IntoTransport;
+#[cfg(feature = "mcp")]
+use rmcp::transport::StreamableHttpClientTransport;
+#[cfg(feature = "mcp")]
+use rmcp::transport::TokioChildProcess;
+#[cfg(feature = "mcp")]
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 
 use crate::message::ToolContent as MessageToolContent;
 use crate::message::ToolContentPart;
@@ -80,11 +105,29 @@ const DUPLEX_BUFFER: usize = 4096;
 /// guard cancels the background task — there is no leaked runtime work.
 #[derive(Clone, Debug)]
 pub struct McpClient {
-    /// The running client service. The handler is fixed to `()`, the pure
-    /// client: a server's `sampling`/`roots` requests get default empty
-    /// answers. A host that wants to honour those constructs its own client
-    /// with a richer handler (out of scope for this module).
+    /// The running rmcp client service backing this connection.
+    ///
+    /// Held behind an [`Arc`] so every [`McpTool`](crate::mcp::McpTool) clone
+    /// shares one connection cheaply; calls reach the server via
+    /// [`RunningService`]'s `Deref` to rmcp's `Peer`. The handler type is fixed
+    /// to `()` (the pure client), so a server's `sampling`/`roots` requests get
+    /// default empty answers — a host that wants to honour those constructs its
+    /// own client with a richer handler (out of scope for this module). Dropping
+    /// the last clone drops the [`RunningService`], whose cancellation guard
+    /// ends the background task.
     service: Arc<RunningService<RoleClient, ()>>,
+
+    /// How to rebuild this connection on [`Self::reconnect`], or `None`.
+    ///
+    /// Set by [`Self::stdio`] (a [`CommandSpec`]) and [`Self::http_sse`] (an
+    /// endpoint), so a dropped connection can re-spawn the child or re-connect
+    /// to the server. `None` for [`Self::in_process`] and
+    /// [`Self::from_service`]: those clients have no way to reconstruct their
+    /// transport, so [`Self::reconnect`] returns [`McpError::Handshake`] for
+    /// them. Private because the concrete [`ReconnectSpec`] enum is an
+    /// implementation detail; callers drive reconnect through the method, not
+    /// the field.
+    reconnect_spec: Option<ReconnectSpec>,
 }
 
 impl McpClient {
@@ -134,6 +177,7 @@ impl McpClient {
         let client = ().serve(client_end).await.map_err(|e| McpError::Handshake(e.to_string()))?;
         Ok(Self {
             service: Arc::new(client),
+            reconnect_spec: None,
         })
     }
 
@@ -142,11 +186,28 @@ impl McpClient {
     /// For the common case use [`Self::in_process`], which handles the duplex
     /// and handshake. This constructor is for callers (and tests) that drive
     /// `().serve(transport)` themselves — e.g. to attach a custom client
-    /// handler, or to share a transport set up out-of-band.
+    /// handler, or to share a transport set up out-of-band. The returned client
+    /// has no [`Self::reconnect`] spec (returns [`McpError::Handshake`]).
     #[must_use]
     pub fn from_service(service: RunningService<RoleClient, ()>) -> Self {
         Self {
             service: Arc::new(service),
+            reconnect_spec: None,
+        }
+    }
+
+    /// Build an [`McpClient`] from a running service + the spec to rebuild it.
+    ///
+    /// Shared tail of the three constructors: [`Self::stdio`] and
+    /// [`Self::http_sse`] (via [`Self::http_connect`]) pass `Some(spec)` so
+    /// [`Self::reconnect`] can rebuild the transport; [`Self::in_process`] and
+    /// [`Self::from_service`] pass `None` (no rebuildable transport). Wraps the
+    /// service in an [`Arc`] so each [`McpTool`](crate::mcp::McpTool) clone
+    /// shares one connection cheaply.
+    fn wrap(service: RunningService<RoleClient, ()>, spec: Option<ReconnectSpec>) -> Self {
+        Self {
+            service: Arc::new(service),
+            reconnect_spec: spec,
         }
     }
 
@@ -183,6 +244,266 @@ impl McpClient {
             .await
             .map_err(|e| ToolError::Execution(format!("MCP tools/call failed: {e}")))?;
         bridge_result(server_name, result).map_err(|e| ToolError::Execution(e.to_string()))
+    }
+
+    /// Connect to an MCP server running as a child process over stdio.
+    ///
+    /// `command` is spawned via rmcp's [`TokioChildProcess`]
+    /// (`transport-child-process` cargo-feature): it pipes the child's
+    /// stdin/stdout (NDJSON JSON-RPC) and **inherits stderr** so server logs
+    /// surface during development. The transport implements rmcp's `Transport`
+    /// directly, so `().serve(transport)` (a pure client, handler `()`) drives
+    /// the MCP `initialize` handshake before returning.
+    ///
+    /// **Lifecycle:** rmcp kills the child on drop via its `ChildWithCleanup`
+    /// (force-kill after a 3s graceful timeout). Callers do **not** set
+    /// `kill_on_drop` themselves — it is redundant with rmcp's cleanup.
+    /// Dropping the returned [`McpClient`] (and all its clones) terminates the
+    /// server process.
+    ///
+    /// **Runtime:** spawns the child and drives the handshake from the caller's
+    /// async context, so this must be called from within a running tokio
+    /// runtime (it panics with "no reactor running" otherwise).
+    ///
+    /// The [`CommandSpec`] is retained so [`Self::reconnect`] can re-spawn the
+    /// same server.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError::Handshake`] if the child fails to spawn (`io::Error` from
+    /// [`TokioChildProcess::new`]), exits before handshake, or the `initialize`
+    /// round-trip fails (`ClientInitializeError`).
+    pub async fn stdio(command: CommandSpec) -> Result<Self, McpError> {
+        let transport = TokioChildProcess::new(command.as_tokio_command())
+            .map_err(|e| McpError::Handshake(e.to_string()))?;
+        let service = ().serve(transport).await.map_err(|e| McpError::Handshake(e.to_string()))?;
+        Ok(Self::wrap(service, Some(ReconnectSpec::Stdio(command))))
+    }
+
+    /// Connect to a remote MCP server via Streamable HTTP, using rmcp's default
+    /// HTTP client.
+    ///
+    /// JSON-RPC 2.0 over a single endpoint: `POST` for requests (the server
+    /// replies `application/json` or `text/event-stream`), optional `GET` for a
+    /// long-lived SSE notification stream, `DELETE` for session termination.
+    /// Session identity is the `Mcp-Session-Id` response header, echoed back.
+    ///
+    /// rmcp's [`StreamableHttpClientTransport`] handles **all** of
+    /// `Mcp-Session-Id` capture/echo, JSON-vs-SSE response splitting, the
+    /// optional GET-opened SSE stream, DELETE-on-close, and transparent session
+    /// re-init on HTTP 404 — loopctl does none of it. This constructor builds
+    /// the transport via `from_uri` and runs `().serve(transport)` to handshake.
+    ///
+    /// The endpoint is retained so [`Self::reconnect`] can re-connect. rmcp's
+    /// default client deliberately disables connection pooling
+    /// (`pool_max_idle_per_host(0)`) to avoid ~40ms TCP Delayed-ACK stalls; for
+    /// pooling/TLS/timeouts use [`Self::http_sse_with_client`].
+    ///
+    /// **Runtime:** rmcp's Streamable HTTP transport spawns a background worker
+    /// task, so this must be called from within a running tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError::Handshake`] if the HTTP connection cannot be established or
+    /// `initialize` fails (`ClientInitializeError`).
+    pub async fn http_sse(endpoint: impl Into<Arc<str>>) -> Result<Self, McpError> {
+        let endpoint = endpoint.into();
+        let transport = StreamableHttpClientTransport::from_uri(Arc::clone(&endpoint));
+        Self::http_connect(transport, endpoint).await
+    }
+
+    /// Connect via Streamable HTTP with a caller-supplied [`reqwest::Client`].
+    ///
+    /// Like [`Self::http_sse`], but the caller provides its own HTTP client —
+    /// for connection pooling, custom TLS, or timeouts. Built via
+    /// [`StreamableHttpClientTransport::with_client`]. Prefer the plain
+    /// [`Self::http_sse`] unless you need pooling (rmcp's default disables it to
+    /// avoid TCP Delayed-ACK stalls).
+    ///
+    /// The endpoint (not the client) is retained for [`Self::reconnect`]; a
+    /// reconnect re-connects with rmcp's default client, not the originally
+    /// supplied one.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError::Handshake`] if the HTTP connection cannot be established or
+    /// `initialize` fails.
+    pub async fn http_sse_with_client(
+        endpoint: impl Into<Arc<str>>,
+        client: reqwest::Client,
+    ) -> Result<Self, McpError> {
+        let endpoint = endpoint.into();
+        let transport = StreamableHttpClientTransport::with_client(
+            client,
+            StreamableHttpClientTransportConfig::with_uri(Arc::clone(&endpoint)),
+        );
+        Self::http_connect(transport, endpoint).await
+    }
+
+    /// Drive `().serve(transport)` for an HTTP transport and wrap the result.
+    ///
+    /// # Errors
+    ///
+    /// [`McpError::Handshake`] if the rmcp `serve`/`initialize` fails
+    /// (`ClientInitializeError`).
+    async fn http_connect<T, E, A>(transport: T, endpoint: Arc<str>) -> Result<Self, McpError>
+    where
+        T: IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let service = ().serve(transport).await.map_err(|e| McpError::Handshake(e.to_string()))?;
+        Ok(Self::wrap(service, Some(ReconnectSpec::HttpSse(endpoint))))
+    }
+
+    /// Re-establish a dropped connection using [`StreamRetryConfig`](crate::stream::handler::StreamRetryConfig)
+    /// backoff.
+    ///
+    /// After a transient failure (child exited, HTTP 5xx, broken pipe), call
+    /// this on the dead [`McpClient`]: it backs off per `retry` and re-runs the
+    /// constructor that originally built this client (a spec stored on the
+    /// client at construction time), returning a **new** [`McpClient`]. The old
+    /// client's transport is dead; the caller re-issues `tools/list` via a fresh
+    /// [`McpToolProvider`] on the returned client.
+    ///
+    /// Returns [`McpError::Handshake`] if this client is an [`Self::in_process`]
+    /// client (no reconnect spec — an in-process server cannot be rebuilt) or
+    /// after the retry config's max retries.
+    ///
+    /// **Reuse, don't reinvent:** loopctl already ships exponential-backoff-
+    /// with-jitter retry ([`StreamRetryConfig`](crate::stream::handler::StreamRetryConfig)).
+    /// This method consumes it directly — there is one retry strategy for the
+    /// whole crate, not a second one for MCP. (rmcp ships no transport-level
+    /// reconnect, only an in-stream SSE resume policy — verified.)
+    ///
+    /// # Errors
+    ///
+    /// [`McpError::Handshake`] for `in_process` clients, or after
+    /// `retry.max_retries` failed attempts (the last error is carried). The
+    /// loop always runs at least one attempt before giving up, so a returned
+    /// `Handshake` carries a real connection failure, not a placeholder.
+    pub async fn reconnect(
+        &self,
+        retry: &crate::stream::handler::StreamRetryConfig,
+    ) -> Result<Self, McpError> {
+        let Some(spec) = self.reconnect_spec.clone() else {
+            return Err(McpError::Handshake(
+                "this McpClient cannot be reconnected (in-process)".to_string(),
+            ));
+        };
+        let mut last_err: Option<McpError> = None;
+        for attempt in 0..=retry.max_retries {
+            if attempt > 0 {
+                let delay = retry.jittered_base_delay(attempt.saturating_sub(1));
+                tokio::time::sleep(delay).await;
+            }
+            match spec.connect().await {
+                Ok(client) => return Ok(client),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            McpError::Handshake("reconnect made no attempts (max_retries overflow)".to_string())
+        }))
+    }
+}
+
+/// What to spawn for [`McpClient::stdio`]. [`Clone`] so [`McpClient::reconnect`]
+/// can re-establish the child.
+///
+/// Build with struct-literal syntax or [`CommandSpec::default`] then set the
+/// fields you need; only [`program`](Self::program) is required for a working
+/// spawn.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::mcp::CommandSpec;
+///
+/// let spec = CommandSpec {
+///     program: "npx".into(),
+///     args: vec!["-y".into(), "@modelcontextprotocol/server-everything".into()],
+///     ..Default::default()
+/// };
+/// assert_eq!(spec.program, "npx");
+/// assert_eq!(spec.args.len(), 2);
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct CommandSpec {
+    /// Executable path or name resolvable on `PATH`.
+    ///
+    /// Passed verbatim to [`tokio::process::Command::new`]; resolution follows
+    /// the platform's usual `PATH` search. Required for a working spawn.
+    pub program: String,
+
+    /// Arguments after [`program`](Self::program).
+    ///
+    /// Forwarded to the child in order via `Command::args`. Empty by default.
+    pub args: Vec<String>,
+
+    /// Extra environment variables for the child.
+    ///
+    /// Each `(key, value)` pair is added via `Command::env` on top of the
+    /// parent's environment; existing keys are overwritten. Empty by default.
+    pub env: Vec<(String, String)>,
+
+    /// Working directory, or inherit the parent's.
+    ///
+    /// `None` (the default) inherits the calling process's cwd; `Some(path)`
+    /// sets it via `Command::current_dir`.
+    pub cwd: Option<String>,
+}
+
+impl CommandSpec {
+    /// Build a [`tokio::process::Command`] from this spec.
+    ///
+    /// Maps the four fields onto the equivalent `tokio::process::Command`
+    /// calls. Does **not** set `kill_on_drop`: rmcp's `TokioChildProcess` kills
+    /// the child on drop via its own cleanup guard, so a caller-set
+    /// `kill_on_drop` would be redundant.
+    fn as_tokio_command(&self) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.program);
+        cmd.args(&self.args);
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+        if let Some(cwd) = &self.cwd {
+            cmd.current_dir(cwd);
+        }
+        cmd
+    }
+}
+
+/// How to rebuild a connection on [`McpClient::reconnect`]. Stored on
+/// [`McpClient`] by [`McpClient::stdio`] / [`McpClient::http_sse`]; `None` for
+/// [`McpClient::in_process`].
+#[derive(Clone, Debug)]
+enum ReconnectSpec {
+    /// Re-spawn this command.
+    ///
+    /// Carries the full [`CommandSpec`] so a reconnect reproduces the original
+    /// program, arguments, environment, and working directory.
+    Stdio(CommandSpec),
+
+    /// Re-connect to this endpoint.
+    ///
+    /// The `Arc<str>` endpoint is reused; the reconnect uses rmcp's default
+    /// HTTP client (not any caller-supplied client from the original
+    /// `http_sse_with_client` call — that client is not retained).
+    HttpSse(Arc<str>),
+}
+
+impl ReconnectSpec {
+    /// Re-run the constructor that originally built the client.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`McpError::Handshake`] from the underlying constructor
+    /// (`stdio`/`http_sse`).
+    async fn connect(&self) -> Result<McpClient, McpError> {
+        match self {
+            Self::Stdio(command) => McpClient::stdio(command.clone()).await,
+            Self::HttpSse(endpoint) => McpClient::http_sse(Arc::clone(endpoint)).await,
+        }
     }
 }
 

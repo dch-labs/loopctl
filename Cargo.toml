@@ -33,7 +33,7 @@ bytes = { version = "1", optional = true }
 async-stream = { version = "0.3", optional = true }
 httpdate = { version = "1", optional = true }
 jsonschema = { version = "0.49", optional = true }
-rmcp = { version = "3", optional = true, default-features = false, features = ["client", "server", "macros", "transport-async-rw"] }
+rmcp = { version = "3", optional = true, default-features = false, features = ["client", "server", "macros", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-io"] }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
@@ -62,8 +62,10 @@ zai = ["providers", "anthropic"]
 grammar = ["providers"]
 schema_validation = ["dep:jsonschema"]
 
-# MCP client adapter
-mcp = ["dep:rmcp"]
+# MCP client adapter + transports (stdio, Streamable HTTP/SSE). Enables
+# `streaming` for `StreamRetryConfig` (reconnect backoff) and `reqwest` for the
+# HTTP transport's caller-supplied client.
+mcp = ["dep:rmcp", "streaming", "dep:reqwest"]
 
 [[example]]
 name = "hello-cli"
@@ -83,6 +85,10 @@ required-features = ["testing", "providers"]
 
 [[example]]
 name = "mcp-adapter"
+required-features = ["mcp"]
+
+[[example]]
+name = "mcp-stdio-server"
 required-features = ["mcp"]
 
 [lints.clippy]

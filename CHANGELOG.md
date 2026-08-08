@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Added
 
+- `mcp` feature + `loopctl::mcp` module — adapt any MCP server's tools as loopctl `Tool` implementations. New public types: `McpClient` (a connected client handle), `McpToolProvider` (discovers a server's tools and registers them into a `ToolRegistry`), `McpTool` (one server tool as a `Tool`), `McpError`. The adapter is transport-agnostic; `McpClient::in_process` connects an in-process rmcp server for tests and bundled-server use. Real transports (stdio, HTTP/SSE) arrive in a later release. The optional `rmcp` dependency is pulled in only by the `mcp` feature (`default = []` is unchanged). A runnable end-to-end demo ships at `examples/mcp-adapter.rs` (`cargo run --example mcp-adapter --features mcp`).
 - `LoopError::ToolRecoveryExhausted { tool, attempts }` — the driver now enforces `MAX_RECOVERY_ATTEMPTS` (5) as a hard ceiling. A recovery strategy that always returns `Retry` is stopped after 5 retries (attempt 6), returning this variant instead of looping forever. Pinned by `recovery_ceiling_stops_retry_forever_strategy`.
 - `RunConfig::memory_top_k` — configurable number of memory entries retrieved and injected per turn (default 3; was a hardcoded magic number).
 - `MachineStep::CallTools { turn, calls }` — the machine now emits the 0-indexed turn number on `CallTools` (matching `CallLLM`), so both handlers source the turn identically from the machine rather than one reading a field and the other querying a counter.

@@ -486,28 +486,43 @@ impl CommandSpec {
     }
 }
 
-/// How to rebuild a connection on [`McpClient::reconnect`]. Stored on
-/// [`McpClient`] by [`McpClient::stdio`] / [`McpClient::http_sse`]; `None` for
-/// [`McpClient::in_process`].
+/// How to rebuild a dropped connection for [`McpClient::reconnect`].
+///
+/// Stored on [`McpClient`] at construction time by each transport
+/// constructor, so a reconnect is a faithful re-run of the original
+/// connection rather than a re-derivation. In-process clients carry no
+/// spec — their server lives in memory and cannot be re-established — so
+/// [`McpClient::in_process`] stores `None` and reconnecting one is an
+/// error.
 #[derive(Clone, Debug)]
 enum ReconnectSpec {
-    /// Re-spawn this command.
+    /// Re-spawn this command as a stdio child process.
     ///
-    /// Carries the full [`CommandSpec`] so a reconnect reproduces the original
-    /// program, arguments, environment, and working directory.
+    /// Carries the full [`CommandSpec`] so the reconnect reproduces the
+    /// original program, arguments, environment, and working directory of
+    /// the server it replaces.
     Stdio(CommandSpec),
 
-    /// Re-connect to this endpoint.
+    /// Re-connect to this Streamable HTTP endpoint.
     ///
-    /// The `Arc<str>` endpoint is reused, with the caller-supplied
-    /// `reqwest::Client` from the original [`McpClient::http_sse_with_client`]
-    /// call when one was given (`Some`) — preserving its pooling, TLS, and
-    /// timeout configuration — or rmcp's default client (`None`, from
-    /// [`McpClient::http_sse`]).
+    /// The endpoint is reused verbatim. The client mirrors the original
+    /// constructor: when the caller supplied a [`reqwest::Client`] (via
+    /// [`McpClient::http_sse_with_client`], stored as `Some`), the reconnect
+    /// reuses it and preserves its pooling, TLS, and timeout configuration;
+    /// `None` (from [`McpClient::http_sse`]) reconnects with rmcp's default
+    /// client, exactly as the first connection did.
     HttpSse {
         /// The endpoint URL to re-connect to.
+        ///
+        /// The same `Arc<str>` the original constructor received, kept
+        /// verbatim so the reconnect targets the identical server.
         endpoint: Arc<str>,
-        /// The client to reconnect with, when the caller supplied one.
+
+        /// The HTTP client to reconnect with, when the caller supplied one.
+        ///
+        /// `Some` retains the [`reqwest::Client`] handed to
+        /// [`McpClient::http_sse_with_client`]; `None` selects rmcp's
+        /// default client, matching [`McpClient::http_sse`].
         client: Option<reqwest::Client>,
     },
 }

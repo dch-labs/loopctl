@@ -1737,7 +1737,9 @@ impl StreamHandler {
                                         .fallback_non_streaming(
                                             client,
                                             request,
+                                            &options,
                                             cancel,
+                                            total_deadline,
                                             outcome,
                                         )
                                         .await?;
@@ -2062,7 +2064,9 @@ impl StreamHandler {
         &self,
         client: &C,
         request: &crate::api::StreamRequest,
+        options: &crate::structured::RequestOptions,
         cancel: &Arc<CancelSignal>,
+        total_deadline: Option<Instant>,
         stream_outcome: Option<StreamOutcome>,
     ) -> Result<(Message, StreamStopReason, Option<Usage>), StreamHandlerError> {
         if cancel.is_cancelled() {
@@ -2070,9 +2074,19 @@ impl StreamHandler {
         }
 
         let result = tokio::select! {
-            res = client.create_message(request) => res,
+            res = client.create_message_with_options(request, options.clone()) => res,
             () = cancel.notified() => {
                 return Err(StreamHandlerError::Cancelled);
+            }
+            () = deadline_future(total_deadline) => {
+                return Err(StreamHandlerError::FallbackFailed {
+                    stream_outcome: stream_outcome.unwrap_or(StreamOutcome::InitFailed {
+                        attempts: 0,
+                        last_error: "unknown".to_string(),
+                    }),
+                    fallback_error: "fallback request exceeded the total stream deadline"
+                        .to_string(),
+                });
             }
         };
 
@@ -2805,7 +2819,9 @@ mod tests {
             .fallback_non_streaming(
                 &client,
                 &crate::api::StreamRequest::new(vec![]),
+                &crate::structured::RequestOptions::default(),
                 &cancel,
+                None,
                 Some(StreamOutcome::InitFailed {
                     last_error: "stream failed".to_string(),
                     attempts: 3,
@@ -2845,7 +2861,9 @@ mod tests {
             .fallback_non_streaming(
                 &client,
                 &crate::api::StreamRequest::new(vec![]),
+                &crate::structured::RequestOptions::default(),
                 &cancel,
+                None,
                 None,
             )
             .await
@@ -2855,6 +2873,178 @@ mod tests {
             matches!(err, StreamHandlerError::Cancelled),
             "expected Cancelled, got: {err}"
         );
+    }
+
+    /// Mock recording every `create_message_with_options` invocation, so the
+    /// fallback's options forwarding is observable.
+    struct OptionsRecordingMock {
+        seen: std::sync::Mutex<Vec<crate::structured::RequestOptions>>,
+    }
+
+    impl ApiClient for OptionsRecordingMock {
+        fn model(&self) -> String {
+            "test-model".to_string()
+        }
+
+        fn stream_messages(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn create_message(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: Message::assistant("unused"),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
+        }
+
+        fn create_message_with_options(
+            &self,
+            _request: &crate::api::StreamRequest,
+            options: crate::structured::RequestOptions,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.seen.lock().unwrap().push(options);
+            Box::pin(async {
+                Ok(crate::api::NonStreamingResponse {
+                    message: Message::assistant("fallback works"),
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
+                    usage: Some(crate::stream::Usage::default()),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_non_streaming_forwards_request_options() {
+        let handler = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+            fallback_to_non_streaming: true,
+            ..Default::default()
+        });
+        let client = OptionsRecordingMock {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let cancel = Arc::new(CancelSignal::new());
+
+        let mut options = crate::structured::RequestOptions::default();
+        options.response_format = Some(crate::structured::ResponseFormat::new(
+            "probe",
+            serde_json::json!({"type": "object"}),
+        ));
+
+        let (message, _stop, _usage) = handler
+            .fallback_non_streaming(
+                &client,
+                &crate::api::StreamRequest::new(vec![]),
+                &options,
+                &cancel,
+                None,
+                Some(StreamOutcome::InitFailed {
+                    last_error: "stream failed".to_string(),
+                    attempts: 1,
+                }),
+            )
+            .await
+            .expect("fallback should succeed");
+
+        assert!(
+            message.text_content().contains("fallback works"),
+            "the options-aware response is the one used"
+        );
+        let seen = client.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one options-aware call");
+        assert!(
+            seen[0]
+                .response_format
+                .as_ref()
+                .is_some_and(|format| format.name == "probe"),
+            "the fallback must receive the turn's RequestOptions verbatim"
+        );
+    }
+
+    /// Mock whose non-streaming call never resolves — the deadline arm must
+    /// win.
+    struct HangingFallbackMock;
+
+    impl ApiClient for HangingFallbackMock {
+        fn model(&self) -> String {
+            "test-model".to_string()
+        }
+
+        fn stream_messages(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn create_message(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_non_streaming_honors_the_total_deadline() {
+        let handler = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+            fallback_to_non_streaming: true,
+            ..Default::default()
+        });
+        let cancel = Arc::new(CancelSignal::new());
+        let deadline = Instant::now() + Duration::from_millis(10);
+
+        let err = handler
+            .fallback_non_streaming(
+                &HangingFallbackMock,
+                &crate::api::StreamRequest::new(vec![]),
+                &crate::structured::RequestOptions::default(),
+                &cancel,
+                Some(deadline),
+                None,
+            )
+            .await
+            .expect_err("a hanging fallback must be cut by the deadline");
+
+        match err {
+            StreamHandlerError::FallbackFailed { fallback_error, .. } => {
+                assert!(
+                    fallback_error.contains("deadline"),
+                    "the deadline arm must be the failure cause: {fallback_error}"
+                );
+            }
+            other => panic!("expected FallbackFailed, got: {other}"),
+        }
     }
 
     #[tokio::test]
@@ -2870,7 +3060,9 @@ mod tests {
             .fallback_non_streaming(
                 &client,
                 &crate::api::StreamRequest::new(vec![]),
+                &crate::structured::RequestOptions::default(),
                 &cancel,
+                None,
                 Some(StreamOutcome::InitFailed {
                     last_error: "stream timeout".to_string(),
                     attempts: 2,

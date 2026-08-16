@@ -1008,17 +1008,103 @@ impl ToolError {
 /// [`ToolContext::get_extension`] to store and retrieve values keyed by
 /// their Rust type.
 ///
-/// # Example
+/// # Passing host state to tools
 ///
-/// ```rust,ignore
-/// let mut ctx = ToolContext::default();
-/// ctx.cwd = "/tmp/workspace".into();
-/// ctx.set_extension(MyConfig { verbose: true });
+/// Host state (a working directory, configuration, channels — anything the
+/// embedding application owns that a tool needs but the model does not send)
+/// reaches a tool through one of two supported options, depending on who
+/// dispatches the tool.
 ///
-/// // Inside a tool:
-/// if let Some(cfg) = ctx.get_extension::<MyConfig>() {
-///     println!("verbose={}", cfg.verbose);
+/// **Option A — the engine dispatches (`BareLoop`): a middleware injector.**
+/// Each dispatch's `ToolContext` is built fresh by the engine with only
+/// `session_id` set — `cwd`, `is_non_interactive`, and `extensions` all start
+/// at their defaults, and host code never holds that value. The one place it
+/// can be augmented is a [`ToolMiddleware`], which receives `&mut`
+/// [`ToolDispatchContext`] — whose public `tool_context` field exists for
+/// exactly this — before the pipeline core invokes the tool. Install with
+/// [`BareLoop::set_pipeline`] (which also shares the loop's own tool registry
+/// with the pipeline core), registering the injector first so later
+/// middlewares see the enriched context. Without a pipeline installed,
+/// engine-dispatched tools observe no host state at all.
+///
+/// **Option B — the host dispatches: build the context yourself.**
+/// When your code calls [`Tool::call`] directly (tests, scripts, simple
+/// integrations), construct the `ToolContext`, set fields and extensions, and
+/// pass it in — you own the value end to end, so nothing else is required.
+///
+/// Also possible, but discouraged: registering a wrapper tool that clones the
+/// incoming context, installs the extension, and delegates (works because
+/// `ToolContext` is `Clone`, but costs per-tool wiring plus a `Tool`-trait
+/// forwarding layer), and capturing state in the tool struct at construction
+/// (which bypasses the context entirely). Prefer the middleware — it is the
+/// same idea at the engine's single sanctioned interception point. The
+/// `host-state` example in the repository's `examples/` directory demonstrates
+/// both options end to end.
+///
+/// [`BareLoop`]: crate::engine::BareLoop
+/// [`BareLoop::set_pipeline`]: crate::engine::BareLoop::set_pipeline
+/// [`Tool::call`]: crate::tool::Tool::call
+/// [`ToolDispatchContext`]: crate::middleware::ToolDispatchContext
+/// [`ToolDispatchContext::tool_context`]: crate::middleware::ToolDispatchContext::tool_context
+/// [`ToolMiddleware`]: crate::middleware::ToolMiddleware
+///
+/// # Example — Option B: host-built context (runnable)
+///
+/// ```
+/// use loopctl::tool::ToolContext;
+///
+/// #[derive(Clone)]
+/// struct MyConfig {
+///     verbose: bool,
 /// }
+///
+/// let mut ctx = ToolContext::default();
+/// ctx.set_extension(MyConfig { verbose: true });
+/// assert!(ctx.get_extension::<MyConfig>().expect("just set").verbose);
+/// ```
+///
+/// # Example — Option A: middleware injector (compiles, does not run)
+///
+/// ```rust,no_run
+/// use std::future::Future;
+/// use std::pin::Pin;
+/// use std::sync::Arc;
+/// use loopctl::config::SessionConfig;
+/// use loopctl::engine::BareLoop;
+/// use loopctl::middleware::ToolDispatchContext;
+/// use loopctl::middleware::ToolDispatchResult;
+/// use loopctl::middleware::ToolMiddleware;
+/// use loopctl::middleware::ToolPipeline;
+/// # use loopctl::testing::MockApiClient;
+/// # use loopctl::tool::ToolRegistry;
+///
+/// #[derive(Clone)]
+/// struct MyConfig {
+///     verbose: bool,
+/// }
+///
+/// struct Injector;
+///
+/// impl ToolMiddleware for Injector {
+///     fn name(&self) -> &str {
+///         "my-injector"
+///     }
+///     fn dispatch<'a>(
+///         &'a self,
+///         ctx: &'a mut ToolDispatchContext,
+///         next: &'a ToolPipeline,
+///     ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
+///         ctx.tool_context.set_extension(MyConfig { verbose: true });
+///         Box::pin(async move { next.dispatch(ctx).await })
+///     }
+/// }
+///
+/// let client = MockApiClient::new("demo");
+/// let mut agent =
+///     BareLoop::new(Arc::new(client), ToolRegistry::new(), SessionConfig::default());
+/// agent
+///     .set_pipeline(ToolPipeline::builder().with_middleware(Injector))
+///     .expect("static pipeline composition");
 /// ```
 #[derive(Clone)]
 pub struct ToolContext {

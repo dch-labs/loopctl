@@ -708,3 +708,101 @@ async fn absent_destructive_hint_defaults_to_destructive_per_spec() {
         "explicit destructiveHint=false must be honored"
     );
 }
+
+/// A server whose only tool sleeps before answering — long relative to the
+/// test's shortened call timeout, short relative to the default.
+#[derive(Clone)]
+struct SlowServer {
+    router: ToolRouter<Self>,
+}
+
+#[tool_router]
+impl SlowServer {
+    fn new() -> Self {
+        Self {
+            router: Self::tool_router(),
+        }
+    }
+
+    #[tool(description = "Sleeps before answering")]
+    async fn slow(&self) -> String {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        "finally".to_string()
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for SlowServer {}
+
+#[tokio::test]
+async fn call_timeout_cuts_a_slow_tool_with_a_soft_error() {
+    let (client, _server) = connect_in_process(SlowServer::new()).await;
+    let provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect")
+        .with_call_timeout(Duration::from_millis(10));
+    let slow = provider
+        .tools()
+        .iter()
+        .find(|t| t.name() == "slow")
+        .expect("slow tool");
+    let ctx = ToolContext::default();
+
+    let out = slow
+        .call(json!({}), &ctx)
+        .await
+        .expect("timeout is a soft error");
+    assert!(out.is_error, "the timeout must surface as is_error");
+    let text = out.text_content();
+    assert!(
+        text.contains("slow") && text.contains("timed out"),
+        "the soft error must name the tool and the timeout: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn default_timeout_lets_a_quick_tool_through() {
+    let (client, _server) = connect_in_process(SlowServer::new()).await;
+    let provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect");
+    let slow = provider
+        .tools()
+        .iter()
+        .find(|t| t.name() == "slow")
+        .expect("slow tool");
+    let ctx = ToolContext::default();
+
+    let out = slow
+        .call(json!({}), &ctx)
+        .await
+        .expect("call ok under the default timeout");
+    assert!(!out.is_error, "a 150ms call must survive the 60s default");
+    assert_eq!(out.text_content(), "finally");
+}
+
+#[tokio::test]
+async fn refresh_preserves_the_overridden_call_timeout() {
+    let (client, _server) = connect_in_process(SlowServer::new()).await;
+    let mut provider = McpToolProvider::connect(client, None)
+        .await
+        .expect("connect")
+        .with_call_timeout(Duration::from_millis(10));
+
+    // Rebuild the tool snapshot: the refreshed tools must inherit the
+    // provider's overridden timeout, not the constructor default.
+    provider.refresh().await.expect("refresh");
+    let slow = provider
+        .tools()
+        .iter()
+        .find(|t| t.name() == "slow")
+        .expect("slow tool after refresh");
+    let ctx = ToolContext::default();
+
+    let out = slow.call(json!({}), &ctx).await.expect("call resolves");
+    assert!(
+        out.is_error && out.text_content().contains("timed out"),
+        "the refreshed tool must still be bounded by the override: {}",
+        out.text_content()
+    );
+}

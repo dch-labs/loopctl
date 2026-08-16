@@ -63,6 +63,15 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Default per-call budget for a forwarded `tools/call` round-trip.
+///
+/// Generous enough for interactive server tools (searches, reads, short
+/// builds) while still bounding a wedged server so the agent loop cannot
+/// hang indefinitely. Override per provider with
+/// [`McpToolProvider::with_call_timeout`](McpToolProvider::with_call_timeout).
+const DEFAULT_MCP_CALL_TIMEOUT: Duration = Duration::from_mins(1);
 
 use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
@@ -577,6 +586,16 @@ pub struct McpToolProvider {
     /// so a refresh preserves the original namespacing without the caller
     /// having to pass the prefix again.
     prefix: Option<String>,
+
+    /// The per-call timeout applied to every adapted tool's `tools/call`.
+    ///
+    /// Bounds each forwarded call so a wedged server cannot hang the agent
+    /// loop indefinitely — a call that exceeds it resolves to a *soft* error
+    /// result the model can see and adapt to. Defaults to
+    /// [`DEFAULT_MCP_CALL_TIMEOUT`]; overridden via
+    /// [`with_call_timeout`](Self::with_call_timeout), which also updates
+    /// already-discovered tools and applies to later refreshes.
+    call_timeout: Duration,
 }
 
 impl McpToolProvider {
@@ -605,12 +624,35 @@ impl McpToolProvider {
     /// earlier, from the construction of the supplied [`McpClient`].
     pub async fn connect(client: McpClient, name_prefix: Option<String>) -> Result<Self, McpError> {
         let mut tools = Vec::new();
-        bridge_tool_list(&client, name_prefix.as_deref(), &mut tools).await?;
+        bridge_tool_list(
+            &client,
+            name_prefix.as_deref(),
+            DEFAULT_MCP_CALL_TIMEOUT,
+            &mut tools,
+        )
+        .await?;
         Ok(Self {
             client,
             tools,
             prefix: name_prefix,
+            call_timeout: DEFAULT_MCP_CALL_TIMEOUT,
         })
+    }
+
+    /// Set the per-call timeout for every adapted tool's `tools/call`.
+    ///
+    /// Updates both already-discovered tools and the value applied to later
+    /// [`refresh`](Self::refresh) snapshots, so the knob takes effect
+    /// immediately regardless of when it is called. A call that exceeds the
+    /// timeout resolves to a soft error result naming the tool and the
+    /// budget — the run continues and the model decides how to adapt.
+    #[must_use]
+    pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = timeout;
+        for tool in &mut self.tools {
+            tool.call_timeout = timeout;
+        }
+        self
     }
 
     /// Re-run `tools/list` and rebuild the tool snapshot in place.
@@ -633,7 +675,13 @@ impl McpToolProvider {
     /// only assigned on success).
     pub async fn refresh(&mut self) -> Result<(), McpError> {
         let mut tools = Vec::new();
-        bridge_tool_list(&self.client, self.prefix.as_deref(), &mut tools).await?;
+        bridge_tool_list(
+            &self.client,
+            self.prefix.as_deref(),
+            self.call_timeout,
+            &mut tools,
+        )
+        .await?;
         self.tools = tools;
         Ok(())
     }
@@ -769,6 +817,14 @@ pub struct McpTool {
     /// polarity from `read_only_hint`). Exposed via
     /// [`McpTool::is_destructive_hint`] for a future permission gate.
     destructive_hint: bool,
+
+    /// The per-call timeout for this tool's `tools/call` round-trip.
+    ///
+    /// Copied from the provider at discovery (or updated by
+    /// [`with_call_timeout`](McpToolProvider::with_call_timeout)). A call that
+    /// exceeds it resolves to a soft error result rather than hanging the
+    /// agent loop on a wedged server.
+    call_timeout: Duration,
 }
 
 impl McpTool {
@@ -844,7 +900,10 @@ impl Tool for McpTool {
     /// [`ToolError::Execution`] for any protocol failure, transport error, or
     /// server-reported empty error — mapped at the [`McpClient`] boundary. A
     /// server-reported tool error (`isError: true`) with content is surfaced as
-    /// a *soft* [`ToolOutput`] with `is_error` set, not as an `Err`.
+    /// a *soft* [`ToolOutput`] with `is_error` set, not as an `Err`. A call
+    /// that exceeds the tool's [`call_timeout`](McpTool) likewise resolves to
+    /// a soft error result naming the tool and the budget, so a wedged server
+    /// costs one tool result instead of the whole run.
     fn call(
         &self,
         input: serde_json::Value,
@@ -852,7 +911,18 @@ impl Tool for McpTool {
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
         let client = self.client.clone();
         let server_name = self.server_name.clone();
-        Box::pin(async move { client.call_tool_forward(&server_name, input).await })
+        let exposed_name = self.exposed_name.clone();
+        let call_timeout = self.call_timeout;
+        Box::pin(async move {
+            match tokio::time::timeout(call_timeout, client.call_tool_forward(&server_name, input))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Ok(ToolOutput::error_text(format!(
+                    "MCP tool '{exposed_name}' timed out after {call_timeout:?} without a response"
+                ))),
+            }
+        })
     }
 
     /// Conservatively `false` for every MCP tool.
@@ -927,6 +997,7 @@ pub enum McpError {
 async fn bridge_tool_list(
     client: &McpClient,
     prefix: Option<&str>,
+    call_timeout: Duration,
     out: &mut Vec<McpTool>,
 ) -> Result<(), McpError> {
     let server_tools = client
@@ -936,7 +1007,7 @@ async fn bridge_tool_list(
         .map_err(|e| McpError::Protocol(e.to_string()))?;
     let mut seen = std::collections::HashSet::new();
     for server_tool in server_tools {
-        let Some(adapted) = bridge_tool(&server_tool, prefix, client) else {
+        let Some(adapted) = bridge_tool(&server_tool, prefix, client, call_timeout) else {
             continue;
         };
         if !seen.insert(adapted.exposed_name.clone()) {
@@ -991,6 +1062,7 @@ fn bridge_tool(
     server_tool: &rmcp::model::Tool,
     prefix: Option<&str>,
     client: &McpClient,
+    call_timeout: Duration,
 ) -> Option<McpTool> {
     let server_name = server_tool.name.to_string();
     if server_name.is_empty() {
@@ -1030,6 +1102,7 @@ fn bridge_tool(
         client: client.clone(),
         read_only_hint,
         destructive_hint,
+        call_timeout,
     })
 }
 

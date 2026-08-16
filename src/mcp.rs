@@ -79,11 +79,8 @@ use rmcp::model::ContentBlock;
 use rmcp::service::RoleClient;
 use rmcp::service::RunningService;
 use rmcp::transport::IntoTransport;
-#[cfg(feature = "mcp")]
 use rmcp::transport::StreamableHttpClientTransport;
-#[cfg(feature = "mcp")]
 use rmcp::transport::TokioChildProcess;
-#[cfg(feature = "mcp")]
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 
 use crate::message::ToolContent as MessageToolContent;
@@ -318,7 +315,7 @@ impl McpClient {
     pub async fn http_sse(endpoint: impl Into<Arc<str>>) -> Result<Self, McpError> {
         let endpoint = endpoint.into();
         let transport = StreamableHttpClientTransport::from_uri(Arc::clone(&endpoint));
-        Self::http_connect(transport, endpoint).await
+        Self::http_connect(transport, endpoint, None).await
     }
 
     /// Connect via Streamable HTTP with a caller-supplied [`reqwest::Client`].
@@ -329,9 +326,9 @@ impl McpClient {
     /// [`Self::http_sse`] unless you need pooling (rmcp's default disables it to
     /// avoid TCP Delayed-ACK stalls).
     ///
-    /// The endpoint (not the client) is retained for [`Self::reconnect`]; a
-    /// reconnect re-connects with rmcp's default client, not the originally
-    /// supplied one.
+    /// Both the endpoint and the supplied client are retained for
+    /// [`Self::reconnect`]; a reconnect re-connects with this same client,
+    /// preserving its pooling, TLS, and timeout configuration.
     ///
     /// # Errors
     ///
@@ -343,10 +340,10 @@ impl McpClient {
     ) -> Result<Self, McpError> {
         let endpoint = endpoint.into();
         let transport = StreamableHttpClientTransport::with_client(
-            client,
+            client.clone(),
             StreamableHttpClientTransportConfig::with_uri(Arc::clone(&endpoint)),
         );
-        Self::http_connect(transport, endpoint).await
+        Self::http_connect(transport, endpoint, Some(client)).await
     }
 
     /// Drive `().serve(transport)` for an HTTP transport and wrap the result.
@@ -355,13 +352,20 @@ impl McpClient {
     ///
     /// [`McpError::Handshake`] if the rmcp `serve`/`initialize` fails
     /// (`ClientInitializeError`).
-    async fn http_connect<T, E, A>(transport: T, endpoint: Arc<str>) -> Result<Self, McpError>
+    async fn http_connect<T, E, A>(
+        transport: T,
+        endpoint: Arc<str>,
+        client: Option<reqwest::Client>,
+    ) -> Result<Self, McpError>
     where
         T: IntoTransport<RoleClient, E, A>,
         E: std::error::Error + Send + Sync + 'static,
     {
         let service = ().serve(transport).await.map_err(|e| McpError::Handshake(e.to_string()))?;
-        Ok(Self::wrap(service, Some(ReconnectSpec::HttpSse(endpoint))))
+        Ok(Self::wrap(
+            service,
+            Some(ReconnectSpec::HttpSse { endpoint, client }),
+        ))
     }
 
     /// Re-establish a dropped connection using [`StreamRetryConfig`](crate::stream::handler::StreamRetryConfig)
@@ -495,10 +499,17 @@ enum ReconnectSpec {
 
     /// Re-connect to this endpoint.
     ///
-    /// The `Arc<str>` endpoint is reused; the reconnect uses rmcp's default
-    /// HTTP client (not any caller-supplied client from the original
-    /// `http_sse_with_client` call — that client is not retained).
-    HttpSse(Arc<str>),
+    /// The `Arc<str>` endpoint is reused, with the caller-supplied
+    /// `reqwest::Client` from the original [`McpClient::http_sse_with_client`]
+    /// call when one was given (`Some`) — preserving its pooling, TLS, and
+    /// timeout configuration — or rmcp's default client (`None`, from
+    /// [`McpClient::http_sse`]).
+    HttpSse {
+        /// The endpoint URL to re-connect to.
+        endpoint: Arc<str>,
+        /// The client to reconnect with, when the caller supplied one.
+        client: Option<reqwest::Client>,
+    },
 }
 
 impl ReconnectSpec {
@@ -511,7 +522,12 @@ impl ReconnectSpec {
     async fn connect(&self) -> Result<McpClient, McpError> {
         match self {
             Self::Stdio(command) => McpClient::stdio(command.clone()).await,
-            Self::HttpSse(endpoint) => McpClient::http_sse(Arc::clone(endpoint)).await,
+            Self::HttpSse { endpoint, client } => match client {
+                Some(client) => {
+                    McpClient::http_sse_with_client(Arc::clone(endpoint), client.clone()).await
+                }
+                None => McpClient::http_sse(Arc::clone(endpoint)).await,
+            },
         }
     }
 }

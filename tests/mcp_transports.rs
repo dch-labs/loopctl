@@ -29,12 +29,27 @@ use loopctl::stream::handler::StreamRetryConfig;
 
 /// Path to the loopctl-shipped stdio example server binary.
 ///
-/// `cargo test` builds examples into `target/<profile>/examples/`; the
-/// `CARGO_MANIFEST_DIR` env var points at the crate root during the test run.
+/// Derived from the test binary's own location: `cargo test` places the test
+/// binary in `target/<profile>/deps/` and example binaries in
+/// `target/<profile>/examples/`, so walking two levels up from
+/// `current_exe()` lands on the profile directory regardless of `--release`
+/// or a custom `CARGO_TARGET_DIR`.
 fn stdio_server_bin() -> String {
-    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("target/debug/examples/mcp-stdio-server");
-    path.to_string_lossy().to_string()
+    let exe = std::env::current_exe().expect("test binary path");
+    let profile_dir = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .expect("profile directory above the test binary's deps directory");
+    let name = if cfg!(windows) {
+        "mcp-stdio-server.exe"
+    } else {
+        "mcp-stdio-server"
+    };
+    profile_dir
+        .join("examples")
+        .join(name)
+        .to_string_lossy()
+        .to_string()
 }
 
 /// A `CommandSpec` pointing at the loopctl stdio example server.
@@ -235,12 +250,10 @@ async fn http_sse_connect_refused_is_handshake_error() {
 }
 
 #[tokio::test]
-async fn http_sse_reconnect_refused_gives_up() {
-    // Connect (fails), then a reconnect attempt against the same refused
-    // endpoint exhausts fast_retry and returns Handshake. We build a client
-    // whose spec is the refused endpoint by... we can't, since http_sse fails.
-    // Instead: confirm the http_sse_with_client path also refuses (the power
-    // path's error mapping), matching the plain http_sse test above.
+async fn http_sse_with_client_connect_refused_is_handshake_error() {
+    // The caller-supplied-client constructor maps a refused connection (port
+    // 1 on most systems) to the same Handshake error as the default-client
+    // path — the error mapping is uniform across both constructors.
     let req_client = reqwest::Client::builder().build().expect("reqwest client");
     let err = McpClient::http_sse_with_client("http://127.0.0.1:1/mcp", req_client)
         .await

@@ -137,11 +137,15 @@ pub(super) async fn read_bounded_body(resp: reqwest::Response) -> Result<bytes::
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 #[derive(Clone)]
 pub(super) struct HttpClientConfig {
-    /// The total HTTP request timeout (connect + response + body).
+    /// The HTTP read timeout: the maximum gap between bytes of a response.
     ///
-    /// Bounds the entire request lifecycle — a hanging server will be
-    /// aborted after this duration rather than blocking the agent loop
-    /// indefinitely. Defaults to 120 seconds.
+    /// Bounds *idleness*, not total duration — a healthy slow stream (a long
+    /// SSE generation that keeps emitting events) runs as long as it keeps
+    /// producing bytes, while a server that goes silent is aborted after this
+    /// gap. This is deliberately not a total request timeout: a total cap at
+    /// the HTTP layer would pre-empt the `StreamHandler`'s per-event and
+    /// total-stream deadlines (and the engine's turn timeout), killing any
+    /// generation longer than the cap. Defaults to 120 seconds.
     ///
     /// Ignored when an external client is supplied via
     /// [`with_http_client`](Self::with_http_client); configure it on that
@@ -212,9 +216,11 @@ impl Default for HttpClientConfig {
 
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 impl HttpClientConfig {
-    /// Set the total request timeout.
+    /// Set the read timeout (maximum gap between response bytes).
     ///
-    /// Ignored when an external client was supplied via
+    /// Not a total request timeout — long streaming generations are bounded
+    /// by the `StreamHandler`'s per-event/total deadlines, not by the HTTP
+    /// layer. Ignored when an external client was supplied via
     /// [`with_http_client`](Self::with_http_client).
     #[must_use]
     pub(super) fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -297,8 +303,11 @@ impl HttpClientConfig {
     ///
     /// If an external client was supplied via
     /// [`with_http_client`](Self::with_http_client), it is returned verbatim. Otherwise
-    /// a new client is constructed with the configured timeouts, pool knobs,
-    /// and `tcp_nodelay(true)`.
+    /// a new client is constructed with a connect timeout, a read (idle-gap)
+    /// timeout, pool knobs, and `tcp_nodelay(true)`. No total request
+    /// timeout is set at this layer: generation-length budgets belong to the
+    /// `StreamHandler` and the engine's turn timeout, and a total HTTP cap
+    /// would abort healthy long streams.
     ///
     /// # Errors
     ///
@@ -307,7 +316,7 @@ impl HttpClientConfig {
         match self.http {
             Some(shared) => Ok(shared),
             None => reqwest::Client::builder()
-                .timeout(self.timeout)
+                .read_timeout(self.timeout)
                 .connect_timeout(self.connect_timeout)
                 .tcp_nodelay(self.tcp_nodelay)
                 .maybe_pool_max_idle_per_host(self.pool_max_idle_per_host)

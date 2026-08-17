@@ -357,7 +357,10 @@ impl LoopManagers {
     /// Set the middleware pipeline for tool dispatch.
     ///
     /// Non-consuming variant of [`with_pipeline`](Self::with_pipeline) for
-    /// cases where the managers is already constructed.
+    /// cases where a `LoopManagers` is already constructed. If you are installing
+    /// onto a [`BareLoop`](crate::engine::BareLoop), prefer
+    /// [`BareLoop::set_pipeline`](crate::engine::BareLoop::set_pipeline), which
+    /// shares the loop's tool registry with the pipeline core automatically.
     pub fn set_pipeline(&mut self, pipeline: ToolPipeline) {
         self.tool_pipeline = Some(pipeline);
     }

@@ -284,16 +284,30 @@ impl<C: ApiClient> BareLoop<C> {
     /// automatically from `self.tools` so that schema generation and dispatch
     /// always share the same underlying registry:
     ///
+    /// The pipeline is also the injection point for per-dispatch host state:
+    /// a middleware may augment `ctx.tool_context` — set extensions, `cwd`,
+    /// `is_non_interactive` — before the tool runs. See
+    /// [`ToolContext`](crate::tool::ToolContext) ("Passing host state to
+    /// tools") and the `host-state` example for the full pattern.
+    ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// use loopctl::engine::middleware::{ToolPipeline, TimeoutMiddleware};
+    /// ```rust,no_run
+    /// # use std::sync::Arc;
+    /// # use loopctl::config::SessionConfig;
+    /// # use loopctl::engine::BareLoop;
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    /// use loopctl::middleware::{ToolPipeline, TimeoutMiddleware};
     ///
     /// let builder = ToolPipeline::builder()
     ///     .with_middleware(TimeoutMiddleware::from_secs(30));
     ///
-    /// let mut agent = BareLoop::new(client, registry, config);
-    /// agent.set_pipeline(builder)?;
+    /// # let client = MockApiClient::new("demo");
+    /// # let registry = ToolRegistry::new();
+    /// # let config = SessionConfig::default();
+    /// let mut agent = BareLoop::new(Arc::new(client), registry, config);
+    /// agent.set_pipeline(builder).expect("static composition is valid");
     /// ```
     ///
     /// # Errors

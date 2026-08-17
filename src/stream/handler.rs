@@ -2051,15 +2051,28 @@ impl StreamHandler {
     ///
     /// Called when streaming fails (timeout, retries exhausted) and
     /// `fallback_to_non_streaming` is enabled. Uses
-    /// [`ApiClient::create_message`] to get a complete typed response — the
-    /// message, stop reason, and token usage are returned directly, with no
-    /// JSON parsing at this layer.
+    /// [`ApiClient::create_message_with_options`] with the turn's
+    /// [`RequestOptions`](crate::structured::RequestOptions) — a configured
+    /// `response_format` or `tool_constraint` applies to the fallback exactly
+    /// as it did to the streaming attempt — to get a complete typed response:
+    /// the message, stop reason, and token usage are returned directly, with
+    /// no JSON parsing at this layer.
+    ///
+    /// The request is raced against the turn's `total_deadline` (the same one
+    /// that bounded the streaming attempts), so a hanging non-streaming call
+    /// cannot outlive the budget the stream already spent. The deadline
+    /// bounds *waiting*, not completion: a response that has resolved by the
+    /// time the select is polled is accepted even when it lands at or past
+    /// the deadline — the answer exists and its tokens are already spent, so
+    /// discarding it would trade finished work for wall-clock bookkeeping.
+    /// `None` means no deadline is configured and the call is bounded only
+    /// by cancellation and any client-level limits.
     ///
     /// # Errors
     ///
-    /// Returns [`StreamHandlerError::FallbackFailed`] if the fallback
-    /// request also fails, or [`StreamHandlerError::Cancelled`] if the
-    /// cancel signal fires.
+    /// Returns [`StreamHandlerError::FallbackFailed`] if the fallback request
+    /// also fails or the total deadline expires before it completes, or
+    /// [`StreamHandlerError::Cancelled`] if the cancel signal fires.
     async fn fallback_non_streaming<C: ApiClient>(
         &self,
         client: &C,
@@ -2074,10 +2087,12 @@ impl StreamHandler {
         }
 
         let result = tokio::select! {
-            res = client.create_message_with_options(request, options.clone()) => res,
+            biased;
+
             () = cancel.notified() => {
                 return Err(StreamHandlerError::Cancelled);
             }
+            res = client.create_message_with_options(request, options.clone()) => res,
             () = deadline_future(total_deadline) => {
                 return Err(StreamHandlerError::FallbackFailed {
                     stream_outcome: stream_outcome.unwrap_or(StreamOutcome::InitFailed {
@@ -2137,8 +2152,9 @@ pub enum HandlerEvent {
     ///
     /// Carries the final message, stop reason, and token usage from the
     /// non-streaming
-    /// [`create_message`](crate::api::ApiClient::create_message) typed
-    /// response. The engine should stop accumulating and use these directly —
+    /// [`create_message_with_options`](crate::api::ApiClient::create_message_with_options)
+    /// typed response, bounded by the turn's total deadline. The engine
+    /// should stop accumulating and use these directly —
     /// the streaming accumulator's partial state from failed attempts is
     /// irrelevant on this path.
     ///
@@ -3045,6 +3061,35 @@ mod tests {
             }
             other => panic!("expected FallbackFailed, got: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn completed_fallback_response_racing_the_deadline_is_accepted() {
+        let handler = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+            fallback_to_non_streaming: true,
+            ..Default::default()
+        });
+        let client = HandlerMock::new().with_text_response("worth keeping");
+        let cancel = Arc::new(CancelSignal::new());
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("a past instant");
+
+        let (message, _stop_reason, _usage) = handler
+            .fallback_non_streaming(
+                &client,
+                &crate::api::StreamRequest::new(vec![]),
+                &crate::structured::RequestOptions::default(),
+                &cancel,
+                Some(deadline),
+                None,
+            )
+            .await
+            .expect("a completed response outranks the expired deadline");
+        assert!(
+            message.text_content().contains("worth keeping"),
+            "the completed response is returned, not discarded"
+        );
     }
 
     #[tokio::test]

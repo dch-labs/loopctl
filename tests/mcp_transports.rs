@@ -240,23 +240,36 @@ async fn http_sse_with_client_round_trips() {
     assert!(!names.is_empty(), "server advertised tools");
 }
 
+/// An endpoint whose single connection is accepted and then severed.
+///
+/// Binds a loopback listener on an OS-assigned port, accepts exactly one
+/// connection on a background thread, and closes it — so a client dialing
+/// the endpoint deterministically sees the connection drop mid-handshake,
+/// with no dependence on how any well-known port behaves on this host.
+fn severed_endpoint() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("assigned port");
+    std::thread::spawn(move || {
+        if let Ok((conn, _)) = listener.accept() {
+            drop(conn);
+        }
+    });
+    format!("http://{addr}/mcp")
+}
+
 #[tokio::test]
 async fn http_sse_connect_refused_is_handshake_error() {
-    // Port 1 refuses on most systems. No #[ignore] — exercises the error path.
-    let err = McpClient::http_sse("http://127.0.0.1:1/mcp")
+    let err = McpClient::http_sse(severed_endpoint())
         .await
-        .expect_err("port 1 must refuse");
+        .expect_err("severed connection must fail the handshake");
     assert!(matches!(err, McpError::Handshake(_)), "got {err:?}");
 }
 
 #[tokio::test]
 async fn http_sse_with_client_connect_refused_is_handshake_error() {
-    // The caller-supplied-client constructor maps a refused connection (port
-    // 1 on most systems) to the same Handshake error as the default-client
-    // path — the error mapping is uniform across both constructors.
     let req_client = reqwest::Client::builder().build().expect("reqwest client");
-    let err = McpClient::http_sse_with_client("http://127.0.0.1:1/mcp", req_client)
+    let err = McpClient::http_sse_with_client(severed_endpoint(), req_client)
         .await
-        .expect_err("refused");
+        .expect_err("severed connection must fail the handshake");
     assert!(matches!(err, McpError::Handshake(_)), "got {err:?}");
 }

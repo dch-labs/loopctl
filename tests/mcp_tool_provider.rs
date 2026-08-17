@@ -789,8 +789,6 @@ async fn refresh_preserves_the_overridden_call_timeout() {
         .expect("connect")
         .with_call_timeout(Duration::from_millis(10));
 
-    // Rebuild the tool snapshot: the refreshed tools must inherit the
-    // provider's overridden timeout, not the constructor default.
     provider.refresh().await.expect("refresh");
     let slow = provider
         .tools()

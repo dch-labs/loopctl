@@ -1,12 +1,15 @@
 //! MCP client + server adapters — bridge loopctl and the Model Context Protocol
 //! in both directions.
 //!
-//! [Model Context Protocol][mcp] servers expose callable *tools*. This module
-//! connects one server, discovers its tools (`tools/list`), and wraps each one
-//! as an ordinary loopctl [`Tool`] whose [`call`](Tool::call) forwards to the
-//! server (`tools/call`). The agent loop, the registry, the middleware
+//! [Model Context Protocol][mcp] servers expose callable *tools*. The client
+//! adapters connect to a server, discover its tools (`tools/list`), and wrap
+//! each one as an ordinary loopctl [`Tool`] whose [`call`](Tool::call) forwards
+//! to the server (`tools/call`). The agent loop, the registry, the middleware
 //! pipeline, permission gates, and observers never learn a tool is remote —
-//! they see a `Box<dyn Tool>`.
+//! they see a `Box<dyn Tool>`. The server adapter is the mirror image: it
+//! serves a loopctl [`ToolRegistry`] to any MCP
+//! client, so one application's tool set is usable
+//! both inside its own agent loop and from any MCP-speaking host.
 //!
 //! # The adapter surface
 //!
@@ -18,10 +21,18 @@
 //!   [`register_into`](McpToolProvider::register_into) registers the batch into
 //!   a [`ToolRegistry`].
 //! - [`McpTool`] — one server tool as a [`Tool`].
-//! - [`McpError`] — adapter errors.
+//! - [`McpError`] — client-adapter errors.
+//! - [`McpServerAdapter`] — serve a [`ToolRegistry`]
+//!   over MCP: `tools/list` maps to the registry's schemas, `tools/call`
+//!   dispatches to [`Tool::call`]. Drive it with
+//!   [`McpServerAdapter::serve_stdio`] or any transport rmcp supports.
 //!
-//! No rmcp type appears in any of these public signatures; an rmcp upgrade is
-//! a one-file change (this one).
+//! No rmcp type appears in the client adapters' public signatures — an rmcp
+//! upgrade changes their behavior without touching their API. The server
+//! adapter is the deliberate exception: it implements rmcp's `ServerHandler`
+//! and `serve_stdio` returns rmcp's own `RunningService`, so an embedding can
+//! drive it with every transport rmcp supports. On the server side, the rmcp
+//! version is part of this module's public surface.
 //!
 //! # Transports
 //!
@@ -30,7 +41,7 @@
 //!
 //! - **stdio** — [`McpClient::stdio`] spawns an MCP server as a child process
 //!   (NDJSON JSON-RPC over the child's stdin/stdout). The common local
-//!   deployment shape (MCP client, Cursor, the reference clients).
+//!   deployment shape: a server running as a child on the same machine.
 //! - **Streamable HTTP/SSE** — [`McpClient::http_sse`] (rmcp's default HTTP
 //!   client) or [`McpClient::http_sse_with_client`] (caller-supplied
 //!   `reqwest::Client`) connect to a remote server. rmcp handles
@@ -45,8 +56,10 @@
 //!
 //! # Example
 //!
-//! See `examples/mcp-adapter.rs` for a runnable end-to-end demo (an in-process
-//! server, discovery, registration, and a call). In short:
+//! See `examples/mcp-adapter.rs` for a runnable end-to-end demo of the client
+//! direction (an in-process server, discovery, registration, and a call), and
+//! `examples/mcp_server.rs` for serving a registry over stdio. The client
+//! direction in short:
 //!
 //! ```rust,ignore
 //! use loopctl::mcp::{McpClient, McpToolProvider};
@@ -91,6 +104,11 @@ pub mod server;
 pub use server::McpServerAdapter;
 
 /// Buffer size for the in-process duplex channel ([`McpClient::in_process`]).
+///
+/// `4 KiB` comfortably carries a handshake, a tool list, and typical tool
+/// results without back-pressure. Larger payloads still flow — the writer
+/// blocks until the reader drains, so the channel chunks them through
+/// rather than failing.
 const DUPLEX_BUFFER: usize = 4096;
 
 /// A live, initialized connection to an MCP server.
@@ -1001,20 +1019,29 @@ impl Tool for McpTool {
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
     /// The `initialize` handshake or underlying transport failed before any
-    /// tools could be listed. Carries the rmcp service/transport error as a
-    /// string (the rmcp error types are not uniformly `Send + 'static`; this
-    /// keeps [`McpError`] cheap and stable across rmcp version bumps).
+    /// tools could be listed.
+    ///
+    /// Carries the rmcp service/transport error as a string — the rmcp error
+    /// types are not uniformly `Send + 'static`, and stringing them keeps
+    /// [`McpError`] cheap and stable across rmcp version bumps.
     #[error("MCP handshake/transport error: {0}")]
     Handshake(String),
 
-    /// A JSON-RPC-level protocol error from the server, e.g. `tools/list`
-    /// rejected or `tools/call` for an unknown tool.
+    /// A JSON-RPC-level protocol error reported by the server.
+    ///
+    /// Covers RPC-level failures such as `tools/list` being rejected or
+    /// `tools/call` naming a tool the server does not have. The carried
+    /// string is the server's own error message.
     #[error("MCP protocol error: {0}")]
     Protocol(String),
 
-    /// The server returned a tool result with `isError = true` and no textual
-    /// content to surface. (When there *is* text content, the bridge returns a
-    /// soft-error [`ToolOutput`] instead of raising this.)
+    /// The server returned a tool result with `isError = true` and no
+    /// textual content to surface.
+    ///
+    /// When there *is* text content, the bridge returns a soft-error
+    /// [`ToolOutput`] instead of raising this — the model can read the
+    /// message, so nothing is lost. An empty error leaves nothing to show
+    /// the model, which the adapter refuses to swallow silently.
     #[error("MCP tool '{0}' reported an error with no content")]
     EmptyToolError(String),
 }

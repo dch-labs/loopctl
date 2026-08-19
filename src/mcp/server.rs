@@ -58,6 +58,7 @@ use crate::mcp::convert;
 use crate::tool::Tool;
 use crate::tool::ToolContext;
 use crate::tool::ToolError;
+use crate::tool::ToolOutput;
 use crate::tool::ToolRegistry;
 
 /// An MCP server backed by a loopctl [`ToolRegistry`].
@@ -190,6 +191,33 @@ impl McpServerAdapter {
     }
 }
 
+/// Dispatch one tool call, guarded against request cancellation.
+///
+/// The cancellation token is polled first (`biased` selection), and the tool
+/// future is only constructed when its branch is polled — so a request that is
+/// already cancelled when it reaches dispatch resolves to
+/// [`ToolError::Cancelled`] without invoking the tool at all. Once the tool is
+/// running, cancellation drops its in-flight future; tools served over MCP must
+/// therefore be cancellation-safe, the same contract the engine's dispatch
+/// path imposes.
+///
+/// # Errors
+///
+/// [`ToolError::Cancelled`] when the token is already cancelled or fires while
+/// the tool is running; otherwise whatever the tool itself reports.
+async fn dispatch_guarded(
+    tool: &dyn Tool,
+    input: serde_json::Value,
+    context: &ToolContext,
+    ct: &tokio_util::sync::CancellationToken,
+) -> Result<ToolOutput, ToolError> {
+    tokio::select! {
+        biased;
+        () = ct.cancelled() => Err(ToolError::Cancelled),
+        result = async { tool.call(input, context).await } => result,
+    }
+}
+
 impl ServerHandler for McpServerAdapter {
     /// Advertise the server identity and the **tools** capability only.
     ///
@@ -210,6 +238,9 @@ impl ServerHandler for McpServerAdapter {
     /// Pagination is ignored: loopctl registries are small, and the MCP
     /// `nextCursor` mechanism exists for tool lists with thousands of entries.
     /// The whole list is returned in one page regardless of any client cursor.
+    /// A tool whose input schema is not an object-typed JSON Schema is omitted
+    /// from the listing (with a warning) rather than advertised with a
+    /// malformed schema.
     ///
     /// Each tool's [`is_read_only`](crate::tool::Tool::is_read_only) flag is
     /// forwarded as the MCP `annotations.readOnlyHint` so clients can apply
@@ -228,7 +259,7 @@ impl ServerHandler for McpServerAdapter {
             .registry
             .all_schemas()
             .into_iter()
-            .map(|schema| {
+            .filter_map(|schema| {
                 let is_read_only = self
                     .registry
                     .get(&schema.tool)
@@ -249,17 +280,18 @@ impl ServerHandler for McpServerAdapter {
     ///   have, which is a request-routing failure. The message names the
     ///   registered tools for clients and logs that surface protocol-error
     ///   text.
-    /// - **Tool found, `Ok`** → content from the [`ToolOutput`](crate::tool::ToolOutput)
+    /// - **Tool found, `Ok`** → content from the [`ToolOutput`]
     ///   payload with `is_error` mirroring its soft-error flag.
     /// - **Tool found, `Err`** → `is_error: true` with the error text as
     ///   content — the model should see "permission denied: …" and react, not
     ///   a transport error.
     ///
-    /// The call is raced against the request's cancellation token: when the
-    /// client cancels the request (`notifications/cancelled`) or the
-    /// connection drops, the in-flight future is **dropped** and the call
-    /// resolves to a cancelled tool-level result. Tools served over MCP must
-    /// therefore be cancellation-safe — the same contract the engine's
+    /// The call is raced against the request's cancellation token: a request
+    /// that is already cancelled when it reaches dispatch never invokes the
+    /// tool, and when the client cancels mid-flight (`notifications/cancelled`)
+    /// or the connection drops, the in-flight future is **dropped** and the
+    /// call resolves to a cancelled tool-level result. Tools served over MCP
+    /// must therefore be cancellation-safe — the same contract the engine's
     /// dispatch path imposes on tools it runs.
     ///
     /// # Errors
@@ -282,10 +314,7 @@ impl ServerHandler for McpServerAdapter {
         let input = request
             .arguments
             .map_or(serde_json::Value::Null, serde_json::Value::Object);
-        let result = tokio::select! {
-            result = tool.call(input, &self.context) => result,
-            () = context.ct.cancelled() => Err(ToolError::Cancelled),
-        };
+        let result = dispatch_guarded(tool, input, &self.context, &context.ct).await;
         Ok(convert::dispatch_result_to_call_tool(&name, result).into())
     }
 }
@@ -299,6 +328,8 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     struct EchoTool;
 
@@ -464,6 +495,36 @@ mod tests {
     impl Drop for NeverCompletingCall {
         fn drop(&mut self) {
             self.dropped.notify_one();
+        }
+    }
+
+    /// Records invocation at the moment `call` runs — before any awaiting —
+    /// so a test can tell whether dispatch ever started the tool.
+    struct CallCountingTool {
+        invoked: Arc<AtomicBool>,
+    }
+
+    impl Tool for CallCountingTool {
+        fn name(&self) -> &'static str {
+            "counted"
+        }
+        fn description(&self) -> &'static str {
+            "Records whether it was invoked"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "counted".into(),
+                description: "Records whether it was invoked".into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            self.invoked.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok(ToolOutput::text("ran")) })
         }
     }
 
@@ -684,5 +745,54 @@ mod tests {
         tokio::time::timeout(guard, dropped_wait)
             .await
             .expect("cancelled call's tool future was dropped");
+    }
+
+    #[tokio::test]
+    async fn dispatch_guarded_already_cancelled_token_never_invokes_the_tool() {
+        let invoked = Arc::new(AtomicBool::new(false));
+        let tool = CallCountingTool {
+            invoked: Arc::clone(&invoked),
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let result = dispatch_guarded(
+            &tool,
+            serde_json::Value::Null,
+            &ToolContext::default(),
+            &token,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ToolError::Cancelled)),
+            "already-cancelled request resolves to Cancelled, got {result:?}"
+        );
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "already-cancelled request must not invoke the tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_guarded_live_token_invokes_the_tool() {
+        let invoked = Arc::new(AtomicBool::new(false));
+        let tool = CallCountingTool {
+            invoked: Arc::clone(&invoked),
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+        let result = dispatch_guarded(
+            &tool,
+            serde_json::Value::Null,
+            &ToolContext::default(),
+            &token,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "live request dispatches normally: {result:?}"
+        );
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "live request must invoke the tool"
+        );
     }
 }

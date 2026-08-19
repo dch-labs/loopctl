@@ -108,10 +108,16 @@ pub(crate) fn bridge_result(
 /// Convert a loopctl [`ToolSchema`] to an MCP `Tool`.
 ///
 /// The load-bearing detail: loopctl's field is named `tool`, MCP's is named
-/// `name` — this is the rename. `input_schema` is a `serde_json::Value` in
-/// loopctl and a `JsonObject` (`Map`) in MCP; we require it to be a JSON object
-/// (every valid JSON Schema is) and extract the map. An empty description is
-/// omitted (MCP's `description` is optional) rather than sent as `""`.
+/// `name` — this is the rename. An empty description is omitted (MCP's
+/// `description` is optional) rather than sent as `""`.
+///
+/// Only object-typed schemas are convertible: the root must be a JSON object
+/// carrying `"type": "object"` — the shape MCP clients expect a tool's input
+/// schema to have, and the only one rmcp's `JsonObject` field can carry
+/// (boolean schemas and non-object roots cannot be represented). Any other
+/// root — a boolean, a string, an object missing or disagreeing on `type` —
+/// yields `None` with a warning; callers omit such tools from the listing
+/// rather than advertise a malformed schema.
 ///
 /// `is_read_only` (from [`Tool::is_read_only`](crate::tool::Tool::is_read_only),
 /// which [`ToolSchema`] does not carry) is forwarded as the MCP
@@ -121,16 +127,20 @@ pub(crate) fn bridge_result(
 /// hint absent would make the MCP default ("assume destructive") contradict the
 /// read-only hint. When `is_read_only` is `false`, no annotations are sent and
 /// the client applies the spec defaults.
-pub(crate) fn tool_schema_to_mcp(schema: ToolSchema, is_read_only: bool) -> McpTool {
-    let input_schema: serde_json::Map<String, serde_json::Value> = match schema.input_schema {
-        serde_json::Value::Object(map) => map,
+pub(crate) fn tool_schema_to_mcp(schema: ToolSchema, is_read_only: bool) -> Option<McpTool> {
+    let input_schema = match schema.input_schema {
+        serde_json::Value::Object(map)
+            if map.get("type").and_then(serde_json::Value::as_str) == Some("object") =>
+        {
+            map
+        }
         other => {
             tracing::warn!(
                 tool = %schema.tool,
                 schema = %other,
-                "tool input_schema is not a JSON object; sending empty schema"
+                "tool input_schema is not an object-typed JSON Schema; omitting the tool"
             );
-            serde_json::Map::new()
+            return None;
         }
     };
     let description = if schema.description.is_empty() {
@@ -142,7 +152,7 @@ pub(crate) fn tool_schema_to_mcp(schema: ToolSchema, is_read_only: bool) -> McpT
         McpTool::new_with_raw(schema.tool, description, std::sync::Arc::new(input_schema));
     tool.annotations =
         is_read_only.then(|| ToolAnnotations::from_raw(None, Some(true), Some(false), None, None));
-    tool
+    Some(tool)
 }
 
 /// Map `Result<ToolOutput, ToolError>` → `CallToolResult`.
@@ -229,6 +239,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
         };
         let mcp_tool = tool_schema_to_mcp(schema, false);
+        let mcp_tool = mcp_tool.expect("object-typed schema converts");
         assert_eq!(mcp_tool.name.as_ref(), "echo");
         assert_eq!(mcp_tool.description.as_deref(), Some("Echoes input"));
     }
@@ -238,21 +249,41 @@ mod tests {
         let schema = ToolSchema {
             tool: "x".into(),
             description: String::new(),
-            input_schema: json!({"properties": {"q": {"type": "string"}}}),
+            input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
         };
         let mcp_tool = tool_schema_to_mcp(schema, false);
+        let mcp_tool = mcp_tool.expect("object-typed schema converts");
         assert!(mcp_tool.input_schema.contains_key("properties"));
     }
 
     #[test]
-    fn tool_schema_non_object_input_degrades_to_empty_not_panic() {
+    fn tool_schema_false_root_is_rejected() {
+        let schema = ToolSchema {
+            tool: "x".into(),
+            description: String::new(),
+            input_schema: json!(false),
+        };
+        assert!(tool_schema_to_mcp(schema, false).is_none());
+    }
+
+    #[test]
+    fn tool_schema_string_root_is_rejected() {
         let schema = ToolSchema {
             tool: "x".into(),
             description: String::new(),
             input_schema: json!("not an object"),
         };
-        let mcp_tool = tool_schema_to_mcp(schema, false);
-        assert!(mcp_tool.input_schema.is_empty());
+        assert!(tool_schema_to_mcp(schema, false).is_none());
+    }
+
+    #[test]
+    fn tool_schema_object_without_root_type_is_rejected() {
+        let schema = ToolSchema {
+            tool: "x".into(),
+            description: String::new(),
+            input_schema: json!({"properties": {"q": {"type": "string"}}}),
+        };
+        assert!(tool_schema_to_mcp(schema, false).is_none());
     }
 
     #[test]
@@ -263,6 +294,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
         };
         let mcp_tool = tool_schema_to_mcp(schema, false);
+        let mcp_tool = mcp_tool.expect("object-typed schema converts");
         assert_eq!(mcp_tool.description, None);
     }
 
@@ -274,6 +306,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
         };
         let mcp_tool = tool_schema_to_mcp(schema, true);
+        let mcp_tool = mcp_tool.expect("object-typed schema converts");
         let annotations = mcp_tool
             .annotations
             .expect("read-only tool has annotations");
@@ -289,6 +322,7 @@ mod tests {
             input_schema: json!({"type": "object"}),
         };
         let mcp_tool = tool_schema_to_mcp(schema, false);
+        let mcp_tool = mcp_tool.expect("object-typed schema converts");
         assert!(mcp_tool.annotations.is_none());
     }
 

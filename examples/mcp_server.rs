@@ -49,7 +49,10 @@ use serde_json::json;
 /// A tool that returns its `message` argument unchanged.
 ///
 /// The success-path fixture of this smoke test: it round-trips a string
-/// through `Tool::call` → MCP `tools/call` → back to the client.
+/// through `Tool::call` → MCP `tools/call` → back to the client. Input
+/// whose `message` is missing or not a string is rejected with
+/// [`ToolError::InvalidInput`], which the adapter surfaces as a tool-level
+/// error result the caller can read.
 struct EchoTool;
 
 impl Tool for EchoTool {
@@ -75,12 +78,14 @@ impl Tool for EchoTool {
         input: serde_json::Value,
         _ctx: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        let msg = input
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        Box::pin(async move { Ok(ToolOutput::text(msg)) })
+        Box::pin(async move {
+            let Some(message) = input.get("message").and_then(serde_json::Value::as_str) else {
+                return Err(ToolError::InvalidInput(
+                    "expected a string field `message`".into(),
+                ));
+            };
+            Ok(ToolOutput::text(message.to_string()))
+        })
     }
 }
 

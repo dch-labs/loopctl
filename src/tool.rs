@@ -1063,9 +1063,11 @@ impl ToolError {
 /// assert!(ctx.get_extension::<MyConfig>().expect("just set").verbose);
 /// ```
 ///
-/// # Example — Option A: middleware injector (compiles, does not run)
+/// # Example — Option A: middleware injector
 ///
 /// ```rust,no_run
+/// # #[cfg(feature = "testing")]
+/// # fn example() {
 /// use std::future::Future;
 /// use std::pin::Pin;
 /// use std::sync::Arc;
@@ -1099,12 +1101,17 @@ impl ToolError {
 ///     }
 /// }
 ///
-/// let client = MockApiClient::new("demo");
-/// let mut agent =
-///     BareLoop::new(Arc::new(client), ToolRegistry::new(), SessionConfig::default());
+/// # let client = MockApiClient::new("demo");
+/// # let mut agent =
+/// #     BareLoop::new(Arc::new(client), ToolRegistry::new(), SessionConfig::default());
 /// agent
 ///     .set_pipeline(ToolPipeline::builder().with_middleware(Injector))
 ///     .expect("static pipeline composition");
+/// # }
+/// # fn main() {
+/// # #[cfg(feature = "testing")]
+/// # example();
+/// # }
 /// ```
 #[derive(Clone)]
 pub struct ToolContext {

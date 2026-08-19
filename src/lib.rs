@@ -22,7 +22,7 @@
 //! - **[`middleware`]** — Tool dispatch middleware pipeline (timeouts, permissions, output limits).
 //! - **[`tool`]** — Tool trait, registry, and supporting types.
 //! - **`tool::health`** — Per-tool health monitoring, circuit breakers, and self-healing routing. *Requires `tool_health` feature.*
-//! - **[`mcp`]** — MCP client adapter ([`McpToolProvider`](mcp::McpToolProvider)) — adapt any MCP server's tools as `Tool` impls. *Requires `mcp` feature.*
+//! - **[`mcp`]** — MCP client + server adapters ([`McpToolProvider`](mcp::McpToolProvider) adapts foreign MCP servers; [`McpServerAdapter`](mcp::McpServerAdapter) serves a `ToolRegistry` over MCP). *Requires `mcp` feature.*
 //!
 //! ## API Layer
 //!

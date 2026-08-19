@@ -293,6 +293,8 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Example
     ///
     /// ```rust,no_run
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
     /// # use std::sync::Arc;
     /// # use loopctl::config::SessionConfig;
     /// # use loopctl::engine::BareLoop;
@@ -308,6 +310,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// # let config = SessionConfig::default();
     /// let mut agent = BareLoop::new(Arc::new(client), registry, config);
     /// agent.set_pipeline(builder).expect("static composition is valid");
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
     /// ```
     ///
     /// # Errors

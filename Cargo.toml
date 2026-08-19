@@ -63,9 +63,10 @@ grammar = ["providers"]
 schema_validation = ["dep:jsonschema"]
 
 # MCP client adapter + transports (stdio, Streamable HTTP/SSE). Enables
-# `streaming` for `StreamRetryConfig` (reconnect backoff) and `reqwest` for the
-# HTTP transport's caller-supplied client.
-mcp = ["dep:rmcp", "streaming", "dep:reqwest"]
+# `streaming` for `StreamRetryConfig` (reconnect backoff), `reqwest` for the
+# HTTP transport's caller-supplied client, and `jsonschema` to validate served
+# tools' input schemas before advertising them.
+mcp = ["dep:rmcp", "streaming", "dep:reqwest", "dep:jsonschema"]
 
 [[example]]
 name = "hello-cli"
@@ -89,6 +90,10 @@ required-features = ["mcp"]
 
 [[example]]
 name = "mcp-stdio-server"
+required-features = ["mcp"]
+
+[[example]]
+name = "mcp_server"
 required-features = ["mcp"]
 
 [lints.clippy]

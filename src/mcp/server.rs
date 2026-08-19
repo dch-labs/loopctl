@@ -736,12 +736,14 @@ mod tests {
             )
             .await
             .expect("send request");
-        started_wait.await;
+        let guard = std::time::Duration::from_secs(10);
+        tokio::time::timeout(guard, started_wait)
+            .await
+            .expect("hanging tool was polled at least once");
         handle
             .cancel(Some("test cancellation".into()))
             .await
             .expect("cancel notification sent");
-        let guard = std::time::Duration::from_secs(10);
         tokio::time::timeout(guard, dropped_wait)
             .await
             .expect("cancelled call's tool future was dropped");

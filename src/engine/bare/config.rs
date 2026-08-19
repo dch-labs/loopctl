@@ -292,7 +292,10 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// Needs the `testing` feature for `MockApiClient`, so the doctest is
+    /// neither compiled nor run.
+    ///
+    /// ```rust,ignore
     /// # use std::sync::Arc;
     /// # use loopctl::config::SessionConfig;
     /// # use loopctl::engine::BareLoop;

@@ -1063,9 +1063,12 @@ impl ToolError {
 /// assert!(ctx.get_extension::<MyConfig>().expect("just set").verbose);
 /// ```
 ///
-/// # Example — Option A: middleware injector (compiles, does not run)
+/// # Example — Option A: middleware injector
 ///
-/// ```rust,no_run
+/// Needs the `testing` feature for `MockApiClient`, so the doctest is
+/// neither compiled nor run.
+///
+/// ```rust,ignore
 /// use std::future::Future;
 /// use std::pin::Pin;
 /// use std::sync::Arc;

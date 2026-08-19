@@ -238,9 +238,9 @@ impl ServerHandler for McpServerAdapter {
     /// Pagination is ignored: loopctl registries are small, and the MCP
     /// `nextCursor` mechanism exists for tool lists with thousands of entries.
     /// The whole list is returned in one page regardless of any client cursor.
-    /// A tool whose input schema is not an object-typed JSON Schema is omitted
-    /// from the listing (with a warning) rather than advertised with a
-    /// malformed schema.
+    /// A tool whose input schema is not a compilable, object-typed JSON Schema
+    /// is omitted from the listing (with a warning) rather than advertised
+    /// with a schema strict clients may reject.
     ///
     /// Each tool's [`is_read_only`](crate::tool::Tool::is_read_only) flag is
     /// forwarded as the MCP `annotations.readOnlyHint` so clients can apply

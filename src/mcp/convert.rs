@@ -105,19 +105,59 @@ pub(crate) fn bridge_result(
     Ok(output)
 }
 
+/// A schema retriever that refuses every external reference.
+///
+/// Served tool schemas are validated before being advertised, and validation
+/// must stay local and side-effect free: fetching a remote or file-backed
+/// `$ref` from inside `tools/list` would turn a tool's schema into outbound
+/// I/O — and a blocking call inside an async handler. Refused references
+/// surface as ordinary compile errors, so such schemas are skipped with a
+/// warning instead of fetched. Internal `#/…` references never reach a
+/// retriever and keep working.
+struct RefusingRetriever;
+
+impl jsonschema::Retrieve for RefusingRetriever {
+    fn retrieve(
+        &self,
+        uri: &jsonschema::Uri<String>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        Err(format!("external schema reference refused: {uri}").into())
+    }
+}
+
+/// Compile `schema` as a JSON Schema, refusing external references.
+///
+/// Compilation is the whole check: a schema that compiles is structurally
+/// valid JSON Schema — well-formed keywords, compilable regexes, resolvable
+/// internal references. The draft is detected from `$schema` when present.
+///
+/// # Errors
+///
+/// The compile error when the schema is not valid JSON Schema (including a
+/// refused external reference).
+fn compile_schema(schema: &serde_json::Value) -> Result<(), jsonschema::ValidationError<'static>> {
+    jsonschema::options()
+        .with_retriever(RefusingRetriever)
+        .build(schema)
+        .map(|_| ())
+}
+
 /// Convert a loopctl [`ToolSchema`] to an MCP `Tool`.
 ///
 /// The load-bearing detail: loopctl's field is named `tool`, MCP's is named
 /// `name` — this is the rename. An empty description is omitted (MCP's
 /// `description` is optional) rather than sent as `""`.
 ///
-/// Only object-typed schemas are convertible: the root must be a JSON object
-/// carrying `"type": "object"` — the shape MCP clients expect a tool's input
-/// schema to have, and the only one rmcp's `JsonObject` field can carry
-/// (boolean schemas and non-object roots cannot be represented). Any other
-/// root — a boolean, a string, an object missing or disagreeing on `type` —
-/// yields `None` with a warning; callers omit such tools from the listing
-/// rather than advertise a malformed schema.
+/// Only valid, object-typed schemas are convertible. The root must be a JSON
+/// object carrying `"type": "object"` — the shape MCP clients expect a tool's
+/// input schema to have, and the only one rmcp's `JsonObject` field can carry
+/// (boolean schemas and non-object roots cannot be represented) — and the
+/// whole schema must compile as JSON Schema with external references refused
+/// (see [`compile_schema`]). Anything else — a boolean or string root, an
+/// object missing or disagreeing on `type`, malformed keywords, an
+/// uncompilable regex, a dangling or external `$ref` — yields `None` with a
+/// warning; callers omit such tools from the listing rather than advertise a
+/// schema strict clients may reject.
 ///
 /// `is_read_only` (from [`Tool::is_read_only`](crate::tool::Tool::is_read_only),
 /// which [`ToolSchema`] does not carry) is forwarded as the MCP
@@ -128,6 +168,14 @@ pub(crate) fn bridge_result(
 /// read-only hint. When `is_read_only` is `false`, no annotations are sent and
 /// the client applies the spec defaults.
 pub(crate) fn tool_schema_to_mcp(schema: ToolSchema, is_read_only: bool) -> Option<McpTool> {
+    if let Err(error) = compile_schema(&schema.input_schema) {
+        tracing::warn!(
+            tool = %schema.tool,
+            error = %error,
+            "tool input_schema does not compile as JSON Schema; omitting the tool"
+        );
+        return None;
+    }
     let input_schema = match schema.input_schema {
         serde_json::Value::Object(map)
             if map.get("type").and_then(serde_json::Value::as_str) == Some("object") =>
@@ -284,6 +332,71 @@ mod tests {
             input_schema: json!({"properties": {"q": {"type": "string"}}}),
         };
         assert!(tool_schema_to_mcp(schema, false).is_none());
+    }
+
+    #[test]
+    fn tool_schema_malformed_keyword_is_rejected() {
+        let schema = ToolSchema {
+            tool: "x".into(),
+            description: String::new(),
+            input_schema: json!({"type": "object", "properties": {"q": 42}}),
+        };
+        assert!(
+            tool_schema_to_mcp(schema, false).is_none(),
+            "`properties` must be an object; a schema with a malformed keyword is omitted"
+        );
+    }
+
+    #[test]
+    fn tool_schema_uncompilable_regex_is_rejected() {
+        let schema = ToolSchema {
+            tool: "x".into(),
+            description: String::new(),
+            input_schema: json!({"type": "object", "pattern": "["}),
+        };
+        assert!(tool_schema_to_mcp(schema, false).is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_schema_external_ref_is_refused_without_blocking() {
+        let schema = ToolSchema {
+            tool: "x".into(),
+            description: String::new(),
+            input_schema: json!({"type": "object", "$ref": "https://example.com/schema.json"}),
+        };
+        let converted = tool_schema_to_mcp(schema, false);
+        assert!(
+            converted.is_none(),
+            "external references are refused, never fetched"
+        );
+    }
+
+    #[test]
+    fn tool_schema_internal_ref_compiles() {
+        let schema = ToolSchema {
+            tool: "x".into(),
+            description: String::new(),
+            input_schema: json!({
+                "type": "object",
+                "definitions": {"q": {"type": "string"}},
+                "properties": {"q": {"$ref": "#/definitions/q"}}
+            }),
+        };
+        assert!(tool_schema_to_mcp(schema, false).is_some());
+    }
+
+    #[test]
+    fn tool_schema_with_declared_draft_compiles() {
+        let schema = ToolSchema {
+            tool: "x".into(),
+            description: String::new(),
+            input_schema: json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": {"q": {"type": "string"}}
+            }),
+        };
+        assert!(tool_schema_to_mcp(schema, false).is_some());
     }
 
     #[test]

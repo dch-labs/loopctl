@@ -668,19 +668,27 @@ impl ContextManager {
             });
         }
 
-        if outcome.messages.len() == message_count && outcome.tokens_saved == 0 {
+        if outcome.messages.len() == message_count && tokens_after >= tokens_before {
             return Ok(EnsureContextResult::NoAction(outcome.messages));
         }
-        Ok(EnsureContextResult::Compacted(outcome))
+        let mut normalized = outcome;
+        normalized.tokens_after = tokens_after;
+        normalized.tokens_saved = tokens_before.saturating_sub(tokens_after);
+        Ok(EnsureContextResult::Compacted(normalized))
     }
 
     /// Manually trigger compaction regardless of threshold.
     ///
     /// Use this when the agent or a tool explicitly requests context
     /// reduction. The `reason` is set to [`CompactReason::Manual`]. A
-    /// successful pass that shrinks neither the message list nor the token
-    /// count is reported as [`EnsureContextResult::NoAction`] — compaction
-    /// did not occur, so compaction observers and hooks stay silent.
+    /// successful pass is classified with this manager's configured
+    /// [`TokenCounter`], not the compactor's self-report: when the message
+    /// count is unchanged and the measured token count did not shrink, the
+    /// pass is reported as [`EnsureContextResult::NoAction`] — compaction
+    /// did not occur, so compaction observers and hooks stay silent. On the
+    /// [`EnsureContextResult::Compacted`] path the outcome's token fields
+    /// are normalized to the same counter, so telemetry reflects the
+    /// manager's measurements.
     /// # Errors
     ///
     /// Returns a [`ContextOverflow`] if compaction fails or the result
@@ -700,9 +708,14 @@ impl ContextManager {
     /// driving state machine) and the `reason` should reach the compactor's
     /// [`CompactionContext`] so it can vary strategy (e.g. more aggressive
     /// summarization for [`CompactReason::Emergency`]). A successful pass
-    /// that shrinks neither the message list nor the token count is
-    /// reported as [`EnsureContextResult::NoAction`] — compaction did not
-    /// occur, so compaction observers and hooks stay silent.
+    /// is classified with this manager's configured [`TokenCounter`], not
+    /// the compactor's self-report: when the message count is unchanged and
+    /// the measured token count did not shrink, the pass is reported as
+    /// [`EnsureContextResult::NoAction`] — compaction did not occur, so
+    /// compaction observers and hooks stay silent. On the
+    /// [`EnsureContextResult::Compacted`] path the outcome's token fields
+    /// are normalized to the same counter, so telemetry reflects the
+    /// manager's measurements.
     ///
     /// # Errors
     ///
@@ -744,9 +757,10 @@ impl ContextManager {
             });
         }
 
-        if outcome.tokens_after > self.context_window {
+        let tokens_after = self.estimate_tokens(&outcome.messages);
+        if tokens_after > self.context_window {
             return Err(ContextOverflow {
-                tokens_used: outcome.tokens_after,
+                tokens_used: tokens_after,
                 context_window: self.context_window,
                 message_count,
                 trigger: CompactReason::Manual,
@@ -754,10 +768,13 @@ impl ContextManager {
             });
         }
 
-        if outcome.messages.len() == message_count && outcome.tokens_saved == 0 {
+        if outcome.messages.len() == message_count && tokens_after >= tokens_before {
             return Ok(EnsureContextResult::NoAction(outcome.messages));
         }
-        Ok(EnsureContextResult::Compacted(outcome))
+        let mut normalized = outcome;
+        normalized.tokens_after = tokens_after;
+        normalized.tokens_saved = tokens_before.saturating_sub(tokens_after);
+        Ok(EnsureContextResult::Compacted(normalized))
     }
 
     /// Build telemetry for a compaction operation.

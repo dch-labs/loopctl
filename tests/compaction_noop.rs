@@ -220,6 +220,40 @@ mod scenarios {
     }
 
     #[tokio::test]
+    #[ignore = "known defect: the machine's context estimate resets to zero at run start, so a run whose committed history already exceeds the window sends its first request over-window before any compaction check can run; un-ignore when fixed"]
+    async fn first_request_of_an_over_window_run_is_never_sent() {
+        let script = vec![
+            final_response(),
+            tool_turn_response(0, 40),
+            tool_turn_response(1, 40),
+        ];
+        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+
+        let config = SessionConfig::default()
+            .with_context_window(200)
+            .with_compact_threshold(80);
+        let client_handle = client.clone();
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+
+        let first = agent.run(&"x".repeat(750), &RunConfig::default()).await;
+        assert!(
+            first.is_ok(),
+            "the first run's single request stays under the window: {first:?}"
+        );
+
+        let _second = agent.run(&"y".repeat(50), &RunConfig::default()).await;
+
+        let served = client_handle.served_request_tokens();
+        for tokens in &served {
+            assert!(
+                *tokens <= 200,
+                "committed history over the window must trigger compaction (or a typed \
+                 failure) before the run's first request; served estimates {served:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn default_loop_compacts_at_the_threshold() {
         let client = RecordingClient::wrap(
             MockApiClient::new("test-model").with_responses(growing_conversation_script(12)),

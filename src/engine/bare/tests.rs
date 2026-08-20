@@ -4824,10 +4824,13 @@ async fn failed_run_after_noop_compaction_leaves_history_clean() {
     let mut agent = BareLoop::new(Arc::new(client), registry, config);
 
     let result = agent.run(&"x".repeat(300), &make_run_config()).await;
-    assert!(
-        result.is_err(),
-        "mock has no response for the post-compact call"
-    );
+    match result {
+        Err(LoopError::ContextExceeded { .. }) => {}
+        other => panic!(
+            "mock has no response for the post-compact call; an unshrinkable over-threshold \
+             conversation must fail with ContextExceeded instead, got {other:?}"
+        ),
+    }
     assert!(
         agent.conversation().is_empty(),
         "discard_pending doc: no messages from the abandoned run may leak into the next run's context; got {} messages",

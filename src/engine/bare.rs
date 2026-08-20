@@ -585,9 +585,12 @@ impl<C: ApiClient> BareLoop<C> {
     /// Constructs a [`BareLoop`] whose machine is `machine` — for example to
     /// resume a serialized run: deserialize the machine, wrap it in a loop with
     /// the original client/tools, and continue driving it with
-    /// [`run()`](crate::engine::core::Loop::run). The session/run config
-    /// is taken from the machine. A fresh [`LoopManagers`] is created with a
-    /// default [`ContextManager`] synced from `session_config` (see
+    /// [`run()`](crate::engine::core::Loop::run). The supplied
+    /// `session_config` configures the resumed loop; per-run settings come
+    /// from the [`RunConfig`](crate::engine::RunConfig) the caller passes to
+    /// each `run()` call — the machine itself stores no configuration. A
+    /// fresh [`LoopManagers`] is created with a default
+    /// [`ContextManager`] synced from `session_config` (see
     /// [`Self::new_with_managers`]).
     #[must_use]
     pub fn from_machine(
@@ -1183,9 +1186,10 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Runs the configured [`ContextManager`](crate::compact::ContextManager)
     /// over the machine-owned history (firing `on_compaction` and hooks), then
-    /// feeds the outcome back to the machine: a rewritten history through
+    /// feeds the outcome back to the machine: a rewritten history with the
+    /// driver's measured before/after token sizes through
     /// [`LoopMachine::compaction_result`](crate::engine::core::LoopMachine::compaction_result),
-    /// an unchanged one through
+    /// an unchanged one with the same measurements through
     /// [`LoopMachine::compaction_noop`](crate::engine::core::LoopMachine::compaction_noop)
     /// so the pending buffer survives. The machine already sits in
     /// `AwaitingCompaction` for this reason when the step arrives; the driver
@@ -1200,12 +1204,18 @@ impl<C: ApiClient> BareLoop<C> {
         reason: crate::compact::types::CompactReason,
     ) -> Result<(), LoopError> {
         let turn = self.machine.turns_taken();
-        match self.run_compaction(turn, reason).await? {
-            compact::CompactStepOutcome::Compacted(compacted, tokens_after) => {
-                self.machine.compaction_result(compacted, tokens_after);
+        let outcome = self.run_compaction(turn, reason).await?;
+        match outcome.compacted {
+            Some(compacted) => {
+                self.machine.compaction_result(
+                    compacted,
+                    outcome.tokens_before,
+                    outcome.tokens_after,
+                );
             }
-            compact::CompactStepOutcome::Unchanged(tokens_after) => {
-                self.machine.compaction_noop(tokens_after);
+            None => {
+                self.machine
+                    .compaction_noop(outcome.tokens_before, outcome.tokens_after);
             }
         }
         Ok(())

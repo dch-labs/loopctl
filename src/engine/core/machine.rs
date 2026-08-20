@@ -449,6 +449,23 @@ impl LoopMachine {
         self.pending_tools.clear();
     }
 
+    /// Feed a driver-measured context estimate into the machine.
+    ///
+    /// The driver calls this whenever history grows outside a model response
+    /// — after [`Self::accept_input`] at run start, so the first
+    /// [`Self::next_step`] sees the true size of the committed history plus
+    /// the new input instead of the zero `accept_input` reset to, and after
+    /// any other append the machine would otherwise not learn about until the
+    /// next response. Replaces the current estimate with `tokens`; performs
+    /// no state transition, so the compaction trigger evaluates it on the
+    /// next [`Self::next_step`]. No effect once the machine is terminal.
+    pub fn set_context_tokens(&mut self, tokens: u64) {
+        if self.is_terminal() {
+            return;
+        }
+        self.context_tokens = tokens;
+    }
+
     /// Return the next step the driver must perform.
     ///
     /// `policy` supplies the turn budget and compaction thresholds the machine

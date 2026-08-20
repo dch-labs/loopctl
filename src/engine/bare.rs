@@ -1242,6 +1242,8 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             self.session.runs.push(Run::new(input, run_config));
             self.notify_run_start();
             self.machine.accept_input(input);
+            let estimate = self.count_context(&self.machine.full_history());
+            self.machine.set_context_tokens(estimate);
 
             loop {
                 let policy = self.machine_policy();

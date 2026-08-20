@@ -80,7 +80,7 @@ impl EchoServer {
         "ok".to_string()
     }
 }
-
+#[allow(clippy::unused_async_trait_impl)] // FIXME(rmcp): drop when tool_handler emits awaits
 #[tool_handler]
 impl ServerHandler for EchoServer {}
 
@@ -187,7 +187,7 @@ impl SoftErrorServer {
         Ok(CallToolResult::error(vec![ContentBlock::text("boom")]))
     }
 }
-
+#[allow(clippy::unused_async_trait_impl)] // FIXME(rmcp): drop when tool_handler emits awaits
 #[tool_handler]
 impl ServerHandler for SoftErrorServer {}
 
@@ -227,7 +227,7 @@ impl EmptyErrorServer {
         Ok(CallToolResult::error(vec![]))
     }
 }
-
+#[allow(clippy::unused_async_trait_impl)] // FIXME(rmcp): drop when tool_handler emits awaits
 #[tool_handler]
 impl ServerHandler for EmptyErrorServer {}
 
@@ -253,7 +253,7 @@ impl ProtocolErrorServer {
         Err(McpErrorData::invalid_params("not allowed", None))
     }
 }
-
+#[allow(clippy::unused_async_trait_impl)] // FIXME(rmcp): drop when tool_handler emits awaits
 #[tool_handler]
 impl ServerHandler for ProtocolErrorServer {}
 
@@ -341,7 +341,7 @@ impl MultipartServer {
         ]))
     }
 }
-
+#[allow(clippy::unused_async_trait_impl)] // FIXME(rmcp): drop when tool_handler emits awaits
 #[tool_handler]
 impl ServerHandler for MultipartServer {}
 
@@ -415,7 +415,7 @@ impl AudioServer {
         )]))
     }
 }
-
+#[allow(clippy::unused_async_trait_impl)] // FIXME(rmcp): drop when tool_handler emits awaits
 #[tool_handler]
 impl ServerHandler for AudioServer {}
 
@@ -488,7 +488,7 @@ impl CollisionServer {
         "b".to_string()
     }
 }
-
+#[allow(clippy::unused_async_trait_impl)] // FIXME(rmcp): drop when tool_handler emits awaits
 #[tool_handler]
 impl ServerHandler for CollisionServer {}
 
@@ -649,16 +649,16 @@ impl AnnotatedServer {
 }
 
 impl ServerHandler for AnnotatedServer {
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _ctx: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<rmcp::model::ListToolsResult, McpErrorData> {
-        Ok(rmcp::model::ListToolsResult {
+    ) -> impl Future<Output = Result<rmcp::model::ListToolsResult, McpErrorData>> {
+        std::future::ready(Ok(rmcp::model::ListToolsResult {
             next_cursor: None,
             tools: vec![annotated_tool(true), plain_tool()],
             ..Default::default()
-        })
+        }))
     }
 }
 
@@ -730,7 +730,7 @@ impl SlowServer {
         "finally".to_string()
     }
 }
-
+#[allow(clippy::unused_async_trait_impl)] // FIXME(rmcp): drop when tool_handler emits awaits
 #[tool_handler]
 impl ServerHandler for SlowServer {}
 

@@ -42,6 +42,7 @@
 //! handshake in the example's module doc exercises the same code path with no
 //! client at all.
 
+use std::future::Future;
 use std::sync::Arc;
 
 use rmcp::ErrorData;
@@ -180,14 +181,16 @@ impl McpServerAdapter {
     ///
     /// # Errors
     ///
-    /// Returns `rmcp::service::ServerInitializeError` if the handshake fails
-    /// (e.g. the client sends a malformed `initialize`).
+    /// Returns a boxed `rmcp::service::ServerInitializeError` if the handshake
+    /// fails (e.g. the client sends a malformed `initialize`).
     pub async fn serve_stdio(
         self,
-    ) -> Result<rmcp::service::RunningService<RoleServer, Self>, rmcp::service::ServerInitializeError>
-    {
+    ) -> Result<
+        rmcp::service::RunningService<RoleServer, Self>,
+        Box<rmcp::service::ServerInitializeError>,
+    > {
         let transport = rmcp::transport::io::stdio();
-        self.serve(transport).await
+        self.serve(transport).await.map_err(Box::new)
     }
 }
 
@@ -250,11 +253,13 @@ impl ServerHandler for McpServerAdapter {
     ///
     /// Never returns `Err` — listing local schemas cannot fail — but the
     /// [`ServerHandler`] signature is `Result`, so the error type remains.
-    async fn list_tools(
+    /// The listing is built synchronously; the returned future is immediately
+    /// ready.
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
+    ) -> impl Future<Output = Result<rmcp::model::ListToolsResult, ErrorData>> {
         let tools = self
             .registry
             .all_schemas()
@@ -267,10 +272,10 @@ impl ServerHandler for McpServerAdapter {
                 convert::tool_schema_to_mcp(schema, is_read_only)
             })
             .collect();
-        Ok(rmcp::model::ListToolsResult {
+        std::future::ready(Ok(rmcp::model::ListToolsResult {
             tools,
             ..Default::default()
-        })
+        }))
     }
 
     /// `tools/call` → registry lookup → [`Tool::call`].

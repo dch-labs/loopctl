@@ -44,7 +44,7 @@ impl GreetServer {
         "hello, world!".to_string()
     }
 }
-
+#[allow(clippy::unused_async_trait_impl)] // FIXME(rmcp): drop when tool_handler emits awaits
 #[tool_handler]
 impl ServerHandler for GreetServer {}
 

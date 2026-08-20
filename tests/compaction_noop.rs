@@ -220,7 +220,6 @@ mod scenarios {
     }
 
     #[tokio::test]
-    #[ignore = "known defect: the machine's context estimate resets to zero at run start, so a run whose committed history already exceeds the window sends its first request over-window before any compaction check can run; un-ignore when fixed"]
     async fn first_request_of_an_over_window_run_is_never_sent() {
         let script = vec![
             final_response(),
@@ -235,13 +234,13 @@ mod scenarios {
         let client_handle = client.clone();
         let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
 
-        let first = agent.run(&"x".repeat(750), &RunConfig::default()).await;
+        let first = agent.run(&"x".repeat(600), &RunConfig::default()).await;
         assert!(
             first.is_ok(),
-            "the first run's single request stays under the window: {first:?}"
+            "the first run starts under the threshold and completes: {first:?}"
         );
 
-        let _second = agent.run(&"y".repeat(50), &RunConfig::default()).await;
+        let _second = agent.run(&"y".repeat(200), &RunConfig::default()).await;
 
         let served = client_handle.served_request_tokens();
         for tokens in &served {

@@ -7,8 +7,9 @@
 //! [`FrontierProfile`] is the named opt-out: v0.1.0-style defaults with none
 //! of the small-model machinery installed.
 //!
-//! Apply a profile with [`ConstrainedProfile::apply`] (pipeline + contributor)
-//! or compose the individual pieces ([`ConstrainedProfile::session_config`],
+//! Apply a profile with [`ConstrainedProfile::apply`] (context manager +
+//! pipeline + contributor) or compose the individual pieces
+//! ([`ConstrainedProfile::session_config`],
 //! [`ConstrainedProfile::run_config`],
 //! [`ConstrainedProfile::pipeline_builder`],
 //! [`ConstrainedProfile::request_options`]) by hand.
@@ -54,12 +55,15 @@ const MEMOIZED_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
 
 /// The small-model-tuned runtime profile.
 ///
-/// Bundles aggressive context budgeting (smaller window, fewer turns),
-/// verify-on-write ([`VerifyMiddleware`] with [`NoopVerifier`]),
-/// tool-call memoization ([`MemoizingMiddleware`] with [`NoopPathExtractor`]),
-/// output truncation ([`OutputLimitMiddleware`]), goal re-injection
-/// ([`GoalReminder`]), and strict tool-call decoding
-/// ([`ToolConstraint::Strict`]) into one coherent profile.
+/// Bundles context-budget machinery (a context manager that compacts the
+/// conversation at the session's configured threshold), a smaller window and
+/// fewer turns via [`session_config`](Self::session_config) /
+/// [`run_config`](Self::run_config), verify-on-write
+/// ([`VerifyMiddleware`] with [`NoopVerifier`]), tool-call memoization
+/// ([`MemoizingMiddleware`] with [`NoopPathExtractor`]), output truncation
+/// ([`OutputLimitMiddleware`]), goal re-injection ([`GoalReminder`]), and
+/// strict tool-call decoding ([`ToolConstraint::Strict`]) into one coherent
+/// profile.
 ///
 /// This is the harder-problem profile: it assumes the model drifts off-goal,
 /// repeats tool calls, ships broken edits, and emits malformed tool
@@ -137,10 +141,15 @@ impl ConstrainedProfile {
         RequestOptions::new().with_tool_constraint(ToolConstraint::Strict)
     }
 
-    /// Apply the profile's pipeline and goal-reminder contributor to a
-    /// [`BareLoop`].
+    /// Apply the profile's compaction machinery, pipeline, and goal-reminder
+    /// contributor to a [`BareLoop`].
     ///
-    /// Sets the small-model middleware stack (via [`Self::pipeline_builder`]) and
+    /// Installs a [`ContextManager`](crate::compact::ContextManager) around a
+    /// [`TruncatingCompactor`](crate::compact::TruncatingCompactor) with its
+    /// window and threshold synced from the loop's session config, replacing
+    /// whatever the constructor seeded, so the profile's context budgeting is
+    /// enforced by machinery rather than left to the caller. Also sets the
+    /// small-model middleware stack (via [`Self::pipeline_builder`]) and
     /// registers a [`GoalReminder`] firing every 5 turns. Does **not** set
     /// the loop's config or request options — those are set separately at
     /// construction (`BareLoop::new`) and via
@@ -163,6 +172,12 @@ impl ConstrainedProfile {
     /// ConstrainedProfile::apply(&mut agent).unwrap();
     /// ```
     pub fn apply<C: crate::api::ApiClient>(loop_: &mut BareLoop<C>) -> Result<(), LoopError> {
+        let manager = crate::compact::ContextManager::new(Arc::new(
+            crate::compact::TruncatingCompactor::default(),
+        ))
+        .with_context_window(loop_.session_config().context_window)
+        .with_threshold(loop_.session_config().compact_threshold);
+        loop_.set_context_manager(Arc::new(manager));
         loop_.set_pipeline(Self::pipeline_builder())?;
         loop_.add_contributor(Box::new(GoalReminder::new(GOAL_REMINDER_EVERY_N_TURNS)));
         Ok(())

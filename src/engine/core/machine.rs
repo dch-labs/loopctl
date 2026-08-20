@@ -391,9 +391,9 @@ pub struct LoopMachine {
     /// Context tokens at the time of the last compaction request.
     ///
     /// When the machine emits `Compact`, it records `context_tokens`
-    /// here. After `compaction_result`, if `tokens_after` has not
-    /// decreased below this value, the machine transitions to
-    /// [`MachineOutcome::Failed`] with
+    /// here. After `compaction_result` or `compaction_noop`, if
+    /// `tokens_after` has not decreased below this value, the machine
+    /// transitions to [`MachineOutcome::Failed`] with
     /// [`LoopError::ContextExceeded`] instead of requesting another
     /// compaction — preventing an infinite compaction cycle when the
     /// compactor cannot reduce the context.
@@ -656,16 +656,7 @@ impl LoopMachine {
         if self.is_terminal() {
             return;
         }
-        if let Some(before) = self.last_compaction_tokens
-            && tokens_after >= before
-        {
-            self.state = MachineState::Terminal(MachineOutcome::Failed {
-                error: LoopError::ContextExceeded {
-                    used: tokens_after,
-                    limit: before,
-                },
-            });
-            self.last_compaction_tokens = None;
+        if self.terminate_on_no_progress(tokens_after) {
             return;
         }
         self.last_compaction_tokens = None;
@@ -673,6 +664,61 @@ impl LoopMachine {
         self.pending.clear();
         self.context_tokens = tokens_after;
         self.state = MachineState::Start;
+    }
+
+    /// Feed an unchanged compaction result back into the machine.
+    ///
+    /// The driver calls this after servicing a [`MachineStep::Compact`] that
+    /// changed nothing — no compactor ran, a pre-compact hook vetoed the pass,
+    /// or the compactor returned the conversation unchanged. The committed
+    /// history and the pending buffer are left untouched: feeding the
+    /// uncompacted conversation through [`Self::compaction_result`] would
+    /// commit the current run's partial messages mid-run, so a later failure
+    /// could no longer discard them.
+    ///
+    /// `tokens_after` is the driver's measured estimate of the unchanged
+    /// conversation, which the machine adopts as the current context size.
+    /// The same no-progress guard as [`Self::compaction_result`] applies: when
+    /// the estimate has not decreased below the size recorded when compaction
+    /// was requested, the machine transitions to [`MachineOutcome::Failed`]
+    /// with [`LoopError::ContextExceeded`] — compaction cannot shrink this
+    /// conversation, and another model call would exceed the context window.
+    /// Has no effect once the machine is terminal.
+    pub fn compaction_noop(&mut self, tokens_after: u64) {
+        if self.is_terminal() {
+            return;
+        }
+        if self.terminate_on_no_progress(tokens_after) {
+            return;
+        }
+        self.last_compaction_tokens = None;
+        self.context_tokens = tokens_after;
+        self.state = MachineState::Start;
+    }
+
+    /// Fail the run when a compaction feed made no progress.
+    ///
+    /// Shared guard behind [`Self::compaction_result`] and
+    /// [`Self::compaction_noop`]: compares `tokens_after` against the context
+    /// size recorded when the machine emitted `Compact`. When nothing was
+    /// shaved off, transitions to [`MachineOutcome::Failed`] with
+    /// [`LoopError::ContextExceeded`] (preventing an infinite compaction
+    /// cycle) and returns `true`; returns `false` when the feed may proceed.
+    fn terminate_on_no_progress(&mut self, tokens_after: u64) -> bool {
+        let Some(before) = self.last_compaction_tokens else {
+            return false;
+        };
+        if tokens_after < before {
+            return false;
+        }
+        self.state = MachineState::Terminal(MachineOutcome::Failed {
+            error: LoopError::ContextExceeded {
+                used: tokens_after,
+                limit: before,
+            },
+        });
+        self.last_compaction_tokens = None;
+        true
     }
 
     /// Mark the run as cancelled.

@@ -19,6 +19,34 @@ use crate::capabilities::Hookable;
 use crate::message::Message;
 use crate::observer::CompactedContext;
 
+/// The result of servicing a [`MachineStep::Compact`](crate::engine::core::MachineStep::Compact),
+/// before it is fed back into the machine.
+///
+/// Distinguishes a pass that rewrote the history from one that left it
+/// unchanged, because the machine treats the two differently: a rewritten
+/// history replaces the committed one and clears the pending buffer
+/// ([`LoopMachine::compaction_result`](crate::engine::core::LoopMachine::compaction_result)),
+/// while an unchanged history must leave both alone
+/// ([`LoopMachine::compaction_noop`](crate::engine::core::LoopMachine::compaction_noop))
+/// — committing the in-flight run's partial messages mid-run would make a
+/// later failure un-discardable.
+pub(super) enum CompactStepOutcome {
+    /// Compaction rewrote the history.
+    ///
+    /// Carries the compacted message list and its post-compaction token
+    /// estimate, ready to feed into
+    /// [`LoopMachine::compaction_result`](crate::engine::core::LoopMachine::compaction_result).
+    Compacted(Vec<Message>, u64),
+
+    /// Compaction changed nothing.
+    ///
+    /// No compactor ran, a pre-compact hook vetoed the pass, or the manager
+    /// reported no action. Carries the driver's measured estimate of the
+    /// unchanged conversation, ready to feed into
+    /// [`LoopMachine::compaction_noop`](crate::engine::core::LoopMachine::compaction_noop).
+    Unchanged(u64),
+}
+
 impl<C: ApiClient> BareLoop<C> {
     /// Compact the conversation context owned by the driving machine.
     ///
@@ -28,15 +56,15 @@ impl<C: ApiClient> BareLoop<C> {
     /// asks the configured [`ContextManager`](crate::compact::ContextManager)
     /// to reduce it, fires
     /// [`on_compaction`](crate::observer::LoopObserver::on_compaction) and the
-    /// post-compact hook when compaction occurred, and returns the compacted
-    /// messages alongside the post-compaction token estimate. The caller feeds
-    /// both back via
-    /// [`LoopMachine::compaction_result`](crate::engine::core::LoopMachine::compaction_result).
+    /// post-compact hook when compaction occurred, and returns a
+    /// [`CompactStepOutcome`] for the driver to feed back into the machine.
     ///
-    /// When no `ContextManager` is set the history is returned unchanged with a
-    /// zero token estimate, so the machine can resume without compaction. When
-    /// a pre-compact hook aborts compaction the history is likewise returned
-    /// unchanged.
+    /// When no `ContextManager` is set, a pre-compact hook aborts the pass,
+    /// or the manager reports [`EnsureContextResult::NoAction`], the
+    /// conversation is returned unchanged with a *measured* estimate of its
+    /// size — never a hard-coded zero — so the machine's no-progress guard
+    /// sees the true size and terminates with a typed error when compaction
+    /// cannot reduce instead of silently looping.
     ///
     /// # Errors
     ///
@@ -47,15 +75,17 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         turn: usize,
         reason: crate::compact::types::CompactReason,
-    ) -> Result<(Vec<Message>, u64), LoopError> {
+    ) -> Result<CompactStepOutcome, LoopError> {
         let history = self.machine.full_history();
         let Some(ctx_manager) = self.managers.context_manager() else {
-            return Ok((history, 0));
+            let tokens_after = self.count_context(&history);
+            return Ok(CompactStepOutcome::Unchanged(tokens_after));
         };
 
         #[cfg(feature = "hooks")]
         if self.pre_compact_hook_aborts(&history) {
-            return Ok((history, 0));
+            let tokens_after = self.count_context(&history);
+            return Ok(CompactStepOutcome::Unchanged(tokens_after));
         }
 
         #[cfg(feature = "hooks")]
@@ -84,9 +114,15 @@ impl<C: ApiClient> BareLoop<C> {
                     tokens_saved,
                     compact_start.elapsed(),
                 );
-                Ok((outcome.messages, tokens_after))
+                Ok(CompactStepOutcome::Compacted(
+                    outcome.messages,
+                    tokens_after,
+                ))
             }
-            Ok(EnsureContextResult::NoAction(messages)) => Ok((messages, 0)),
+            Ok(EnsureContextResult::NoAction(messages)) => {
+                let tokens_after = self.count_context(&messages);
+                Ok(CompactStepOutcome::Unchanged(tokens_after))
+            }
             Err(overflow) => Err(LoopError::ContextExceeded {
                 used: overflow.tokens_used,
                 limit: overflow.context_window,

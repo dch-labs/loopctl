@@ -333,7 +333,8 @@ pub struct MachinePolicy {
 ///             machine.tool_results(Vec::new());
 ///         }
 ///         MachineStep::Compact { .. } => {
-///             machine.compaction_result(machine.history().to_vec(), 0);
+///             let measured_before = 80;
+///             machine.compaction_result(machine.history().to_vec(), measured_before, 60);
 ///         }
 ///         MachineStep::Done(MachineOutcome::Completed { final_text }) => {
 ///             assert_eq!(final_text, "Hi there");
@@ -388,17 +389,6 @@ pub struct LoopMachine {
     /// policy to decide whether to emit a [`MachineStep::Compact`].
     context_tokens: u64,
 
-    /// Context tokens at the time of the last compaction request.
-    ///
-    /// When the machine emits `Compact`, it records `context_tokens`
-    /// here. After `compaction_result`, if `tokens_after` has not
-    /// decreased below this value, the machine transitions to
-    /// [`MachineOutcome::Failed`] with
-    /// [`LoopError::ContextExceeded`] instead of requesting another
-    /// compaction — preventing an infinite compaction cycle when the
-    /// compactor cannot reduce the context.
-    last_compaction_tokens: Option<u64>,
-
     /// Whether [`Self::cancel`] has been called.
     ///
     /// A cancellation request from the driver. Once set, the next
@@ -433,7 +423,6 @@ impl LoopMachine {
             state: MachineState::Start,
             turns_taken: 0,
             context_tokens: 0,
-            last_compaction_tokens: None,
             cancelled: false,
             pending_tools: Vec::new(),
         }
@@ -460,6 +449,23 @@ impl LoopMachine {
         self.pending_tools.clear();
     }
 
+    /// Feed a driver-measured context estimate into the machine.
+    ///
+    /// The driver calls this whenever history grows outside a model response
+    /// — after [`Self::accept_input`] at run start, so the first
+    /// [`Self::next_step`] sees the true size of the committed history plus
+    /// the new input instead of the zero `accept_input` reset to, and after
+    /// any other append the machine would otherwise not learn about until the
+    /// next response. Replaces the current estimate with `tokens`; performs
+    /// no state transition, so the compaction trigger evaluates it on the
+    /// next [`Self::next_step`]. No effect once the machine is terminal.
+    pub fn set_context_tokens(&mut self, tokens: u64) {
+        if self.is_terminal() {
+            return;
+        }
+        self.context_tokens = tokens;
+    }
+
     /// Return the next step the driver must perform.
     ///
     /// `policy` supplies the turn budget and compaction thresholds the machine
@@ -468,7 +474,8 @@ impl LoopMachine {
     ///
     /// This is pure and idempotent: calling it twice with no intervening feed
     /// method ([`Self::model_response`], [`Self::tool_results`],
-    /// [`Self::compaction_result`], [`Self::cancel`]) returns an equal step.
+    /// [`Self::compaction_result`], [`Self::compaction_noop`],
+    /// [`Self::cancel`]) returns an equal step.
     /// Once the machine is terminal, every subsequent call returns
     /// [`MachineStep::Done`] with the same [`MachineOutcome`].
     ///
@@ -520,13 +527,11 @@ impl LoopMachine {
         }
         if self.is_emergency(policy) {
             let reason = CompactReason::Emergency;
-            self.last_compaction_tokens = Some(self.context_tokens);
             self.state = MachineState::AwaitingCompaction { reason };
             return MachineStep::Compact { reason };
         }
         if policy.auto_compact && self.should_compact(policy) {
             let reason = CompactReason::ThresholdExceeded;
-            self.last_compaction_tokens = Some(self.context_tokens);
             self.state = MachineState::AwaitingCompaction { reason };
             return MachineStep::Compact { reason };
         }
@@ -646,33 +651,81 @@ impl LoopMachine {
 
     /// Feed compacted history back into the machine.
     ///
-    /// The driver calls this after servicing a [`MachineStep::Compact`], passing
-    /// the compacted history and `tokens_after` — its estimate of that history's
-    /// token size, which the machine adopts as the current context size so it
-    /// does not immediately request another compaction. The next
-    /// [`Self::next_step`] then requests the deferred [`MachineStep::CallLLM`].
-    /// Has no effect once the machine is terminal.
-    pub fn compaction_result(&mut self, compacted: Vec<Message>, tokens_after: u64) {
+    /// The driver calls this after servicing a [`MachineStep::Compact`] that
+    /// rewrote the history, passing the compacted history plus two measured
+    /// estimates from the same token counter: `tokens_before` — the size of
+    /// the full history ahead of the compaction pass — and `tokens_after` —
+    /// the size of `compacted`. The machine adopts `tokens_after` as the
+    /// current context size so it does not immediately request another
+    /// compaction. The next [`Self::next_step`] then requests the deferred
+    /// [`MachineStep::CallLLM`]. Has no effect once the machine is terminal.
+    pub fn compaction_result(
+        &mut self,
+        compacted: Vec<Message>,
+        tokens_before: u64,
+        tokens_after: u64,
+    ) {
         if self.is_terminal() {
             return;
         }
-        if let Some(before) = self.last_compaction_tokens
-            && tokens_after >= before
-        {
-            self.state = MachineState::Terminal(MachineOutcome::Failed {
-                error: LoopError::ContextExceeded {
-                    used: tokens_after,
-                    limit: before,
-                },
-            });
-            self.last_compaction_tokens = None;
+        if self.terminate_on_no_progress(tokens_before, tokens_after) {
             return;
         }
-        self.last_compaction_tokens = None;
         self.history = compacted;
         self.pending.clear();
         self.context_tokens = tokens_after;
         self.state = MachineState::Start;
+    }
+
+    /// Feed an unchanged compaction result back into the machine.
+    ///
+    /// The driver calls this after servicing a [`MachineStep::Compact`] that
+    /// changed nothing — no compactor ran, a pre-compact hook vetoed the pass,
+    /// or the compactor returned the conversation unchanged. The committed
+    /// history and the pending buffer are left untouched: feeding the
+    /// uncompacted conversation through [`Self::compaction_result`] would
+    /// commit the current run's partial messages mid-run, so a later failure
+    /// could no longer discard them.
+    ///
+    /// `tokens_before` and `tokens_after` are the driver's measured estimates
+    /// of the conversation ahead of and after the pass (equal in practice,
+    /// since nothing changed); the machine adopts `tokens_after` as the
+    /// current context size. The same no-progress guard as
+    /// [`Self::compaction_result`] applies: when nothing was shaved off, the
+    /// machine transitions to [`MachineOutcome::Failed`] with
+    /// [`LoopError::ContextExceeded`] — compaction cannot shrink this
+    /// conversation, and another model call would exceed the context window.
+    /// Has no effect once the machine is terminal.
+    pub fn compaction_noop(&mut self, tokens_before: u64, tokens_after: u64) {
+        if self.is_terminal() {
+            return;
+        }
+        if self.terminate_on_no_progress(tokens_before, tokens_after) {
+            return;
+        }
+        self.context_tokens = tokens_after;
+        self.state = MachineState::Start;
+    }
+
+    /// Fail the run when a compaction feed made no progress.
+    ///
+    /// Shared guard behind [`Self::compaction_result`] and
+    /// [`Self::compaction_noop`]: compares the driver's measured post-pass
+    /// token count against its measured pre-pass count of the full history.
+    /// When nothing was shaved off, transitions to [`MachineOutcome::Failed`]
+    /// with [`LoopError::ContextExceeded`] (preventing an infinite compaction
+    /// cycle) and returns `true`; returns `false` when the feed may proceed.
+    fn terminate_on_no_progress(&mut self, tokens_before: u64, tokens_after: u64) -> bool {
+        if tokens_after < tokens_before {
+            return false;
+        }
+        self.state = MachineState::Terminal(MachineOutcome::Failed {
+            error: LoopError::ContextExceeded {
+                used: tokens_after,
+                limit: tokens_before,
+            },
+        });
+        true
     }
 
     /// Mark the run as cancelled.
@@ -878,6 +931,10 @@ mod tests {
         crate::compact::HeuristicTokenCounter.count(&machine.full_history())
     }
 
+    fn count_vec_tokens(messages: &[Message]) -> u64 {
+        crate::compact::CompactionOutcome::estimate_tokens(messages)
+    }
+
     fn same_step(a: &MachineStep, b: &MachineStep) -> bool {
         serde_json::to_string(a).unwrap_or_default() == serde_json::to_string(b).unwrap_or_default()
     }
@@ -973,7 +1030,9 @@ mod tests {
             machine.next_step(policy),
             MachineStep::Compact { .. }
         ));
-        machine.compaction_result(vec![Message::user("compacted")], 0);
+        let compacted = vec![Message::user("compacted")];
+        let tokens_after = count_vec_tokens(&compacted);
+        machine.compaction_result(compacted, count_tokens(&machine), tokens_after);
         let snapshot = serde_json::to_string(&machine).expect("serialize");
         let mut restored: LoopMachine = serde_json::from_str(&snapshot).expect("deserialize");
         let a = machine.next_step(policy);
@@ -1167,7 +1226,8 @@ mod tests {
             MachineStep::Compact { .. }
         ));
         let compacted = vec![Message::user("compacted-only")];
-        machine.compaction_result(compacted.clone(), 0);
+        let tokens_after = count_vec_tokens(&compacted);
+        machine.compaction_result(compacted.clone(), count_tokens(&machine), tokens_after);
         // Compare by serialized form: Message is not PartialEq.
         let got = serde_json::to_string(&machine.full_history()).expect("serialize history");
         let want = serde_json::to_string(&compacted).expect("serialize expected");
@@ -1219,7 +1279,9 @@ mod tests {
             machine.next_step(policy),
             MachineStep::Compact { .. }
         ));
-        machine.compaction_result(vec![Message::user("compacted")], 0);
+        let compacted = vec![Message::user("compacted")];
+        let tokens_after = count_vec_tokens(&compacted);
+        machine.compaction_result(compacted, count_tokens(&machine), tokens_after);
 
         assert_eq!(
             machine.history().len(),
@@ -1250,7 +1312,12 @@ mod tests {
             machine.next_step(policy),
             MachineStep::Compact { .. }
         ));
-        machine.compaction_result(vec![Message::user("compacted")], 90);
+        let tokens_before = count_tokens(&machine);
+        machine.compaction_result(
+            vec![Message::user("compacted")],
+            tokens_before,
+            tokens_before,
+        );
 
         match machine.next_step(policy) {
             MachineStep::Done(MachineOutcome::Failed {
@@ -1279,7 +1346,8 @@ mod tests {
             machine.next_step(policy),
             MachineStep::Compact { .. }
         ));
-        machine.compaction_result(vec![Message::user("compacted")], 30);
+        let tokens_before = count_tokens(&machine);
+        machine.compaction_result(vec![Message::user("compacted")], tokens_before, 30);
 
         assert!(
             matches!(machine.next_step(policy), MachineStep::CallLLM { .. }),

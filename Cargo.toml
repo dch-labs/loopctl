@@ -10,7 +10,7 @@ documentation = "https://docs.rs/loopctl"
 keywords = ["agent", "framework", "llm", "loop"]
 categories = ["api-bindings", "development-tools"]
 readme = "README.md"
-rust-version = "1.94"
+rust-version = "1.98"
 
 [lib]
 name = "loopctl"

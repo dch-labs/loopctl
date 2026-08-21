@@ -157,6 +157,7 @@ async fn reconnect_in_process_client_is_error() {
             "ok".into()
         }
     }
+    #[allow(clippy::unused_async_trait_impl)] // FIXME(rmcp): drop when tool_handler emits awaits
     #[tool_handler]
     impl ServerHandler for S {}
 

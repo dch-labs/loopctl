@@ -61,7 +61,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::cancel::CancelSignal;
-use crate::compact::ContextManager;
+use crate::compact::{ContextManager, TruncatingCompactor};
 use crate::config::SessionConfig;
 use crate::engine::core::{
     LoopMachine, MachineOutcome, MachinePolicy, MachineState, MachineStep, ModelResponse,
@@ -353,8 +353,10 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Create a new `BareLoop` with the given components.
     ///
-    /// Initializes an empty conversation history and a
-    /// fresh [`LoopManagers`]. The cancellation signal starts as non-cancelled.
+    /// Initializes an empty conversation history and a fresh
+    /// [`LoopManagers`] seeded with a default [`ContextManager`] synced from
+    /// the session config (see [`Self::new_with_managers`]). The cancellation
+    /// signal starts as non-cancelled.
     ///
     /// # Parameters
     ///
@@ -381,6 +383,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`LoopManagers`] — for example, to enable loop detection or
     /// circuit-breaker policies.
     ///
+    /// When the supplied bundle carries no [`ContextManager`], a default one
+    /// (a [`TruncatingCompactor`](crate::compact::TruncatingCompactor)) is
+    /// installed with its context window and threshold synced from
+    /// `session_config`, so the session's auto-compaction settings are backed
+    /// by machinery that can actually reduce the history. A bundle that
+    /// already carries a context manager is used as-is.
+    ///
     /// # Parameters
     ///
     /// - `client` — The LLM API client, wrapped in `Arc`.
@@ -406,8 +415,12 @@ impl<C: ApiClient> BareLoop<C> {
         client: Arc<C>,
         tools: ToolRegistry,
         session_config: SessionConfig,
-        managers: LoopManagers,
+        mut managers: LoopManagers,
     ) -> Self {
+        if managers.context_manager().is_none() {
+            let seeded = Self::default_context_manager(&session_config);
+            managers.set_context_manager(Arc::new(seeded));
+        }
         Self {
             client,
             tools: Arc::new(tools),
@@ -572,8 +585,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// Constructs a [`BareLoop`] whose machine is `machine` — for example to
     /// resume a serialized run: deserialize the machine, wrap it in a loop with
     /// the original client/tools, and continue driving it with
-    /// [`run()`](crate::engine::core::Loop::run). The session/run config
-    /// is taken from the machine.
+    /// [`run()`](crate::engine::core::Loop::run). The supplied
+    /// `session_config` configures the resumed loop; per-run settings come
+    /// from the [`RunConfig`](crate::engine::RunConfig) the caller passes to
+    /// each `run()` call — the machine itself stores no configuration. A
+    /// fresh [`LoopManagers`] is created with a default
+    /// [`ContextManager`] synced from `session_config` (see
+    /// [`Self::new_with_managers`]).
     #[must_use]
     pub fn from_machine(
         machine: LoopMachine,
@@ -581,12 +599,15 @@ impl<C: ApiClient> BareLoop<C> {
         client: Arc<C>,
         tools: ToolRegistry,
     ) -> Self {
+        let mut managers = LoopManagers::new();
+        let seeded = Self::default_context_manager(&session_config);
+        managers.set_context_manager(Arc::new(seeded));
         Self {
             client,
             tools: Arc::new(tools),
             session: Session::new(session_config),
             machine,
-            managers: LoopManagers::new(),
+            managers,
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
@@ -597,6 +618,21 @@ impl<C: ApiClient> BareLoop<C> {
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
             turn_mode: default_turn_mode(),
         }
+    }
+
+    /// Build the default context manager for a session config.
+    ///
+    /// A [`TruncatingCompactor`] behind a [`ContextManager`] whose context
+    /// window and threshold mirror `session_config`'s. Installed by
+    /// [`Self::new_with_managers`] and [`Self::from_machine`] when the
+    /// manager bundle carries no compaction machinery of its own, so the
+    /// session's auto-compaction trigger is never an alarm without a
+    /// sprinkler. Hosts that want different behavior install their own
+    /// manager, which is never overridden.
+    fn default_context_manager(session_config: &SessionConfig) -> ContextManager {
+        ContextManager::new(Arc::new(TruncatingCompactor::default()))
+            .with_context_window(session_config.context_window)
+            .with_threshold(session_config.compact_threshold)
     }
 
     /// Get the tool registry.
@@ -1143,6 +1179,8 @@ impl<C: ApiClient> BareLoop<C> {
             Role::User,
             slots.into_iter().flatten().collect(),
         )]);
+        let estimate = self.count_context(&self.machine.full_history());
+        self.machine.set_context_tokens(estimate);
         Ok(())
     }
 
@@ -1150,7 +1188,14 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Runs the configured [`ContextManager`](crate::compact::ContextManager)
     /// over the machine-owned history (firing `on_compaction` and hooks), then
-    /// feeds the compacted history back to the machine.
+    /// feeds the outcome back to the machine: a rewritten history with the
+    /// driver's measured before/after token sizes through
+    /// [`LoopMachine::compaction_result`](crate::engine::core::LoopMachine::compaction_result),
+    /// an unchanged one with the same measurements through
+    /// [`LoopMachine::compaction_noop`](crate::engine::core::LoopMachine::compaction_noop)
+    /// so the pending buffer survives. The machine already sits in
+    /// `AwaitingCompaction` for this reason when the step arrives; the driver
+    /// only performs the I/O and feeds the result back.
     ///
     /// # Errors
     ///
@@ -1161,10 +1206,20 @@ impl<C: ApiClient> BareLoop<C> {
         reason: crate::compact::types::CompactReason,
     ) -> Result<(), LoopError> {
         let turn = self.machine.turns_taken();
-        // The machine is already `AwaitingCompaction` for this reason; the
-        // driver just performs the IO and feeds the result back.
-        let (compacted, tokens_after) = self.run_compaction(turn, reason).await?;
-        self.machine.compaction_result(compacted, tokens_after);
+        let outcome = self.run_compaction(turn, reason).await?;
+        match outcome.compacted {
+            Some(compacted) => {
+                self.machine.compaction_result(
+                    compacted,
+                    outcome.tokens_before,
+                    outcome.tokens_after,
+                );
+            }
+            None => {
+                self.machine
+                    .compaction_noop(outcome.tokens_before, outcome.tokens_after);
+            }
+        }
         Ok(())
     }
 }
@@ -1189,6 +1244,8 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             self.session.runs.push(Run::new(input, run_config));
             self.notify_run_start();
             self.machine.accept_input(input);
+            let estimate = self.count_context(&self.machine.full_history());
+            self.machine.set_context_tokens(estimate);
 
             loop {
                 let policy = self.machine_policy();

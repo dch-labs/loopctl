@@ -1244,12 +1244,16 @@ async fn compaction_sees_pending_messages() {
 
     let config = make_config()
         .with_context_window(100)
-        .with_compact_threshold(10);
+        .with_compact_threshold(20);
     let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
     agent.set_context_manager(Arc::new(
-        crate::compact::ContextManager::new(Arc::new(crate::compact::TruncatingCompactor::new()))
-            .with_context_window(100)
-            .with_threshold(10),
+        crate::compact::ContextManager::new(Arc::new(
+            crate::compact::TruncatingCompactor::new()
+                .with_preserve_recent(1)
+                .with_min_messages(2),
+        ))
+        .with_context_window(100)
+        .with_threshold(20),
     ));
 
     agent
@@ -1306,7 +1310,10 @@ async fn context_token_count_includes_model_response_message() {
     let counter_clone = Arc::clone(&token_ctr);
 
     let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
-    agent.set_token_counter(counter_clone);
+    agent.set_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(crate::compact::TruncatingCompactor::new()))
+            .with_token_counter(counter_clone),
+    ));
 
     agent.run("hi", &RunConfig::default()).await.unwrap();
 
@@ -1364,12 +1371,12 @@ async fn compaction_then_failure_leaves_history_compacted() {
 
     let config = make_config()
         .with_context_window(100)
-        .with_compact_threshold(10);
+        .with_compact_threshold(80);
     let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
     agent.set_context_manager(Arc::new(
         crate::compact::ContextManager::new(Arc::new(crate::compact::TruncatingCompactor::new()))
             .with_context_window(100)
-            .with_threshold(10),
+            .with_threshold(80),
     ));
 
     agent.run("first run", &RunConfig::default()).await.unwrap();
@@ -4803,5 +4810,34 @@ fn fluent_with_observer_equivalent_to_register_observer() {
         fluent.managers.observers().len(),
         imperative.managers.observers().len(),
         "both paths register the same number of observers"
+    );
+}
+
+#[tokio::test]
+async fn failed_run_after_noop_compaction_leaves_history_clean() {
+    let client = MockClient::new("test-model");
+    client.add_tool_only_response("call_1", "echo", json!({"message": "hi"}));
+
+    let mut config = make_config();
+    config.context_window = 100;
+    config.compact_threshold = 50;
+    config.auto_compact = true;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, config);
+
+    let result = agent.run(&"x".repeat(300), &make_run_config()).await;
+    match result {
+        Err(LoopError::ContextExceeded { .. }) => {}
+        other => panic!(
+            "mock has no response for the post-compact call; an unshrinkable over-threshold \
+             conversation must fail with ContextExceeded instead, got {other:?}"
+        ),
+    }
+    assert!(
+        agent.conversation().is_empty(),
+        "discard_pending doc: no messages from the abandoned run may leak into the next run's context; got {} messages",
+        agent.conversation().len()
     );
 }

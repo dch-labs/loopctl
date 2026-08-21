@@ -607,7 +607,8 @@ impl ApiClient for MockApiClient {
     ///
     /// ```text
     /// MessageStart → PartStart(text) → IndexedDelta(text) → MessagePartStop
-    ///              → [PartStart(tool_use) → MessagePartStop]   (if tool_call is set)
+    ///              → [PartStart(tool_use) → IndexedDelta(input_json)
+    ///                 → MessagePartStop]   (if tool_call is set)
     ///              → MessageDelta(stop_reason, usage) → MessageStop
     /// ```
     ///
@@ -674,11 +675,24 @@ impl ApiClient for MockApiClient {
 
         events.push(Ok(StreamEvent::PartStop));
 
-        // Tool call content block (if any)
+        // Tool call content block (if any). Real providers open the tool
+        // block with an empty input and stream the arguments as input-json
+        // deltas; the mock mirrors that shape so accumulated tool input is
+        // identical on the mock and real paths.
         if let Some(tc) = &response.tool_call {
             events.push(Ok(StreamEvent::PartStart(PartStart {
                 index: 1,
-                part: Some(MessagePart::tool_call(&tc.id, &tc.name, tc.input.clone())),
+                part: Some(MessagePart::tool_call(
+                    &tc.id,
+                    &tc.name,
+                    serde_json::json!({}),
+                )),
+            })));
+            events.push(Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::InputJson {
+                    partial_json: tc.input.to_string(),
+                },
             })));
             events.push(Ok(StreamEvent::PartStop));
         }
@@ -1445,6 +1459,27 @@ mod tests {
             }
         });
         assert!(has_tool_stop);
+
+        let mut accumulator = crate::stream::StreamAccumulator::new();
+        for event in &events {
+            let Ok(event) = event else {
+                panic!("mock stream must not carry errors here");
+            };
+            accumulator
+                .process(event)
+                .expect("accumulator accepts mock events");
+        }
+        let assembled = accumulator.build();
+        let tool_calls = assembled.tool_call_parts();
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "one tool call reconstructed from the stream"
+        );
+        let (id, name, input) = tool_calls[0];
+        assert_eq!(id, "call_1");
+        assert_eq!(name, "echo");
+        assert_eq!(input, &json!({"message": "hi"}));
     }
 
     #[tokio::test]

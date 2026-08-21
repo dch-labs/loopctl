@@ -138,7 +138,12 @@ mod scenarios {
         ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, loopctl::tool::ToolError>> + Send + '_>>
         {
             Box::pin(async move {
-                let payload = format!("echo: {input} {}", "r".repeat(200));
+                let fill = input
+                    .get("fill")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|fill| usize::try_from(fill).ok())
+                    .unwrap_or(200);
+                let payload = format!("echo: {input} {}", "r".repeat(fill));
                 Ok(ToolOutput::text(payload))
             })
         }
@@ -155,6 +160,20 @@ mod scenarios {
                 id: format!("call_{step}"),
                 name: "echo".to_string(),
                 input: serde_json::json!({"step": step}),
+            }),
+            stop_reason: "tool_use".to_string(),
+        }
+    }
+
+    /// A tool turn whose echo result is `fill` characters, so a single
+    /// dispatch can grow the history by a controlled amount.
+    fn tool_turn_response_with_fill(step: usize, text_chars: usize, fill: usize) -> MockResponse {
+        MockResponse {
+            text: format!("step {step} {}", "w".repeat(text_chars)),
+            tool_call: Some(MockToolCall {
+                id: format!("call_{step}"),
+                name: "echo".to_string(),
+                input: serde_json::json!({"step": step, "fill": fill}),
             }),
             stop_reason: "tool_use".to_string(),
         }
@@ -248,6 +267,41 @@ mod scenarios {
                 *tokens <= 200,
                 "committed history over the window must trigger compaction (or a typed \
                  failure) before the run's first request; served estimates {served:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_growth_alone_crosses_the_threshold() {
+        let script = vec![tool_turn_response_with_fill(0, 20, 8_000), final_response()];
+        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+
+        let config = SessionConfig::default()
+            .with_context_window(2_000)
+            .with_compact_threshold(80);
+        let client_handle = client.clone();
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+
+        let result = agent.run("keep echoing", &RunConfig::default()).await;
+
+        match result {
+            Err(LoopError::ContextExceeded { .. }) => {}
+            other => panic!(
+                "tool-result growth alone must trip the compaction check and fail to \
+                 shrink the three-message history; got {other:?}"
+            ),
+        }
+        let served = client_handle.served_request_tokens();
+        assert_eq!(
+            served.len(),
+            1,
+            "the follow-up request must wait for the compaction check to see the \
+             tool-result growth; served {served:?}"
+        );
+        for tokens in &served {
+            assert!(
+                *tokens <= 2_000,
+                "no request may exceed the 2_000-token window; served estimates {served:?}"
             );
         }
     }

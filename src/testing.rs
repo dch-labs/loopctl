@@ -674,11 +674,24 @@ impl ApiClient for MockApiClient {
 
         events.push(Ok(StreamEvent::PartStop));
 
-        // Tool call content block (if any)
+        // Tool call content block (if any). Real providers open the tool
+        // block with an empty input and stream the arguments as input-json
+        // deltas; the mock mirrors that shape so accumulated tool input is
+        // identical on the mock and real paths.
         if let Some(tc) = &response.tool_call {
             events.push(Ok(StreamEvent::PartStart(PartStart {
                 index: 1,
-                part: Some(MessagePart::tool_call(&tc.id, &tc.name, tc.input.clone())),
+                part: Some(MessagePart::tool_call(
+                    &tc.id,
+                    &tc.name,
+                    serde_json::json!({}),
+                )),
+            })));
+            events.push(Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::InputJson {
+                    partial_json: tc.input.to_string(),
+                },
             })));
             events.push(Ok(StreamEvent::PartStop));
         }

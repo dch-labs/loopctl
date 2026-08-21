@@ -203,12 +203,15 @@ pub enum LoopError {
         /// with `limit` to report utilization to the caller.
         used: u64,
 
-        /// Maximum tokens allowed by the model.
+        /// The token budget that was exceeded.
         ///
-        /// Sourced from
-        /// [`SessionConfig::context_window`](crate::config::SessionConfig::context_window).
-        /// When `used` exceeds this after compaction, the run cannot
-        /// continue on the current model.
+        /// One of two values, depending on where the error originates:
+        /// the model's context window (from
+        /// [`SessionConfig::context_window`](crate::config::SessionConfig::context_window))
+        /// when a compaction result still does not fit, or the measured
+        /// pre-compaction size when the no-progress guard ends a run
+        /// because compaction could not reduce the conversation. Pair
+        /// with `used` to report utilization to the caller.
         limit: u64,
     },
 

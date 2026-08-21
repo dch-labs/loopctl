@@ -931,6 +931,10 @@ mod tests {
         crate::compact::HeuristicTokenCounter.count(&machine.full_history())
     }
 
+    fn count_vec_tokens(messages: &[Message]) -> u64 {
+        crate::compact::CompactionOutcome::estimate_tokens(messages)
+    }
+
     fn same_step(a: &MachineStep, b: &MachineStep) -> bool {
         serde_json::to_string(a).unwrap_or_default() == serde_json::to_string(b).unwrap_or_default()
     }
@@ -1026,7 +1030,9 @@ mod tests {
             machine.next_step(policy),
             MachineStep::Compact { .. }
         ));
-        machine.compaction_result(vec![Message::user("compacted")], count_tokens(&machine), 0);
+        let compacted = vec![Message::user("compacted")];
+        let tokens_after = count_vec_tokens(&compacted);
+        machine.compaction_result(compacted, count_tokens(&machine), tokens_after);
         let snapshot = serde_json::to_string(&machine).expect("serialize");
         let mut restored: LoopMachine = serde_json::from_str(&snapshot).expect("deserialize");
         let a = machine.next_step(policy);
@@ -1220,7 +1226,8 @@ mod tests {
             MachineStep::Compact { .. }
         ));
         let compacted = vec![Message::user("compacted-only")];
-        machine.compaction_result(compacted.clone(), count_tokens(&machine), 0);
+        let tokens_after = count_vec_tokens(&compacted);
+        machine.compaction_result(compacted.clone(), count_tokens(&machine), tokens_after);
         // Compare by serialized form: Message is not PartialEq.
         let got = serde_json::to_string(&machine.full_history()).expect("serialize history");
         let want = serde_json::to_string(&compacted).expect("serialize expected");
@@ -1272,7 +1279,9 @@ mod tests {
             machine.next_step(policy),
             MachineStep::Compact { .. }
         ));
-        machine.compaction_result(vec![Message::user("compacted")], count_tokens(&machine), 0);
+        let compacted = vec![Message::user("compacted")];
+        let tokens_after = count_vec_tokens(&compacted);
+        machine.compaction_result(compacted, count_tokens(&machine), tokens_after);
 
         assert_eq!(
             machine.history().len(),

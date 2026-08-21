@@ -1179,6 +1179,8 @@ impl<C: ApiClient> BareLoop<C> {
             Role::User,
             slots.into_iter().flatten().collect(),
         )]);
+        let estimate = self.count_context(&self.machine.full_history());
+        self.machine.set_context_tokens(estimate);
         Ok(())
     }
 

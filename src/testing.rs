@@ -607,7 +607,8 @@ impl ApiClient for MockApiClient {
     ///
     /// ```text
     /// MessageStart → PartStart(text) → IndexedDelta(text) → MessagePartStop
-    ///              → [PartStart(tool_use) → MessagePartStop]   (if tool_call is set)
+    ///              → [PartStart(tool_use) → IndexedDelta(input_json)
+    ///                 → MessagePartStop]   (if tool_call is set)
     ///              → MessageDelta(stop_reason, usage) → MessageStop
     /// ```
     ///
@@ -1458,6 +1459,27 @@ mod tests {
             }
         });
         assert!(has_tool_stop);
+
+        let mut accumulator = crate::stream::StreamAccumulator::new();
+        for event in &events {
+            let Ok(event) = event else {
+                panic!("mock stream must not carry errors here");
+            };
+            accumulator
+                .process(event)
+                .expect("accumulator accepts mock events");
+        }
+        let assembled = accumulator.build();
+        let tool_calls = assembled.tool_call_parts();
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "one tool call reconstructed from the stream"
+        );
+        let (id, name, input) = tool_calls[0];
+        assert_eq!(id, "call_1");
+        assert_eq!(name, "echo");
+        assert_eq!(input, &json!({"message": "hi"}));
     }
 
     #[tokio::test]

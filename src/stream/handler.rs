@@ -886,6 +886,20 @@ struct EventDiagnostics {
 }
 
 impl EventDiagnostics {
+    /// Snapshot the diagnostic context for one event poll.
+    ///
+    /// Convenience constructor for the per-iteration snapshot
+    /// [`next_event`](StreamHandler::next_event) receives: progress counts,
+    /// the turn-level start instant, and partial-data presence derived from
+    /// the shadow accumulator's current part list.
+    fn new(events_processed: u64, stream_start: Instant, shadow: &StreamAccumulator) -> Self {
+        Self {
+            events_processed,
+            stream_start,
+            has_partial_data: !shadow.peek_parts().is_empty(),
+        }
+    }
+
     /// Build the [`StreamOutcome::TotalTimeout`] for this point in the stream.
     ///
     /// Snapshots the current diagnostic state — partial-data flag, events
@@ -1682,19 +1696,7 @@ impl StreamHandler {
             // Shadow accumulator tracks partial-data presence for diagnostics.
             let mut shadow = StreamAccumulator::new();
 
-            'outer: loop {
-                if let Some(deadline) = total_deadline
-                    && Instant::now() >= deadline
-                {
-                    Err(StreamHandlerError::InitFailed(
-                        StreamOutcome::TotalTimeout {
-                            has_partial_data: !shadow.peek_parts().is_empty(),
-                            events_processed: 0,
-                            duration: stream_start.elapsed(),
-                        },
-                    ))?;
-                }
-
+            loop {
                 if !first_attempt {
                     shadow = StreamAccumulator::new();
                     yield HandlerEvent::AttemptReset;
@@ -1708,88 +1710,129 @@ impl StreamHandler {
                 let mut consecutive_timeouts: usize = 0;
                 let mut events_processed: u64 = 0;
 
-                loop {
-                    let diagnostics = EventDiagnostics {
-                        events_processed,
-                        stream_start,
-                        has_partial_data: !shadow.peek_parts().is_empty(),
-                    };
-                    match self.next_event(
-                        &mut stream,
-                        cancel,
-                        &mut consecutive_timeouts,
-                        total_deadline,
-                        &diagnostics,
-                    ).await {
+                let action = loop {
+                    let diagnostics =
+                        EventDiagnostics::new(events_processed, stream_start, &shadow);
+                    match self
+                        .next_event(
+                            &mut stream,
+                            cancel,
+                            &mut consecutive_timeouts,
+                            total_deadline,
+                            &diagnostics,
+                        )
+                        .await
+                    {
                         Ok(Some(event)) => {
                             events_processed = events_processed.saturating_add(1);
                             consecutive_timeouts = 0;
-                            if let Err(e) = shadow.process(&event) {
-                                Err(StreamHandlerError::StreamFailed(
-                                    StreamOutcome::InitFailed {
-                                        attempts: transport_attempts.saturating_add(1),
-                                        last_error: e.to_string(),
-                                    },
-                                ))?;
-                            }
+                            Self::accumulate_event(&mut shadow, &event, transport_attempts)?;
                             yield HandlerEvent::Stream(event);
                         }
                         Ok(None) => return,
-                        Err(failure) => {
-                            let last_stream_outcome = carried_outcome(&failure.error);
-                            let action =
-                                if let Some(StreamOutcome::RateLimited { detail, .. }) =
-                                    &last_stream_outcome
-                                {
-                                    self.decide_rate_limit_error(
-                                        failure.error,
-                                        detail,
-                                        &mut rate_limit_retries,
-                                        total_deadline,
-                                        last_stream_outcome.clone(),
-                                    )
-                                } else {
-                                    self.decide_transport_error(
-                                        failure.error,
-                                        failure.retryable,
-                                        &mut transport_attempts,
-                                        max_attempts,
-                                        last_stream_outcome.clone(),
-                                        total_deadline,
-                                    )
-                                };
-                            match action {
-                                ErrorAction::Fail(e) => {
-                                    Err(e)?;
-                                    return;
-                                }
-                                ErrorAction::TryFallback(outcome) => {
-                                    let (message, fallback_stop_reason, fallback_usage) = self
-                                        .fallback_non_streaming(
-                                            client,
-                                            request,
-                                            &options,
-                                            cancel,
-                                            total_deadline,
-                                            outcome,
-                                        )
-                                        .await?;
-                                    yield HandlerEvent::Fallback {
-                                        message,
-                                        stop_reason: fallback_stop_reason,
-                                        usage: fallback_usage,
-                                    };
-                                    return;
-                                }
-                                ErrorAction::Retry(delay) => {
-                                    sleep_cancellable(delay, cancel).await?;
-                                    continue 'outer;
-                                }
-                            }
-                        }
+                        Err(failure) => break self.decide_failure_action(
+                            failure,
+                            &mut rate_limit_retries,
+                            &mut transport_attempts,
+                            max_attempts,
+                            total_deadline,
+                        ),
+                    }
+                };
+
+                match action {
+                    ErrorAction::Fail(e) => {
+                        Err(e)?;
+                        return;
+                    }
+                    ErrorAction::TryFallback(outcome) => {
+                        let (message, stop_reason, usage) = self
+                            .fallback_non_streaming(
+                                client,
+                                request,
+                                &options,
+                                cancel,
+                                total_deadline,
+                                outcome,
+                            )
+                            .await?;
+                        yield HandlerEvent::Fallback {
+                            message,
+                            stop_reason,
+                            usage,
+                        };
+                        return;
+                    }
+                    ErrorAction::Retry(delay) => {
+                        sleep_cancellable(delay, cancel).await?;
                     }
                 }
             }
+        })
+    }
+
+    /// Route a failed event poll to the matching retry ladder.
+    ///
+    /// The single dispatch point for the generator's error arm: when the
+    /// failure's carried outcome is [`StreamOutcome::RateLimited`] it draws on
+    /// the rate-limit budget via
+    /// [`decide_rate_limit_error`](Self::decide_rate_limit_error); every other
+    /// failure draws on the transport budget via
+    /// [`decide_transport_error`](Self::decide_transport_error) (including the
+    /// retryability fast-fail and the terminal total-timeout route). Keeping
+    /// the outcome-inspection here leaves the generator body a flat
+    /// decision-and-act sequence.
+    fn decide_failure_action(
+        &self,
+        failure: StreamFailure,
+        rate_limit_retries: &mut u32,
+        transport_attempts: &mut u32,
+        max_attempts: u32,
+        total_deadline: Option<Instant>,
+    ) -> ErrorAction {
+        let last_stream_outcome = carried_outcome(&failure.error);
+        if let Some(StreamOutcome::RateLimited { detail, .. }) = &last_stream_outcome {
+            self.decide_rate_limit_error(
+                failure.error,
+                detail,
+                rate_limit_retries,
+                total_deadline,
+                last_stream_outcome.clone(),
+            )
+        } else {
+            self.decide_transport_error(
+                failure.error,
+                failure.retryable,
+                transport_attempts,
+                max_attempts,
+                last_stream_outcome.clone(),
+                total_deadline,
+            )
+        }
+    }
+
+    /// Accumulate one accepted event into the shadow accumulator.
+    ///
+    /// Wraps [`StreamAccumulator::process`] for the generator's happy-path
+    /// arm: a malformed event becomes the same
+    /// [`StreamHandlerError::StreamFailed`] the inline code built, with the
+    /// attempt count carried as `transport_attempts + 1` (the attempt in
+    /// flight when the event arrived).
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped accumulation failure for the generator to
+    /// propagate as its terminal item.
+    fn accumulate_event(
+        shadow: &mut StreamAccumulator,
+        event: &StreamEvent,
+        transport_attempts: u32,
+    ) -> Result<(), StreamHandlerError> {
+        shadow.process(event).map_err(|e| {
+            StreamHandlerError::StreamFailed(StreamOutcome::InitFailed {
+                attempts: transport_attempts.saturating_add(1),
+                last_error: e.to_string(),
+            })
         })
     }
 
@@ -2126,21 +2169,29 @@ impl StreamHandler {
     /// the message, stop reason, and token usage are returned directly, with
     /// no JSON parsing at this layer.
     ///
-    /// The request is raced against the turn's `total_deadline` (the same one
-    /// that bounded the streaming attempts), so a hanging non-streaming call
-    /// cannot outlive the budget the stream already spent. The deadline
-    /// bounds *waiting*, not completion: a response that has resolved by the
-    /// time the select is polled is accepted even when it lands at or past
-    /// the deadline — the answer exists and its tokens are already spent, so
-    /// discarding it would trade finished work for wall-clock bookkeeping.
-    /// `None` means no deadline is configured and the call is bounded only
-    /// by cancellation and any client-level limits.
+    /// While streaming-budget time remains, the request is raced against the
+    /// turn's `total_deadline` (the same one that bounded the streaming
+    /// attempts), so a hanging non-streaming call cannot outlive the budget
+    /// the stream already spent. When the deadline has already expired by
+    /// the time the fallback starts — the terminal total-timeout paths,
+    /// where the expiry itself is what triggered the fallback — racing
+    /// against it would kill the request on its first poll and make the
+    /// configured fallback unreachable; instead the fallback gets one fresh
+    /// budget of [`initial_event_timeout`] to produce its answer. In both
+    /// cases the deadline bounds *waiting*, not completion: a response that
+    /// has resolved by the time the select is polled is accepted even when
+    /// it lands at or past the deadline — the answer exists and its tokens
+    /// are already spent, so discarding it would trade finished work for
+    /// wall-clock bookkeeping. `None` means no deadline is configured and
+    /// the call is bounded only by cancellation and any client-level limits.
     ///
     /// # Errors
     ///
     /// Returns [`StreamHandlerError::FallbackFailed`] if the fallback request
-    /// also fails or the total deadline expires before it completes, or
+    /// also fails or its deadline expires before it completes, or
     /// [`StreamHandlerError::Cancelled`] if the cancel signal fires.
+    ///
+    /// [`initial_event_timeout`]: StreamTimeoutConfig::initial_event_timeout
     async fn fallback_non_streaming<C: ApiClient>(
         &self,
         client: &C,
@@ -2154,6 +2205,11 @@ impl StreamHandler {
             return Err(StreamHandlerError::Cancelled);
         }
 
+        let fallback_deadline = match total_deadline {
+            Some(deadline) if deadline > Instant::now() => total_deadline,
+            Some(_) => Instant::now().checked_add(self.timeout_config.initial_event_timeout),
+            None => None,
+        };
         let result = tokio::select! {
             biased;
 
@@ -2161,14 +2217,13 @@ impl StreamHandler {
                 return Err(StreamHandlerError::Cancelled);
             }
             res = client.create_message_with_options(request, options.clone()) => res,
-            () = deadline_future(total_deadline) => {
+            () = deadline_future(fallback_deadline) => {
                 return Err(StreamHandlerError::FallbackFailed {
                     stream_outcome: stream_outcome.unwrap_or(StreamOutcome::InitFailed {
                         attempts: 0,
                         last_error: "unknown".to_string(),
                     }),
-                    fallback_error: "fallback request exceeded the total stream deadline"
-                        .to_string(),
+                    fallback_error: "fallback request exceeded its deadline".to_string(),
                 });
             }
         };
@@ -5007,10 +5062,9 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
 
         let start = Instant::now();
-        let err = handler
+        let result = handler
             .drive_turn(&client, &crate::api::StreamRequest::new(vec![]), &cancel)
-            .await
-            .expect_err("tight total timeout should fail the turn");
+            .await;
         let elapsed = start.elapsed();
         // The clamp keeps the sleep inside the ~80ms budget, so the whole turn
         // resolves well under the 600s hint. Allow generous slack for scheduling.
@@ -5018,11 +5072,19 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "deadline clamp should prevent a 600s sleep; elapsed {elapsed:?}",
         );
-        // No escalation: the deadline tripped before the counter ceiling.
-        assert!(
-            !matches!(err, StreamHandlerError::RateLimitEscalation { .. }),
-            "timeout should fire before escalation"
-        );
+        // The expiry is terminal: with the fallback enabled by default the
+        // turn resolves through it, otherwise it fails — never the 600s hint,
+        // never escalation (the deadline trips before the counter ceiling).
+        match result {
+            Ok(done) => assert!(
+                done.from_fallback,
+                "a prompt success here can only be the non-streaming fallback"
+            ),
+            Err(err) => assert!(
+                !matches!(err, StreamHandlerError::RateLimitEscalation { .. }),
+                "timeout should fire before escalation"
+            ),
+        }
     }
 
     #[tokio::test]
@@ -5096,6 +5158,105 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn malformed_event_fails_the_stream_with_attempt_context() {
+        struct GarbageToolInputMock;
+        impl ApiClient for GarbageToolInputMock {
+            fn model(&self) -> String {
+                "garbage-input".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+            {
+                let events = vec![
+                    Ok(StreamEvent::MessageStart(MessageStart {
+                        message: MessageMetadata {
+                            id: "m1".to_string(),
+                            role: "assistant".to_string(),
+                            model: "garbage-input".to_string(),
+                        },
+                    })),
+                    Ok(StreamEvent::PartStart(PartStart {
+                        index: 0,
+                        part: Some(crate::stream::MessagePart::tool_call(
+                            "t1",
+                            "search",
+                            serde_json::json!({}),
+                        )),
+                    })),
+                    Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                        index: 0,
+                        delta: DeltaPart::InputJson {
+                            partial_json: "not json".to_string(),
+                        },
+                    })),
+                    Ok(StreamEvent::PartStop),
+                ];
+                Box::pin(futures::stream::iter(events))
+            }
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Err(ApiError::http("unused")) })
+            }
+        }
+
+        let handler = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+            initial_event_timeout: Duration::from_secs(5),
+            per_event_timeout: Duration::from_secs(5),
+            total_stream_timeout: Duration::from_secs(60),
+            max_consecutive_timeouts: 3,
+            fallback_to_non_streaming: false,
+        });
+        let cancel = Arc::new(CancelSignal::new());
+        let request = crate::api::StreamRequest::new(vec![]);
+        let mut stream = handler.stream_turn(
+            &GarbageToolInputMock,
+            &request,
+            crate::structured::RequestOptions::default(),
+            &cancel,
+        );
+        let mut yielded = 0usize;
+        let mut terminal = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(HandlerEvent::Stream(_)) => yielded += 1,
+                Ok(_) => {}
+                Err(e) => {
+                    terminal = Some(e);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            yielded, 3,
+            "events accepted before the malformed one are yielded first"
+        );
+        match terminal.expect("the malformed event must fail the stream") {
+            StreamHandlerError::StreamFailed(StreamOutcome::InitFailed {
+                attempts,
+                last_error,
+            }) => {
+                assert_eq!(attempts, 1, "the failure names the in-flight attempt");
+                assert!(
+                    last_error.contains("invalid tool input JSON"),
+                    "the accumulator's rejection surfaces verbatim, got: {last_error}"
+                );
+            }
+            other => panic!("expected a StreamFailed InitFailed terminal, got {other:?}"),
+        }
+    }
+
     #[test]
     fn http_429_is_classified_as_rate_limited() {
         let detected =
@@ -5105,6 +5266,32 @@ mod tests {
             detected.kind,
             RateLimitKind::RateLimited,
             "doc: RateLimited is the HTTP 429 Too Many Requests kind"
+        );
+    }
+
+    #[test]
+    fn rate_limit_variant_kind_splits_by_message_status() {
+        let overload =
+            DetectedRateLimit::detect(&ApiError::rate_limited("HTTP 503: unavailable", None))
+                .expect("a 503-shaped RateLimit must be detected");
+        assert!(
+            matches!(overload.kind, RateLimitKind::Overloaded),
+            "503 is the Overloaded kind, got {:?}",
+            overload.kind
+        );
+        let overloaded_529 =
+            DetectedRateLimit::detect(&ApiError::rate_limited("HTTP 529: overloaded", None))
+                .expect("a 529-shaped RateLimit must be detected");
+        assert!(matches!(overloaded_529.kind, RateLimitKind::Overloaded));
+        let quota = DetectedRateLimit::detect(&ApiError::rate_limited("HTTP 429: slow down", None))
+            .expect("a 429-shaped RateLimit must be detected");
+        assert!(matches!(quota.kind, RateLimitKind::RateLimited));
+        let untyped =
+            DetectedRateLimit::detect(&ApiError::rate_limited("provider quota text", None))
+                .expect("a statusless RateLimit must be detected");
+        assert!(
+            matches!(untyped.kind, RateLimitKind::RateLimited),
+            "without an embedded status the default kind is RateLimited"
         );
     }
 
@@ -5397,6 +5584,11 @@ mod tests {
                 self.non_streaming_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async {
+                    // A real fallback request is pending on its first poll,
+                    // unlike an instantly-ready future — the sleep makes the
+                    // test discriminate a fallback killed by the already
+                    // expired streaming deadline.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                     Ok(crate::api::NonStreamingResponse {
                         message: Message::new(
                             crate::message::Role::Assistant,
@@ -5419,6 +5611,7 @@ mod tests {
         let cancel = Arc::new(CancelSignal::new());
         let request = crate::api::StreamRequest::new(vec![]);
         let client = StallThenFallbackMock::counting();
+        let started = Instant::now();
         let mut stream = handler.stream_turn(
             &client,
             &request,
@@ -5435,6 +5628,11 @@ mod tests {
         assert!(
             fell_back,
             "a mid-stream total timeout must reach the non-streaming fallback, not a retry or a bare failure"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "the fallback must complete after the streaming deadline expired, at {started:?}+{elapsed:?}",
+            elapsed = started.elapsed()
         );
         assert_eq!(
             client
@@ -5557,6 +5755,197 @@ mod tests {
                 })) if events_processed >= 2
             ),
             "the terminal error must be the mid-stream TotalTimeout with real progress, got {terminal:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hanging_fallback_is_cut_by_the_fresh_budget() {
+        struct StallWithHangingFallbackMock {
+            stream_calls: std::sync::atomic::AtomicUsize,
+            non_streaming_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl ApiClient for StallWithHangingFallbackMock {
+            fn model(&self) -> String {
+                "stall-hanging-fallback".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+            {
+                self.stream_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let events = vec![Ok(StreamEvent::MessageStart(MessageStart {
+                    message: MessageMetadata {
+                        id: "m1".to_string(),
+                        role: "assistant".to_string(),
+                        model: "stall-hanging-fallback".to_string(),
+                    },
+                }))];
+                Box::pin(futures::stream::iter(events).chain(futures::stream::pending()))
+            }
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                self.non_streaming_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let handler = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+            initial_event_timeout: Duration::from_millis(200),
+            per_event_timeout: Duration::from_millis(200),
+            total_stream_timeout: Duration::from_millis(400),
+            max_consecutive_timeouts: 10,
+            fallback_to_non_streaming: true,
+        });
+        let cancel = Arc::new(CancelSignal::new());
+        let client = StallWithHangingFallbackMock {
+            stream_calls: std::sync::atomic::AtomicUsize::new(0),
+            non_streaming_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let started = Instant::now();
+        let err = terminal_error(&handler, &client, &cancel).await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            client
+                .stream_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the stalled stream costs one attempt"
+        );
+        assert_eq!(
+            client
+                .non_streaming_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the fallback must actually start"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(550),
+            "the fallback must run its fresh initial_event_timeout budget (200ms) after the \
+             streaming deadline (400ms), not be cut instantly by the expired deadline; elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the fresh budget must still bound a hanging fallback; elapsed {elapsed:?}"
+        );
+        match err {
+            StreamHandlerError::FallbackFailed { fallback_error, .. } => assert!(
+                fallback_error.contains("deadline"),
+                "the fresh budget's expiry must be the failure cause: {fallback_error}"
+            ),
+            other => panic!("a hanging fallback must fail as FallbackFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_before_retry_takes_the_fallback() {
+        struct RetryErrorThenFallbackMock {
+            stream_calls: std::sync::atomic::AtomicUsize,
+            non_streaming_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl ApiClient for RetryErrorThenFallbackMock {
+            fn model(&self) -> String {
+                "retry-then-fallback".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+            {
+                self.stream_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(futures::stream::iter(vec![Err(ApiError::http(
+                    "connection reset",
+                ))]))
+            }
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                self.non_streaming_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: Message::new(
+                            crate::message::Role::Assistant,
+                            vec![crate::stream::MessagePart::text("fallback answer")],
+                        ),
+                        stop_reason: StreamStopReason::EndTurn,
+                        usage: None,
+                    })
+                })
+            }
+        }
+
+        let handler = StreamHandler::new()
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_secs(5),
+                per_event_timeout: Duration::from_secs(5),
+                total_stream_timeout: Duration::from_millis(150),
+                max_consecutive_timeouts: 3,
+                fallback_to_non_streaming: true,
+            })
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 1,
+                base_delay_ms: 400,
+                max_delay_ms: 400,
+                ..Default::default()
+            });
+        let cancel = Arc::new(CancelSignal::new());
+        let client = RetryErrorThenFallbackMock {
+            stream_calls: std::sync::atomic::AtomicUsize::new(0),
+            non_streaming_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let request = crate::api::StreamRequest::new(vec![]);
+        let mut stream = handler.stream_turn(
+            &client,
+            &request,
+            crate::structured::RequestOptions::default(),
+            &cancel,
+        );
+        let mut fell_back = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(HandlerEvent::Fallback { .. }) => fell_back = true,
+                Ok(_) => {}
+                Err(e) => panic!("the expiry must take the fallback, got {e:?}"),
+            }
+        }
+        assert!(
+            fell_back,
+            "a deadline expiring before the next retry must reach the non-streaming fallback"
+        );
+        let calls = client
+            .stream_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            calls, 2,
+            "the retried attempt starts and is cut on its first poll — the expiry is terminal"
+        );
+        assert_eq!(
+            client
+                .non_streaming_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the fallback must run exactly once"
         );
     }
 

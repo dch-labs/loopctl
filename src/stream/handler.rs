@@ -1707,7 +1707,6 @@ impl StreamHandler {
 
                 let mut consecutive_timeouts: usize = 0;
                 let mut events_processed: u64 = 0;
-                let stream_start = Instant::now();
 
                 loop {
                     let diagnostics = EventDiagnostics {
@@ -1841,8 +1840,16 @@ impl StreamHandler {
     /// classes (authentication rejections, other 4xx the retryable set
     /// excludes) never enter the retry math.
     ///
-    /// For retryable errors, checks whether the transport-retry budget is
-    /// exhausted:
+    /// An outcome carrying [`StreamOutcome::TotalTimeout`] is equally
+    /// terminal but takes the budget-exhaustion route instead: the total
+    /// budget is already spent, so a second streaming attempt can only fail
+    /// against the same expired deadline — the non-streaming fallback runs
+    /// when one is configured, otherwise the error fails the turn. The
+    /// already-built outcome (real `events_processed`, real
+    /// `has_partial_data`) propagates verbatim.
+    ///
+    /// For other retryable errors, checks whether the transport-retry budget
+    /// is exhausted:
     ///
     /// - **Exhausted + fallback enabled** → [`ErrorAction::TryFallback`]:
     ///   the non-streaming path gets one last chance, carrying the stream
@@ -1863,6 +1870,12 @@ impl StreamHandler {
         total_deadline: Option<Instant>,
     ) -> ErrorAction {
         if !retryable {
+            return ErrorAction::Fail(err);
+        }
+        if matches!(last_outcome, Some(StreamOutcome::TotalTimeout { .. })) {
+            if self.timeout_config.fallback_to_non_streaming {
+                return ErrorAction::TryFallback(last_outcome);
+            }
             return ErrorAction::Fail(err);
         }
         if *transport_attempts >= max_attempts.saturating_sub(1) {
@@ -5329,6 +5342,449 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mid_stream_total_timeout_takes_the_fallback_path() {
+        struct StallThenFallbackMock {
+            stream_calls: std::sync::atomic::AtomicUsize,
+            non_streaming_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl StallThenFallbackMock {
+            fn counting() -> Self {
+                Self {
+                    stream_calls: std::sync::atomic::AtomicUsize::new(0),
+                    non_streaming_calls: std::sync::atomic::AtomicUsize::new(0),
+                }
+            }
+        }
+        impl ApiClient for StallThenFallbackMock {
+            fn model(&self) -> String {
+                "stall-fallback".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+            {
+                self.stream_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let events = vec![
+                    Ok(StreamEvent::MessageStart(MessageStart {
+                        message: MessageMetadata {
+                            id: "m1".to_string(),
+                            role: "assistant".to_string(),
+                            model: "stall-fallback".to_string(),
+                        },
+                    })),
+                    Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                        index: 0,
+                        delta: DeltaPart::Text {
+                            text: "partial".to_string(),
+                        },
+                    })),
+                ];
+                Box::pin(futures::stream::iter(events).chain(futures::stream::pending()))
+            }
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                self.non_streaming_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: Message::new(
+                            crate::message::Role::Assistant,
+                            vec![crate::stream::MessagePart::text("fallback answer")],
+                        ),
+                        stop_reason: StreamStopReason::EndTurn,
+                        usage: None,
+                    })
+                })
+            }
+        }
+
+        let handler = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+            initial_event_timeout: Duration::from_millis(200),
+            per_event_timeout: Duration::from_millis(200),
+            total_stream_timeout: Duration::from_millis(400),
+            max_consecutive_timeouts: 10,
+            fallback_to_non_streaming: true,
+        });
+        let cancel = Arc::new(CancelSignal::new());
+        let request = crate::api::StreamRequest::new(vec![]);
+        let client = StallThenFallbackMock::counting();
+        let mut stream = handler.stream_turn(
+            &client,
+            &request,
+            crate::structured::RequestOptions::default(),
+            &cancel,
+        );
+        let mut fell_back = false;
+        while let Some(item) = stream.next().await {
+            match item.expect("an expired deadline with fallback configured must not error") {
+                HandlerEvent::Fallback { .. } => fell_back = true,
+                HandlerEvent::Stream(_) | HandlerEvent::AttemptReset => {}
+            }
+        }
+        assert!(
+            fell_back,
+            "a mid-stream total timeout must reach the non-streaming fallback, not a retry or a bare failure"
+        );
+        assert_eq!(
+            client
+                .stream_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the expired deadline must cost exactly one streaming attempt"
+        );
+        assert_eq!(
+            client
+                .non_streaming_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the fallback must run exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_total_timeout_is_not_retried() {
+        struct CountingStallMock {
+            stream_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl ApiClient for CountingStallMock {
+            fn model(&self) -> String {
+                "counting-stall".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+            {
+                self.stream_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let events = vec![
+                    Ok(StreamEvent::MessageStart(MessageStart {
+                        message: MessageMetadata {
+                            id: "m1".to_string(),
+                            role: "assistant".to_string(),
+                            model: "counting-stall".to_string(),
+                        },
+                    })),
+                    Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                        index: 0,
+                        delta: DeltaPart::Text {
+                            text: "partial".to_string(),
+                        },
+                    })),
+                ];
+                Box::pin(futures::stream::iter(events).chain(futures::stream::pending()))
+            }
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Err(ApiError::http("unused")) })
+            }
+        }
+
+        let handler = StreamHandler::new()
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_millis(200),
+                per_event_timeout: Duration::from_millis(200),
+                total_stream_timeout: Duration::from_millis(400),
+                max_consecutive_timeouts: 10,
+                fallback_to_non_streaming: false,
+            })
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 3,
+                base_delay_ms: 1,
+                max_delay_ms: 2,
+                ..Default::default()
+            });
+        let cancel = Arc::new(CancelSignal::new());
+        let request = crate::api::StreamRequest::new(vec![]);
+        let client = CountingStallMock {
+            stream_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut stream = handler.stream_turn(
+            &client,
+            &request,
+            crate::structured::RequestOptions::default(),
+            &cancel,
+        );
+        let mut resets = 0usize;
+        let mut terminal = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(HandlerEvent::AttemptReset) => resets += 1,
+                Ok(_) => {}
+                Err(e) => {
+                    terminal = Some(e);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            client
+                .stream_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an expired total deadline must never trigger a second streaming attempt"
+        );
+        assert_eq!(
+            resets, 0,
+            "no AttemptReset may be emitted when the timeout is terminal"
+        );
+        assert!(
+            matches!(
+                terminal,
+                Some(StreamHandlerError::StreamFailed(StreamOutcome::TotalTimeout {
+                    events_processed,
+                    ..
+                })) if events_processed >= 2
+            ),
+            "the terminal error must be the mid-stream TotalTimeout with real progress, got {terminal:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_event_timeout_exhaustion_still_retries() {
+        struct AlwaysStalledMock {
+            stream_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl ApiClient for AlwaysStalledMock {
+            fn model(&self) -> String {
+                "always-stalled".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+            {
+                self.stream_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(futures::stream::pending())
+            }
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Err(ApiError::http("no non-streaming path")) })
+            }
+        }
+
+        let handler = StreamHandler::new()
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_millis(50),
+                per_event_timeout: Duration::from_millis(50),
+                total_stream_timeout: Duration::from_secs(60),
+                max_consecutive_timeouts: 2,
+                fallback_to_non_streaming: false,
+            })
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 1,
+                base_delay_ms: 1,
+                max_delay_ms: 2,
+                ..Default::default()
+            });
+        let cancel = Arc::new(CancelSignal::new());
+        let client = AlwaysStalledMock {
+            stream_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let err = terminal_error(&handler, &client, &cancel).await;
+        assert_eq!(
+            client
+                .stream_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "per-event timeout exhaustion keeps the retry ladder: initial + one retry"
+        );
+        assert!(
+            matches!(
+                err,
+                StreamHandlerError::StreamFailed(StreamOutcome::EventTimeout { .. })
+            ),
+            "the exhausted ladder terminates with the EventTimeout outcome, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_event_stall_still_uses_the_total_deadline() {
+        struct SlowButHealthyStream;
+        impl ApiClient for SlowButHealthyStream {
+            fn model(&self) -> String {
+                "slow-healthy".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+            {
+                Box::pin(async_stream::stream! {
+                    yield Ok(StreamEvent::MessageStart(MessageStart {
+                        message: MessageMetadata {
+                            id: "m1".to_string(),
+                            role: "assistant".to_string(),
+                            model: "slow-healthy".to_string(),
+                        },
+                    }));
+                    for _ in 0..10 {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        yield Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                            index: 0,
+                            delta: DeltaPart::Text { text: "chunk".to_string() },
+                        }));
+                    }
+                    yield Ok(StreamEvent::MessageStop);
+                })
+            }
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Err(ApiError::http("unused")) })
+            }
+        }
+
+        struct FlakyThenOkStream {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl ApiClient for FlakyThenOkStream {
+            fn model(&self) -> String {
+                "flaky-then-ok".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+            {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    return Box::pin(futures::stream::iter(vec![Err(ApiError::http(
+                        "connection reset",
+                    ))]));
+                }
+                Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::MessageStart(MessageStart {
+                        message: MessageMetadata {
+                            id: "m2".to_string(),
+                            role: "assistant".to_string(),
+                            model: "flaky-then-ok".to_string(),
+                        },
+                    })),
+                    Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                        index: 0,
+                        delta: DeltaPart::Text {
+                            text: "recovered".to_string(),
+                        },
+                    })),
+                    Ok(StreamEvent::MessageStop),
+                ]))
+            }
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Err(ApiError::http("unused")) })
+            }
+        }
+
+        let handler = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+            initial_event_timeout: Duration::from_secs(1),
+            per_event_timeout: Duration::from_secs(1),
+            total_stream_timeout: Duration::from_secs(2),
+            max_consecutive_timeouts: 3,
+            fallback_to_non_streaming: false,
+        });
+        let cancel = Arc::new(CancelSignal::new());
+        let request = crate::api::StreamRequest::new(vec![]);
+        {
+            let mut stream = handler.stream_turn(
+                &SlowButHealthyStream,
+                &request,
+                crate::structured::RequestOptions::default(),
+                &cancel,
+            );
+            let mut stopped = false;
+            while let Some(item) = stream.next().await {
+                if let HandlerEvent::Stream(StreamEvent::MessageStop) =
+                    item.expect("a healthy stream within both budgets must not error")
+                {
+                    stopped = true;
+                }
+            }
+            assert!(
+                stopped,
+                "a stream producing events under the total budget must complete, not be cut"
+            );
+        }
+
+        let client = FlakyThenOkStream {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let handler = handler.with_retry_config(StreamRetryConfig {
+            max_retries: 1,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            ..Default::default()
+        });
+        let mut stream = handler.stream_turn(
+            &client,
+            &request,
+            crate::structured::RequestOptions::default(),
+            &cancel,
+        );
+        let mut stopped = false;
+        while let Some(item) = stream.next().await {
+            if let HandlerEvent::Stream(StreamEvent::MessageStop) =
+                item.expect("a retried-then-successful stream must not error")
+            {
+                stopped = true;
+            }
+        }
+        assert!(stopped, "the recovered attempt must complete the turn");
+        assert_eq!(
+            client.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly one retry, then success"
+        );
+    }
+
+    #[tokio::test]
     async fn cancelled_stream_is_not_retried() {
         let client = StalledStreamClient {
             stream_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -5365,5 +5821,199 @@ mod tests {
             matches!(err, StreamHandlerError::Cancelled),
             "the terminal error must be the cancellation, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_total_timeout_reports_real_progress() {
+        struct StallAfterEventsMock;
+
+        impl ApiClient for StallAfterEventsMock {
+            fn model(&self) -> String {
+                "stall".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                let events = vec![
+                    Ok(StreamEvent::MessageStart(MessageStart {
+                        message: MessageMetadata {
+                            id: "m1".to_string(),
+                            role: "assistant".to_string(),
+                            model: "stall".to_string(),
+                        },
+                    })),
+                    Ok(StreamEvent::PartStart(PartStart {
+                        index: 0,
+                        part: Some(crate::stream::MessagePart::text("")),
+                    })),
+                    Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                        index: 0,
+                        delta: DeltaPart::Text {
+                            text: "hi".to_string(),
+                        },
+                    })),
+                ];
+                Box::pin(futures::stream::iter(events).chain(futures::stream::pending()))
+            }
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Err(ApiError::http_with_status(500, "no non-streaming")) })
+            }
+        }
+
+        let handler = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+            initial_event_timeout: Duration::from_millis(100),
+            per_event_timeout: Duration::from_millis(100),
+            total_stream_timeout: Duration::from_millis(500),
+            max_consecutive_timeouts: 10,
+            fallback_to_non_streaming: false,
+        });
+        let cancel = Arc::new(CancelSignal::new());
+        let req = crate::api::StreamRequest::new(vec![]);
+        let mut stream = handler.stream_turn(
+            &StallAfterEventsMock,
+            &req,
+            crate::structured::RequestOptions::default(),
+            &cancel,
+        );
+        let mut streamed = 0usize;
+        let mut terminal = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(HandlerEvent::Stream(_)) => streamed += 1,
+                Err(e) => {
+                    terminal = Some(e);
+                    break;
+                }
+                Ok(_) => {}
+            }
+        }
+        assert!(streamed >= 3, "the stream processed real events first");
+        match terminal.expect("stream must terminate with an error") {
+            StreamHandlerError::StreamFailed(StreamOutcome::TotalTimeout {
+                events_processed,
+                ..
+            }) => assert!(
+                events_processed >= 3,
+                "doc: events_processed counts accepted events before the deadline — zero implies an immediate stall"
+            ),
+            other => panic!(
+                "a mid-stream deadline is a StreamFailed TotalTimeout, got {other:?} after {streamed} events"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn total_timeout_duration_covers_retried_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FailThenStallMock {
+            calls: AtomicUsize,
+        }
+
+        impl ApiClient for FailThenStallMock {
+            fn model(&self) -> String {
+                "flaky".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>,
+            > {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    let opening = futures::stream::once(async {
+                        Ok(StreamEvent::MessageStart(MessageStart {
+                            message: MessageMetadata {
+                                id: "m1".to_string(),
+                                role: "assistant".to_string(),
+                                model: "flaky".to_string(),
+                            },
+                        }))
+                    });
+                    let kept_alive = opening.chain(futures::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                            index: 0,
+                            delta: DeltaPart::Text {
+                                text: "chunk".to_string(),
+                            },
+                        }))
+                    }));
+                    Box::pin(kept_alive.chain(futures::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                        Err(ApiError::http_with_status(500, "transient boom"))
+                    })))
+                } else {
+                    Box::pin(futures::stream::pending())
+                }
+            }
+            fn create_message(
+                &self,
+                _request: &crate::api::StreamRequest,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Err(ApiError::http_with_status(500, "no non-streaming")) })
+            }
+        }
+
+        let handler = StreamHandler::new()
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_millis(500),
+                per_event_timeout: Duration::from_millis(500),
+                total_stream_timeout: Duration::from_secs(2),
+                max_consecutive_timeouts: 10,
+                fallback_to_non_streaming: false,
+            })
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 1,
+                ..Default::default()
+            });
+        let client = FailThenStallMock {
+            calls: AtomicUsize::new(0),
+        };
+        let cancel = Arc::new(CancelSignal::new());
+        let req = crate::api::StreamRequest::new(vec![]);
+        let mut stream = handler.stream_turn(
+            &client,
+            &req,
+            crate::structured::RequestOptions::default(),
+            &cancel,
+        );
+        let mut terminal = None;
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                terminal = Some(e);
+                break;
+            }
+        }
+        match terminal.expect("stream must terminate with an error") {
+            StreamHandlerError::StreamFailed(StreamOutcome::TotalTimeout { duration, .. }) => {
+                assert!(
+                    duration >= Duration::from_millis(1500),
+                    "doc: duration is the full stream lifetime, approximately the configured total (2s); got {duration:?}"
+                );
+            }
+            other => panic!("expected StreamFailed TotalTimeout, got {other:?}"),
+        }
     }
 }

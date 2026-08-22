@@ -235,7 +235,7 @@ impl GeminiClient {
         body: &Value,
     ) -> Result<reqwest::Response, ApiError> {
         let mut key_header = reqwest::header::HeaderValue::from_str(api_key)
-            .map_err(|e| ApiError::http(format!("invalid api key header: {e}")))?;
+            .map_err(|e| ApiError::auth_invalid_key(format!("invalid api key header: {e}")))?;
         key_header.set_sensitive(true);
         super::post_json_checked(
             http,

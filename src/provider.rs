@@ -162,12 +162,14 @@ pub(super) async fn read_error_body(resp: reqwest::Response) -> String {
         && let Some(chunk) = stream.next().await
     {
         match chunk {
-            Ok(bytes) => buf.extend_from_slice(&bytes),
+            Ok(bytes) => {
+                let remaining = MAX_ERROR_BODY.saturating_sub(buf.len());
+                buf.extend_from_slice(bytes.get(..remaining).unwrap_or(&bytes));
+            }
             Err(_) => break,
         }
     }
-    let capped = buf.get(..MAX_ERROR_BODY).unwrap_or(&buf);
-    String::from_utf8_lossy(capped).into_owned()
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Classify a non-success HTTP response into the matching [`ApiError`]
@@ -1209,6 +1211,55 @@ mod tests {
         let bytes = read_bounded_body(resp).await.expect("small body must pass");
         assert_eq!(bytes.as_ref(), body.as_slice());
         handle.await.unwrap();
+    }
+
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+    #[tokio::test]
+    async fn read_error_body_caps_chunked_oversized_response() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let written = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = written.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            drop(sock.read(&mut buf).await);
+            let head = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            let chunk = vec![b'x'; 16384];
+            for _ in 0..16 {
+                // Yield between chunks so the client task gets scheduled and
+                // its early abort can interrupt the transfer (see the
+                // Content-Length variant above for the buffering rationale).
+                tokio::task::yield_now().await;
+                if sock.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                counter.fetch_add(chunk.len(), Ordering::SeqCst);
+                drop(sock.flush().await);
+            }
+        });
+
+        let resp = get_response(&format!("http://{addr}")).await;
+        let text = read_error_body(resp).await;
+        server.await.unwrap();
+        assert_eq!(
+            text.len(),
+            MAX_ERROR_BODY,
+            "a chunked oversized error body must retain exactly the capped prefix"
+        );
+        assert!(
+            text.chars().all(|c| c == 'x'),
+            "the retained prefix must be the body's leading bytes"
+        );
+        let total = written.load(Ordering::SeqCst);
+        assert!(
+            total < 16 * 16384,
+            "the read must abort the transfer short of the full 256 KiB body; the server wrote {total} bytes"
+        );
     }
 
     #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]

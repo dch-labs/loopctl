@@ -246,7 +246,7 @@ impl OpenAiClient {
         body: &Value,
     ) -> Result<reqwest::Response, ApiError> {
         let mut bearer = reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
-            .map_err(|e| ApiError::http(format!("invalid bearer token: {e}")))?;
+            .map_err(|e| ApiError::auth_invalid_key(format!("invalid bearer token: {e}")))?;
         bearer.set_sensitive(true);
         super::post_json_checked(http, url, &[(reqwest::header::AUTHORIZATION, bearer)], body).await
     }

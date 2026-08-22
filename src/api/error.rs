@@ -510,19 +510,11 @@ impl ApiError {
                 }
             }
             Self::RateLimit { .. } => ErrorCode::ApiRateLimited,
-            Self::Http(msg) => {
-                if let Some(rest) = msg.strip_prefix("HTTP ")
-                    && let Some(colon) = rest.find(':')
-                    && let Ok(status) = rest[..colon].parse::<u16>()
-                {
-                    return if status >= 500 {
-                        ErrorCode::HttpResponseError
-                    } else {
-                        ErrorCode::HttpRequestError
-                    };
-                }
-                ErrorCode::HttpConnectionError
-            }
+            Self::Http(msg) => match http_status_from_message(msg) {
+                Some(status) if status >= 500 => ErrorCode::HttpResponseError,
+                Some(_) => ErrorCode::HttpRequestError,
+                None => ErrorCode::HttpConnectionError,
+            },
             Self::Json(_) => ErrorCode::JsonParseError,
             Self::Io(err) => {
                 use std::io::ErrorKind;

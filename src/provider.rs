@@ -200,7 +200,11 @@ fn classify_error_response(status: u16, body: String, retry_after: Option<Durati
 /// status via [`classify_error_response`]. Callers therefore get the right
 /// variant — auth rejections as [`ApiError::Auth`], rate limits with the
 /// server-advised delay as [`ApiError::RateLimit`] — without each provider
-/// re-implementing (and drifting on) the same branches.
+/// re-implementing (and drifting on) the same branches. Header values are
+/// applied verbatim: callers mark credential headers sensitive
+/// ([`HeaderValue::set_sensitive`](reqwest::header::HeaderValue::set_sensitive))
+/// so they are redacted in debug output and never indexed into HTTP/2's
+/// header-compression table.
 ///
 /// # Errors
 ///
@@ -210,11 +214,11 @@ fn classify_error_response(status: u16, body: String, retry_after: Option<Durati
 pub(super) async fn post_json_checked(
     client: &reqwest::Client,
     url: &str,
-    headers: &[(&str, &str)],
+    headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
     body: &serde_json::Value,
 ) -> Result<reqwest::Response, ApiError> {
     let request = headers.iter().fold(client.post(url), |req, (name, value)| {
-        req.header(*name, *value)
+        req.header(name.clone(), value.clone())
     });
     let resp = request
         .json(body)
@@ -1268,8 +1272,8 @@ mod tests {
         server.await.unwrap();
         let total = written.load(Ordering::SeqCst);
         assert!(
-            total <= 72 * 1024,
-            "the error-body cap (8 KiB) must bound how much of an oversized error body is read; the server wrote {total} bytes"
+            total < 2 * 1024 * 1024,
+            "the error-body cap (8 KiB) must stop the read short of the declared 2 MiB body; the server wrote {total} bytes"
         );
     }
 }

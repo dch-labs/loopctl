@@ -5251,4 +5251,119 @@ mod tests {
             "with the fallback disabled the exhausted ladder fails the stream, got {err:?}"
         );
     }
+
+    #[tokio::test]
+    async fn not_found_stream_errors_are_not_retried() {
+        let client =
+            FailingStreamClient::failing_with(|| ApiError::http_with_status(404, "unknown model"));
+        let handler = StreamHandler::new()
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 3,
+                base_delay_ms: 1,
+                max_delay_ms: 2,
+                ..Default::default()
+            })
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_secs(5),
+                per_event_timeout: Duration::from_secs(5),
+                total_stream_timeout: Duration::from_secs(60),
+                max_consecutive_timeouts: 3,
+                fallback_to_non_streaming: true,
+            });
+        let cancel = Arc::new(CancelSignal::new());
+        let err = terminal_error(&handler, &client, &cancel).await;
+        assert_eq!(
+            client.stream_calls(),
+            1,
+            "a permanent 404 must cost exactly one streaming attempt"
+        );
+        assert_eq!(
+            client.non_streaming_calls(),
+            0,
+            "a permanent 404 must not get a non-streaming fallback attempt"
+        );
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::InitFailed { last_error, .. }) => {
+                assert!(
+                    last_error.contains("HTTP 404"),
+                    "the permanent status must surface verbatim, got: {last_error}"
+                );
+            }
+            other => panic!("the 404 must fail the stream, got {other:?}"),
+        }
+    }
+
+    /// A stream client that accepts the request and then never produces an
+    /// event, counting calls so the cancellation contract can assert the
+    /// handler never re-entered the retry ladder.
+    struct StalledStreamClient {
+        stream_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ApiClient for StalledStreamClient {
+        fn model(&self) -> String {
+            "stalled".to_string()
+        }
+
+        fn stream_messages(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+            self.stream_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(futures::stream::pending())
+        }
+
+        fn create_message(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Err(ApiError::http("no non-streaming path")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_is_not_retried() {
+        let client = StalledStreamClient {
+            stream_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let handler = StreamHandler::new()
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 3,
+                base_delay_ms: 1,
+                max_delay_ms: 2,
+                ..Default::default()
+            })
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_secs(5),
+                per_event_timeout: Duration::from_secs(5),
+                total_stream_timeout: Duration::from_secs(60),
+                max_consecutive_timeouts: 3,
+                fallback_to_non_streaming: true,
+            });
+        let cancel = Arc::new(CancelSignal::new());
+        let cancel_for_task = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancel_for_task.cancel();
+        });
+        let err = terminal_error(&handler, &client, &cancel).await;
+        assert_eq!(
+            client
+                .stream_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancellation mid-stream must not re-enter the retry ladder"
+        );
+        assert!(
+            matches!(err, StreamHandlerError::Cancelled),
+            "the terminal error must be the cancellation, got {err:?}"
+        );
+    }
 }

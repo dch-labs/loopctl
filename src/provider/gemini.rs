@@ -234,7 +234,19 @@ impl GeminiClient {
         api_key: &str,
         body: &Value,
     ) -> Result<reqwest::Response, ApiError> {
-        super::post_json_checked(http, url, &[("x-goog-api-key", api_key)], body).await
+        let mut key_header = reqwest::header::HeaderValue::from_str(api_key)
+            .map_err(|e| ApiError::http(format!("invalid api key header: {e}")))?;
+        key_header.set_sensitive(true);
+        super::post_json_checked(
+            http,
+            url,
+            &[(
+                reqwest::header::HeaderName::from_static("x-goog-api-key"),
+                key_header,
+            )],
+            body,
+        )
+        .await
     }
 }
 
@@ -287,39 +299,7 @@ impl ApiClient for GeminiClient {
         &self,
         request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        let system = request.system.clone();
-        let tools = request.tools.clone();
-        let body = build_request_body(
-            &request.messages,
-            system.as_deref(),
-            tools.as_deref(),
-            None,
-            &ToolConstraint::None,
-            self.include_thoughts,
-        );
-        let url = self.stream_url();
-        let http = self.http.clone();
-        let api_key = self.api_key.clone();
-
-        Box::pin(async_stream::try_stream! {
-            let resp = Self::post_content(&http, &url, &api_key, &body).await?;
-            let mut sse = SseReader::from_response(resp);
-            let mut emitter = StreamEmitter::default();
-
-            while let Some(data) = sse.next_gemini_data().await? {
-                emitter.process_chunk(&data);
-                if emitter.error_recorded() {
-                    break;
-                }
-                for ev in emitter.drain() {
-                    yield ev;
-                }
-            }
-
-            for ev in emitter.finish()? {
-                yield ev;
-            }
-        })
+        self.stream_messages_with_options(request, crate::structured::RequestOptions::default())
     }
 
     fn create_message(

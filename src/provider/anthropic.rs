@@ -159,12 +159,21 @@ impl AnthropicClient {
         api_key: &str,
         body: &Value,
     ) -> Result<reqwest::Response, ApiError> {
+        let mut key_header = reqwest::header::HeaderValue::from_str(api_key)
+            .map_err(|e| ApiError::http(format!("invalid api key header: {e}")))?;
+        key_header.set_sensitive(true);
         super::post_json_checked(
             http,
             url,
             &[
-                ("x-api-key", api_key),
-                ("anthropic-version", ANTHROPIC_VERSION),
+                (
+                    reqwest::header::HeaderName::from_static("x-api-key"),
+                    key_header,
+                ),
+                (
+                    reqwest::header::HeaderName::from_static("anthropic-version"),
+                    reqwest::header::HeaderValue::from_static(ANTHROPIC_VERSION),
+                ),
             ],
             body,
         )

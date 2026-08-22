@@ -42,7 +42,6 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const SSE_EVENT_PREFIX: &str = "event: ";
 const SSE_DATA_PREFIX: &str = "data: ";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
-const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
 
 /// An Anthropic Claude chat client with streaming support.
 ///
@@ -146,40 +145,30 @@ impl AnthropicClient {
     /// [`stream_messages_with_options`](ApiClient::stream_messages_with_options),
     /// and [`create_message_with_options`](ApiClient::create_message_with_options).
     /// Sends the JSON body with `x-api-key` and `anthropic-version` headers.
-    /// On a non-success status, reads the error body (capped at
-    /// `MAX_ERROR_BODY` bytes) and returns it as an [`ApiError`].
+    /// Delegates to [`post_json_checked`](super::post_json_checked), which
+    /// classifies non-success responses (auth rejections, rate limits with
+    /// their server-advised delay) into structured [`ApiError`] variants.
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError::http`] if the HTTP request fails, or
-    /// [`ApiError::http_with_status`] if the server responds with a
-    /// non-success status code.
+    /// Returns [`ApiError::http`] if the HTTP request fails, or the
+    /// classified variant for a non-success status code.
     async fn post_messages(
         http: &reqwest::Client,
         url: &str,
         api_key: &str,
         body: &Value,
     ) -> Result<reqwest::Response, ApiError> {
-        let resp = http
-            .post(url)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| ApiError::http(e.to_string()))?;
-        let status = resp.status();
-        if status.is_success() {
-            Ok(resp)
-        } else {
-            // Cap the error body to prevent OOM from oversized error responses.
-            let bytes = resp.bytes().await.unwrap_or_default();
-            let text = match bytes.get(..MAX_ERROR_BODY) {
-                Some(truncated) => String::from_utf8_lossy(truncated).into_owned(),
-                None => String::from_utf8_lossy(&bytes).into_owned(),
-            };
-            Err(ApiError::http_with_status(status.as_u16(), text))
-        }
+        super::post_json_checked(
+            http,
+            url,
+            &[
+                ("x-api-key", api_key),
+                ("anthropic-version", ANTHROPIC_VERSION),
+            ],
+            body,
+        )
+        .await
     }
 
     /// Build the full URL for the Anthropic Messages API endpoint.
@@ -322,12 +311,15 @@ impl ApiClient for AnthropicClient {
 
             while let Some((event_type, data)) = sse.next_event().await? {
                 emitter.process_event(&event_type, data);
+                if emitter.error_recorded() {
+                    break;
+                }
                 for ev in emitter.drain() {
                     yield ev;
                 }
             }
 
-            for ev in emitter.finish() {
+            for ev in emitter.finish()? {
                 yield ev;
             }
         })
@@ -951,6 +943,17 @@ struct StreamEmitter {
     /// after the stream already terminated.
     finished: bool,
 
+    /// A terminal error delivered as an `event: error` SSE event, if any.
+    ///
+    /// Anthropic reports mid-stream failures (an `overloaded_error` after
+    /// generation began, for example) as error events rather than closing
+    /// the HTTP stream with a status. Recorded here so
+    /// [`finish`](Self::finish) terminates the stream with the error
+    /// instead of the synthetic clean [`StreamEvent::MessageStop`] —
+    /// without it, a consumer could not distinguish an errored stream from
+    /// a healthy truncated one. First error wins; later ones are ignored.
+    error: Option<ApiError>,
+
     /// Buffered [`StreamEvent`]s waiting to be yielded to the consumer.
     ///
     /// All `on_*` handlers push onto this queue; the stream loop drains it
@@ -964,10 +967,12 @@ impl StreamEmitter {
     ///
     /// `event_type` is the value of the Anthropic `event:` line
     /// (`message_start`, `content_block_start`, `content_block_delta`,
-    /// `content_block_stop`, `message_delta`, `message_stop`); `data` is
-    /// the parsed JSON payload of the paired `data:` line, or `None` when
-    /// the payload was absent or failed to parse. Unknown event types are
-    /// ignored. Any events produced are appended to the pending queue.
+    /// `content_block_stop`, `message_delta`, `message_stop`, `error`);
+    /// `data` is the parsed JSON payload of the paired `data:` line, or
+    /// `None` when the payload was absent or failed to parse. Unknown event
+    /// types are ignored. Any events produced are appended to the pending
+    /// queue; an `error` event records the terminal error that
+    /// [`finish`](Self::finish) surfaces.
     fn process_event(&mut self, event_type: &str, data: Option<Value>) {
         match event_type {
             "message_start" => self.on_message_start(data.as_ref()),
@@ -976,6 +981,7 @@ impl StreamEmitter {
             "content_block_stop" => self.on_block_stop(data),
             "message_delta" => self.on_message_delta(data),
             "message_stop" => self.on_message_stop(),
+            "error" => self.on_error(data.as_ref()),
             _ => {}
         }
     }
@@ -1260,21 +1266,68 @@ impl StreamEmitter {
         self.push(StreamEvent::MessageStop);
     }
 
+    /// Handle a terminal `error` event.
+    ///
+    /// Reads `/error/type` and `/error/message` (Anthropic's error payload,
+    /// e.g. `overloaded_error` / `"Overloaded"`) into an
+    /// [`ApiError::api`] recording that [`finish`](Self::finish) surfaces as
+    /// the stream's terminal error. Missing fields fall back to generic
+    /// wording so a malformed payload still terminates with an error rather
+    /// than being dropped. The first error wins; later ones are ignored.
+    fn on_error(&mut self, data: Option<&Value>) {
+        if self.error.is_some() {
+            return;
+        }
+        let (kind, message) = match data {
+            Some(v) => (
+                v.pointer("/error/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error")
+                    .to_string(),
+                v.pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stream failed")
+                    .to_string(),
+            ),
+            None => ("error".to_string(), "stream failed".to_string()),
+        };
+        self.error = Some(ApiError::api(format!("{kind}: {message}")));
+    }
+
     /// Finalize the stream and return any remaining events.
     ///
-    /// Drains the pending queue, then appends a single
-    /// [`StreamEvent::MessageStop`] when the stream was started but no
-    /// `message_stop` event has already emitted one (tracked by the
-    /// `finished` flag). This covers streams that end without an explicit
-    /// terminal event; when `message_stop` was processed, the synthetic
-    /// terminal is suppressed so the consumer sees exactly one
+    /// When an `event: error` was recorded, terminates with that error and
+    /// emits nothing further — no synthetic [`StreamEvent::MessageStop`], so
+    /// the failure cannot masquerade as a clean stop. Otherwise drains the
+    /// pending queue and appends a single `MessageStop` when the stream was
+    /// started but no `message_stop` event has already emitted one (tracked
+    /// by the `finished` flag). This covers streams that end without an
+    /// explicit terminal event; when `message_stop` was processed, the
+    /// synthetic terminal is suppressed so the consumer sees exactly one
     /// `MessageStop`.
-    fn finish(&mut self) -> Vec<StreamEvent> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the recorded terminal error, if an `event: error` arrived
+    /// during the stream.
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
+        if let Some(err) = self.error.take() {
+            return Err(err);
+        }
         let mut out = self.drain();
         if self.started && !self.finished {
             out.push(StreamEvent::MessageStop);
         }
-        out
+        Ok(out)
+    }
+
+    /// Whether a terminal `event: error` has been recorded.
+    ///
+    /// The stream loop checks this after each SSE event to stop reading —
+    /// Anthropic may hold the errored connection open, and waiting for its
+    /// EOF would delay the error the emitter already knows about.
+    fn error_recorded(&self) -> bool {
+        self.error.is_some()
     }
 
     /// Drain all pending events.
@@ -1807,7 +1860,7 @@ mod tests {
                 .any(|e| matches!(e, StreamEvent::MessageStop))
         );
 
-        let after_finish = em.finish();
+        let after_finish = em.finish().expect("no recorded error");
         assert!(
             after_finish
                 .iter()
@@ -1822,7 +1875,7 @@ mod tests {
         em.started = true;
         em.finished = false;
 
-        let events = em.finish();
+        let events = em.finish().expect("no recorded error");
         assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop)));
     }
 
@@ -1832,8 +1885,57 @@ mod tests {
         em.started = true;
         em.finished = true;
 
-        let events = em.finish();
+        let events = em.finish().expect("no recorded error");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn midstream_error_event_surfaces_as_an_error() {
+        let mut em = StreamEmitter::default();
+        em.process_event("message_start", Some(serde_json::json!({})));
+        em.process_event(
+            "content_block_start",
+            Some(serde_json::json!({
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            })),
+        );
+        em.process_event(
+            "content_block_delta",
+            Some(serde_json::json!({
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "partial"}
+            })),
+        );
+        em.process_event(
+            "error",
+            Some(serde_json::json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "Overloaded"}
+            })),
+        );
+        assert!(
+            em.error_recorded(),
+            "an event: error mid-stream must be recorded"
+        );
+        let drained = em.drain();
+        assert!(
+            drained
+                .iter()
+                .all(|e| !matches!(e, StreamEvent::MessageStop)),
+            "no clean MessageStop may be emitted alongside the failure: {drained:?}"
+        );
+        let err = em
+            .finish()
+            .expect_err("finish must surface the recorded error");
+        assert!(
+            err.to_string().contains("overloaded_error"),
+            "the terminal error must name the provider's type: {err}"
+        );
+        assert!(
+            err.to_string().contains("Overloaded"),
+            "the terminal error must carry the provider's message: {err}"
+        );
     }
 
     #[test]

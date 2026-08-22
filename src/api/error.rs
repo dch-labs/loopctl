@@ -155,8 +155,10 @@ pub enum ErrorCode {
     /// The request was malformed or could not be serialised before
     /// reaching the server. Maps to **1201**.
     ///
-    /// This code is retryable — a resend may succeed if the root cause
-    /// was a transient serialisation glitch.
+    /// Most statuses mapping here are permanent client errors — a 4xx other
+    /// than 408/429 cannot succeed on resend. [`ApiError::is_retryable`]
+    /// distinguishes by the embedded status rather than trusting this code
+    /// alone.
     HttpRequestError = 1201,
 
     /// An HTTP response error (non-success status).
@@ -613,12 +615,25 @@ impl ApiError {
 
     /// Check whether this error is safe to retry.
     ///
-    /// Returns `true` for transient failures where a retry (possibly
-    /// with back-off) has a reasonable chance of succeeding:
+    /// Returns `true` only for failure classes where a retry has a
+    /// reasonable chance of succeeding:
     ///
-    /// [`ErrorCode::ApiRequestFailed`], [`ErrorCode::ApiRateLimited`],
-    /// [`ErrorCode::ApiTimeout`], [`ErrorCode::HttpConnectionError`],
-    /// [`ErrorCode::HttpRequestError`], and [`ErrorCode::HttpResponseError`].
+    /// - 5xx server errors ([`ErrorCode::HttpResponseError`]),
+    /// - 408 request timeouts and generic API timeouts
+    ///   ([`ErrorCode::ApiTimeout`]),
+    /// - rate-limit responses — HTTP 429, 503, 529, carried by the
+    ///   structured [`RateLimit`](Self::RateLimit) variant or an
+    ///   `Http` message ([`ErrorCode::ApiRateLimited`]),
+    /// - connection-level transport failures — DNS, TCP, TLS
+    ///   ([`ErrorCode::HttpConnectionError`]), and interrupted SSE
+    ///   streams ([`ErrorCode::ApiStreamError`]),
+    /// - generic retryable API request failures
+    ///   ([`ErrorCode::ApiRequestFailed`]).
+    ///
+    /// Every other 4xx is permanent: authentication rejections (401/403),
+    /// malformed requests, unknown endpoints and models. Retrying those
+    /// cannot succeed — callers should fail fast instead of spending the
+    /// retry ladder on them.
     ///
     /// # Example
     ///
@@ -629,18 +644,27 @@ impl ApiError {
     ///
     /// let err = ApiError::auth("bad key");
     /// assert!(!err.is_retryable());
+    ///
+    /// let err = ApiError::http_with_status(404, "unknown model");
+    /// assert!(!err.is_retryable());
+    ///
+    /// let err = ApiError::http_with_status(503, "unavailable");
+    /// assert!(err.is_retryable());
     /// ```
     #[must_use]
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self.code(),
-            ErrorCode::ApiRequestFailed
-                | ErrorCode::ApiRateLimited
-                | ErrorCode::ApiTimeout
-                | ErrorCode::HttpConnectionError
-                | ErrorCode::HttpRequestError
-                | ErrorCode::HttpResponseError
-        )
+        match self {
+            Self::Http(msg) => http_status_is_retryable(msg),
+            _ => matches!(
+                self.code(),
+                ErrorCode::ApiRequestFailed
+                    | ErrorCode::ApiRateLimited
+                    | ErrorCode::ApiTimeout
+                    | ErrorCode::ApiStreamError
+                    | ErrorCode::HttpConnectionError
+                    | ErrorCode::HttpResponseError
+            ),
+        }
     }
 
     /// `true` for rate-limit-class errors.
@@ -798,8 +822,16 @@ impl ApiError {
     /// inspects the embedded status to select the appropriate [`ErrorCode`]:
     ///
     /// - `5xx` → [`ErrorCode::HttpResponseError`] (server error, retryable)
-    /// - `4xx` → [`ErrorCode::HttpRequestError`] (client error, retryable)
+    /// - `4xx` → [`ErrorCode::HttpRequestError`] (client error; retryable
+    ///   only for 408/429 — see [`ApiError::is_retryable`])
     /// - Other / unparseable → [`ErrorCode::HttpConnectionError`]
+    ///
+    /// Provider code holding the actual HTTP response should prefer the
+    /// classified constructors — [`auth_invalid_key`](Self::auth_invalid_key)
+    /// for 401/403 and [`rate_limited`](Self::rate_limited) for
+    /// 429/503/529 — so the status semantics survive in the variant instead
+    /// of living only in this message format. Reserve this constructor for
+    /// statuses with no dedicated variant and for hand-built errors.
     ///
     /// # Example
     ///
@@ -1133,18 +1165,75 @@ impl ApiError {
 }
 
 /// Inspect an `Http(String)` body (formatted `"HTTP {status}: ..."`) and return
+/// the embedded status code.
+///
+/// Returns `None` for messages without the `"HTTP {status}:"` prefix
+/// (connection-level failures carry free-form text) and for malformed or
+/// non-numeric statuses. The single extraction point behind
+/// [`http_status_is_overload`] and the retryability classification on
+/// [`ApiError::is_retryable`].
+pub(crate) fn http_status_from_message(msg: &str) -> Option<u16> {
+    let rest = msg.strip_prefix("HTTP ")?;
+    let colon = rest.find(':')?;
+    rest[..colon].parse::<u16>().ok()
+}
+
+/// Inspect an `Http(String)` body (formatted `"HTTP {status}: ..."`) and return
 /// `true` when the status is a rate-limit-adjacent overload: 429, 503, or 529.
 ///
 /// Returns `false` for any other status, malformed prefixes, or other error
 /// shapes.
 pub(crate) fn http_status_is_overload(msg: &str) -> bool {
-    let Some(rest) = msg.strip_prefix("HTTP ") else {
-        return false;
-    };
-    let Some(colon) = rest.find(':') else {
-        return false;
-    };
-    matches!(rest[..colon].parse::<u16>().ok(), Some(429 | 503 | 529))
+    matches!(http_status_from_message(msg), Some(429 | 503 | 529))
+}
+
+/// Classify an `Http(String)` message against the retryable status set.
+///
+/// Connection-level messages (no `"HTTP {status}:"` prefix) are retryable —
+/// DNS, TCP, and TLS failures are usually transient. A carried status is
+/// retryable exactly when it is a 5xx server error, a 408 request timeout,
+/// or a 429 rate limit; every other 4xx is permanent.
+fn http_status_is_retryable(msg: &str) -> bool {
+    match http_status_from_message(msg) {
+        None => true,
+        Some(status) => status >= 500 || matches!(status, 408 | 429),
+    }
+}
+
+/// Parse an HTTP `Retry-After` header value into a [`Duration`](std::time::Duration).
+///
+/// Accepts the two RFC 9110 forms:
+/// - **delta-seconds** (`"12"`) → `Duration::from_secs(12)`. Huge values are
+///   accepted as-is rather than overflowing; callers clamp via their own
+///   back-off ceilings.
+/// - **HTTP-date** (`"Wed, 21 Oct 2026 07:28:00 GMT"`) → `max(ZERO, date − now)`.
+///   Only available when the `providers` feature is enabled (the `httpdate`
+///   crate lives there); returns `None` otherwise.
+///
+/// Returns `None` for anything unparseable. This is the single parser shared
+/// by the provider clients (which read the header while the response is in
+/// hand) and the stream handler's detection for hand-built errors.
+#[cfg(any(feature = "streaming", feature = "providers"))]
+pub(crate) fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(std::time::Duration::from_secs(secs));
+    }
+    #[cfg(feature = "providers")]
+    {
+        if let Ok(target) = httpdate::parse_http_date(trimmed) {
+            let now = std::time::SystemTime::now();
+            return now
+                .duration_since(target)
+                .ok()
+                .map(|_| std::time::Duration::ZERO)
+                .or_else(|| target.duration_since(now).ok());
+        }
+    }
+    None
 }
 
 /// Result type for operations that can fail with [`ApiError`].
@@ -1313,11 +1402,70 @@ mod tests {
         assert!(ApiError::api_rate_limited().is_retryable());
         assert!(ApiError::rate_limited("too many requests", None).is_retryable());
         assert!(ApiError::http("connection failed").is_retryable());
-        // HttpResponseError (5xx) and HttpRequestError (4xx) are retryable
+        // HttpResponseError (5xx) and rate-limit statuses are retryable
         assert!(ApiError::http_with_status(503, "unavailable").is_retryable());
+        assert!(ApiError::http_with_status(500, "server error").is_retryable());
         assert!(ApiError::http_with_status(429, "too many requests").is_retryable());
+        assert!(ApiError::http_with_status(408, "request timeout").is_retryable());
+        // Permanent 4xx statuses are not retryable
+        assert!(!ApiError::http_with_status(400, "bad request").is_retryable());
+        assert!(!ApiError::http_with_status(404, "not found").is_retryable());
         assert!(!ApiError::auth("invalid key").is_retryable());
         assert!(!ApiError::tool("not found").is_retryable());
+    }
+
+    #[test]
+    fn http_retryability_set_is_explicit() {
+        let retryable = [429u16, 500, 502, 503, 504, 529, 408];
+        for status in retryable {
+            assert!(
+                ApiError::http_with_status(status, "classified").is_retryable(),
+                "HTTP {status} belongs to the retryable set"
+            );
+        }
+        let permanent = [400u16, 401, 403, 404, 405, 422, 451];
+        for status in permanent {
+            assert!(
+                !ApiError::http_with_status(status, "classified").is_retryable(),
+                "HTTP {status} is permanent — outside the retryable set"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(any(feature = "streaming", feature = "providers"))]
+    fn parse_retry_after_delta_seconds() {
+        assert_eq!(
+            parse_retry_after("12"),
+            Some(std::time::Duration::from_secs(12))
+        );
+        assert_eq!(parse_retry_after("0"), Some(std::time::Duration::ZERO));
+        assert_eq!(
+            parse_retry_after("  7  "),
+            Some(std::time::Duration::from_secs(7))
+        );
+    }
+
+    #[test]
+    #[cfg(any(feature = "streaming", feature = "providers"))]
+    fn parse_retry_after_huge_value_parses_without_panicking() {
+        let parsed = parse_retry_after("999999999999");
+        assert!(parsed.is_some(), "huge value should parse, not panic");
+    }
+
+    #[test]
+    #[cfg(any(feature = "streaming", feature = "providers"))]
+    fn parse_retry_after_garbage_returns_none() {
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("abc"), None);
+    }
+
+    #[test]
+    #[cfg(feature = "providers")]
+    fn parse_retry_after_http_date() {
+        let parsed = parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT");
+        assert!(parsed.is_some(), "HTTP-date should parse under providers");
     }
 
     #[test]

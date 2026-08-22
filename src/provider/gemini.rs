@@ -42,7 +42,6 @@ const DEFAULT_MODEL: &str = "gemini-2.0-flash";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const THINKING_PART_INDEX: usize = 1;
-const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
 
 /// A Google Gemini API client with streaming support.
 ///
@@ -220,7 +219,10 @@ impl GeminiClient {
     /// Send a POST request and return the raw response.
     ///
     /// Shared by both [`ApiClient::stream_messages`] and
-    /// [`ApiClient::create_message`].
+    /// [`ApiClient::create_message`]. Delegates to
+    /// [`post_json_checked`](super::post_json_checked), which classifies
+    /// non-success responses (auth rejections, rate limits with their
+    /// server-advised delay) into structured [`ApiError`] variants.
     ///
     /// # Errors
     ///
@@ -232,25 +234,7 @@ impl GeminiClient {
         api_key: &str,
         body: &Value,
     ) -> Result<reqwest::Response, ApiError> {
-        let resp = http
-            .post(url)
-            .header("x-goog-api-key", api_key)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| ApiError::http(e.to_string()))?;
-        let status = resp.status();
-        if status.is_success() {
-            Ok(resp)
-        } else {
-            // Cap the error body to prevent OOM from oversized error responses.
-            let bytes = resp.bytes().await.unwrap_or_default();
-            let text = match bytes.get(..MAX_ERROR_BODY) {
-                Some(truncated) => String::from_utf8_lossy(truncated).into_owned(),
-                None => String::from_utf8_lossy(&bytes).into_owned(),
-            };
-            Err(ApiError::http_with_status(status.as_u16(), text))
-        }
+        super::post_json_checked(http, url, &[("x-goog-api-key", api_key)], body).await
     }
 }
 
@@ -324,12 +308,15 @@ impl ApiClient for GeminiClient {
 
             while let Some(data) = sse.next_gemini_data().await? {
                 emitter.process_chunk(&data);
+                if emitter.error_recorded() {
+                    break;
+                }
                 for ev in emitter.drain() {
                     yield ev;
                 }
             }
 
-            for ev in emitter.finish() {
+            for ev in emitter.finish()? {
                 yield ev;
             }
         })
@@ -388,12 +375,15 @@ impl ApiClient for GeminiClient {
 
             while let Some(data) = sse.next_gemini_data().await? {
                 emitter.process_chunk(&data);
+                if emitter.error_recorded() {
+                    break;
+                }
                 for ev in emitter.drain() {
                     yield ev;
                 }
             }
 
-            for ev in emitter.finish() {
+            for ev in emitter.finish()? {
                 yield ev;
             }
         })
@@ -931,6 +921,16 @@ struct StreamEmitter {
     /// `MessageStop`, and each must fire exactly once.
     terminal: TerminalStage,
 
+    /// A terminal error carried by a top-level `/error` chunk, if any.
+    ///
+    /// Gemini reports mid-stream failures as SSE chunks whose JSON carries
+    /// an `error` object instead of candidates. Recorded here so
+    /// [`finish`](Self::finish) terminates the stream with the error instead
+    /// of the synthetic [`StreamEvent::MessageStop`] — without it, a
+    /// consumer could not distinguish an errored stream from a healthy
+    /// truncated one. First error wins; later ones are ignored.
+    error: Option<ApiError>,
+
     /// Buffered [`StreamEvent`]s waiting to be yielded to the consumer.
     ///
     /// All event-producing methods push onto this queue via
@@ -948,8 +948,14 @@ impl StreamEmitter {
     /// for text deltas, [`extract_function_call`](Self::extract_function_call)
     /// for tool calls, and [`extract_finish_reason`](Self::extract_finish_reason)
     /// for the terminal stop signal. Events accumulate in the internal queue
-    /// until [`drain`](Self::drain) is called.
+    /// until [`drain`](Self::drain) is called. A chunk carrying a top-level
+    /// `/error` object produces no events — it records the terminal error
+    /// that [`finish`](Self::finish) surfaces.
     fn process_chunk(&mut self, json: &Value) {
+        if json.get("error").is_some() {
+            self.record_error(json);
+            return;
+        }
         if !self.started {
             self.started = true;
             self.push(StreamEvent::MessageStart(MessageStart {
@@ -963,6 +969,28 @@ impl StreamEmitter {
 
         self.extract_parts_with_tools(json);
         self.extract_finish_reason(json);
+    }
+
+    /// Record the terminal error from a top-level `/error` chunk.
+    ///
+    /// Reads `/error/status` and `/error/message` (Gemini's error payload,
+    /// e.g. `"UNAVAILABLE"` / `"The model is overloaded"`) into an
+    /// [`ApiError::api`] recording. Missing fields fall back to generic
+    /// wording so a malformed payload still terminates with an error rather
+    /// than being dropped. The first error wins; later ones are ignored.
+    fn record_error(&mut self, json: &Value) {
+        if self.error.is_some() {
+            return;
+        }
+        let status = json
+            .pointer("/error/status")
+            .and_then(Value::as_str)
+            .unwrap_or("error");
+        let message = json
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("stream failed");
+        self.error = Some(ApiError::api(format!("{status}: {message}")));
     }
 
     /// Extract text, thought, and tool-call parts from the chunk, preserving
@@ -1178,10 +1206,21 @@ impl StreamEmitter {
     /// Finalize the stream, emitting the terminal
     /// [`MessageStop`](StreamEvent::MessageStop) if one was started.
     ///
-    /// Drains any remaining pending events and appends the stop event.
-    /// Safe to call exactly once at the end of the stream; subsequent calls
-    /// return an empty vec (the `terminal` stage guards against double-stop).
-    fn finish(&mut self) -> Vec<StreamEvent> {
+    /// When an error chunk was recorded, terminates with that error and
+    /// emits nothing further — no synthetic `MessageStop`, so the failure
+    /// cannot masquerade as a clean stop. Otherwise drains any remaining
+    /// pending events and appends the stop event. Safe to call exactly once
+    /// at the end of the stream; subsequent calls return an empty vec (the
+    /// `terminal` stage guards against double-stop).
+    ///
+    /// # Errors
+    ///
+    /// Returns the recorded terminal error, if a top-level error chunk
+    /// arrived during the stream.
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
+        if let Some(err) = self.error.take() {
+            return Err(err);
+        }
         let mut out = self.drain();
         let stop_pending = matches!(
             self.terminal,
@@ -1194,7 +1233,16 @@ impl StreamEmitter {
             };
             out.push(StreamEvent::MessageStop);
         }
-        out
+        Ok(out)
+    }
+
+    /// Whether a terminal error chunk has been recorded.
+    ///
+    /// The stream loop checks this after each chunk to stop reading —
+    /// Gemini may hold the errored connection open, and waiting for its
+    /// EOF would delay the error the emitter already knows about.
+    fn error_recorded(&self) -> bool {
+        self.error.is_some()
     }
 
     /// Push an event onto the internal pending queue.
@@ -2138,7 +2186,7 @@ mod tests {
         em.started = true;
         em.terminal = TerminalStage::Pending;
 
-        let events = em.finish();
+        let events = em.finish().expect("no recorded error");
         assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop)));
     }
 
@@ -2148,8 +2196,41 @@ mod tests {
         em.started = true;
         em.terminal = TerminalStage::StopEmitted;
 
-        let events = em.finish();
+        let events = em.finish().expect("no recorded error");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn gemini_error_chunk_terminates_with_error() {
+        let mut em = StreamEmitter::default();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "partial"}]}}]
+        }));
+        em.process_chunk(&serde_json::json!({
+            "error": {"code": 503, "message": "The model is overloaded", "status": "UNAVAILABLE"}
+        }));
+        assert!(
+            em.error_recorded(),
+            "a top-level error chunk must be recorded"
+        );
+        let drained = em.drain();
+        assert!(
+            drained
+                .iter()
+                .all(|e| !matches!(e, StreamEvent::MessageStop)),
+            "no clean MessageStop may be emitted alongside the failure: {drained:?}"
+        );
+        let err = em
+            .finish()
+            .expect_err("finish must surface the recorded error");
+        assert!(
+            err.to_string().contains("UNAVAILABLE"),
+            "the terminal error must name the provider's status: {err}"
+        );
+        assert!(
+            err.to_string().contains("The model is overloaded"),
+            "the terminal error must carry the provider's message: {err}"
+        );
     }
 
     #[test]
@@ -2165,7 +2246,7 @@ mod tests {
         }));
         em.drain();
         assert!(matches!(em.terminal, TerminalStage::FinishReasonSeen));
-        let events = em.finish();
+        let events = em.finish().expect("no recorded error");
         assert!(
             events.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
             "MessageStop must be emitted even after finishReason was processed"
@@ -2179,7 +2260,7 @@ mod tests {
         // terminal stage reaches Terminal.
         let mut em = StreamEmitter::default();
         em.started = true;
-        let stop_events = em.finish();
+        let stop_events = em.finish().expect("no recorded error");
         assert!(
             stop_events
                 .iter()

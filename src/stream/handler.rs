@@ -34,7 +34,7 @@
 //! ```
 
 use crate::api::ApiClient;
-use crate::api::error::{ApiError, http_status_is_overload};
+use crate::api::error::{ApiError, http_status_from_message, parse_retry_after};
 use crate::cancel::CancelSignal;
 use crate::message::Message;
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
@@ -558,12 +558,16 @@ impl DetectedRateLimit {
     /// Inspect an [`ApiError`] for a rate-limit signature.
     ///
     /// Returns `Some(DetectedRateLimit)` when the error is:
-    /// - the structured [`ApiError::RateLimit`] variant (typed `retry_after`),
+    /// - the structured [`ApiError::RateLimit`] variant (typed `retry_after`;
+    ///   kind `RateLimited` for 429-shaped messages, `Overloaded` when the
+    ///   message carries a 503/529 status),
     /// - an `Api(String)` whose body contains `"rate limit"` or `"429"`, or
-    /// - an `Http(String)` whose `"HTTP {status}:"` prefix indicates 503/529.
+    /// - an `Http(String)` whose `"HTTP {status}:"` prefix indicates 429
+    ///   (kind [`RateLimitKind::RateLimited`]) or 503/529 (kind
+    ///   [`RateLimitKind::Overloaded`]).
     ///
-    /// Returns `None` for everything else (500s, auth errors, generic transport
-    /// failures, etc.).
+    /// Returns `None` for everything else (500s, auth errors, generic
+    /// transport failures, etc.).
     #[must_use]
     pub fn detect(err: &crate::api::error::ApiError) -> Option<Self> {
         match err {
@@ -571,7 +575,10 @@ impl DetectedRateLimit {
                 retry_after,
                 message,
             } => Some(Self {
-                kind: RateLimitKind::RateLimited,
+                kind: match http_status_from_message(message) {
+                    Some(503 | 529) => RateLimitKind::Overloaded,
+                    _ => RateLimitKind::RateLimited,
+                },
                 retry_after: *retry_after,
                 message: message.clone(),
             }),
@@ -587,46 +594,21 @@ impl DetectedRateLimit {
                     None
                 }
             }
-            ApiError::Http(msg) if http_status_is_overload(msg) => Some(Self {
-                kind: RateLimitKind::Overloaded,
-                retry_after: parse_retry_after(msg),
-                message: msg.clone(),
-            }),
+            ApiError::Http(msg) => {
+                let kind = match http_status_from_message(msg) {
+                    Some(429) => RateLimitKind::RateLimited,
+                    Some(503 | 529) => RateLimitKind::Overloaded,
+                    _ => return None,
+                };
+                Some(Self {
+                    kind,
+                    retry_after: parse_retry_after(msg),
+                    message: msg.clone(),
+                })
+            }
             _ => None,
         }
     }
-}
-
-/// Parse an HTTP `Retry-After` value into a [`Duration`].
-///
-/// Accepts the two RFC 9110 forms:
-/// - **delta-seconds** (`"12"`) → `Duration::from_secs(12)`. Huge values are
-///   clamped rather than overflowing.
-/// - **HTTP-date** (`"Wed, 21 Oct 2026 07:28:00 GMT"`) → `max(ZERO, date − now)`.
-///   Only available when the `providers` feature is enabled (the `httpdate`
-///   crate lives there); returns `None` otherwise.
-///
-/// Returns `None` for anything unparseable.
-fn parse_retry_after(value: &str) -> Option<Duration> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(secs) = trimmed.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
-    }
-    #[cfg(feature = "providers")]
-    {
-        if let Ok(target) = httpdate::parse_http_date(trimmed) {
-            let now = std::time::SystemTime::now();
-            return now
-                .duration_since(target)
-                .ok()
-                .map(|_| Duration::ZERO)
-                .or_else(|| target.duration_since(now).ok());
-        }
-    }
-    None
 }
 
 /// Clamp a rate-limit backoff so it cannot sleep past the turn's `total_deadline`.
@@ -744,6 +726,44 @@ enum ErrorAction {
     Retry(Duration),
 }
 
+/// A failed event poll paired with its retry classification.
+///
+/// Carries the [`StreamHandlerError`] the generator propagates plus the
+/// [`ApiError::is_retryable`] verdict captured while the originating provider
+/// error was still typed — before it was flattened into an outcome's message
+/// string. [`decide_transport_error`](StreamHandler::decide_transport_error)
+/// reads the verdict to fail fast on permanent errors instead of spending the
+/// transport-retry ladder on them.
+struct StreamFailure {
+    /// The error to propagate when the failure is terminal.
+    ///
+    /// Built from the failing outcome exactly as it flows to the consumer;
+    /// the retry verdict never alters the error's shape.
+    error: StreamHandlerError,
+
+    /// Whether the underlying failure is transient.
+    ///
+    /// `true` for timeouts, 5xx responses, 408 request timeouts, 429 rate
+    /// limits, and connection-level transport errors; `false` for permanent
+    /// classes (authentication rejections, other 4xx) and cancellation.
+    retryable: bool,
+}
+
+impl StreamFailure {
+    /// Wrap a transient failure whose full retry treatment applies.
+    ///
+    /// Used for the timeout outcomes, which have no [`ApiError`] to consult —
+    /// a deadline that fired is by definition worth another attempt while the
+    /// budget lasts.
+    fn transient(error: StreamHandlerError) -> Self {
+        Self {
+            error,
+            retryable: true,
+        }
+    }
+}
+
+/// Recover the [`StreamOutcome`] a [`StreamHandlerError`] carries, if any.
 ///
 /// Only [`InitFailed`](StreamHandlerError::InitFailed) and
 /// [`StreamFailed`](StreamHandlerError::StreamFailed) carry one (the outcome
@@ -895,27 +915,37 @@ impl EventDiagnostics {
         }
     }
 
-    /// Map a stream API error to the matching [`StreamHandlerError`].
+    /// Map a stream API error to the matching [`StreamFailure`].
     ///
     /// Two branches: if [`DetectedRateLimit::detect`] classifies the error as
     /// a 429/503/529, builds a [`StreamOutcome::RateLimited`] carrying the
     /// parsed `Retry-After` and current progress; otherwise wraps it as a
     /// generic [`StreamOutcome::InitFailed`] with `attempts: 1` (this is the
     /// per-event error path, not the init-retry path, so the attempt counter
-    /// isn't meaningful here). Used by `stream_turn` when the stream yields
-    /// an `Err` event.
-    fn api_error_outcome(&self, error: &crate::api::error::ApiError) -> StreamHandlerError {
+    /// isn't meaningful here). The retry verdict is
+    /// [`ApiError::is_retryable`] consulted while the error is still typed —
+    /// the outcome flattens it to a message string, after which the
+    /// classification would be unrecoverable. Used by `stream_turn` when the
+    /// stream yields an `Err` event.
+    fn api_error_failure(&self, error: &crate::api::error::ApiError) -> StreamFailure {
+        let retryable = error.is_retryable();
         if let Some(detail) = DetectedRateLimit::detect(error) {
-            return StreamHandlerError::StreamFailed(StreamOutcome::RateLimited {
-                detail,
-                has_partial_data: self.has_partial_data,
-                events_processed: self.events_processed,
-            });
+            return StreamFailure {
+                error: StreamHandlerError::StreamFailed(StreamOutcome::RateLimited {
+                    detail,
+                    has_partial_data: self.has_partial_data,
+                    events_processed: self.events_processed,
+                }),
+                retryable,
+            };
         }
-        StreamHandlerError::StreamFailed(StreamOutcome::InitFailed {
-            attempts: 1,
-            last_error: error.to_string(),
-        })
+        StreamFailure {
+            error: StreamHandlerError::StreamFailed(StreamOutcome::InitFailed {
+                attempts: 1,
+                last_error: error.to_string(),
+            }),
+            retryable,
+        }
     }
 }
 
@@ -1706,27 +1736,29 @@ impl StreamHandler {
                             yield HandlerEvent::Stream(event);
                         }
                         Ok(None) => return,
-                        Err(err) => {
-                            let last_stream_outcome = carried_outcome(&err);
-                            let action = if let Some(StreamOutcome::RateLimited { detail, .. }) =
-                                &last_stream_outcome
-                            {
-                                self.decide_rate_limit_error(
-                                    err,
-                                    detail,
-                                    &mut rate_limit_retries,
-                                    total_deadline,
-                                    last_stream_outcome.clone(),
-                                )
-                            } else {
-                                self.decide_transport_error(
-                                    err,
-                                    &mut transport_attempts,
-                                    max_attempts,
-                                    last_stream_outcome.clone(),
-                                    total_deadline,
-                                )
-                            };
+                        Err(failure) => {
+                            let last_stream_outcome = carried_outcome(&failure.error);
+                            let action =
+                                if let Some(StreamOutcome::RateLimited { detail, .. }) =
+                                    &last_stream_outcome
+                                {
+                                    self.decide_rate_limit_error(
+                                        failure.error,
+                                        detail,
+                                        &mut rate_limit_retries,
+                                        total_deadline,
+                                        last_stream_outcome.clone(),
+                                    )
+                                } else {
+                                    self.decide_transport_error(
+                                        failure.error,
+                                        failure.retryable,
+                                        &mut transport_attempts,
+                                        max_attempts,
+                                        last_stream_outcome.clone(),
+                                        total_deadline,
+                                    )
+                                };
                             match action {
                                 ErrorAction::Fail(e) => {
                                     Err(e)?;
@@ -1803,7 +1835,14 @@ impl StreamHandler {
 
     /// Decide how to handle a non-rate-limit transport stream error.
     ///
-    /// Checks whether the transport-retry budget is exhausted:
+    /// Fails fast — one attempt, no backoff, no non-streaming fallback — when
+    /// `retryable` is `false`: the verdict is [`ApiError::is_retryable`]
+    /// consulted while the provider error was still typed, so permanent
+    /// classes (authentication rejections, other 4xx the retryable set
+    /// excludes) never enter the retry math.
+    ///
+    /// For retryable errors, checks whether the transport-retry budget is
+    /// exhausted:
     ///
     /// - **Exhausted + fallback enabled** → [`ErrorAction::TryFallback`]:
     ///   the non-streaming path gets one last chance, carrying the stream
@@ -1817,11 +1856,15 @@ impl StreamHandler {
     fn decide_transport_error(
         &self,
         err: StreamHandlerError,
+        retryable: bool,
         transport_attempts: &mut u32,
         max_attempts: u32,
         last_outcome: Option<StreamOutcome>,
         total_deadline: Option<Instant>,
     ) -> ErrorAction {
+        if !retryable {
+            return ErrorAction::Fail(err);
+        }
         if *transport_attempts >= max_attempts.saturating_sub(1) {
             if self.timeout_config.fallback_to_non_streaming {
                 return ErrorAction::TryFallback(last_outcome);
@@ -1950,9 +1993,11 @@ impl StreamHandler {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamHandlerError::Cancelled`] if the cancel signal fires, or
-    /// [`StreamHandlerError::StreamFailed`] on total/per-event timeout or an API
-    /// error.
+    /// Returns a [`StreamFailure`] carrying [`StreamHandlerError::Cancelled`]
+    /// if the cancel signal fires, or
+    /// [`StreamHandlerError::StreamFailed`] on total/per-event timeout or an
+    /// API error — paired with the error's retry classification where the
+    /// provider error was still typed.
     async fn next_event<S>(
         &self,
         stream: &mut S,
@@ -1960,28 +2005,36 @@ impl StreamHandler {
         consecutive_timeouts: &mut usize,
         total_deadline: Option<Instant>,
         diagnostics: &EventDiagnostics,
-    ) -> Result<Option<StreamEvent>, StreamHandlerError>
+    ) -> Result<Option<StreamEvent>, StreamFailure>
     where
         S: futures::Stream<Item = Result<crate::stream::StreamEvent, crate::api::error::ApiError>>
             + Unpin,
     {
         loop {
             if Self::deadline_exceeded(total_deadline) {
-                return Err(StreamHandlerError::StreamFailed(
+                return Err(StreamFailure::transient(StreamHandlerError::StreamFailed(
                     diagnostics.total_timeout(),
-                ));
+                )));
             }
             if cancel.is_cancelled() {
-                return Err(StreamHandlerError::Cancelled);
+                return Err(StreamFailure {
+                    error: StreamHandlerError::Cancelled,
+                    retryable: false,
+                });
             }
 
             let event_deadline = self.event_deadline(diagnostics.events_processed);
             let event_result = tokio::select! {
                 event = stream.next() => EventPoll::Next(event),
-                () = cancel.notified() => return Err(StreamHandlerError::Cancelled),
+                () = cancel.notified() => return Err(StreamFailure {
+                    error: StreamHandlerError::Cancelled,
+                    retryable: false,
+                }),
                 () = deadline_future(event_deadline) => EventPoll::TimedOut,
                 () = deadline_future(total_deadline) => {
-                    return Err(StreamHandlerError::StreamFailed(diagnostics.total_timeout()));
+                    return Err(StreamFailure::transient(
+                        StreamHandlerError::StreamFailed(diagnostics.total_timeout()),
+                    ));
                 }
             };
             match event_result {
@@ -1993,14 +2046,16 @@ impl StreamHandler {
                         self.timeout_config.max_consecutive_timeouts as usize
                     };
                     if *consecutive_timeouts >= max_consecutive {
-                        return Err(StreamHandlerError::StreamFailed(diagnostics.event_timeout(
-                            u32::try_from(*consecutive_timeouts).unwrap_or(u32::MAX),
+                        return Err(StreamFailure::transient(StreamHandlerError::StreamFailed(
+                            diagnostics.event_timeout(
+                                u32::try_from(*consecutive_timeouts).unwrap_or(u32::MAX),
+                            ),
                         )));
                     }
                 }
                 EventPoll::Next(Some(Ok(event))) => return Ok(Some(event)),
                 EventPoll::Next(Some(Err(api_error))) => {
-                    return Err(diagnostics.api_error_outcome(&api_error));
+                    return Err(diagnostics.api_error_failure(&api_error));
                 }
                 EventPoll::Next(None) => return Ok(None),
             }
@@ -3898,33 +3953,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_after_delta_seconds() {
-        assert_eq!(parse_retry_after("12"), Some(Duration::from_secs(12)));
-        assert_eq!(parse_retry_after("0"), Some(Duration::ZERO));
-        assert_eq!(parse_retry_after("  7  "), Some(Duration::from_secs(7)));
-    }
-
-    #[test]
-    fn parse_retry_after_huge_value_clamps() {
-        let parsed = parse_retry_after("999999999999");
-        assert!(parsed.is_some(), "huge value should parse, not panic");
-    }
-
-    #[test]
-    fn parse_retry_after_garbage_returns_none() {
-        assert_eq!(parse_retry_after("soon"), None);
-        assert_eq!(parse_retry_after(""), None);
-        assert_eq!(parse_retry_after("abc"), None);
-    }
-
-    #[test]
-    #[cfg(feature = "providers")]
-    fn parse_retry_after_http_date() {
-        let parsed = parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT");
-        assert!(parsed.is_some(), "HTTP-date should parse under providers");
-    }
-
-    #[test]
     fn clamp_delay_to_deadline_none_deadline_returns_delay_unchanged() {
         let delay = Duration::from_mins(10);
         assert_eq!(clamp_delay_to_deadline(delay, None), delay);
@@ -5052,6 +5080,290 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "cancellation during backoff should return immediately, not wait for the 60s sleep; elapsed {elapsed:?}",
+        );
+    }
+
+    #[test]
+    fn http_429_is_classified_as_rate_limited() {
+        let detected =
+            DetectedRateLimit::detect(&ApiError::http_with_status(429, "Too Many Requests"))
+                .expect("429 must be detected as a rate limit");
+        assert_eq!(
+            detected.kind,
+            RateLimitKind::RateLimited,
+            "doc: RateLimited is the HTTP 429 Too Many Requests kind"
+        );
+    }
+
+    /// A stream client whose every attempt fails with the given error.
+    ///
+    /// Builds the error per call from a factory (the error type is not
+    /// `Clone`) and counts `stream_messages` / `create_message` calls so the
+    /// permanent-error contracts can assert exactly how many attempts the
+    /// handler spent before giving up.
+    struct FailingStreamClient {
+        make_error: fn() -> ApiError,
+        stream_calls: std::sync::atomic::AtomicUsize,
+        non_streaming_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FailingStreamClient {
+        fn failing_with(make_error: fn() -> ApiError) -> Self {
+            Self {
+                make_error,
+                stream_calls: std::sync::atomic::AtomicUsize::new(0),
+                non_streaming_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn stream_calls(&self) -> usize {
+            self.stream_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn non_streaming_calls(&self) -> usize {
+            self.non_streaming_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ApiClient for FailingStreamClient {
+        fn model(&self) -> String {
+            "failing".to_string()
+        }
+
+        fn stream_messages(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+            self.stream_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(futures::stream::iter(vec![Err((self.make_error)())]))
+        }
+
+        fn create_message(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.non_streaming_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err((self.make_error)()) })
+        }
+    }
+
+    /// Consume `stream_turn` to its terminal item, returning the error.
+    async fn terminal_error<C: ApiClient>(
+        handler: &StreamHandler,
+        client: &C,
+        cancel: &Arc<CancelSignal>,
+    ) -> StreamHandlerError {
+        let request = crate::api::StreamRequest::new(vec![]);
+        let mut stream = handler.stream_turn(
+            client,
+            &request,
+            crate::structured::RequestOptions::default(),
+            cancel,
+        );
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                return e;
+            }
+        }
+        panic!("the stream must terminate with an error");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_stream_errors_are_not_retried() {
+        let client = FailingStreamClient::failing_with(|| {
+            ApiError::auth_invalid_key("HTTP 401: invalid api key")
+        });
+        let handler = StreamHandler::new()
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 3,
+                base_delay_ms: 1,
+                max_delay_ms: 2,
+                ..Default::default()
+            })
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_secs(5),
+                per_event_timeout: Duration::from_secs(5),
+                total_stream_timeout: Duration::from_secs(60),
+                max_consecutive_timeouts: 3,
+                fallback_to_non_streaming: true,
+            });
+        let cancel = Arc::new(CancelSignal::new());
+        let err = terminal_error(&handler, &client, &cancel).await;
+        assert_eq!(
+            client.stream_calls(),
+            1,
+            "a permanent 401 must cost exactly one streaming attempt"
+        );
+        assert_eq!(
+            client.non_streaming_calls(),
+            0,
+            "a permanent 401 must not get a non-streaming fallback attempt"
+        );
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::InitFailed { last_error, .. }) => {
+                assert!(
+                    last_error.contains("Invalid API key"),
+                    "the auth failure must surface verbatim, got: {last_error}"
+                );
+            }
+            other => panic!("the 401 must fail the stream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_server_error_is_still_retried() {
+        let client = FailingStreamClient::failing_with(|| ApiError::http_with_status(500, "boom"));
+        let handler = StreamHandler::new()
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 3,
+                base_delay_ms: 1,
+                max_delay_ms: 2,
+                ..Default::default()
+            })
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_secs(5),
+                per_event_timeout: Duration::from_secs(5),
+                total_stream_timeout: Duration::from_secs(60),
+                max_consecutive_timeouts: 3,
+                fallback_to_non_streaming: false,
+            });
+        let cancel = Arc::new(CancelSignal::new());
+        let err = terminal_error(&handler, &client, &cancel).await;
+        assert_eq!(
+            client.stream_calls(),
+            4,
+            "a 500-class error keeps the full ladder: initial + max_retries retries"
+        );
+        assert!(
+            matches!(
+                err,
+                StreamHandlerError::StreamFailed(StreamOutcome::InitFailed { .. })
+            ),
+            "with the fallback disabled the exhausted ladder fails the stream, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn not_found_stream_errors_are_not_retried() {
+        let client =
+            FailingStreamClient::failing_with(|| ApiError::http_with_status(404, "unknown model"));
+        let handler = StreamHandler::new()
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 3,
+                base_delay_ms: 1,
+                max_delay_ms: 2,
+                ..Default::default()
+            })
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_secs(5),
+                per_event_timeout: Duration::from_secs(5),
+                total_stream_timeout: Duration::from_secs(60),
+                max_consecutive_timeouts: 3,
+                fallback_to_non_streaming: true,
+            });
+        let cancel = Arc::new(CancelSignal::new());
+        let err = terminal_error(&handler, &client, &cancel).await;
+        assert_eq!(
+            client.stream_calls(),
+            1,
+            "a permanent 404 must cost exactly one streaming attempt"
+        );
+        assert_eq!(
+            client.non_streaming_calls(),
+            0,
+            "a permanent 404 must not get a non-streaming fallback attempt"
+        );
+        match err {
+            StreamHandlerError::StreamFailed(StreamOutcome::InitFailed { last_error, .. }) => {
+                assert!(
+                    last_error.contains("HTTP 404"),
+                    "the permanent status must surface verbatim, got: {last_error}"
+                );
+            }
+            other => panic!("the 404 must fail the stream, got {other:?}"),
+        }
+    }
+
+    /// A stream client that accepts the request and then never produces an
+    /// event, counting calls so the cancellation contract can assert the
+    /// handler never re-entered the retry ladder.
+    struct StalledStreamClient {
+        stream_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ApiClient for StalledStreamClient {
+        fn model(&self) -> String {
+            "stalled".to_string()
+        }
+
+        fn stream_messages(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+            self.stream_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(futures::stream::pending())
+        }
+
+        fn create_message(
+            &self,
+            _request: &crate::api::StreamRequest,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::api::NonStreamingResponse, ApiError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Err(ApiError::http("no non-streaming path")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_is_not_retried() {
+        let client = StalledStreamClient {
+            stream_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let handler = StreamHandler::new()
+            .with_retry_config(StreamRetryConfig {
+                max_retries: 3,
+                base_delay_ms: 1,
+                max_delay_ms: 2,
+                ..Default::default()
+            })
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_secs(5),
+                per_event_timeout: Duration::from_secs(5),
+                total_stream_timeout: Duration::from_secs(60),
+                max_consecutive_timeouts: 3,
+                fallback_to_non_streaming: true,
+            });
+        let cancel = Arc::new(CancelSignal::new());
+        let cancel_for_task = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancel_for_task.cancel();
+        });
+        let err = terminal_error(&handler, &client, &cancel).await;
+        assert_eq!(
+            client
+                .stream_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancellation mid-stream must not re-enter the retry ladder"
+        );
+        assert!(
+            matches!(err, StreamHandlerError::Cancelled),
+            "the terminal error must be the cancellation, got {err:?}"
         );
     }
 }

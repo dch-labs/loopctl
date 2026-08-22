@@ -45,7 +45,6 @@ const SSE_DONE: &str = "[DONE]";
 const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const THINKING_PART_INDEX: usize = 1;
-const MAX_ERROR_BODY: usize = 8 * 1024; // 8 Kb
 
 /// An OpenAI-compatible chat completions client with streaming support.
 ///
@@ -231,8 +230,10 @@ impl OpenAiClient {
     /// Send a POST request to the chat-completions endpoint.
     ///
     /// Shared by both [`ApiClient::stream_messages`] and
-    /// [`ApiClient::create_message`]. Returns the raw
-    /// [`reqwest::Response`] after checking for HTTP errors.
+    /// [`ApiClient::create_message`]. Delegates to
+    /// [`post_json_checked`](super::post_json_checked), which classifies
+    /// non-success responses (auth rejections, rate limits with their
+    /// server-advised delay) into structured [`ApiError`] variants.
     ///
     /// # Errors
     ///
@@ -244,26 +245,10 @@ impl OpenAiClient {
         api_key: &str,
         body: &Value,
     ) -> Result<reqwest::Response, ApiError> {
-        let resp = http
-            .post(url)
-            .bearer_auth(api_key)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| ApiError::http(e.to_string()))?;
-
-        let status = resp.status();
-        if status.is_success() {
-            Ok(resp)
-        } else {
-            // Cap the error body to prevent OOM from oversized error responses.
-            let bytes = resp.bytes().await.unwrap_or_default();
-            let text = match bytes.get(..MAX_ERROR_BODY) {
-                Some(truncated) => String::from_utf8_lossy(truncated).into_owned(),
-                None => String::from_utf8_lossy(&bytes).into_owned(),
-            };
-            Err(ApiError::http_with_status(status.as_u16(), text))
-        }
+        let mut bearer = reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|e| ApiError::auth_invalid_key(format!("invalid bearer token: {e}")))?;
+        bearer.set_sensitive(true);
+        super::post_json_checked(http, url, &[(reqwest::header::AUTHORIZATION, bearer)], body).await
     }
 }
 

@@ -126,6 +126,124 @@ pub(super) async fn read_bounded_body(resp: reqwest::Response) -> Result<bytes::
     Ok(buf.into())
 }
 
+/// Maximum error-diagnostic body retained from a non-success response (8 `KiB`).
+///
+/// Bounds both memory and network traffic when a provider answers a failed
+/// request with a large body: the read stops as soon as this many bytes are
+/// available, so a misbehaving endpoint cannot make the client materialize a
+/// multi-gigabyte error page. The retained prefix is what error messages and
+/// logs carry.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+pub(super) const MAX_ERROR_BODY: usize = 8 * 1024;
+
+/// Read the diagnostic body of an error response, capped at
+/// [`MAX_ERROR_BODY`] bytes.
+///
+/// Two guards bound the transfer. When `Content-Length` is present and
+/// exceeds the cap, the body is refused outright — the response is dropped
+/// without reading a single body byte, closing the connection before the
+/// server can send the bulk (kernel socket buffers would otherwise let a
+/// misbehaving server write far past the cap even after the client stops
+/// reading). Otherwise the body is streamed and the read stops as soon as
+/// the cap is available, which also bounds chunked responses. Decode errors
+/// are replaced lossily so a binary body still yields printable text for
+/// logs; an oversized body yields an empty string — its status alone
+/// classifies the error.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+pub(super) async fn read_error_body(resp: reqwest::Response) -> String {
+    if let Some(len) = resp.content_length()
+        && usize::try_from(len).map_or(true, |n| n > MAX_ERROR_BODY)
+    {
+        return String::new();
+    }
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < MAX_ERROR_BODY
+        && let Some(chunk) = stream.next().await
+    {
+        match chunk {
+            Ok(bytes) => {
+                let remaining = MAX_ERROR_BODY.saturating_sub(buf.len());
+                buf.extend_from_slice(bytes.get(..remaining).unwrap_or(&bytes));
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Classify a non-success HTTP response into the matching [`ApiError`]
+/// variant.
+///
+/// The status alone picks the variant so the classification survives without
+/// re-parsing message strings: 401 and 403 are authentication failures
+/// ([`ApiError::Auth`], permanent), 429/503/529 are rate limits
+/// ([`ApiError::RateLimit`], carrying the parsed `Retry-After` when the
+/// server sent one), and everything else stays a status-tagged
+/// [`ApiError::Http`]. The body text is preserved in the message for
+/// diagnostics, prefixed with the status.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+fn classify_error_response(status: u16, body: String, retry_after: Option<Duration>) -> ApiError {
+    match status {
+        401 => ApiError::auth_invalid_key(format!("HTTP {status}: {body}")),
+        403 => ApiError::auth(format!("HTTP {status}: {body}")),
+        429 | 503 | 529 => ApiError::rate_limited(format!("HTTP {status}: {body}"), retry_after),
+        _ => ApiError::http_with_status(status, body),
+    }
+}
+
+/// Send a JSON POST and classify non-success responses into structured
+/// [`ApiError`] variants.
+///
+/// The single HTTP-error construction site shared by the provider clients:
+/// it sends the request with `headers` applied, and on a non-success status
+/// it reads the `Retry-After` header while the response is still in hand,
+/// reads the diagnostic body capped at [`MAX_ERROR_BODY`] bytes, and maps the
+/// status via [`classify_error_response`]. Callers therefore get the right
+/// variant — auth rejections as [`ApiError::Auth`], rate limits with the
+/// server-advised delay as [`ApiError::RateLimit`] — without each provider
+/// re-implementing (and drifting on) the same branches. Header values are
+/// applied verbatim: callers mark credential headers sensitive
+/// ([`HeaderValue::set_sensitive`](reqwest::header::HeaderValue::set_sensitive))
+/// so they are redacted in debug output and never indexed into HTTP/2's
+/// header-compression table.
+///
+/// # Errors
+///
+/// Returns [`ApiError::http`] when the request fails at the transport level,
+/// or the classified variant for any non-success status.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+pub(super) async fn post_json_checked(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(reqwest::header::HeaderName, reqwest::header::HeaderValue)],
+    body: &serde_json::Value,
+) -> Result<reqwest::Response, ApiError> {
+    let request = headers.iter().fold(client.post(url), |req, (name, value)| {
+        req.header(name.clone(), value.clone())
+    });
+    let resp = request
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| ApiError::http(e.to_string()))?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::api::error::parse_retry_after);
+    let body_text = read_error_body(resp).await;
+    Err(classify_error_response(
+        status.as_u16(),
+        body_text,
+        retry_after,
+    ))
+}
+
 /// Shared HTTP-client configuration embedded by every provider builder.
 ///
 /// Holds the timeout, connection-pool, and TCP knobs that are identical
@@ -1097,6 +1215,55 @@ mod tests {
 
     #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
     #[tokio::test]
+    async fn read_error_body_caps_chunked_oversized_response() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let written = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = written.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            drop(sock.read(&mut buf).await);
+            let head = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            let chunk = vec![b'x'; 16384];
+            for _ in 0..16 {
+                // Yield between chunks so the client task gets scheduled and
+                // its early abort can interrupt the transfer (see the
+                // Content-Length variant above for the buffering rationale).
+                tokio::task::yield_now().await;
+                if sock.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                counter.fetch_add(chunk.len(), Ordering::SeqCst);
+                drop(sock.flush().await);
+            }
+        });
+
+        let resp = get_response(&format!("http://{addr}")).await;
+        let text = read_error_body(resp).await;
+        server.await.unwrap();
+        assert_eq!(
+            text.len(),
+            MAX_ERROR_BODY,
+            "a chunked oversized error body must retain exactly the capped prefix"
+        );
+        assert!(
+            text.chars().all(|c| c == 'x'),
+            "the retained prefix must be the body's leading bytes"
+        );
+        let total = written.load(Ordering::SeqCst);
+        assert!(
+            total < 16 * 16384,
+            "the read must abort the transfer short of the full 256 KiB body; the server wrote {total} bytes"
+        );
+    }
+
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+    #[tokio::test]
     async fn read_bounded_body_rejects_oversized_content_length() {
         let body = vec![b'x'; MAX_RESPONSE_BODY + 1];
         let (url, handle) = serve_once(200, String::new(), body).await;
@@ -1109,5 +1276,55 @@ mod tests {
             "expected a too-large error, got: {err}"
         );
         handle.await.unwrap();
+    }
+
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn error_body_read_is_bounded_by_the_cap() {
+        use crate::api::ApiClient as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let written = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = written.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            drop(sock.read(&mut buf).await);
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2097152\r\nConnection: close\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            let chunk = vec![b'x'; 8192];
+            for _ in 0..256 {
+                // Yield between chunks: on kernels with multi-MiB socket
+                // buffers the burst of non-blocking writes below never
+                // returns Pending, so without this the server would finish
+                // buffering the whole body before the client task ever runs
+                // and its early abort could not interrupt the transfer.
+                tokio::task::yield_now().await;
+                if sock.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                counter.fetch_add(chunk.len(), Ordering::SeqCst);
+                drop(sock.flush().await);
+            }
+        });
+
+        let client = crate::provider::OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .expect("client builds");
+        let result = client
+            .create_message(&crate::api::StreamRequest::new(vec![]))
+            .await;
+        assert!(result.is_err(), "a 500 response must surface an error");
+        server.await.unwrap();
+        let total = written.load(Ordering::SeqCst);
+        assert!(
+            total < 2 * 1024 * 1024,
+            "the error-body cap (8 KiB) must stop the read short of the declared 2 MiB body; the server wrote {total} bytes"
+        );
     }
 }

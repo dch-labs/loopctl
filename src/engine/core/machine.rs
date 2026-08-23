@@ -505,7 +505,7 @@ impl LoopMachine {
                 self.request_model(turn, policy)
             }
             MachineState::AwaitingTools { turn, .. } => {
-                let calls = std::mem::take(&mut self.pending_tools);
+                let calls = self.pending_tools.clone();
                 MachineStep::CallTools { turn, calls }
             }
             MachineState::AwaitingCompaction { reason } => MachineStep::Compact { reason },
@@ -619,8 +619,11 @@ impl LoopMachine {
 
     /// Feed tool-result messages back into the machine.
     ///
-    /// Each provided [`Message`] is appended to the history. After the results
-    /// are recorded, the next [`Self::next_step`] requests another
+    /// Each provided [`Message`] is appended to the history, and the pending
+    /// tool calls are consumed — this is the one feed that clears them, so a
+    /// [`next_step`](Self::next_step) re-poll before it returns the same calls
+    /// again, while the step after it advances. After the results are
+    /// recorded, the next [`Self::next_step`] requests another
     /// [`MachineStep::CallLLM`] (subject to the max-turn budget and compaction
     /// trigger). Has no effect once the machine is terminal.
     pub fn tool_results(&mut self, messages: Vec<Message>) {
@@ -636,12 +639,9 @@ impl LoopMachine {
     ///
     /// The driver calls this to add a message that did not come from a model
     /// response, a tool result, or a compaction pass — for example a host
-    /// steering message, or the output of a [`ContextContributor`] that
-    /// re-emits the agent's goal before the next turn. The message becomes part
+    /// steering message. The message becomes part
     /// of the record the driver builds the feed from on the next
     /// [`MachineStep::CallLLM`]. Has no effect once the machine is terminal.
-    ///
-    /// [`ContextContributor`]: crate::contributor::ContextContributor
     pub fn inject(&mut self, message: Message) {
         if self.is_terminal() {
             return;
@@ -1524,5 +1524,32 @@ mod tests {
         let run = crate::engine::RunConfig::default();
         let _: usize = run.max_turns;
         let _ = run.parallel_tool_dispatch;
+    }
+
+    #[test]
+    fn repolling_next_step_returns_the_same_call_tools_step() {
+        let mut machine = small_machine();
+        let step = machine.next_step(test_policy(5));
+        assert!(matches!(step, MachineStep::CallLLM { .. }));
+        machine.model_response(tool_response("Read", &["Read"], 10), 10);
+
+        let first = machine.next_step(test_policy(5));
+        let MachineStep::CallTools { calls, .. } = &first else {
+            panic!("expected CallTools, got {first:?}");
+        };
+        assert_eq!(calls.len(), 1);
+
+        let second = machine.next_step(test_policy(5));
+        assert!(
+            same_step(&first, &second),
+            "next_step doc: pure and idempotent — a repoll returned {second:?}"
+        );
+
+        machine.tool_results(vec![Message::user("result")]);
+        let after_feed = machine.next_step(test_policy(5));
+        assert!(
+            matches!(after_feed, MachineStep::CallLLM { .. }),
+            "tool_results consumes the pending calls — the next step advances, got {after_feed:?}"
+        );
     }
 }

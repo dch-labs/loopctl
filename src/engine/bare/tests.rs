@@ -120,7 +120,7 @@ impl MockClient {
         &self,
         tool_id: &str,
         tool_name: &str,
-        tool_input: Value,
+        tool_input: &Value,
         final_text: &str,
     ) {
         let tool_events = vec![
@@ -133,9 +133,15 @@ impl MockClient {
             }),
             StreamEvent::PartStart(PartStart {
                 index: 0,
-                part: Some(MessagePart::tool_call(tool_id, tool_name, tool_input)),
+                part: Some(MessagePart::tool_call(tool_id, tool_name, Value::Null)),
             }),
-            StreamEvent::PartStop { index: None },
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::InputJson {
+                    partial_json: tool_input.to_string(),
+                },
+            }),
+            StreamEvent::PartStop { index: Some(0) },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("tool_call".to_string()),
@@ -230,7 +236,7 @@ impl MockClient {
         crate::error::recover_guard(self.responses.lock()).push(text_events);
     }
 
-    fn add_tool_only_response(&self, tool_id: &str, tool_name: &str, tool_input: Value) {
+    fn add_tool_only_response(&self, tool_id: &str, tool_name: &str, tool_input: &Value) {
         let tool_events = vec![
             StreamEvent::MessageStart(MessageStart {
                 message: MessageMetadata {
@@ -241,9 +247,15 @@ impl MockClient {
             }),
             StreamEvent::PartStart(PartStart {
                 index: 0,
-                part: Some(MessagePart::tool_call(tool_id, tool_name, tool_input)),
+                part: Some(MessagePart::tool_call(tool_id, tool_name, Value::Null)),
             }),
-            StreamEvent::PartStop { index: None },
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::InputJson {
+                    partial_json: tool_input.to_string(),
+                },
+            }),
+            StreamEvent::PartStop { index: Some(0) },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("tool_call".to_string()),
@@ -579,7 +591,7 @@ async fn non_streaming_turn_returns_assembled_message() {
 #[tokio::test]
 async fn non_streaming_turn_runs_tool_call_loop() {
     let client = MockClient::new("test-model");
-    client.add_tool_then_text("call_1", "echo", json!({"message": "hi"}), "all done");
+    client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
     let mut registry = ToolRegistry::new();
     registry.register(EchoTool);
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
@@ -855,7 +867,7 @@ async fn test_bare_loop_with_tool_call() {
     client.add_tool_then_text(
         "tool_1",
         "echo",
-        json!({"message": "hello"}),
+        &json!({"message": "hello"}),
         "I echoed your message.",
     );
 
@@ -881,7 +893,7 @@ async fn memory_stores_trajectory_after_tool_call() {
     client.add_tool_then_text(
         "tool_1",
         "echo",
-        json!({"message": "hello"}),
+        &json!({"message": "hello"}),
         "I echoed your message.",
     );
 
@@ -1174,7 +1186,7 @@ async fn observer_sequence_text_only_turn() {
 #[tokio::test]
 async fn observer_sequence_tool_call_turn() {
     let client = MockClient::new("test-model");
-    client.add_tool_then_text("tool_1", "echo", json!({"message": "hi"}), "Done.");
+    client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "Done.");
     let mut registry = ToolRegistry::new();
     registry.register(EchoTool);
     let log = sequence_log();
@@ -1439,7 +1451,7 @@ async fn observer_sequence_cancelled_turn() {
     let client = MockClient::new("test-model");
     // Never-ending tool calls so the loop is mid-flight when cancelled.
     for _ in 0..5 {
-        client.add_tool_only_response("c1", "echo", json!({"message": "x"}));
+        client.add_tool_only_response("c1", "echo", &json!({"message": "x"}));
     }
     let mut registry = ToolRegistry::new();
     registry.register(EchoTool);
@@ -1482,7 +1494,7 @@ async fn dispatch_surfaces_tool_name_on_tool_pre() {
     // A tool-call turn then a final text turn. The driver is dispatching the
     // tool during `on_tool_pre`; the ToolNameCapture observer records the
     // tool name carried on the context.
-    client.add_tool_then_text("tool_1", "echo", json!({"message": "hi"}), "done");
+    client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "done");
     let mut registry = ToolRegistry::new();
     registry.register(EchoTool);
 
@@ -1579,7 +1591,7 @@ async fn test_bare_loop_max_turns_exceeded() {
         client.add_tool_only_response(
             &format!("tool_{i}"),
             "echo",
-            json!({"message": format!("msg_{i}")}),
+            &json!({"message": format!("msg_{i}")}),
         );
     }
 
@@ -1636,7 +1648,12 @@ async fn test_bare_loop_api_error() {
 #[tokio::test]
 async fn test_tool_not_found_returns_error_result() {
     let client = MockClient::new("test-model");
-    client.add_tool_then_text("tool_1", "nonexistent", json!({}), "I see the tool failed.");
+    client.add_tool_then_text(
+        "tool_1",
+        "nonexistent",
+        &json!({}),
+        "I see the tool failed.",
+    );
 
     // Empty registry — tool won't be found
     let config = make_config();
@@ -1654,7 +1671,7 @@ async fn test_tool_not_found_returns_error_result() {
 #[tokio::test]
 async fn test_tool_execution_failure() {
     let client = MockClient::new("test-model");
-    client.add_tool_then_text("tool_1", "fail", json!({}), "The tool failed, moving on.");
+    client.add_tool_then_text("tool_1", "fail", &json!({}), "The tool failed, moving on.");
 
     let mut registry = ToolRegistry::new();
     registry.register(FailingTool);
@@ -1718,7 +1735,7 @@ async fn test_observer_run_start_end_symmetry_across_multiple_runs() {
 #[tokio::test]
 async fn test_observer_tool_events() {
     let client = MockClient::new("test-model");
-    client.add_tool_then_text("tool_1", "echo", json!({"message": "test"}), "All done!");
+    client.add_tool_then_text("tool_1", "echo", &json!({"message": "test"}), "All done!");
 
     let plugin = Arc::new(CountingObserver::new());
     let mut registry = ToolRegistry::new();
@@ -1742,7 +1759,7 @@ async fn test_conversation_built_correctly() {
     client.add_tool_then_text(
         "tool_1",
         "echo",
-        json!({"message": "hello"}),
+        &json!({"message": "hello"}),
         "Final answer.",
     );
 
@@ -2239,7 +2256,7 @@ async fn test_text_delta_turn_number_matches_surrounding_turn() {
     }
 
     let client = MockClient::new("test-model");
-    client.add_tool_then_text("tool_1", "echo", json!({"message": "hi"}), "All done");
+    client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "All done");
 
     let mut registry = ToolRegistry::new();
     registry.register(EchoTool);
@@ -2442,7 +2459,7 @@ async fn test_on_text_delta_and_streamer_coexist() {
 #[tokio::test]
 async fn test_on_tool_call_received_fires_once_per_call() {
     let client = MockClient::new("test-model");
-    client.add_tool_then_text("tool_1", "echo", json!({"message": "hi"}), "Done");
+    client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "Done");
 
     let mut registry = ToolRegistry::new();
     registry.register(EchoTool);
@@ -2563,7 +2580,7 @@ async fn test_on_tool_call_received_turn_matches_other_events() {
     }
 
     let client = MockClient::new("test-model");
-    client.add_tool_then_text("tool_1", "echo", json!({"message": "hi"}), "Done");
+    client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "Done");
 
     let mut registry = ToolRegistry::new();
     registry.register(EchoTool);
@@ -2634,7 +2651,7 @@ async fn test_on_tool_call_received_does_not_refire_on_retry() {
     }
 
     let client = MockClient::new("test-model");
-    client.add_tool_then_text("tool_1", "flaky", json!({}), "Recovered");
+    client.add_tool_then_text("tool_1", "flaky", &json!({}), "Recovered");
 
     let mut registry = ToolRegistry::new();
     registry.register(FlakyTool::new(2));
@@ -2814,7 +2831,7 @@ async fn test_loop_detection_hard_stop_propagates_loop_error() {
     registry.register(EchoTool);
     let client = MockClient::new("test");
     for i in 0..10 {
-        client.add_tool_only_response(&format!("call_{i}"), "echo", json!({ "message": "hi" }));
+        client.add_tool_only_response(&format!("call_{i}"), "echo", &json!({ "message": "hi" }));
     }
 
     let managers = LoopManagers::new().with_detection(
@@ -2844,8 +2861,8 @@ async fn test_loop_detection_soft_block_before_stop_threshold() {
     let mut registry = ToolRegistry::new();
     registry.register(EchoTool);
     let client = MockClient::new("test");
-    client.add_tool_only_response("c1", "echo", json!({ "message": "hi" }));
-    client.add_tool_only_response("c2", "echo", json!({ "message": "hi" }));
+    client.add_tool_only_response("c1", "echo", &json!({ "message": "hi" }));
+    client.add_tool_only_response("c2", "echo", &json!({ "message": "hi" }));
     client.add_text_response("Done");
 
     let managers = LoopManagers::new().with_detection(
@@ -2885,7 +2902,7 @@ async fn test_default_recovery_on_tool_error_returns_soft_result() {
     registry.register(FailingTool);
 
     let client = MockClient::new("test");
-    client.add_tool_then_text("tool_1", "fail", json!({}), "Moving on");
+    client.add_tool_then_text("tool_1", "fail", &json!({}), "Moving on");
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
     let result = agent.run("Test", &RunConfig::default()).await.unwrap();
@@ -2896,7 +2913,7 @@ async fn test_default_recovery_on_tool_error_returns_soft_result() {
 #[tokio::test]
 async fn test_recovery_on_missing_tool_returns_soft_result() {
     let client = MockClient::new("test");
-    client.add_tool_then_text("tool_1", "nonexistent", json!({}), "OK");
+    client.add_tool_then_text("tool_1", "nonexistent", &json!({}), "OK");
 
     let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
     let result = agent.run("Test", &RunConfig::default()).await.unwrap();
@@ -2910,7 +2927,7 @@ async fn test_recovery_noop_reflector_no_retries() {
     registry.register(FailingTool);
 
     let client = MockClient::new("test");
-    client.add_tool_then_text("tool_1", "fail", json!({}), "OK");
+    client.add_tool_then_text("tool_1", "fail", &json!({}), "OK");
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
     let result = agent.run("Test", &RunConfig::default()).await.unwrap();
@@ -2924,7 +2941,7 @@ async fn test_recovery_respects_cancellation() {
     registry.register(FailingTool);
 
     let client = MockClient::new("test");
-    client.add_tool_only_response("tc-1", "fail", json!({}));
+    client.add_tool_only_response("tc-1", "fail", &json!({}));
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
 
@@ -2980,7 +2997,7 @@ async fn test_cancel_during_dispatch_lands_in_cancelled_state() {
     registry.register(FailingTool);
 
     let client = MockClient::new("test");
-    client.add_tool_only_response("tc-1", "fail", json!({}));
+    client.add_tool_only_response("tc-1", "fail", &json!({}));
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
     agent.set_reflector(Arc::new(AlwaysRecoverable));
@@ -3114,7 +3131,7 @@ async fn test_stream_turn_cancelled_mid_stream() {
 #[tokio::test]
 async fn test_set_pipeline_injects_self_tools_registry() {
     let client = MockClient::new("test-model");
-    client.add_tool_then_text("tool_1", "echo", json!({"message": "hello"}), "done");
+    client.add_tool_then_text("tool_1", "echo", &json!({"message": "hello"}), "done");
     let mut registry = ToolRegistry::new();
     registry.register(EchoTool);
     let config = make_config();
@@ -3158,8 +3175,8 @@ impl crate::middleware::ToolMiddleware for TurnNumberCapture {
 async fn test_turn_number_is_actual_turn_index() {
     let client = MockClient::new("test-model");
     // Turn 0: model requests tool call, then turn 1: model requests another
-    client.add_tool_only_response("tool_0", "echo", json!({"message": "a"}));
-    client.add_tool_only_response("tool_1", "echo", json!({"message": "b"}));
+    client.add_tool_only_response("tool_0", "echo", &json!({"message": "a"}));
+    client.add_tool_only_response("tool_1", "echo", &json!({"message": "b"}));
     client.add_text_response("done");
 
     let mut registry = ToolRegistry::new();
@@ -3801,7 +3818,7 @@ async fn run_cancel_during_dispatch_fires_turn_end() {
     });
 
     let client = MockClient::new("test");
-    client.add_tool_only_response("tc-1", "slow", json!({}));
+    client.add_tool_only_response("tc-1", "slow", &json!({}));
 
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
     let observer = Arc::new(CountingObserver::new());
@@ -3870,7 +3887,7 @@ async fn run_cancel_during_recovery_backoff_returns_fast() {
     }
 
     let client = MockClient::new("test");
-    client.add_tool_only_response("tc-1", "fail", json!({}));
+    client.add_tool_only_response("tc-1", "fail", &json!({}));
 
     let mut registry = ToolRegistry::new();
     registry.register(FailingTool);
@@ -4045,7 +4062,7 @@ impl RecordingClient {
         &self,
         tool_id: &str,
         tool_name: &str,
-        tool_input: Value,
+        tool_input: &Value,
         final_text: &str,
     ) {
         let tool_events = vec![
@@ -4058,9 +4075,15 @@ impl RecordingClient {
             }),
             StreamEvent::PartStart(PartStart {
                 index: 0,
-                part: Some(MessagePart::tool_call(tool_id, tool_name, tool_input)),
+                part: Some(MessagePart::tool_call(tool_id, tool_name, Value::Null)),
             }),
-            StreamEvent::PartStop { index: None },
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::InputJson {
+                    partial_json: tool_input.to_string(),
+                },
+            }),
+            StreamEvent::PartStop { index: Some(0) },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("tool_call".to_string()),
@@ -4433,7 +4456,7 @@ async fn test_contributor_fires_across_two_turns() {
     // Two-turn session via a tool: turn 1 = tool_call, turn 2 = end_turn.
     // The contributor must be consulted on BOTH turns.
     let client = RecordingClient::new("test-model");
-    client.add_tool_then_text("t1", "echo", json!({"message": "hi"}), "all done");
+    client.add_tool_then_text("t1", "echo", &json!({"message": "hi"}), "all done");
     let counter = Arc::new(AtomicUsize::new(0));
 
     let mut registry = ToolRegistry::new();
@@ -4486,7 +4509,7 @@ async fn test_contributor_sees_turn_number() {
     // Assert the ContributorContext.turn matches the engine's turn counter
     // at consultation time. Captures the value across a 2-turn session.
     let client = RecordingClient::new("test-model");
-    client.add_tool_then_text("t1", "echo", json!({"message": "x"}), "done");
+    client.add_tool_then_text("t1", "echo", &json!({"message": "x"}), "done");
     let seen_turns = Arc::new(Mutex::new(Vec::<usize>::new()));
 
     let mut registry = ToolRegistry::new();
@@ -4586,7 +4609,7 @@ async fn test_constrained_apply_wires_pipeline_and_contributor() {
     registry.register(EchoTool);
 
     let client = RecordingClient::new("test-model");
-    client.add_tool_then_text("t1", "echo", json!({"message": "x"}), "done");
+    client.add_tool_then_text("t1", "echo", &json!({"message": "x"}), "done");
 
     let mut agent = BareLoop::new(Arc::new(client.clone()), registry, contributor_config());
     // apply() wires the pipeline + a cadence-5 GoalReminder.
@@ -4816,7 +4839,7 @@ fn fluent_with_observer_equivalent_to_register_observer() {
 #[tokio::test]
 async fn failed_run_after_noop_compaction_leaves_history_clean() {
     let client = MockClient::new("test-model");
-    client.add_tool_only_response("call_1", "echo", json!({"message": "hi"}));
+    client.add_tool_only_response("call_1", "echo", &json!({"message": "hi"}));
 
     let mut config = make_config();
     config.context_window = 100;
@@ -4839,5 +4862,320 @@ async fn failed_run_after_noop_compaction_leaves_history_clean() {
         agent.conversation().is_empty(),
         "discard_pending doc: no messages from the abandoned run may leak into the next run's context; got {} messages",
         agent.conversation().len()
+    );
+}
+
+#[tokio::test]
+async fn continuation_turn_queries_memory_with_tool_result_text() {
+    use std::sync::Mutex;
+
+    use crate::memory::{ConsolidationStats, LoopMemory, MemoryEntry};
+
+    struct QueryCapturingMemory {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+    impl LoopMemory for QueryCapturingMemory {
+        fn store(
+            &self,
+            _entry: MemoryEntry,
+        ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn retrieve(
+            &self,
+            query: &str,
+            _limit: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + '_>>
+        {
+            crate::error::recover_guard(self.queries.lock()).push(query.to_string());
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn consolidate(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(ConsolidationStats::default()) })
+        }
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "done");
+
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    agent.set_memory(Arc::new(QueryCapturingMemory {
+        queries: Arc::clone(&queries),
+    }));
+
+    agent.run("q", &make_run_config()).await.unwrap();
+
+    let queries = crate::error::recover_guard(queries.lock());
+    let continuation = queries
+        .get(1)
+        .expect("a two-turn run must query memory once per turn");
+    assert!(
+        continuation.contains("Echo: hi"),
+        "the continuation turn must query memory with the tool-result text, got {continuation:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn continuation_turn_joins_parallel_tool_results_with_newlines() {
+    let client = MockClient::new("test-model");
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_1".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::tool_call("call_1", "echo", Value::Null)),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::InputJson {
+                partial_json: json!({"message": "first"}).to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: Some(0) },
+        StreamEvent::PartStart(PartStart {
+            index: 1,
+            part: Some(MessagePart::tool_call("call_2", "echo", Value::Null)),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 1,
+            delta: DeltaPart::InputJson {
+                partial_json: json!({"message": "second"}).to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: Some(1) },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("tool_call".into()),
+            },
+            usage: Some(Usage::new(10, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    client.add_text_response("done");
+
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+
+    let result = agent.run("q", &make_run_config()).await.unwrap();
+    let second = result
+        .turns
+        .get(1)
+        .expect("parallel tool run has a second turn");
+    assert_eq!(
+        second.input, "Echo: first\nEcho: second",
+        "parallel tool results join with a newline, matching each result's own Display convention"
+    );
+}
+
+#[tokio::test]
+async fn continuation_turn_with_image_only_result_has_empty_input() {
+    use crate::message::{ImageSource, ToolContent, ToolContentPart};
+
+    struct ScreenshotTool;
+    impl Tool for ScreenshotTool {
+        fn name(&self) -> &'static str {
+            "screenshot"
+        }
+        fn description(&self) -> &'static str {
+            "Captures the screen"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "screenshot".into(),
+                description: "Captures the screen".into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(ToolOutput::success(ToolContent::Multipart(vec![
+                    ToolContentPart::Image {
+                        source: ImageSource::new_base64("image/png", "aGVsbG8="),
+                    },
+                ])))
+            })
+        }
+    }
+
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text("call_1", "screenshot", &json!({}), "done");
+
+    let mut registry = ToolRegistry::new();
+    registry.register(ScreenshotTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+
+    let result = agent.run("q", &make_run_config()).await.unwrap();
+    let second = result.turns.get(1).expect("tool run has a second turn");
+    assert_eq!(
+        second.input, "",
+        "an image-only result has no text to summarize — the input is empty by design, not by loss"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn continuation_turn_uses_tool_results_not_accompanying_text() {
+    let client = MockClient::new("test-model");
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_1".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("checking the file first")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "checking the file first".into(),
+            },
+        }),
+        StreamEvent::PartStop { index: Some(0) },
+        StreamEvent::PartStart(PartStart {
+            index: 1,
+            part: Some(MessagePart::tool_call("call_1", "echo", Value::Null)),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 1,
+            delta: DeltaPart::InputJson {
+                partial_json: json!({"message": "hi"}).to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: Some(1) },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("tool_call".into()),
+            },
+            usage: Some(Usage::new(10, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    client.add_text_response("done");
+
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+
+    let result = agent.run("q", &make_run_config()).await.unwrap();
+    let second = result.turns.get(1).expect("tool run has a second turn");
+    assert_eq!(
+        second.input, "Echo: hi",
+        "the last history message is the tool-result message — accompanying assistant \
+         narration does not displace the dispatch context as the continuation input"
+    );
+}
+
+#[tokio::test]
+async fn post_tool_turn_input_carries_tool_result_text() {
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "done");
+
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+
+    let result = agent.run("q", &make_run_config()).await.unwrap();
+    let second = result.turns.get(1).expect("tool run has a second turn");
+    assert!(
+        second.input.contains("Echo: hi"),
+        "Turn.input doc: for subsequent turns it is the tool-result text from the previous turn's dispatch; got {:?}",
+        second.input
+    );
+}
+#[tokio::test]
+async fn cancel_during_tool_invocation_drops_the_in_flight_call() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct SlowTool {
+        started: Arc<tokio::sync::Notify>,
+        finished: Arc<AtomicBool>,
+    }
+    impl Tool for SlowTool {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+
+        fn description(&self) -> &'static str {
+            "Sleeps, then records completion"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "slow".into(),
+                description: "Sleeps, then records completion".into(),
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let started = self.started.clone();
+            let finished = self.finished.clone();
+            Box::pin(async move {
+                started.notify_one();
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                finished.store(true, Ordering::SeqCst);
+                Ok(ToolOutput::text("slow done"))
+            })
+        }
+    }
+
+    let client = MockClient::new("test-model");
+    client.add_tool_only_response("call_1", "slow", &json!({}));
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(AtomicBool::new(false));
+    let mut registry = ToolRegistry::new();
+    registry.register(SlowTool {
+        started: Arc::clone(&started),
+        finished: finished.clone(),
+    });
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+
+    let signal = agent.cancel_signal();
+    tokio::spawn(async move {
+        started.notified().await;
+        signal.cancel();
+    });
+    let start = std::time::Instant::now();
+    let result = agent.run("q", &make_run_config()).await;
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(result, Err(LoopError::Cancelled)),
+        "a cancelled run must return LoopError::Cancelled, got {result:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the dropped invocation must not delay the return; elapsed {elapsed:?}"
+    );
+    assert!(
+        !finished.load(Ordering::SeqCst),
+        "dispatch races the cancel signal and drops the in-flight invocation — tools must be cancellation-safe"
     );
 }

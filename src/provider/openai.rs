@@ -42,7 +42,6 @@ use crate::tool::ToolSchema;
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-4o";
 const SSE_DONE: &str = "[DONE]";
-const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const THINKING_PART_INDEX: usize = 1;
 
@@ -932,7 +931,7 @@ impl SseReader {
     async fn next_openai_data(&mut self) -> Result<Option<String>, ApiError> {
         loop {
             while let Some(line) = self.take_line()? {
-                let Some(data) = line.strip_prefix(SSE_DATA_PREFIX) else {
+                let Some(data) = super::sse_data_payload(&line) else {
                     continue;
                 };
                 if data == SSE_DONE {
@@ -3282,5 +3281,77 @@ mod tests {
             "the preserved text rides as a trailing user message"
         );
         assert_eq!(messages[1]["content"], "stale results, search again");
+    }
+
+    #[tokio::test]
+    async fn sse_data_line_without_space_is_parsed() {
+        let data = "data:{\"ok\":true}\n\n";
+        let mut reader = SseReader {
+            bytes: Box::pin(futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(
+                data.to_string().into(),
+            )])),
+            buf: Vec::new(),
+        };
+        let parsed = reader
+            .next_openai_data()
+            .await
+            .expect("reader must not err");
+        assert!(
+            parsed.is_some(),
+            "spec-legal 'data:' line must yield the payload, not be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_done_marker_terminates_the_stream() {
+        let data = "data:[DONE]\n\n";
+        let mut reader = SseReader {
+            bytes: Box::pin(futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(
+                data.to_string().into(),
+            )])),
+            buf: Vec::new(),
+        };
+        let parsed = reader
+            .next_openai_data()
+            .await
+            .expect("reader must not err");
+        assert_eq!(
+            parsed, None,
+            "the compact [DONE] marker must end the stream exactly like the spaced form"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_data_line_yields_empty_payload_then_next_chunk_parses() {
+        let data = "data:\n\ndata:{\"ok\":1}\n\n";
+        let mut reader = SseReader {
+            bytes: Box::pin(futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(
+                data.to_string().into(),
+            )])),
+            buf: Vec::new(),
+        };
+        let first = reader
+            .next_openai_data()
+            .await
+            .expect("reader must not err");
+        assert_eq!(
+            first,
+            Some(String::new()),
+            "a bare data field carries an empty payload, not a skipped line"
+        );
+        let second = reader
+            .next_openai_data()
+            .await
+            .expect("reader must not err");
+        assert_eq!(
+            second.as_deref(),
+            Some("{\"ok\":1}"),
+            "the chunk after a bare data line must still parse"
+        );
+        let third = reader
+            .next_openai_data()
+            .await
+            .expect("reader must not err");
+        assert_eq!(third, None, "the stream must end cleanly after the payload");
     }
 }

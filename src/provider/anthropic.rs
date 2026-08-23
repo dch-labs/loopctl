@@ -39,8 +39,6 @@ use crate::tool::ToolSchema;
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const SSE_EVENT_PREFIX: &str = "event: ";
-const SSE_DATA_PREFIX: &str = "data: ";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// An Anthropic Claude chat client with streaming support.
@@ -236,13 +234,25 @@ impl AnthropicClient {
     }
 }
 
-/// Extract token [`Usage`] from Anthropic's native `usage` object.
+/// Extract token [`Usage`] from Anthropic's native `usage` field.
 ///
-/// Reads `usage.input_tokens` and `usage.output_tokens`. Returns `None` when
-/// the `usage` object is absent or when both counts are zero, matching the
-/// convention used by the streaming emitter in `on_message_delta`.
+/// Reads `usage.input_tokens` and `usage.output_tokens` via
+/// [`extract_usage_object`]. Returns `None` when the `usage` object is absent
+/// or when both counts are zero, matching the convention used by the
+/// streaming emitter in `on_message_delta`.
 fn extract_usage(raw: &Value) -> Option<Usage> {
-    let usage = raw.get("usage")?;
+    extract_usage_object(raw.get("usage")?)
+}
+
+/// Extract token [`Usage`] from a single Anthropic `usage` object.
+///
+/// Reads the object's `input_tokens` and `output_tokens`, defaulting each to
+/// zero when absent or non-numeric. Returns `None` when both counts are zero,
+/// so an all-zero report is indistinguishable from a missing one — the
+/// convention both response paths apply. Shared by the non-streaming
+/// `usage` field ([`extract_usage`]) and the streaming `message_start`
+/// latch in `on_message_start`.
+fn extract_usage_object(usage: &Value) -> Option<Usage> {
     let input = usage
         .get("input_tokens")
         .and_then(Value::as_u64)
@@ -843,10 +853,10 @@ impl SseReader {
                     continue;
                 }
 
-                if let Some(ev) = line.strip_prefix(SSE_EVENT_PREFIX) {
+                if let Some(ev) = super::sse_event_type(&line) {
                     event_type = ev.into();
                     have_event = true;
-                } else if let Some(d) = line.strip_prefix(SSE_DATA_PREFIX) {
+                } else if let Some(d) = super::sse_data_payload(&line) {
                     if data.is_empty() {
                         data = d.into();
                     } else {
@@ -975,6 +985,16 @@ struct StreamEmitter {
     /// a healthy truncated one. First error wins; later ones are ignored.
     error: Option<ApiError>,
 
+    /// Token usage latched from the `message_start` event.
+    ///
+    /// Anthropic reports the prompt's real token counts in `message_start`'s
+    /// `usage` object; the terminal `message_delta` revises only the output
+    /// side (and on server-tool turns may revise both upward). The latch
+    /// lets [`on_message_delta`](Self::on_message_delta) report the real
+    /// input count on the terminal event instead of zero. Stays zeroed when
+    /// the event carries no `usage` object.
+    start_usage: Usage,
+
     /// Buffered [`StreamEvent`]s waiting to be yielded to the consumer.
     ///
     /// All `on_*` handlers push onto this queue; the stream loop drains it
@@ -1011,7 +1031,9 @@ impl StreamEmitter {
     ///
     /// On the first call, reads the message `id` and `model` from
     /// `/message/id` and `/message/model` and emits a
-    /// [`StreamEvent::MessageStart`]. No-ops on subsequent calls (the
+    /// [`StreamEvent::MessageStart`], and latches `/message/usage` into
+    /// [`start_usage`](Self::start_usage) — the only place Anthropic reports
+    /// input tokens on the streaming path. No-ops on subsequent calls (the
     /// `started` flag guards against duplicate emissions). Missing fields
     /// default to empty strings rather than erroring, so a malformed
     /// `message_start` still produces a usable event.
@@ -1034,6 +1056,10 @@ impl StreamEmitter {
             ),
             None => (String::new(), String::new()),
         };
+        self.start_usage = data
+            .and_then(|v| v.pointer("/message/usage"))
+            .and_then(extract_usage_object)
+            .unwrap_or_default();
 
         self.push(StreamEvent::MessageStart(MessageStart {
             message: MessageMetadata {
@@ -1210,9 +1236,16 @@ impl StreamEmitter {
     /// Reads `/delta/stop_reason` (mapped via
     /// [`StreamStopReason::from_api_str`], defaulting to `EndTurn` on an
     /// unrecognized value) and `/usage/input_tokens` +
-    /// `/usage/output_tokens` (defaulting to 0; the usage event is only
-    /// attached when at least one is non-zero). Emits a single
-    /// [`StreamEvent::MessageDelta`] with both.
+    /// `/usage/output_tokens`, each merged with the
+    /// [`start_usage`](Self::start_usage) latch by taking the larger of the
+    /// two counts. The max matters because the two events split the
+    /// reporting: `message_start` carries the input count the terminal
+    /// delta omits, and a server-tools turn's delta may revise either count
+    /// upward from its start value — the larger figure is always the
+    /// up-to-date one. The usage event is only attached when at least one
+    /// merged count is non-zero. Emits a single
+    /// [`StreamEvent::MessageDelta`] with both, so streaming and
+    /// non-streaming turns report identical usage.
     ///
     /// This handler does not mark the stream finished — that is the job of
     /// [`on_message_stop`](Self::on_message_stop), which Anthropic sends
@@ -1230,16 +1263,18 @@ impl StreamEmitter {
             .pointer("/delta/stop_reason")
             .and_then(Value::as_str)
             .map(|s| StreamStopReason::from_api_str(s).unwrap_or(StreamStopReason::EndTurn));
-        let in_tok = v
+        let delta_in = v
             .pointer("/usage/input_tokens")
             .and_then(Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(0);
-        let out_tok = v
+        let delta_out = v
             .pointer("/usage/output_tokens")
             .and_then(Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(0);
+        let in_tok = delta_in.max(self.start_usage.input_tokens);
+        let out_tok = delta_out.max(self.start_usage.output_tokens);
 
         let usage = if in_tok > 0 || out_tok > 0 {
             Some(Usage::new(in_tok, out_tok))
@@ -2851,6 +2886,365 @@ mod tests {
             slashed.messages_url(),
             bare.messages_url(),
             "a trailing-slash base URL must join to the same request URL as the bare one"
+        );
+    }
+
+    #[test]
+    fn emitter_streams_input_tokens_from_message_start() {
+        let mut em = StreamEmitter::default();
+        let start_data = serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3",
+                "usage": {"input_tokens": 25, "output_tokens": 1}
+            }
+        });
+        em.on_message_start(Some(&start_data));
+        em.drain();
+        let delta_data = serde_json::json!({
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 15}
+        });
+        em.on_message_delta(Some(delta_data));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        let usage = usage.expect("MessageDelta must carry usage");
+        assert_eq!(
+            usage.input_tokens, 25,
+            "input tokens arrive on message_start and must survive to the terminal usage"
+        );
+        assert_eq!(usage.output_tokens, 15);
+    }
+
+    #[test]
+    fn streamed_and_non_streamed_usage_agree() {
+        let raw = serde_json::json!({
+            "id": "msg_1",
+            "content": [{"type": "text", "text": "hi there"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 25, "output_tokens": 15}
+        });
+        let non_streamed = AnthropicClient::build_response(&raw);
+
+        let mut em = StreamEmitter::default();
+        em.on_message_start(Some(&serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3",
+                "usage": {"input_tokens": 25, "output_tokens": 1}
+            }
+        })));
+        em.drain();
+        em.on_message_delta(Some(serde_json::json!({
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 15}
+        })));
+        let streamed = em.drain().iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+
+        assert_eq!(
+            streamed, non_streamed.usage,
+            "the same exchange served streaming and non-streaming must report identical usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_data_line_without_space_is_parsed() {
+        let data = "event: message_start\ndata:{\"message\":{\"id\":\"m1\"}}\n\n";
+        let mut reader = SseReader {
+            bytes: Box::pin(futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(
+                data.to_string().into(),
+            )])),
+            buf: Vec::new(),
+        };
+        let parsed = reader.next_event().await.expect("reader must not err");
+        let (_, payload) = parsed.expect("the event must be delivered");
+        assert!(
+            payload.is_some(),
+            "spec-legal 'data:' line must carry the payload, not be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_multi_line_data_joins_spaced_and_compact_forms() {
+        let data = "event: message_start\ndata: {\"a\":\ndata:1}\n\n";
+        let mut reader = SseReader {
+            bytes: Box::pin(futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(
+                data.to_string().into(),
+            )])),
+            buf: Vec::new(),
+        };
+        let parsed = reader.next_event().await.expect("reader must not err");
+        let (_, payload) = parsed.expect("the event must be delivered");
+        let payload = payload.expect("the joined payload must parse");
+        assert_eq!(
+            payload,
+            serde_json::json!({"a": 1}),
+            "data lines of either spacing form concatenate into one payload"
+        );
+    }
+
+    #[test]
+    fn emitter_delta_usage_revision_wins_over_start_latch() {
+        let mut em = StreamEmitter::default();
+        em.on_message_start(Some(&serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3",
+                "usage": {"input_tokens": 25, "output_tokens": 1}
+            }
+        })));
+        em.drain();
+        em.on_message_delta(Some(serde_json::json!({
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"input_tokens": 40, "output_tokens": 15}
+        })));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        let usage = usage.expect("MessageDelta must carry usage");
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens),
+            (40, 15),
+            "a server-tools turn whose delta revises the counts upward must not be under-reported"
+        );
+    }
+
+    #[test]
+    fn emitter_message_delta_without_usage_still_reports_latched_tokens() {
+        let mut em = StreamEmitter::default();
+        em.on_message_start(Some(&serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3",
+                "usage": {"input_tokens": 25, "output_tokens": 1}
+            }
+        })));
+        em.drain();
+        em.on_message_delta(Some(serde_json::json!({
+            "delta": {"stop_reason": "end_turn"}
+        })));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        let usage = usage.expect("the latch alone must still produce a usage report");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (25, 1));
+    }
+
+    #[test]
+    fn emitter_duplicate_message_start_keeps_first_usage_latch() {
+        let mut em = StreamEmitter::default();
+        em.on_message_start(Some(&serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3",
+                "usage": {"input_tokens": 25, "output_tokens": 1}
+            }
+        })));
+        em.on_message_start(Some(&serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3",
+                "usage": {"input_tokens": 99, "output_tokens": 99}
+            }
+        })));
+        em.drain();
+        em.on_message_delta(Some(serde_json::json!({
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 15}
+        })));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        let usage = usage.expect("MessageDelta must carry usage");
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens),
+            (25, 15),
+            "only the first message_start latches; a replayed one must not overwrite it"
+        );
+    }
+
+    #[test]
+    fn emitter_message_delta_without_usage_omits_usage() {
+        let mut em = StreamEmitter::default();
+        em.on_message_start(Some(&serde_json::json!({
+            "message": {"id": "msg_1", "model": "claude-3"}
+        })));
+        em.drain();
+        em.on_message_delta(Some(serde_json::json!({
+            "delta": {"stop_reason": "end_turn"}
+        })));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        assert_eq!(
+            usage, None,
+            "with no usage on either event, the delta carries no usage, matching the non-streaming path"
+        );
+    }
+
+    #[test]
+    fn extract_usage_object_defaults_malformed_counts_to_zero() {
+        let malformed = serde_json::json!({
+            "input_tokens": "many",
+            "output_tokens": -5
+        });
+        assert_eq!(
+            extract_usage_object(&malformed),
+            None,
+            "non-numeric counts default to zero, and an all-zero report is None"
+        );
+        let partial = serde_json::json!({"input_tokens": 12});
+        assert_eq!(
+            extract_usage_object(&partial),
+            Some(Usage::new(12, 0)),
+            "a missing output count defaults to zero without dropping the input report"
+        );
+    }
+
+    /// Serve one fixed SSE response body on a local TCP listener.
+    ///
+    /// Binds an ephemeral port, accepts a single connection, and answers
+    /// with a `text/event-stream` response carrying `body`. Awaiting the
+    /// returned handle confirms the server finished writing.
+    async fn serve_sse(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            drop(sock.read(&mut buf).await);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            drop(sock.write_all(head.as_bytes()).await);
+            drop(sock.write_all(body.as_bytes()).await);
+            drop(sock.flush().await);
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    /// Drain a message stream to `(saw_message_start, terminal_usage)`.
+    async fn collect_stream_telemetry(
+        mut stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send>>,
+    ) -> (bool, Option<Usage>) {
+        use futures::StreamExt;
+
+        let mut usage = None;
+        let mut saw_start = false;
+        while let Some(event) = stream.next().await {
+            match event.expect("stream must not err") {
+                StreamEvent::MessageStart(_) => saw_start = true,
+                StreamEvent::MessageDelta(MessageDelta { usage: u, .. }) => usage = u,
+                _ => {}
+            }
+        }
+        (saw_start, usage)
+    }
+
+    #[tokio::test]
+    async fn streamed_turn_reports_latched_input_tokens_over_the_wire() {
+        let body = concat!(
+            "event: message_start\n",
+            "data:{\"message\":{\"id\":\"m1\",\"model\":\"claude-3\",",
+            "\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n",
+            "event: message_delta\n",
+            "data:{\"delta\":{\"stop_reason\":\"end_turn\"},",
+            "\"usage\":{\"output_tokens\":15}}\n\n",
+            "event: message_stop\n",
+            "data:{}\n\n",
+        );
+        let (url, server) = serve_sse(body).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(url)
+            .build()
+            .unwrap();
+        let (saw_start, usage) = collect_stream_telemetry(
+            client.stream_messages(&crate::api::StreamRequest::new(vec![Message::user("hi")])),
+        )
+        .await;
+        server.await.unwrap();
+
+        assert!(saw_start, "the stream must deliver its message_start");
+        let usage = usage.expect("the terminal MessageDelta must carry usage");
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens),
+            (25, 15),
+            "a compact-data-line wire must yield the latched input tokens and the delta's output tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_event_line_without_space_dispatches_the_event() {
+        let data = "event:message_start\ndata: {\"message\":{\"id\":\"m1\"}}\n\n";
+        let mut reader = SseReader {
+            bytes: Box::pin(futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(
+                data.to_string().into(),
+            )])),
+            buf: Vec::new(),
+        };
+        let parsed = reader.next_event().await.expect("reader must not err");
+        let (event_type, payload) = parsed.expect("the event must be delivered");
+        assert_eq!(
+            event_type, "message_start",
+            "spec-legal 'event:' line must dispatch under its event type, not as unknown"
+        );
+        assert!(
+            payload.is_some(),
+            "the paired data payload must be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_turn_dispatches_compact_event_lines_over_the_wire() {
+        let body = concat!(
+            "event:message_start\n",
+            "data: {\"message\":{\"id\":\"m1\",\"model\":\"claude-3\",",
+            "\"usage\":{\"input_tokens\":25,\"output_tokens\":1}}}\n\n",
+            "event:message_delta\n",
+            "data: {\"delta\":{\"stop_reason\":\"end_turn\"},",
+            "\"usage\":{\"output_tokens\":15}}\n\n",
+            "event:message_stop\n",
+            "data: {}\n\n",
+        );
+        let (url, server) = serve_sse(body).await;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(url)
+            .build()
+            .unwrap();
+        let (saw_start, usage) = collect_stream_telemetry(
+            client.stream_messages(&crate::api::StreamRequest::new(vec![Message::user("hi")])),
+        )
+        .await;
+        server.await.unwrap();
+
+        assert!(
+            saw_start,
+            "compact event lines must dispatch their events, not silence the whole stream"
+        );
+        let usage = usage.expect("the terminal MessageDelta must carry usage");
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens),
+            (25, 15),
+            "a compact-event-line wire must report the same usage as the spaced form"
         );
     }
 }

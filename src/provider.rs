@@ -70,6 +70,36 @@ use std::time::Duration;
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 mod sse;
 
+/// Extract the payload of an SSE `data:` field line, or `None` for any other
+/// line.
+///
+/// The SSE specification allows zero or one space after the field colon, so
+/// both the spaced form (`data: {...}`) that first-party endpoints send and
+/// the compact form (`data:{...}`) that some OpenAI/Anthropic-compatible
+/// servers emit are accepted. Exactly one leading space is removed — a second
+/// space is payload, not framing. Shared by every provider's event reader so
+/// the rule cannot drift between them.
+#[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+fn sse_data_payload(line: &str) -> Option<&str> {
+    let payload = line.strip_prefix("data:")?;
+    Some(payload.strip_prefix(' ').unwrap_or(payload))
+}
+
+/// Extract the event name of an SSE `event:` field line, or `None` for any
+/// other line.
+///
+/// Applies the same one-optional-space rule as [`sse_data_payload`]: the
+/// spec allows zero or one space after the field colon, and a second space
+/// is part of the name. Used by the Anthropic event reader, which pairs an
+/// `event:` line with its `data:` payload before dispatching — a compact
+/// `event:` line there previously dispatched under an empty type, dropping
+/// the whole event.
+#[cfg(feature = "anthropic")]
+fn sse_event_type(line: &str) -> Option<&str> {
+    let event = line.strip_prefix("event:")?;
+    Some(event.strip_prefix(' ').unwrap_or(event))
+}
+
 /// Maximum accepted response body size (10 MB).
 ///
 /// Guards against unbounded memory growth from a misbehaving or hostile
@@ -1340,6 +1370,56 @@ mod tests {
         assert!(
             total < 2 * 1024 * 1024,
             "the error-body cap (8 KiB) must stop the read short of the declared 2 MiB body; the server wrote {total} bytes"
+        );
+    }
+
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
+    #[test]
+    fn sse_data_payload_accepts_spaced_and_compact_forms() {
+        assert_eq!(sse_data_payload("data: {\"a\":1}"), Some("{\"a\":1}"));
+        assert_eq!(sse_data_payload("data:{\"a\":1}"), Some("{\"a\":1}"));
+        assert_eq!(
+            sse_data_payload("data:  two spaces"),
+            Some(" two spaces"),
+            "only the first space after the colon is framing; a second space is payload"
+        );
+        assert_eq!(
+            sse_data_payload("data:"),
+            Some(""),
+            "a bare data field carries an empty payload, not a skipped line"
+        );
+        assert_eq!(sse_data_payload("event: message_start"), None);
+        assert_eq!(sse_data_payload(": keep-alive comment"), None);
+        assert_eq!(
+            sse_data_payload("DATA: {\"a\":1}"),
+            None,
+            "SSE field names are case-sensitive; only lowercase data fields carry payloads"
+        );
+    }
+
+    #[cfg(feature = "anthropic")]
+    #[test]
+    fn sse_event_type_accepts_spaced_and_compact_forms() {
+        assert_eq!(
+            sse_event_type("event: message_start"),
+            Some("message_start")
+        );
+        assert_eq!(sse_event_type("event:message_start"), Some("message_start"));
+        assert_eq!(
+            sse_event_type("event:  two spaces"),
+            Some(" two spaces"),
+            "only the first space after the colon is framing; a second space is part of the name"
+        );
+        assert_eq!(
+            sse_event_type("event:"),
+            Some(""),
+            "a bare event field carries an empty name, not a skipped line"
+        );
+        assert_eq!(sse_event_type("data: {}"), None);
+        assert_eq!(
+            sse_event_type("EVENT: message_start"),
+            None,
+            "SSE field names are case-sensitive; only lowercase event fields name events"
         );
     }
 

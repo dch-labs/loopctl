@@ -39,7 +39,6 @@ use crate::tool::ToolSchema;
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_MODEL: &str = "gemini-2.0-flash";
-const SSE_DATA_PREFIX: &str = "data: ";
 const TEXT_PART_INDEX: usize = 0;
 const THINKING_PART_INDEX: usize = 1;
 
@@ -171,9 +170,14 @@ impl GeminiClient {
     /// field becomes a [`MessagePart::Text`] part and each `functionCall`
     /// becomes a [`MessagePart::ToolCall`] with its `id` preserved when
     /// present (Gemini 3 assigns a unique id per call; older versions omit
-    /// it, in which case the id defaults to an empty string). A single part
-    /// may hold both `text` and `functionCall`, in which case it yields two
-    /// parts. Maps `candidates[0].finishReason` to a [`StreamStopReason`]
+    /// it, in which case the id defaults to an empty string) and its `args`
+    /// normalized by [`normalize_function_args`] (absent or `null` becomes
+    /// an empty object). Parts flagged
+    /// `thought: true` are skipped — reasoning is stream-only in this crate,
+    /// so their summaries are dropped rather than surfaced as visible text,
+    /// matching what the streaming accumulator's text lane yields. A single
+    /// part may hold both `text` and `functionCall`, in which case it yields
+    /// two parts. Maps `candidates[0].finishReason` to a [`StreamStopReason`]
     /// using the same mapping the streaming emitter applies: `"MAX_TOKENS"` →
     /// `MaxTokens`, anything else (including the `"STOP"` default) →
     /// `EndTurn`. Reads `usageMetadata.promptTokenCount` and
@@ -186,16 +190,17 @@ impl GeminiClient {
             .and_then(|p| p.as_array())
         {
             for part in content_parts {
-                if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                let is_thought = part
+                    .get("thought")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !is_thought && let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                     parts.push(MessagePart::text(text));
                 }
                 if let Some(fc) = part.get("functionCall") {
                     let id = fc.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let input = fc
-                        .get("args")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({}));
+                    let input = normalize_function_args(fc);
                     parts.push(MessagePart::tool_call(id, name, input));
                 }
             }
@@ -247,6 +252,21 @@ impl GeminiClient {
             body,
         )
         .await
+    }
+}
+
+/// Normalize a function call's `args` field into the tool-call input.
+///
+/// Gemini omits `args` for parameterless calls, and some Gemini-compatible
+/// frontends send an explicit `null`; both mean "no arguments" and become an
+/// empty object, so tool executors always receive an object to read. Any
+/// other value passes through verbatim — a non-object `args` is malformed
+/// wire data, and silently rewriting it would hide it.
+fn normalize_function_args(func_call: &Value) -> Value {
+    match func_call.get("args") {
+        Some(Value::Object(map)) => Value::Object(map.clone()),
+        Some(Value::Null) | None => serde_json::json!({}),
+        Some(other) => other.clone(),
     }
 }
 
@@ -761,7 +781,7 @@ impl SseReader {
                 if line.is_empty() {
                     continue;
                 }
-                if let Some(data) = line.strip_prefix(SSE_DATA_PREFIX) {
+                if let Some(data) = super::sse_data_payload(&line) {
                     match serde_json::from_str::<Value>(data) {
                         Ok(json) => return Ok(Some(json)),
                         Err(e) => {
@@ -1056,7 +1076,9 @@ impl StreamEmitter {
     ///
     /// Called inline from [`extract_parts_with_tools`] so tool calls appear
     /// at their original position relative to text/thought parts. Each call
-    /// gets its own incrementing index.
+    /// gets its own incrementing index, and its `args` are normalized by
+    /// [`normalize_function_args`] — the `PartStart` input and the emitted
+    /// `InputJson` delta both carry the normalized object.
     fn handle_function_call(&mut self, part: &Value) {
         let Some(func_call) = part.get("functionCall") else {
             return;
@@ -1071,7 +1093,7 @@ impl StreamEmitter {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let args = func_call.pointer("/args").cloned().unwrap_or(Value::Null);
+        let args = normalize_function_args(func_call);
         let args_str = serde_json::to_string(&args).unwrap_or_default();
 
         if matches!(self.thinking, PartLane::Open) {
@@ -3142,6 +3164,240 @@ mod tests {
             slashed.generate_url(),
             bare.generate_url(),
             "a trailing-slash base URL must join to the same request URL as the bare one"
+        );
+    }
+
+    #[test]
+    fn build_response_excludes_thought_summaries() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "internal plan", "thought": true},
+                        {"text": "answer"}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(
+            response.message.text_content(),
+            "answer",
+            "thought parts must not surface as visible text on the non-streaming path"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_data_line_without_space_is_parsed() {
+        let chunk = "data:{\"candidates\":[]}\n\n";
+        let stream =
+            futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(chunk.to_string().into())]);
+        let mut reader = SseReader {
+            bytes: Box::pin(stream),
+            buf: Vec::new(),
+        };
+        let parsed = reader
+            .next_gemini_data()
+            .await
+            .expect("reader must not err");
+        assert!(
+            parsed.is_some(),
+            "spec-legal 'data:' line must yield the payload, not be skipped"
+        );
+    }
+
+    #[test]
+    fn emitter_function_call_without_args_defaults_to_empty_object() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"content": {"parts": [{"functionCall": {"name": "ping"}}]}}]
+        }));
+        let events = em.drain();
+        let start = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::PartStart(ps) => Some(ps),
+                _ => None,
+            })
+            .expect("PartStart");
+        match &start.part {
+            Some(MessagePart::ToolCall { input, .. }) => assert_eq!(
+                *input,
+                serde_json::json!({}),
+                "a parameterless function call must carry an empty object, matching build_response's default"
+            ),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emitter_function_call_without_args_emits_empty_object_json_delta() {
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"content": {"parts": [{"functionCall": {"name": "ping"}}]}}]
+        }));
+        let events = em.drain();
+        let delta = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::IndexedDelta(IndexedDelta {
+                    delta: DeltaPart::InputJson { partial_json },
+                    ..
+                }) => Some(partial_json.clone()),
+                _ => None,
+            })
+            .expect("InputJson delta");
+        assert_eq!(
+            delta, "{}",
+            "tool input is assembled from these deltas; a parameterless call must serialize as an empty object, not null"
+        );
+    }
+
+    #[test]
+    fn function_call_with_explicit_null_args_normalizes_to_empty_object() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"functionCall": {"name": "ping", "args": null}}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let non_streamed = GeminiClient::build_response(&raw);
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&raw);
+        let streamed = em
+            .drain()
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::PartStart(PartStart {
+                    part: Some(MessagePart::ToolCall { input, .. }),
+                    ..
+                }) => Some(input.clone()),
+                _ => None,
+            })
+            .expect("PartStart");
+        assert_eq!(
+            streamed,
+            serde_json::json!({}),
+            "an explicit null means no arguments; the streamed path must hand executors an object"
+        );
+        match &non_streamed.message.parts[0] {
+            MessagePart::ToolCall { input, .. } => assert_eq!(
+                input,
+                &serde_json::json!({}),
+                "an explicit null must normalize to an empty object, matching the streamed path"
+            ),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_non_object_args_pass_through_verbatim() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"functionCall": {"name": "ping", "args": [1, 2]}}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        let mut em = StreamEmitter::default();
+        em.started = true;
+        em.process_chunk(&raw);
+        let streamed = em
+            .drain()
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::PartStart(PartStart {
+                    part: Some(MessagePart::ToolCall { input, .. }),
+                    ..
+                }) => Some(input.clone()),
+                _ => None,
+            })
+            .expect("PartStart");
+        match &response.message.parts[0] {
+            MessagePart::ToolCall { input, .. } => {
+                assert_eq!(
+                    input,
+                    &serde_json::json!([1, 2]),
+                    "only absent and null args normalize; a malformed non-object value stays visible"
+                );
+                assert_eq!(
+                    &streamed, input,
+                    "a non-object args value must pass through identically on both paths"
+                );
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_all_thought_parts_leave_text_empty() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "internal plan", "thought": true}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(
+            response.message.text_content(),
+            "",
+            "a response made only of thought parts must yield no visible text"
+        );
+    }
+
+    #[test]
+    fn build_response_explicit_false_thought_flag_keeps_text() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "answer", "thought": false}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(
+            response.message.text_content(),
+            "answer",
+            "an explicit thought: false marks visible text and must be kept"
+        );
+    }
+
+    #[test]
+    fn build_response_non_bool_thought_flag_keeps_text() {
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "answer", "thought": "yes"}]},
+                "finishReason": "STOP"
+            }]
+        });
+        let response = GeminiClient::build_response(&raw);
+        assert_eq!(
+            response.message.text_content(),
+            "answer",
+            "a non-boolean thought value is not a thought marker on the streaming path either"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_data_line_is_skipped_and_next_chunk_parses() {
+        let chunk = "data:\n\ndata:{\"candidates\":[]}\n\n";
+        let stream =
+            futures::stream::iter(vec![Ok::<bytes::Bytes, ApiError>(chunk.to_string().into())]);
+        let mut reader = SseReader {
+            bytes: Box::pin(stream),
+            buf: Vec::new(),
+        };
+        let parsed = reader
+            .next_gemini_data()
+            .await
+            .expect("reader must not err");
+        assert_eq!(
+            parsed,
+            Some(serde_json::json!({"candidates": []})),
+            "an empty data payload is skipped inside the reader; the next chunk still parses"
         );
     }
 }

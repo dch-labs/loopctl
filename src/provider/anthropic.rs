@@ -432,10 +432,12 @@ impl AnthropicClientBuilder {
     ///
     /// Defaults to `https://api.anthropic.com`. Override when targeting a
     /// proxy, gateway, or Anthropic-compatible endpoint (e.g. Z.AI at
+    /// Trailing `/` separators are trimmed, so joined request paths never
+    /// contain `//` — a `…/v1/` base behaves identically to `…/v1`.
     /// `https://api.z.ai/api/anthropic`).
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
-        self.base_url = url.into();
+        self.base_url = url.into().trim_end_matches('/').to_string();
         self
     }
 
@@ -657,6 +659,7 @@ fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32)
         tool_constraint,
     } = spec;
 
+    let tools = tools.filter(|t| !t.is_empty());
     let (non_system, effective_system) = super::fold_system_messages(messages, *system);
     let msgs: Vec<Value> = non_system.iter().map(|m| convert_message(m)).collect();
     let effective_system = effective_system.unwrap_or_default();
@@ -732,13 +735,22 @@ fn convert_message(m: &Message) -> Value {
                 }));
             }
             MessagePart::ToolResult {
-                call_id, output, ..
+                call_id,
+                output,
+                is_error,
+                ..
             } => {
-                tool_results.push(serde_json::json!({
+                let mut block = serde_json::json!({
                     "type": "tool_result",
                     "tool_use_id": call_id,
                     "content": output.to_string(),
-                }));
+                });
+                if matches!(is_error, Some(true))
+                    && let Some(obj) = block.as_object_mut()
+                {
+                    obj.insert("is_error".to_string(), Value::Bool(true));
+                }
+                tool_results.push(block);
             }
             MessagePart::Image { .. } => {}
         }
@@ -2767,5 +2779,78 @@ mod tests {
             .position(|e| matches!(e, StreamEvent::MessageStop))
             .expect("MessageStop present");
         assert!(stop_idx < msg_stop_idx, "PartStop must precede MessageStop");
+    }
+
+    #[test]
+    fn request_body_omits_tools_for_empty_slice() {
+        let body = build_request_body(
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &[crate::message::Message::user("hi")],
+                system: None,
+                tools: Some(&[]),
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
+            false,
+            1024,
+        );
+        assert!(
+            body.get("tools").is_none(),
+            "an empty tool list must be omitted, not sent as []; got {}",
+            body.get("tools").unwrap_or(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn convert_message_marks_error_tool_results() {
+        let msg = crate::message::Message::new(
+            crate::message::Role::User,
+            vec![crate::message::MessagePart::tool_result(
+                "c1",
+                "bash",
+                crate::message::ToolContent::from_string("exit 1"),
+                true,
+            )],
+        );
+        let json = convert_message(&msg);
+        assert_eq!(
+            json.pointer("/content/0/is_error"),
+            Some(&serde_json::json!(true)),
+            "Anthropic's tool_result block supports is_error and must receive it; got {json}"
+        );
+        let ok = crate::message::Message::new(
+            crate::message::Role::User,
+            vec![crate::message::MessagePart::tool_result(
+                "c2",
+                "search",
+                crate::message::ToolContent::from_string("[]"),
+                false,
+            )],
+        );
+        let ok_json = convert_message(&ok);
+        assert!(
+            ok_json.pointer("/content/0/is_error").is_none(),
+            "successful results carry no is_error (the wire default is false): {ok_json}"
+        );
+    }
+
+    #[test]
+    fn messages_url_has_no_double_slash_for_trailing_slash_base() {
+        let bare = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url("https://api.example.com")
+            .build()
+            .expect("client builds");
+        let slashed = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url("https://api.example.com/")
+            .build()
+            .expect("client builds");
+        assert_eq!(
+            slashed.messages_url(),
+            bare.messages_url(),
+            "a trailing-slash base URL must join to the same request URL as the bare one"
+        );
     }
 }

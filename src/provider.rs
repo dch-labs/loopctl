@@ -713,7 +713,7 @@ pub fn grok() -> Result<OpenAiClient, ApiError> {
 /// `https://api.z.ai/api/anthropic`.
 ///
 /// Reads `ZAI_API_KEY` (or `ZHIPUAI_API_KEY`) (required) and optionally
-/// `ZAI_MODEL` (defaults to `glm-4.6`).
+/// `ZAI_MODEL` (defaults to `glm-4.7`).
 ///
 /// # Example
 ///
@@ -1325,6 +1325,23 @@ mod tests {
         assert!(
             total < 2 * 1024 * 1024,
             "the error-body cap (8 KiB) must stop the read short of the declared 2 MiB body; the server wrote {total} bytes"
+        );
+    }
+
+    #[cfg(feature = "zai")]
+    #[test]
+    fn zai_default_model_matches_the_documented_default() {
+        use crate::api::ApiClient;
+
+        unsafe {
+            std::env::set_var("ZAI_API_KEY", "test-key");
+            std::env::remove_var("ZAI_MODEL");
+        }
+        let client = zai().expect("client builds with the test key");
+        assert_eq!(
+            client.model(),
+            "glm-4.7",
+            "the deliberate default is glm-4.7; the doc was corrected to match"
         );
     }
 }

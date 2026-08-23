@@ -395,9 +395,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// Contributors are consulted in registration order after
     /// [`on_turn_start`](crate::observer::LoopObserver::on_turn_start) and
     /// before the model call. Each contributor that returns [`Some`] message
-    /// has that message appended to the conversation (in registration order)
-    /// so it reaches the model this turn and persists into later turns subject
-    /// to compaction.
+    /// has that message re-emitted into the outbound request for the current
+    /// turn only — the message is never recorded into the conversation
+    /// history, so it does not accumulate across turns and vanishes the
+    /// moment the contributor stops returning it. Registering a contributor
+    /// that always returns the same message is the cheap way to keep a goal
+    /// reminder in front of the model every turn without growing the
+    /// history.
     ///
     /// With no contributors registered, the loop behaves identically to a loop
     /// built without any — the turn-top consultation is a single cheap branch.

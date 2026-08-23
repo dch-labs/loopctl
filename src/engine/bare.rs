@@ -662,10 +662,12 @@ impl<C: ApiClient> BareLoop<C> {
     /// - Top of the main loop (before streaming starts)
     /// - Between individual tool dispatches
     /// - During streaming (via `tokio::select!` with `CancelSignal::notified()`)
-    ///
-    /// **Not** cancellable during:
-    ///
-    /// - Inside a running tool invocation
+    /// - During a running tool invocation: dispatch races the cancel signal
+    ///   in a `tokio::select!`, and when cancel wins the in-flight invocation
+    ///   is dropped mid-flight — the run returns without its result. Tools
+    ///   must therefore be cancellation-safe (drop-safe futures; no required
+    ///   cleanup that only runs to completion), the same contract the
+    ///   dispatch path and the MCP server adapter impose.
     pub fn cancel(&self) {
         self.cancelled.cancel();
     }
@@ -1002,7 +1004,8 @@ impl<C: ApiClient> BareLoop<C> {
     /// Called from [`handle_call_llm`](BareLoop::handle_call_llm) after
     /// contributor messages have been collected and before the request is
     /// built. The `turn_input` (the user input on turn 0, otherwise the last
-    /// history message text — see [`turn_input`](Self::turn_input)) is used as
+    /// history message's text or, after tool dispatch, its tool-result
+    /// output — see [`turn_input`](Self::turn_input)) is used as
     /// the search key passed to [`LoopMemory::retrieve`](crate::memory::LoopMemory::retrieve),
     /// capped at the run's configured `memory_top_k`.
     ///
@@ -1068,16 +1071,18 @@ impl<C: ApiClient> BareLoop<C> {
     /// On turn 0 this is the user's input verbatim
     /// ([`Run::input`](crate::engine::core::Run::input)); on later turns it
     /// is the concatenated text of the last message in the machine's history
-    /// — typically the prior assistant response, or a tool result on a turn
-    /// that follows tool dispatch. Returns an empty string when the run or
-    /// history is unexpectedly empty, which would itself indicate a driver
-    /// invariant violation (every non-first turn follows at least one
-    /// recorded message).
+    /// — typically the prior assistant response, or, on a turn that follows
+    /// tool dispatch, the tool-result output text (that message carries only
+    /// [`ToolResult`](crate::message::MessagePart::ToolResult) parts, whose
+    /// text is read from their output). Returns an empty string when the run
+    /// or history is unexpectedly empty (a driver invariant violation — every
+    /// non-first turn follows at least one recorded message), or when the
+    /// last message carries no text-bearing parts at all — an image-only
+    /// multipart tool result legitimately has nothing to summarize.
     ///
     /// [`build_turn_request`]: BareLoop::build_turn_request
     fn turn_input(&self, turn: usize) -> String {
-        let is_first_turn = turn == 0;
-        if is_first_turn {
+        if turn == 0 {
             self.session
                 .current_run()
                 .map_or(String::new(), |r| r.input.clone())
@@ -1085,14 +1090,37 @@ impl<C: ApiClient> BareLoop<C> {
             self.machine
                 .full_history()
                 .last()
-                .map(|m| {
-                    m.parts
-                        .iter()
-                        .filter_map(|p| p.as_text())
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
+                .map(Self::message_input)
                 .unwrap_or_default()
+        }
+    }
+
+    /// Summarize one history message as the input context of a continuation
+    /// turn.
+    ///
+    /// Text parts win when any are present; otherwise the tool-result
+    /// outputs join with newlines (matching each result's own `Display`
+    /// convention), so a parallel dispatch's results read as separate lines.
+    /// A message with no text-bearing parts — an image-only multipart
+    /// result — has nothing to summarize and yields the empty string.
+    fn message_input(message: &Message) -> String {
+        let text: String = message
+            .parts
+            .iter()
+            .filter_map(MessagePart::as_text)
+            .collect();
+        if text.is_empty() {
+            message
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    MessagePart::ToolResult { output, .. } => Some(output.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            text
         }
     }
 

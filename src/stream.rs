@@ -331,9 +331,11 @@ pub struct MessageMetadata {
 pub struct PartStart {
     /// Zero-based index of this part within the message.
     ///
-    /// Sequentially assigned by the API. Used to correlate
-    /// [`IndexedDelta`] events with the correct part.
-    /// Indices are monotonically increasing within a single stream.
+    /// Assigned by the API and used, together with the lane's kind,
+    /// to correlate [`IndexedDelta`] events with the correct slot:
+    /// indices may be reused across text, thinking, and tool lanes
+    /// (a text lane and a first tool call can both carry index 0),
+    /// so a slot is identified by the pair, not the index alone.
     pub index: usize,
 
     /// The part, if known at start time.
@@ -354,8 +356,11 @@ pub struct PartStart {
 /// A delta (incremental update) for the current part.
 ///
 /// Carries a [`DeltaPart`] payload that should be appended to the
-/// in-progress part identified by [`index`](Self::index).
-/// Multiple deltas may arrive for a single part.
+/// in-progress part identified by [`index`](Self::index) together
+/// with the lane kind matching the payload — indices may be reused
+/// across text, thinking, and tool lanes, and the
+/// [`StreamAccumulator`] routes by that pair. Multiple deltas may
+/// arrive for a single part.
 ///
 /// # Example
 ///
@@ -372,16 +377,17 @@ pub struct IndexedDelta {
     /// Zero-based index of the part being updated.
     ///
     /// Matches the [`index`](PartStart::index) from the
-    /// corresponding [`PartStart`] event. All deltas with
-    /// the same index belong to the same part.
+    /// corresponding [`PartStart`] event. Deltas sharing an index
+    /// may belong to different lanes when the index is reused
+    /// across kinds; the payload's kind disambiguates.
     pub index: usize,
 
     /// The incremental content to append.
     ///
     /// See [`DeltaPart`] for the possible payload types. The
-    /// [`StreamAccumulator`] appends text fragments to
-    /// [`current_text`](StreamAccumulator) and JSON fragments to
-    /// [`current_tool_input`](StreamAccumulator) based on this value.
+    /// [`StreamAccumulator`] routes each fragment to the open slot
+    /// matching this event's `index` and the payload's lane kind,
+    /// appending it to that slot's buffer.
     pub delta: DeltaPart,
 }
 
@@ -881,8 +887,9 @@ pub struct StreamAccumulator {
     /// all at the terminal `finish_reason`. Each
     /// [`PartStart`](StreamEvent::PartStart) pushes a new slot;
     /// [`IndexedDelta`](StreamEvent::IndexedDelta) routes to the slot
-    /// whose `index` matches; [`PartStop`](StreamEvent::PartStop)
-    /// flushes the oldest slot still open.
+    /// matching both its `index` and its lane kind;
+    /// [`PartStop`](StreamEvent::PartStop) closes the slot its `index`
+    /// names, or the oldest open slot when the index is `None`.
     open: Vec<OpenPart>,
 
     /// The model name that produced this response.

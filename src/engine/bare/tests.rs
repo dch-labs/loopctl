@@ -4658,7 +4658,7 @@ async fn test_on_thinking_delta_fires_per_thinking_delta() {
                 text: " chunk".into(),
             },
         }),
-        StreamEvent::PartStop { index: None },
+        StreamEvent::PartStop { index: Some(1) },
         StreamEvent::PartStart(PartStart {
             index: 0,
             part: Some(MessagePart::text("ignored")),
@@ -4669,7 +4669,7 @@ async fn test_on_thinking_delta_fires_per_thinking_delta() {
                 text: "final answer".into(),
             },
         }),
-        StreamEvent::PartStop { index: None },
+        StreamEvent::PartStop { index: Some(0) },
         StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some("end_turn".into()),

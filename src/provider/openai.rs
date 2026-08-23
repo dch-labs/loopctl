@@ -1316,9 +1316,9 @@ impl StreamEmitter {
     /// first text delta) followed by `IndexedDelta(Text)` events. If it
     /// carries non-empty `reasoning_content`, the same shape is emitted for
     /// the reasoning lane. Switching lanes emits a `PartStop` for the previous
-    /// lane first — the downstream accumulator keys on a single active index,
-    /// so leaving both open would let one lane's deltas clobber the other's
-    /// buffered state. If it carries `tool_calls`, delegates each to
+    /// lane first, keeping at most one content lane open — a lane left open
+    /// behind a switch could later share its part index with a tool call and
+    /// make closing ambiguous. If it carries `tool_calls`, delegates each to
     /// [`process_tool_call`](Self::process_tool_call).
     fn process_delta(&mut self, delta: &OpenAiDelta) {
         if let Some(text) = &delta.content
@@ -3367,9 +3367,8 @@ mod tests {
         assert!(has_text, "a Text delta should have fired");
 
         // The lane switch from reasoning to text must emit exactly one
-        // PartStop for the reasoning lane before the text PartStart. Without
-        // it the downstream accumulator (which keys on a single active index)
-        // would let text deltas clobber the reasoning lane's state.
+        // PartStop for the reasoning lane before the text PartStart, so at
+        // most one content lane is ever open.
         let lane_switch_stops = events
             .iter()
             .filter(|e| matches!(e, StreamEvent::PartStop { .. }))

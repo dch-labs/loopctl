@@ -151,6 +151,7 @@ pub fn extract_tool_call(
     events: &[loopctl::stream::StreamEvent],
 ) -> Option<(String, serde_json::Value)> {
     let mut name: Option<String> = None;
+    let mut tool_index: Option<usize> = None;
     let mut json_buf = String::new();
 
     for ev in events {
@@ -158,17 +159,23 @@ pub fn extract_tool_call(
             loopctl::stream::StreamEvent::PartStart(ps) => {
                 if let Some(loopctl::message::MessagePart::ToolCall { name: n, .. }) = &ps.part {
                     name = Some(n.clone());
+                    tool_index = Some(ps.index);
                 }
             }
             loopctl::stream::StreamEvent::IndexedDelta(d) => {
                 if name.is_some()
+                    && Some(d.index) == tool_index
                     && let loopctl::stream::DeltaPart::InputJson { partial_json } = &d.delta
                 {
                     json_buf.push_str(partial_json);
                 }
             }
-            loopctl::stream::StreamEvent::PartStop { .. } => {
-                if let Some(n) = name.take() {
+            loopctl::stream::StreamEvent::PartStop { index } => {
+                let closes_tool = match index {
+                    Some(i) => Some(*i) == tool_index,
+                    None => true,
+                };
+                if closes_tool && let Some(n) = name.take() {
                     let input = if json_buf.is_empty() {
                         serde_json::Value::Object(serde_json::Map::new())
                     } else {

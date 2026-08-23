@@ -1001,9 +1001,9 @@ impl StreamEmitter {
     /// Gemini can interleave text, thought (`thought: true`), and
     /// `functionCall` parts within a single chunk. This method walks the
     /// parts array in order and routes each to its lane, closing the
-    /// previous lane first when switching — the downstream accumulator
-    /// keys on a single active index, so failing to close would let
-    /// deltas for one lane clobber the other's buffered state.
+    /// previous lane first when switching — at most one content lane is
+    /// ever open, so a lane left open behind a switch could share its
+    /// part index with a later tool call and make closing ambiguous.
     fn extract_parts_with_tools(&mut self, json: &Value) {
         let Some(parts) = json
             .pointer("/candidates/0/content/parts")
@@ -1843,10 +1843,9 @@ mod tests {
     #[test]
     fn emitter_thought_and_text_parts_interleave() {
         // Gemini interleaves thought and text parts in the same parts[] array.
-        // When the lane changes the emitter closes the previous lane with a
-        // PartStop before opening the next, so the downstream accumulator
-        // (single active index) never sees one lane's deltas clobber the
-        // other's buffered state.
+        // When the lane changes the emitter closes the previous lane with an
+        // addressed PartStop before opening the next, keeping at most one
+        // content lane open at any time.
         let mut em = StreamEmitter::default();
         em.started = true;
 

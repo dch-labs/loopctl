@@ -5111,6 +5111,7 @@ async fn cancel_during_tool_invocation_drops_the_in_flight_call() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct SlowTool {
+        started: Arc<tokio::sync::Notify>,
         finished: Arc<AtomicBool>,
     }
     impl Tool for SlowTool {
@@ -5134,8 +5135,10 @@ async fn cancel_during_tool_invocation_drops_the_in_flight_call() {
             _input: Value,
             _ctx: &ToolContext,
         ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let started = self.started.clone();
             let finished = self.finished.clone();
             Box::pin(async move {
+                started.notify_one();
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 finished.store(true, Ordering::SeqCst);
                 Ok(ToolOutput::text("slow done"))
@@ -5146,16 +5149,18 @@ async fn cancel_during_tool_invocation_drops_the_in_flight_call() {
     let client = MockClient::new("test-model");
     client.add_tool_only_response("call_1", "slow", &json!({}));
 
+    let started = Arc::new(tokio::sync::Notify::new());
     let finished = Arc::new(AtomicBool::new(false));
     let mut registry = ToolRegistry::new();
     registry.register(SlowTool {
+        started: Arc::clone(&started),
         finished: finished.clone(),
     });
     let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
 
     let signal = agent.cancel_signal();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        started.notified().await;
         signal.cancel();
     });
     let start = std::time::Instant::now();

@@ -42,6 +42,11 @@
 //!   tool-call content blocks.
 //! - [`test_config`] — Create a test [`SessionConfig`] with sensible defaults.
 //!
+//! # Test Environment
+//!
+//! - [`EnvGuard`] — serialize and restore environment variables around
+//!   tests that mutate them.
+//!
 //! # Quick Start
 //!
 //! ```rust
@@ -1641,5 +1646,226 @@ mod tests {
         assert!(!client.set_model(""));
         assert!(!client.set_model("   "));
         assert_eq!(client.model(), "model-a");
+    }
+}
+
+/// The single lock serializing environment access across tests.
+///
+/// Tests execute on parallel threads inside one process, and an environment
+/// mutation racing a concurrent read is exactly the unsoundness the `unsafe`
+/// marking on `set_var`/`remove_var` warns about. Every mutation — inside an
+/// [`EnvGuard`] or its [`Drop`] — happens while this lock is held, so no two
+/// environment touches from different tests can interleave.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    /// Whether an [`EnvGuard`] is already held on this thread; a nested
+    /// [`EnvGuard::acquire`] would deadlock on the non-reentrant lock, so
+    /// it fails fast instead.
+    static ENV_GUARD_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Holds a shared env lock and restores snapshotted variables.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::testing::EnvGuard;
+///
+/// let env = EnvGuard::acquire(&["LOOPCTL_DOC_EXAMPLE"]);
+/// env.set("LOOPCTL_DOC_EXAMPLE", "1");
+/// assert_eq!(std::env::var("LOOPCTL_DOC_EXAMPLE"), Ok("1".to_string()));
+/// drop(env);
+/// assert!(std::env::var("LOOPCTL_DOC_EXAMPLE").is_err());
+/// ```
+///
+/// Acquires the lock, snapshots the named variables, and restores each to
+/// its prior value (present or absent) on drop — assertion failures and
+/// panics included. Hold for the whole test body and mutate only through
+/// [`set`](Self::set)/[`remove`](Self::remove).
+pub struct EnvGuard {
+    /// Proof that `ENV_LOCK` is held for the guard's lifetime.
+    ///
+    /// Dropping the guard releases the lock (after restoration), which is
+    /// what makes the whole-test hold work: no other environment-mutating
+    /// test can run between this guard's acquisition and its drop.
+    _lock: std::sync::MutexGuard<'static, ()>,
+
+    /// The variables to restore, each with its pre-test value.
+    ///
+    /// `Some(value)` restores the variable to that value on drop; `None`
+    /// removes it (it was absent when the guard was acquired). Populated
+    /// once under the lock in [`acquire`](Self::acquire), never mutated
+    /// after — the `debug_assert!`s in [`set`](Self::set) and
+    /// [`remove`](Self::remove) police that mutations stay within this list.
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvGuard {
+    /// Lock the environment and snapshot variables for restoration.
+    ///
+    /// Takes `ENV_LOCK`, records each named variable's current value (or
+    /// absence), and marks the thread as holding a guard so a nested
+    /// `acquire` fails fast instead of deadlocking the test runner. One
+    /// guard per test, acquired before any mutation; keep it alive for the
+    /// whole test body.
+    ///
+    /// # Panics
+    ///
+    /// Panics when this thread already holds a guard — a nested acquire
+    /// would deadlock on the non-reentrant lock.
+    pub fn acquire(vars: &[&'static str]) -> Self {
+        ENV_GUARD_HELD.with(|held| {
+            assert!(
+                !held.get(),
+                "nested EnvGuard::acquire would deadlock; one guard per test"
+            );
+        });
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved = vars
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect();
+        ENV_GUARD_HELD.with(|held| held.set(true));
+        Self { _lock: lock, saved }
+    }
+
+    /// Set a snapshotted variable under the held lock.
+    ///
+    /// The debug assertion rejects names the guard did not snapshot —
+    /// mutating those would leak past the guard, since [`Drop`] restores
+    /// only the snapshotted list.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when `name` was not snapshotted — the
+    /// mutation would not be restored on drop.
+    pub fn set(&self, name: &'static str, value: &str) {
+        debug_assert!(
+            self.saved
+                .iter()
+                .any(|(snapshotted, _)| *snapshotted == name),
+            "setting {name} without a snapshot: Drop would not restore it"
+        );
+        // SAFETY: the guard holds the crate-wide env lock for this scope.
+        unsafe { std::env::set_var(name, value) }
+    }
+
+    /// Remove a snapshotted variable under the held lock.
+    ///
+    /// Mirrors [`set`](Self::set): the debug assertion rejects names the
+    /// guard did not snapshot.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds when `name` was not snapshotted — the
+    /// mutation would not be restored on drop.
+    pub fn remove(&self, name: &'static str) {
+        debug_assert!(
+            self.saved
+                .iter()
+                .any(|(snapshotted, _)| *snapshotted == name),
+            "removing {name} without a snapshot: Drop would not restore it"
+        );
+        // SAFETY: the guard holds the crate-wide env lock for this scope.
+        unsafe { std::env::remove_var(name) }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        ENV_GUARD_HELD.with(|held| held.set(false));
+        for (name, value) in &self.saved {
+            match value {
+                Some(previous) => unsafe { std::env::set_var(name, previous) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod env_guard_tests {
+    use super::*;
+
+    #[test]
+    fn guard_restores_previous_values_on_normal_exit() {
+        // A guard restores the state found at ITS acquire, so establishing a
+        // pre-existing value requires setting it outside any guard. SAFETY:
+        // the variable name is unique to this test, so no parallel test can
+        // race this setup or the cleanup below.
+        unsafe { std::env::set_var("LOOPCTL_GUARD_VALUE", "original") };
+        {
+            let env = EnvGuard::acquire(&["LOOPCTL_GUARD_VALUE"]);
+            env.set("LOOPCTL_GUARD_VALUE", "mutated");
+            env.remove("LOOPCTL_GUARD_VALUE");
+            env.set("LOOPCTL_GUARD_VALUE", "mutated-again");
+        }
+        assert_eq!(
+            std::env::var("LOOPCTL_GUARD_VALUE"),
+            Ok("original".to_string()),
+            "drop must restore the pre-guard value after mixed set/remove churn"
+        );
+        // SAFETY: unique to this test; a guard cannot erase — it only
+        // restores to acquire-time state.
+        unsafe { std::env::remove_var("LOOPCTL_GUARD_VALUE") };
+    }
+
+    #[test]
+    fn nested_acquire_fails_fast() {
+        let result = std::panic::catch_unwind(|| {
+            let _outer = EnvGuard::acquire(&["LOOPCTL_GUARD_NESTED"]);
+            let _inner = EnvGuard::acquire(&["LOOPCTL_GUARD_NESTED"]);
+        });
+        let panic = result.expect_err("nested acquire must panic, not deadlock");
+        let names_it = panic
+            .downcast_ref::<String>()
+            .is_some_and(|m| m.contains("one guard per test"))
+            || panic
+                .downcast_ref::<&str>()
+                .is_some_and(|m| m.contains("one guard per test"));
+        assert!(
+            names_it,
+            "the panic must name the nesting rule so the failure is actionable"
+        );
+    }
+
+    #[test]
+    fn mutating_unsnapshotted_variable_fails() {
+        let result = std::panic::catch_unwind(|| {
+            let env = EnvGuard::acquire(&["LOOPCTL_GUARD_SNAPSHOT"]);
+            env.set("LOOPCTL_GUARD_UNSNAPSHOTTED", "x");
+        });
+        let panic = result.expect_err("mutating an unsnapshotted name must panic");
+        let names_it = panic
+            .downcast_ref::<String>()
+            .is_some_and(|m| m.contains("without a snapshot"))
+            || panic
+                .downcast_ref::<&str>()
+                .is_some_and(|m| m.contains("without a snapshot"));
+        assert!(
+            names_it,
+            "the panic must name the snapshot rule so the failure is actionable"
+        );
+    }
+
+    #[test]
+    fn guard_restores_after_panic() {
+        {
+            let env = EnvGuard::acquire(&["LOOPCTL_GUARD_TEST"]);
+            env.remove("LOOPCTL_GUARD_TEST");
+        }
+        let result = std::panic::catch_unwind(|| {
+            let env = EnvGuard::acquire(&["LOOPCTL_GUARD_TEST"]);
+            env.set("LOOPCTL_GUARD_TEST", "mutated");
+            panic!("simulated test failure");
+        });
+        assert!(result.is_err(), "the closure must have panicked");
+        assert!(
+            std::env::var("LOOPCTL_GUARD_TEST").is_err(),
+            "drop during unwinding must restore the variable to absent"
+        );
     }
 }

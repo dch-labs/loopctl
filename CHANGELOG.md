@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 - `current_run`/`current_run_mut` wrappers removed; callers delegate to `Session`'s existing methods.
 - Loop-detection decision logic (`decide_detected_pattern`, `apply_loop_detection`) moved to `llm_turn.rs` (response-side), separating it from tool-operation detection (`pre_detection`/`post_detection`) in `dispatch.rs`.
 
+### Added
+
+- `loopctl::testing::EnvGuard` — a shared RAII guard for tests that mutate environment variables. `EnvGuard::acquire(&["VAR_A", "VAR_B"])` takes a crate-wide lock (parallel tests cannot interleave environment access), snapshots the named variables, and restores each to its prior value — present or absent — on drop, covering assertion failures and panics; `set`/`remove` mutate under the held lock and reject names that were not snapshotted, and a nested `acquire` fails fast instead of deadlocking. Usable from lib tests, integration tests, and downstream via the `testing` feature.
+
 ### Fixed
 
 - `Retry-After` is captured. Provider clients now read the header at HTTP time and classify 429/503/529 responses into `ApiError::RateLimit { retry_after }`, so the server-advised-delay machinery (`RateLimitConfig::respect_retry_after` / `max_delay`) actually receives the provider's guidance — previously the header was discarded with the response object and downstream code tried to parse the delay back out of a flattened `"HTTP 429: {json}"` string, which can never carry it. Pinned by `retry_after_header_reaches_the_error` (all three clients, `tests/provider_error_path.rs`) and `header_retry_after_flows_to_the_rate_limit_budget` (end-to-end through `StreamHandler`: the observed retry delay honors the header's 7s, clamped by `max_delay`).

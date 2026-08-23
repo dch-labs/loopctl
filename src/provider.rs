@@ -771,6 +771,8 @@ pub fn self_hosted(base_url: &str, model: &str) -> Result<OpenAiClient, ApiError
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "testing")]
+    use crate::testing::EnvGuard;
 
     #[cfg(any(
         feature = "ollama",
@@ -779,189 +781,202 @@ mod tests {
         feature = "zai",
         feature = "openai"
     ))]
-    macro_rules! env_set {
-        ($($arg:tt)*) => {{
-            // SAFETY: This is only used in single-threaded test code where
-            // no other task is reading or writing environment variables.
-            unsafe { std::env::set_var($($arg)*) }
-        }};
-    }
-
-    #[cfg(any(
-        feature = "ollama",
-        feature = "deepseek",
-        feature = "grok",
-        feature = "zai",
-        feature = "openai"
+    #[cfg(all(
+        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        feature = "testing"
     ))]
-    macro_rules! env_remove {
-        ($($arg:tt)*) => {{
-            // SAFETY: This is only used in single-threaded test code where
-            // no other task is reading or writing environment variables.
-            unsafe { std::env::remove_var($($arg)*) }
-        }};
-    }
-
-    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
     #[test]
     fn env_or_fallback_primary_set() {
-        env_set!("LOOPCTL_TEST_PRIMARY", "primary-val");
-        env_remove!("LOOPCTL_TEST_FALLBACK");
+        let env = EnvGuard::acquire(&["LOOPCTL_TEST_PRIMARY", "LOOPCTL_TEST_FALLBACK"]);
+        env.set("LOOPCTL_TEST_PRIMARY", "primary-val");
+        env.remove("LOOPCTL_TEST_FALLBACK");
         assert_eq!(
             env_or_fallback("LOOPCTL_TEST_PRIMARY", "LOOPCTL_TEST_FALLBACK"),
             Some("primary-val".into())
         );
-        env_remove!("LOOPCTL_TEST_PRIMARY");
     }
 
-    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
+    #[cfg(all(
+        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        feature = "testing"
+    ))]
     #[test]
     fn env_or_fallback_fallback_used_when_primary_missing() {
-        env_remove!("LOOPCTL_TEST_PRIMARY2");
-        env_set!("LOOPCTL_TEST_FALLBACK2", "fallback-val");
+        let env = EnvGuard::acquire(&["LOOPCTL_TEST_PRIMARY2", "LOOPCTL_TEST_FALLBACK2"]);
+        env.remove("LOOPCTL_TEST_PRIMARY2");
+        env.set("LOOPCTL_TEST_FALLBACK2", "fallback-val");
         assert_eq!(
             env_or_fallback("LOOPCTL_TEST_PRIMARY2", "LOOPCTL_TEST_FALLBACK2"),
             Some("fallback-val".into())
         );
-        env_remove!("LOOPCTL_TEST_FALLBACK2");
     }
 
-    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
+    #[cfg(all(
+        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        feature = "testing"
+    ))]
     #[test]
     fn env_or_fallback_none_when_both_missing() {
-        env_remove!("LOOPCTL_TEST_NEITHER_A");
-        env_remove!("LOOPCTL_TEST_NEITHER_B");
+        let env = EnvGuard::acquire(&["LOOPCTL_TEST_NEITHER_A", "LOOPCTL_TEST_NEITHER_B"]);
+        env.remove("LOOPCTL_TEST_NEITHER_A");
+        env.remove("LOOPCTL_TEST_NEITHER_B");
         assert_eq!(
             env_or_fallback("LOOPCTL_TEST_NEITHER_A", "LOOPCTL_TEST_NEITHER_B"),
             None
         );
     }
 
-    #[cfg(any(
-        feature = "ollama",
-        feature = "deepseek",
-        feature = "grok",
-        feature = "zai",
-        feature = "openai"
+    #[cfg(all(
+        any(
+            feature = "ollama",
+            feature = "deepseek",
+            feature = "grok",
+            feature = "zai",
+            feature = "openai"
+        ),
+        feature = "testing"
     ))]
     #[test]
     fn env_or_default_uses_env_when_set() {
-        env_set!("LOOPCTL_TEST_DEFAULT", "from-env");
+        let env = EnvGuard::acquire(&["LOOPCTL_TEST_DEFAULT"]);
+        env.set("LOOPCTL_TEST_DEFAULT", "from-env");
         assert_eq!(
             env_or_default("LOOPCTL_TEST_DEFAULT", "fallback"),
             "from-env"
         );
-        env_remove!("LOOPCTL_TEST_DEFAULT");
     }
 
-    #[cfg(any(
-        feature = "ollama",
-        feature = "deepseek",
-        feature = "grok",
-        feature = "zai",
-        feature = "openai"
+    #[cfg(all(
+        any(
+            feature = "ollama",
+            feature = "deepseek",
+            feature = "grok",
+            feature = "zai",
+            feature = "openai"
+        ),
+        feature = "testing"
     ))]
     #[test]
     fn env_or_default_uses_default_when_unset() {
-        env_remove!("LOOPCTL_TEST_DEFAULT2");
+        let env = EnvGuard::acquire(&["LOOPCTL_TEST_DEFAULT2"]);
+        env.remove("LOOPCTL_TEST_DEFAULT2");
         assert_eq!(
             env_or_default("LOOPCTL_TEST_DEFAULT2", "fallback"),
             "fallback"
         );
     }
 
-    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
+    #[cfg(all(
+        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        feature = "testing"
+    ))]
     #[test]
     fn require_api_key_primary_set() {
-        env_set!("LOOPCTL_TEST_KEY_PRIMARY", "secret");
-        env_remove!("LOOPCTL_TEST_KEY_FALLBACK");
+        let env = EnvGuard::acquire(&["LOOPCTL_TEST_KEY_PRIMARY", "LOOPCTL_TEST_KEY_FALLBACK"]);
+        env.set("LOOPCTL_TEST_KEY_PRIMARY", "secret");
+        env.remove("LOOPCTL_TEST_KEY_FALLBACK");
         let key = require_api_key(
             "LOOPCTL_TEST_KEY_PRIMARY",
             Some("LOOPCTL_TEST_KEY_FALLBACK"),
         )
         .unwrap();
         assert_eq!(key, "secret");
-        env_remove!("LOOPCTL_TEST_KEY_PRIMARY");
     }
 
-    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
+    #[cfg(all(
+        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        feature = "testing"
+    ))]
     #[test]
     fn require_api_key_fallback_used() {
-        env_remove!("LOOPCTL_TEST_KEY_PRIMARY2");
-        env_set!("LOOPCTL_TEST_KEY_FALLBACK2", "fallback-secret");
+        let env = EnvGuard::acquire(&["LOOPCTL_TEST_KEY_PRIMARY2", "LOOPCTL_TEST_KEY_FALLBACK2"]);
+        env.remove("LOOPCTL_TEST_KEY_PRIMARY2");
+        env.set("LOOPCTL_TEST_KEY_FALLBACK2", "fallback-secret");
         let key = require_api_key(
             "LOOPCTL_TEST_KEY_PRIMARY2",
             Some("LOOPCTL_TEST_KEY_FALLBACK2"),
         )
         .unwrap();
         assert_eq!(key, "fallback-secret");
-        env_remove!("LOOPCTL_TEST_KEY_FALLBACK2");
     }
 
-    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
+    #[cfg(all(
+        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        feature = "testing"
+    ))]
     #[test]
     fn require_api_key_no_fallback_set() {
-        env_set!("LOOPCTL_TEST_KEY_ONLY", "only-val");
+        let env = EnvGuard::acquire(&["LOOPCTL_TEST_KEY_ONLY"]);
+        env.set("LOOPCTL_TEST_KEY_ONLY", "only-val");
         let key = require_api_key("LOOPCTL_TEST_KEY_ONLY", None).unwrap();
         assert_eq!(key, "only-val");
-        env_remove!("LOOPCTL_TEST_KEY_ONLY");
     }
 
-    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
+    #[cfg(all(
+        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        feature = "testing"
+    ))]
     #[test]
     fn require_api_key_errors_when_missing() {
-        env_remove!("LOOPCTL_TEST_MISSING_KEY");
+        let env = EnvGuard::acquire(&["LOOPCTL_TEST_MISSING_KEY"]);
+        env.remove("LOOPCTL_TEST_MISSING_KEY");
         let err = require_api_key("LOOPCTL_TEST_MISSING_KEY", None).unwrap_err();
         assert!(err.to_string().contains("LOOPCTL_TEST_MISSING_KEY"));
     }
 
-    #[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
+    #[cfg(all(
+        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        feature = "testing"
+    ))]
     #[test]
     fn require_api_key_errors_when_both_missing() {
-        env_remove!("LOOPCTL_TEST_MISSING_A");
-        env_remove!("LOOPCTL_TEST_MISSING_B");
+        let env = EnvGuard::acquire(&["LOOPCTL_TEST_MISSING_A", "LOOPCTL_TEST_MISSING_B"]);
+        env.remove("LOOPCTL_TEST_MISSING_A");
+        env.remove("LOOPCTL_TEST_MISSING_B");
         let err =
             require_api_key("LOOPCTL_TEST_MISSING_A", Some("LOOPCTL_TEST_MISSING_B")).unwrap_err();
         assert!(err.to_string().contains("LOOPCTL_TEST_MISSING_A"));
     }
 
-    #[cfg(feature = "ollama")]
+    #[cfg(all(feature = "ollama", feature = "testing"))]
     #[test]
     fn ollama_client_builds_with_defaults() {
         use crate::api::ApiClient;
-        env_remove!("OLLAMA_BASE_URL");
+        let env = EnvGuard::acquire(&["OLLAMA_BASE_URL"]);
+        env.remove("OLLAMA_BASE_URL");
         let client = ollama("llama3").unwrap();
         assert_eq!(client.model(), "llama3");
     }
 
-    #[cfg(feature = "ollama")]
+    #[cfg(all(feature = "ollama", feature = "testing"))]
     #[test]
     fn ollama_client_respects_base_url_env() {
         use crate::api::ApiClient;
-        env_set!("OLLAMA_BASE_URL", "http://my-host:1234/v1");
+        let env = EnvGuard::acquire(&["OLLAMA_BASE_URL"]);
+        env.set("OLLAMA_BASE_URL", "http://my-host:1234/v1");
         let client = ollama("test-model").unwrap();
         assert_eq!(client.model(), "test-model");
-        env_remove!("OLLAMA_BASE_URL");
     }
 
-    #[cfg(feature = "ollama")]
+    #[cfg(all(feature = "ollama", feature = "testing"))]
     #[test]
     fn ollama_client_uses_api_key_when_set() {
         use crate::api::ApiClient;
-        env_remove!("OLLAMA_BASE_URL");
-        env_set!("OLLAMA_API_KEY", "my-cloud-key");
+        let env = EnvGuard::acquire(&["OLLAMA_BASE_URL", "OLLAMA_API_KEY"]);
+        env.remove("OLLAMA_BASE_URL");
+        env.set("OLLAMA_API_KEY", "my-cloud-key");
         // Should build successfully with the cloud key — no network call.
         let client = ollama("llama3").unwrap();
         assert_eq!(client.model(), "llama3");
-        env_remove!("OLLAMA_API_KEY");
     }
 
-    #[cfg(feature = "ollama")]
+    #[cfg(all(feature = "ollama", feature = "testing"))]
     #[test]
     fn ollama_client_defaults_to_local_without_key() {
         use crate::api::ApiClient;
-        env_remove!("OLLAMA_BASE_URL");
-        env_remove!("OLLAMA_API_KEY");
+        let env = EnvGuard::acquire(&["OLLAMA_BASE_URL", "OLLAMA_API_KEY"]);
+        env.remove("OLLAMA_BASE_URL");
+        env.remove("OLLAMA_API_KEY");
         // Should still build — local Ollama doesn't need a real key.
         let client = ollama("llama3").unwrap();
         assert_eq!(client.model(), "llama3");
@@ -1328,15 +1343,14 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "zai")]
+    #[cfg(all(feature = "zai", feature = "testing"))]
     #[test]
     fn zai_default_model_matches_the_documented_default() {
         use crate::api::ApiClient;
 
-        unsafe {
-            std::env::set_var("ZAI_API_KEY", "test-key");
-            std::env::remove_var("ZAI_MODEL");
-        }
+        let env = EnvGuard::acquire(&["ZAI_API_KEY", "ZAI_MODEL"]);
+        env.set("ZAI_API_KEY", "test-key");
+        env.remove("ZAI_MODEL");
         let client = zai().expect("client builds with the test key");
         assert_eq!(
             client.model(),

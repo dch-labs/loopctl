@@ -165,7 +165,7 @@ pub enum StreamEvent {
     /// Emitted before any [`IndexedDelta`] events for this part.
     /// May contain a partial [`MessagePart`] for tool-call parts
     /// where the `id` and `name` are known upfront. For text parts,
-    /// the [`PartStart::part`] field will be `None`.
+    /// the [`PartStart::part`] field carries an empty text part; `None` marks a reasoning lane.
     PartStart(PartStart),
 
     /// A delta (incremental update) for the current part.
@@ -179,11 +179,24 @@ pub enum StreamEvent {
 
     /// The end of the current part.
     ///
-    /// Signals that all [`IndexedDelta`] events for this part
-    /// have been sent. No payload is attached. Consumers should
-    /// finalize the in-progress part (e.g. parse accumulated JSON
-    /// for tool-call parts) when this event is received.
-    PartStop,
+    /// Signals that all [`IndexedDelta`] events for this part have been
+    /// sent. The `index` names the lane being closed, as carried by the
+    /// matching [`PartStart`](StreamEvent::PartStart) — the accumulator
+    /// closes the open slot carrying that index (the first such slot when
+    /// two lanes share an index; each flushes by its own kind, so the
+    /// contents survive regardless of which one closes first). `None`
+    /// (third-party emitters, and events serialized before the index
+    /// existed) closes the oldest open slot, the legacy FIFO behavior.
+    /// Consumers should finalize the in-progress part (e.g. parse
+    /// accumulated JSON for tool-call parts) when this event is received.
+    PartStop {
+        /// Index of the lane being closed, as carried by the matching
+        /// [`PartStart`](StreamEvent::PartStart).
+        ///
+        /// `None` closes the oldest open slot (legacy FIFO behavior).
+        #[serde(default)]
+        index: Option<usize>,
+    },
 
     /// A delta update for the message itself (contains stop reason).
     ///
@@ -305,8 +318,8 @@ pub struct MessageMetadata {
 /// use loopctl::message::MessagePart;
 /// use serde_json::Value;
 ///
-/// // Text part start — type is implicit
-/// let text_start = PartStart { index: 0, part: None };
+/// // Text part start — carries an empty text part
+/// let text_start = PartStart { index: 0, part: Some(MessagePart::text("")) };
 ///
 /// // Tool-call part start — id and name are provided
 /// let tool_start = PartStart {
@@ -318,26 +331,36 @@ pub struct MessageMetadata {
 pub struct PartStart {
     /// Zero-based index of this part within the message.
     ///
-    /// Sequentially assigned by the API. Used to correlate
-    /// [`IndexedDelta`] events with the correct part.
-    /// Indices are monotonically increasing within a single stream.
+    /// Assigned by the API and used, together with the lane's kind,
+    /// to correlate [`IndexedDelta`] events with the correct slot:
+    /// indices may be reused across text, thinking, and tool lanes
+    /// (a text lane and a first tool call can both carry index 0),
+    /// so a slot is identified by the pair, not the index alone.
     pub index: usize,
 
     /// The part, if known at start time.
     ///
     /// `Some` for tool-call parts (so the `id` and `name` are
-    /// available immediately). `None` for text parts, where
-    /// the type is inferred from subsequent [`DeltaPart::Text`]
-    /// deltas. The [`StreamAccumulator`] uses this to seed the
-    /// tool ID and name before deltas arrive.
+    /// available immediately) and for text parts (an empty text
+    /// part — the lane's kind is fixed here, not inferred from
+    /// later deltas). `None` marks a reasoning lane, which
+    /// accumulates [`Thinking`] fragments that flush nothing on
+    /// close. The [`StreamAccumulator`] uses this to pick the
+    /// slot's kind and to seed the tool ID and name before deltas
+    /// arrive.
+    ///
+    /// [`Thinking`]: crate::stream::DeltaPart::Thinking
     pub part: Option<MessagePart>,
 }
 
 /// A delta (incremental update) for the current part.
 ///
 /// Carries a [`DeltaPart`] payload that should be appended to the
-/// in-progress part identified by [`index`](Self::index).
-/// Multiple deltas may arrive for a single part.
+/// in-progress part identified by [`index`](Self::index) together
+/// with the lane kind matching the payload — indices may be reused
+/// across text, thinking, and tool lanes, and the
+/// [`StreamAccumulator`] routes by that pair. Multiple deltas may
+/// arrive for a single part.
 ///
 /// # Example
 ///
@@ -354,16 +377,17 @@ pub struct IndexedDelta {
     /// Zero-based index of the part being updated.
     ///
     /// Matches the [`index`](PartStart::index) from the
-    /// corresponding [`PartStart`] event. All deltas with
-    /// the same index belong to the same part.
+    /// corresponding [`PartStart`] event. Deltas sharing an index
+    /// may belong to different lanes when the index is reused
+    /// across kinds; the payload's kind disambiguates.
     pub index: usize,
 
     /// The incremental content to append.
     ///
     /// See [`DeltaPart`] for the possible payload types. The
-    /// [`StreamAccumulator`] appends text fragments to
-    /// [`current_text`](StreamAccumulator) and JSON fragments to
-    /// [`current_tool_input`](StreamAccumulator) based on this value.
+    /// [`StreamAccumulator`] routes each fragment to the open slot
+    /// matching this event's `index` and the payload's lane kind,
+    /// appending it to that slot's buffer.
     pub delta: DeltaPart,
 }
 
@@ -863,8 +887,9 @@ pub struct StreamAccumulator {
     /// all at the terminal `finish_reason`. Each
     /// [`PartStart`](StreamEvent::PartStart) pushes a new slot;
     /// [`IndexedDelta`](StreamEvent::IndexedDelta) routes to the slot
-    /// whose `index` matches; [`PartStop`](StreamEvent::PartStop)
-    /// flushes the oldest slot still open.
+    /// matching both its `index` and its lane kind;
+    /// [`PartStop`](StreamEvent::PartStop) closes the slot its `index`
+    /// names, or the oldest open slot when the index is `None`.
     open: Vec<OpenPart>,
 
     /// The model name that produced this response.
@@ -893,7 +918,7 @@ enum OpenPartKind {
     /// Assistant text, reconstructed from `delta.content` fragments.
     ///
     /// The default lane: a [`PartStart`](StreamEvent::PartStart) that
-    /// carries no tool-call part opens a text slot, and its buffered
+    /// carries a text part opens a text slot, and its buffered
     /// string becomes a [`MessagePart::Text`] on close.
     #[default]
     Text,
@@ -906,14 +931,27 @@ enum OpenPartKind {
     /// and accumulates the raw JSON arguments string; on close it parses
     /// that string into the tool-call [`MessagePart::ToolCall`] input.
     Tool,
+
+    /// A reasoning lane, opened by a [`PartStart`](StreamEvent::PartStart)
+    /// that carries no part.
+    ///
+    /// Reasoning is stream-only in this crate — there is no thinking
+    /// [`MessagePart`] — so the slot accumulates its fragments and flushes
+    /// nothing on close. The kind exists so [`Thinking`] deltas have a lane
+    /// of their own: without it, providers that index the reasoning lane
+    /// alongside tool-call wire indices would let one lane's deltas land in
+    /// the other's buffers.
+    ///
+    /// [`Thinking`]: crate::stream::DeltaPart::Thinking
+    Thinking,
 }
 
 /// A single in-progress part being accumulated between open and close.
 ///
-/// Holds the buffers for one lane — assistant text or a tool call —
-/// from the [`PartStart`](StreamEvent::PartStart) that opens it to the
-/// [`PartStop`](StreamEvent::PartStop) that flushes it. The
-/// [`StreamAccumulator`] keeps a [`Vec`] of these so that providers
+/// Holds the buffers for one lane — assistant text, a tool call, or a
+/// reasoning lane — from the [`PartStart`](StreamEvent::PartStart) that
+/// opens it to the [`PartStop`](StreamEvent::PartStop) that flushes it.
+/// The [`StreamAccumulator`] keeps a [`Vec`] of these so that providers
 /// which leave several parts open at once (OpenAI's interleaved parallel
 /// tool calls) accumulate each one independently.
 #[derive(Debug, Default)]
@@ -939,6 +977,15 @@ struct OpenPart {
     /// flushed into a [`MessagePart::Text`] on close. Empty and unused
     /// for tool-call slots.
     text: String,
+
+    /// Buffered reasoning text for a thinking-lane slot.
+    ///
+    /// Grown one fragment at a time by [`DeltaPart::Thinking`] deltas.
+    /// Reasoning is stream-only in this crate — there is no thinking
+    /// [`MessagePart`] — so the buffer is discarded on close; it exists so
+    /// the fragments have somewhere kind-correct to land. Empty and unused
+    /// for text and tool-call slots.
+    thinking: String,
 
     /// Server-assigned identifier of the tool call.
     ///
@@ -992,12 +1039,16 @@ impl StreamAccumulator {
     /// so that providers which leave several parts open at once — OpenAI
     /// interleaves parallel tool calls — accumulate each one
     /// independently. Each [`PartStart`](StreamEvent::PartStart) opens a
-    /// new slot keyed by its `index`; each
-    /// [`IndexedDelta`](StreamEvent::IndexedDelta) routes to the matching
-    /// slot; each [`PartStop`](StreamEvent::PartStop) flushes the oldest
-    /// open slot (FIFO by `PartStart` arrival order). Providers that only
-    /// ever hold one slot open (Anthropic, Gemini) behave exactly as on a
-    /// single-slot accumulator.
+    /// new slot keyed by its `index` and lane kind; each
+    /// [`IndexedDelta`](StreamEvent::IndexedDelta) routes to the open slot
+    /// matching both its index and its kind — text fragments only enter
+    /// text slots, tool-argument fragments only enter tool slots, so a
+    /// reused index across lanes cannot corrupt either; each
+    /// [`PartStop`](StreamEvent::PartStop) closes the slot its `index`
+    /// names, or the oldest open slot when the index is `None` (legacy
+    /// FIFO, kept for third-party emitters and pre-index events).
+    /// Providers that only ever hold one slot open (Anthropic, Gemini)
+    /// behave exactly as on a single-slot accumulator.
     ///
     /// # Arguments
     ///
@@ -1010,10 +1061,11 @@ impl StreamAccumulator {
     ///   slot for the given `index` (text or tool call, decided by the
     ///   carried part). Several slots may be open at once.
     /// - [`IndexedDelta`](StreamEvent::IndexedDelta) — Routes the
-    ///   fragment to the open slot whose `index` matches and appends it
-    ///   to that slot's buffer.
-    /// - [`PartStop`](StreamEvent::PartStop) — Flushes the oldest
-    ///   still-open slot into a finished [`MessagePart`] and drops it.
+    ///   fragment to the open slot matching both its `index` and its kind
+    ///   (text, tool, or thinking) and appends it to that slot's buffer.
+    /// - [`PartStop`](StreamEvent::PartStop) — Flushes the slot its
+    ///   `index` names (or the oldest still-open slot when the index is
+    ///   `None`) into a finished [`MessagePart`] and drops it.
     /// - [`MessageDelta`](StreamEvent::MessageDelta) — Captures usage statistics.
     /// - [`MessageStop`](StreamEvent::MessageStop) / [`Ping`](StreamEvent::Ping) — Ignored.
     ///
@@ -1022,6 +1074,7 @@ impl StreamAccumulator {
     /// ```rust
     /// use loopctl::stream::{StreamAccumulator, StreamEvent, MessageStart, MessageMetadata,
     ///     PartStart, IndexedDelta, DeltaPart};
+    /// use loopctl::message::MessagePart;
     ///
     /// let mut acc = StreamAccumulator::new();
     /// let start = MessageStart {
@@ -1032,7 +1085,7 @@ impl StreamAccumulator {
     ///     },
     /// };
     /// acc.process(&StreamEvent::MessageStart(start)).unwrap();
-    /// acc.process(&StreamEvent::PartStart(PartStart { index: 0, part: None })).unwrap();
+    /// acc.process(&StreamEvent::PartStart(PartStart { index: 0, part: Some(MessagePart::text("")) })).unwrap();
     /// let delta = IndexedDelta {
     ///     index: 0,
     ///     delta: DeltaPart::Text { text: "hi".to_string() },
@@ -1055,7 +1108,8 @@ impl StreamAccumulator {
             StreamEvent::PartStart(part_start) => {
                 let kind = match &part_start.part {
                     Some(MessagePart::ToolCall { .. }) => OpenPartKind::Tool,
-                    _ => OpenPartKind::Text,
+                    Some(_) => OpenPartKind::Text,
+                    None => OpenPartKind::Thinking,
                 };
                 let mut slot = OpenPart {
                     index: part_start.index,
@@ -1070,7 +1124,16 @@ impl StreamAccumulator {
                 Ok(())
             }
             StreamEvent::IndexedDelta(delta) => {
-                let Some(slot) = self.open.iter_mut().find(|s| s.index == delta.index) else {
+                let kind = match &delta.delta {
+                    DeltaPart::InputJson { .. } | DeltaPart::ToolCall { .. } => OpenPartKind::Tool,
+                    DeltaPart::Text { .. } => OpenPartKind::Text,
+                    DeltaPart::Thinking { .. } => OpenPartKind::Thinking,
+                };
+                let Some(slot) = self
+                    .open
+                    .iter_mut()
+                    .find(|s| s.kind == kind && s.index == delta.index)
+                else {
                     return Ok(());
                 };
                 match &delta.delta {
@@ -1085,38 +1148,37 @@ impl StreamAccumulator {
                             slot.tool_input.push_str(s);
                         }
                     }
-                    DeltaPart::Thinking { .. } => {}
+                    DeltaPart::Thinking { text } => {
+                        slot.thinking.push_str(text);
+                    }
                 }
                 Ok(())
             }
-            StreamEvent::PartStop => {
-                let Some(slot) = self.open.first_mut() else {
+            StreamEvent::PartStop { index } => {
+                let pos = match index {
+                    Some(i) => self.open.iter().position(|s| s.index == *i),
+                    None => (!self.open.is_empty()).then_some(0),
+                };
+                let Some(pos) = pos else {
                     return Ok(());
                 };
+                let slot = self.open.remove(pos);
                 let flushed = match slot.kind {
                     OpenPartKind::Text if !slot.text.is_empty() => {
-                        Some(MessagePart::text(std::mem::take(&mut slot.text)))
+                        Some(MessagePart::text(slot.text))
                     }
                     OpenPartKind::Tool if !slot.tool_name.is_empty() => {
                         let input: Value = if slot.tool_input.is_empty() {
                             Value::Object(serde_json::Map::new())
                         } else {
                             serde_json::from_str(&slot.tool_input).map_err(|e| {
-                                StreamError::InvalidToolInputJson(
-                                    e,
-                                    std::mem::take(&mut slot.tool_input),
-                                )
+                                StreamError::InvalidToolInputJson(e, slot.tool_input.clone())
                             })?
                         };
-                        Some(MessagePart::tool_call(
-                            std::mem::take(&mut slot.tool_id),
-                            std::mem::take(&mut slot.tool_name),
-                            input,
-                        ))
+                        Some(MessagePart::tool_call(slot.tool_id, slot.tool_name, input))
                     }
                     _ => None,
                 };
-                self.open.remove(0);
                 if let Some(part) = flushed {
                     self.completed.push(part);
                 }
@@ -1269,7 +1331,7 @@ mod tests {
         .unwrap();
         acc.process(&StreamEvent::PartStart(PartStart {
             index: 0,
-            part: None,
+            part: Some(crate::message::MessagePart::text("")),
         }))
         .unwrap();
         acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
@@ -1286,7 +1348,7 @@ mod tests {
             },
         }))
         .unwrap();
-        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
         acc.process(&StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some("end_turn".to_string()),
@@ -1321,7 +1383,7 @@ mod tests {
             },
         }))
         .unwrap();
-        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
 
         let msg = acc.build();
         assert_eq!(msg.parts.len(), 1);
@@ -1380,8 +1442,8 @@ mod tests {
             },
         }))
         .unwrap();
-        acc.process(&StreamEvent::PartStop).unwrap();
-        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
 
         let msg = acc.build();
         assert_eq!(msg.parts.len(), 2);
@@ -1423,7 +1485,7 @@ mod tests {
     fn test_stream_event_variants() {
         let _ = StreamEvent::Ping;
         let _ = StreamEvent::MessageStop;
-        let _ = StreamEvent::PartStop;
+        let _ = StreamEvent::PartStop { index: None };
     }
 
     #[test]
@@ -1446,7 +1508,7 @@ mod tests {
         }))
         .unwrap();
 
-        let result = acc.process(&StreamEvent::PartStop);
+        let result = acc.process(&StreamEvent::PartStop { index: None });
         assert!(result.is_err());
         let err = result.unwrap_err();
         match &err {
@@ -1468,7 +1530,7 @@ mod tests {
             )),
         }))
         .unwrap();
-        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
 
         let msg = acc.build();
         assert_eq!(msg.parts.len(), 1);
@@ -1501,7 +1563,7 @@ mod tests {
         }))
         .unwrap();
 
-        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
 
         let msg = acc.build();
         assert_eq!(msg.parts.len(), 1);
@@ -1526,7 +1588,7 @@ mod tests {
         }))
         .unwrap();
 
-        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
 
         let msg = acc.build();
         assert!(msg.parts.is_empty());
@@ -1549,7 +1611,7 @@ mod tests {
         }))
         .unwrap();
 
-        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
 
         let msg = acc.build();
         assert_eq!(msg.parts.len(), 1);
@@ -1577,7 +1639,7 @@ mod tests {
         }))
         .unwrap();
 
-        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
 
         let msg = acc.build();
         assert_eq!(msg.parts.len(), 1);
@@ -1608,7 +1670,7 @@ mod tests {
             delta: DeltaPart::Text { text: "hi".into() },
         }))
         .unwrap();
-        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
         acc.process(&StreamEvent::MessageStop).unwrap();
 
         let msg = acc.build();
@@ -1632,7 +1694,7 @@ mod tests {
             },
         }))
         .unwrap();
-        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
 
         acc.process(&StreamEvent::PartStart(PartStart {
             index: 1,
@@ -1646,7 +1708,7 @@ mod tests {
             },
         }))
         .unwrap();
-        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
 
         let msg = acc.build();
         assert_eq!(msg.parts.len(), 2);
@@ -1694,7 +1756,7 @@ mod tests {
             },
         }))
         .unwrap();
-        acc.process(&StreamEvent::PartStop).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
         let msg = acc.build();
         let text = msg.parts.iter().find_map(|p| match p {
             MessagePart::Text { text } => Some(text.as_str()),
@@ -1704,6 +1766,242 @@ mod tests {
             !text.unwrap_or("").contains("reasoning here"),
             "reasoning must not leak into the message text: {text:?}"
         );
+    }
+
+    #[test]
+    fn input_json_never_enters_text_slot() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("")),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "answer".into(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::InputJson {
+                partial_json: r#"{"msg":"hi"}"#.into(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop { index: Some(0) })
+            .unwrap();
+        let msg = acc.build();
+        assert_eq!(
+            msg.parts.len(),
+            1,
+            "tool-argument deltas must not open or flush extra parts"
+        );
+        match &msg.parts[0] {
+            MessagePart::Text { text } => assert_eq!(text, "answer"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn addressed_part_stop_closes_named_slot() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::tool_call("call_a", "echo", Value::Null)),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 1,
+            part: Some(MessagePart::tool_call("call_b", "search", Value::Null)),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 1,
+            delta: DeltaPart::InputJson {
+                partial_json: r#"{"q":"rust"}"#.into(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop { index: Some(1) })
+            .unwrap();
+        let msg = acc.build();
+        assert_eq!(
+            msg.parts.len(),
+            1,
+            "the named slot flushes; the still-open slot does not"
+        );
+        match &msg.parts[0] {
+            MessagePart::ToolCall { id, input, .. } => {
+                assert_eq!(id, "call_b");
+                assert_eq!(input, &serde_json::json!({"q": "rust"}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn part_stop_without_index_keeps_fifo() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 3,
+            part: Some(MessagePart::tool_call("call_a", "echo", Value::Null)),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("")),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text { text: "hi".into() },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
+        acc.process(&StreamEvent::PartStop { index: None }).unwrap();
+        let msg = acc.build();
+        assert_eq!(
+            msg.parts.len(),
+            2,
+            "both slots flush in open order, not index order"
+        );
+        match &msg.parts[0] {
+            MessagePart::ToolCall { id, .. } => assert_eq!(
+                id, "call_a",
+                "the first-opened slot closes first regardless of its index"
+            ),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match &msg.parts[1] {
+            MessagePart::Text { text } => assert_eq!(text, "hi"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn part_stop_deserializes_without_index_for_back_compat() {
+        let legacy: StreamEvent = serde_json::from_str(r#"{"type":"part_stop"}"#)
+            .expect("events serialized before the index existed must still load");
+        assert!(
+            matches!(legacy, StreamEvent::PartStop { index: None }),
+            "a missing index deserializes as the legacy FIFO close"
+        );
+        let addressed: StreamEvent = serde_json::from_str(r#"{"type":"part_stop","index":2}"#)
+            .expect("the addressed form must load");
+        assert!(matches!(
+            addressed,
+            StreamEvent::PartStop { index: Some(2) }
+        ));
+        let round: StreamEvent =
+            serde_json::from_str(&serde_json::to_string(&addressed).unwrap()).unwrap();
+        assert!(
+            matches!(round, StreamEvent::PartStop { index: Some(2) }),
+            "the addressed form must survive a serialize/deserialize round trip"
+        );
+    }
+
+    #[test]
+    fn addressed_part_stop_for_unknown_index_is_a_noop() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("")),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text { text: "hi".into() },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop { index: Some(7) })
+            .unwrap();
+        let msg = acc.build();
+        assert!(
+            msg.parts.is_empty(),
+            "a stop naming no open slot closes nothing; the still-open slot drops at build"
+        );
+    }
+
+    #[test]
+    fn addressed_stop_closes_oldest_slot_at_shared_index() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 1,
+            part: None,
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 1,
+            part: Some(MessagePart::tool_call("call_b", "search", Value::Null)),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop { index: Some(1) })
+            .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 1,
+            delta: DeltaPart::InputJson {
+                partial_json: r#"{"q":"rust"}"#.into(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop { index: Some(1) })
+            .unwrap();
+        let msg = acc.build();
+        assert_eq!(
+            msg.parts.len(),
+            1,
+            "the first close hits the older thinking slot; the tool slot stays open for its deltas"
+        );
+        match &msg.parts[0] {
+            MessagePart::ToolCall { input, .. } => assert_eq!(
+                input,
+                &serde_json::json!({"q": "rust"}),
+                "arguments arriving after the shared-index close must still land in the tool slot"
+            ),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_delta_never_enters_tool_slot() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::tool_call("call_1", "echo", Value::Null)),
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "stray narration".into(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::InputJson {
+                partial_json: r#"{"msg":"hi"}"#.into(),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop { index: Some(0) })
+            .unwrap();
+        let msg = acc.build();
+        assert_eq!(
+            msg.parts.len(),
+            1,
+            "a text delta must not open or flush an extra part in a tool lane"
+        );
+        match &msg.parts[0] {
+            MessagePart::ToolCall { input, .. } => assert_eq!(
+                input,
+                &serde_json::json!({"msg": "hi"}),
+                "the tool arguments must be untouched by the stray text delta"
+            ),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
     }
 
     #[test]

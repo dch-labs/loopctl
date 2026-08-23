@@ -1001,9 +1001,9 @@ impl StreamEmitter {
     /// Gemini can interleave text, thought (`thought: true`), and
     /// `functionCall` parts within a single chunk. This method walks the
     /// parts array in order and routes each to its lane, closing the
-    /// previous lane first when switching — the downstream accumulator
-    /// keys on a single active index, so failing to close would let
-    /// deltas for one lane clobber the other's buffered state.
+    /// previous lane first when switching — at most one content lane is
+    /// ever open, so a lane left open behind a switch could share its
+    /// part index with a later tool call and make closing ambiguous.
     fn extract_parts_with_tools(&mut self, json: &Value) {
         let Some(parts) = json
             .pointer("/candidates/0/content/parts")
@@ -1034,7 +1034,9 @@ impl StreamEmitter {
             if is_thought {
                 if matches!(self.text, PartLane::Open) {
                     self.text = PartLane::Closed;
-                    self.push(StreamEvent::PartStop);
+                    self.push(StreamEvent::PartStop {
+                        index: Some(TEXT_PART_INDEX),
+                    });
                 }
                 if matches!(self.thinking, PartLane::Closed) {
                     self.thinking = PartLane::Open;
@@ -1052,7 +1054,9 @@ impl StreamEmitter {
             } else {
                 if matches!(self.thinking, PartLane::Open) {
                     self.thinking = PartLane::Closed;
-                    self.push(StreamEvent::PartStop);
+                    self.push(StreamEvent::PartStop {
+                        index: Some(THINKING_PART_INDEX),
+                    });
                 }
                 if matches!(self.text, PartLane::Closed) {
                     self.text = PartLane::Open;
@@ -1098,11 +1102,15 @@ impl StreamEmitter {
 
         if matches!(self.thinking, PartLane::Open) {
             self.thinking = PartLane::Closed;
-            self.push(StreamEvent::PartStop);
+            self.push(StreamEvent::PartStop {
+                index: Some(THINKING_PART_INDEX),
+            });
         }
         if matches!(self.text, PartLane::Open) {
             self.text = PartLane::Closed;
-            self.push(StreamEvent::PartStop);
+            self.push(StreamEvent::PartStop {
+                index: Some(TEXT_PART_INDEX),
+            });
         }
 
         let idx = self.next_tool_index;
@@ -1122,7 +1130,7 @@ impl StreamEmitter {
                 partial_json: args_str,
             },
         }));
-        self.push(StreamEvent::PartStop);
+        self.push(StreamEvent::PartStop { index: Some(idx) });
     }
 
     /// Extract the finish reason from the chunk and emit stop events.
@@ -1157,12 +1165,16 @@ impl StreamEmitter {
 
         if matches!(self.thinking, PartLane::Open) {
             self.thinking = PartLane::Closed;
-            self.push(StreamEvent::PartStop);
+            self.push(StreamEvent::PartStop {
+                index: Some(THINKING_PART_INDEX),
+            });
         }
 
         if matches!(self.text, PartLane::Open) {
             self.text = PartLane::Closed;
-            self.push(StreamEvent::PartStop);
+            self.push(StreamEvent::PartStop {
+                index: Some(TEXT_PART_INDEX),
+            });
         }
 
         let usage = json.pointer("/usageMetadata").and_then(|u| {
@@ -1831,10 +1843,9 @@ mod tests {
     #[test]
     fn emitter_thought_and_text_parts_interleave() {
         // Gemini interleaves thought and text parts in the same parts[] array.
-        // When the lane changes the emitter closes the previous lane with a
-        // PartStop before opening the next, so the downstream accumulator
-        // (single active index) never sees one lane's deltas clobber the
-        // other's buffered state.
+        // When the lane changes the emitter closes the previous lane with an
+        // addressed PartStop before opening the next, keeping at most one
+        // content lane open at any time.
         let mut em = StreamEmitter::default();
         em.started = true;
 
@@ -1874,7 +1885,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, StreamEvent::PartStop))
+                .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
                 .count(),
             1,
             "lane switch must close the thinking lane"
@@ -1899,7 +1910,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, StreamEvent::PartStop))
+                .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
                 .count(),
             1,
             "lane switch must close the text lane"
@@ -1924,7 +1935,9 @@ mod tests {
         let events = em.drain();
         // The thinking lane was open; finish must close it with a PartStop.
         assert!(
-            events.iter().any(|e| matches!(e, StreamEvent::PartStop)),
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::PartStop { .. })),
             "finish must emit PartStop for the open thinking lane"
         );
     }
@@ -1991,7 +2004,11 @@ mod tests {
             "candidates": [{"finishReason": "STOP"}]
         }));
         let events = em.drain();
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::PartStop)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::PartStop { .. }))
+        );
         assert!(
             matches!(em.text, PartLane::Closed),
             "extract_finish_reason must close the text lane in state, not just emit PartStop"
@@ -2048,7 +2065,7 @@ mod tests {
             .count();
         let first_stops = first
             .iter()
-            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
             .count();
 
         em.process_chunk(&serde_json::json!({
@@ -2090,7 +2107,7 @@ mod tests {
         // the tool PartStart).
         let stops = events
             .iter()
-            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
             .count();
         assert_eq!(stops, 2, "text lane closed + tool part closed");
 
@@ -2109,7 +2126,7 @@ mod tests {
             .expect("Text delta present");
         let stop_idx = events
             .iter()
-            .position(|e| matches!(e, StreamEvent::PartStop))
+            .position(|e| matches!(e, StreamEvent::PartStop { .. }))
             .expect("PartStop present");
         let tool_start_idx = events
             .iter()
@@ -2995,7 +3012,7 @@ mod tests {
 
         let stops = events
             .iter()
-            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
             .count();
         assert_eq!(stops, 2, "each tool call must emit its own PartStop");
     }
@@ -3037,7 +3054,7 @@ mod tests {
                     delta: DeltaPart::InputJson { .. },
                     ..
                 }) => "json_delta",
-                StreamEvent::PartStop => "stop",
+                StreamEvent::PartStop { .. } => "stop",
                 _ => "other",
             })
             .collect();

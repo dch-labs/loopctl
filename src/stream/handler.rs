@@ -2867,7 +2867,7 @@ mod tests {
                     text: "hi".to_string(),
                 },
             })),
-            Ok(StreamEvent::PartStop),
+            Ok(StreamEvent::PartStop { index: None }),
             Ok(StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("end_turn".to_string()),
@@ -5192,7 +5192,7 @@ mod tests {
                             partial_json: "not json".to_string(),
                         },
                     })),
-                    Ok(StreamEvent::PartStop),
+                    Ok(StreamEvent::PartStop { index: None }),
                 ];
                 Box::pin(futures::stream::iter(events))
             }

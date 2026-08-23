@@ -99,7 +99,7 @@ impl MockClient {
                     text: text.to_string(),
                 },
             }),
-            StreamEvent::PartStop,
+            StreamEvent::PartStop { index: None },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("end_turn".to_string()),
@@ -135,7 +135,7 @@ impl MockClient {
                 index: 0,
                 part: Some(MessagePart::tool_call(tool_id, tool_name, tool_input)),
             }),
-            StreamEvent::PartStop,
+            StreamEvent::PartStop { index: None },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("tool_call".to_string()),
@@ -164,7 +164,7 @@ impl MockClient {
                     text: final_text.to_string(),
                 },
             }),
-            StreamEvent::PartStop,
+            StreamEvent::PartStop { index: None },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("end_turn".to_string()),
@@ -189,7 +189,7 @@ impl MockClient {
                 index: idx,
                 part: Some(MessagePart::tool_call(id, name, input.clone())),
             }));
-            tool_events.push(StreamEvent::PartStop);
+            tool_events.push(StreamEvent::PartStop { index: None });
         }
         tool_events.push(StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
@@ -218,7 +218,7 @@ impl MockClient {
                     text: final_text.to_string(),
                 },
             }),
-            StreamEvent::PartStop,
+            StreamEvent::PartStop { index: None },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("end_turn".to_string()),
@@ -243,7 +243,7 @@ impl MockClient {
                 index: 0,
                 part: Some(MessagePart::tool_call(tool_id, tool_name, tool_input)),
             }),
-            StreamEvent::PartStop,
+            StreamEvent::PartStop { index: None },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("tool_call".to_string()),
@@ -274,7 +274,7 @@ impl MockClient {
                     text: text.to_string(),
                 },
             }),
-            StreamEvent::PartStop,
+            StreamEvent::PartStop { index: None },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("max_tokens".to_string()),
@@ -1842,7 +1842,7 @@ async fn test_multiple_tool_calls_in_one_turn() {
                 json!({"message": "first"}),
             )),
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::PartStart(PartStart {
             index: 1,
             part: Some(MessagePart::tool_call(
@@ -1851,7 +1851,7 @@ async fn test_multiple_tool_calls_in_one_turn() {
                 json!({"message": "second"}),
             )),
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some("tool_call".to_string()),
@@ -1903,12 +1903,12 @@ async fn test_mixed_known_unknown_tools_merge_into_one_user_message() {
                 json!({"message": "hi"}),
             )),
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::PartStart(PartStart {
             index: 1,
             part: Some(MessagePart::tool_call("t2", "nonexistent", json!({}))),
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some("tool_call".to_string()),
@@ -1972,7 +1972,7 @@ async fn test_mixed_known_unknown_tools_preserve_request_order() {
             index: 0,
             part: Some(MessagePart::tool_call("t1", "ghost", json!({}))),
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::PartStart(PartStart {
             index: 1,
             part: Some(MessagePart::tool_call(
@@ -1981,12 +1981,12 @@ async fn test_mixed_known_unknown_tools_preserve_request_order() {
                 json!({"message": "mid"}),
             )),
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::PartStart(PartStart {
             index: 2,
             part: Some(MessagePart::tool_call("t3", "phantom", json!({}))),
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some("tool_call".to_string()),
@@ -2119,7 +2119,7 @@ async fn test_text_streamer_ignores_non_text_deltas() {
                 partial_json: "{}".into(),
             },
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some("tool_call".into()),
@@ -2193,7 +2193,7 @@ async fn test_on_text_delta_fires_per_sse_chunk_in_order() {
                 text: "world".into(),
             },
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some("end_turn".into()),
@@ -2326,7 +2326,7 @@ async fn test_on_text_delta_ignores_non_text_deltas() {
                 partial_json: "{}".into(),
             },
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some("tool_call".into()),
@@ -2480,7 +2480,7 @@ async fn test_on_tool_call_received_fires_per_call_for_multiple_calls() {
                 json!({"message": "first"}),
             )),
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::PartStart(PartStart {
             index: 1,
             part: Some(MessagePart::tool_call(
@@ -2489,7 +2489,7 @@ async fn test_on_tool_call_received_fires_per_call_for_multiple_calls() {
                 json!({"message": "second"}),
             )),
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some("tool_call".to_string()),
@@ -2783,7 +2783,7 @@ async fn test_tool_error_is_soft_not_hard() {
             index: 0,
             part: Some(MessagePart::tool_call("t1", "nonexistent", json!({}))),
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: None },
         StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some("tool_call".to_string()),
@@ -4022,7 +4022,7 @@ impl RecordingClient {
                     text: text.to_string(),
                 },
             }),
-            StreamEvent::PartStop,
+            StreamEvent::PartStop { index: None },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("end_turn".to_string()),
@@ -4060,7 +4060,7 @@ impl RecordingClient {
                 index: 0,
                 part: Some(MessagePart::tool_call(tool_id, tool_name, tool_input)),
             }),
-            StreamEvent::PartStop,
+            StreamEvent::PartStop { index: None },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("tool_call".to_string()),
@@ -4089,7 +4089,7 @@ impl RecordingClient {
                     text: final_text.to_string(),
                 },
             }),
-            StreamEvent::PartStop,
+            StreamEvent::PartStop { index: None },
             StreamEvent::MessageDelta(MessageDelta {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("end_turn".to_string()),
@@ -4658,7 +4658,7 @@ async fn test_on_thinking_delta_fires_per_thinking_delta() {
                 text: " chunk".into(),
             },
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: Some(1) },
         StreamEvent::PartStart(PartStart {
             index: 0,
             part: Some(MessagePart::text("ignored")),
@@ -4669,7 +4669,7 @@ async fn test_on_thinking_delta_fires_per_thinking_delta() {
                 text: "final answer".into(),
             },
         }),
-        StreamEvent::PartStop,
+        StreamEvent::PartStop { index: Some(0) },
         StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
                 stop_reason: Some("end_turn".into()),

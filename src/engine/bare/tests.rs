@@ -3924,15 +3924,18 @@ async fn run_cancel_during_recovery_backoff_returns_fast() {
 
 #[tokio::test]
 #[cfg(feature = "streaming")]
-async fn test_rate_limit_escalation_feeds_circuit_breaker() {
-    use crate::fallback::FallbackManager;
+async fn escalation_trips_from_primary_state() {
+    use crate::fallback::{FallbackManager, FallbackState};
     use crate::managers::LoopManagers;
     use crate::stream::handler::{RateLimitConfig, StreamHandler, StreamTimeoutConfig};
 
-    // Every stream attempt is rate-limited, so the handler escalates on the
-    // first 429 (fallback_after_retries = 0).
-    struct AlwaysRateLimitClient;
-    impl ApiClient for AlwaysRateLimitClient {
+    // Rate-limited on the first request, healthy text afterwards; the
+    // per-request model override is recorded so the served model is
+    // observable. fallback_after_retries = 0 escalates on the first 429.
+    struct RateLimitThenTextClient {
+        served_models: Arc<Mutex<Vec<Option<String>>>>,
+    }
+    impl ApiClient for RateLimitThenTextClient {
         fn model(&self) -> String {
             "primary-model".to_string()
         }
@@ -3964,6 +3967,51 @@ async fn test_rate_limit_escalation_feeds_circuit_breaker() {
                 })
             })
         }
+        fn stream_messages_with_options(
+            &self,
+            _request: &crate::api::StreamRequest,
+            options: crate::structured::RequestOptions,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+        {
+            crate::error::recover_guard(self.served_models.lock()).push(options.model.clone());
+            if options.model.is_some() {
+                let text = crate::message::MessagePart::text("served by fallback");
+                let events = vec![
+                    Ok(StreamEvent::MessageStart(MessageStart {
+                        message: MessageMetadata {
+                            id: "msg_fb".into(),
+                            role: "assistant".into(),
+                            model: "fallback-model".into(),
+                        },
+                    })),
+                    Ok(StreamEvent::PartStart(PartStart {
+                        index: 0,
+                        part: Some(text),
+                    })),
+                    Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                        index: 0,
+                        delta: crate::stream::DeltaPart::Text {
+                            text: "served by fallback".into(),
+                        },
+                    })),
+                    Ok(StreamEvent::PartStop { index: Some(0) }),
+                    Ok(StreamEvent::MessageDelta(MessageDelta {
+                        delta: crate::stream::MessageDeltaPayload {
+                            stop_reason: Some("end_turn".into()),
+                        },
+                        usage: Some(crate::stream::Usage::new(1, 1)),
+                    })),
+                    Ok(StreamEvent::MessageStop),
+                ];
+                return Box::pin(futures::stream::iter(events));
+            }
+            Box::pin(futures::stream::once(async {
+                Err(ApiError::RateLimit {
+                    retry_after: None,
+                    message: "slow down".into(),
+                })
+            }))
+        }
     }
 
     let handler = StreamHandler::new()
@@ -3978,27 +4026,38 @@ async fn test_rate_limit_escalation_feeds_circuit_breaker() {
             ..Default::default()
         });
 
-    // Circuit breaker: trips on a single model failure (threshold = 1) and
-    // has a fallback model configured.
-    let mut managers = LoopManagers::new().with_fallback(FallbackManager::new_with_fallback(
-        "primary-model".to_string(),
-        1,
-    ));
-    managers.fallback().set_fallback_model("fallback-model");
-    managers.set_stream_handler(handler);
+    let manager = FallbackManager::new(1, 2);
+    manager.set_original_model("primary-model".to_string());
+    manager.set_fallback_model("fallback-model");
+    assert_eq!(
+        manager.state(),
+        FallbackState::Primary,
+        "precondition: the rebuilt manager starts from a clean Primary state"
+    );
+    let managers = LoopManagers::new()
+        .with_fallback(manager)
+        .with_stream_handler(handler);
 
-    let config = make_config();
-    let client = Arc::new(AlwaysRateLimitClient);
-    let mut agent = BareLoop::new_with_managers(client, ToolRegistry::new(), config, managers);
+    let served_models = Arc::new(Mutex::new(Vec::new()));
+    let client = Arc::new(RateLimitThenTextClient {
+        served_models: Arc::clone(&served_models),
+    });
+    let mut agent =
+        BareLoop::new_with_managers(client, ToolRegistry::new(), make_config(), managers);
 
     let result = agent.run("Hi", &RunConfig::default()).await;
     assert!(result.is_err(), "rate-limited turn should fail");
-
-    // The escalation arm called record_model_failure(); with threshold 1 the
-    // breaker tripped into Fallback state.
     assert!(
         agent.managers.fallback().is_using_fallback(),
-        "escalation should trip the circuit breaker to the fallback model"
+        "escalation trips the circuit breaker to the fallback model"
+    );
+
+    let second = agent.run("Hi", &RunConfig::default()).await;
+    assert!(second.is_ok(), "the fallback model serves the next run");
+    assert_eq!(
+        crate::error::recover_guard(served_models.lock())[1],
+        Some("fallback-model".to_string()),
+        "the request after the trip carries the fallback model override"
     );
 }
 

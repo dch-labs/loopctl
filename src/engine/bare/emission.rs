@@ -270,6 +270,8 @@ impl<C: ApiClient> BareLoop<C> {
         if matches!(e, LoopError::Cancelled) {
             return e;
         }
+        let was_in_fallback =
+            self.managers.fallback().state() == crate::fallback::FallbackState::Fallback;
         let tripped = if matches!(e, LoopError::RateLimitEscalation { .. }) {
             self.managers
                 .fallback()
@@ -288,6 +290,10 @@ impl<C: ApiClient> BareLoop<C> {
                     .observers()
                     .on_fallback(&FallbackContext { from, to });
             }
+        }
+
+        if was_in_fallback && let Some(active) = self.managers.fallback().fallback_model() {
+            self.managers.fallback().mark_fallback_failed(&active);
         }
 
         self.managers

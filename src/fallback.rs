@@ -569,44 +569,6 @@ impl FallbackManager {
         }
     }
 
-    /// Create with fallback already activated.
-    ///
-    /// Useful when a new manager should start in the
-    /// [`FallbackState::Fallback`] state — for instance when
-    /// the primary model is already known to be degraded.
-    /// The `original_model` is stored for later recovery via
-    /// [`should_try_resume_primary`](Self::should_try_resume_primary).
-    ///
-    /// # Parameters
-    ///
-    /// * `original_model` — the model name to remember for future recovery.
-    /// * `fallback_threshold` — used for future re-tripping if recovery fails.
-    ///
-    /// # Initial state
-    ///
-    /// - [`fallback_activated`](Self::is_fallback_active) = `true`
-    /// - [`state()`](Self::state) = [`FallbackState::Fallback`]
-    /// - [`consecutive_failures()`](Self::consecutive_failures) = `0`
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use loopctl::fallback::{FallbackManager, FailureKind};
-    ///
-    /// let mgr = FallbackManager::new_with_fallback("llm-70b".into(), 3);
-    /// assert!(mgr.is_using_fallback());
-    /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
-    /// ```
-    #[must_use]
-    pub fn new_with_fallback(original_model: String, fallback_threshold: usize) -> Self {
-        let mgr = Self::new(fallback_threshold, 2);
-        if let Ok(mut state) = mgr.state.lock() {
-            state.original_model = Some(original_model);
-            Self::transition_to_fallback_impl(&mut state);
-        }
-        mgr
-    }
-
     /// Create a new manager with a primary model name.
     ///
     /// The model name is stored as
@@ -706,8 +668,7 @@ impl FallbackManager {
     /// Get the original model name (before fallback).
     ///
     /// Returns the model name stored at construction time via
-    /// [`for_model`](Self::for_model) or
-    /// [`new_with_fallback`](Self::new_with_fallback), or set later
+    /// [`for_model`](Self::for_model), or set later
     /// with [`set_original_model`](Self::set_original_model).
     /// Returns `None` if no model name has been set.
     ///
@@ -783,7 +744,10 @@ impl FallbackManager {
     ///
     /// * `Some(model_name)` — the model the caller should use for the next
     ///   LLM request.
-    /// * `None` — no model has been configured (neither primary nor fallback).
+    /// * `None` — no model has been configured (neither primary nor
+    ///   fallback), or the breaker is open with its entire fallback chain
+    ///   exhausted — the caller should fail rather than retreat to the
+    ///   known-bad primary.
     ///
     /// # Example
     ///
@@ -798,10 +762,11 @@ impl FallbackManager {
         };
         match state.state {
             FallbackState::Primary | FallbackState::Recovering => state.original_model.clone(),
-            FallbackState::Fallback => state
-                .active_fallback
-                .clone()
-                .or_else(|| state.original_model.clone()),
+            FallbackState::Fallback => match &state.active_fallback {
+                Some(model) => Some(model.clone()),
+                None if state.fallback_models.is_empty() => state.original_model.clone(),
+                None => None,
+            },
         }
     }
 
@@ -1057,6 +1022,11 @@ impl FallbackManager {
     /// // active_model skips failed, returns next available
     /// assert_eq!(mgr.fallback_model(), Some("llm-3".to_string()));
     /// ```
+    ///
+    /// The agent loop calls this automatically whenever a turn fails while
+    /// the breaker is already in [`FallbackState::Fallback`] — hosts
+    /// driving the manager directly must call it themselves to advance the
+    /// chain.
     pub fn mark_fallback_failed(&self, model: &str) -> bool {
         let mut found = false;
         if let Ok(mut state) = self.state.lock() {
@@ -1333,7 +1303,7 @@ impl FallbackManager {
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
                 warn!(
-                    "Fallback model \"{fb_name}\" also experiencing failures; consider calling mark_fallback_failed(\"{fb_name}\") to skip it"
+                    "Fallback model \"{fb_name}\" also experiencing failures; the agent loop marks it failed automatically (direct callers of record_failure must call mark_fallback_failed themselves)"
                 );
                 false
             }
@@ -1346,9 +1316,10 @@ impl FallbackManager {
                     false
                 }
                 FailureKind::Transient => {
+                    state.primary_success_count = 0;
                     warn!(
                         consecutive_failures = state.consecutive_failures,
-                        "Transient failure recorded during recovery; staying half-open"
+                        "Transient failure recorded during recovery; success streak reset, staying half-open"
                     );
                     false
                 }
@@ -1505,6 +1476,7 @@ impl FallbackManager {
         state.fallback_activated = true;
         state.fallback_switched_at = Some(Instant::now());
         state.primary_success_count = 0;
+        state.consecutive_failures = 0;
         info!("Circuit breaker: transitioned to Fallback state");
     }
 
@@ -1721,14 +1693,6 @@ mod tests {
     }
 
     #[test]
-    fn test_new_with_fallback() {
-        let mgr = FallbackManager::new_with_fallback("llm-70b".into(), 3);
-        assert!(mgr.is_fallback_active());
-        assert!(mgr.is_using_fallback());
-        assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
-    }
-
-    #[test]
     fn test_reset() {
         let mgr = FallbackManager::new(3, 2);
         for _ in 0..3 {
@@ -1844,10 +1808,15 @@ mod tests {
         mgr.add_fallback_model("fallback-model");
         // Record a failure while in Primary to dirty the counter, then trip.
         mgr.record_failure(FailureKind::Transient);
+        assert!(
+            mgr.consecutive_failures() > 0,
+            "counter is dirty before the trip"
+        );
         mgr.transition_to_fallback();
 
-        // State is dirty.
-        assert!(mgr.consecutive_failures() > 0);
+        // The trip itself resets the failure counter; the switch time is
+        // the remaining dirty state a full reset must clear.
+        assert_eq!(mgr.consecutive_failures(), 0);
         assert!(mgr.fallback_switched_at().is_some());
 
         // Full reset.
@@ -1909,5 +1878,54 @@ mod tests {
     fn with_max_fail_count_clamps_to_minimum_one() {
         let entry = FallbackEntry::new("model-e").with_max_fail_count(0);
         assert_eq!(entry.max_fail_count, 1);
+    }
+
+    #[test]
+    fn consecutive_failures_resets_on_trip() {
+        let mgr = FallbackManager::new(3, 2);
+        assert!(!mgr.record_failure(FailureKind::Transient));
+        assert!(!mgr.record_failure(FailureKind::Transient));
+        assert!(mgr.record_failure(FailureKind::Transient));
+        assert_eq!(mgr.state(), FallbackState::Fallback);
+        assert_eq!(
+            mgr.consecutive_failures(),
+            0,
+            "field doc: reset to 0 on trip"
+        );
+    }
+
+    #[test]
+    fn transient_failure_during_recovery_breaks_success_streak() {
+        let mgr = FallbackManager::new(3, 2);
+        for _ in 0..3 {
+            mgr.record_failure(FailureKind::Transient);
+        }
+        mgr.transition_to_recovering();
+        mgr.record_success();
+        mgr.record_failure(FailureKind::Transient);
+        mgr.record_success();
+        assert_eq!(
+            mgr.state(),
+            FallbackState::Recovering,
+            "field doc: only consecutive successes accumulate toward recovery"
+        );
+    }
+
+    #[test]
+    fn active_model_does_not_return_primary_when_chain_is_exhausted() {
+        let mgr = FallbackManager::for_model("primary");
+        mgr.add_fallback_model("fb1");
+        mgr.add_fallback_model("fb2");
+        mgr.mark_fallback_failed("fb1");
+        mgr.mark_fallback_failed("fb1");
+        mgr.mark_fallback_failed("fb2");
+        mgr.mark_fallback_failed("fb2");
+        mgr.transition_to_fallback();
+        assert_eq!(mgr.state(), FallbackState::Fallback);
+        assert_ne!(
+            mgr.active_model().as_deref(),
+            Some("primary"),
+            "a dedicated fallback is configured; the exhausted chain must not silently route back to the failed primary"
+        );
     }
 }

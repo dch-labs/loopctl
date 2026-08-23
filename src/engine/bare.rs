@@ -71,7 +71,7 @@ use crate::engine::core::{
 
 use crate::error::LoopError;
 
-use crate::capabilities::{Compactable, Detectable};
+use crate::capabilities::{Compactable, Detectable, FallbackCapable};
 use crate::contributor::{ContextContributor, ContributorContext};
 #[cfg(all(test, feature = "hooks"))]
 use crate::hooks::Hook;
@@ -267,6 +267,15 @@ pub struct BareLoop<C: ApiClient> {
     /// [`set_request_options`](BareLoop::set_request_options).
     request_options: RequestOptions,
 
+    /// The model that served the previous turn's request, if the fallback
+    /// manager is configured to route models.
+    ///
+    /// Compared against each turn's routed model so
+    /// [`on_model_switched`](crate::observer::LoopObserver::on_model_switched)
+    /// fires exactly once per model change. `None` until a configured
+    /// manager routes its first request.
+    last_routed_model: Option<String>,
+
     /// How each LLM turn is fulfilled (streaming vs non-streaming).
     ///
     /// Defaults to [`TurnMode::Streaming`] when the `streaming` feature is
@@ -434,6 +443,7 @@ impl<C: ApiClient> BareLoop<C> {
             text_streamer: None,
             contributors: Vec::new(),
             request_options: RequestOptions::default(),
+            last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
             turn_mode: default_turn_mode(),
         }
@@ -615,6 +625,7 @@ impl<C: ApiClient> BareLoop<C> {
             text_streamer: None,
             contributors: Vec::new(),
             request_options: RequestOptions::default(),
+            last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
             turn_mode: default_turn_mode(),
         }
@@ -885,6 +896,18 @@ impl<C: ApiClient> BareLoop<C> {
     /// Propagates [`LoopError::Cancelled`] when the cancel signal fires
     /// mid-stream, or any streaming / loop-detection error.
     async fn handle_call_llm(&mut self, turn: usize) -> Result<(), LoopError> {
+        let fallback = self.managers.fallback();
+        if fallback.state() == crate::fallback::FallbackState::Fallback
+            && fallback.active_model().is_none()
+            && !fallback.fallback_models().is_empty()
+        {
+            return Err(LoopError::FallbackExhausted);
+        }
+        if fallback.should_try_resume_primary(fallback.config().recovery_timeout) {
+            fallback.transition_to_recovering();
+        }
+        self.note_routed_model();
+
         let turn_start = Instant::now();
         let turn_input = self.turn_input(turn);
 

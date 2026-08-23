@@ -678,7 +678,7 @@ impl ApiClient for MockApiClient {
             delta: DeltaPart::Text { text },
         })));
 
-        events.push(Ok(StreamEvent::PartStop));
+        events.push(Ok(StreamEvent::PartStop { index: Some(0) }));
 
         // Tool call content block (if any). Real providers open the tool
         // block with an empty input and stream the arguments as input-json
@@ -699,7 +699,7 @@ impl ApiClient for MockApiClient {
                     partial_json: tc.input.to_string(),
                 },
             })));
-            events.push(Ok(StreamEvent::PartStop));
+            events.push(Ok(StreamEvent::PartStop { index: Some(1) }));
         }
 
         // Message delta with stop reason

@@ -1034,7 +1034,9 @@ impl StreamEmitter {
             if is_thought {
                 if matches!(self.text, PartLane::Open) {
                     self.text = PartLane::Closed;
-                    self.push(StreamEvent::PartStop);
+                    self.push(StreamEvent::PartStop {
+                        index: Some(TEXT_PART_INDEX),
+                    });
                 }
                 if matches!(self.thinking, PartLane::Closed) {
                     self.thinking = PartLane::Open;
@@ -1052,7 +1054,9 @@ impl StreamEmitter {
             } else {
                 if matches!(self.thinking, PartLane::Open) {
                     self.thinking = PartLane::Closed;
-                    self.push(StreamEvent::PartStop);
+                    self.push(StreamEvent::PartStop {
+                        index: Some(THINKING_PART_INDEX),
+                    });
                 }
                 if matches!(self.text, PartLane::Closed) {
                     self.text = PartLane::Open;
@@ -1098,11 +1102,15 @@ impl StreamEmitter {
 
         if matches!(self.thinking, PartLane::Open) {
             self.thinking = PartLane::Closed;
-            self.push(StreamEvent::PartStop);
+            self.push(StreamEvent::PartStop {
+                index: Some(THINKING_PART_INDEX),
+            });
         }
         if matches!(self.text, PartLane::Open) {
             self.text = PartLane::Closed;
-            self.push(StreamEvent::PartStop);
+            self.push(StreamEvent::PartStop {
+                index: Some(TEXT_PART_INDEX),
+            });
         }
 
         let idx = self.next_tool_index;
@@ -1122,7 +1130,7 @@ impl StreamEmitter {
                 partial_json: args_str,
             },
         }));
-        self.push(StreamEvent::PartStop);
+        self.push(StreamEvent::PartStop { index: Some(idx) });
     }
 
     /// Extract the finish reason from the chunk and emit stop events.
@@ -1157,12 +1165,16 @@ impl StreamEmitter {
 
         if matches!(self.thinking, PartLane::Open) {
             self.thinking = PartLane::Closed;
-            self.push(StreamEvent::PartStop);
+            self.push(StreamEvent::PartStop {
+                index: Some(THINKING_PART_INDEX),
+            });
         }
 
         if matches!(self.text, PartLane::Open) {
             self.text = PartLane::Closed;
-            self.push(StreamEvent::PartStop);
+            self.push(StreamEvent::PartStop {
+                index: Some(TEXT_PART_INDEX),
+            });
         }
 
         let usage = json.pointer("/usageMetadata").and_then(|u| {
@@ -1874,7 +1886,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, StreamEvent::PartStop))
+                .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
                 .count(),
             1,
             "lane switch must close the thinking lane"
@@ -1899,7 +1911,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, StreamEvent::PartStop))
+                .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
                 .count(),
             1,
             "lane switch must close the text lane"
@@ -1924,7 +1936,9 @@ mod tests {
         let events = em.drain();
         // The thinking lane was open; finish must close it with a PartStop.
         assert!(
-            events.iter().any(|e| matches!(e, StreamEvent::PartStop)),
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::PartStop { .. })),
             "finish must emit PartStop for the open thinking lane"
         );
     }
@@ -1991,7 +2005,11 @@ mod tests {
             "candidates": [{"finishReason": "STOP"}]
         }));
         let events = em.drain();
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::PartStop)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::PartStop { .. }))
+        );
         assert!(
             matches!(em.text, PartLane::Closed),
             "extract_finish_reason must close the text lane in state, not just emit PartStop"
@@ -2048,7 +2066,7 @@ mod tests {
             .count();
         let first_stops = first
             .iter()
-            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
             .count();
 
         em.process_chunk(&serde_json::json!({
@@ -2090,7 +2108,7 @@ mod tests {
         // the tool PartStart).
         let stops = events
             .iter()
-            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
             .count();
         assert_eq!(stops, 2, "text lane closed + tool part closed");
 
@@ -2109,7 +2127,7 @@ mod tests {
             .expect("Text delta present");
         let stop_idx = events
             .iter()
-            .position(|e| matches!(e, StreamEvent::PartStop))
+            .position(|e| matches!(e, StreamEvent::PartStop { .. }))
             .expect("PartStop present");
         let tool_start_idx = events
             .iter()
@@ -2995,7 +3013,7 @@ mod tests {
 
         let stops = events
             .iter()
-            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
             .count();
         assert_eq!(stops, 2, "each tool call must emit its own PartStop");
     }
@@ -3037,7 +3055,7 @@ mod tests {
                     delta: DeltaPart::InputJson { .. },
                     ..
                 }) => "json_delta",
-                StreamEvent::PartStop => "stop",
+                StreamEvent::PartStop { .. } => "stop",
                 _ => "other",
             })
             .collect();

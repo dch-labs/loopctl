@@ -1216,17 +1216,16 @@ impl StreamEmitter {
     /// does not carry useful information on this event beyond the
     /// implicit close).
     fn on_block_stop(&mut self, _data: Option<Value>) {
-        if self.text_index.is_some() {
-            self.text_index = None;
-            self.push(StreamEvent::PartStop);
+        if let Some(index) = self.text_index.take() {
+            self.push(StreamEvent::PartStop { index: Some(index) });
         } else if self.thinking_part_open {
             self.thinking_part_open = false;
-            self.thinking_index = None;
-            self.push(StreamEvent::PartStop);
+            let index = self.thinking_index.take();
+            self.push(StreamEvent::PartStop { index });
         } else if self.tool_parts_open > 0 {
             self.tool_parts_open = self.tool_parts_open.saturating_sub(1);
-            self.current_tool_index = None;
-            self.push(StreamEvent::PartStop);
+            let index = self.current_tool_index.take();
+            self.push(StreamEvent::PartStop { index });
         }
     }
 
@@ -1307,13 +1306,17 @@ impl StreamEmitter {
     fn on_message_stop(&mut self) {
         self.finished = true;
         if self.thinking_part_open {
-            self.push(StreamEvent::PartStop);
+            self.push(StreamEvent::PartStop {
+                index: self.thinking_index,
+            });
         }
         if self.text_index.is_some() {
-            self.push(StreamEvent::PartStop);
+            self.push(StreamEvent::PartStop {
+                index: self.text_index,
+            });
         }
         for _ in 0..self.tool_parts_open {
-            self.push(StreamEvent::PartStop);
+            self.push(StreamEvent::PartStop { index: None });
         }
         self.thinking_part_open = false;
         self.thinking_index = None;
@@ -1861,7 +1864,7 @@ mod tests {
 
         em.on_block_stop(None);
         let events = em.drain();
-        assert!(matches!(events[0], StreamEvent::PartStop));
+        assert!(matches!(events[0], StreamEvent::PartStop { .. }));
         assert!(em.text_index.is_none());
     }
 
@@ -1894,9 +1897,9 @@ mod tests {
         let events = em.drain();
         // 1 PartStop for text + 2 for tools, then the terminal MessageStop.
         assert_eq!(events.len(), 4);
-        assert!(matches!(events[0], StreamEvent::PartStop));
-        assert!(matches!(events[1], StreamEvent::PartStop));
-        assert!(matches!(events[2], StreamEvent::PartStop));
+        assert!(matches!(events[0], StreamEvent::PartStop { .. }));
+        assert!(matches!(events[1], StreamEvent::PartStop { .. }));
+        assert!(matches!(events[2], StreamEvent::PartStop { .. }));
         assert!(
             matches!(events.last(), Some(StreamEvent::MessageStop)),
             "message_stop must emit the terminal MessageStop after the PartStops: {events:?}"
@@ -2756,7 +2759,7 @@ mod tests {
         let events = em.drain();
 
         assert_eq!(events.len(), 1, "exactly one PartStop");
-        assert!(matches!(events[0], StreamEvent::PartStop));
+        assert!(matches!(events[0], StreamEvent::PartStop { .. }));
         assert!(!em.thinking_part_open, "thinking_part_open reset");
         assert!(em.thinking_index.is_none(), "thinking_index cleared");
     }
@@ -2788,7 +2791,9 @@ mod tests {
 
         // Expected: one PartStop (thinking) then one MessageStop.
         assert!(
-            events.iter().any(|e| matches!(e, StreamEvent::PartStop)),
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::PartStop { .. })),
             "message_stop must emit a PartStop for the open thinking block"
         );
         assert!(
@@ -2807,7 +2812,7 @@ mod tests {
         // Ordering: PartStop before MessageStop.
         let stop_idx = events
             .iter()
-            .position(|e| matches!(e, StreamEvent::PartStop))
+            .position(|e| matches!(e, StreamEvent::PartStop { .. }))
             .expect("PartStop present");
         let msg_stop_idx = events
             .iter()

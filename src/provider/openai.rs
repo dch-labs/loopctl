@@ -1326,7 +1326,9 @@ impl StreamEmitter {
         {
             if matches!(self.thinking, PartLane::Open) {
                 self.thinking = PartLane::Closed;
-                self.push(StreamEvent::PartStop);
+                self.push(StreamEvent::PartStop {
+                    index: Some(THINKING_PART_INDEX),
+                });
             }
             if matches!(self.text, PartLane::Closed) {
                 self.text = PartLane::Open;
@@ -1346,7 +1348,9 @@ impl StreamEmitter {
         {
             if matches!(self.text, PartLane::Open) {
                 self.text = PartLane::Closed;
-                self.push(StreamEvent::PartStop);
+                self.push(StreamEvent::PartStop {
+                    index: Some(TEXT_PART_INDEX),
+                });
             }
             if matches!(self.thinking, PartLane::Closed) {
                 self.thinking = PartLane::Open;
@@ -1364,9 +1368,32 @@ impl StreamEmitter {
         }
 
         if let Some(tool_calls) = &delta.tool_calls {
+            self.close_content_lanes();
             for tc in tool_calls {
                 self.process_tool_call(tc);
             }
+        }
+    }
+
+    /// Close the open text and thinking lanes, if any.
+    ///
+    /// Called before the first tool [`PartStart`](StreamEvent::PartStart) of
+    /// a chunk and at finish: wire tool-call indices and the content-lane
+    /// indices overlap (a text lane at part index 0 versus a first tool call
+    /// at wire index 0), so an open content lane at tool time would share its
+    /// index with a tool lane. Each stop names the lane it closes.
+    fn close_content_lanes(&mut self) {
+        if matches!(self.text, PartLane::Open) {
+            self.text = PartLane::Closed;
+            self.push(StreamEvent::PartStop {
+                index: Some(TEXT_PART_INDEX),
+            });
+        }
+        if matches!(self.thinking, PartLane::Open) {
+            self.thinking = PartLane::Closed;
+            self.push(StreamEvent::PartStop {
+                index: Some(THINKING_PART_INDEX),
+            });
         }
     }
 
@@ -1430,18 +1457,15 @@ impl StreamEmitter {
         }
         self.finished = true;
 
-        if matches!(self.text, PartLane::Open) {
-            self.text = PartLane::Closed;
-            self.push(StreamEvent::PartStop);
-        }
-
-        if matches!(self.thinking, PartLane::Open) {
-            self.thinking = PartLane::Closed;
-            self.push(StreamEvent::PartStop);
-        }
-
-        for _ in 0..self.open_tool_count {
-            self.push(StreamEvent::PartStop);
+        self.close_content_lanes();
+        let open_tool_indices: Vec<usize> = self
+            .seen_tool_indices
+            .iter()
+            .take(self.open_tool_count)
+            .copied()
+            .collect();
+        for index in open_tool_indices {
+            self.push(StreamEvent::PartStop { index: Some(index) });
         }
 
         let stop_reason = match reason {
@@ -2164,6 +2188,152 @@ mod tests {
     }
 
     #[test]
+    fn text_then_tool_call_stream_preserves_tool_arguments() {
+        use crate::stream::StreamAccumulator;
+
+        // The text lane opens at part index 0 and the wire tool index is
+        // also 0 — without addressed lane closing and kind-aware routing
+        // every InputJson fragment lands in the text slot and the tool
+        // executes with `{}`.
+        let mut em = StreamEmitter::default();
+        let mut acc = StreamAccumulator::new();
+        let chunks = [
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"Let me check that."},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
+        ];
+        for raw in chunks {
+            let chunk = OpenAiChunk::parse(raw).unwrap();
+            em.process_chunk(&chunk);
+            for ev in em.drain() {
+                acc.process(&ev).unwrap();
+            }
+        }
+        for ev in em.finish() {
+            acc.process(&ev).unwrap();
+        }
+
+        let msg = acc.build();
+        assert_eq!(
+            msg.parts.len(),
+            2,
+            "the text part and the tool part both flush"
+        );
+        match &msg.parts[0] {
+            MessagePart::Text { text } => assert_eq!(text, "Let me check that."),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match &msg.parts[1] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "echo");
+                assert_eq!(
+                    input,
+                    &serde_json::json!({"msg": "hi"}),
+                    "the tool arguments must survive the text-lane index collision"
+                );
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_then_text_reopen_preserves_both() {
+        use crate::stream::StreamAccumulator;
+
+        // Wire-legal interleaving: content resumes after tool fragments, so
+        // the reopened text lane shares part index 0 with the tool lane.
+        let mut em = StreamEmitter::default();
+        let mut acc = StreamAccumulator::new();
+        let chunks = [
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"echo","arguments":"{\"msg\":"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hi\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"Done, here is what I found."},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
+        ];
+        for raw in chunks {
+            let chunk = OpenAiChunk::parse(raw).unwrap();
+            em.process_chunk(&chunk);
+            for ev in em.drain() {
+                acc.process(&ev).unwrap();
+            }
+        }
+        for ev in em.finish() {
+            acc.process(&ev).unwrap();
+        }
+
+        let msg = acc.build();
+        let tool = msg
+            .parts
+            .iter()
+            .find_map(|p| match p {
+                MessagePart::ToolCall { name, input, .. } => Some((name.clone(), input.clone())),
+                _ => None,
+            })
+            .expect("the tool call must survive the reopened text lane");
+        assert_eq!(tool.0, "echo");
+        assert_eq!(tool.1, serde_json::json!({"msg": "hi"}));
+        let text = msg
+            .parts
+            .iter()
+            .find_map(|p| match p {
+                MessagePart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("the trailing text must survive the reopened lane");
+        assert_eq!(text, "Done, here is what I found.");
+    }
+
+    #[test]
+    fn thinking_then_two_tool_calls_preserve_arguments() {
+        use crate::stream::StreamAccumulator;
+
+        // The reasoning lane sits at part index 1 and the second tool
+        // call's wire index is also 1 — the collision shape.
+        let mut em = StreamEmitter::default();
+        let mut acc = StreamAccumulator::new();
+        let chunks = [
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"reasoning_content":"thinking hard"},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"echo","arguments":"{\"a\":"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"search","arguments":"{\"q\":"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"rust\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":null,"finish_reason":"tool_calls"}]}"#,
+        ];
+        for raw in chunks {
+            let chunk = OpenAiChunk::parse(raw).unwrap();
+            em.process_chunk(&chunk);
+            for ev in em.drain() {
+                acc.process(&ev).unwrap();
+            }
+        }
+        for ev in em.finish() {
+            acc.process(&ev).unwrap();
+        }
+
+        let msg = acc.build();
+        assert_eq!(msg.parts.len(), 2, "both tool calls flush");
+        match &msg.parts[0] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "echo");
+                assert_eq!(input, &serde_json::json!({"a": 1}));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+        match &msg.parts[1] {
+            MessagePart::ToolCall { name, input, .. } => {
+                assert_eq!(name, "search");
+                assert_eq!(
+                    input,
+                    &serde_json::json!({"q": "rust"}),
+                    "the index-1 call must survive the thinking-lane collision"
+                );
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn emitter_real_continuation_chunks_omit_id_and_name() {
         use crate::stream::StreamAccumulator;
 
@@ -2202,6 +2372,69 @@ mod tests {
     }
 
     #[test]
+    fn tool_open_closes_text_lane_with_addressed_stop() {
+        let mut em = StreamEmitter::default();
+        let text = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"let me look"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&text);
+        em.drain();
+
+        let tool = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"echo","arguments":"{}"}}]},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&tool);
+        let events = em.drain();
+
+        assert!(
+            matches!(
+                events.first(),
+                Some(StreamEvent::PartStop { index: Some(0) })
+            ),
+            "the open text lane must close with an addressed stop before the tool part opens: {events:?}"
+        );
+        assert!(
+            matches!(events.get(1), Some(StreamEvent::PartStart(ps))
+                if matches!(ps.part, Some(MessagePart::ToolCall { .. }))),
+            "the tool PartStart follows the lane close: {events:?}"
+        );
+    }
+
+    #[test]
+    fn tool_open_closes_thinking_lane_with_addressed_stop() {
+        let mut em = StreamEmitter::default();
+        let reasoning = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"reasoning_content":"deliberating"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&reasoning);
+        em.drain();
+
+        let tool = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"search","arguments":"{}"}}]},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&tool);
+        let events = em.drain();
+
+        assert!(
+            matches!(
+                events.first(),
+                Some(StreamEvent::PartStop { index: Some(1) })
+            ),
+            "the open thinking lane must close with an addressed stop naming part index 1 \
+             before a tool call at the same wire index opens: {events:?}"
+        );
+        assert!(
+            matches!(events.get(1), Some(StreamEvent::PartStart(ps))
+                if matches!(ps.part, Some(MessagePart::ToolCall { .. }))),
+            "the tool PartStart follows the lane close: {events:?}"
+        );
+    }
+
+    #[test]
     fn emitter_finish_emits_part_stops_and_message_delta() {
         let mut em = StreamEmitter::default();
 
@@ -2219,7 +2452,7 @@ mod tests {
         em.process_chunk(&finish);
         let part_stop_events = em.drain();
         assert_eq!(part_stop_events.len(), 1);
-        assert!(matches!(part_stop_events[0], StreamEvent::PartStop));
+        assert!(matches!(part_stop_events[0], StreamEvent::PartStop { .. }));
 
         let events = em.finish();
         assert!(
@@ -2290,7 +2523,7 @@ mod tests {
         em.process_chunk(&finish);
         let part_stop_events = em.drain();
         assert_eq!(part_stop_events.len(), 1);
-        assert!(matches!(part_stop_events[0], StreamEvent::PartStop));
+        assert!(matches!(part_stop_events[0], StreamEvent::PartStop { .. }));
 
         let events = em.finish();
         let delta = events.iter().find_map(|e| match e {
@@ -3139,7 +3372,7 @@ mod tests {
         // would let text deltas clobber the reasoning lane's state.
         let lane_switch_stops = events
             .iter()
-            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
             .count();
         assert_eq!(
             lane_switch_stops, 1,
@@ -3181,7 +3414,7 @@ mod tests {
         // be closed with exactly one PartStop between them.
         let stops = events
             .iter()
-            .filter(|e| matches!(e, StreamEvent::PartStop))
+            .filter(|e| matches!(e, StreamEvent::PartStop { .. }))
             .count();
         assert_eq!(stops, 1, "exactly one PartStop for the text lane");
 
@@ -3197,7 +3430,7 @@ mod tests {
             .expect("text delta present");
         let stop_idx = events
             .iter()
-            .position(|e| matches!(e, StreamEvent::PartStop))
+            .position(|e| matches!(e, StreamEvent::PartStop { .. }))
             .expect("PartStop present");
         let thinking_idx = events
             .iter()

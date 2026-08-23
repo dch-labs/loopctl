@@ -167,7 +167,7 @@ pub fn extract_tool_call(
                     json_buf.push_str(partial_json);
                 }
             }
-            loopctl::stream::StreamEvent::PartStop => {
+            loopctl::stream::StreamEvent::PartStop { .. } => {
                 if let Some(n) = name.take() {
                     let input = if json_buf.is_empty() {
                         serde_json::Value::Object(serde_json::Map::new())

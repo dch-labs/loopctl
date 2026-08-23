@@ -350,15 +350,22 @@ pub(crate) fn parse_json_lenient(text: &str) -> Option<serde_json::Value> {
 
 /// Find and parse the outermost JSON object or array in a string.
 ///
-/// Scans for the first `{` or `[`, tracks brace/bracket depth, and extracts
-/// the substring up to the matching close. String-aware: braces/brackets
+/// Scans for the first `{` or `[`, tracks independent brace and bracket
+/// depths, and extracts the substring up to the close of the outermost
+/// container — a candidate completes only when both depths return to zero,
+/// so an inner container of the other kind (an array inside an object, or
+/// an object inside an array) is a plain depth change rather than a
+/// mismatch. A closing delimiter that arrives while its own depth is zero
+/// cannot belong to balanced JSON, so the candidate is abandoned and the
+/// scan resumes — a later, well-formed value may still be found. The
+/// outermost candidate that parses wins. String-aware: braces/brackets
 /// inside JSON string literals (`"..."`) do not affect depth, and `\"`
 /// escapes are honored.
 pub(crate) fn extract_json_substring(text: &str) -> Option<serde_json::Value> {
     let bytes = text.as_bytes();
     let mut start = None;
-    let mut depth: i32 = 0;
-    let mut close = b'\0';
+    let mut brace_depth: usize = 0;
+    let mut bracket_depth: usize = 0;
     let mut in_string = false;
     let mut escaped = false;
 
@@ -381,25 +388,35 @@ pub(crate) fn extract_json_substring(text: &str) -> Option<serde_json::Value> {
             b'{' | b'[' => {
                 if start.is_none() {
                     start = Some(i);
-                    close = if byte == b'{' { b'}' } else { b']' };
                 }
-                depth = depth.saturating_add(1);
+                if byte == b'{' {
+                    brace_depth = brace_depth.saturating_add(1);
+                } else {
+                    bracket_depth = bracket_depth.saturating_add(1);
+                }
             }
             b'}' | b']' => {
-                if let Some(s) = start {
-                    if byte == close {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            let slice = text.get(s..=i).unwrap_or(text);
-                            if let Ok(v) = serde_json::from_str(slice) {
-                                return Some(v);
-                            }
-                            start = None;
+                let Some(s) = start else {
+                    continue;
+                };
+                let depth = if byte == b'}' {
+                    &mut brace_depth
+                } else {
+                    &mut bracket_depth
+                };
+                if *depth == 0 {
+                    // Unbalanced closer inside the candidate — not JSON.
+                    start = None;
+                    brace_depth = 0;
+                    bracket_depth = 0;
+                } else {
+                    *depth = depth.saturating_sub(1);
+                    if brace_depth == 0 && bracket_depth == 0 {
+                        let slice = text.get(s..=i).unwrap_or(text);
+                        if let Ok(v) = serde_json::from_str(slice) {
+                            return Some(v);
                         }
-                    } else {
-                        // Mismatched closing delimiter — not valid JSON.
                         start = None;
-                        depth = 0;
                     }
                 }
             }
@@ -412,10 +429,12 @@ pub(crate) fn extract_json_substring(text: &str) -> Option<serde_json::Value> {
 /// Tighten a JSON Schema for strict-mode submission.
 ///
 /// Recursively, on every `type: "object"` subschema that has a `properties`
-/// map: set `additionalProperties` to `false` and set `required` to the full
-/// list of property keys. Non-object subschemas (`string`, `number`, etc.)
-/// are returned unchanged; the implementation recurses into object
-/// properties, `array` `items`, and the values of `allOf` / `anyOf` /
+/// map: set `additionalProperties` to `false` and set `required` to the
+/// union of any pre-existing entries and the full list of property keys —
+/// every property becomes required, and author-declared entries naming keys
+/// without a matching property survive. Non-object subschemas (`string`,
+/// `number`, etc.) are returned unchanged; the implementation recurses into
+/// object properties, `array` `items`, and the values of `allOf` / `anyOf` /
 /// `oneOf` arrays, but leaves `$ref`, `if`/`then`/`else`, and other
 /// combinator shapes untouched (best-effort).
 ///
@@ -470,8 +489,11 @@ pub(crate) fn tighten_json_schema(schema: &serde_json::Value) -> serde_json::Val
 ///
 /// 1. setting `additionalProperties: false` — rejects extra/hallucinated
 ///    fields the model invents beyond the declared properties,
-/// 2. setting `required` to the full list of that object's own property
-///    keys — rejects missing fields the model omitted.
+/// 2. setting `required` to the union of any pre-existing entries (kept in
+///    their original order) and that object's own property keys (appended
+///    when not already listed) — rejects missing fields the model omitted
+///    without silently dropping an author-declared requirement that has no
+///    matching property.
 ///
 /// Together these make every object schema *closed* (no extra keys) and
 /// *fully mandatory* (no optional keys). The two are complementary: neither
@@ -566,15 +588,22 @@ fn tighten_in_place(schema: &mut serde_json::Value) {
         .and_then(serde_json::Value::as_object)
         .map(|props| props.keys().cloned().collect())
         .unwrap_or_default();
-    obj.insert(
-        "required".to_string(),
-        serde_json::Value::Array(
-            property_keys
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect(),
-        ),
-    );
+    let mut required: Vec<serde_json::Value> = obj
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let already_listed: std::collections::HashSet<String> = required
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect();
+    for key in property_keys {
+        if !already_listed.contains(key.as_str()) {
+            required.push(serde_json::Value::String(key));
+        }
+    }
+    obj.insert("required".to_string(), serde_json::Value::Array(required));
 }
 
 /// Request a typed, schema-conformant value from the model.
@@ -672,40 +701,30 @@ mod tests {
         assert_eq!(opts.response_format.as_ref().unwrap().name, "action");
     }
 
-    #[cfg(any(feature = "openai", feature = "gemini"))]
-    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_plain_json() {
         let v = parse_json_lenient(r#"{"a": 1}"#).unwrap();
         assert_eq!(v["a"], 1);
     }
 
-    #[cfg(any(feature = "openai", feature = "gemini"))]
-    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_with_prefix() {
         let v = parse_json_lenient(r#"Here is the JSON: {"a": 1}"#).unwrap();
         assert_eq!(v["a"], 1);
     }
 
-    #[cfg(any(feature = "openai", feature = "gemini"))]
-    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_markdown_fences() {
         let v = parse_json_lenient("```json\n{\"a\": 1}\n```").unwrap();
         assert_eq!(v["a"], 1);
     }
 
-    #[cfg(any(feature = "openai", feature = "gemini"))]
-    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_array() {
         let v = parse_json_lenient(r#"prefix [1, 2, 3] suffix"#).unwrap();
         assert_eq!(v[0], 1);
     }
 
-    #[cfg(any(feature = "openai", feature = "gemini"))]
-    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_no_json() {
         let result = parse_json_lenient("just prose, nothing here");
@@ -719,40 +738,30 @@ mod tests {
         assert!(err.to_string().contains("schema"));
     }
 
-    #[cfg(any(feature = "openai", feature = "gemini"))]
-    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_brace_inside_string() {
         let v = parse_json_lenient(r#"prefix {"a": "}"} suffix"#).unwrap();
         assert_eq!(v["a"], "}");
     }
 
-    #[cfg(any(feature = "openai", feature = "gemini"))]
-    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_bracket_inside_string() {
         let v = parse_json_lenient(r#"before {"x": "]"} after"#).unwrap();
         assert_eq!(v["x"], "]");
     }
 
-    #[cfg(any(feature = "openai", feature = "gemini"))]
-    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_escaped_quote_in_string() {
         let v = parse_json_lenient(r#"here {"a": "he said \"hi\""} there"#).unwrap();
         assert_eq!(v["a"], "he said \"hi\"");
     }
 
-    #[cfg(any(feature = "openai", feature = "gemini"))]
-    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_nested_objects_in_prose() {
         let v = parse_json_lenient(r#"result: {"outer": {"inner": 42}}"#).unwrap();
         assert_eq!(v["outer"]["inner"], 42);
     }
 
-    #[cfg(any(feature = "openai", feature = "gemini"))]
-    #[cfg(any(feature = "openai", feature = "gemini"))]
     #[test]
     fn parse_json_lenient_mismatched_delimiter_then_valid() {
         let v = parse_json_lenient(r#"{oops] then {"a":1}"#).unwrap();
@@ -1250,5 +1259,177 @@ mod tests {
         let def = &tightened["definitions"]["X"];
         assert_eq!(def["additionalProperties"], false);
         assert_eq!(def["required"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_json_lenient_object_containing_array() {
+        let v = parse_json_lenient(r#"prefix {"a": [1, 2]} suffix"#).unwrap();
+        assert_eq!(v["a"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn parse_json_lenient_array_containing_object() {
+        let v = parse_json_lenient(r#"prefix [{"a": 1}] suffix"#).unwrap();
+        assert_eq!(v[0]["a"], 1);
+    }
+
+    #[test]
+    fn parse_json_lenient_fenced_failure_analysis_shape() {
+        let v = parse_json_lenient("```json\n{\"m\": {\"p\": [1]}}\n```").unwrap();
+        assert!(v.is_object());
+        assert_eq!(v["m"]["p"], serde_json::json!([1]));
+    }
+
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[test]
+    fn tighten_preserves_required_entries_without_matching_property() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "required": ["a", "meta"]
+        });
+        let tightened = tighten_json_schema(&schema);
+        let required = tightened["required"].as_array().unwrap();
+        assert!(
+            required.iter().any(|v| v == "meta"),
+            "required entry without a matching property must survive tightening: {required:?}"
+        );
+    }
+
+    #[test]
+    fn parse_json_lenient_deeply_mixed_nesting_extracts_outermost() {
+        let v = parse_json_lenient(
+            r#"analysis: {"is_recoverable":true,"correction":{"modified_input":{"path":["a"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            v["correction"]["modified_input"]["path"],
+            serde_json::json!(["a"])
+        );
+    }
+
+    #[test]
+    fn parse_json_lenient_object_with_array_of_objects() {
+        let v = parse_json_lenient(r#"{"a": [{"b": 2}]}"#).unwrap();
+        assert_eq!(v["a"][0]["b"], 2);
+    }
+
+    #[test]
+    fn parse_json_lenient_stray_brace_in_array_resumes_scan() {
+        let v = parse_json_lenient(r#"[1, 2} then {"a":1}"#).unwrap();
+        assert_eq!(
+            v["a"], 1,
+            "a stray brace inside an array candidate aborts it; the later object still extracts"
+        );
+    }
+
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[test]
+    fn tighten_required_union_keeps_order_then_appends_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"b": {"type": "number"}, "a": {"type": "string"}},
+            "required": ["meta"]
+        });
+        let tightened = tighten_json_schema(&schema);
+        assert_eq!(
+            tightened["required"],
+            serde_json::json!(["meta", "a", "b"]),
+            "pre-existing entries keep their order first, then unlisted property keys append"
+        );
+        let twice = tighten_json_schema(&tightened);
+        assert_eq!(
+            twice["required"],
+            serde_json::json!(["meta", "a", "b"]),
+            "the union is idempotent: a second pass neither reorders nor duplicates"
+        );
+    }
+
+    #[test]
+    fn parse_json_lenient_first_valid_candidate_wins() {
+        let v = parse_json_lenient(r#"{"a": 1} and {"b": 2}"#).unwrap();
+        assert_eq!(
+            v["a"], 1,
+            "the outermost candidate that parses wins; a later sibling is not preferred"
+        );
+    }
+
+    #[test]
+    fn parse_json_lenient_unparseable_candidate_then_valid() {
+        let v = parse_json_lenient(r#"{"a": } then {"b": 1}"#).unwrap();
+        assert_eq!(
+            v["b"], 1,
+            "a balanced but invalid candidate is abandoned at its close; the scan resumes"
+        );
+    }
+
+    #[test]
+    fn parse_json_lenient_unterminated_json_returns_none() {
+        let result = parse_json_lenient(r#"prefix {"a": 1"#);
+        assert_eq!(
+            result, None,
+            "a candidate that never closes yields nothing, not a panic or a partial value"
+        );
+    }
+
+    #[test]
+    fn parse_json_lenient_nested_arrays() {
+        let v = parse_json_lenient(r#"result [[1, 2], [3]]"#).unwrap();
+        assert_eq!(v[0][1], 2);
+        assert_eq!(v[1][0], 3);
+    }
+
+    #[test]
+    fn parse_json_lenient_empty_containers_in_prose() {
+        let empty_object = parse_json_lenient(r#"text {} more"#).unwrap();
+        assert!(
+            empty_object
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+        );
+        let empty_array = parse_json_lenient(r#"text [] more"#).unwrap();
+        assert!(empty_array.as_array().is_some_and(Vec::is_empty));
+    }
+
+    #[test]
+    fn parse_json_lenient_escaped_backslash_in_string() {
+        let v = parse_json_lenient(r#"{"path": "c:\\"}"#).unwrap();
+        assert_eq!(v["path"], "c:\\");
+    }
+
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "grammar",
+        feature = "openai",
+        feature = "gemini"
+    ))]
+    #[test]
+    fn tighten_required_union_applies_to_nested_objects() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "object",
+                    "properties": {"lang": {"type": "string"}},
+                    "required": ["secret"]
+                }
+            }
+        });
+        let tightened = tighten_json_schema(&schema);
+        assert_eq!(
+            tightened["properties"]["filter"]["required"],
+            serde_json::json!(["secret", "lang"]),
+            "the union applies at every object level, not just the root"
+        );
     }
 }

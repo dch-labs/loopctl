@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 - `RunConfig::memory_top_k` — configurable number of memory entries retrieved and injected per turn (default 3; was a hardcoded magic number).
 - `MachineStep::CallTools { turn, calls }` — the machine now emits the 0-indexed turn number on `CallTools` (matching `CallLLM`), so both handlers source the turn identically from the machine rather than one reading a field and the other querying a counter.
 - `parallel_hard_error_discards_sibling_results` test — pins the documented contract that a hard error in a parallel wave aborts the batch and discards already-completed sibling results.
+- `loopctl::testing::EnvGuard` — a shared RAII guard for tests that mutate environment variables. `EnvGuard::acquire(&["VAR_A", "VAR_B"])` takes a crate-wide lock (parallel tests cannot interleave environment access), snapshots the named variables, and restores each to its prior value — present or absent — on drop, covering assertion failures and panics; `set`/`remove` mutate under the held lock and reject names that were not snapshotted, and a nested `acquire` fails fast instead of deadlocking. Usable from lib tests, integration tests, and downstream via the `testing` feature.
 
 ### Changed
 
@@ -48,10 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 - `millis_u64` unified across `emission.rs` and `compact.rs` (was duplicated with different overflow fallbacks: `u64::MAX` vs `0`).
 - `current_run`/`current_run_mut` wrappers removed; callers delegate to `Session`'s existing methods.
 - Loop-detection decision logic (`decide_detected_pattern`, `apply_loop_detection`) moved to `llm_turn.rs` (response-side), separating it from tool-operation detection (`pre_detection`/`post_detection`) in `dispatch.rs`.
-
-### Added
-
-- `loopctl::testing::EnvGuard` — a shared RAII guard for tests that mutate environment variables. `EnvGuard::acquire(&["VAR_A", "VAR_B"])` takes a crate-wide lock (parallel tests cannot interleave environment access), snapshots the named variables, and restores each to its prior value — present or absent — on drop, covering assertion failures and panics; `set`/`remove` mutate under the held lock and reject names that were not snapshotted, and a nested `acquire` fails fast instead of deadlocking. Usable from lib tests, integration tests, and downstream via the `testing` feature.
 
 ### Fixed
 

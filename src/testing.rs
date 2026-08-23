@@ -1694,11 +1694,13 @@ pub struct EnvGuard {
     /// The variables to restore, each with its pre-test value.
     ///
     /// `Some(value)` restores the variable to that value on drop; `None`
-    /// removes it (it was absent when the guard was acquired). Populated
+    /// removes it (it was absent when the guard was acquired). Values are
+    /// captured as `OsString`, so non-Unicode values round-trip too.
+    /// Populated
     /// once under the lock in [`acquire`](Self::acquire), never mutated
-    /// after — the `debug_assert!`s in [`set`](Self::set) and
+    /// after — the `assert!`s in [`set`](Self::set) and
     /// [`remove`](Self::remove) police that mutations stay within this list.
-    saved: Vec<(&'static str, Option<String>)>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
 impl EnvGuard {
@@ -1726,7 +1728,7 @@ impl EnvGuard {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let saved = vars
             .iter()
-            .map(|name| (*name, std::env::var(name).ok()))
+            .map(|name| (*name, std::env::var_os(name)))
             .collect();
         ENV_GUARD_HELD.with(|held| held.set(true));
         Self { _lock: lock, saved }
@@ -1740,10 +1742,10 @@ impl EnvGuard {
     ///
     /// # Panics
     ///
-    /// Panics in debug builds when `name` was not snapshotted — the
-    /// mutation would not be restored on drop.
+    /// Panics when `name` was not snapshotted — the mutation would not be
+    /// restored on drop.
     pub fn set(&self, name: &'static str, value: &str) {
-        debug_assert!(
+        assert!(
             self.saved
                 .iter()
                 .any(|(snapshotted, _)| *snapshotted == name),
@@ -1760,10 +1762,10 @@ impl EnvGuard {
     ///
     /// # Panics
     ///
-    /// Panics in debug builds when `name` was not snapshotted — the
-    /// mutation would not be restored on drop.
+    /// Panics when `name` was not snapshotted — the mutation would not be
+    /// restored on drop.
     pub fn remove(&self, name: &'static str) {
-        debug_assert!(
+        assert!(
             self.saved
                 .iter()
                 .any(|(snapshotted, _)| *snapshotted == name),
@@ -1793,24 +1795,41 @@ mod env_guard_tests {
     #[test]
     fn guard_restores_previous_values_on_normal_exit() {
         // A guard restores the state found at ITS acquire, so establishing a
-        // pre-existing value requires setting it outside any guard. SAFETY:
-        // the variable name is unique to this test, so no parallel test can
-        // race this setup or the cleanup below.
-        unsafe { std::env::set_var("LOOPCTL_GUARD_VALUE", "original") };
+        // pre-existing value requires setting it outside any guard. Each raw
+        // access below takes ENV_LOCK for its duration and never overlaps
+        // the guard's scope, keeping every touch serialized. SAFETY: the
+        // name is unique to this test and ENV_LOCK is held.
+        {
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            unsafe { std::env::set_var("LOOPCTL_GUARD_VALUE", "original") };
+        }
         {
             let env = EnvGuard::acquire(&["LOOPCTL_GUARD_VALUE"]);
             env.set("LOOPCTL_GUARD_VALUE", "mutated");
             env.remove("LOOPCTL_GUARD_VALUE");
             env.set("LOOPCTL_GUARD_VALUE", "mutated-again");
         }
+        let restored = {
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::env::var("LOOPCTL_GUARD_VALUE")
+        };
         assert_eq!(
-            std::env::var("LOOPCTL_GUARD_VALUE"),
+            restored,
             Ok("original".to_string()),
             "drop must restore the pre-guard value after mixed set/remove churn"
         );
-        // SAFETY: unique to this test; a guard cannot erase — it only
-        // restores to acquire-time state.
-        unsafe { std::env::remove_var("LOOPCTL_GUARD_VALUE") };
+        // SAFETY: unique to this test and ENV_LOCK is held; a guard cannot
+        // erase — it only restores to acquire-time state.
+        {
+            let _lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            unsafe { std::env::remove_var("LOOPCTL_GUARD_VALUE") };
+        }
     }
 
     #[test]

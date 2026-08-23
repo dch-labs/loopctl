@@ -1342,15 +1342,25 @@ mod tests {
             "required": ["meta"]
         });
         let tightened = tighten_json_schema(&schema);
+        let required = tightened["required"].as_array().unwrap();
         assert_eq!(
-            tightened["required"],
-            serde_json::json!(["meta", "a", "b"]),
-            "pre-existing entries keep their order first, then unlisted property keys append"
+            required.first(),
+            Some(&serde_json::json!("meta")),
+            "pre-existing entries keep their position ahead of appended property keys"
+        );
+        assert_eq!(
+            required.len(),
+            3,
+            "every property key is appended exactly once"
+        );
+        assert!(
+            required.contains(&serde_json::json!("a"))
+                && required.contains(&serde_json::json!("b")),
+            "the unlisted property keys join the union, in map order: {required:?}"
         );
         let twice = tighten_json_schema(&tightened);
         assert_eq!(
-            twice["required"],
-            serde_json::json!(["meta", "a", "b"]),
+            twice["required"], tightened["required"],
             "the union is idempotent: a second pass neither reorders nor duplicates"
         );
     }

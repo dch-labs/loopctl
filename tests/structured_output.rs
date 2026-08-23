@@ -232,7 +232,7 @@ async fn lenient_extraction_rescue_rate_across_prompts() {
                 if std::env::var("LOOPCTL_RAW").as_deref() == Ok("1") {
                     println!("--- raw reply (round {}) ---\n{raw}\n---", i + 1);
                 }
-                let wrapped = !serde_json::from_str::<serde_json::Value>(&raw).is_ok();
+                let wrapped = serde_json::from_str::<serde_json::Value>(&raw).is_err();
                 match RepairPlan::from_value(client.extract_structured(&response.message)) {
                     Ok(plan) if !plan.summary.is_empty() && !plan.steps.is_empty() => {
                         Some((wrapped, plan))

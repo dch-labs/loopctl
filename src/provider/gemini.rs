@@ -462,10 +462,12 @@ impl GeminiClientBuilder {
     /// Set the base URL for API requests.
     ///
     /// Defaults to `https://generativelanguage.googleapis.com/v1beta`.
+    /// Trailing `/` separators are trimmed, so joined request paths never
+    /// contain `//` — a `…/v1/` base behaves identically to `…/v1`.
     /// Override when targeting a proxy or Google AI-compatible endpoint.
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
-        self.base_url = url.into();
+        self.base_url = url.into().trim_end_matches('/').to_string();
         self
     }
 
@@ -631,7 +633,7 @@ fn build_request_body(
         }
 
         if response_format.is_none()
-            && let Some(tool_list) = tools
+            && let Some(tool_list) = tools.filter(|t| !t.is_empty())
         {
             let strict = matches!(tool_constraint, ToolConstraint::Strict);
             obj.insert(
@@ -3105,5 +3107,41 @@ mod tests {
         let usage = usage.expect("finish must include Usage from usageMetadata");
         assert_eq!(usage.input_tokens, 42);
         assert_eq!(usage.output_tokens, 12);
+    }
+
+    #[test]
+    fn request_body_omits_tools_for_empty_slice() {
+        let body = build_request_body(
+            &[crate::message::Message::user("hi")],
+            None,
+            Some(&[]),
+            None,
+            &ToolConstraint::None,
+            false,
+        );
+        assert!(
+            body.get("tools").is_none(),
+            "an empty tool list must be omitted, not sent as []; got {}",
+            body.get("tools").unwrap_or(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn generate_url_has_no_double_slash_for_trailing_slash_base() {
+        let bare = GeminiClient::builder()
+            .with_api_key("k")
+            .with_base_url("https://api.example.com")
+            .build()
+            .expect("client builds");
+        let slashed = GeminiClient::builder()
+            .with_api_key("k")
+            .with_base_url("https://api.example.com/")
+            .build()
+            .expect("client builds");
+        assert_eq!(
+            slashed.generate_url(),
+            bare.generate_url(),
+            "a trailing-slash base URL must join to the same request URL as the bare one"
+        );
     }
 }

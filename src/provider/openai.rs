@@ -480,10 +480,12 @@ impl OpenAiClientBuilder {
     ///
     /// Defaults to `https://api.openai.com/v1`. Override when targeting an
     /// OpenAI-compatible endpoint (e.g. `https://api.deepseek.com/v1`,
+    /// Trailing `/` separators are trimmed, so joined request paths never
+    /// contain `//` — a `…/v1/` base behaves identically to `…/v1`.
     /// `http://localhost:11434/v1` for Ollama, or a vLLM server).
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
-        self.base_url = url.into();
+        self.base_url = url.into().trim_end_matches('/').to_string();
         self
     }
 
@@ -678,6 +680,7 @@ impl RequestBody {
         response_format: Option<&crate::structured::ResponseFormat>,
         tool_constraint: &ToolConstraint,
     ) -> Self {
+        let tools = tools.filter(|t| !t.is_empty());
         let mut msgs = Vec::with_capacity(messages.len().saturating_add(1));
 
         if let Some(sys) = system {
@@ -779,7 +782,8 @@ impl RequestBody {
 /// a dedicated array, tool results to use the `tool` role, and plain
 /// text to use a simple `{role, content}` pair. A single loopctl message
 /// with multiple tool-result parts expands to one OpenAI `tool` message per
-/// result, so the return is a vector.
+/// result, so the return is a vector; text parts alongside tool results are
+/// preserved as a trailing `user` message after the `tool` messages.
 fn convert_message(m: &Message) -> Vec<Value> {
     let role = match m.role {
         Role::User => "user",
@@ -819,6 +823,12 @@ fn convert_message(m: &Message) -> Vec<Value> {
     if !tool_calls.is_empty() {
         vec![build_assistant_message(role, &tool_calls, &text_parts)]
     } else if !tool_results.is_empty() {
+        if !text_parts.is_empty() {
+            tool_results.push(serde_json::json!({
+                "role": "user",
+                "content": text_parts.join(""),
+            }));
+        }
         tool_results
     } else {
         vec![serde_json::json!({ "role": role, "content": text_parts.join("") })]
@@ -3201,5 +3211,76 @@ mod tests {
             .expect("thinking delta present");
         assert!(text_idx < stop_idx, "text delta before PartStop");
         assert!(stop_idx < thinking_idx, "PartStop before thinking delta");
+    }
+
+    #[test]
+    fn request_body_omits_tools_for_empty_slice() {
+        let body = RequestBody::build(
+            "m",
+            &[crate::message::Message::user("hi")],
+            None,
+            Some(&[]),
+            None,
+            &ToolConstraint::None,
+        )
+        .to_json(false);
+        assert!(
+            body.get("tools").is_none(),
+            "an empty tool list must be omitted, not sent as []; got {}",
+            body.get("tools").unwrap_or(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn completions_url_has_no_double_slash_for_trailing_slash_base() {
+        let bare = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url("https://api.example.com/v1")
+            .build()
+            .expect("client builds");
+        let slashed = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url("https://api.example.com/v1/")
+            .build()
+            .expect("client builds");
+        assert_eq!(
+            slashed.completions_url(),
+            bare.completions_url(),
+            "a trailing-slash base URL must join to the same request URL as the bare one"
+        );
+    }
+
+    #[test]
+    fn convert_message_keeps_text_alongside_tool_results() {
+        let msg = crate::message::Message::new(
+            crate::message::Role::User,
+            vec![
+                crate::message::MessagePart::text("stale results, search again"),
+                crate::message::MessagePart::tool_result(
+                    "c1",
+                    "search",
+                    crate::message::ToolContent::from_string("[]"),
+                    false,
+                ),
+            ],
+        );
+        let json = serde_json::to_string(&convert_message(&msg)).unwrap_or_default();
+        assert!(
+            json.contains("stale results, search again"),
+            "text parts accompanying tool results must reach the model; got {json}"
+        );
+        let messages = convert_message(&msg);
+        assert_eq!(
+            messages.len(),
+            2,
+            "one tool message plus the trailing user text message: {messages:?}"
+        );
+        assert_eq!(messages[0]["role"], "tool", "the tool result comes first");
+        assert_eq!(messages[0]["tool_call_id"], "c1");
+        assert_eq!(
+            messages[1]["role"], "user",
+            "the preserved text rides as a trailing user message"
+        );
+        assert_eq!(messages[1]["content"], "stale results, search again");
     }
 }

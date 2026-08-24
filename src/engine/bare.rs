@@ -56,6 +56,7 @@
 
 use crate::api::ApiClient;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -290,6 +291,18 @@ pub struct BareLoop<C: ApiClient> {
     /// When one is set, its counter is the single source of truth
     /// (see [`count_context`](Self::count_context)).
     token_counter: Arc<dyn crate::compact::TokenCounter>,
+
+    /// The per-session temp directory this loop owns, if any.
+    ///
+    /// `Some(path)` from construction — the path is computed eagerly so
+    /// it is stable, while the directory itself is materialised lazily on
+    /// first tool dispatch (see
+    /// [`session_temp_dir_string`](Self::session_temp_dir_string)).
+    /// `None` when the host opted out of managed temp via
+    /// [`with_managed_temp_disabled`](Self::with_managed_temp_disabled).
+    /// [`Drop`] best-effort removes the directory at this path; removal
+    /// errors are logged at `warn!` and swallowed.
+    session_temp_dir: Option<PathBuf>,
 }
 
 /// Per-turn accounting forwarded from [`handle_call_tools`](BareLoop::handle_call_tools)
@@ -431,10 +444,13 @@ impl<C: ApiClient> BareLoop<C> {
             let seeded = Self::default_context_manager(&session_config);
             managers.set_context_manager(Arc::new(seeded));
         }
+        let session = Session::new(session_config);
+        let session_temp_dir = Some(Self::session_temp_subdir(&std::env::temp_dir(), session.id));
         Self {
             client,
             tools: Arc::new(tools),
-            session: Session::new(session_config),
+            session,
+            session_temp_dir,
             machine: LoopMachine::from_history(Vec::new()),
             managers,
             reflector: Arc::new(NoopReflector),
@@ -584,11 +600,12 @@ impl<C: ApiClient> BareLoop<C> {
     /// Consume the loop and take ownership of its state machine.
     ///
     /// Returns the [`LoopMachine`], dropping the rest of the loop (client,
-    /// tools, managers). Use this to checkpoint a run's machine for later
+    /// tools, managers) — including, via drop, the per-session temp
+    /// directory. Use this to checkpoint a run's machine for later
     /// resumption via [`BareLoop::from_machine`].
     #[must_use]
-    pub fn into_machine(self) -> LoopMachine {
-        self.machine
+    pub fn into_machine(mut self) -> LoopMachine {
+        std::mem::replace(&mut self.machine, LoopMachine::from_history(Vec::new()))
     }
 
     /// Build a loop around an existing state machine.
@@ -613,10 +630,13 @@ impl<C: ApiClient> BareLoop<C> {
         let mut managers = LoopManagers::new();
         let seeded = Self::default_context_manager(&session_config);
         managers.set_context_manager(Arc::new(seeded));
+        let session = Session::new(session_config);
+        let session_temp_dir = Some(Self::session_temp_subdir(&std::env::temp_dir(), session.id));
         Self {
             client,
             tools: Arc::new(tools),
-            session: Session::new(session_config),
+            session,
+            session_temp_dir,
             machine,
             managers,
             reflector: Arc::new(NoopReflector),
@@ -645,6 +665,16 @@ impl<C: ApiClient> BareLoop<C> {
         ContextManager::new(Arc::new(TruncatingCompactor::default()))
             .with_context_window(session_config.context_window)
             .with_threshold(session_config.compact_threshold)
+    }
+
+    /// Compute the per-session temp subdir path under `base`.
+    ///
+    /// The path is computed eagerly at construction so it is stable for
+    /// the loop's lifetime; the directory itself is only materialised on
+    /// first tool dispatch (see
+    /// [`session_temp_dir_string`](Self::session_temp_dir_string)).
+    fn session_temp_subdir(base: &std::path::Path, session_id: uuid::Uuid) -> PathBuf {
+        base.join(format!("loopctl-{session_id}"))
     }
 
     /// Get the tool registry.
@@ -1281,6 +1311,25 @@ impl<C: ApiClient> BareLoop<C> {
             }
         }
         Ok(())
+    }
+}
+
+impl<C: ApiClient> Drop for BareLoop<C> {
+    fn drop(&mut self) {
+        if let Some(dir) = self.session_temp_dir.take() {
+            // Best-effort: a missing dir (host pre-cleaned, or lazy
+            // materialisation never ran) is silent; anything else logs
+            // once and is left for the OS — Drop cannot return errors.
+            if let Err(e) = std::fs::remove_dir_all(&dir)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "failed to clean up session temp dir"
+                );
+            }
+        }
     }
 }
 

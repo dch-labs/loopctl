@@ -279,11 +279,40 @@ impl ToolDependencyGraph {
 impl<C: ApiClient> BareLoop<C> {
     /// Build a tool context for tool invocations.
     ///
-    /// Creates a [`ToolContext`] pre-populated with the current session ID.
+    /// Creates a [`ToolContext`] pre-populated with the current session ID
+    /// and the per-session temp directory
+    /// (see [`ToolContext::temp_dir`](crate::tool::ToolContext::temp_dir)).
     pub(super) fn build_tool_context(&self) -> ToolContext {
         ToolContext {
             session_id: self.session.id,
+            temp_dir: self.session_temp_dir_string(),
             ..ToolContext::default()
+        }
+    }
+
+    /// Materialise and return the per-session temp directory as a string.
+    ///
+    /// When the host opted out of managed temp, or when creating the
+    /// per-session subdir fails, the process-wide [`std::env::temp_dir`]
+    /// is returned instead — a tool must always receive a writable path,
+    /// so failure is logged and degraded, never propagated. Creation is
+    /// idempotent: an existing subdir is reused, so the lazy
+    /// materialisation on first dispatch costs one no-op `mkdir` per
+    /// subsequent call.
+    fn session_temp_dir_string(&self) -> String {
+        let Some(dir) = self.session_temp_dir.as_ref() else {
+            return std::env::temp_dir().to_string_lossy().into_owned();
+        };
+        match std::fs::create_dir_all(dir) {
+            Ok(()) => dir.to_string_lossy().into_owned(),
+            Err(e) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "failed to create session temp dir; falling back to the process temp"
+                );
+                std::env::temp_dir().to_string_lossy().into_owned()
+            }
         }
     }
 

@@ -1387,6 +1387,8 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 self.machine.discard_pending();
             }
 
+            self.managers.detection().consume_pending_loop_stop();
+
             let run = self.session.current_run().cloned().unwrap_or_default();
             let duration = run.duration();
 

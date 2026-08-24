@@ -71,9 +71,11 @@ pub struct AnthropicClient {
     /// The current model identifier, stored behind a mutex for runtime
     /// hot-swapping.
     ///
-    /// Changed via [`ApiClient::set_model`] when the
-    /// [`FallbackManager`](crate::fallback::FallbackManager) trips to a
-    /// fallback model.
+    /// Changed via [`ApiClient::set_model`] (host-initiated swaps) or
+    /// overridden per request via
+    /// [`RequestOptions::model`](crate::structured::RequestOptions::model)
+    /// — the channel the fallback machinery routes through, leaving the
+    /// client itself untouched.
     model: std::sync::Mutex<String>,
 
     /// The maximum output tokens per response.
@@ -256,13 +258,11 @@ fn extract_usage_object(usage: &Value) -> Option<Usage> {
     let input = usage
         .get("input_tokens")
         .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0);
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
     let output = usage
         .get("output_tokens")
         .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
-        .unwrap_or(0);
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
     (input > 0 || output > 0).then(|| Usage::new(input, output))
 }
 
@@ -303,6 +303,12 @@ impl ApiClient for AnthropicClient {
         request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        #[cfg(feature = "grammar")]
+        if matches!(&options.tool_constraint, ToolConstraint::Grammar(_)) {
+            return Box::pin(futures::stream::once(async move {
+                Err(grammar_unsupported_error())
+            }));
+        }
         let system = request.system.clone();
         let tools = request.tools.clone();
         let model = options
@@ -353,6 +359,10 @@ impl ApiClient for AnthropicClient {
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
     {
+        #[cfg(feature = "grammar")]
+        if matches!(&options.tool_constraint, ToolConstraint::Grammar(_)) {
+            return Box::pin(async move { Err(grammar_unsupported_error()) });
+        }
         let system = request.system.clone();
         let tools = request.tools.clone();
         let model = options
@@ -448,9 +458,9 @@ impl AnthropicClientBuilder {
     ///
     /// Defaults to `https://api.anthropic.com`. Override when targeting a
     /// proxy, gateway, or Anthropic-compatible endpoint (e.g. Z.AI at
-    /// Trailing `/` separators are trimmed, so joined request paths never
-    /// contain `//` — a `…/v1/` base behaves identically to `…/v1`.
-    /// `https://api.z.ai/api/anthropic`).
+    /// `https://api.z.ai/api/anthropic`). Trailing `/` separators are
+    /// trimmed, so joined request paths never contain `//` — a `…/v1/`
+    /// base behaves identically to `…/v1`.
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into().trim_end_matches('/').to_string();
@@ -459,9 +469,11 @@ impl AnthropicClientBuilder {
 
     /// Set the default model identifier.
     ///
-    /// The model string is sent as the `model` field on every request. Can be
-    /// changed at runtime via [`AnthropicClient::set_model`] (e.g. when the
-    /// [`FallbackManager`](crate::fallback::FallbackManager) trips).
+    /// The model string is sent as the `model` field on every request,
+    /// unless a per-request
+    /// [`RequestOptions::model`](crate::structured::RequestOptions::model)
+    /// override names another. Can also be swapped wholesale at runtime
+    /// via [`AnthropicClient::set_model`].
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
@@ -472,18 +484,26 @@ impl AnthropicClientBuilder {
     ///
     /// Anthropic requires this field on every request — unlike OpenAI, which
     /// defaults it server-side. It bounds the length of a single model
-    /// response. Defaults to 8192. Increase for long-form generation;
-    /// decrease to cap cost on simple queries.
+    /// response. Defaults to 8192. Increase for long-form generation;    /// Set the `max_tokens` sent with every request.
+    ///
+    /// Anthropic requires the Messages API's mandatory `max_tokens`
+    /// field to be at least 1; [`build`](Self::build) rejects a zero
+    /// value instead of letting the server answer a guaranteed 400.
     #[must_use]
     pub fn with_max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = tokens;
         self
     }
 
-    /// Set the total request timeout (connect + response + body).
+    /// Set the HTTP read timeout.
     ///
+    /// This bounds *idleness* — how long a gap between bytes on the
+    /// connection may last — not the total request lifetime: a stream
+    /// that keeps producing bytes runs as long as it keeps producing.
     /// Defaults to 120 seconds. Ignored when a client was supplied via
-    /// [`with_http_client`](Self::with_http_client).
+    /// [`with_http_client`](Self::with_http_client); bound the whole
+    /// turn with a [`StreamHandler`](crate::stream::handler::StreamHandler)
+    /// total timeout instead.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.http = self.http.with_timeout(timeout);
@@ -560,12 +580,18 @@ impl AnthropicClientBuilder {
     /// # Errors
     ///
     /// Returns [`ApiError`] if no API key was set via
-    /// [`with_api_key`](Self::with_api_key).
+    /// [`with_api_key`](Self::with_api_key), or when `max_tokens` is
+    /// zero (the Messages API requires at least 1).
     pub fn build(self) -> Result<AnthropicClient, ApiError> {
         let api_key = self
             .api_key
             .ok_or_else(|| ApiError::auth_invalid_key("API key not provided"))?;
         let http = self.http.build()?;
+        if self.max_tokens == 0 {
+            return Err(ApiError::config(
+                "max_tokens must be at least 1 — the Messages API rejects 0",
+            ));
+        }
 
         Ok(AnthropicClient {
             http,
@@ -651,6 +677,20 @@ struct RequestBodySpec<'a> {
     /// [`ToolConstraint::None`]: crate::structured::ToolConstraint::None
     /// [`ToolConstraint::Strict`]: crate::structured::ToolConstraint::Strict
     tool_constraint: &'a ToolConstraint,
+}
+
+/// The config error for grammar constraints on the Messages API.
+///
+/// Anthropic has no grammar-constrained decoding, so a requested grammar
+/// is rejected loudly instead of silently downgraded to an unconstrained
+/// request — a caller asking for structural guarantees must not discover
+/// their absence from malformed tool calls downstream.
+#[cfg(feature = "grammar")]
+fn grammar_unsupported_error() -> ApiError {
+    ApiError::config(
+        "the Anthropic Messages API has no grammar-constrained decoding; \
+         use ToolConstraint::Strict or an OpenAI-compatible endpoint",
+    )
 }
 
 /// Build the JSON request body for the Anthropic Messages API.
@@ -986,9 +1026,9 @@ struct StreamEmitter {
     /// generation began, for example) as error events rather than closing
     /// the HTTP stream with a status. Recorded here so
     /// [`finish`](Self::finish) terminates the stream with the error
-    /// instead of the synthetic clean [`StreamEvent::MessageStop`] —
-    /// without it, a consumer could not distinguish an errored stream from
-    /// a healthy truncated one. First error wins; later ones are ignored.
+    /// instead of completing it — without it, a consumer could not
+    /// distinguish an errored stream from a truncated one. First error
+    /// wins; later ones are ignored.
     error: Option<ApiError>,
 
     /// Token usage latched from the `message_start` event.
@@ -1246,8 +1286,11 @@ impl StreamEmitter {
     /// two counts. The max matters because the two events split the
     /// reporting: `message_start` carries the input count the terminal
     /// delta omits, and a server-tools turn's delta may revise either count
-    /// upward from its start value — the larger figure is always the
-    /// up-to-date one. The usage event is only attached when at least one
+    /// upward from its start value. The merge is max-by-assumption, not
+    /// max-by-guarantee: a genuine downward revision by the terminal delta
+    /// (cache accounting adjustments) loses to the latched start value —
+    /// the cost of never under-reporting a count the earlier event already
+    /// claimed. The usage event is only attached when at least one
     /// merged count is non-zero. Emits a single
     /// [`StreamEvent::MessageDelta`] with both, so streaming and
     /// non-streaming turns report identical usage.
@@ -1271,13 +1314,11 @@ impl StreamEmitter {
         let delta_in = v
             .pointer("/usage/input_tokens")
             .and_then(Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(0);
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
         let delta_out = v
             .pointer("/usage/output_tokens")
             .and_then(Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-            .unwrap_or(0);
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
         let in_tok = delta_in.max(self.start_usage.input_tokens);
         let out_tok = delta_out.max(self.start_usage.output_tokens);
 
@@ -1305,10 +1346,11 @@ impl StreamEmitter {
     /// `PartStop`s are pushed first so the event order matches the
     /// documented protocol (`PartStop* → MessageStop`).
     ///
-    /// Setting `finished` here is what suppresses the synthetic
-    /// [`StreamEvent::MessageStop`] in [`finish`](Self::finish), so a
-    /// stream that delivered `message_stop` does not get a second
-    /// terminal event appended after the SSE stream ends.
+    /// Setting `finished` here marks the stream complete so later
+    /// handlers (a duplicate `message_stop`, an out-of-order
+    /// `message_delta`) are no-ops. [`finish`](Self::finish) appends
+    /// nothing — this event is the one and only source of the terminal
+    /// [`StreamEvent::MessageStop`].
     fn on_message_stop(&mut self) {
         self.finished = true;
         if self.thinking_part_open {
@@ -1334,11 +1376,17 @@ impl StreamEmitter {
     /// Handle a terminal `error` event.
     ///
     /// Reads `/error/type` and `/error/message` (Anthropic's error payload,
-    /// e.g. `overloaded_error` / `"Overloaded"`) into an
-    /// [`ApiError::api`] recording that [`finish`](Self::finish) surfaces as
-    /// the stream's terminal error. Missing fields fall back to generic
-    /// wording so a malformed payload still terminates with an error rather
-    /// than being dropped. The first error wins; later ones are ignored.
+    /// e.g. `overloaded_error` / `"Overloaded"`). Rate-limit family failures
+    /// (`rate_limit_error`, the 429 SSE form, and `overloaded_error`, the
+    /// 529 SSE form) become [`ApiError::RateLimit`] so the stream handler's
+    /// rate-limit ladder — with its backoff and `Retry-After` handling —
+    /// owns the response, mirroring the status-based classification of
+    /// non-streaming requests. Everything else stays an
+    /// [`ApiError::api`] recording. In both cases [`finish`](Self::finish)
+    /// surfaces the recording as the stream's terminal error; missing
+    /// fields fall back to generic wording so a malformed payload still
+    /// terminates with an error rather than being dropped. The first error
+    /// wins; later ones are ignored.
     fn on_error(&mut self, data: Option<&Value>) {
         if self.error.is_some() {
             return;
@@ -1356,20 +1404,29 @@ impl StreamEmitter {
             ),
             None => ("error".to_string(), "stream failed".to_string()),
         };
-        self.error = Some(ApiError::api(format!("{kind}: {message}")));
+        let detail = format!("{kind}: {message}");
+        self.error = Some(
+            if matches!(kind.as_str(), "rate_limit_error" | "overloaded_error") {
+                ApiError::RateLimit {
+                    retry_after: None,
+                    message: detail,
+                }
+            } else {
+                ApiError::api(detail)
+            },
+        );
     }
 
     /// Finalize the stream and return any remaining events.
     ///
     /// When an `event: error` was recorded, terminates with that error and
     /// emits nothing further — no synthetic [`StreamEvent::MessageStop`], so
-    /// the failure cannot masquerade as a clean stop. Otherwise drains the
-    /// pending queue and appends a single `MessageStop` when the stream was
-    /// started but no `message_stop` event has already emitted one (tracked
-    /// by the `finished` flag). This covers streams that end without an
-    /// explicit terminal event; when `message_stop` was processed, the
-    /// synthetic terminal is suppressed so the consumer sees exactly one
-    /// `MessageStop`.
+    /// the failure cannot masquerade as a clean stop. Otherwise drains
+    /// the pending queue — nothing is appended: `MessageStop` is emitted
+    /// exactly once, by the `message_stop` event itself. A stream that
+    /// ends without that event is truncated, and the *absence* of the
+    /// stop is what tells the handler so; synthesizing one here would
+    /// dress a cut connection up as a completed turn.
     ///
     /// # Errors
     ///
@@ -1379,11 +1436,7 @@ impl StreamEmitter {
         if let Some(err) = self.error.take() {
             return Err(err);
         }
-        let mut out = self.drain();
-        if self.started && !self.finished {
-            out.push(StreamEvent::MessageStop);
-        }
-        Ok(out)
+        Ok(self.drain())
     }
 
     /// Whether a terminal `event: error` has been recorded.
@@ -1935,13 +1988,18 @@ mod tests {
     }
 
     #[test]
-    fn emitter_finish_emits_message_stop_if_needed() {
+    fn emitter_finish_emits_no_stop_without_message_stop() {
         let mut em = StreamEmitter::default();
         em.started = true;
         em.finished = false;
 
         let events = em.finish().expect("no recorded error");
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop)));
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, StreamEvent::MessageStop)),
+            "a stream that ends without message_stop is truncated — no synthetic stop may dress it up"
+        );
     }
 
     #[test]
@@ -2004,10 +2062,118 @@ mod tests {
     }
 
     #[test]
+    fn builder_rejects_zero_max_tokens() {
+        let built = AnthropicClient::builder()
+            .with_api_key("test")
+            .with_max_tokens(0)
+            .build();
+        let Err(err) = built else {
+            panic!("a zero max_tokens must fail at build time")
+        };
+        assert!(
+            err.to_string().contains("max_tokens"),
+            "the error must name the field: {err}"
+        );
+    }
+
+    #[cfg(feature = "grammar")]
+    #[tokio::test]
+    async fn grammar_constraint_errors_loudly() {
+        let client = AnthropicClient::builder()
+            .with_api_key("test")
+            .build()
+            .unwrap();
+        let opts = crate::structured::RequestOptions::default().with_tool_constraint(
+            crate::structured::ToolConstraint::Grammar(std::sync::Arc::new(
+                crate::provider::grammar::JsonSchemaGrammar::from_schemas(&[]),
+            )),
+        );
+        let mut stream =
+            client.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), opts);
+        let first = futures::StreamExt::next(&mut stream).await;
+        assert!(
+            matches!(&first, Some(Err(err)) if err.to_string().contains("grammar")),
+            "a grammar constraint must be rejected, not silently downgraded: {first:?}"
+        );
+    }
+
+    #[test]
+    fn emitter_downward_delta_revision_loses_to_the_start_latch() {
+        let mut em = StreamEmitter::default();
+        em.process_event(
+            "message_start",
+            Some(serde_json::json!({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 25, "output_tokens": 1}}
+            })),
+        );
+        em.drain();
+        em.process_event(
+            "message_delta",
+            Some(serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"input_tokens": 12, "output_tokens": 5}
+            })),
+        );
+        let events = em.drain();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+                _ => None,
+            })
+            .expect("the terminal delta carries usage");
+        assert_eq!(
+            usage.input_tokens, 25,
+            "the merge is max-by-assumption: a downward revision loses to the latched start value"
+        );
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn midstream_rate_limit_family_errors_classify_as_rate_limit() {
+        for kind in ["rate_limit_error", "overloaded_error"] {
+            let mut em = StreamEmitter::default();
+            em.process_event(
+                "error",
+                Some(serde_json::json!({
+                    "type": "error",
+                    "error": {"type": kind, "message": "slow down"}
+                })),
+            );
+            let err = em
+                .finish()
+                .expect_err("finish must surface the recorded error");
+            assert!(
+                matches!(err, ApiError::RateLimit { .. }),
+                "{kind} is the SSE form of a rate-limit status and must classify as RateLimit"
+            );
+        }
+
+        let mut em = StreamEmitter::default();
+        em.process_event(
+            "error",
+            Some(serde_json::json!({
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "bad shape"}
+            })),
+        );
+        let err = em
+            .finish()
+            .expect_err("finish must surface the recorded error");
+        assert!(
+            !matches!(err, ApiError::RateLimit { .. }),
+            "non-rate-limit errors stay provider errors: {err}"
+        );
+    }
+
+    #[test]
     fn sse_reader_take_line_extracts_newline() {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "event: ping\n".into(),
+            done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "event: ping");
         assert!(reader.buf.is_empty());
@@ -2018,6 +2184,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "partial".into(),
+            done_marker_seen: false,
         };
         assert!(reader.take_line().unwrap().is_none());
     }
@@ -2027,6 +2194,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "line1\nline2\n".into(),
+            done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "line1");
         assert_eq!(reader.take_line().unwrap().unwrap(), "line2");
@@ -2037,6 +2205,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hi\r\n".into(),
+            done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "data: hi");
     }
@@ -2058,6 +2227,7 @@ mod tests {
             buf: "event: message_start\ndata: {}\n\n"
                 .to_string()
                 .into_bytes(),
+            done_marker_seen: false,
         };
         assert_eq!(
             reader.take_line().unwrap(),
@@ -2075,6 +2245,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let result = reader.next_event().await.unwrap();
         assert!(result.is_some());
@@ -2091,6 +2262,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let result = reader.next_event().await.unwrap();
         assert!(result.is_some());
@@ -2115,6 +2287,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let result = reader.next_event().await.unwrap();
         assert!(result.is_some());
@@ -2130,6 +2303,7 @@ mod tests {
         let mut reader = super::SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let result = reader.next_event().await;
         assert!(result.is_err(), "should error on buffer overflow");
@@ -2972,6 +3146,7 @@ mod tests {
                 data.to_string().into(),
             )])),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let parsed = reader.next_event().await.expect("reader must not err");
         let (_, payload) = parsed.expect("the event must be delivered");
@@ -3054,6 +3229,7 @@ mod tests {
                 data.to_string().into(),
             )])),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let parsed = reader.next_event().await.expect("reader must not err");
         let (_, payload) = parsed.expect("the event must be delivered");
@@ -3275,6 +3451,7 @@ mod tests {
                 data.to_string().into(),
             )])),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let parsed = reader.next_event().await.expect("reader must not err");
         let (event_type, payload) = parsed.expect("the event must be delivered");

@@ -426,13 +426,26 @@ impl fmt::Display for CircuitState {
 pub struct CircuitBreakerConfig {
     /// Number of consecutive failures before the breaker opens.
     ///
-    /// Defaults to 3.
+    /// Defaults to 3. `0` disables tripping — the crate-wide "zero
+    /// disables" sentinel — so a breaker configured with `0` records
+    /// failures and telemetry but never opens.
     pub failure_threshold: u64,
 
     /// How long to wait in the `Open` state before transitioning to `HalfOpen`.
     ///
     /// Defaults to 30 seconds.
     pub recovery_duration: Duration,
+
+    /// How long the single `HalfOpen` probe may stay in flight before the
+    /// breaker gives up on it.
+    ///
+    /// A probe whose result never arrives (the dispatch was cancelled or
+    /// the task died mid-flight) would otherwise strand the breaker in
+    /// `HalfOpen` forever — no probe result is ever recorded, so nothing
+    /// closes or reopens it. After the timeout the breaker returns to
+    /// `Open` with a freshly armed cooldown, and a later request probes
+    /// again. Defaults to 30 seconds.
+    pub probe_timeout: Duration,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -440,6 +453,7 @@ impl Default for CircuitBreakerConfig {
         Self {
             failure_threshold: 3,
             recovery_duration: Duration::from_secs(30),
+            probe_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -491,6 +505,14 @@ pub struct ToolCircuitBreaker {
     /// immutable thereafter.
     recovery_duration: Duration,
 
+    /// How long a `HalfOpen` probe may stay in flight before the breaker
+    /// re-arms recovery (see [`CircuitBreakerConfig::probe_timeout`]).
+    ///
+    /// Compared against the elapsed time since the probe was granted in
+    /// [`allow_request`](Self::allow_request). Set at construction and
+    /// immutable thereafter.
+    probe_timeout: Duration,
+
     /// All mutable state, behind a single lock.
     ///
     /// Holding the counter, state, and last-failure timestamp together
@@ -519,6 +541,16 @@ struct BreakerState {
     /// `Closed` transitions to `Open`.
     consecutive_failures: u64,
 
+    /// When the current `HalfOpen` probe was granted, or `None`.
+    ///
+    /// Set when [`allow_request`](ToolCircuitBreaker::allow_request)
+    /// transitions `Open`→`HalfOpen`; cleared by the probe's
+    /// `record_success`/`record_failure`. When the probe outlives
+    /// [`probe_timeout`](ToolCircuitBreaker::probe_timeout) without a
+    /// record, the next `allow_request` re-arms recovery instead of
+    /// stranding the breaker.
+    probe_started_at: Option<Instant>,
+
     /// When the most recent failure occurred, or `None` if none yet.
     ///
     /// Compared against `recovery_duration` in `allow_request` to decide
@@ -532,6 +564,7 @@ impl Default for BreakerState {
             circuit: CircuitState::Closed,
             consecutive_failures: 0,
             last_failure_time: None,
+            probe_started_at: None,
         }
     }
 }
@@ -546,8 +579,20 @@ impl ToolCircuitBreaker {
         Self {
             failure_threshold,
             recovery_duration,
+            probe_timeout: recovery_duration,
             state: Mutex::new(BreakerState::default()),
         }
+    }
+
+    /// Override the `HalfOpen` probe timeout (builder style).
+    ///
+    /// [`new`](Self::new) defaults the probe timeout to the recovery
+    /// duration; use this when a probe should be given more (or less)
+    /// time than a full recovery window before the breaker re-arms.
+    #[must_use]
+    pub fn with_probe_timeout(mut self, probe_timeout: Duration) -> Self {
+        self.probe_timeout = probe_timeout;
+        self
     }
 
     /// Create a circuit breaker from a [`CircuitBreakerConfig`].
@@ -557,7 +602,12 @@ impl ToolCircuitBreaker {
     /// Useful when many breakers share a single config.
     #[must_use]
     pub fn from_config(config: &CircuitBreakerConfig) -> Self {
-        Self::new(config.recovery_duration, config.failure_threshold)
+        Self {
+            failure_threshold: config.failure_threshold,
+            recovery_duration: config.recovery_duration,
+            probe_timeout: config.probe_timeout,
+            state: Mutex::new(BreakerState::default()),
+        }
     }
 
     /// Whether a request is allowed to proceed.
@@ -573,13 +623,24 @@ impl ToolCircuitBreaker {
         let mut state = crate::error::recover_guard(self.state.lock());
         match state.circuit {
             CircuitState::Closed => true,
-            CircuitState::HalfOpen => false,
+            CircuitState::HalfOpen => {
+                let probe_expired = state
+                    .probe_started_at
+                    .is_some_and(|t| t.elapsed() >= self.probe_timeout);
+                if probe_expired {
+                    state.circuit = CircuitState::Open;
+                    state.last_failure_time = Some(Instant::now());
+                    state.probe_started_at = None;
+                }
+                false
+            }
             CircuitState::Open => {
                 let recovered = state
                     .last_failure_time
                     .is_some_and(|t| t.elapsed() >= self.recovery_duration);
                 if recovered {
                     state.circuit = CircuitState::HalfOpen;
+                    state.probe_started_at = Some(Instant::now());
                     true
                 } else {
                     false
@@ -639,6 +700,7 @@ impl ToolCircuitBreaker {
     pub fn record_success(&self) {
         let mut state = crate::error::recover_guard(self.state.lock());
         state.consecutive_failures = 0;
+        state.probe_started_at = None;
         state.circuit = CircuitState::Closed;
     }
 
@@ -651,9 +713,12 @@ impl ToolCircuitBreaker {
         let mut state = crate::error::recover_guard(self.state.lock());
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         state.last_failure_time = Some(Instant::now());
+        state.probe_started_at = None;
         match state.circuit {
             CircuitState::Closed => {
-                if state.consecutive_failures >= self.failure_threshold {
+                if self.failure_threshold > 0
+                    && state.consecutive_failures >= self.failure_threshold
+                {
                     state.circuit = CircuitState::Open;
                 }
             }
@@ -1298,10 +1363,52 @@ mod tests {
     }
 
     #[test]
+    fn zero_failure_threshold_disables_tripping() {
+        let cb = ToolCircuitBreaker::new(Duration::from_millis(10), 0);
+        for _ in 0..10 {
+            cb.record_failure();
+        }
+        assert!(
+            cb.allow_request(),
+            "a zero threshold follows the crate-wide zero-disables sentinel: \
+             failures are counted but the breaker never opens"
+        );
+        assert_eq!(cb.consecutive_failures(), 10);
+    }
+
+    #[test]
+    fn stranded_half_open_probe_re_arms_recovery_after_the_timeout() {
+        let cb = ToolCircuitBreaker::new(Duration::from_millis(40), 1)
+            .with_probe_timeout(Duration::from_millis(60));
+        cb.record_failure();
+        assert!(!cb.allow_request());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            cb.allow_request(),
+            "after the recovery window the probe is granted"
+        );
+        // The probe never records (cancelled or lost). Without the probe
+        // timeout the breaker would answer false forever.
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            !cb.allow_request(),
+            "an expired probe re-arms the Open cooldown instead of stranding HalfOpen"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            cb.allow_request(),
+            "a fresh probe is granted after the re-armed cooldown"
+        );
+        cb.record_success();
+        assert!(cb.allow_request(), "the recorded probe closes the breaker");
+    }
+
+    #[test]
     fn circuit_breaker_from_config() {
         let config = CircuitBreakerConfig {
             failure_threshold: 5,
             recovery_duration: Duration::from_mins(1),
+            probe_timeout: Duration::from_mins(1),
         };
         let cb = ToolCircuitBreaker::from_config(&config);
 
@@ -1365,6 +1472,7 @@ mod tests {
         let low_threshold_registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 2,
             recovery_duration: Duration::from_secs(30),
+            probe_timeout: Duration::from_secs(30),
         });
         for _ in 0..5 {
             low_threshold_registry.record_failure("tool_b", Duration::from_millis(10));
@@ -1381,6 +1489,7 @@ mod tests {
         let registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 2,
             recovery_duration: Duration::from_secs(30),
+            probe_timeout: Duration::from_secs(30),
         });
 
         // Healthy tool — available
@@ -1398,6 +1507,7 @@ mod tests {
         let registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 1,
             recovery_duration: Duration::from_millis(40),
+            probe_timeout: Duration::from_secs(30),
         });
         registry.record_failure("tool", Duration::from_millis(1));
         assert!(
@@ -1474,6 +1584,7 @@ mod tests {
         let registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 1,
             recovery_duration: Duration::from_secs(30),
+            probe_timeout: Duration::from_secs(30),
         });
 
         // Make "bash" unhealthy
@@ -1494,6 +1605,7 @@ mod tests {
         let registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
             failure_threshold: 1,
             recovery_duration: Duration::from_secs(30),
+            probe_timeout: Duration::from_secs(30),
         });
 
         // Both unhealthy

@@ -39,6 +39,14 @@ pub(super) struct SseReader {
     /// `\n`-terminated lines are drained by [`take_line`](SseReader::take_line)
     /// and decoded as UTF-8.
     pub(super) buf: Vec<u8>,
+
+    /// Whether an OpenAI-style `data: [DONE]` sentinel has been read.
+    ///
+    /// Set by the OpenAI data reader when it consumes the sentinel; read
+    /// by the stream loop to tell a provider-signalled end apart from a
+    /// bare EOF (a cut connection), so the emitter only completes a
+    /// stream the provider actually terminated.
+    pub(super) done_marker_seen: bool,
 }
 
 impl SseReader {
@@ -55,6 +63,7 @@ impl SseReader {
         Self {
             bytes: Box::pin(bytes),
             buf: Vec::new(),
+            done_marker_seen: false,
         }
     }
 
@@ -79,6 +88,23 @@ impl SseReader {
         let line = String::from_utf8(line_bytes)
             .map_err(|e| ApiError::http(format!("SSE line is not valid UTF-8: {e}")))?;
         Ok(Some(line.trim().to_string()))
+    }
+
+    /// Whether the OpenAI-style `[DONE]` sentinel has been read.
+    ///
+    /// Pure read over [`done_marker_seen`](Self::done_marker_seen); see
+    /// that field for why the distinction matters.
+    pub(super) fn done_marker_seen(&self) -> bool {
+        self.done_marker_seen
+    }
+
+    /// Record that the OpenAI-style `[DONE]` sentinel has been read.
+    ///
+    /// The OpenAI data reader calls this when it consumes the sentinel;
+    /// the flag then serves both the sentinel's `Ok(None)` return and
+    /// later [`done_marker_seen`](Self::done_marker_seen) polls.
+    pub(super) fn mark_done_marker_seen(&mut self) {
+        self.done_marker_seen = true;
     }
 
     /// Fetch the next chunk from the HTTP stream and append it to the buffer.
@@ -117,6 +143,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: vec![0xFF, 0xFE, 0xFD, b'\n'],
+            done_marker_seen: false,
         };
         let result = reader.take_line();
         assert!(result.is_err(), "invalid UTF-8 must surface as an error");
@@ -127,6 +154,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: b"data: hello\n".to_vec(),
+            done_marker_seen: false,
         };
         let line = reader.take_line().unwrap().unwrap();
         assert_eq!(line, "data: hello");

@@ -7,10 +7,15 @@ use std::pin::Pin;
 
 /// Middleware that truncates tool output to a maximum character count.
 ///
-/// If the tool's text output exceeds the limit, it is truncated and
-/// suffixed with a `[truncated]` marker. For [`ToolContent::Multipart`]
-/// results, each text part is individually truncated in the same way;
-/// image parts are left unchanged.
+/// The limit is a **whole-output budget over the text content**: a text
+/// part that does not fit is cut so that the kept text *plus* its
+/// `[truncated]` marker stays within the remaining budget, and once the
+/// budget is exhausted every later text part is emptied (one earlier
+/// marker already signals the truncation — a marker per part would
+/// overflow the cap it enforces). Image parts are left unchanged.
+///
+/// A `max_chars` of `0` disables the middleware entirely (the crate-wide
+/// zero-disables sentinel) — output passes through untouched.
 ///
 /// This prevents runaway tools from flooding the conversation with
 /// excessive output that would blow the context window.
@@ -29,11 +34,31 @@ pub struct OutputLimitMiddleware {
     max_chars: usize,
 }
 
+/// The truncation marker appended to a cut text part.
+///
+/// Thirteen characters including the leading newline; its length is
+/// reserved inside the remaining budget by [`truncate_marked`] so a cut
+/// part lands exactly on the cap.
+const TRUNCATION_MARKER: &str = "\n[truncated]";
+
+/// Truncate `text` so the kept text plus the marker fits `budget`.
+///
+/// When `budget` is smaller than the marker itself the result is the
+/// bare marker — truncation must stay visible even at tiny budgets, so
+/// the cap floors at one marker.
+fn truncate_marked(text: &str, budget: usize) -> String {
+    let marker_len = TRUNCATION_MARKER.chars().count();
+    let kept = budget.saturating_sub(marker_len);
+    let truncated: String = text.chars().take(kept).collect();
+    format!("{truncated}{TRUNCATION_MARKER}")
+}
+
 impl OutputLimitMiddleware {
     /// Create a new output-limiting middleware.
     ///
-    /// `max_chars` is the maximum number of characters in the text
-    /// output. Outputs at or below this limit pass through unchanged.
+    /// `max_chars` is the maximum number of characters of text output
+    /// (markers included once a part is cut). Outputs at or below this
+    /// limit pass through unchanged. `0` disables the middleware.
     #[must_use]
     pub fn new(max_chars: usize) -> Self {
         Self { max_chars }
@@ -53,13 +78,15 @@ impl ToolMiddleware for OutputLimitMiddleware {
         let max_chars = self.max_chars;
         Box::pin(async move {
             let mut result = next.dispatch(ctx).await;
+            if max_chars == 0 {
+                return result;
+            }
 
             match result.output {
                 ToolContent::Text(ref text) => {
                     let char_count = text.chars().count();
                     if char_count > max_chars {
-                        let truncated: String = text.chars().take(max_chars).collect();
-                        result.output = ToolContent::Text(format!("{truncated}\n[truncated]"));
+                        result.output = ToolContent::Text(truncate_marked(text, max_chars));
                     }
                 }
                 ToolContent::Multipart(ref mut parts) => {
@@ -70,10 +97,8 @@ impl ToolMiddleware for OutputLimitMiddleware {
                             if char_count > remaining {
                                 if remaining == 0 {
                                     text.clear();
-                                    text.push_str("[truncated]");
                                 } else {
-                                    let truncated: String = text.chars().take(remaining).collect();
-                                    *text = format!("{truncated}\n[truncated]");
+                                    *text = truncate_marked(text, remaining);
                                 }
                                 remaining = 0;
                             } else {

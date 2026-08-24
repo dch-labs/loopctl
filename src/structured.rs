@@ -253,11 +253,14 @@ pub enum ToolConstraint {
 /// `create_message` call.
 ///
 /// Additive and forward-compatible: every field has a default that
-/// reproduces prior behaviour, and providers that don't understand a field
-/// ignore it. Carries [`response_format`](Self::response_format) (constrain
-/// the model's free-text output to a schema) and
+/// reproduces prior behaviour, and a field a client cannot honor is
+/// rejected with a config error rather than silently ignored (see the
+/// `ApiClient` trait's `*_with_options` defaults). Carries
+/// [`response_format`](Self::response_format) (constrain the model's
+/// free-text output to a schema),
 /// [`tool_constraint`](Self::tool_constraint) (constrain the model's tool
-/// calls to the registered schemas).
+/// calls to the registered schemas), and [`model`](Self::model) (serve
+/// this one request with a different model).
 ///
 /// The two paths are independent: setting `response_format` suppresses
 /// `tools` (and therefore makes `tool_constraint` a no-op for that
@@ -304,10 +307,16 @@ impl RequestOptions {
     /// The provider serves this one request with the named model instead
     /// of the client's current model; the client itself is untouched, so
     /// concurrent loops over one shared client cannot cross-wire their
-    /// models.
+    /// models. An empty or whitespace-only name is ignored (the override
+    /// stays unset) — the client builders reject empty model names, and
+    /// an override that would request a nameless model is never that.
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
+        let model = model.into();
+        if model.trim().is_empty() {
+            return self;
+        }
+        self.model = Some(model);
         self
     }
 
@@ -694,6 +703,22 @@ mod tests {
             "tool": "write",
             "args": { "path": "/tmp/test.txt" }
         })
+    }
+
+    #[test]
+    fn with_model_ignores_empty_and_whitespace_names() {
+        let opts = RequestOptions::default().with_model("");
+        assert!(
+            opts.model.is_none(),
+            "an empty model name leaves the override unset — providers reject nameless models"
+        );
+        let opts = RequestOptions::default().with_model("   ");
+        assert!(
+            opts.model.is_none(),
+            "a whitespace-only model name leaves the override unset"
+        );
+        let opts = RequestOptions::default().with_model("fallback-model");
+        assert_eq!(opts.model.as_deref(), Some("fallback-model"));
     }
 
     #[test]

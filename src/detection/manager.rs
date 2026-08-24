@@ -280,7 +280,11 @@ pub struct DetectionConfig {
     /// When a single operation's repetition count reaches this value, the
     /// detector sets [`LoopStatus::should_stop`] so the caller halts the
     /// agent. Setting it to `0` disables forced stops entirely while still
-    /// issuing warnings.
+    /// issuing warnings. The count is window-relative, not cumulative:
+    /// [`max_history`](Self::max_history) eviction can reset it, so a
+    /// stuck operation interleaved with enough distinct traffic may never
+    /// reach the threshold — raise `max_history` if slow loops must be
+    /// caught.
     pub stop_threshold: usize,
 
     /// Whether loop detection is enabled. Default: **true**.
@@ -434,9 +438,14 @@ pub struct DetectionStats {
 
     /// Mirrors `LoopStatus::repetition_count`. Triggers `LoopDetected` at `loop_threshold`. Reset by `reset`.
     ///
-    /// Live snapshot of the most-repeated operation's count, so observers can
-    /// watch a potential loop build up before it actually trips the
-    /// [`DetectionConfig::loop_threshold`].
+    /// Live snapshot of the most-repeated operation's count, updated on
+    /// every [`record_operation`](DetectionManager::record_operation) —
+    /// below the threshold (the build-up phase) as well as at the peak,
+    /// so observers can genuinely watch a potential loop build up before
+    /// it trips the [`DetectionConfig::loop_threshold`]. The streak
+    /// recedes only when the window itself does: a differing result
+    /// flushes a *warned* pattern's entries, and window eviction drops
+    /// old counts.
     pub current_streak: usize,
 }
 
@@ -766,6 +775,7 @@ impl DetectionManager {
                 e.into_inner()
             });
             guard.turns_analyzed = guard.turns_analyzed.saturating_add(1);
+            guard.current_streak = self.loop_detector.max_operation_count();
             DetectedPattern::NoPattern
         }
     }
@@ -782,6 +792,15 @@ impl DetectionManager {
     /// [`check_loop_pattern`](Self::check_loop_pattern)) never
     /// acknowledge implicitly; the stopping path marks automatically
     /// inside [`record_operation`](Self::record_operation).
+    ///
+    /// Acknowledging is orthogonal to *detection*: the repetition count
+    /// and `should_stop` are unaffected, and a host cannot ack its way
+    /// out of a stop. The pattern itself dissolves only through progress
+    /// semantics — a differing result hash for the same operation
+    /// flushes its window entries — so a host acknowledging while the
+    /// agent alternates two outputs for one operation never sees the
+    /// warning rebuilt, but also never sees a stop; that is the
+    /// documented "different output = progress" rule at work.
     ///
     /// # Arguments
     ///
@@ -1011,6 +1030,32 @@ impl DetectionManager {
             };
         }
         DetectedPattern::NoPattern
+    }
+
+    /// Consume a never-fired loop stop so the next run starts clean.
+    ///
+    /// A loop stop fires only at the next tool dispatch's pre-check: a run
+    /// whose identical calls reach `stop_threshold` and then goes terminal
+    /// (the model stops calling tools) never fires it, and the stale window
+    /// would kill the *next* run's first dispatch with repetitions the new
+    /// run never produced. The engine calls this at every run end: when the
+    /// current pattern would stop — the detector's own `should_stop`
+    /// rule (the single stop-rule source, zero sentinel included), the
+    /// same rule the pre-dispatch check consults — the loop window is
+    /// cleared, the
+    /// same consumption a fired stop performs. Below the stop threshold
+    /// nothing is cleared: sub-threshold history is harmless and may still
+    /// warn. Convergence state is deliberately untouched — cross-run
+    /// terminal-answer streaks are load-bearing for the opt-in
+    /// [`Stop`](crate::detection::ConvergenceAction::Stop)/[`AskUser`](crate::detection::ConvergenceAction::AskUser)
+    /// actions.
+    pub fn consume_pending_loop_stop(&self) {
+        if !self.config.enable_loop_detection {
+            return;
+        }
+        if self.loop_detector.check_loop().should_stop {
+            self.loop_detector.clear();
+        }
     }
 
     /// Obtain a shared reference to the [`LoopDetector`].
@@ -1637,6 +1682,60 @@ mod tests {
         assert!(
             after.is_looping,
             "the acknowledgement suppresses the warning only — the pattern itself is still live"
+        );
+    }
+
+    #[test]
+    fn current_streak_tracks_below_the_threshold_and_after_recovery() {
+        let manager = DetectionManager::new_with_config(DetectionConfig {
+            loop_threshold: 4,
+            stop_threshold: 10,
+            ..DetectionConfig::default()
+        })
+        .unwrap();
+        manager.record_operation(Operation::new("Read", "/f.txt"));
+        assert_eq!(
+            manager.stats().current_streak,
+            1,
+            "the streak must be live in the build-up phase, not frozen at zero"
+        );
+        manager.record_operation(Operation::new("Read", "/f.txt"));
+        assert_eq!(manager.stats().current_streak, 2);
+
+        manager.record_operation(Operation::new("Read", "/other.txt"));
+        assert_eq!(
+            manager.stats().current_streak,
+            2,
+            "an unrelated operation leaves the most-repeated count alone — \
+             the streak is the window's live maximum"
+        );
+    }
+
+    #[test]
+    fn consume_pending_loop_stop_clears_only_at_the_stop_threshold() {
+        let manager = DetectionManager::new_with_config(DetectionConfig {
+            loop_threshold: 2,
+            stop_threshold: 5,
+            ..DetectionConfig::default()
+        })
+        .unwrap();
+        for _ in 0..3 {
+            manager.record_operation(Operation::new("Read", "/f.txt"));
+        }
+        manager.consume_pending_loop_stop();
+        let below = manager.check_loop_pattern();
+        assert!(
+            matches!(&below, DetectedPattern::LoopDetected { repetitions: 3, .. }),
+            "below the stop threshold the window must survive — it may still warn: {below:?}"
+        );
+
+        for _ in 0..2 {
+            manager.record_operation(Operation::new("Read", "/f.txt"));
+        }
+        manager.consume_pending_loop_stop();
+        assert!(
+            matches!(manager.check_loop_pattern(), DetectedPattern::NoPattern),
+            "at the stop threshold the never-fired stop state must be consumed"
         );
     }
 }

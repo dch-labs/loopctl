@@ -545,7 +545,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Wall-clock deadline for a single non-streaming turn (no-streaming
     /// fallback).
     ///
-    /// Hardcoded 5-minute default. Tighter than the streaming path's 15-minute
+    /// Hardcoded 5-minute default. Tighter than the streaming path's 5-minute
     /// `total_stream_timeout` because a non-streaming turn is a single HTTP
     /// request — if it hasn't returned in 5 minutes, something is wrong. See
     /// the `streaming`-feature variant for the configurable path.
@@ -1386,6 +1386,8 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             } else {
                 self.machine.discard_pending();
             }
+
+            self.managers.detection().consume_pending_loop_stop();
 
             let run = self.session.current_run().cloned().unwrap_or_default();
             let duration = run.duration();

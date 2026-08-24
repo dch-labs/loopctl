@@ -69,9 +69,11 @@ pub struct GeminiClient {
     /// The current model identifier, stored behind a mutex for runtime
     /// hot-swapping.
     ///
-    /// Changed via [`ApiClient::set_model`] when the
-    /// [`FallbackManager`](crate::fallback::FallbackManager) trips to a
-    /// fallback model.
+    /// Changed via [`ApiClient::set_model`] (host-initiated swaps) or
+    /// overridden per request via
+    /// [`RequestOptions::model`](crate::structured::RequestOptions::model)
+    /// — the channel the fallback machinery routes through, leaving the
+    /// client itself untouched.
     model: std::sync::Mutex<String>,
 
     /// Whether to request thought summaries from reasoning-capable models.
@@ -361,6 +363,12 @@ impl ApiClient for GeminiClient {
         request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        #[cfg(feature = "grammar")]
+        if matches!(&options.tool_constraint, ToolConstraint::Grammar(_)) {
+            return Box::pin(futures::stream::once(async move {
+                Err(grammar_unsupported_error())
+            }));
+        }
         let system = request.system.clone();
         let tools = request.tools.clone();
         let rf = options.response_format.as_ref();
@@ -407,6 +415,10 @@ impl ApiClient for GeminiClient {
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
     {
+        #[cfg(feature = "grammar")]
+        if matches!(&options.tool_constraint, ToolConstraint::Grammar(_)) {
+            return Box::pin(async move { Err(grammar_unsupported_error()) });
+        }
         let system = request.system.clone();
         let tools = request.tools.clone();
         let response_format = options.response_format.as_ref();
@@ -510,19 +522,25 @@ impl GeminiClientBuilder {
     /// Set the default model identifier.
     ///
     /// The model string is embedded in the request URL (e.g.
-    /// `/models/{model}:generateContent`). Can be changed at runtime via
-    /// [`GeminiClient::set_model`] (e.g. when the
-    /// [`FallbackManager`](crate::fallback::FallbackManager) trips).
+    /// `/models/{model}:generateContent`), unless a per-request
+    /// [`RequestOptions::model`](crate::structured::RequestOptions::model)
+    /// override names another. Can also be swapped wholesale at runtime
+    /// via [`GeminiClient::set_model`].
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
     }
 
-    /// Set the total request timeout (connect + response + body).
+    /// Set the HTTP read timeout.
     ///
+    /// This bounds *idleness* — how long a gap between bytes on the
+    /// connection may last — not the total request lifetime: a stream
+    /// that keeps producing bytes runs as long as it keeps producing.
     /// Defaults to 120 seconds. Ignored when a client was supplied via
-    /// [`with_http_client`](Self::with_http_client).
+    /// [`with_http_client`](Self::with_http_client); bound the whole
+    /// turn with a [`StreamHandler`](crate::stream::handler::StreamHandler)
+    /// total timeout instead.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.http = self.http.with_timeout(timeout);
@@ -697,10 +715,27 @@ fn build_request_body(
     body
 }
 
+/// The config error for grammar constraints on the Gemini API.
+///
+/// Gemini has no grammar-constrained tool decoding, so a requested
+/// grammar is rejected loudly instead of silently downgraded to an
+/// unconstrained request — a caller asking for structural guarantees
+/// must not discover their absence from malformed tool calls downstream.
+#[cfg(feature = "grammar")]
+fn grammar_unsupported_error() -> ApiError {
+    ApiError::config(
+        "the Gemini API has no grammar-constrained tool decoding; \
+         use ToolConstraint::Strict or an OpenAI-compatible endpoint",
+    )
+}
+
 /// Convert a single framework [`Message`] into the Gemini JSON shape.
 ///
 /// Gemini uses `role: "user"` / `role: "model"` (not "assistant") and
-/// a `parts` array for content blocks.
+/// a `parts` array for content blocks. A tool result's `is_error` flag
+/// is not forwarded: the `functionResponse` payload carries the output
+/// text either way, and Gemini has no dedicated error channel for it —
+/// a failed call's error text itself conveys the failure to the model.
 fn convert_message(m: &Message) -> Value {
     // System messages are folded into the top-level `systemInstruction` field
     // by `build_request_body` before this function is reached, so the `System`
@@ -847,29 +882,22 @@ enum PartLane {
 
 /// How far the stream has progressed through its terminal sequence.
 ///
-/// A Gemini stream has two independent terminal transitions:
-/// [`extract_finish_reason`](StreamEmitter::extract_finish_reason) processes a
-/// `finishReason` chunk (emitting a [`MessageDelta`](StreamEvent::MessageDelta)
-/// and closing any open parts), and [`finish`](StreamEmitter::finish) appends
-/// the synthetic [`MessageStop`](StreamEvent::MessageStop). Either may occur
-/// first — a `finishReason` chunk may arrive before stream end, and `finish`
-/// is always called at stream end — and each must fire exactly once. Because
-/// the two are independent, this enum encodes all four combinations rather
-/// than a single linear progression, advancing to [`Terminal`](Self::Terminal)
-/// only once both are complete.
+/// A Gemini stream terminates in two steps: a `finishReason` chunk (the
+/// provider's terminal signal, processed by
+/// [`extract_finish_reason`](StreamEmitter::extract_finish_reason)) and
+/// then the [`MessageStop`](StreamEvent::MessageStop) that
+/// [`finish`](StreamEmitter::finish) emits for it at stream end. A
+/// stream that ends without a `finishReason` gets no `MessageStop` —
+/// its absence is the truncation signal the handler acts on. Once both
+/// steps are done the stage is [`Terminal`](Self::Terminal) and all
+/// later terminal work is a no-op.
 #[derive(Default)]
 enum TerminalStage {
-    /// Neither transition has run yet.
+    /// No `finishReason` has been seen.
     ///
     /// The default state at the start of a stream.
     #[default]
     Pending,
-
-    /// [`finish`](StreamEmitter::finish) has emitted the synthetic
-    /// [`MessageStop`](StreamEvent::MessageStop).
-    ///
-    /// Subsequent `finish` calls are no-ops.
-    StopEmitted,
 
     /// A `finishReason` chunk has been fully processed.
     ///
@@ -877,12 +905,9 @@ enum TerminalStage {
     /// are no-ops.
     FinishReasonSeen,
 
-    /// Both transitions are complete.
+    /// The `MessageStop` for a seen `finishReason` has been emitted.
     ///
-    /// The only state from which no further terminal work is possible;
-    /// reached from either [`StopEmitted`](Self::StopEmitted) or
-    /// [`FinishReasonSeen`](Self::FinishReasonSeen) once the other
-    /// transition fires.
+    /// The only state from which no further terminal work is possible.
     Terminal,
 }
 
@@ -905,6 +930,15 @@ struct StreamEmitter {
     /// since Gemini's streaming chunks don't carry them) and treats later
     /// chunks as content only.
     started: bool,
+
+    /// The latest non-empty `usageMetadata` seen on any chunk.
+    ///
+    /// Gemini reports cumulative usage on every chunk, but the terminal
+    /// `finishReason` chunk does not always carry it (proxies and
+    /// gateways frequently split them). Latching the latest report lets
+    /// the terminal [`MessageDelta`](StreamEvent::MessageDelta) attach
+    /// usage even when the two arrive on different chunks.
+    pending_usage: Option<Usage>,
 
     /// Whether the text content part is currently open.
     ///
@@ -931,22 +965,20 @@ struct StreamEmitter {
 
     /// How far the stream has progressed through its terminal sequence.
     ///
-    /// Tracks two independent transitions — `finishReason` processing (by
-    /// [`extract_finish_reason`](Self::extract_finish_reason)) and the
-    /// synthetic [`StreamEvent::MessageStop`] emission (by
-    /// [`finish`](Self::finish)) — as a single field. The two are
-    /// independent: a `finishReason` chunk may arrive before or after
-    /// `MessageStop`, and each must fire exactly once.
+    /// Tracks the terminal sequence — `finishReason` processing (by
+    /// [`extract_finish_reason`](Self::extract_finish_reason)), then the
+    /// [`StreamEvent::MessageStop`] emission for it (by
+    /// [`finish`](Self::finish)) — as a single field.
     terminal: TerminalStage,
 
     /// A terminal error carried by a top-level `/error` chunk, if any.
     ///
     /// Gemini reports mid-stream failures as SSE chunks whose JSON carries
     /// an `error` object instead of candidates. Recorded here so
-    /// [`finish`](Self::finish) terminates the stream with the error instead
-    /// of the synthetic [`StreamEvent::MessageStop`] — without it, a
-    /// consumer could not distinguish an errored stream from a healthy
-    /// truncated one. First error wins; later ones are ignored.
+    /// [`finish`](Self::finish) terminates the stream with the error
+    /// instead of completing it — without it, a consumer could not
+    /// distinguish an errored stream from a truncated one. First error
+    /// wins; later ones are ignored.
     error: Option<ApiError>,
 
     /// Buffered [`StreamEvent`]s waiting to be yielded to the consumer.
@@ -985,17 +1017,53 @@ impl StreamEmitter {
             }));
         }
 
+        self.note_usage(json);
         self.extract_parts_with_tools(json);
         self.extract_finish_reason(json);
     }
 
+    /// Latch the chunk's `usageMetadata` when it carries a non-empty one.
+    ///
+    /// Reports are cumulative, so the latest non-empty report is the most
+    /// complete; `extract_finish_reason` consumes the latch when it emits
+    /// the terminal `MessageDelta`. Counts above `u32::MAX` saturate
+    /// rather than read as zero.
+    fn note_usage(&mut self, json: &Value) {
+        let input = json
+            .pointer("/usageMetadata/promptTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let output = json
+            .pointer("/usageMetadata/candidatesTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let thoughts = json
+            .pointer("/usageMetadata/thoughtsTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let total_output = output.saturating_add(thoughts);
+        if input > 0 || total_output > 0 {
+            self.pending_usage = Some(Usage::new(
+                u32::try_from(input).unwrap_or(u32::MAX),
+                u32::try_from(total_output).unwrap_or(u32::MAX),
+            ));
+        }
+    }
+
     /// Record the terminal error from a top-level `/error` chunk.
     ///
-    /// Reads `/error/status` and `/error/message` (Gemini's error payload,
-    /// e.g. `"UNAVAILABLE"` / `"The model is overloaded"`) into an
+    /// Reads `/error/status`, `/error/code`, and `/error/message`
+    /// (Gemini's error payload, e.g. `"UNAVAILABLE"` / `"The model is
+    /// overloaded"`). Rate-limit family failures (HTTP codes 429/503/529
+    /// or statuses `RESOURCE_EXHAUSTED`/`UNAVAILABLE`) become
+    /// [`ApiError::RateLimit`] so the stream handler's rate-limit ladder
+    /// — with its backoff and `Retry-After` handling — owns the
+    /// response, mirroring the status-based classification of
+    /// non-streaming requests. Everything else stays an
     /// [`ApiError::api`] recording. Missing fields fall back to generic
-    /// wording so a malformed payload still terminates with an error rather
-    /// than being dropped. The first error wins; later ones are ignored.
+    /// wording so a malformed payload still terminates with an error
+    /// rather than being dropped. The first error wins; later ones are
+    /// ignored.
     fn record_error(&mut self, json: &Value) {
         if self.error.is_some() {
             return;
@@ -1008,7 +1076,18 @@ impl StreamEmitter {
             .pointer("/error/message")
             .and_then(Value::as_str)
             .unwrap_or("stream failed");
-        self.error = Some(ApiError::api(format!("{status}: {message}")));
+        let code = json.pointer("/error/code").and_then(Value::as_u64);
+        let detail = format!("{status}: {message}");
+        let rate_limited = code.is_some_and(|code| code == 429 || code == 503 || code == 529)
+            || matches!(status, "RESOURCE_EXHAUSTED" | "UNAVAILABLE");
+        self.error = Some(if rate_limited {
+            ApiError::RateLimit {
+                retry_after: None,
+                message: detail,
+            }
+        } else {
+            ApiError::api(detail)
+        });
     }
 
     /// Extract text, thought, and tool-call parts from the chunk, preserving
@@ -1170,10 +1249,7 @@ impl StreamEmitter {
         else {
             return;
         };
-        self.terminal = match self.terminal {
-            TerminalStage::StopEmitted => TerminalStage::Terminal,
-            _ => TerminalStage::FinishReasonSeen,
-        };
+        self.terminal = TerminalStage::FinishReasonSeen;
         let stop = match reason {
             "MAX_TOKENS" => StreamStopReason::MaxTokens,
             _ => StreamStopReason::EndTurn,
@@ -1193,29 +1269,7 @@ impl StreamEmitter {
             });
         }
 
-        let usage = json.pointer("/usageMetadata").and_then(|u| {
-            let input = u
-                .get("promptTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let output = u
-                .get("candidatesTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let thoughts = u
-                .get("thoughtsTokenCount")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let total_output = output.saturating_add(thoughts);
-            if input == 0 && total_output == 0 {
-                None
-            } else {
-                Some(Usage::new(
-                    u32::try_from(input).unwrap_or(0),
-                    u32::try_from(total_output).unwrap_or(0),
-                ))
-            }
-        });
+        let usage = self.pending_usage.take();
 
         self.push(StreamEvent::MessageDelta(MessageDelta {
             delta: MessageDeltaPayload {
@@ -1241,9 +1295,12 @@ impl StreamEmitter {
     /// When an error chunk was recorded, terminates with that error and
     /// emits nothing further — no synthetic `MessageStop`, so the failure
     /// cannot masquerade as a clean stop. Otherwise drains any remaining
-    /// pending events and appends the stop event. Safe to call exactly once
-    /// at the end of the stream; subsequent calls return an empty vec (the
-    /// `terminal` stage guards against double-stop).
+    /// pending events and appends the stop **only when a `finishReason`
+    /// was seen**: Gemini's terminal signal is the `finishReason` chunk,
+    /// and a stream that ends without one is truncated — the absence of
+    /// the stop is what tells the handler so. Safe to call exactly once
+    /// at the end of the stream; subsequent calls return an empty vec
+    /// (the `terminal` stage guards against double-stop).
     ///
     /// # Errors
     ///
@@ -1254,15 +1311,9 @@ impl StreamEmitter {
             return Err(err);
         }
         let mut out = self.drain();
-        let stop_pending = matches!(
-            self.terminal,
-            TerminalStage::Pending | TerminalStage::FinishReasonSeen
-        );
+        let stop_pending = matches!(self.terminal, TerminalStage::FinishReasonSeen);
         if self.started && stop_pending {
-            self.terminal = match self.terminal {
-                TerminalStage::FinishReasonSeen => TerminalStage::Terminal,
-                _ => TerminalStage::StopEmitted,
-            };
+            self.terminal = TerminalStage::Terminal;
             out.push(StreamEvent::MessageStop);
         }
         Ok(out)
@@ -2218,20 +2269,25 @@ mod tests {
     }
 
     #[test]
-    fn emitter_finish_emits_message_stop_if_needed() {
+    fn emitter_finish_emits_no_stop_without_a_finish_reason() {
         let mut em = StreamEmitter::default();
         em.started = true;
         em.terminal = TerminalStage::Pending;
 
         let events = em.finish().expect("no recorded error");
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::MessageStop)));
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, StreamEvent::MessageStop)),
+            "a stream that ends without finishReason is truncated — no synthetic stop may dress it up"
+        );
     }
 
     #[test]
     fn emitter_finish_noop_if_already_stopped() {
         let mut em = StreamEmitter::default();
         em.started = true;
-        em.terminal = TerminalStage::StopEmitted;
+        em.terminal = TerminalStage::Terminal;
 
         let events = em.finish().expect("no recorded error");
         assert!(events.is_empty());
@@ -2268,6 +2324,89 @@ mod tests {
             err.to_string().contains("The model is overloaded"),
             "the terminal error must carry the provider's message: {err}"
         );
+        assert!(
+            matches!(err, ApiError::RateLimit { .. }),
+            "a 503/UNAVAILABLE chunk is the SSE form of an overloaded status \
+             and must classify as RateLimit"
+        );
+    }
+
+    #[cfg(feature = "grammar")]
+    #[tokio::test]
+    async fn grammar_constraint_errors_loudly() {
+        let client = GeminiClient::builder()
+            .with_api_key("test")
+            .build()
+            .unwrap();
+        let opts = crate::structured::RequestOptions::default().with_tool_constraint(
+            crate::structured::ToolConstraint::Grammar(std::sync::Arc::new(
+                crate::provider::grammar::JsonSchemaGrammar::from_schemas(&[]),
+            )),
+        );
+        let mut stream =
+            client.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), opts);
+        let first = futures::StreamExt::next(&mut stream).await;
+        assert!(
+            matches!(&first, Some(Err(err)) if err.to_string().contains("grammar")),
+            "a grammar constraint must be rejected, not silently downgraded: {first:?}"
+        );
+    }
+
+    #[test]
+    fn usage_from_an_earlier_chunk_survives_a_usageless_finish_chunk() {
+        let mut em = StreamEmitter::default();
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "partial"}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 25,
+                "candidatesTokenCount": 7,
+                "thoughtsTokenCount": 3
+            }
+        }));
+        em.process_chunk(&serde_json::json!({
+            "candidates": [{"finishReason": "STOP"}]
+        }));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        let usage = usage.expect("the terminal delta must carry usage");
+        assert_eq!(usage.input_tokens, 25);
+        assert_eq!(
+            usage.output_tokens, 10,
+            "candidatesTokenCount + thoughtsTokenCount, latched from the earlier chunk"
+        );
+    }
+
+    #[test]
+    fn gemini_rate_limit_error_chunk_classifies_as_rate_limit() {
+        let mut em = StreamEmitter::default();
+        em.process_chunk(&serde_json::json!({
+            "error": {"code": 429, "message": "Resource exhausted", "status": "RESOURCE_EXHAUSTED"}
+        }));
+        let err = em
+            .finish()
+            .expect_err("finish must surface the recorded error");
+        assert!(
+            matches!(err, ApiError::RateLimit { .. }),
+            "a 429/RESOURCE_EXHAUSTED chunk must classify as RateLimit"
+        );
+    }
+
+    #[test]
+    fn gemini_non_rate_limit_error_chunk_stays_a_provider_error() {
+        let mut em = StreamEmitter::default();
+        em.process_chunk(&serde_json::json!({
+            "error": {"code": 400, "message": "API key not valid", "status": "INVALID_ARGUMENT"}
+        }));
+        let err = em
+            .finish()
+            .expect_err("finish must surface the recorded error");
+        assert!(
+            !matches!(err, ApiError::RateLimit { .. }),
+            "non-rate-limit errors stay provider errors: {err}"
+        );
     }
 
     #[test]
@@ -2292,34 +2431,42 @@ mod tests {
 
     #[test]
     fn emitter_finish_reason_after_finish_advances_to_terminal() {
-        // A finishReason arriving after finish() still emits its own
-        // MessageDelta, but a *second* such chunk must be a no-op once the
-        // terminal stage reaches Terminal.
+        // A finishReason arriving after a truncated finish() (no stop was
+        // emitted) still emits its own MessageDelta and completes the
+        // stream; a *second* such chunk must be a no-op once Terminal is
+        // reached.
         let mut em = StreamEmitter::default();
         em.started = true;
-        let stop_events = em.finish().expect("no recorded error");
+        let empty = em.finish().expect("no recorded error");
         assert!(
-            stop_events
-                .iter()
-                .any(|e| matches!(e, StreamEvent::MessageStop)),
-            "first finish must emit MessageStop"
+            empty.is_empty(),
+            "a truncated finish emits nothing — the missing stop is the truncation signal"
         );
-        assert!(matches!(em.terminal, TerminalStage::StopEmitted));
+        assert!(matches!(em.terminal, TerminalStage::Pending));
 
         em.process_chunk(&serde_json::json!({
             "candidates": [{"finishReason": "STOP"}]
         }));
         assert!(
-            matches!(em.terminal, TerminalStage::Terminal),
-            "late finishReason after finish must advance to Terminal"
+            matches!(em.terminal, TerminalStage::FinishReasonSeen),
+            "a late finishReason after a truncated finish is still processed"
         );
         let late_events = em.drain();
         assert!(
             late_events
                 .iter()
                 .any(|e| matches!(e, StreamEvent::MessageDelta(_))),
-            "the first late finishReason still emits its MessageDelta"
+            "the late finishReason still emits its MessageDelta"
         );
+
+        let stop_events = em.finish().expect("no recorded error");
+        assert!(
+            stop_events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::MessageStop)),
+            "finish after the late finishReason must emit MessageStop"
+        );
+        assert!(matches!(em.terminal, TerminalStage::Terminal));
 
         em.process_chunk(&serde_json::json!({
             "candidates": [{"finishReason": "STOP"}]
@@ -2336,6 +2483,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hello\n".into(),
+            done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "data: hello");
         assert!(reader.buf.is_empty());
@@ -2346,6 +2494,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "partial".into(),
+            done_marker_seen: false,
         };
         assert!(reader.take_line().unwrap().is_none());
     }
@@ -2355,6 +2504,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "line1\nline2\n".into(),
+            done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "line1");
         assert_eq!(reader.take_line().unwrap().unwrap(), "line2");
@@ -2365,6 +2515,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hi\r\n".into(),
+            done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "data: hi");
     }
@@ -2409,6 +2560,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: {\"candidates\":[]}\n\n".to_string().into_bytes(),
+            done_marker_seen: false,
         };
         assert_eq!(
             reader.take_line().unwrap(),
@@ -2426,6 +2578,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let result = reader.next_gemini_data().await.unwrap();
         assert!(result.is_some());
@@ -2441,6 +2594,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         // First call should skip malformed and return the valid one.
         let result = reader.next_gemini_data().await.unwrap();
@@ -2456,6 +2610,7 @@ mod tests {
         let mut reader = super::SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let result = reader.next_gemini_data().await;
         assert!(result.is_err(), "should error on buffer overflow");
@@ -3296,6 +3451,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let parsed = reader
             .next_gemini_data()
@@ -3489,6 +3645,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let parsed = reader
             .next_gemini_data()

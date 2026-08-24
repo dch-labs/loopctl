@@ -855,6 +855,14 @@ impl Operation {
 /// An empty result usually means the tool produced
 /// no output, and hashing it would add noise without value.
 ///
+/// Two consequences of these rules are deliberate cuts, recorded here:
+/// all empty-output calls of one operation share the `None` hash and
+/// count as identical repetitions (nothing distinguishes two silent
+/// successes), and the engine hashes multipart results by their rendered
+/// text — parts that carry no text (images, binary) are invisible to the
+/// comparison. The signature's `primary_param` is the lever for hosts
+/// that need finer distinctions.
+///
 /// # Use in Loop Detection
 ///
 /// The hash is stored in [`Operation::result_hash`] and used by
@@ -915,15 +923,21 @@ pub fn hash_result(content: &str) -> Option<u64> {
 ///
 /// # Warning Deduplication
 ///
-/// The [`warning`](LoopStatus::warning) field is `None` when:
-/// 1. No loop was detected ([`is_looping`](LoopStatus::is_looping) is `false`), or
-/// 2. The same operation was already warned about and the agent hasn't
-///    hit the [`stop_threshold`](LoopDetectorConfig::stop_threshold).
+/// The [`warning`](LoopStatus::warning) field is `None` when no loop was
+/// detected, or when the pattern's first operation sits in the warned set
+/// while below the [`stop_threshold`](LoopDetectorConfig::stop_threshold).
 ///
-/// This prevents the agent's context from being flooded with identical
-/// loop messages across consecutive [`check_loop`](LoopDetector::check_loop)
-/// calls. When the agent makes progress (result hash changes) or the
-/// detector is reset, the warning is re-enabled.
+/// Entries enter the warned set only from the recording paths (the
+/// stop-escalation mark) or from a host calling
+/// [`acknowledge_loop_warning`](crate::detection::DetectionManager::acknowledge_loop_warning);
+/// polls never insert. Below the stop threshold, an unacknowledged
+/// warning is therefore rebuilt on every poll — the one-shot band the
+/// engine's warning path can reach is "a warned pattern whose count
+/// dropped back below the stop threshold", plus host acknowledgements.
+/// A warned entry leaves the set when the agent makes progress (a
+/// differing result hash for the same operation flushes it) or the
+/// detector is reset; at or over the stop threshold the warning is
+/// always rebuilt, never suppressed.
 ///
 /// # Example
 ///
@@ -1273,9 +1287,13 @@ impl LoopDetector {
     ///
     /// # When Called
     ///
-    /// Called by the framework once per completed tool invocation — the
-    /// single record point for loop detection. Hosts driving the detector
-    /// directly may also use [`LoopDetector::record_from_input`] or
+    /// The single record point for loop detection. The engine calls it
+    /// once per dispatch **attempt**: recovery retries of a failing call
+    /// each record too (bounded by the recovery ceiling), so a flaky
+    /// logical call can reach the loop threshold on its own — a host
+    /// that wants per-invocation semantics should record at its own
+    /// boundary instead. Hosts driving the detector directly may also
+    /// use [`LoopDetector::record_from_input`] or
     /// [`LoopDetector::record_from_input_with_error`] for input-only
     /// records (no result yet).
     pub fn record(&self, operation: Operation) {
@@ -1377,10 +1395,12 @@ impl LoopDetector {
     /// as distinct operations — the agent is making progress, not looping.
     ///
     /// **Deduplication:** if a warning was already issued for the same
-    /// operation (tracked in the warned-operations set) and
+    /// operation (tracked in the warned-operations set — fed by the
+    /// stop-escalation mark or a host acknowledgement) and
     /// [`should_stop`](LoopStatus::should_stop) is `false`, the
-    /// [`warning`](LoopStatus::warning) field is suppressed to avoid
-    /// spamming the agent.
+    /// [`warning`](LoopStatus::warning) field is suppressed. An
+    /// unacknowledged warning below the stop threshold is rebuilt on
+    /// every poll — see the enum-level Warning Deduplication notes.
     ///
     /// # Returns
     ///
@@ -1390,9 +1410,10 @@ impl LoopDetector {
     /// # When Called
     ///
     /// Called by the framework between tool invocations as a pure read —
-    /// the single record point is [`record`](LoopDetector::record), called
-    /// once per completed invocation, so examining a step twice (pre-checks,
-    /// re-derived steps) counts it once.
+    /// examining a step twice (pre-checks, re-derived steps) counts it
+    /// once. Note that the engine's recovery retries record once per
+    /// *attempt* (see [`record`](LoopDetector::record)); the count here
+    /// reflects what has been recorded, not logical invocations.
     pub fn check_loop(&self) -> LoopStatus {
         let Ok(ops) = self.operations.lock() else {
             return LoopStatus::default();
@@ -1435,6 +1456,26 @@ impl LoopDetector {
         {
             warned.insert(first_op.clone());
         }
+    }
+
+    /// The highest occurrence count of any operation in the window.
+    ///
+    /// Threshold-free companion to
+    /// [`repetition_count`](LoopStatus::repetition_count), which only
+    /// reflects operations that reached the loop threshold: this reports
+    /// the live maximum below the threshold too, so streak telemetry can
+    /// watch a potential loop build up before it trips. Zero on an empty
+    /// window (or a poisoned lock).
+    #[must_use]
+    pub fn max_operation_count(&self) -> usize {
+        let Ok(ops) = self.operations.lock() else {
+            return 0;
+        };
+        Self::count_operations(&ops)
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
     }
 
     /// Count occurrences of each operation in the deque.
@@ -1546,8 +1587,10 @@ impl LoopDetector {
     ///
     /// # When Called
     ///
-    /// Called by the framework before dispatching each tool call within a
-    /// turn. If `true`, the framework should stop the turn.
+    /// Not called by the engine — hosts that want a per-turn tool budget
+    /// call this before each dispatch and call
+    /// [`reset_turn`](Self::reset_turn) at their turn boundary. The
+    /// engine imposes its own caps (`max_turns`, the turn's tool list).
     pub fn check_turn_limit(&self) -> bool {
         match self.turn_count.lock() {
             Ok(count) => *count >= self.config.max_tools_per_turn,
@@ -1575,8 +1618,9 @@ impl LoopDetector {
     ///
     /// # When Called
     ///
-    /// At the beginning of every new turn, before any tool calls are
-    /// dispatched.
+    /// By the host at its own turn boundary — the engine does not reset
+    /// the counter, so without a host call the count grows for the
+    /// detector's lifetime.
     pub fn reset_turn(&self) {
         if let Ok(mut count) = self.turn_count.lock() {
             *count = 0;

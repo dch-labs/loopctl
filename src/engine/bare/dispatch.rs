@@ -519,9 +519,16 @@ impl<C: ApiClient> BareLoop<C> {
                 return Ok(blocked);
             }
 
-            if let Some(blocked) = self.pre_detection(turn_idx)? {
+            if let Err(e) = self.pre_detection(turn_idx) {
+                let blocked = Self::result_for_call(
+                    &tc,
+                    Duration::ZERO,
+                    ToolContent::Text(format!("dispatch refused before execution: {e}")),
+                    true,
+                    None,
+                );
                 self.notify_tool_post(turn_idx, &tc, &blocked);
-                return Ok(blocked);
+                return Err(e);
             }
 
             let start = Instant::now();
@@ -535,7 +542,7 @@ impl<C: ApiClient> BareLoop<C> {
             #[cfg(feature = "hooks")]
             self.notify_post_tool_use_hooks(&tc, &tool_result, turn_idx);
             #[cfg(feature = "tool_health")]
-            self.record_tool_health(tc.tool.as_str(), &tool_result);
+            self.record_tool_health(&Self::health_key(&tc, &tool_result), &tool_result);
             self.record_tool_memory(&tc, &tool_result).await;
 
             if !tool_result.is_error {
@@ -589,6 +596,7 @@ impl<C: ApiClient> BareLoop<C> {
     fn notify_tool_post(&self, turn_idx: usize, tc: &ToolCall, result: &ToolDispatchResult) {
         self.managers.observers().on_tool_post(&ToolPostContext {
             turn: turn_idx,
+            tool_call_id: result.tool_call_id.clone(),
             tool: tc.tool.clone(),
             result_hash: loop_detector::hash_result(&result.output.to_string()),
             is_error: result.is_error,
@@ -617,21 +625,22 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// A pure read of the sliding window: the single record point per
     /// invocation is [`post_detection`](Self::post_detection), so a
-    /// re-derived or re-driven step cannot double-count. Returns
-    /// `Some(blocked_result)` if loop detection blocks the call,
-    /// or `None` if dispatch should proceed.
+    /// re-derived or re-driven step cannot double-count. A pattern at or
+    /// over the stop threshold aborts the call; anything less severe
+    /// (no pattern, a warning-band pattern) lets dispatch proceed.
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::LoopDetected`] if the detection manager signals
-    /// a hard stop.
-    fn pre_detection(&self, turn_idx: usize) -> Result<Option<ToolDispatchResult>, LoopError> {
+    /// Returns [`LoopError::LoopDetected`] if the loop window holds a
+    /// pattern at or over the stop threshold. Convergence patterns are
+    /// decided on the response path, not here.
+    fn pre_detection(&self, turn_idx: usize) -> Result<(), LoopError> {
         let pattern = self.managers.detection().check_loop_pattern();
 
         self.managers.notify_detected_pattern(&pattern, turn_idx);
         match self.decide_detected_pattern(&pattern) {
             Some(e) => Err(e),
-            None => Ok(None),
+            None => Ok(()),
         }
     }
 
@@ -640,6 +649,9 @@ impl<C: ApiClient> BareLoop<C> {
     /// The single write point per invocation: hashes the result — multipart
     /// by its rendered text — so the detector distinguishes "same input,
     /// same output" (stuck) from "same input, different output" (progress).
+    /// The primary parameter is the configured signature's extraction, with
+    /// a canonical-JSON rendering of the input as the fallback when the
+    /// signature yields nothing (see [`detection_primary_param`]).
     fn post_detection(&self, tc: &ToolCall, tool_result: &ToolDispatchResult) {
         let result_hash = match &tool_result.output {
             ToolContent::Text(t) => loop_detector::hash_result(t),
@@ -647,13 +659,37 @@ impl<C: ApiClient> BareLoop<C> {
                 loop_detector::hash_result(&tool_result.output.to_string())
             }
         };
-        let operation = Operation::from_input_with_result_and_signature(
-            &tc.tool,
-            &tc.input,
+        let operation = Operation {
+            tool: tc.tool.clone(),
+            primary_param: self.detection_primary_param(&tc.tool, &tc.input),
             result_hash,
-            self.managers.detection().signature(),
-        );
+        };
         self.managers.detection().record_operation(operation);
+    }
+
+    /// The primary parameter one dispatch is recorded under.
+    ///
+    /// The configured [`ToolSignature`]'s extraction, falling back to a
+    /// canonical-JSON rendering of the whole input when the extraction
+    /// yields the empty string — the default
+    /// [`NoOpToolSignature`](crate::detection::NoOpToolSignature)'s blind
+    /// spot. Without the fallback, two calls of one tool with different
+    /// inputs but byte-identical outputs (the same file read from two
+    /// paths, `git status` twice on an unchanged tree) collapse into one
+    /// operation and count as repetition; with it, only *identical
+    /// inputs* repeating is flagged. A signature that does extract keeps
+    /// full control of the key.
+    fn detection_primary_param(&self, tool: &str, input: &serde_json::Value) -> String {
+        let extracted = self
+            .managers
+            .detection()
+            .signature()
+            .extract_primary_param(tool, input);
+        if extracted.is_empty() {
+            serde_json::to_string(input).unwrap_or_default()
+        } else {
+            extracted
+        }
     }
 
     /// Execute a single tool call.
@@ -876,6 +912,22 @@ impl<C: ApiClient> BareLoop<C> {
             health.record_failure(tool_name, tool_result.duration);
         } else {
             health.record_success(tool_name, tool_result.duration);
+        }
+    }
+
+    /// The tool name health statistics are keyed on for one dispatch.
+    ///
+    /// The executed (resolved) tool name when a routing middleware
+    /// renamed it, else the requested name — the same key space
+    /// [`VerifyMiddleware`](crate::middleware::verify::VerifyMiddleware)
+    /// matches on, so health, verification, and telemetry all describe
+    /// one dispatch by one name.
+    #[cfg(feature = "tool_health")]
+    fn health_key(tc: &ToolCall, tool_result: &ToolDispatchResult) -> String {
+        if tool_result.resolved_tool_name.is_empty() {
+            tc.tool.clone()
+        } else {
+            tool_result.resolved_tool_name.clone()
         }
     }
 

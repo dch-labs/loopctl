@@ -1200,26 +1200,35 @@ mod tests {
 
         let result = pipeline.invoke(long_output_ctx("long_output", 200)).await;
         assert!(!result.is_error);
-        let expected = format!("{}\n[truncated]", "a".repeat(limit));
+        let expected = format!("{}\n[truncated]", "a".repeat(limit - 12));
         assert_eq!(result.output, ToolContent::Text(expected));
+        let ToolContent::Text(text) = &result.output else {
+            panic!("expected Text output")
+        };
+        let text_len = text.chars().count();
+        assert_eq!(
+            text_len, limit,
+            "a truncated output is exactly at the cap — the marker is inside the budget"
+        );
     }
 
     #[tokio::test]
     async fn test_output_limit_truncation_respects_char_boundary() {
-        // Verify truncation operates on char boundaries, not bytes.
+        // Verify truncation operates on char boundaries, not bytes, and
+        // that the marker is reserved inside the budget: a 15-char cap
+        // keeps 3 é (each 2 bytes) plus the 12-char marker.
         let registry = long_output_registry();
-        let limit = 5;
         let pipeline = ToolPipeline::builder()
-            .with_middleware(OutputLimitMiddleware::new(limit))
+            .with_middleware(OutputLimitMiddleware::new(15))
             .with_core(Arc::clone(&registry))
             .build()
             .expect("valid");
         let mut ctx = test_ctx("long_output");
-        ctx.input = serde_json::json!({"count": 10, "char": "é"});
+        ctx.input = serde_json::json!({"count": 30, "char": "é"});
 
         let result = pipeline.invoke(ctx).await;
         assert!(!result.is_error);
-        let expected = format!("{}\n[truncated]", "é".repeat(limit));
+        let expected = format!("{}\n[truncated]", "é".repeat(3));
         assert_eq!(result.output, ToolContent::Text(expected));
     }
 
@@ -1234,34 +1243,29 @@ mod tests {
 
         let result = pipeline.invoke(test_ctx("multipart")).await;
         assert!(!result.is_error);
-        // The shared character budget (3) is consumed by the first text
-        // part. "part1" (5 chars > 3) → "par\n[truncated]", remaining=0.
-        // "part2" gets zero remaining budget → "[truncated]".
+        // The shared character budget (3) is smaller than the marker
+        // (12), so the first text part collapses to the bare marker —
+        // truncation must stay visible even at tiny budgets — and the
+        // second gets zero remaining budget and is emptied.
         match result.output {
             ToolContent::Multipart(parts) => {
                 assert_eq!(parts.len(), 2, "should still have 2 parts");
-                // Part 0 consumes the entire budget.
                 match &parts[0] {
                     ToolContentPart::Text { text } => {
-                        assert!(
-                            text.starts_with("par"),
-                            "part 0 should start with first 3 chars: got {text:?}"
-                        );
-                        assert!(
-                            text.contains("[truncated]"),
-                            "part 0 should be truncated: got {text:?}"
+                        assert_eq!(
+                            text, "\n[truncated]",
+                            "part 0 keeps only the marker: got {text:?}"
                         );
                     }
                     ToolContentPart::Image { .. } => {
                         panic!("unexpected image part in MultipartTool output");
                     }
                 }
-                // Part 1 gets zero remaining budget.
                 match &parts[1] {
                     ToolContentPart::Text { text } => {
                         assert_eq!(
-                            text, "[truncated]",
-                            "part 1 should be fully truncated with zero budget: got {text:?}"
+                            text, "",
+                            "a part with zero remaining budget is emptied, not re-marked: got {text:?}"
                         );
                     }
                     ToolContentPart::Image { .. } => {
@@ -1368,12 +1372,12 @@ mod tests {
 
         let result = pipeline.invoke(long_output_ctx("long_output", 1000)).await;
         assert!(!result.is_error);
-        let expected = format!("{}\n[truncated]", "a".repeat(20));
+        let expected = format!("{}\n[truncated]", "a".repeat(20 - 12));
         assert_eq!(result.output, ToolContent::Text(expected));
     }
 
     #[tokio::test]
-    async fn test_output_limit_zero_chars_truncates_everything() {
+    async fn test_output_limit_zero_chars_disables_truncation() {
         let registry = long_output_registry();
         let pipeline = ToolPipeline::builder()
             .with_middleware(OutputLimitMiddleware::new(0))
@@ -1383,9 +1387,13 @@ mod tests {
 
         let result = pipeline.invoke(long_output_ctx("long_output", 100)).await;
         assert!(!result.is_error);
+        let ToolContent::Text(text) = result.output else {
+            panic!("expected Text output from the long-output tool")
+        };
         assert_eq!(
-            result.output,
-            ToolContent::Text("\n[truncated]".to_string())
+            text.chars().count(),
+            100,
+            "a zero cap disables the middleware — output passes through untouched"
         );
     }
 
@@ -1512,7 +1520,8 @@ mod tests {
     #[tokio::test]
     async fn output_limit_multipart_shared_budget_truncates_later_parts() {
         // max_chars = 6: part 0 (4) fits, leaving 2.
-        // Part 1 (4 > 2) → "bb\n[truncated]". Part 2 → 0 remaining.
+        // Part 1 (4 > 2) collapses to the bare marker (2 < marker 12).
+        // Part 2 → 0 remaining, emptied.
         let mut registry = ToolRegistry::new();
         registry.register(ThreePartTextTool);
         let pipeline = ToolPipeline::builder()
@@ -1535,13 +1544,9 @@ mod tests {
                 }
                 match &parts[1] {
                     ToolContentPart::Text { text } => {
-                        assert!(
-                            text.starts_with("bb"),
-                            "part 1 should start with 2 chars: got {text:?}"
-                        );
-                        assert!(
-                            text.contains("[truncated]"),
-                            "part 1 should be truncated: got {text:?}"
+                        assert_eq!(
+                            text, "\n[truncated]",
+                            "part 1 keeps only the marker (remaining 2 < marker): got {text:?}"
                         );
                     }
                     ToolContentPart::Image { .. } => panic!("expected Text part 1"),
@@ -1549,8 +1554,8 @@ mod tests {
                 match &parts[2] {
                     ToolContentPart::Text { text } => {
                         assert_eq!(
-                            text, "[truncated]",
-                            "part 2 should be fully truncated: got {text:?}"
+                            text, "",
+                            "part 2 should be emptied with zero budget: got {text:?}"
                         );
                     }
                     ToolContentPart::Image { .. } => panic!("expected Text part 2"),
@@ -1626,8 +1631,8 @@ mod tests {
                 match &parts[2] {
                     ToolContentPart::Text { text } => {
                         assert_eq!(
-                            text, "[truncated]",
-                            "part 2 should be fully truncated: got {text:?}"
+                            text, "",
+                            "part 2 should be emptied with zero budget: got {text:?}"
                         );
                     }
                     ToolContentPart::Image { .. } => panic!("expected Text part 2"),

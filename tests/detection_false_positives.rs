@@ -36,6 +36,8 @@ use serde_json::Value;
 enum Step {
     /// A tool-call turn with the given preamble text (may be empty).
     Preamble(String),
+    /// A tool-call turn for `search` with a caller-chosen input.
+    ToolInput(Value),
     /// A terminal text-only turn.
     Text(String),
 }
@@ -88,6 +90,33 @@ impl ApiClient for ScriptedClient {
         let step = self.script.lock().unwrap().remove(0);
         *self.turns.lock().unwrap() += 1;
         let events = match step {
+            Step::ToolInput(input) => vec![
+                Ok(StreamEvent::MessageStart(MessageStart {
+                    message: MessageMetadata {
+                        id: "msg_1".into(),
+                        role: "assistant".into(),
+                        model: "test-model".into(),
+                    },
+                })),
+                Ok(StreamEvent::PartStart(PartStart {
+                    index: 1,
+                    part: Some(MessagePart::tool_call("call_1", "search", Value::Null)),
+                })),
+                Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                    index: 1,
+                    delta: DeltaPart::InputJson {
+                        partial_json: input.to_string(),
+                    },
+                })),
+                Ok(StreamEvent::PartStop { index: Some(1) }),
+                Ok(StreamEvent::MessageDelta(MessageDelta {
+                    delta: MessageDeltaPayload {
+                        stop_reason: Some("tool_call".into()),
+                    },
+                    usage: Some(Usage::new(1, 1)),
+                })),
+                Ok(StreamEvent::MessageStop),
+            ],
             Step::Preamble(text) => {
                 let mut events: Vec<Result<StreamEvent, ApiError>> =
                     vec![Ok(StreamEvent::MessageStart(MessageStart {
@@ -365,6 +394,97 @@ fn tool_script(turns: usize) -> Vec<Step> {
     }
     script.push(Step::Text("done".into()));
     script
+}
+
+/// A tool returning byte-identical output for every input, whatever the
+/// input.
+struct IdenticalOutputTool;
+
+impl Tool for IdenticalOutputTool {
+    fn name(&self) -> &'static str {
+        "search"
+    }
+
+    fn description(&self) -> &'static str {
+        "Returns the same result for every input"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            tool: "search".into(),
+            description: "Returns the same result for every input".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        Box::pin(async { Ok(ToolOutput::text("same result every time".to_string())) })
+    }
+}
+
+#[tokio::test]
+async fn next_run_after_an_unfired_stop_is_not_killed() {
+    let client = ScriptedClient::new(vec![
+        Step::ToolInput(serde_json::json!({"path": "a"})),
+        Step::ToolInput(serde_json::json!({"path": "a"})),
+        Step::ToolInput(serde_json::json!({"path": "a"})),
+        Step::Text("done".into()),
+        Step::ToolInput(serde_json::json!({"path": "a"})),
+        Step::Text("done".into()),
+        Step::ToolInput(serde_json::json!({"path": "a"})),
+        Step::Text("done".into()),
+    ]);
+    let manager = DetectionManager::new_with_config(DetectionConfig {
+        loop_threshold: 2,
+        stop_threshold: 3,
+        ..DetectionConfig::default()
+    })
+    .unwrap();
+    let (mut agent, _client) = make_agent(client, manager, registry_with(IdenticalOutputTool));
+
+    let run1 = agent.run("q", &RunConfig::default()).await;
+    assert!(
+        run1.is_ok(),
+        "run 1 (3 identical calls, then terminal) must complete: {run1:?}"
+    );
+
+    let run2 = agent.run("q", &RunConfig::default()).await;
+    assert!(
+        run2.is_ok(),
+        "run 2 must not be killed at its first dispatch by run 1's \
+         never-fired stop state: {run2:?}"
+    );
+
+    let run3 = agent.run("q", &RunConfig::default()).await;
+    assert!(run3.is_ok(), "run 3 must complete: {run3:?}");
+}
+
+#[tokio::test]
+async fn distinct_inputs_with_identical_outputs_are_distinct_operations() {
+    let client = ScriptedClient::new(vec![
+        Step::ToolInput(serde_json::json!({"path": "a.rs"})),
+        Step::ToolInput(serde_json::json!({"path": "b.rs"})),
+        Step::ToolInput(serde_json::json!({"path": "a.rs"})),
+        Step::Text("done".into()),
+    ]);
+    let manager = DetectionManager::new_with_config(DetectionConfig {
+        loop_threshold: 2,
+        stop_threshold: 10,
+        ..DetectionConfig::default()
+    })
+    .unwrap();
+    let (mut agent, _client) = make_agent(client, manager, registry_with(IdenticalOutputTool));
+
+    let result = agent.run("q", &RunConfig::default()).await;
+    assert!(
+        result.is_ok(),
+        "byte-identical outputs from different inputs must not count as one \
+         repeating operation under the default wiring: {result:?}"
+    );
 }
 
 #[tokio::test]

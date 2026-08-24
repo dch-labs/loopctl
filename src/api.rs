@@ -294,32 +294,33 @@ pub trait ApiClient: Send + Sync {
     ///
     /// When `options` is empty (the default), delegates to
     /// [`stream_messages`](ApiClient::stream_messages). When `options`
-    /// contains fields the client does not support (e.g. `response_format`
-    /// on a client that has not overridden this method), yields an
-    /// [`ApiError::config`] error as the first stream item.
+    /// contains fields the client does not support (`response_format`,
+    /// `tool_constraint`, or a per-request `model` override on a client
+    /// that has not overridden this method), yields an
+    /// [`ApiError::config`] error as the first stream item — a field the
+    /// client cannot forward must fail loudly rather than be silently
+    /// dropped: a dropped `model` override would serve a different model
+    /// than the one the fallback machinery routed and reported.
     /// `OpenAiClient`, `AnthropicClient`, and `GeminiClient` override
-    /// this to inject the schema.
+    /// this to honor all three fields.
     fn stream_messages_with_options(
         &self,
         request: &StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        if options.response_format.is_none() {
-            return self.stream_messages(request);
+        if let Some(err) = unsupported_options_error(&options) {
+            return Box::pin(futures::stream::once(async move { Err(err) }));
         }
-        Box::pin(futures::stream::once(async {
-            Err(ApiError::config(
-                "this client does not support structured output (response_format)",
-            ))
-        }))
+        self.stream_messages(request)
     }
 
     /// Non-streaming variant that honors [`RequestOptions`](crate::structured::RequestOptions).
     ///
     /// When `options` is empty (the default), delegates to
     /// [`create_message`](ApiClient::create_message). When `options`
-    /// contains fields the client does not support (e.g. `response_format`
-    /// on a client that has not overridden this method), returns an
+    /// contains fields the client does not support (see
+    /// [`stream_messages_with_options`](ApiClient::stream_messages_with_options)
+    /// for the field list and the fail-loudly rationale), returns an
     /// [`ApiError::config`] error. This is the primary path for structured
     /// output — a complete JSON document must be present before
     /// deserialization, so callers that need a typed `T` should use this
@@ -331,14 +332,10 @@ pub trait ApiClient: Send + Sync {
         request: &StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>> {
-        if options.response_format.is_none() {
-            return self.create_message(request);
+        if let Some(err) = unsupported_options_error(&options) {
+            return Box::pin(async move { Err(err) });
         }
-        Box::pin(async {
-            Err(ApiError::config(
-                "this client does not support structured output (response_format)",
-            ))
-        })
+        self.create_message(request)
     }
 
     /// Extract the structured-output payload from an assistant message.
@@ -359,6 +356,55 @@ pub trait ApiClient: Send + Sync {
         let text = message.text_content();
         crate::structured::parse_json_lenient(&text).unwrap_or(serde_json::Value::String(text))
     }
+}
+
+/// The config error for [`RequestOptions`](crate::structured::RequestOptions)
+/// fields a client cannot forward, or `None` when every field is at its
+/// default.
+///
+/// Used by the trait's default `*_with_options` implementations. An
+/// unsupported field must fail loudly: silently dropping `model` would
+/// serve a different model than the one the fallback machinery routed and
+/// reported, and silently dropping `tool_constraint` or `response_format`
+/// would degrade a constrained request to an unconstrained one with no
+/// signal to the caller.
+pub(crate) fn unsupported_options_error(
+    options: &crate::structured::RequestOptions,
+) -> Option<ApiError> {
+    if let Some(err) = unsupported_structured_output_error(options) {
+        return Some(err);
+    }
+    if options.model.is_some() {
+        return Some(ApiError::config(
+            "this client does not support per-request model overrides (model)",
+        ));
+    }
+    None
+}
+
+/// The config error for the structured-output option fields a client
+/// cannot forward (`response_format`, `tool_constraint`), or `None`.
+///
+/// The shared core of [`unsupported_options_error`]; also used directly
+/// by clients that honor the per-request `model` override but implement
+/// neither structured-output field (e.g. `MockApiClient`).
+pub(crate) fn unsupported_structured_output_error(
+    options: &crate::structured::RequestOptions,
+) -> Option<ApiError> {
+    if options.response_format.is_some() {
+        return Some(ApiError::config(
+            "this client does not support structured output (response_format)",
+        ));
+    }
+    if !matches!(
+        options.tool_constraint,
+        crate::structured::ToolConstraint::None
+    ) {
+        return Some(ApiError::config(
+            "this client does not support tool-call constraints (tool_constraint)",
+        ));
+    }
+    None
 }
 
 /// Owned, single-threaded API client handle.
@@ -512,6 +558,66 @@ mod tests {
         let response = result.unwrap();
         assert!(!response.message.parts.is_empty());
         assert_eq!(response.stop_reason, StreamStopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn default_with_options_rejects_every_unsupported_field() {
+        let client = MockClient::new("primary-model");
+        let req = StreamRequest::new(vec![]);
+
+        let model_override =
+            crate::structured::RequestOptions::default().with_model("fallback-model");
+        let mut stream = client.stream_messages_with_options(&req, model_override.clone());
+        let first = stream.next().await;
+        drop(stream);
+        assert!(
+            matches!(&first, Some(Err(err)) if err.to_string().contains("model")),
+            "a model override the default impl cannot forward must fail loudly, got: {first:?}"
+        );
+        let result = client
+            .create_message_with_options(&req, model_override)
+            .await;
+        assert!(
+            result.is_err(),
+            "the non-streaming default must reject the same override"
+        );
+
+        let strict = crate::structured::RequestOptions::default()
+            .with_tool_constraint(crate::structured::ToolConstraint::Strict);
+        let mut stream = client.stream_messages_with_options(&req, strict);
+        let first = stream.next().await;
+        drop(stream);
+        assert!(
+            matches!(&first, Some(Err(err)) if err.to_string().contains("tool_constraint")),
+            "a tool constraint the default impl cannot forward must fail loudly, got: {first:?}"
+        );
+
+        let plain = crate::structured::RequestOptions::default();
+        let mut stream = client.stream_messages_with_options(&req, plain);
+        let first = stream.next().await;
+        drop(stream);
+        let delegated = first.is_some_and(|item| item.is_ok());
+        assert!(
+            delegated,
+            "default options must still delegate to the plain method"
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn mock_client_serves_the_turn_under_the_routed_model() {
+        let mock = crate::testing::MockApiClient::new("primary").with_text_response("hi");
+        let opts = crate::structured::RequestOptions::default().with_model("fallback");
+        let mut stream =
+            mock.stream_messages_with_options(&StreamRequest::new(vec![Message::user("q")]), opts);
+        let first = futures::StreamExt::next(&mut stream).await;
+        match first {
+            Some(Ok(StreamEvent::MessageStart(start))) => assert_eq!(
+                start.message.model, "fallback",
+                "the mock — like the real providers — must serve the turn under the routed model"
+            ),
+            other => panic!("expected a clean MessageStart under the override, got {other:?}"),
+        }
     }
 
     #[test]

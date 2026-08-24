@@ -164,6 +164,29 @@ struct CacheEntry {
     paths: Vec<String>,
 }
 
+/// Interior cache state: the entry map plus the invalidation epoch.
+///
+/// Both live under one lock so an insert racing a concurrent write-class
+/// invalidation is decided atomically: [`insert`] re-checks the epoch it
+/// captured at dispatch start while holding the lock, so a result computed
+/// before a write either lands before the write's eviction (and is evicted
+/// by it) or is skipped — it can never land after an eviction it never
+/// saw and outlive it until the TTL expires.
+#[derive(Default)]
+struct CacheState {
+    /// Successful results keyed by `(tool, canonical input)`.
+    ///
+    /// Mirrors the pre-`CacheState` map verbatim; only the surrounding
+    /// epoch moved beside it under the same lock.
+    entries: HashMap<CacheKey, CacheEntry>,
+
+    /// Monotonic count of write-class invalidation passes.
+    ///
+    /// Bumped by [`invalidate_paths`] under the lock; compared by
+    /// [`insert`] under the same lock.
+    write_epoch: u64,
+}
+
 /// Deduplicates repeat tool calls by `(tool_name, hash(canonical input))`.
 ///
 /// On a cache hit (memoized tool + key present + not TTL-expired),
@@ -192,7 +215,7 @@ pub struct MemoizingMiddleware {
     /// The lock is held only briefly during lookup / insert / evict —
     /// never across the inner `next.dispatch()` call (which could take
     /// seconds and would serialize all tool calls).
-    cache: Mutex<HashMap<CacheKey, CacheEntry>>,
+    cache: Mutex<CacheState>,
 
     /// Exact-match tool names whose results to cache.
     ///
@@ -243,7 +266,7 @@ impl MemoizingMiddleware {
         ttl_turns: u32,
     ) -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(CacheState::default()),
             tools,
             write_tools,
             path_extractor,
@@ -254,7 +277,7 @@ impl MemoizingMiddleware {
 
 impl std::fmt::Debug for MemoizingMiddleware {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let len = crate::error::recover_guard(self.cache.lock()).len();
+        let len = crate::error::recover_guard(self.cache.lock()).entries.len();
         f.debug_struct("MemoizingMiddleware")
             .field("cache_entries", &len)
             .field("tools", &self.tools)
@@ -283,6 +306,7 @@ impl ToolMiddleware for MemoizingMiddleware {
         };
         let ttl_turns = self.ttl_turns;
         let current_turn = ctx.turn_number;
+        let epoch_at_dispatch = is_memoized.then(|| current_epoch(&self.cache));
 
         Box::pin(async move {
             if is_memoized
@@ -291,7 +315,6 @@ impl ToolMiddleware for MemoizingMiddleware {
             {
                 let mut result = cached;
                 append_cached_marker(&mut result.output);
-                result.duration = std::time::Duration::ZERO;
                 return result;
             }
 
@@ -302,8 +325,8 @@ impl ToolMiddleware for MemoizingMiddleware {
                 invalidate_paths(&self.cache, &write_paths);
             } else if is_memoized && !result.is_error {
                 let paths = self.path_extractor.paths(&ctx.tool_name, &ctx.input);
-                if let Some(key) = key {
-                    insert(&self.cache, key, result.clone(), current_turn, paths);
+                if let (Some(key), Some(epoch)) = (key, epoch_at_dispatch) {
+                    insert(&self.cache, key, result.clone(), current_turn, paths, epoch);
                 }
             }
 
@@ -332,7 +355,7 @@ fn make_key(tool_name: &str, input: &Value) -> CacheKey {
 /// exists and is not TTL-expired. Stale entries are evicted as a side
 /// effect of the lookup (lazy expiry).
 fn lookup_fresh(
-    cache: &Mutex<HashMap<CacheKey, CacheEntry>>,
+    cache: &Mutex<CacheState>,
     key: &CacheKey,
     current_turn: usize,
     ttl_turns: u32,
@@ -340,13 +363,13 @@ fn lookup_fresh(
     let mut guard = crate::error::recover_guard(cache.lock());
     let expired =
         |entry: &CacheEntry| current_turn.saturating_sub(entry.turn_inserted) >= ttl_turns as usize;
-    if let Some(entry) = guard.get(key)
+    if let Some(entry) = guard.entries.get(key)
         && expired(entry)
     {
-        guard.remove(key);
+        guard.entries.remove(key);
         return None;
     }
-    guard.get(key).map(|e| e.result.clone())
+    guard.entries.get(key).map(|e| e.result.clone())
 }
 
 /// Insert a successful tool result into the cache.
@@ -356,15 +379,26 @@ fn lookup_fresh(
 /// key already exists (e.g. the same call was made earlier and the
 /// entry wasn't TTL-evicted or path-invalidated in between), it is
 /// replaced — the newer result wins.
+///
+/// `epoch_at_dispatch` is the invalidation epoch captured when the
+/// dispatch started; when a write-class invalidation has bumped the
+/// epoch since (a write may have completed while this call was in
+/// flight), the insert is skipped — the computed result may reflect
+/// pre-write state and would otherwise outlive the invalidation until
+/// the TTL expires. Returns whether the entry was stored.
 fn insert(
-    cache: &Mutex<HashMap<CacheKey, CacheEntry>>,
+    cache: &Mutex<CacheState>,
     key: CacheKey,
     result: ToolDispatchResult,
     turn_inserted: usize,
     paths: Vec<String>,
-) {
+    epoch_at_dispatch: u64,
+) -> bool {
     let mut guard = crate::error::recover_guard(cache.lock());
-    guard.insert(
+    if guard.write_epoch != epoch_at_dispatch {
+        return false;
+    }
+    guard.entries.insert(
         key,
         CacheEntry {
             result,
@@ -372,20 +406,36 @@ fn insert(
             paths,
         },
     );
+    true
+}
+
+/// Read the current invalidation epoch under the cache lock.
+///
+/// Captured by the dispatch path before the inner call runs, so the
+/// post-dispatch [`insert`] can detect a concurrent write-class
+/// invalidation.
+fn current_epoch(cache: &Mutex<CacheState>) -> u64 {
+    crate::error::recover_guard(cache.lock()).write_epoch
 }
 
 /// Evict entries whose paths intersect any of `write_paths`.
 ///
 /// Intersection is exact string equality — no prefix or glob logic.
 /// An empty `write_paths` set evicts nothing (a write that touches no
-/// known paths can't path-invalidate anything).
-fn invalidate_paths(cache: &Mutex<HashMap<CacheKey, CacheEntry>>, write_paths: &[String]) {
+/// known paths can't path-invalidate anything) and bumps no epoch.
+/// A real eviction also bumps the invalidation epoch so in-flight
+/// cache misses computed against pre-write state are not inserted
+/// afterwards (see [`insert`]).
+fn invalidate_paths(cache: &Mutex<CacheState>, write_paths: &[String]) {
     if write_paths.is_empty() {
         return;
     }
     let write_set: HashSet<&str> = write_paths.iter().map(String::as_str).collect();
     let mut guard = crate::error::recover_guard(cache.lock());
-    guard.retain(|_, entry| !entry.paths.iter().any(|p| write_set.contains(p.as_str())));
+    guard
+        .entries
+        .retain(|_, entry| !entry.paths.iter().any(|p| write_set.contains(p.as_str())));
+    guard.write_epoch = guard.write_epoch.saturating_add(1);
 }
 
 /// Append the `[cached]` marker to a `ToolContent`.
@@ -823,7 +873,7 @@ mod tests {
 
     #[test]
     fn lookup_fresh_returns_none_on_miss() {
-        let cache = Mutex::new(HashMap::new());
+        let cache = Mutex::new(CacheState::default());
         let key = make_key("Read", &serde_json::json!({"path": "x"}));
         let result = lookup_fresh(&cache, &key, 0, 10);
         assert!(result.is_none(), "empty cache should miss");
@@ -831,7 +881,7 @@ mod tests {
 
     #[test]
     fn lookup_fresh_returns_result_on_hit() {
-        let cache = Mutex::new(HashMap::new());
+        let cache = Mutex::new(CacheState::default());
         let key = make_key("Read", &serde_json::json!({"path": "x"}));
         insert(
             &cache,
@@ -846,6 +896,7 @@ mod tests {
             },
             0,
             vec![],
+            0,
         );
         let result = lookup_fresh(&cache, &key, 1, 10);
         assert!(result.is_some(), "fresh entry should hit");
@@ -853,7 +904,7 @@ mod tests {
 
     #[test]
     fn lookup_fresh_expires_and_evicts_stale_entry() {
-        let cache = Mutex::new(HashMap::new());
+        let cache = Mutex::new(CacheState::default());
         let key = make_key("Read", &serde_json::json!({"path": "x"}));
         insert(
             &cache,
@@ -868,6 +919,7 @@ mod tests {
             },
             0,
             vec![],
+            0,
         );
         // ttl_turns=2: entry inserted at turn 0 is fresh at turn 1
         // (1-0=1 < 2), expired at turn 2 (2-0=2 >= 2).
@@ -882,14 +934,14 @@ mod tests {
         // Lazy eviction: the entry should have been removed by the lookup.
         let guard = crate::error::recover_guard(cache.lock());
         assert!(
-            guard.is_empty(),
+            guard.entries.is_empty(),
             "expired entry should be evicted from cache"
         );
     }
 
     #[test]
     fn insert_stores_entry_and_replace_overwrites() {
-        let cache = Mutex::new(HashMap::new());
+        let cache = Mutex::new(CacheState::default());
         let key = make_key("Read", &serde_json::json!({"path": "x"}));
         insert(
             &cache,
@@ -904,6 +956,7 @@ mod tests {
             },
             0,
             vec![],
+            0,
         );
         insert(
             &cache,
@@ -918,6 +971,7 @@ mod tests {
             },
             1,
             vec![],
+            0,
         );
         let result = lookup_fresh(&cache, &key, 2, 10).unwrap();
         match result.output {
@@ -930,7 +984,7 @@ mod tests {
 
     #[test]
     fn invalidate_paths_removes_overlapping_entries() {
-        let cache = Mutex::new(HashMap::new());
+        let cache = Mutex::new(CacheState::default());
         let key_a = make_key("Read", &serde_json::json!({"path": "a.rs"}));
         let key_b = make_key("Read", &serde_json::json!({"path": "b.rs"}));
         let result = ToolDispatchResult {
@@ -947,26 +1001,34 @@ mod tests {
             result.clone(),
             0,
             vec!["a.rs".to_string()],
+            0,
         );
-        insert(&cache, key_b.clone(), result, 0, vec!["b.rs".to_string()]);
+        insert(
+            &cache,
+            key_b.clone(),
+            result,
+            0,
+            vec!["b.rs".to_string()],
+            0,
+        );
 
         // Write to a.rs should evict key_a but not key_b.
         invalidate_paths(&cache, &["a.rs".to_string()]);
 
         let guard = crate::error::recover_guard(cache.lock());
         assert!(
-            !guard.contains_key(&key_a),
+            !guard.entries.contains_key(&key_a),
             "overlapping entry should be evicted"
         );
         assert!(
-            guard.contains_key(&key_b),
+            guard.entries.contains_key(&key_b),
             "non-overlapping entry should survive"
         );
     }
 
     #[test]
     fn invalidate_paths_noop_on_empty_write_paths() {
-        let cache = Mutex::new(HashMap::new());
+        let cache = Mutex::new(CacheState::default());
         let key = make_key("Read", &serde_json::json!({"path": "x"}));
         insert(
             &cache,
@@ -981,15 +1043,20 @@ mod tests {
             },
             0,
             vec!["x".to_string()],
+            0,
         );
         invalidate_paths(&cache, &[]);
         let guard = crate::error::recover_guard(cache.lock());
-        assert_eq!(guard.len(), 1, "empty write_paths should evict nothing");
+        assert_eq!(
+            guard.entries.len(),
+            1,
+            "empty write_paths should evict nothing"
+        );
     }
 
     #[test]
     fn invalidate_paths_evicts_all_matching() {
-        let cache = Mutex::new(HashMap::new());
+        let cache = Mutex::new(CacheState::default());
         let result = ToolDispatchResult {
             tool_call_id: String::new(),
             output: ToolContent::from_string("content"),
@@ -1007,14 +1074,150 @@ mod tests {
             "Grep",
             &serde_json::json!({"path": "shared.rs", "pattern": "foo"}),
         );
-        insert(&cache, k1, result.clone(), 0, vec!["shared.rs".to_string()]);
-        insert(&cache, k2, result, 0, vec!["shared.rs".to_string()]);
+        insert(
+            &cache,
+            k1,
+            result.clone(),
+            0,
+            vec!["shared.rs".to_string()],
+            0,
+        );
+        insert(&cache, k2, result, 0, vec!["shared.rs".to_string()], 0);
 
         invalidate_paths(&cache, &["shared.rs".to_string()]);
         let guard = crate::error::recover_guard(cache.lock());
         assert!(
-            guard.is_empty(),
+            guard.entries.is_empty(),
             "both entries touch shared.rs — both evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_of_zero_caches_nothing() {
+        let mw = make_middleware(Arc::new(PathFromInput), 0);
+        let (pipeline, calls) = pipeline(mw, ToolContent::from_string("file contents"), false);
+
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "foo.rs"}), 0);
+        let first = pipeline.dispatch(&mut ctx).await;
+        assert!(
+            matches!(&first.output, ToolContent::Text(t) if t.contains("file contents")),
+            "the first call executes the tool"
+        );
+
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "foo.rs"}), 0);
+        let second = pipeline.dispatch(&mut ctx).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a ttl of zero expires every entry immediately — no call is ever served from the cache"
+        );
+        assert!(
+            matches!(&second.output, ToolContent::Text(t) if t.contains("file contents")),
+            "the second call re-executes the tool"
+        );
+    }
+
+    #[test]
+    fn insert_after_invalidation_is_skipped() {
+        let cache = Mutex::new(CacheState::default());
+        let key = make_key("Read", &serde_json::json!({"path": "x"}));
+        let result = ToolDispatchResult {
+            tool_call_id: String::new(),
+            output: ToolContent::from_string("content"),
+            is_error: false,
+            duration: Duration::ZERO,
+            resolved_tool_name: String::new(),
+            display_hint: None,
+        };
+        let epoch = current_epoch(&cache);
+        invalidate_paths(&cache, &["x".to_string()]);
+        assert_eq!(
+            current_epoch(&cache),
+            epoch.saturating_add(1),
+            "an eviction bumps the invalidation epoch"
+        );
+        assert!(
+            !insert(&cache, key, result, 0, vec!["x".to_string()], epoch),
+            "an insert whose dispatch predated the invalidation must be skipped"
+        );
+        assert!(
+            crate::error::recover_guard(cache.lock()).entries.is_empty(),
+            "no entry may land after an unseen eviction"
+        );
+    }
+
+    #[test]
+    fn insert_at_the_current_epoch_is_stored() {
+        let cache = Mutex::new(CacheState::default());
+        let key = make_key("Read", &serde_json::json!({"path": "x"}));
+        let result = ToolDispatchResult {
+            tool_call_id: String::new(),
+            output: ToolContent::from_string("content"),
+            is_error: false,
+            duration: Duration::ZERO,
+            resolved_tool_name: String::new(),
+            display_hint: None,
+        };
+        let epoch = current_epoch(&cache);
+        assert!(
+            insert(&cache, key.clone(), result, 0, vec!["x".to_string()], epoch),
+            "an insert at the current epoch must be stored"
+        );
+        assert!(
+            crate::error::recover_guard(cache.lock())
+                .entries
+                .contains_key(&key),
+            "the entry must be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hit_preserves_the_original_call_duration() {
+        struct SlowOutputMiddleware;
+        impl ToolMiddleware for SlowOutputMiddleware {
+            fn name(&self) -> &'static str {
+                "slow_output"
+            }
+            fn dispatch<'a>(
+                &'a self,
+                _ctx: &'a mut ToolDispatchContext,
+                _next: &'a ToolPipeline,
+            ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
+                Box::pin(async {
+                    ToolDispatchResult {
+                        output: ToolContent::from_string("content"),
+                        is_error: false,
+                        resolved_tool_name: String::new(),
+                        tool_call_id: String::new(),
+                        duration: Duration::from_millis(250),
+                        display_hint: None,
+                    }
+                })
+            }
+        }
+
+        let memoize = make_middleware(Arc::new(NoopPathExtractor), 10);
+        let registry = Arc::new(ToolRegistry::new());
+        let pipeline = ToolPipeline::builder()
+            .with_middleware(memoize)
+            .with_middleware(SlowOutputMiddleware)
+            .with_core(registry)
+            .build()
+            .expect("pipeline builds");
+
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "x"}), 0);
+        let first = pipeline.dispatch(&mut ctx).await;
+        assert_eq!(
+            first.duration,
+            Duration::from_millis(250),
+            "the miss reports the tool's own duration"
+        );
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "x"}), 1);
+        let second = pipeline.dispatch(&mut ctx).await;
+        assert_eq!(
+            second.duration,
+            Duration::from_millis(250),
+            "a hit must preserve the cached duration so health statistics              track the real tool latency, not a zero-cost lookup"
         );
     }
 

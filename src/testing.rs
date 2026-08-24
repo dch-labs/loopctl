@@ -511,6 +511,77 @@ impl MockApiClient {
         self
     }
 
+    /// Build one scripted response's stream events under the given model.
+    ///
+    /// The shared body of [`stream_messages`](ApiClient::stream_messages)
+    /// and [`stream_messages_with_options`](ApiClient::stream_messages_with_options):
+    /// pops the next [`MockResponse`] and renders it as the same event
+    /// sequence a real provider emits, with `model` naming the model that
+    /// served the turn.
+    fn stream_events(&self, model: String) -> Vec<Result<StreamEvent, ApiError>> {
+        if let Some(ref err) = self.error {
+            return vec![Err(ApiError::api(err))];
+        }
+
+        let response = self.pop_response();
+        let mut events: Vec<Result<StreamEvent, ApiError>> =
+            vec![Ok(StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg_test".to_string(),
+                    role: "assistant".to_string(),
+                    model,
+                },
+            }))];
+
+        // Text content block
+        let text = response.text.clone();
+        events.push(Ok(StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("")),
+        })));
+
+        // Text delta
+        events.push(Ok(StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text { text },
+        })));
+
+        events.push(Ok(StreamEvent::PartStop { index: Some(0) }));
+
+        // Tool call content block (if any). Real providers open the tool
+        // block with an empty input and stream the arguments as input-json
+        // deltas; the mock mirrors that shape so accumulated tool input is
+        // identical on the mock and real paths.
+        if let Some(tc) = &response.tool_call {
+            events.push(Ok(StreamEvent::PartStart(PartStart {
+                index: 1,
+                part: Some(MessagePart::tool_call(
+                    &tc.id,
+                    &tc.name,
+                    serde_json::json!({}),
+                )),
+            })));
+            events.push(Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::InputJson {
+                    partial_json: tc.input.to_string(),
+                },
+            })));
+            events.push(Ok(StreamEvent::PartStop { index: Some(1) }));
+        }
+
+        // Message delta with stop reason
+        events.push(Ok(StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some(response.stop_reason),
+            },
+            usage: Some(Usage::new(50, 25)),
+        })));
+
+        events.push(Ok(StreamEvent::MessageStop));
+        events
+    }
+
     /// Pop the next [`MockResponse`] from the internal queue.
     ///
     /// If more than one response is queued the front entry is removed
@@ -647,71 +718,53 @@ impl ApiClient for MockApiClient {
         &self,
         _request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        if let Some(ref err) = self.error {
-            let err = err.clone();
-            return Box::pin(futures::stream::once(
-                async move { Err(ApiError::api(&err)) },
-            ));
-        }
-
-        let response = self.pop_response();
         let model = crate::error::recover_guard(self.model_name.lock()).clone();
-        let mut events: Vec<Result<StreamEvent, ApiError>> =
-            vec![Ok(StreamEvent::MessageStart(MessageStart {
-                message: MessageMetadata {
-                    id: "msg_test".to_string(),
-                    role: "assistant".to_string(),
-                    model,
-                },
-            }))];
+        let events = self.stream_events(model);
+        Box::pin(futures::stream::iter(events))
+    }
 
-        // Text content block
-        let text = response.text.clone();
-        events.push(Ok(StreamEvent::PartStart(PartStart {
-            index: 0,
-            part: Some(MessagePart::text("")),
-        })));
-
-        // Text delta
-        events.push(Ok(StreamEvent::IndexedDelta(IndexedDelta {
-            index: 0,
-            delta: DeltaPart::Text { text },
-        })));
-
-        events.push(Ok(StreamEvent::PartStop { index: Some(0) }));
-
-        // Tool call content block (if any). Real providers open the tool
-        // block with an empty input and stream the arguments as input-json
-        // deltas; the mock mirrors that shape so accumulated tool input is
-        // identical on the mock and real paths.
-        if let Some(tc) = &response.tool_call {
-            events.push(Ok(StreamEvent::PartStart(PartStart {
-                index: 1,
-                part: Some(MessagePart::tool_call(
-                    &tc.id,
-                    &tc.name,
-                    serde_json::json!({}),
-                )),
-            })));
-            events.push(Ok(StreamEvent::IndexedDelta(IndexedDelta {
-                index: 1,
-                delta: DeltaPart::InputJson {
-                    partial_json: tc.input.to_string(),
-                },
-            })));
-            events.push(Ok(StreamEvent::PartStop { index: Some(1) }));
+    /// Streaming variant that honors the per-request model override.
+    ///
+    /// Rejects `response_format` and `tool_constraint` loudly (the mock
+    /// implements neither) and serves the response under
+    /// `options.model` when set — the mock's stand-in for the wire-level
+    /// model switch real clients perform, so fallback-routing tests
+    /// built on the mock observe the routed model instead of silently
+    /// receiving the constructor's name.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// use futures::StreamExt;
+    /// use loopctl::api::{ApiClient, StreamRequest};
+    /// use loopctl::structured::RequestOptions;
+    /// use loopctl::testing::MockApiClient;
+    ///
+    /// let client = MockApiClient::new("primary").with_text_response("Hi!");
+    /// let opts = RequestOptions::default().with_model("fallback");
+    /// let stream = client.stream_messages_with_options(&StreamRequest::new(vec![]), opts);
+    /// let events: Vec<_> = stream.collect().await;
+    /// # let first = events.first().unwrap().as_ref().unwrap();
+    /// # use loopctl::stream::StreamEvent;
+    /// # let loopctl::stream::StreamEvent::MessageStart(start) = first else {
+    /// #     panic!("first event must be MessageStart")
+    /// # };
+    /// # assert_eq!(start.message.model, "fallback");
+    /// # });
+    /// ```
+    fn stream_messages_with_options(
+        &self,
+        _request: &crate::api::StreamRequest,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        if let Some(err) = crate::api::unsupported_structured_output_error(&options) {
+            return Box::pin(futures::stream::once(async move { Err(err) }));
         }
-
-        // Message delta with stop reason
-        events.push(Ok(StreamEvent::MessageDelta(MessageDelta {
-            delta: MessageDeltaPayload {
-                stop_reason: Some(response.stop_reason),
-            },
-            usage: Some(Usage::new(50, 25)),
-        })));
-
-        events.push(Ok(StreamEvent::MessageStop));
-
+        let model = options
+            .model
+            .unwrap_or_else(|| crate::error::recover_guard(self.model_name.lock()).clone());
+        let events = self.stream_events(model);
         Box::pin(futures::stream::iter(events))
     }
 
@@ -766,6 +819,27 @@ impl ApiClient for MockApiClient {
                 usage: Some(crate::stream::Usage::default()),
             })
         })
+    }
+
+    /// Non-streaming variant that accepts the per-request model override.
+    ///
+    /// Rejects `response_format` and `tool_constraint` loudly (the mock
+    /// implements neither). The per-request `model` is accepted without
+    /// changing the response: a [`NonStreamingResponse`](crate::api::NonStreamingResponse)
+    /// carries no model field, so there is nothing to vary — accepting
+    /// the override keeps fallback-routing tests on the non-streaming
+    /// path running instead of failing on a field the mock does forward
+    /// on its streaming twin.
+    fn create_message_with_options(
+        &self,
+        request: &crate::api::StreamRequest,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        if let Some(err) = crate::api::unsupported_structured_output_error(&options) {
+            return Box::pin(async move { Err(err) });
+        }
+        self.create_message(request)
     }
 }
 

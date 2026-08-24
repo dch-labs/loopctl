@@ -44,9 +44,19 @@ impl Default for TimeoutConfig {
 /// Middleware that wraps tool execution in a timeout.
 ///
 /// If the tool execution exceeds the configured timeout, returns an
-/// error result. Optionally retries once with a longer timeout.
-/// Respects the [`CancelSignal`](crate::cancel::CancelSignal) via `tokio::select!` so that
-/// cancellation is not blocked by a slow tool.
+/// error result. When `retry_on_timeout` is set it retries up to
+/// [`max_retries`](TimeoutConfig::max_retries) times, doubling the
+/// timeout per attempt. Respects the
+/// [`CancelSignal`](crate::cancel::CancelSignal) via `tokio::select!` so
+/// that cancellation is not blocked by a slow tool.
+///
+/// Two shape notes for standalone pipelines: a timed-out result reports
+/// `duration` = the timeout that expired (the configured deadline, not
+/// the elapsed wall time), and a cancellation observed *here* becomes a
+/// soft `is_error` result rather than a hard error — inside the engine
+/// the driver's own cancel-vs-dispatch select usually wins the race and
+/// surfaces [`LoopError::Cancelled`](crate::error::LoopError::Cancelled)
+/// instead.
 ///
 /// # Example
 ///

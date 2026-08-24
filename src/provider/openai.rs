@@ -75,9 +75,11 @@ pub struct OpenAiClient {
     /// The current model identifier, stored behind a mutex for runtime
     /// hot-swapping.
     ///
-    /// Changed via [`ApiClient::set_model`] when the
-    /// [`FallbackManager`](crate::fallback::FallbackManager) trips to a
-    /// fallback model.
+    /// Changed via [`ApiClient::set_model`] (host-initiated swaps) or
+    /// overridden per request via
+    /// [`RequestOptions::model`](crate::structured::RequestOptions::model)
+    /// — the channel the fallback machinery routes through, leaving the
+    /// client itself untouched.
     model: std::sync::Mutex<String>,
 
     /// Whether to request `stream_options.include_usage` on streaming requests.
@@ -295,6 +297,10 @@ impl ApiClient for OpenAiClient {
 
             while let Some(data) = sse.next_openai_data().await? {
                 let Some(chunk) = OpenAiChunk::parse(&data) else {
+                    if let Some(err) = OpenAiStreamError::parse(&data) {
+                        emitter.record_error(&err);
+                        break;
+                    }
                     continue;
                 };
                 emitter.process_chunk(&chunk);
@@ -302,8 +308,11 @@ impl ApiClient for OpenAiClient {
                     yield ev;
                 }
             }
+            if sse.done_marker_seen() {
+                emitter.mark_done();
+            }
 
-            for ev in emitter.finish() {
+            for ev in emitter.finish()? {
                 yield ev;
             }
         })
@@ -370,6 +379,10 @@ impl ApiClient for OpenAiClient {
 
             while let Some(data) = sse.next_openai_data().await? {
                 let Some(chunk) = OpenAiChunk::parse(&data) else {
+                    if let Some(err) = OpenAiStreamError::parse(&data) {
+                        emitter.record_error(&err);
+                        break;
+                    }
                     continue;
                 };
                 emitter.process_chunk(&chunk);
@@ -377,8 +390,11 @@ impl ApiClient for OpenAiClient {
                     yield ev;
                 }
             }
+            if sse.done_marker_seen() {
+                emitter.mark_done();
+            }
 
-            for ev in emitter.finish() {
+            for ev in emitter.finish()? {
                 yield ev;
             }
         })
@@ -485,9 +501,9 @@ impl OpenAiClientBuilder {
     ///
     /// Defaults to `https://api.openai.com/v1`. Override when targeting an
     /// OpenAI-compatible endpoint (e.g. `https://api.deepseek.com/v1`,
+    /// `http://localhost:11434/v1` for Ollama, or a vLLM server).
     /// Trailing `/` separators are trimmed, so joined request paths never
     /// contain `//` — a `…/v1/` base behaves identically to `…/v1`.
-    /// `http://localhost:11434/v1` for Ollama, or a vLLM server).
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into().trim_end_matches('/').to_string();
@@ -496,19 +512,26 @@ impl OpenAiClientBuilder {
 
     /// Set the default model identifier.
     ///
-    /// The model string is sent as the `model` field on every request. Can be
-    /// changed at runtime via [`OpenAiClient::set_model`] (e.g. when the
-    /// [`FallbackManager`](crate::fallback::FallbackManager) trips).
+    /// The model string is sent as the `model` field on every request,
+    /// unless a per-request
+    /// [`RequestOptions::model`](crate::structured::RequestOptions::model)
+    /// override names another. Can also be swapped wholesale at runtime
+    /// via [`OpenAiClient::set_model`].
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
     }
 
-    /// Set the total request timeout (connect + response + body).
+    /// Set the HTTP read timeout.
     ///
+    /// This bounds *idleness* — how long a gap between bytes on the
+    /// connection may last — not the total request lifetime: a stream
+    /// that keeps producing bytes runs as long as it keeps producing.
     /// Defaults to 120 seconds. Ignored when a client was supplied via
-    /// [`with_http_client`](Self::with_http_client).
+    /// [`with_http_client`](Self::with_http_client); bound the whole
+    /// turn with a [`StreamHandler`](crate::stream::handler::StreamHandler)
+    /// total timeout instead.
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.http = self.http.with_timeout(timeout);
@@ -788,7 +811,10 @@ impl RequestBody {
 /// text to use a simple `{role, content}` pair. A single loopctl message
 /// with multiple tool-result parts expands to one OpenAI `tool` message per
 /// result, so the return is a vector; text parts alongside tool results are
-/// preserved as a trailing `user` message after the `tool` messages.
+/// preserved as a trailing `user` message after the `tool` messages. A tool
+/// result's `is_error` flag is not forwarded — the Chat Completions `tool`
+/// message has no error field; the output text itself conveys failures
+/// (Anthropic's wire format is the one that carries an explicit flag).
 fn convert_message(m: &Message) -> Vec<Value> {
     let role = match m.role {
         Role::User => "user",
@@ -941,6 +967,7 @@ impl SseReader {
                     continue;
                 };
                 if data == SSE_DONE {
+                    self.mark_done_marker_seen();
                     return Ok(None);
                 }
                 return Ok(Some(data.into()));
@@ -1000,7 +1027,11 @@ impl OpenAiChunk {
     /// Parse a raw SSE data payload into an [`OpenAiChunk`].
     ///
     /// Returns `None` for malformed payloads so the caller can skip
-    /// them without interrupting the stream.
+    /// them without interrupting the stream. Payloads carrying a
+    /// top-level `error` object are malformed as chunks by
+    /// construction (they carry no `id`/`model`/`choices`); the caller
+    /// re-parses those with [`OpenAiStreamError::parse`] instead of
+    /// skipping them.
     fn parse(data: &str) -> Option<Self> {
         match serde_json::from_str(data) {
             Ok(chunk) => Some(chunk),
@@ -1012,6 +1043,106 @@ impl OpenAiChunk {
                 );
                 None
             }
+        }
+    }
+}
+
+/// The `data: {"error": {…}}` payload OpenAI-compatible endpoints emit
+/// when a request fails after the stream has started.
+///
+/// OpenAI's own API reports mid-stream failures this way, and
+/// OpenAI-compatible servers (vLLM, Ollama, gateways) widely mirror the
+/// shape. The payload has no `id`/`model`/`choices`, so it never parses
+/// as an [`OpenAiChunk`]; the stream loop parses it separately and
+/// surfaces it as the stream's terminal error instead of skipping it —
+/// otherwise a truncated response masquerades as a clean turn.
+#[derive(Deserialize)]
+struct OpenAiStreamError {
+    /// Human-readable failure description from the provider.
+    ///
+    /// Forwarded verbatim into the classified error's message so the
+    /// terminal failure names what the server actually said.
+    message: String,
+
+    /// Provider error class, e.g. `"rate_limit_error"` or `"server_error"`.
+    ///
+    /// `None` when a compatible server omits it; `rate_limit_error`
+    /// routes the failure into [`ApiError::RateLimit`].
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+
+    /// Machine-readable error code, when the server sends one.
+    ///
+    /// OpenAI uses string codes (`"rate_limit_exceeded"`); some
+    /// compatible servers use numeric HTTP statuses. Either spelling of
+    /// 429 marks a rate-limited request.
+    #[serde(default)]
+    code: Option<serde_json::Value>,
+}
+
+impl OpenAiStreamError {
+    /// Parse a raw SSE data payload as a mid-stream error.
+    ///
+    /// Returns `Some` iff the payload is a JSON object carrying a
+    /// top-level `error` — an object (the common shape; siblings such as
+    /// a gateway-added `object` field are ignored) or a bare string
+    /// (`data: {"error": "internal server error"}`, the shape several
+    /// compatible servers emit). The stream loop calls this only after
+    /// [`OpenAiChunk::parse`] has rejected the payload, so anything
+    /// without an `error` key stays a skip.
+    fn parse(data: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(data).ok()?;
+        match value.get("error")? {
+            serde_json::Value::String(message) => Some(Self {
+                message: message.clone(),
+                kind: None,
+                code: None,
+            }),
+            serde_json::Value::Object(fields) => {
+                serde_json::from_value(serde_json::Value::Object(fields.clone()))
+                    .map_err(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to parse OpenAI mid-stream error payload"
+                        );
+                        e
+                    })
+                    .ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Classify the error for the retry machinery.
+    ///
+    /// Mirrors the status-based classification of non-streaming
+    /// responses: a rate-limited request becomes
+    /// [`ApiError::RateLimit`] so the stream handler's rate-limit
+    /// ladder — not the generic transport ladder — owns the response.
+    /// Everything else stays a provider error message.
+    fn classify(&self) -> ApiError {
+        let numeric_status = self.code.as_ref().and_then(serde_json::Value::as_u64);
+        let rate_limited = self.kind.as_deref() == Some("rate_limit_error")
+            || numeric_status.is_some_and(|status| matches!(status, 429 | 503 | 529))
+            || self.code.as_ref() == Some(&serde_json::json!("rate_limit_exceeded"));
+        let mut detail = String::new();
+        if let Some(kind) = &self.kind {
+            detail.push_str(kind);
+            detail.push_str(": ");
+        }
+        detail.push_str(&self.message);
+        if let Some(status) = numeric_status {
+            detail.push_str(" (HTTP ");
+            detail.push_str(&status.to_string());
+            detail.push(')');
+        }
+        if rate_limited {
+            ApiError::RateLimit {
+                retry_after: None,
+                message: detail,
+            }
+        } else {
+            ApiError::api(detail)
         }
     }
 }
@@ -1057,8 +1188,8 @@ struct OpenAiUsage {
 impl From<&OpenAiUsage> for Usage {
     fn from(u: &OpenAiUsage) -> Self {
         Usage::new(
-            u32::try_from(u.prompt_tokens).unwrap_or(0),
-            u32::try_from(u.completion_tokens).unwrap_or(0),
+            u32::try_from(u.prompt_tokens).unwrap_or(u32::MAX),
+            u32::try_from(u.completion_tokens).unwrap_or(u32::MAX),
         )
     }
 }
@@ -1245,6 +1376,17 @@ struct StreamEmitter {
     /// [`StreamEvent::MessageStop`] after the stream already terminated.
     finished: bool,
 
+    /// Whether the provider signalled the end of the stream.
+    ///
+    /// Set when the SSE `[DONE]` sentinel is read (the stream loop marks
+    /// it) or a `finish_reason` was processed. [`finish`](Self::finish)
+    /// completes the stream with a [`StreamEvent::MessageStop`] only
+    /// when the provider actually terminated it — a bare EOF without
+    /// either signal is a truncated stream, surfaced to the handler by
+    /// the *absence* of the stop rather than papered over with a
+    /// synthetic one.
+    done: bool,
+
     /// The stop reason captured by [`process_finish`](Self::process_finish),
     /// deferred until the usage chunk arrives or [`finish`](Self::finish)
     /// flushes it.
@@ -1264,6 +1406,15 @@ struct StreamEmitter {
     /// deferred `MessageDelta`, this is converted to `Some(Usage)` (or left
     /// as `None` if the provider never sent usage).
     pending_usage: Option<Usage>,
+
+    /// The mid-stream error recorded from an [`OpenAiStreamError`]
+    /// payload, if the stream delivered one.
+    ///
+    /// First error wins: a second error payload is ignored. While set,
+    /// [`finish`](Self::finish) returns this error instead of
+    /// synthesizing a [`StreamEvent::MessageStop`], so a server-side
+    /// failure never masquerades as a clean (truncated) completion.
+    error: Option<ApiError>,
 
     /// Buffered [`StreamEvent`]s waiting to be yielded to the consumer.
     ///
@@ -1504,17 +1655,57 @@ impl StreamEmitter {
     /// Finalize the stream, emitting the terminal
     /// [`MessageStop`](StreamEvent::MessageStop) if one was started.
     ///
-    /// Flushes any deferred [`MessageDelta`](StreamEvent::MessageDelta)
-    /// (when no usage chunk arrived), drains remaining pending events, and
-    /// appends the stop event. Called exactly once at the end of the SSE
-    /// stream.
-    fn finish(&mut self) -> Vec<StreamEvent> {
+    /// A recorded mid-stream error is returned instead of any events:
+    /// no synthetic `MessageStop` may dress a failed stream up as a
+    /// clean, truncated completion. Flushes any deferred
+    /// [`MessageDelta`](StreamEvent::MessageDelta) (when no usage chunk
+    /// arrived), drains remaining pending events, and appends the stop
+    /// **only when the provider terminated the stream** (a
+    /// `finish_reason` was processed or the `[DONE]` sentinel was read):
+    /// a bare EOF without either is a truncated stream, and the absence
+    /// of the stop is what tells the handler so. Called exactly once at
+    /// the end of the SSE stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns the recorded mid-stream error, when one was recorded.
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
+        if let Some(err) = self.error.take() {
+            return Err(err);
+        }
+        if self.done && !self.finished {
+            self.process_finish("stop");
+        }
         self.flush_message_delta();
         let mut out = self.drain();
-        if self.started {
+        if self.started && (self.finished || self.done) {
             out.push(StreamEvent::MessageStop);
         }
-        out
+        Ok(out)
+    }
+
+    /// Record a mid-stream error payload as the stream's terminal error.
+    ///
+    /// Mark the provider as having signalled the stream's end.
+    ///
+    /// Called by the stream loop when the SSE `[DONE]` sentinel is read;
+    /// see [`done`](Self::done).
+    fn mark_done(&mut self) {
+        self.done = true;
+    }
+
+    /// Record the first classified mid-stream error as the stream's
+    /// terminal error.
+    ///
+    /// First error wins: once one is recorded, later error payloads are
+    /// ignored. The stream loop stops reading the SSE body right after
+    /// calling this — the server may hold the errored connection open,
+    /// and waiting for its EOF would delay the error
+    /// [`finish`](Self::finish) already knows about.
+    fn record_error(&mut self, payload: &OpenAiStreamError) {
+        if self.error.is_none() {
+            self.error = Some(payload.classify());
+        }
     }
 
     /// Drain all pending events from the internal queue.
@@ -1698,7 +1889,7 @@ mod tests {
         em.process_chunk(&finish);
         em.drain();
 
-        let events = em.finish();
+        let events = em.finish().unwrap();
         let delta = events.iter().find_map(|e| match e {
             StreamEvent::MessageDelta(md) => Some(md),
             _ => None,
@@ -2135,7 +2326,7 @@ mod tests {
                 acc.process(&ev).unwrap();
             }
         }
-        for ev in em.finish() {
+        for ev in em.finish().unwrap() {
             acc.process(&ev).unwrap();
         }
 
@@ -2171,7 +2362,7 @@ mod tests {
                 acc.process(&ev).unwrap();
             }
         }
-        for ev in em.finish() {
+        for ev in em.finish().unwrap() {
             acc.process(&ev).unwrap();
         }
 
@@ -2216,7 +2407,7 @@ mod tests {
                 acc.process(&ev).unwrap();
             }
         }
-        for ev in em.finish() {
+        for ev in em.finish().unwrap() {
             acc.process(&ev).unwrap();
         }
 
@@ -2264,7 +2455,7 @@ mod tests {
                 acc.process(&ev).unwrap();
             }
         }
-        for ev in em.finish() {
+        for ev in em.finish().unwrap() {
             acc.process(&ev).unwrap();
         }
 
@@ -2313,7 +2504,7 @@ mod tests {
                 acc.process(&ev).unwrap();
             }
         }
-        for ev in em.finish() {
+        for ev in em.finish().unwrap() {
             acc.process(&ev).unwrap();
         }
 
@@ -2358,7 +2549,7 @@ mod tests {
                 acc.process(&ev).expect("accumulator accepts events");
             }
         }
-        for ev in em.finish() {
+        for ev in em.finish().expect("clean finish") {
             acc.process(&ev).expect("accumulator accepts finish events");
         }
 
@@ -2460,7 +2651,7 @@ mod tests {
         assert_eq!(part_stop_events.len(), 1);
         assert!(matches!(part_stop_events[0], StreamEvent::PartStop { .. }));
 
-        let events = em.finish();
+        let events = em.finish().unwrap();
         assert!(
             events
                 .iter()
@@ -2531,7 +2722,7 @@ mod tests {
         assert_eq!(part_stop_events.len(), 1);
         assert!(matches!(part_stop_events[0], StreamEvent::PartStop { .. }));
 
-        let events = em.finish();
+        let events = em.finish().unwrap();
         let delta = events.iter().find_map(|e| match e {
             StreamEvent::MessageDelta(md) => Some(md),
             _ => None,
@@ -2557,7 +2748,7 @@ mod tests {
         em.process_chunk(&finish);
         em.drain();
 
-        let final_events = em.finish();
+        let final_events = em.finish().unwrap();
         assert!(matches!(
             final_events.last(),
             Some(StreamEvent::MessageStop)
@@ -2567,8 +2758,97 @@ mod tests {
     #[test]
     fn emitter_finish_without_start_is_empty() {
         let mut em = StreamEmitter::default();
-        let events = em.finish();
+        let events = em.finish().unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn midstream_error_payload_is_recognized_and_classified() {
+        let payload = r#"{"error":{"message":"Rate limit reached","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#;
+        let parsed = OpenAiStreamError::parse(payload)
+            .expect("an error object payload must parse as a mid-stream error");
+        assert!(
+            matches!(parsed.classify(), ApiError::RateLimit { .. }),
+            "a rate_limit_error payload must classify as RateLimit"
+        );
+
+        let server_error = r#"{"error":{"message":"upstream melted","type":"server_error"}}"#;
+        let parsed = OpenAiStreamError::parse(server_error)
+            .expect("an error object payload must parse as a mid-stream error");
+        let err = parsed.classify();
+        assert!(
+            !matches!(err, ApiError::RateLimit { .. }),
+            "non-rate-limit payloads stay provider errors"
+        );
+        assert!(
+            err.to_string().contains("server_error"),
+            "the error must name the provider's type: {err}"
+        );
+
+        let overloaded = OpenAiStreamError::parse(
+            r#"{"error":{"message":"upstream overloaded","type":"server_error","code":503}}"#,
+        )
+        .unwrap();
+        let err = overloaded.classify();
+        assert!(
+            matches!(&err, ApiError::RateLimit { message, .. } if message.contains("503")),
+            "a 503 error chunk must classify as RateLimit with the status in the \
+             detail so downstream overload detection reads Overloaded: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_non_error_payloads_are_still_skipped() {
+        assert!(
+            OpenAiStreamError::parse(r#"{"id":123}"#).is_none(),
+            "a chunk-shaped payload that merely failed strict parsing must stay a skip"
+        );
+        assert!(
+            OpenAiStreamError::parse("not json").is_none(),
+            "garbage must stay a skip"
+        );
+        assert!(
+            OpenAiStreamError::parse(r#"{"error":{"message":"x","object":"error"}}"#).is_some(),
+            "an error object with sibling fields inside it must still parse"
+        );
+        let string_shaped = OpenAiStreamError::parse(r#"{"error":"internal server error"}"#)
+            .expect("a bare string error payload must parse as a mid-stream error");
+        assert_eq!(string_shaped.message, "internal server error");
+        assert!(
+            !matches!(string_shaped.classify(), ApiError::RateLimit { .. }),
+            "a string error carries no class and stays a provider error"
+        );
+    }
+
+    #[test]
+    fn midstream_error_chunk_surfaces_as_an_error() {
+        let mut em = StreamEmitter::default();
+        let chunk = OpenAiChunk::parse(
+            r#"{"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"par"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        em.process_chunk(&chunk);
+        em.drain();
+
+        let err_payload = OpenAiStreamError::parse(
+            r#"{"error":{"message":"server overloaded","type":"server_error"}}"#,
+        )
+        .unwrap();
+        em.record_error(&err_payload);
+        let drained = em.drain();
+        assert!(
+            drained
+                .iter()
+                .all(|e| !matches!(e, StreamEvent::MessageStop)),
+            "no clean MessageStop may be emitted alongside the failure: {drained:?}"
+        );
+        let err = em
+            .finish()
+            .expect_err("finish must surface the recorded error");
+        assert!(
+            err.to_string().contains("server overloaded"),
+            "the terminal error must carry the provider's message: {err}"
+        );
     }
 
     #[test]
@@ -2588,7 +2868,7 @@ mod tests {
         em.process_chunk(&finish);
         em.drain();
 
-        let events = em.finish();
+        let events = em.finish().unwrap();
         let delta = events.iter().find_map(|e| match e {
             StreamEvent::MessageDelta(md) => Some(md),
             _ => None,
@@ -2644,6 +2924,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hello\n".into(),
+            done_marker_seen: false,
         };
         let line = reader.take_line().unwrap().unwrap();
         assert_eq!(line, "data: hello");
@@ -2655,6 +2936,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "partial".into(),
+            done_marker_seen: false,
         };
         assert!(reader.take_line().unwrap().is_none());
     }
@@ -2664,6 +2946,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "line1\nline2\n".into(),
+            done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "line1");
         assert_eq!(reader.take_line().unwrap().unwrap(), "line2");
@@ -2674,6 +2957,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hi\r\n".into(),
+            done_marker_seen: false,
         };
         let line = reader.take_line().unwrap().unwrap();
         assert_eq!(line, "data: hi");
@@ -2694,6 +2978,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hello\ndata: world\n".to_string().into_bytes(),
+            done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap(), Some("data: hello".to_string()));
         assert_eq!(reader.take_line().unwrap(), Some("data: world".to_string()));
@@ -2708,6 +2993,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let result = reader.next_openai_data().await.unwrap();
         assert!(result.is_some());
@@ -2722,6 +3008,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let result = reader.next_openai_data().await.unwrap();
         assert!(result.is_none());
@@ -2734,6 +3021,7 @@ mod tests {
         let mut reader = super::SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let result = reader.next_openai_data().await;
         assert!(result.is_err(), "should error on buffer overflow");
@@ -3594,6 +3882,7 @@ mod tests {
                 data.to_string().into(),
             )])),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let parsed = reader
             .next_openai_data()
@@ -3613,6 +3902,7 @@ mod tests {
                 data.to_string().into(),
             )])),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let parsed = reader
             .next_openai_data()
@@ -3632,6 +3922,7 @@ mod tests {
                 data.to_string().into(),
             )])),
             buf: Vec::new(),
+            done_marker_seen: false,
         };
         let first = reader
             .next_openai_data()

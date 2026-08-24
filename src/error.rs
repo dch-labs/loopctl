@@ -171,6 +171,17 @@ pub enum LoopError {
         String,
     ),
 
+    /// Every configured fallback model has failed.
+    ///
+    /// Returned when the circuit breaker is open, its entire fallback
+    /// chain is exhausted, and the recovery cooldown has not yet
+    /// elapsed. The engine fails the turn with this error rather than
+    /// silently retreating to the known-bad primary; once the cooldown
+    /// elapses, the next turn probes the primary instead of failing
+    /// again. A manager with no configured chain never produces it.
+    #[error("all fallback models exhausted")]
+    FallbackExhausted,
+
     /// The agent exceeded its maximum number of turns.
     ///
     /// The agent loop terminated because `max_turns` was reached. If

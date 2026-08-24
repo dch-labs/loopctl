@@ -276,6 +276,16 @@ pub struct RequestOptions {
     /// registered tool schemas. Default [`ToolConstraint::None`] is a
     /// no-op. See [`ToolConstraint`] for the modes.
     pub tool_constraint: ToolConstraint,
+
+    /// Serve the request with the named model, overriding the client's
+    /// current model.
+    ///
+    /// `None` — the default — uses the client's model, so requests without
+    /// an override behave exactly as before. Set via
+    /// [`with_model`](Self::with_model); the fallback machinery uses this
+    /// seam to route requests to the active fallback model without
+    /// mutating shared client state.
+    pub model: Option<String>,
 }
 
 impl RequestOptions {
@@ -287,6 +297,18 @@ impl RequestOptions {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set a per-request model override.
+    ///
+    /// The provider serves this one request with the named model instead
+    /// of the client's current model; the client itself is untouched, so
+    /// concurrent loops over one shared client cannot cross-wire their
+    /// models.
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
     }
 
     /// Set the response format, builder-style.

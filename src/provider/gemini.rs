@@ -140,28 +140,36 @@ impl GeminiClient {
             .build()
     }
 
-    /// Build the streaming Generate Content URL.
+    /// Build the streaming Generate Content URL for one resolved model.
     ///
-    /// Gemini puts the model in the URL path. The API key is sent via
-    /// the `x-goog-api-key` header, not as a query parameter.
-    fn stream_url(&self) -> String {
-        let model = crate::error::recover_guard(self.model.lock()).clone();
+    /// Gemini puts the model in the URL path — the caller resolves it (the
+    /// client's current model, or a per-request override from
+    /// [`RequestOptions::model`](crate::structured::RequestOptions::model)).
+    /// The API key is sent via the `x-goog-api-key` header, never as a
+    /// query parameter.
+    fn stream_url_for_model(&self, model: &str) -> String {
         format!(
-            "{}/models/{}:streamGenerateContent?alt=sse",
-            self.base_url, model
+            "{}/models/{model}:streamGenerateContent?alt=sse",
+            self.base_url
         )
     }
 
-    /// Build the full URL for the Gemini non-streaming Generate Content
-    /// endpoint.
+    /// Build the non-streaming Generate Content URL for the current model.
     ///
     /// Constructs `{base_url}/models/{model}:generateContent`. The API key
-    /// is sent via the `x-goog-api-key` header, not in the URL.
-    /// Used by [`ApiClient::create_message`] and its `*_with_options`
-    /// variant.
+    /// is sent via the `x-goog-api-key` header, not in the URL. Used by
+    /// [`ApiClient::create_message`] and its `*_with_options` variant.
     fn generate_url(&self) -> String {
         let model = crate::error::recover_guard(self.model.lock()).clone();
-        format!("{}/models/{}:generateContent", self.base_url, model)
+        self.generate_url_for_model(&model)
+    }
+
+    /// Build the non-streaming Generate Content URL for one resolved model.
+    ///
+    /// Shared by the client-model path and the per-request override path
+    /// (see [`stream_url_for_model`](Self::stream_url_for_model)).
+    fn generate_url_for_model(&self, model: &str) -> String {
+        format!("{}/models/{model}:generateContent", self.base_url)
     }
 
     /// Build a typed [`NonStreamingResponse`] from Gemini's native JSON.
@@ -364,7 +372,11 @@ impl ApiClient for GeminiClient {
             &options.tool_constraint,
             self.include_thoughts,
         );
-        let url = self.stream_url();
+        let model = options
+            .model
+            .clone()
+            .unwrap_or_else(|| crate::error::recover_guard(self.model.lock()).clone());
+        let url = self.stream_url_for_model(&model);
         let http = self.http.clone();
         let api_key = self.api_key.clone();
 
@@ -406,7 +418,11 @@ impl ApiClient for GeminiClient {
             &options.tool_constraint,
             self.include_thoughts,
         );
-        let url = self.generate_url();
+        let model = options
+            .model
+            .clone()
+            .unwrap_or_else(|| crate::error::recover_guard(self.model.lock()).clone());
+        let url = self.generate_url_for_model(&model);
         Box::pin(async move {
             let resp = Self::post_content(&self.http, &url, &self.api_key, &body).await?;
             let resp = super::read_bounded_body(resp).await?;
@@ -1577,7 +1593,7 @@ mod tests {
             .with_api_key("secret-key-123")
             .build()
             .unwrap();
-        let url = client.stream_url();
+        let url = client.stream_url_for_model("gemini-2.0-flash");
         assert!(
             !url.contains("secret-key-123"),
             "API key must not appear in stream URL: {url}"
@@ -3202,6 +3218,73 @@ mod tests {
             response.message.text_content(),
             "answer",
             "thought parts must not surface as visible text on the non-streaming path"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_model_override_replaces_the_url_model_on_stream() {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let client = GeminiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .unwrap();
+        let options = crate::structured::RequestOptions::new().with_model("override-model");
+        let mut stream =
+            client.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), options);
+        let _ = stream.next().await;
+        let request = server.await.unwrap();
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(
+            request_line.contains("/models/override-model:streamGenerateContent"),
+            "the streaming URL must honor the per-request model override: {request_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_model_override_replaces_the_url_model() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let client = GeminiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .unwrap();
+        let options = crate::structured::RequestOptions::new().with_model("override-model");
+        drop(
+            client
+                .create_message_with_options(&crate::api::StreamRequest::new(vec![]), options)
+                .await,
+        );
+        let request = server.await.unwrap();
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(
+            request_line.contains("/models/override-model:generateContent"),
+            "Gemini carries the model in the URL; the override must replace it: {request_line}"
         );
     }
 

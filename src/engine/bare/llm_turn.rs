@@ -17,9 +17,9 @@
 use super::Run;
 use super::{ApiClient, BareLoop, LoopError, Message};
 use crate::api::StreamRequest;
-use crate::capabilities::Detectable;
 #[cfg(feature = "streaming")]
 use crate::capabilities::StreamCapable;
+use crate::capabilities::{Detectable, FallbackCapable};
 use crate::detection::{ConvergenceAction, DetectedPattern};
 #[cfg(feature = "streaming")]
 use crate::observer::{TextDeltaContext, ThinkingDeltaContext};
@@ -57,6 +57,63 @@ impl<C: ApiClient> BareLoop<C> {
         StreamRequest::new(messages)
             .with_system(self.session.config.system_prompt.clone())
             .with_tools(self.build_tool_schemas())
+    }
+
+    /// The single model the fallback manager resolves this turn's
+    /// request to.
+    ///
+    /// While the breaker is closed this is the manager's primary
+    /// (`None` only when the manager is unconfigured, which leaves the
+    /// request on the client's own model or the host's override,
+    /// byte-identical to a loop without fallback). While tripped this
+    /// is the active fallback model; during recovery, the primary. With
+    /// a configured manager the resolution is exclusive: outbound
+    /// requests, breaker bookkeeping, recovery probes, and observer
+    /// contexts all derive from this one value, overriding any
+    /// host-provided per-request model.
+    pub(super) fn routed_model(&self) -> Option<String> {
+        let manager = self.managers.fallback();
+        match manager.state() {
+            crate::fallback::FallbackState::Primary => manager.original_model(),
+            _ => manager.active_model(),
+        }
+    }
+
+    /// The request options for this turn with the fallback routing applied.
+    ///
+    /// Applies [`routed_model`](Self::routed_model) as the per-request
+    /// model override; anything the host set on `request_options` passes
+    /// through untouched when no manager is configured.
+    fn turn_request_options(&self) -> crate::structured::RequestOptions {
+        let mut options = self.request_options.clone();
+        if let Some(model) = self.routed_model() {
+            options.model = Some(model);
+        }
+        options
+    }
+
+    /// Fire [`on_model_switched`] when the routed model changed since the
+    /// last request, and remember the current one.
+    ///
+    /// One mechanical signal for every cause of a model change — trip,
+    /// chain advance, recovery — instead of observers piecing it together
+    /// from breaker callbacks. No-op while no manager routes models.
+    pub(super) fn note_routed_model(&mut self) {
+        let served = self.routed_or_client_model();
+        if self
+            .last_routed_model
+            .as_ref()
+            .is_some_and(|m| *m != served)
+        {
+            let from = self.last_routed_model.clone().unwrap_or(served.clone());
+            self.managers
+                .observers()
+                .on_model_switched(&crate::observer::ModelSwitchedContext {
+                    from,
+                    to: served.clone(),
+                });
+        }
+        self.last_routed_model = Some(served);
     }
 
     /// Dispatch one LLM turn according to [`turn_mode`](BareLoop::turn_mode).
@@ -108,7 +165,7 @@ impl<C: ApiClient> BareLoop<C> {
         let request = self.build_turn_request(messages);
         let cancel = std::sync::Arc::clone(&self.cancelled);
         let client = &self.client;
-        let options = self.request_options.clone();
+        let options = self.turn_request_options();
         let timeout = self.turn_timeout();
         let result = tokio::select! {
             biased;
@@ -177,7 +234,7 @@ impl<C: ApiClient> BareLoop<C> {
         let mut stream = handler.stream_turn(
             &*self.client,
             &request,
-            self.request_options.clone(),
+            self.turn_request_options(),
             &self.cancelled,
         );
 

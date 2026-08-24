@@ -305,7 +305,10 @@ impl ApiClient for AnthropicClient {
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
         let system = request.system.clone();
         let tools = request.tools.clone();
-        let model = crate::error::recover_guard(self.model.lock()).clone();
+        let model = options
+            .model
+            .clone()
+            .unwrap_or_else(|| crate::error::recover_guard(self.model.lock()).clone());
         let rf = options.response_format.as_ref();
         let body = build_request_body(
             &RequestBodySpec {
@@ -352,7 +355,10 @@ impl ApiClient for AnthropicClient {
     {
         let system = request.system.clone();
         let tools = request.tools.clone();
-        let model = crate::error::recover_guard(self.model.lock()).clone();
+        let model = options
+            .model
+            .clone()
+            .unwrap_or_else(|| crate::error::recover_guard(self.model.lock()).clone());
         let rf = options.response_format.as_ref();
         let body = build_request_body(
             &RequestBodySpec {
@@ -2972,6 +2978,71 @@ mod tests {
         assert!(
             payload.is_some(),
             "spec-legal 'data:' line must carry the payload, not be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_model_override_replaces_the_body_model_on_stream() {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .unwrap();
+        let options = crate::structured::RequestOptions::new().with_model("override-model");
+        let mut stream =
+            client.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), options);
+        let _ = stream.next().await;
+        let request = server.await.unwrap();
+        assert!(
+            request.contains("\"model\":\"override-model\""),
+            "the streaming path must honor the per-request model override: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_model_override_replaces_the_body_model() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .build()
+            .unwrap();
+        let options = crate::structured::RequestOptions::new().with_model("override-model");
+        drop(
+            client
+                .create_message_with_options(&crate::api::StreamRequest::new(vec![]), options)
+                .await,
+        );
+        let request = server.await.unwrap();
+        assert!(
+            request.contains("\"model\":\"override-model\""),
+            "the per-request override must replace the body's model field: {request}"
         );
     }
 

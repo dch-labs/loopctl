@@ -382,7 +382,7 @@ impl<C: ApiClient> BareLoop<C> {
         match error {
             StreamHandlerError::Cancelled => LoopError::Cancelled,
             StreamHandlerError::InitFailed(outcome) => {
-                LoopError::Api(format!("stream init failed: {outcome}"))
+                LoopError::Api(format!("stream failed before completing: {outcome}"))
             }
             StreamHandlerError::StreamFailed(outcome) => {
                 LoopError::Api(format!("stream failed: {outcome}"))

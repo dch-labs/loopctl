@@ -341,6 +341,14 @@ pub struct ToolPreContext {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ToolPostContext {
+    /// The model-issued call id this result answers.
+    ///
+    /// Mirrors [`ToolPreContext::tool_call_id`](crate::observer::ToolPreContext::tool_call_id)
+    /// so observers can pair pre/post events exactly — including
+    /// same-tool retries and parallel calls, where the `(turn, tool)`
+    /// pair is ambiguous.
+    pub tool_call_id: String,
+
     /// Turn number.
     ///
     /// Identifies which turn this tool result belongs to.

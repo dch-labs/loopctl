@@ -594,6 +594,7 @@ impl<C: ApiClient> BareLoop<C> {
     fn notify_tool_post(&self, turn_idx: usize, tc: &ToolCall, result: &ToolDispatchResult) {
         self.managers.observers().on_tool_post(&ToolPostContext {
             turn: turn_idx,
+            tool_call_id: result.tool_call_id.clone(),
             tool: tc.tool.clone(),
             result_hash: loop_detector::hash_result(&result.output.to_string()),
             is_error: result.is_error,

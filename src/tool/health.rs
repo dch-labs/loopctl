@@ -443,8 +443,10 @@ pub struct CircuitBreakerConfig {
     /// the task died mid-flight) would otherwise strand the breaker in
     /// `HalfOpen` forever — no probe result is ever recorded, so nothing
     /// closes or reopens it. After the timeout the breaker returns to
-    /// `Open` with a freshly armed cooldown, and a later request probes
-    /// again. Defaults to 30 seconds.
+    /// `Open` with the cooldown anchored to the lease's end (backdated,
+    /// so a late-noticed expiry does not extend the wait), and the next
+    /// request past that cooldown probes again. Defaults to 30 seconds;
+    /// `0` disables the lease.
     pub probe_timeout: Duration,
 }
 
@@ -571,13 +573,21 @@ impl Default for BreakerState {
 
 /// Whether the in-flight `HalfOpen` probe has outlived its timeout.
 ///
+/// A zero timeout disables the lease (the crate's zero-disables
+/// sentinel): the probe never expires, and a slow probe's success still
+/// closes the breaker.
+///
 /// A probe whose result never arrives (cancelled dispatch, dead task)
 /// is stranded: no `record_*` will ever run for it, so the expiry check
 /// is what lets the breaker move on — re-arming the `Open` cooldown on
-/// the next `allow_request`, and refusing a *late* result that arrives
+/// the next `allow_request`, and refusing a late *success* that arrives
 /// after expiry (it describes a world the breaker has already left
-/// behind).
+/// behind; a late *failure* is fresh bad news and is accepted, its
+/// cooldown starting when observed).
 fn probe_expired(state: &BreakerState, probe_timeout: Duration) -> bool {
+    if probe_timeout.is_zero() {
+        return false;
+    }
     state
         .probe_started_at
         .is_some_and(|started| started.elapsed() >= probe_timeout)
@@ -593,6 +603,25 @@ fn probe_expires_at(state: &BreakerState, probe_timeout: Duration) -> Option<std
     state
         .probe_started_at
         .and_then(|started| started.checked_add(probe_timeout))
+}
+
+/// Grant the `HalfOpen` probe slot if the `Open` cooldown has elapsed.
+///
+/// The single grant transition: `Open`→`HalfOpen` with the lease clock
+/// started, returning `true` to the caller that won the slot. Shared by
+/// the plain recovery path and the expired-probe re-arm so both grant
+/// identically.
+fn grant_probe(state: &mut BreakerState, recovery_duration: Duration) -> bool {
+    let recovered = state
+        .last_failure_time
+        .is_some_and(|t| t.elapsed() >= recovery_duration);
+    if recovered {
+        state.circuit = CircuitState::HalfOpen;
+        state.probe_started_at = Some(Instant::now());
+        true
+    } else {
+        false
+    }
 }
 
 impl ToolCircuitBreaker {
@@ -643,47 +672,42 @@ impl ToolCircuitBreaker {
     ///   the last failure, in which case the breaker transitions to
     ///   `HalfOpen` and the caller becomes the sole probe.
     /// - **`HalfOpen`**: already probing — no additional probes allowed
-    ///   (returns `false` to prevent thundering-herd).
+    ///   (returns `false` to prevent thundering-herd). An *expired* probe
+    ///   is normalized to `Open` first (cooldown anchored to the lease's
+    ///   end), so a call arriving after that cooldown has also elapsed
+    ///   grants a fresh probe in this same call — the pure
+    ///   [`would_allow_request`](Self::would_allow_request) oracle and
+    ///   this method agree at every instant.
     #[must_use]
     pub fn allow_request(&self) -> bool {
         let mut state = crate::error::recover_guard(self.state.lock());
         match state.circuit {
             CircuitState::Closed => true,
-            CircuitState::HalfOpen => {
-                if probe_expired(&state, self.probe_timeout) {
-                    state.circuit = CircuitState::Open;
-                    state.last_failure_time = probe_expires_at(&state, self.probe_timeout)
-                        .or_else(|| Some(Instant::now()));
-                    state.probe_started_at = None;
-                }
-                false
+            CircuitState::HalfOpen if probe_expired(&state, self.probe_timeout) => {
+                state.circuit = CircuitState::Open;
+                state.last_failure_time =
+                    probe_expires_at(&state, self.probe_timeout).or_else(|| Some(Instant::now()));
+                state.probe_started_at = None;
+                grant_probe(&mut state, self.recovery_duration)
             }
-            CircuitState::Open => {
-                let recovered = state
-                    .last_failure_time
-                    .is_some_and(|t| t.elapsed() >= self.recovery_duration);
-                if recovered {
-                    state.circuit = CircuitState::HalfOpen;
-                    state.probe_started_at = Some(Instant::now());
-                    true
-                } else {
-                    false
-                }
-            }
+            CircuitState::HalfOpen => false,
+            CircuitState::Open => grant_probe(&mut state, self.recovery_duration),
         }
     }
 
     /// Whether a request *would* be allowed, without the `Open`→`HalfOpen` side effect.
     ///
     /// Pure read mirroring [`allow_request`](Self::allow_request)'s decision
-    /// logic: returns `true` for `Closed`, `false` for `HalfOpen`, and for
-    /// `Open` returns `true` only if the recovery duration has elapsed (i.e.
-    /// the next [`allow_request`](Self::allow_request) call would transition
-    /// to `HalfOpen` and grant the probe). Crucially, this performs **no**
-    /// state transition — use it for availability checks
+    /// at the same instant: `true` for `Closed`; for `Open`, `true` once the
+    /// recovery duration has elapsed; for `HalfOpen`, `false` while the
+    /// probe's lease is live and `true` once the lease has expired *and* the
+    /// expiry-anchored cooldown has elapsed (the state an expired probe
+    /// occupies is exactly an `Open` cooldown — the next
+    /// [`allow_request`](Self::allow_request) grants). Crucially, this
+    /// performs **no** state transition — use it for availability checks
     /// ([`is_tool_available`](ToolHealthRegistry::is_tool_available)) so a
-    /// read does not consume the single `HalfOpen` probe slot that belongs to
-    /// the real dispatch path.
+    /// read does not consume the single `HalfOpen` probe slot that belongs
+    /// to the real dispatch path.
     #[must_use]
     pub fn would_allow_request(&self) -> bool {
         let state = crate::error::recover_guard(self.state.lock());
@@ -691,10 +715,9 @@ impl ToolCircuitBreaker {
             CircuitState::Closed => true,
             CircuitState::HalfOpen => {
                 probe_expired(&state, self.probe_timeout)
-                    && state.probe_started_at.is_some_and(|started| {
-                        started
-                            .checked_add(self.probe_timeout)
-                            .and_then(|expired_at| expired_at.checked_add(self.recovery_duration))
+                    && probe_expires_at(&state, self.probe_timeout).is_some_and(|expired_at| {
+                        expired_at
+                            .checked_add(self.recovery_duration)
                             .is_some_and(|available_at| available_at <= Instant::now())
                     })
             }
@@ -707,12 +730,14 @@ impl ToolCircuitBreaker {
     /// Whether the next [`allow_request`](Self::allow_request) call would
     /// transition an `Open` breaker into `HalfOpen`.
     ///
-    /// Pure read: `true` only when the breaker is `Open` and the recovery
-    /// duration has elapsed — i.e. the next `allow_request` would perform the
-    /// `Open`→`HalfOpen` transition and grant the probe slot. Returns `false`
-    /// for `HalfOpen` (a probe is already in flight; the next
-    /// `allow_request` refuses to avoid a thundering herd) and for `Closed`
-    /// (requests are allowed unconditionally, no transition pending).
+    /// Pure read: `true` only when the next
+    /// [`allow_request`](Self::allow_request) would perform the
+    /// `Open`→`HalfOpen` transition and grant the probe slot — an `Open`
+    /// breaker past its cooldown, or a `HalfOpen` breaker whose probe lease
+    /// expired and whose expiry-anchored cooldown has elapsed (the next
+    /// call re-arms and grants in one step). `false` while a probe's lease
+    /// is live (the next call refuses to avoid a thundering herd) and for
+    /// `Closed`.
     /// Complements [`would_allow_request`](Self::would_allow_request).
     #[must_use]
     pub fn would_be_half_open(&self) -> bool {
@@ -721,14 +746,27 @@ impl ToolCircuitBreaker {
             CircuitState::Open => state
                 .last_failure_time
                 .is_some_and(|t| t.elapsed() >= self.recovery_duration),
-            CircuitState::HalfOpen | CircuitState::Closed => false,
+            CircuitState::HalfOpen => {
+                probe_expired(&state, self.probe_timeout)
+                    && probe_expires_at(&state, self.probe_timeout).is_some_and(|expired_at| {
+                        expired_at
+                            .checked_add(self.recovery_duration)
+                            .is_some_and(|available_at| available_at <= Instant::now())
+                    })
+            }
+            CircuitState::Closed => false,
         }
     }
 
     /// Record a successful call.
     ///
-    /// Resets consecutive failures to zero and transitions the breaker
-    /// to Closed.
+    /// Resets consecutive failures to zero and transitions the breaker to
+    /// Closed — except for a `HalfOpen` probe whose lease has expired:
+    /// that success describes a probe the breaker has already abandoned,
+    /// so it re-arms recovery (cooldown anchored to the lease's end)
+    /// instead of closing. A success observed while `Open` closes
+    /// normally: the call that produced it completed just now, so it is
+    /// fresh evidence, not a stale probe result.
     pub fn record_success(&self) {
         let mut state = crate::error::recover_guard(self.state.lock());
         if matches!(state.circuit, CircuitState::HalfOpen)
@@ -777,10 +815,17 @@ impl ToolCircuitBreaker {
     /// numeric encoding.
     #[must_use]
     pub fn state_label(&self) -> &'static str {
-        match crate::error::recover_guard(self.state.lock()).circuit {
+        let state = crate::error::recover_guard(self.state.lock());
+        match state.circuit {
             CircuitState::Closed => "closed",
             CircuitState::Open => "open",
-            CircuitState::HalfOpen => "half-open",
+            CircuitState::HalfOpen => {
+                if probe_expired(&state, self.probe_timeout) {
+                    "open"
+                } else {
+                    "half-open"
+                }
+            }
         }
     }
 
@@ -1449,6 +1494,81 @@ mod tests {
         assert!(
             cb.allow_request(),
             "a fresh probe is granted after the re-armed cooldown"
+        );
+    }
+
+    #[test]
+    fn would_allow_true_means_the_next_call_grants() {
+        let cb = ToolCircuitBreaker::new(Duration::from_millis(40), 1)
+            .with_probe_timeout(Duration::from_millis(60));
+        cb.record_failure();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            cb.allow_request(),
+            "the probe is granted after the cooldown"
+        );
+
+        std::thread::sleep(Duration::from_millis(140));
+        assert!(
+            cb.would_allow_request(),
+            "after the lease and the re-armed cooldown elapse, availability is true"
+        );
+        assert!(
+            cb.allow_request(),
+            "a would-be-allowed request is granted on the very next call — \
+             the oracle and the mutator agree at the same instant"
+        );
+    }
+
+    #[test]
+    fn zero_probe_timeout_disables_the_lease() {
+        let cb = ToolCircuitBreaker::new(Duration::from_millis(40), 1)
+            .with_probe_timeout(Duration::ZERO);
+        cb.record_failure();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            cb.allow_request(),
+            "the probe is granted after the cooldown"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        cb.record_success();
+        assert_eq!(
+            cb.state_label(),
+            "closed",
+            "a zero probe timeout means the lease never expires — a slow \
+             probe's success still closes the breaker"
+        );
+    }
+
+    #[test]
+    fn stranded_probe_recovers_availability_in_the_registry() {
+        let registry = ToolHealthRegistry::new().with_config(CircuitBreakerConfig {
+            failure_threshold: 3,
+            recovery_duration: Duration::from_millis(40),
+            probe_timeout: Duration::from_millis(60),
+        });
+        for _ in 0..3 {
+            registry.record_failure("tool", Duration::from_millis(1));
+        }
+        assert!(
+            !registry.is_tool_available("tool"),
+            "a tripped tool is unavailable"
+        );
+
+        std::thread::sleep(Duration::from_millis(50));
+        let cb = registry.get_circuit_breaker("tool");
+        assert!(cb.allow_request(), "the probe is granted");
+        assert!(
+            !registry.is_tool_available("tool"),
+            "an in-flight probe holds availability"
+        );
+
+        std::thread::sleep(Duration::from_millis(140));
+        assert!(
+            registry.is_tool_available("tool"),
+            "after the lease expires and the re-armed cooldown elapses, the \
+             registry reports the tool available again — a stranded probe \
+             cannot wedge routing forever"
         );
     }
 

@@ -1331,7 +1331,7 @@ pub enum StreamHandlerError {
 impl fmt::Display for StreamHandlerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InitFailed(outcome) => write!(f, "stream init failed: {outcome}"),
+            Self::InitFailed(outcome) => write!(f, "stream failed before completing: {outcome}"),
             Self::StreamFailed(outcome) => write!(f, "stream failed: {outcome}"),
             Self::FallbackFailed {
                 stream_outcome,
@@ -1561,9 +1561,9 @@ impl StreamHandler {
     ///
     /// Each field that violates a [`validate`](StreamTimeoutConfig::validate)
     /// constraint is substituted with the default's value and named in a
-    /// warning; the caller's valid fields are kept (a
-    /// `total_stream_timeout` below the initial timeout is raised to it).
-    /// Constructing the config directly bypasses this — call
+    /// warning; the caller's valid fields are kept, and the sanitized
+    /// result always satisfies every `validate` rule. Constructing the
+    /// config directly bypasses this — call
     /// [`validate`](StreamTimeoutConfig::validate) on hand-built configs.
     ///
     /// # Example
@@ -1587,25 +1587,29 @@ impl StreamHandler {
 
     /// Repair an invalid [`StreamTimeoutConfig`] field by field.
     ///
-    /// Each field that violates its [`validate`](StreamTimeoutConfig::validate)
-    /// constraint is substituted with the default's value and named in a
-    /// warning; every valid field the caller supplied is kept. A
-    /// `total_stream_timeout` below the (possibly sanitized)
-    /// `initial_event_timeout` is raised to it, preserving the ordering
-    /// constraint without discarding either customization. Constructing
-    /// the config directly bypasses this — call
-    /// [`validate`](StreamTimeoutConfig::validate) yourself on
-    /// hand-built configs.
+    /// Each field that violates a [`validate`](StreamTimeoutConfig::validate)
+    /// constraint — including infinite (`Duration::MAX`) event timeouts,
+    /// which silently disable the deadline they name — is substituted
+    /// with the default's value and named in a warning; every valid
+    /// field the caller supplied is kept. The ordering rule runs once
+    /// after substitution: a `total_stream_timeout` below the (possibly
+    /// sanitized) `initial_event_timeout` is raised to it, so the
+    /// sanitized result always satisfies every `validate` rule.
+    /// Constructing the config directly bypasses this — call
+    /// [`validate`](StreamTimeoutConfig::validate) yourself on hand-built
+    /// configs.
     fn sanitized_timeout_config(timeout: StreamTimeoutConfig) -> StreamTimeoutConfig {
         let default = StreamTimeoutConfig::default();
         let mut sanitized = timeout;
         let mut repaired: Vec<&'static str> = Vec::new();
 
-        if sanitized.initial_event_timeout.is_zero() {
+        if sanitized.initial_event_timeout.is_zero()
+            || sanitized.initial_event_timeout == Duration::MAX
+        {
             sanitized.initial_event_timeout = default.initial_event_timeout;
             repaired.push("initial_event_timeout");
         }
-        if sanitized.per_event_timeout.is_zero() {
+        if sanitized.per_event_timeout.is_zero() || sanitized.per_event_timeout == Duration::MAX {
             sanitized.per_event_timeout = default.per_event_timeout;
             repaired.push("per_event_timeout");
         }
@@ -1614,7 +1618,8 @@ impl StreamHandler {
         {
             sanitized.total_stream_timeout = default.total_stream_timeout;
             repaired.push("total_stream_timeout");
-        } else if sanitized.total_stream_timeout < sanitized.initial_event_timeout {
+        }
+        if sanitized.total_stream_timeout < sanitized.initial_event_timeout {
             sanitized.total_stream_timeout = sanitized.initial_event_timeout;
             repaired.push("total_stream_timeout");
         }
@@ -1634,7 +1639,8 @@ impl StreamHandler {
     /// Set the retry configuration, consuming `self`.
     ///
     /// Validates `retry`: if it violates any constraint, the invalid
-    /// value is logged and the default config is kept instead. See
+    /// value is logged and the previously configured (initially default)
+    /// config is kept instead. See
     /// [`StreamRetryConfig::validate`] for the constraints enforced.
     ///
     /// # Example
@@ -2771,7 +2777,10 @@ mod tests {
         };
         let err = StreamHandlerError::InitFailed(outcome);
         let s = err.to_string();
-        assert!(s.contains("init failed"));
+        assert!(
+            s.contains("stream failed before completing"),
+            "the historical variant name must not leak into the message: {s}"
+        );
     }
 
     #[test]
@@ -4120,6 +4129,67 @@ mod tests {
             Duration::from_secs(400),
             "a default total below a custom initial timeout is raised to it, \
              keeping the caller's initial customization"
+        );
+    }
+
+    #[test]
+    fn sanitized_config_always_validates() {
+        let adversarial = [
+            StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_secs(600),
+                total_stream_timeout: Duration::ZERO,
+                ..Default::default()
+            },
+            StreamTimeoutConfig {
+                initial_event_timeout: Duration::MAX,
+                ..Default::default()
+            },
+            StreamTimeoutConfig {
+                per_event_timeout: Duration::MAX,
+                ..Default::default()
+            },
+            StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_secs(45),
+                per_event_timeout: Duration::from_secs(45),
+                total_stream_timeout: Duration::MAX,
+                max_consecutive_timeouts: 7,
+                ..Default::default()
+            },
+        ];
+        for config in adversarial {
+            let handler = StreamHandler::new().with_timeout_config(config);
+            assert!(
+                handler.timeout_config().validate().is_ok(),
+                "the sanitized builder output must satisfy every validate rule: {:?}",
+                handler.timeout_config()
+            );
+        }
+        let zero_total = StreamHandler::new().with_timeout_config(StreamTimeoutConfig {
+            initial_event_timeout: Duration::from_secs(600),
+            total_stream_timeout: Duration::ZERO,
+            ..Default::default()
+        });
+        assert_eq!(
+            zero_total.timeout_config().total_stream_timeout,
+            Duration::from_secs(600),
+            "a repaired total must still honor the ordering rule against a large initial"
+        );
+    }
+
+    #[test]
+    fn handler_error_display_never_says_init_failed() {
+        let outcome = StreamOutcome::InitFailed {
+            last_error: "stream ended without a terminal event".to_string(),
+            attempts: 3,
+        };
+        let rendered = StreamHandlerError::InitFailed(outcome).to_string();
+        assert!(
+            rendered.contains("without a terminal event"),
+            "the wrapper names the failure cause: {rendered}"
+        );
+        assert!(
+            !rendered.contains("init failed"),
+            "the historical variant name must not leak into the rendered message: {rendered}"
         );
     }
 

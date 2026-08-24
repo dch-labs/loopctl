@@ -770,6 +770,27 @@ impl DetectionManager {
         }
     }
 
+    /// Acknowledge a delivered loop warning so it is not rebuilt on
+    /// every subsequent poll.
+    ///
+    /// Call this once you have actually *delivered* a non-stopping
+    /// warning (logged it, surfaced it to a user, fed it to a monitor)
+    /// — the acknowledgement marks the pattern's first repeated
+    /// operation as warned, suppressing the same warning until the
+    /// pattern changes. Pure queries
+    /// ([`check_loop`](Self::check_loop),
+    /// [`check_loop_pattern`](Self::check_loop_pattern)) never
+    /// acknowledge implicitly; the stopping path marks automatically
+    /// inside [`record_operation`](Self::record_operation).
+    ///
+    /// # Arguments
+    ///
+    /// * `repeated_operations` — the slice carried on the
+    ///   [`LoopStatus`] whose warning was delivered.
+    pub fn acknowledge_loop_warning(&self, repeated_operations: &[Operation]) {
+        self.loop_detector.mark_warned(repeated_operations);
+    }
+
     /// Returns the tool signature used for extracting primary parameters.
     ///
     /// Useful when callers need to construct [`Operation`]s directly using
@@ -1589,6 +1610,33 @@ mod tests {
         assert!(
             second.warning.is_some(),
             "doc: any observability layer may poll without side effects"
+        );
+    }
+
+    #[test]
+    fn acknowledge_loop_warning_suppresses_rebuilds() {
+        let manager = DetectionManager::new().unwrap();
+        for _ in 0..3 {
+            manager.record_operation(Operation::new("Read", "/f.txt"));
+        }
+
+        let delivered = manager.check_loop();
+        let repeated = delivered.repeated_operations.clone();
+        assert!(
+            delivered.warning.is_some(),
+            "precondition: a warning is pending"
+        );
+
+        manager.acknowledge_loop_warning(&repeated);
+
+        let after = manager.check_loop();
+        assert!(
+            after.warning.is_none(),
+            "an acknowledged warning must not rebuild while the pattern is unchanged"
+        );
+        assert!(
+            after.is_looping,
+            "the acknowledgement suppresses the warning only — the pattern itself is still live"
         );
     }
 }

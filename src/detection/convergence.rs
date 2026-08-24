@@ -423,8 +423,8 @@ impl ConvergenceStatus {
     /// Returns a [`ConvergenceStatus`] with `detected = false`,
     /// `consecutive_count = 0`, `similarity_score = 0.0`, and empty
     /// `similar_responses`. The `action` defaults to
-    /// [`ConvergenceAction::Stop`] but is irrelevant since `detected` is
-    /// `false`.
+    /// [`ConvergenceAction::Warn`] (matching the enum default) but is
+    /// irrelevant since `detected` is `false`.
     ///
     /// # Example
     ///

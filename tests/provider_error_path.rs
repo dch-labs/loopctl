@@ -413,8 +413,11 @@ mod contracts {
             assert!(saw_text, "sanity: partial text must have been received");
             assert!(
                 saw_error,
-                "a mid-stream error chunk must surface as the stream's terminal \
-                 failure, not complete as a clean turn (MessageStop seen: {saw_stop})"
+                "a mid-stream error chunk must surface as the stream's terminal failure"
+            );
+            assert!(
+                !saw_stop,
+                "no terminal MessageStop may accompany the mid-stream failure"
             );
         }
 
@@ -454,6 +457,41 @@ mod contracts {
                 "a stream cut without [DONE], finish_reason, or an error chunk must not \
                  emit a terminal MessageStop — its absence is the truncation signal the \
                  handler's strict check turns into a failure"
+            );
+        }
+
+        #[tokio::test]
+        async fn openai_done_sentinel_completes_without_a_finish_reason() {
+            let body = format!("data: {}\n\ndata: [DONE]\n\n", sse_chunk("answer", None));
+            let server = serve(
+                200,
+                "OK",
+                &[("Content-Type", "text/event-stream")],
+                &body,
+                1,
+            )
+            .await;
+            let client = openai_at(&server.base_url);
+            let stream =
+                client.stream_messages(&StreamRequest::new(vec![loopctl::message::Message::user(
+                    "hi",
+                )]));
+            futures::pin_mut!(stream);
+            let mut saw_stop = false;
+            let mut failed = false;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(loopctl::stream::StreamEvent::MessageStop) => saw_stop = true,
+                    Err(_) => failed = true,
+                    _ => {}
+                }
+            }
+            server.task.await.unwrap();
+            assert!(
+                saw_stop && !failed,
+                "the [DONE] sentinel alone completes the stream — lenient servers \
+                 that omit finish_reason still terminate cleanly (stop: {saw_stop}, \
+                 failed: {failed})"
             );
         }
 

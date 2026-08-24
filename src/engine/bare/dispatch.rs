@@ -519,7 +519,15 @@ impl<C: ApiClient> BareLoop<C> {
                 return Ok(blocked);
             }
 
-            self.pre_detection(turn_idx)?;
+            if let Err(e) = self.pre_detection(turn_idx) {
+                let blocked = ToolDispatchResult::err(
+                    &tc.tool,
+                    format!("dispatch refused before execution: {e}"),
+                    Duration::ZERO,
+                );
+                self.notify_tool_post(turn_idx, &tc, &blocked);
+                return Err(e);
+            }
 
             let start = Instant::now();
             let tool_result = tokio::select! {

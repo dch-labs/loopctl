@@ -1559,9 +1559,12 @@ impl StreamHandler {
 
     /// Set the timeout configuration, consuming `self`.
     ///
-    /// Validates `timeout`: if it violates any constraint, the invalid
-    /// value is logged and the default config is kept instead. See
-    /// [`StreamTimeoutConfig::validate`] for the constraints enforced.
+    /// Each field that violates a [`validate`](StreamTimeoutConfig::validate)
+    /// constraint is substituted with the default's value and named in a
+    /// warning; the caller's valid fields are kept (a
+    /// `total_stream_timeout` below the initial timeout is raised to it).
+    /// Constructing the config directly bypasses this — call
+    /// [`validate`](StreamTimeoutConfig::validate) on hand-built configs.
     ///
     /// # Example
     ///
@@ -1578,12 +1581,54 @@ impl StreamHandler {
     /// ```
     #[must_use]
     pub fn with_timeout_config(mut self, timeout: StreamTimeoutConfig) -> Self {
-        if let Err(e) = timeout.validate() {
-            tracing::warn!(error = %e, "invalid StreamTimeoutConfig, falling back to default");
-        } else {
-            self.timeout_config = timeout;
-        }
+        self.timeout_config = Self::sanitized_timeout_config(timeout);
         self
+    }
+
+    /// Repair an invalid [`StreamTimeoutConfig`] field by field.
+    ///
+    /// Each field that violates its [`validate`](StreamTimeoutConfig::validate)
+    /// constraint is substituted with the default's value and named in a
+    /// warning; every valid field the caller supplied is kept. A
+    /// `total_stream_timeout` below the (possibly sanitized)
+    /// `initial_event_timeout` is raised to it, preserving the ordering
+    /// constraint without discarding either customization. Constructing
+    /// the config directly bypasses this — call
+    /// [`validate`](StreamTimeoutConfig::validate) yourself on
+    /// hand-built configs.
+    fn sanitized_timeout_config(timeout: StreamTimeoutConfig) -> StreamTimeoutConfig {
+        let default = StreamTimeoutConfig::default();
+        let mut sanitized = timeout;
+        let mut repaired: Vec<&'static str> = Vec::new();
+
+        if sanitized.initial_event_timeout.is_zero() {
+            sanitized.initial_event_timeout = default.initial_event_timeout;
+            repaired.push("initial_event_timeout");
+        }
+        if sanitized.per_event_timeout.is_zero() {
+            sanitized.per_event_timeout = default.per_event_timeout;
+            repaired.push("per_event_timeout");
+        }
+        if sanitized.total_stream_timeout.is_zero()
+            || sanitized.total_stream_timeout == Duration::MAX
+        {
+            sanitized.total_stream_timeout = default.total_stream_timeout;
+            repaired.push("total_stream_timeout");
+        } else if sanitized.total_stream_timeout < sanitized.initial_event_timeout {
+            sanitized.total_stream_timeout = sanitized.initial_event_timeout;
+            repaired.push("total_stream_timeout");
+        }
+        if sanitized.max_consecutive_timeouts == 0 {
+            sanitized.max_consecutive_timeouts = default.max_consecutive_timeouts;
+            repaired.push("max_consecutive_timeouts");
+        }
+        if !repaired.is_empty() {
+            tracing::warn!(
+                fields = repaired.join(","),
+                "invalid StreamTimeoutConfig fields substituted with defaults"
+            );
+        }
+        sanitized
     }
 
     /// Set the retry configuration, consuming `self`.
@@ -1929,6 +1974,12 @@ impl StreamHandler {
         event: &StreamEvent,
     ) -> Result<(), StreamFailure> {
         shadow.process(event).map_err(|e| {
+            tracing::warn!(
+                error = %e,
+                attempts = diagnostics.attempts_so_far,
+                events_processed = diagnostics.events_processed,
+                "malformed accumulator event rejected"
+            );
             StreamFailure::transient(StreamHandlerError::StreamFailed(
                 StreamOutcome::InitFailed {
                     attempts: diagnostics.attempts_so_far,
@@ -4036,16 +4087,39 @@ mod tests {
     }
 
     #[test]
-    fn with_timeout_config_rejects_invalid_falls_back_to_default() {
-        let bad = StreamTimeoutConfig {
-            initial_event_timeout: Duration::ZERO,
+    fn with_timeout_config_substitutes_only_invalid_fields() {
+        let bad_total = StreamTimeoutConfig {
+            initial_event_timeout: Duration::from_secs(45),
+            per_event_timeout: Duration::from_secs(45),
+            total_stream_timeout: Duration::MAX,
+            max_consecutive_timeouts: 7,
             ..Default::default()
         };
-        let handler = StreamHandler::new().with_timeout_config(bad);
+        let handler = StreamHandler::new().with_timeout_config(bad_total);
+        let config = handler.timeout_config();
         assert_eq!(
-            handler.timeout_config().initial_event_timeout,
-            StreamTimeoutConfig::default().initial_event_timeout,
-            "invalid timeout config must fall back to default"
+            config.initial_event_timeout,
+            Duration::from_secs(45),
+            "valid fields the caller supplied must survive an invalid sibling"
+        );
+        assert_eq!(config.per_event_timeout, Duration::from_secs(45));
+        assert_eq!(config.max_consecutive_timeouts, 7);
+        assert_eq!(
+            config.total_stream_timeout,
+            StreamTimeoutConfig::default().total_stream_timeout,
+            "an infinite total timeout is substituted with the default, not silently disabling every deadline"
+        );
+
+        let unordered = StreamTimeoutConfig {
+            initial_event_timeout: Duration::from_secs(400),
+            ..Default::default()
+        };
+        let handler = StreamHandler::new().with_timeout_config(unordered);
+        assert_eq!(
+            handler.timeout_config().total_stream_timeout,
+            Duration::from_secs(400),
+            "a default total below a custom initial timeout is raised to it, \
+             keeping the caller's initial customization"
         );
     }
 

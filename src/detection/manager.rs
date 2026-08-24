@@ -1039,9 +1039,10 @@ impl DetectionManager {
     /// (the model stops calling tools) never fires it, and the stale window
     /// would kill the *next* run's first dispatch with repetitions the new
     /// run never produced. The engine calls this at every run end: when the
-    /// current pattern would stop — repetitions at or over
-    /// [`stop_threshold`](DetectionConfig::stop_threshold), the same query
-    /// the pre-dispatch check consults — the loop window is cleared, the
+    /// current pattern would stop — the detector's own `should_stop`
+    /// rule (the single stop-rule source, zero sentinel included), the
+    /// same rule the pre-dispatch check consults — the loop window is
+    /// cleared, the
     /// same consumption a fired stop performs. Below the stop threshold
     /// nothing is cleared: sub-threshold history is harmless and may still
     /// warn. Convergence state is deliberately untouched — cross-run
@@ -1049,12 +1050,10 @@ impl DetectionManager {
     /// [`Stop`](crate::detection::ConvergenceAction::Stop)/[`AskUser`](crate::detection::ConvergenceAction::AskUser)
     /// actions.
     pub fn consume_pending_loop_stop(&self) {
-        if !self.config.enable_loop_detection || self.config.stop_threshold == 0 {
+        if !self.config.enable_loop_detection {
             return;
         }
-        if let DetectedPattern::LoopDetected { repetitions, .. } = self.check_loop_pattern()
-            && repetitions >= self.config.stop_threshold
-        {
+        if self.loop_detector.check_loop().should_stop {
             self.loop_detector.clear();
         }
     }

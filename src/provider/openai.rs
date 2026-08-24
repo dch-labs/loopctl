@@ -1123,7 +1123,9 @@ impl OpenAiStreamError {
     fn classify(&self) -> ApiError {
         let rate_limited = self.kind.as_deref() == Some("rate_limit_error")
             || self.code.as_ref().is_some_and(|code| {
-                code.as_u64() == Some(429) || code.as_str() == Some("rate_limit_exceeded")
+                code.as_u64()
+                    .is_some_and(|status| matches!(status, 429 | 503 | 529))
+                    || code.as_str() == Some("rate_limit_exceeded")
             });
         let mut detail = String::new();
         if let Some(kind) = &self.kind {
@@ -1678,10 +1680,6 @@ impl StreamEmitter {
 
     /// Record a mid-stream error payload as the stream's terminal error.
     ///
-    /// First error wins: once set, later error payloads are ignored.
-    /// The stream loop stops reading the SSE body as soon as this
-    /// returns `true` — the server may hold the errored connection
-    /// open, and waiting for its EOF would delay the error.
     /// Mark the provider as having signalled the stream's end.
     ///
     /// Called by the stream loop when the SSE `[DONE]` sentinel is read;
@@ -1690,6 +1688,14 @@ impl StreamEmitter {
         self.done = true;
     }
 
+    /// Record the first classified mid-stream error as the stream's
+    /// terminal error.
+    ///
+    /// First error wins: once one is recorded, later error payloads are
+    /// ignored. The stream loop stops reading the SSE body right after
+    /// calling this — the server may hold the errored connection open,
+    /// and waiting for its EOF would delay the error
+    /// [`finish`](Self::finish) already knows about.
     fn record_error(&mut self, payload: &OpenAiStreamError) {
         if self.error.is_none() {
             self.error = Some(payload.classify());

@@ -480,15 +480,14 @@ impl AnthropicClientBuilder {
         self
     }
 
-    /// Set the maximum number of output tokens per response.
+    /// Set the `max_tokens` sent with every request.
     ///
-    /// Anthropic requires this field on every request — unlike OpenAI, which
-    /// defaults it server-side. It bounds the length of a single model
-    /// response. Defaults to 8192. Increase for long-form generation;    /// Set the `max_tokens` sent with every request.
-    ///
-    /// Anthropic requires the Messages API's mandatory `max_tokens`
-    /// field to be at least 1; [`build`](Self::build) rejects a zero
-    /// value instead of letting the server answer a guaranteed 400.
+    /// Anthropic requires this field on every request — unlike OpenAI,
+    /// which defaults it server-side — and it must be at least 1:
+    /// [`build`](Self::build) rejects a zero value instead of letting
+    /// the server answer a guaranteed 400. It bounds the length of a
+    /// single model response. Defaults to 8192; increase it for
+    /// long-form generation.
     #[must_use]
     pub fn with_max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = tokens;

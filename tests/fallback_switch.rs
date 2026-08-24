@@ -164,7 +164,10 @@ async fn tripped_breaker_routes_subsequent_requests_to_fallback_model() {
     let models = requests.lock().unwrap().clone();
     assert_eq!(
         models,
-        vec![None, Some("fallback-model".to_string())],
+        vec![
+            Some("primary-model".to_string()),
+            Some("fallback-model".to_string())
+        ],
         "the request after the trip must carry the fallback model override"
     );
     let message = second.unwrap().turns.last().unwrap().output.clone();
@@ -208,7 +211,7 @@ async fn recovery_probe_returns_to_primary() {
     assert_eq!(
         models,
         vec![
-            None,
+            Some("primary-model".to_string()),
             Some("fallback-model".to_string()),
             Some("primary-model".to_string()),
         ],
@@ -243,7 +246,7 @@ async fn failure_while_on_fallback_advances_the_chain() {
     assert_eq!(
         models,
         vec![
-            None,
+            Some("primary-model".to_string()),
             Some("fallback-1".to_string()),
             Some("fallback-1".to_string()),
             Some("fallback-2".to_string()),
@@ -307,6 +310,63 @@ async fn model_switch_observer_fires_on_trip_and_recovery() {
             ("fallback-model".to_string(), "primary-model".to_string()),
         ],
         "one switch signal per model change: trip to fallback, then the recovery probe back"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn host_model_override_yields_to_the_configured_chain() {
+    let config = loopctl::fallback::FallbackConfig {
+        trip_threshold: 1,
+        ..loopctl::fallback::FallbackConfig::default()
+    };
+    let manager = FallbackManager::new_with_config(config);
+    manager.set_original_model("primary-model".to_string());
+    manager.set_fallback_model("fallback-1");
+
+    let client = ScriptedClient::new(vec![
+        Step::Text("served by the primary".into()),
+        Step::AuthFail,
+        Step::Text("served by the fallback".into()),
+    ]);
+    let requests = Arc::clone(&client.requests);
+    let mut agent = make_agent(client, manager);
+    agent.set_request_options(loopctl::structured::RequestOptions::new().with_model("host-pick"));
+
+    assert!(agent.run("q", &RunConfig::default()).await.is_ok());
+    assert!(agent.run("q", &RunConfig::default()).await.is_err());
+    assert!(agent.run("q", &RunConfig::default()).await.is_ok());
+
+    let models = requests.lock().unwrap().clone();
+    assert_eq!(
+        models,
+        vec![
+            Some("primary-model".to_string()),
+            Some("primary-model".to_string()),
+            Some("fallback-1".to_string()),
+        ],
+        "a configured manager's resolution is exclusive: the host override never reaches the wire"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn host_model_override_stands_without_a_manager() {
+    let client = ScriptedClient::new(vec![Step::Text("served by the host pick".into())]);
+    let requests = Arc::clone(&client.requests);
+    let mut agent = BareLoop::new(
+        Arc::new(client),
+        ToolRegistry::new(),
+        SessionConfig::default(),
+    );
+    agent.set_request_options(loopctl::structured::RequestOptions::new().with_model("host-pick"));
+
+    assert!(agent.run("q", &RunConfig::default()).await.is_ok());
+    let models = requests.lock().unwrap().clone();
+    assert_eq!(
+        models,
+        vec![Some("host-pick".to_string())],
+        "without a configured manager the host's per-request model is honored"
     );
 }
 
@@ -467,7 +527,7 @@ async fn exhausted_chain_recovers_to_primary_after_cooldown() {
     assert_eq!(
         models,
         vec![
-            None,
+            Some("primary-model".to_string()),
             Some("fallback-1".to_string()),
             Some("fallback-1".to_string()),
             Some("primary-model".to_string()),
@@ -534,7 +594,7 @@ async fn probe_failure_retrips_to_the_fallback_model() {
     assert_eq!(
         models,
         vec![
-            None,
+            Some("primary-model".to_string()),
             Some("fallback-model".to_string()),
             Some("primary-model".to_string()),
             Some("fallback-model".to_string()),

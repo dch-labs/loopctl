@@ -59,16 +59,22 @@ impl<C: ApiClient> BareLoop<C> {
             .with_tools(self.build_tool_schemas())
     }
 
-    /// The model the fallback manager routes this turn's request to.
+    /// The single model the fallback manager resolves this turn's
+    /// request to.
     ///
-    /// `None` while the breaker is closed (`Primary`) or no model is
-    /// configured — both cases leave the request on the client's own
-    /// model, byte-identical to a loop without fallback. While tripped
-    /// this is the active fallback model; during recovery, the primary.
+    /// While the breaker is closed this is the manager's primary
+    /// (`None` only when the manager is unconfigured, which leaves the
+    /// request on the client's own model or the host's override,
+    /// byte-identical to a loop without fallback). While tripped this
+    /// is the active fallback model; during recovery, the primary. With
+    /// a configured manager the resolution is exclusive: outbound
+    /// requests, breaker bookkeeping, recovery probes, and observer
+    /// contexts all derive from this one value, overriding any
+    /// host-provided per-request model.
     pub(super) fn routed_model(&self) -> Option<String> {
         let manager = self.managers.fallback();
         match manager.state() {
-            crate::fallback::FallbackState::Primary => None,
+            crate::fallback::FallbackState::Primary => manager.original_model(),
             _ => manager.active_model(),
         }
     }

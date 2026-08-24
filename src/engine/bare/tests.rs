@@ -3974,7 +3974,7 @@ async fn escalation_trips_from_primary_state() {
         ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
         {
             crate::error::recover_guard(self.served_models.lock()).push(options.model.clone());
-            if options.model.is_some() {
+            if options.model.as_deref() == Some("fallback-model") {
                 let text = crate::message::MessagePart::text("served by fallback");
                 let events = vec![
                     Ok(StreamEvent::MessageStart(MessageStart {

@@ -897,14 +897,14 @@ impl<C: ApiClient> BareLoop<C> {
     /// mid-stream, or any streaming / loop-detection error.
     async fn handle_call_llm(&mut self, turn: usize) -> Result<(), LoopError> {
         let fallback = self.managers.fallback();
+        if fallback.should_try_resume_primary(fallback.config().recovery_timeout) {
+            fallback.transition_to_recovering();
+        }
         if fallback.state() == crate::fallback::FallbackState::Fallback
             && fallback.active_model().is_none()
             && !fallback.fallback_models().is_empty()
         {
             return Err(LoopError::FallbackExhausted);
-        }
-        if fallback.should_try_resume_primary(fallback.config().recovery_timeout) {
-            fallback.transition_to_recovering();
         }
         self.note_routed_model();
 

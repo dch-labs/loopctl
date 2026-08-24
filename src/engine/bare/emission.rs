@@ -243,15 +243,29 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
+    /// The model that served the current turn, for observer contexts.
+    ///
+    /// Reads the breaker's current routing (a fallback while it is
+    /// open, the primary otherwise) and falls back to the client's
+    /// static model when no manager routes models. Callers capture it
+    /// before fallback state changes: a success may close the circuit
+    /// and a failure may advance the chain, and the observer context
+    /// should name the model that was serving, not the one that serves
+    /// next.
+    pub(super) fn routed_or_client_model(&self) -> String {
+        self.routed_model().unwrap_or_else(|| self.client.model())
+    }
+
     /// Record a successful LLM turn: tells the fallback manager the model is
     /// healthy and fires
     /// [`on_stream_success`](crate::observer::LoopObserver::on_stream_success).
     pub(super) fn record_turn_success(&mut self, turn: usize, usage: Option<&Usage>) {
+        let served = self.routed_or_client_model();
         self.managers.fallback().record_success();
         let (in_tok, out_tok) = Self::usage_tokens(usage);
         self.managers.observers().on_stream_success(&StreamContext {
             turn,
-            model: self.client.model(),
+            model: served,
             input_tokens: in_tok,
             output_tokens: out_tok,
         });
@@ -270,6 +284,7 @@ impl<C: ApiClient> BareLoop<C> {
         if matches!(e, LoopError::Cancelled) {
             return e;
         }
+        let served = self.routed_or_client_model();
         let was_in_fallback =
             self.managers.fallback().state() == crate::fallback::FallbackState::Fallback;
         let tripped = if matches!(e, LoopError::RateLimitEscalation { .. }) {
@@ -300,7 +315,7 @@ impl<C: ApiClient> BareLoop<C> {
             .observers()
             .on_stream_failure(&StreamFailureContext {
                 turn,
-                model: self.client.model(),
+                model: served,
                 error: e.clone(),
             });
 

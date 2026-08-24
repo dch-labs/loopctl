@@ -65,7 +65,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// configured — both cases leave the request on the client's own
     /// model, byte-identical to a loop without fallback. While tripped
     /// this is the active fallback model; during recovery, the primary.
-    fn routed_model(&self) -> Option<String> {
+    pub(super) fn routed_model(&self) -> Option<String> {
         let manager = self.managers.fallback();
         match manager.state() {
             crate::fallback::FallbackState::Primary => None,
@@ -93,7 +93,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// chain advance, recovery — instead of observers piecing it together
     /// from breaker callbacks. No-op while no manager routes models.
     pub(super) fn note_routed_model(&mut self) {
-        let served = self.routed_model().unwrap_or_else(|| self.client.model());
+        let served = self.routed_or_client_model();
         if self
             .last_routed_model
             .as_ref()

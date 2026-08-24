@@ -154,17 +154,11 @@ impl GeminiClient {
         )
     }
 
-    /// Build the full URL for the Gemini non-streaming Generate Content
-    /// endpoint.
-    ///
-    /// Constructs `{base_url}/models/{model}:generateContent`. The API key
-    /// is sent via the `x-goog-api-key` header, not in the URL.
-    /// Used by [`ApiClient::create_message`] and its `*_with_options`
-    /// variant.
     /// Build the non-streaming Generate Content URL for the current model.
     ///
     /// Constructs `{base_url}/models/{model}:generateContent`. The API key
-    /// is sent via the `x-goog-api-key` header, not in the URL.
+    /// is sent via the `x-goog-api-key` header, not in the URL. Used by
+    /// [`ApiClient::create_message`] and its `*_with_options` variant.
     fn generate_url(&self) -> String {
         let model = crate::error::recover_guard(self.model.lock()).clone();
         self.generate_url_for_model(&model)

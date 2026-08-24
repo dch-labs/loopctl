@@ -311,6 +311,70 @@ async fn model_switch_observer_fires_on_trip_and_recovery() {
 }
 
 #[tokio::test]
+#[cfg(feature = "streaming")]
+async fn stream_observers_report_the_model_that_served_the_turn() {
+    use loopctl::observer::{LoopObserver, StreamContext, StreamFailureContext};
+    use std::sync::Mutex as StdMutex;
+
+    struct StreamRecorder {
+        successes: Arc<StdMutex<Vec<String>>>,
+        failures: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl LoopObserver for StreamRecorder {
+        fn name(&self) -> &'static str {
+            "stream-recorder"
+        }
+        fn on_stream_success(&self, ctx: &StreamContext) {
+            self.successes.lock().unwrap().push(ctx.model.clone());
+        }
+        fn on_stream_failure(&self, ctx: &StreamFailureContext) {
+            self.failures.lock().unwrap().push(ctx.model.clone());
+        }
+    }
+
+    // Default (1-minute) recovery timeout keeps the whole test inside
+    // one fallback stint, so every turn after the trip is served by
+    // fallback-1.
+    let config = loopctl::fallback::FallbackConfig {
+        trip_threshold: 1,
+        ..loopctl::fallback::FallbackConfig::default()
+    };
+    let manager = FallbackManager::new_with_config(config);
+    manager.set_original_model("primary-model".to_string());
+    manager.set_fallback_model("fallback-1");
+
+    let client = ScriptedClient::new(vec![
+        Step::AuthFail,
+        Step::Text("served by the fallback".into()),
+        Step::AuthFail,
+    ]);
+    let mut agent = make_agent(client, manager);
+
+    let successes = Arc::new(StdMutex::new(Vec::new()));
+    let failures = Arc::new(StdMutex::new(Vec::new()));
+    agent.register_observer(Arc::new(StreamRecorder {
+        successes: Arc::clone(&successes),
+        failures: Arc::clone(&failures),
+    }));
+
+    assert!(agent.run("q", &RunConfig::default()).await.is_err());
+    assert!(agent.run("q", &RunConfig::default()).await.is_ok());
+    assert!(agent.run("q", &RunConfig::default()).await.is_err());
+
+    assert_eq!(
+        failures.lock().unwrap().clone(),
+        vec!["primary-model".to_string(), "fallback-1".to_string(),],
+        "failure contexts name the model that was serving, not the client's static name"
+    );
+    assert_eq!(
+        successes.lock().unwrap().clone(),
+        vec!["fallback-1".to_string()],
+        "success contexts name the fallback that served the turn"
+    );
+}
+
+#[tokio::test]
 async fn exhausted_chain_fails_the_turn_instead_of_serving_the_primary() {
     let manager = FallbackManager::new(1, 2);
     manager.set_original_model("primary-model".to_string());
@@ -348,6 +412,67 @@ async fn exhausted_chain_fails_the_turn_instead_of_serving_the_primary() {
         models.last(),
         Some(&Some("fallback-2".to_string())),
         "the last served request was the final chain entry"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn exhausted_chain_recovers_to_primary_after_cooldown() {
+    let config = loopctl::fallback::FallbackConfig {
+        trip_threshold: 1,
+        recovery_timeout: std::time::Duration::from_millis(500),
+        recovery_successes_needed: 1,
+        ..loopctl::fallback::FallbackConfig::default()
+    };
+    let manager = FallbackManager::new_with_config(config);
+    manager.set_original_model("primary-model".to_string());
+    manager.set_fallback_model("fallback-1");
+
+    let client = ScriptedClient::new(vec![
+        Step::AuthFail,
+        Step::AuthFail,
+        Step::AuthFail,
+        Step::Text("primary is back".into()),
+    ]);
+    let requests = Arc::clone(&client.requests);
+    let mut agent = make_agent(client, manager);
+
+    // Trip the primary, then two failures on fallback-1 (the default
+    // `max_fail_count` of 2) to take it out of rotation.
+    assert!(agent.run("q", &RunConfig::default()).await.is_err());
+    assert!(agent.run("q", &RunConfig::default()).await.is_err());
+    assert!(agent.run("q", &RunConfig::default()).await.is_err());
+
+    // Within the cooldown the exhausted chain fails the turn, typed,
+    // without sending a request.
+    let third = agent.run("q", &RunConfig::default()).await;
+    assert!(
+        matches!(third, Err(loopctl::error::LoopError::FallbackExhausted)),
+        "within the cooldown an exhausted chain fails the turn: {third:?}"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        3,
+        "no request may be sent while exhausted inside the cooldown"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(550)).await;
+
+    let fourth = agent.run("q", &RunConfig::default()).await;
+    assert!(
+        fourth.is_ok(),
+        "after the cooldown the exhausted chain still gets its primary probe"
+    );
+    let models = requests.lock().unwrap().clone();
+    assert_eq!(
+        models,
+        vec![
+            None,
+            Some("fallback-1".to_string()),
+            Some("fallback-1".to_string()),
+            Some("primary-model".to_string()),
+        ],
+        "trip → fallback fails twice (exhausting the chain) → primary probe after cooldown"
     );
 }
 

@@ -158,6 +158,7 @@ let agent = BareLoop::new(
 | `zai` | No | `providers`, `anthropic` | Z.AI API client (Anthropic-compatible) |
 | `grammar` | No | `providers` | Tool-call grammar providers for grammar-aware samplers (vLLM `guided_json`); enables the `Grammar` mode of `ToolConstraint` |
 | `schema_validation` | No | — | JSON Schema validation of `Correction::modified_input` in `LlmReflector` (pulls `jsonschema`); when off, validation is skipped |
+| `redaction` | No | `regex` | `RedactingMiddleware` — scrub secrets (bearer headers, AWS keys, PEM blocks, PATs, high-entropy tokens) from tool output as `[REDACTED:<kind>]` |
 | `mcp` | No | `rmcp`, `reqwest`, `async-stream`, `jsonschema` | MCP client + server adapters — adapt foreign MCP servers' tools as `Tool` impls (`McpToolProvider`), or serve a `ToolRegistry` over MCP/stdio to any MCP client (`McpServerAdapter`; served schemas are validated with `jsonschema`, external refs refused) |
 
 ### Streaming vs non-streaming

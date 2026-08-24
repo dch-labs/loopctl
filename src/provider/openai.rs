@@ -1121,18 +1121,21 @@ impl OpenAiStreamError {
     /// ladder — not the generic transport ladder — owns the response.
     /// Everything else stays a provider error message.
     fn classify(&self) -> ApiError {
+        let numeric_status = self.code.as_ref().and_then(serde_json::Value::as_u64);
         let rate_limited = self.kind.as_deref() == Some("rate_limit_error")
-            || self.code.as_ref().is_some_and(|code| {
-                code.as_u64()
-                    .is_some_and(|status| matches!(status, 429 | 503 | 529))
-                    || code.as_str() == Some("rate_limit_exceeded")
-            });
+            || numeric_status.is_some_and(|status| matches!(status, 429 | 503 | 529))
+            || self.code.as_ref() == Some(&serde_json::json!("rate_limit_exceeded"));
         let mut detail = String::new();
         if let Some(kind) = &self.kind {
             detail.push_str(kind);
             detail.push_str(": ");
         }
         detail.push_str(&self.message);
+        if let Some(status) = numeric_status {
+            detail.push_str(" (HTTP ");
+            detail.push_str(&status.to_string());
+            detail.push(')');
+        }
         if rate_limited {
             ApiError::RateLimit {
                 retry_after: None,
@@ -1669,6 +1672,9 @@ impl StreamEmitter {
     fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
         if let Some(err) = self.error.take() {
             return Err(err);
+        }
+        if self.done && !self.finished {
+            self.process_finish("stop");
         }
         self.flush_message_delta();
         let mut out = self.drain();
@@ -2777,6 +2783,17 @@ mod tests {
         assert!(
             err.to_string().contains("server_error"),
             "the error must name the provider's type: {err}"
+        );
+
+        let overloaded = OpenAiStreamError::parse(
+            r#"{"error":{"message":"upstream overloaded","type":"server_error","code":503}}"#,
+        )
+        .unwrap();
+        let err = overloaded.classify();
+        assert!(
+            matches!(&err, ApiError::RateLimit { message, .. } if message.contains("503")),
+            "a 503 error chunk must classify as RateLimit with the status in the \
+             detail so downstream overload detection reads Overloaded: {err}"
         );
     }
 

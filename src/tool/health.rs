@@ -853,7 +853,10 @@ impl ToolCircuitBreaker {
     /// [`allow_request`](Self::allow_request)).
     #[must_use]
     pub fn is_open(&self) -> bool {
-        crate::error::recover_guard(self.state.lock()).circuit == CircuitState::Open
+        let state = crate::error::recover_guard(self.state.lock());
+        state.circuit == CircuitState::Open
+            || (state.circuit == CircuitState::HalfOpen
+                && probe_expired(&state, self.probe_timeout))
     }
 
     /// Whether the breaker is currently in the `HalfOpen` (probing)
@@ -863,7 +866,8 @@ impl ToolCircuitBreaker {
     /// probes are refused to avoid a thundering herd.
     #[must_use]
     pub fn is_half_open(&self) -> bool {
-        crate::error::recover_guard(self.state.lock()).circuit == CircuitState::HalfOpen
+        let state = crate::error::recover_guard(self.state.lock());
+        state.circuit == CircuitState::HalfOpen && !probe_expired(&state, self.probe_timeout)
     }
 }
 

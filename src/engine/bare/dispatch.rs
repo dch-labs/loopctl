@@ -520,10 +520,12 @@ impl<C: ApiClient> BareLoop<C> {
             }
 
             if let Err(e) = self.pre_detection(turn_idx) {
-                let blocked = ToolDispatchResult::err(
-                    &tc.tool,
-                    format!("dispatch refused before execution: {e}"),
+                let blocked = Self::result_for_call(
+                    &tc,
                     Duration::ZERO,
+                    ToolContent::Text(format!("dispatch refused before execution: {e}")),
+                    true,
+                    None,
                 );
                 self.notify_tool_post(turn_idx, &tc, &blocked);
                 return Err(e);

@@ -343,7 +343,13 @@ impl<C: ApiClient> BareLoop<C> {
                 repetitions,
                 pattern_description,
             } => {
-                if config.stop_threshold > 0 && *repetitions >= config.stop_threshold {
+                if self
+                    .managers
+                    .detection()
+                    .loop_detector()
+                    .check_loop()
+                    .should_stop
+                {
                     tracing::error!(
                         repetitions,
                         pattern = %pattern_description,

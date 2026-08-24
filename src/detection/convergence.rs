@@ -91,7 +91,8 @@ use serde::{Deserialize, Serialize};
 /// of these actions. The caller (typically the `DetectionManager`) interprets
 /// the action to decide how to proceed.
 ///
-/// The default is [`ConvergenceAction::Stop`], which halts the agent loop.
+/// The default is [`ConvergenceAction::Warn`], which surfaces the
+/// convergence without halting the loop.
 ///
 /// # Choosing an Action
 ///
@@ -153,6 +154,11 @@ pub enum ConvergenceAction {
     ///
     /// The specific phase transition is left to the caller's discretion;
     /// the detector signals that the current strategy has stagnated.
+    ///
+    /// Engine note: the loop itself does not switch phases on this
+    /// action — it continues the run, surfacing the action through
+    /// [`ConvergenceStatus::action`](ConvergenceStatus::action) for the
+    /// host to execute the transition.
     SwitchPhase,
 
     /// Ask the user for guidance before continuing.
@@ -177,6 +183,11 @@ pub enum ConvergenceAction {
     /// Useful when convergence is caused by the agent repeatedly
     /// revisiting earlier context — compaction removes the redundant
     /// history that may be driving the repetition.
+    ///
+    /// Engine note: the loop itself does not compact on this action —
+    /// it continues the run, surfacing the action through
+    /// [`ConvergenceStatus::action`](ConvergenceStatus::action) for the
+    /// host to invoke its compaction strategy.
     Compact,
 }
 
@@ -244,7 +255,7 @@ pub enum ConvergenceConfigError {
 /// | `enabled`             | `true`   |
 /// | `window_size`         | `3`      |
 /// | `similarity_threshold`| `0.95`   |
-/// | `on_converge`         | `Stop`   |
+/// | `on_converge`         | `Warn`   |
 ///
 /// # Tuning Guidelines
 ///
@@ -294,7 +305,7 @@ pub struct ConvergenceConfig {
     /// near-verbatim matches.
     pub similarity_threshold: f32,
 
-    /// Action on convergence. Defaults to [`ConvergenceAction::Stop`].
+    /// Action on convergence. Defaults to [`ConvergenceAction::Warn`].
     ///
     /// The [`ConvergenceAction`] returned inside [`ConvergenceStatus`] once
     /// convergence is detected, telling the caller whether to halt, warn,
@@ -313,7 +324,7 @@ impl Default for ConvergenceConfig {
     /// | [`enabled`](ConvergenceConfig::enabled)                           | `true`                      |
     /// | [`window_size`](ConvergenceConfig::window_size)                   | `3`                         |
     /// | [`similarity_threshold`](ConvergenceConfig::similarity_threshold) | `0.95`                      |
-    /// | [`on_converge`](ConvergenceConfig::on_converge)                   | [`ConvergenceAction::Stop`] |
+    /// | [`on_converge`](ConvergenceConfig::on_converge)                   | [`ConvergenceAction::Warn`] |
     ///
     /// # Example
     ///
@@ -329,7 +340,7 @@ impl Default for ConvergenceConfig {
             enabled: true,
             window_size: 3,
             similarity_threshold: 0.95,
-            on_converge: ConvergenceAction::Stop,
+            on_converge: ConvergenceAction::default(),
         }
     }
 }
@@ -431,7 +442,7 @@ impl ConvergenceStatus {
             consecutive_count: 0,
             similarity_score: 0.0,
             similar_responses: Vec::new(),
-            action: ConvergenceAction::Stop,
+            action: ConvergenceAction::Warn,
         }
     }
 }
@@ -571,7 +582,7 @@ impl ConvergenceDetector {
     /// | `enabled`             | `true` |
     /// | `window_size`         | `3`    |
     /// | `similarity_threshold`| `0.95` |
-    /// | `on_converge`         | `Stop` |
+    /// | `on_converge`         | `Warn` |
     ///
     /// # Example
     ///

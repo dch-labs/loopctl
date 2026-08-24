@@ -329,7 +329,12 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Reads the detection config (`stop_threshold`, `on_converge`) to
     /// determine if the pattern is severe enough to halt. Returns
-    /// `Some(LoopError)` to abort, `None` to continue.
+    /// `Some(LoopError)` to abort, `None` to continue. A loop hard-stop
+    /// consumes the pattern: the detector's window is cleared on the
+    /// way out, so the run's failure does not block the next run's
+    /// first dispatch with stale repetitions (a `stop_threshold` of 0
+    /// disables hard stops entirely, mirroring the detector's own
+    /// rule).
     pub(super) fn decide_detected_pattern(&self, pattern: &DetectedPattern) -> Option<LoopError> {
         let config = self.managers.detection().config();
         match pattern {
@@ -338,12 +343,13 @@ impl<C: ApiClient> BareLoop<C> {
                 repetitions,
                 pattern_description,
             } => {
-                if *repetitions >= config.stop_threshold {
+                if config.stop_threshold > 0 && *repetitions >= config.stop_threshold {
                     tracing::error!(
                         repetitions,
                         pattern = %pattern_description,
                         "stopping agent: loop threshold exceeded"
                     );
+                    self.managers.detection().loop_detector().clear();
                     Some(LoopError::LoopDetected {
                         message: format!("{pattern_description} repeated {repetitions} times"),
                     })
@@ -355,8 +361,8 @@ impl<C: ApiClient> BareLoop<C> {
                 ConvergenceAction::Stop => Some(LoopError::LoopDetected {
                     message: "agent stopped: convergence detected".into(),
                 }),
-                ConvergenceAction::AskUser => Some(LoopError::LoopDetected {
-                    message: "agent stopped: convergence detected, user input needed".into(),
+                ConvergenceAction::AskUser => Some(LoopError::UserInputRequired {
+                    message: "convergence detected, user input needed".into(),
                 }),
                 ConvergenceAction::Warn
                 | ConvergenceAction::Compact

@@ -275,6 +275,58 @@ impl Tool for ChangingTextTool {
     }
 }
 
+/// A tool that returns identical results for its first `stuck_for`
+/// calls, then changing ones.
+struct FlippingTool {
+    /// Total calls that return the stuck result before results change.
+    stuck_for: usize,
+    /// Calls made so far.
+    calls: Mutex<usize>,
+}
+
+impl Tool for FlippingTool {
+    fn name(&self) -> &'static str {
+        "search"
+    }
+    fn description(&self) -> &'static str {
+        "Returns stuck results, then changing ones"
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            tool: "search".into(),
+            description: "Returns stuck results, then changing ones".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+    fn call(
+        &self,
+        _input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        let calls = &self.calls;
+        let stuck_for = self.stuck_for;
+        Box::pin(async move {
+            let n = {
+                let mut guard = calls.lock().unwrap();
+                *guard += 1;
+                *guard
+            };
+            if n <= stuck_for {
+                Ok(ToolOutput::text("same result every time".to_string()))
+            } else {
+                Ok(ToolOutput::text(format!("result {n}")))
+            }
+        })
+    }
+}
+
+/// A script of similar terminal answers with no tool calls.
+fn converged_script(rounds: usize) -> Vec<Step> {
+    (0..rounds)
+        .map(|_| Step::Text("the answer is ready".into()))
+        .collect()
+}
+
 fn detection_manager() -> DetectionManager {
     DetectionManager::new_with_config(DetectionConfig {
         loop_threshold: 3,
@@ -442,4 +494,134 @@ async fn stop_opt_in_still_ends_the_run() {
         third.is_err(),
         "an explicit Stop opt-in must end the third converged run: {third:?}"
     );
+}
+
+#[tokio::test]
+async fn next_run_after_a_loop_stop_can_dispatch_again() {
+    let mut script = tool_script(11);
+    script.extend(tool_script(3));
+    script.push(Step::Text("done".into()));
+    let (mut agent, _client) = make_agent(
+        ScriptedClient::new(script),
+        detection_manager(),
+        registry_with(FlippingTool {
+            stuck_for: 10,
+            calls: Mutex::new(0),
+        }),
+    );
+
+    let first = agent.run("q", &RunConfig::default()).await;
+    assert!(
+        matches!(first, Err(loopctl::error::LoopError::LoopDetected { .. })),
+        "run 1 hard-stops on the stuck repetition: {first:?}"
+    );
+
+    let second = agent.run("q", &RunConfig::default()).await;
+    assert!(
+        second.is_ok(),
+        "the stop consumed the pattern; run 2's progressing dispatches must proceed: {second:?}"
+    );
+}
+
+#[tokio::test]
+async fn stop_threshold_zero_never_hard_stops() {
+    let manager = DetectionManager::new_with_config(DetectionConfig {
+        loop_threshold: 3,
+        stop_threshold: 0,
+        ..DetectionConfig::default()
+    })
+    .unwrap();
+    let mut script = tool_script(8);
+    script.push(Step::Text("done".into()));
+    let (mut agent, _client) = make_agent(
+        ScriptedClient::new(script),
+        manager,
+        registry_with(StuckMultipartTool),
+    );
+
+    let result = agent.run("q", &RunConfig::default()).await;
+    assert!(
+        result.is_ok(),
+        "stop_threshold 0 disables hard stops; the repeating run must complete: {result:?}"
+    );
+}
+
+#[test]
+fn default_construction_families_agree_on_on_converge() {
+    use loopctl::detection::{ConvergenceConfig, ConvergenceDetector};
+    let warn = loopctl::detection::ConvergenceAction::Warn;
+    assert_eq!(loopctl::detection::ConvergenceAction::default(), warn);
+    assert_eq!(ConvergenceConfig::default().on_converge, warn);
+    assert_eq!(DetectionConfig::default().on_converge, warn);
+    assert_eq!(
+        DetectionManager::default().config().on_converge,
+        warn,
+        "the default manager wiring agrees with the enum default"
+    );
+    let deserialized: ConvergenceConfig =
+        serde_json::from_str("{\"enabled\":true,\"window_size\":3,\"similarity_threshold\":0.95}")
+            .expect("config without on_converge deserializes");
+    assert_eq!(
+        deserialized.on_converge, warn,
+        "a missing on_converge field deserializes to the same default"
+    );
+    let _ = ConvergenceDetector::default();
+}
+
+#[tokio::test]
+async fn ask_user_is_not_reported_as_a_loop() {
+    let manager = DetectionManager::new_with_config(DetectionConfig {
+        loop_threshold: 3,
+        stop_threshold: 10,
+        on_converge: loopctl::detection::ConvergenceAction::AskUser,
+        ..DetectionConfig::default()
+    })
+    .unwrap();
+    let (mut agent, _client) = make_agent(
+        ScriptedClient::new(converged_script(4)),
+        manager,
+        ToolRegistry::new(),
+    );
+
+    // Convergence builds across terminal runs: two clean, the third asks.
+    assert!(agent.run("q", &RunConfig::default()).await.is_ok());
+    assert!(agent.run("q", &RunConfig::default()).await.is_ok());
+    let third = agent.run("q", &RunConfig::default()).await;
+    match third {
+        Err(loopctl::error::LoopError::UserInputRequired { .. }) => {}
+        other => panic!(
+            "an AskUser convergence must surface the typed ask signal, not a loop error: {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn compact_and_switch_phase_continue_the_run() {
+    for action in [
+        loopctl::detection::ConvergenceAction::Compact,
+        loopctl::detection::ConvergenceAction::SwitchPhase,
+    ] {
+        let manager = DetectionManager::new_with_config(DetectionConfig {
+            loop_threshold: 3,
+            stop_threshold: 10,
+            on_converge: action,
+            ..DetectionConfig::default()
+        })
+        .unwrap();
+        let (mut agent, _client) = make_agent(
+            ScriptedClient::new(converged_script(4)),
+            manager,
+            ToolRegistry::new(),
+        );
+
+        // Three converged terminal runs: the action is surfaced, never
+        // engine-enforced — every run completes.
+        for _ in 0..3 {
+            let result = agent.run("q", &RunConfig::default()).await;
+            assert!(
+                result.is_ok(),
+                "{action:?} is host-executed; the engine continues the run: {result:?}"
+            );
+        }
+    }
 }

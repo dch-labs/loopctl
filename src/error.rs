@@ -308,6 +308,23 @@ pub enum LoopError {
         message: String,
     },
 
+    /// A convergence checkpoint asked for user guidance.
+    ///
+    /// Produced when the detection config's `on_converge` is
+    /// [`AskUser`](crate::detection::ConvergenceAction::AskUser) and the agent
+    /// converged: the engine has no interactive channel, so it
+    /// terminates the run with this typed signal instead of a loop
+    /// error — the host decides whether to re-prompt, adjust the task,
+    /// or surface the question to a UI.
+    #[error("user input required: {message}")]
+    UserInputRequired {
+        /// Description of the convergence that triggered the ask.
+        ///
+        /// A human-readable summary of the converged pattern, for the
+        /// host to show alongside its own ask affordance.
+        message: String,
+    },
+
     /// The tool call limit was reached for the current session or
     /// turn.
     ///

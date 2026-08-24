@@ -6,10 +6,13 @@
 //! # How it fits together
 //!
 //! 1. [`AutoCommitHook`] observes post-tool-use events, recording each
-//!    `file_path` touched by the configured tracking tools.
+//!    `file_path` touched — and the tool that touched it — for the
+//!    configured tracking tools.
 //! 2. At run end the hook hands the recorded paths (plus the
 //!    [`AutoCommitConfig`]) to [`GitExecutor`], which shells out to
-//!    `git` to stage, commit, and optionally push.
+//!    `git` to stage, commit (expanding `{{tool}}` / `{{session}}` in
+//!    the message template from the recorded tool name and the run's
+//!    session id), and optionally push.
 //! 3. [`AutoCommitResult`] describes the outcome so callers can log
 //!    failures without inspecting git's stderr.
 
@@ -345,10 +348,16 @@ impl GitExecutor {
     ///
     /// When `session_files` is `Some`, only those paths are staged and committed,
     /// preventing unrelated working-tree changes from leaking into the commit.
+    /// The commit message is [`AutoCommitConfig::message_template`] with
+    /// `{{tool}}` / `{{session}}` expanded from `tool_name` / `session_id`
+    /// — an unsupplied value expands to an empty string, and any other
+    /// braced text passes through verbatim.
     #[must_use]
     pub fn auto_commit_with_files(
         config: &AutoCommitConfig,
         session_files: Option<&[String]>,
+        tool_name: Option<&str>,
+        session_id: Option<&str>,
     ) -> AutoCommitResult {
         if !config.enabled {
             return AutoCommitResult::Skipped {
@@ -380,7 +389,9 @@ impl GitExecutor {
             };
         }
 
-        match Self::commit(&config.message_template, config.commit_mode.is_amend()) {
+        let message =
+            Self::expand_message_template(&config.message_template, tool_name, session_id);
+        match Self::commit(&message, config.commit_mode.is_amend()) {
             Ok(sha) => {
                 if config.auto_push
                     && let Err(e) = Self::push(config.push_branch.as_deref())
@@ -402,11 +413,31 @@ impl GitExecutor {
     ///
     /// Convenience wrapper around
     /// [`auto_commit_with_files`](Self::auto_commit_with_files) that
-    /// passes `None` for the session-files override, so
-    /// [`AutoCommitConfig::files`] controls what gets staged.
+    /// passes `None` for the session-files override and both template
+    /// values, so [`AutoCommitConfig::files`] controls what gets staged
+    /// and any `{{tool}}` / `{{session}}` placeholder expands to an
+    /// empty string.
     #[must_use]
     pub fn auto_commit(config: &AutoCommitConfig) -> AutoCommitResult {
-        Self::auto_commit_with_files(config, None)
+        Self::auto_commit_with_files(config, None, None, None)
+    }
+
+    /// Expand the documented placeholders in a commit message template.
+    ///
+    /// `{{tool}}` becomes the triggering tool name and `{{session}}` the
+    /// session identifier; a placeholder whose value was not supplied
+    /// expands to an empty string. Any other braced text passes through
+    /// verbatim, so user templates with unrelated braces are not
+    /// mangled — expansion is a plain replace of exactly the two
+    /// documented tokens.
+    fn expand_message_template(
+        template: &str,
+        tool_name: Option<&str>,
+        session_id: Option<&str>,
+    ) -> String {
+        template
+            .replace("{{tool}}", tool_name.unwrap_or(""))
+            .replace("{{session}}", session_id.unwrap_or(""))
     }
 }
 
@@ -647,6 +678,15 @@ pub struct AutoCommitHook {
     /// [`Mutex`] so the hook can be shared across threads via
     /// [`HookExecutor`](crate::hooks::HookExecutor).
     modified_files: Mutex<Vec<String>>,
+
+    /// Name of the tool that most recently triggered file tracking.
+    ///
+    /// Recorded alongside the file path in
+    /// [`on_post_tool_use`](Hook::on_post_tool_use) and cleared with the
+    /// modification list at run start, so the run-end commit can expand
+    /// `{{tool}}` in the message template. `None` when no tracked tool
+    /// has run yet.
+    last_tool: Mutex<Option<String>>,
 }
 
 impl AutoCommitHook {
@@ -659,6 +699,7 @@ impl AutoCommitHook {
         Self {
             config: AutoCommitConfig::default(),
             modified_files: Mutex::new(Vec::new()),
+            last_tool: Mutex::new(None),
         }
     }
 
@@ -686,14 +727,28 @@ impl AutoCommitHook {
         }
     }
 
-    /// Clear all recorded file modifications.
+    /// Record the name of the tool that triggered file tracking.
+    ///
+    /// Overwrites any earlier name — the run-end commit expands
+    /// `{{tool}}` with the most recent triggering tool. Lock failures
+    /// are silently ignored.
+    fn record_triggering_tool(&self, tool_name: &str) {
+        if let Ok(mut tool) = self.last_tool.lock() {
+            *tool = Some(tool_name.to_string());
+        }
+    }
+
+    /// Clear all recorded file modifications and the triggering tool.
     ///
     /// Called at run start so a fresh run does not inherit
-    /// modifications from the previous one. Lock failures are silently
-    /// ignored.
+    /// modifications or the tool name from the previous one. Lock
+    /// failures are silently ignored.
     fn clear_modifications(&self) {
         if let Ok(mut files) = self.modified_files.lock() {
             files.clear();
+        }
+        if let Ok(mut tool) = self.last_tool.lock() {
+            *tool = None;
         }
     }
 }
@@ -718,6 +773,7 @@ impl Hook for AutoCommitHook {
             && let Some(file_path) = ctx.input.get("file_path").and_then(|v| v.as_str())
         {
             self.track_modification(file_path);
+            self.record_triggering_tool(&ctx.tool_name);
         }
     }
 
@@ -725,11 +781,15 @@ impl Hook for AutoCommitHook {
         self.clear_modifications();
     }
 
-    fn on_run_end(&self, _ctx: &RunEndContext) {
+    fn on_run_end(&self, ctx: &RunEndContext) {
         let files = self.modified_files.lock().ok().filter(|f| !f.is_empty());
+        let tool = self.last_tool.lock().ok().and_then(|t| t.clone());
+        let session = ctx.session_id.to_string();
         let result = GitExecutor::auto_commit_with_files(
             &self.config,
             files.as_deref().map(|v| v as &[String]),
+            tool.as_deref(),
+            Some(session.as_str()),
         );
         if let AutoCommitResult::Failed { error } = result {
             tracing::warn!(%error, "auto-commit failed");
@@ -915,6 +975,14 @@ mod tests {
         }
     }
 
+    /// Serializes tests that change the process working directory.
+    ///
+    /// `set_current_dir` is process-global and the test harness runs
+    /// tests on parallel threads, so two cwd-changing tests would run
+    /// each other's git commands in the wrong repository. Both harness
+    /// tests hold this lock across their chdir window.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn stage_files_empty_list_does_not_stage_unrelated_changes() {
         use std::fs;
@@ -976,6 +1044,7 @@ mod tests {
 
         fs::write(&sentinel, "v2-uncommitted\n").expect("wrote sentinel v2");
 
+        let _cwd_guard = CWD_LOCK.lock().unwrap();
         std::env::set_current_dir(&repo_dir).expect("cd into repo");
         let result = GitExecutor::stage_files(&[]);
         std::env::set_current_dir(&prev_dir).expect("restored cwd");
@@ -997,6 +1066,106 @@ mod tests {
              but git status was:\n{status_text}\n\
              (this means stage_files ran `git add -A` — the empty-list \
              footgun is still present)"
+        );
+
+        drop(guard);
+    }
+
+    #[test]
+    fn message_template_placeholders_are_expanded() {
+        use std::fs;
+        use std::process::Command;
+        use std::process::Stdio;
+
+        if Command::new("git")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+
+        let mut repo_dir = std::env::temp_dir();
+        repo_dir.push(format!(
+            "loopctl-template-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::create_dir_all(&repo_dir).expect("created temp repo dir");
+        let guard = RepoGuard(repo_dir.clone());
+        let prev_dir = std::env::current_dir().expect("cwd readable");
+
+        for (label, args) in [
+            ("init", vec!["init"]),
+            ("config user.name", vec!["config", "user.name", "test"]),
+            ("config user.email", vec!["config", "user.email", "t@t"]),
+        ] {
+            let status = Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap_or_else(|e| panic!("git {label} spawn failed: {e}"));
+            assert!(status.success(), "git {label} failed");
+        }
+
+        let sentinel = repo_dir.join("tool_output.txt");
+        fs::write(&sentinel, "v1\n").expect("wrote sentinel v1");
+        for (label, args) in [
+            ("add", vec!["add", "tool_output.txt"]),
+            ("commit", vec!["commit", "-m", "init"]),
+        ] {
+            let status = Command::new("git")
+                .args(&args)
+                .current_dir(&repo_dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap_or_else(|e| panic!("git {label} spawn failed: {e}"));
+            assert!(status.success(), "git {label} failed");
+        }
+        fs::write(&sentinel, "v2-uncommitted\n").expect("wrote sentinel v2");
+
+        let config = AutoCommitConfig {
+            enabled: true,
+            // `{{branch}}` is not a documented placeholder — it must
+            // survive expansion verbatim.
+            message_template: "feat: {{tool}} ({{session}}) [{{branch}}]".to_string(),
+            ..AutoCommitConfig::default()
+        };
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let _cwd_guard = CWD_LOCK.lock().unwrap();
+        std::env::set_current_dir(&repo_dir).expect("cd into repo");
+        let result = GitExecutor::auto_commit_with_files(
+            &config,
+            Some(&["tool_output.txt".to_string()]),
+            Some("Write"),
+            Some(session_id),
+        );
+        std::env::set_current_dir(&prev_dir).expect("restored cwd");
+        assert!(
+            matches!(result, AutoCommitResult::Committed { .. }),
+            "auto-commit must succeed, got {result:?}"
+        );
+
+        let output = Command::new("git")
+            .args(["log", "--format=%s", "-1"])
+            .current_dir(&repo_dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git log spawn failed: {e}"));
+        let subject = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            subject,
+            format!("feat: Write ({session_id}) [{{{{branch}}}}]"),
+            "doc: {{tool}} and {{session}} are expanded at run end into the triggering \
+             tool name and the session identifier; any other braced text passes through \
+             verbatim"
         );
 
         drop(guard);

@@ -29,7 +29,10 @@ use std::pin::Pin;
 /// The first message is always retained (if present) because it usually
 /// contains the system prompt or conversation instructions. This prevents
 /// the compactor from discarding essential context that shapes the agent's
-/// behavior. If the conversation is shorter than `min_messages`, no
+/// behavior. Tool-call/result pairs are never split: the split point
+/// moves to keep a pair together, and a result that would be dropped
+/// behind a call carried by the preserved first message is pulled back
+/// alongside it. If the conversation is shorter than `min_messages`, no
 /// compaction occurs.
 ///
 /// # Example
@@ -140,22 +143,25 @@ impl ContextCompactor for TruncatingCompactor {
             // message containing that ToolCall.
             let split = Self::adjust_for_tool_pairs(&messages, initial_split);
 
+            // A split of 0 means the adjustment pulled the whole
+            // conversation into the recent slice — nothing is dropped, so
+            // report no change instead of a compaction that reduced
+            // nothing.
+            if split == 0 {
+                return CompactionOutcome::no_change(messages);
+            }
+
             let recent: Vec<Message> = messages.get(split..).unwrap_or_default().to_vec();
 
-            // Always preserve the first message (typically the system prompt)
-            // unless it is already included in the recent slice (split == 0).
-            let preserved = if split > 0 {
-                if let Some(first) = messages.first() {
-                    let mut v = vec![first.clone()];
-                    v.extend(recent);
-                    v
-                } else {
-                    recent
-                }
-            } else {
-                // split == 0 means recent already contains all messages.
-                recent
-            };
+            // Always preserve the first message (typically the system
+            // prompt); split > 0 guarantees it is not already part of the
+            // recent slice.
+            let mut preserved: Vec<Message> = Vec::with_capacity(recent.len().saturating_add(1));
+            if let Some(first) = messages.first() {
+                preserved.push(first.clone());
+            }
+            preserved.extend(recent);
+            let preserved = Self::reattach_dropped_results(&messages, split, preserved);
 
             let tokens_after = context.counter.count(&preserved);
             CompactionOutcome {
@@ -232,6 +238,80 @@ impl TruncatingCompactor {
         }
 
         new_split
+    }
+
+    /// Pull dropped [`MessagePart::ToolResult`]s back into the kept slice
+    /// when the preserved first message carries their calls.
+    ///
+    /// The first message is kept unconditionally, but its `ToolCall`s can
+    /// have results that land in the dropped range (before `split`) —
+    /// [`adjust_for_tool_pairs`](Self::adjust_for_tool_pairs) repairs only
+    /// the mirror direction (a result in the recent slice whose call
+    /// would be dropped). Each dropped message carrying a still-missing
+    /// result for a first-message call is inserted into the kept slice
+    /// right after the first message, keeping the pair adjacent.
+    /// Results already present anywhere in the kept slice satisfy their
+    /// calls and are not pulled twice.
+    fn reattach_dropped_results(
+        messages: &[Message],
+        split: usize,
+        kept: Vec<Message>,
+    ) -> Vec<Message> {
+        let first_call_ids: HashSet<&String> = kept
+            .first()
+            .into_iter()
+            .flat_map(|msg| msg.parts.iter())
+            .filter_map(|part| match part {
+                MessagePart::ToolCall { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        if first_call_ids.is_empty() {
+            return kept;
+        }
+
+        let kept_result_ids: HashSet<&String> = kept
+            .iter()
+            .flat_map(|msg| msg.parts.iter())
+            .filter_map(|part| match part {
+                MessagePart::ToolResult { call_id, .. } => Some(call_id),
+                _ => None,
+            })
+            .collect();
+        let missing: Vec<&String> = first_call_ids
+            .iter()
+            .filter(|id| !kept_result_ids.contains(*id))
+            .copied()
+            .collect();
+        if missing.is_empty() {
+            return kept;
+        }
+
+        let pulled: Vec<Message> = messages
+            .get(1..split)
+            .unwrap_or_default()
+            .iter()
+            .filter(|msg| {
+                msg.parts.iter().any(|part| match part {
+                    MessagePart::ToolResult { call_id, .. } => missing.contains(&call_id),
+                    _ => false,
+                })
+            })
+            .cloned()
+            .collect();
+        if pulled.is_empty() {
+            return kept;
+        }
+
+        let mut kept_iter = kept.into_iter();
+        let Some(first) = kept_iter.next() else {
+            return pulled;
+        };
+        let mut out = Vec::with_capacity(pulled.len().saturating_add(kept_iter.len()));
+        out.push(first);
+        out.extend(pulled);
+        out.extend(kept_iter);
+        out
     }
 }
 
@@ -648,5 +728,101 @@ mod tests {
         let context = make_context(&messages);
         let outcome = compactor.compact(messages.clone(), 500, context).await;
         assert_eq!(outcome.messages.len(), messages.len());
+    }
+
+    #[tokio::test]
+    async fn preserved_first_message_does_not_orphan_its_tool_call() {
+        let messages = vec![
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "c1",
+                    "Read",
+                    json!({"path": "a.rs"}),
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "c1",
+                    "Read",
+                    tool_text("ok"),
+                    false,
+                )],
+            ),
+            Message::user("q2"),
+            Message::assistant("a2"),
+            Message::user("q3"),
+            Message::assistant("a3"),
+            Message::user("q4"),
+            Message::assistant("a4"),
+        ];
+        let compactor = TruncatingCompactor::new().with_min_messages(4);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+        let has_call = outcome.messages.iter().any(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::ToolCall { id, .. } if id == "c1"))
+        });
+        let has_result = outcome.messages.iter().any(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::ToolResult { call_id, .. } if call_id == "c1"))
+        });
+        assert!(
+            !has_call || has_result,
+            "module doc: the split adjustment avoids orphaning tool-call/result pairs — kept the call but dropped its result: {:?}",
+            outcome.messages.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn straddling_call_at_index_zero_reports_no_action() {
+        // The call sits in the unconditionally-preserved first message
+        // and its result lands in the recent slice, so the backward walk
+        // pulls the split to 0 — nothing can be dropped, and the pass
+        // must report no change (an unchanged list is classified
+        // NoAction by the manager), not a compaction that reduced
+        // nothing.
+        let messages = vec![
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "c1",
+                    "Read",
+                    json!({"path": "a.rs"}),
+                )],
+            ),
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "c1",
+                    "Read",
+                    tool_text("ok"),
+                    false,
+                )],
+            ),
+            Message::user("q2"),
+            Message::assistant("a2"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(4)
+            .with_preserve_recent(3);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages.clone(), 1, context).await;
+        assert!(outcome.success);
+        assert_eq!(
+            outcome.messages.len(),
+            messages.len(),
+            "a split of 0 keeps every message — the outcome must be the unchanged list"
+        );
+        assert_eq!(
+            outcome.tokens_saved, 0,
+            "no-action passes must claim zero savings"
+        );
     }
 }

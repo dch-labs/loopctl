@@ -808,11 +808,11 @@ impl ApiClient for MockApiClient {
         Box::pin(async move {
             let stop_reason = crate::stream::StreamStopReason::from_api_str(&response.stop_reason)
                 .unwrap_or(crate::stream::StreamStopReason::EndTurn);
-            let parts = if let Some(tc) = response.tool_call {
-                vec![MessagePart::tool_call(tc.id, tc.name, tc.input)]
-            } else {
-                vec![MessagePart::text(response.text)]
-            };
+            // Both parts, mirroring the streaming twin's text-then-tool lane order.
+            let mut parts = vec![MessagePart::text(response.text)];
+            if let Some(tc) = response.tool_call {
+                parts.push(MessagePart::tool_call(tc.id, tc.name, tc.input));
+            }
             Ok(crate::api::NonStreamingResponse {
                 message: Message::new(Role::Assistant, parts),
                 stop_reason,
@@ -1638,6 +1638,32 @@ mod tests {
         assert_eq!(
             response.stop_reason,
             crate::stream::StreamStopReason::EndTurn
+        );
+    }
+
+    #[tokio::test]
+    async fn create_message_keeps_text_alongside_tool_call() {
+        let client = MockApiClient::new("test-model").with_responses(vec![MockResponse {
+            text: "Let me look that up.".to_string(),
+            tool_call: Some(MockToolCall {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                input: json!({}),
+            }),
+            stop_reason: "tool_use".to_string(),
+        }]);
+        let response = client
+            .create_message(&crate::api::StreamRequest::new(vec![]))
+            .await
+            .expect("mock must respond");
+        assert_eq!(
+            response.message.text_content(),
+            "Let me look that up.",
+            "doc: the assistant message is built from the response's text and optional tool call"
+        );
+        assert!(
+            response.message.tool_call_parts().len() == 1,
+            "the tool call rides alongside the text, mirroring the streaming twin"
         );
     }
 

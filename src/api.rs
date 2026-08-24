@@ -764,4 +764,55 @@ mod tests {
         };
         assert!(response.usage.is_none());
     }
+
+    #[tokio::test]
+    async fn default_with_options_rejects_unsupported_tool_constraint() {
+        struct PlainClient;
+
+        impl ApiClient for PlainClient {
+            fn model(&self) -> String {
+                "plain".to_string()
+            }
+            fn stream_messages(
+                &self,
+                _request: &StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn futures::Stream<Item = Result<StreamEvent, crate::api::error::ApiError>>
+                        + Send,
+                >,
+            > {
+                Box::pin(futures::stream::empty())
+            }
+            fn create_message(
+                &self,
+                _request: &StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<NonStreamingResponse, crate::api::error::ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: StreamStopReason::EndTurn,
+                        usage: None,
+                    })
+                })
+            }
+        }
+
+        let options = crate::structured::RequestOptions::new()
+            .with_tool_constraint(crate::structured::ToolConstraint::Strict);
+        let mut stream =
+            PlainClient.stream_messages_with_options(&StreamRequest::new(vec![]), options);
+        let first = stream.next().await;
+        assert!(
+            matches!(&first, Some(Err(crate::api::error::ApiError::Config(_)))),
+            "doc: unsupported option fields yield an ApiError::config error as the first item; got {first:?}"
+        );
+    }
 }

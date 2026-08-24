@@ -112,10 +112,10 @@ impl ConstrainedProfile {
     /// Middleware registration order (first-registered outermost):
     /// output-limit → verify → memoize. Memoize (innermost) caches the
     /// raw tool result before verify appends its diagnostics — the cache
-    /// never holds a verify block, and every write-class call is verified
-    /// anew — while the output cap (outermost, post-processing last)
-    /// truncates the combined output, so verify-appended diagnostics
-    /// cannot escape the cap.
+    /// never holds a verify block, and every successful write-class
+    /// call is verified anew — while the output cap (outermost,
+    /// post-processing last) truncates the combined output, so
+    /// verify-appended diagnostics cannot escape the cap.
     ///
     /// No `.with_core()` is set — pass the result to
     /// [`BareLoop::set_pipeline`], which attaches the tool registry.
@@ -516,7 +516,7 @@ mod tests {
         assert_eq!(
             len, expected,
             "doc: verify's appended diagnostics flow through the output cap — the combined \
-             output must truncate to exactly exactly the cap — the marker is inside the budget"
+             output must truncate to exactly the cap — the marker is inside the budget"
         );
     }
 }

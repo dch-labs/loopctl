@@ -10,9 +10,10 @@ use std::pin::Pin;
 /// The limit is a **whole-output budget over the text content**: a text
 /// part that does not fit is cut so that the kept text *plus* its
 /// `[truncated]` marker stays within the remaining budget, and once the
-/// budget is exhausted every later text part is emptied (one earlier
-/// marker already signals the truncation — a marker per part would
-/// overflow the cap it enforces). Image parts are left unchanged.
+/// budget is exhausted every later text part is emptied (a marker per
+/// part would overflow the cap it enforces; when an earlier part was
+/// cut, its marker already signals the truncation). Image parts are
+/// left unchanged.
 ///
 /// A `max_chars` of `0` disables the middleware entirely (the crate-wide
 /// zero-disables sentinel) — output passes through untouched.
@@ -36,7 +37,7 @@ pub struct OutputLimitMiddleware {
 
 /// The truncation marker appended to a cut text part.
 ///
-/// Thirteen characters including the leading newline; its length is
+/// Twelve characters including the leading newline; its length is
 /// reserved inside the remaining budget by [`truncate_marked`] so a cut
 /// part lands exactly on the cap.
 const TRUNCATION_MARKER: &str = "\n[truncated]";

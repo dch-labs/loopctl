@@ -141,9 +141,10 @@ struct CacheKey {
 struct CacheEntry {
     /// The successful `ToolDispatchResult` returned on the original call.
     ///
-    /// Cloned (with `[cached]` appended to its output and `duration`
-    /// zeroed) on a hit. Only successful results (`is_error == false`)
-    /// are cached; errors always re-run.
+    /// Cloned (with `[cached]` appended to its output) on a hit — the
+    /// recorded `duration` is preserved so a hit reports the original
+    /// call's latency, not a zero-cost lookup. Only successful results
+    /// (`is_error == false`) are cached; errors always re-run.
     result: ToolDispatchResult,
 
     /// The `turn_number` at which the entry was inserted.
@@ -456,7 +457,7 @@ mod tests {
     use super::*;
     use crate::cancel::CancelSignal;
     use crate::message::ToolContent;
-    use crate::middleware::{ToolDispatchContext, ToolPipeline};
+    use crate::middleware::{OutputLimitMiddleware, ToolDispatchContext, ToolPipeline};
     use crate::tool::{PermissionCheck, ToolContext, ToolRegistry};
     use std::future::Future;
     use std::sync::Arc;
@@ -1172,6 +1173,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_hit_through_outer_cap_re_applies_the_limit() {
+        struct LongOutputMiddleware;
+        impl ToolMiddleware for LongOutputMiddleware {
+            fn name(&self) -> &'static str {
+                "long_output"
+            }
+            fn dispatch<'a>(
+                &'a self,
+                _ctx: &'a mut ToolDispatchContext,
+                _next: &'a ToolPipeline,
+            ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
+                Box::pin(async {
+                    ToolDispatchResult {
+                        output: ToolContent::from_string("x".repeat(100)),
+                        is_error: false,
+                        resolved_tool_name: String::new(),
+                        tool_call_id: String::new(),
+                        duration: Duration::ZERO,
+                        display_hint: None,
+                    }
+                })
+            }
+        }
+
+        let memoize = make_middleware(Arc::new(NoopPathExtractor), 10);
+        let registry = Arc::new(ToolRegistry::new());
+        let pipeline = ToolPipeline::builder()
+            .with_middleware(OutputLimitMiddleware::new(20))
+            .with_middleware(memoize)
+            .with_middleware(LongOutputMiddleware)
+            .with_core(registry)
+            .build()
+            .expect("pipeline builds");
+
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "x"}), 0);
+        let first = pipeline.dispatch(&mut ctx).await;
+        let first_len = match &first.output {
+            ToolContent::Text(text) => text.chars().count(),
+            ToolContent::Multipart(_) => 0,
+        };
+        assert_eq!(first_len, 20, "the miss is capped at exactly 20 chars");
+
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "x"}), 1);
+        let second = pipeline.dispatch(&mut ctx).await;
+        let second_text = match &second.output {
+            ToolContent::Text(text) => text.clone(),
+            ToolContent::Multipart(_) => String::new(),
+        };
+        let second_len = second_text.chars().count();
+        assert!(
+            second_text.contains("[truncated]"),
+            "the cap truncates the cached result: {second_text:?}"
+        );
+        assert_eq!(
+            second_len, 20,
+            "the cached 100-char result flows back through the outer cap — \
+             re-capped to exactly 20, no bypass: got {second_text:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn cache_hit_preserves_the_original_call_duration() {
         struct SlowOutputMiddleware;
         impl ToolMiddleware for SlowOutputMiddleware {
@@ -1217,7 +1279,8 @@ mod tests {
         assert_eq!(
             second.duration,
             Duration::from_millis(250),
-            "a hit must preserve the cached duration so health statistics              track the real tool latency, not a zero-cost lookup"
+            "a hit must preserve the cached duration so health statistics \
+             track the real tool latency, not a zero-cost lookup"
         );
     }
 

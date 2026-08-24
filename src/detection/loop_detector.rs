@@ -1273,9 +1273,11 @@ impl LoopDetector {
     ///
     /// # When Called
     ///
-    /// Called by the framework after every tool invocation, either
-    /// directly, via [`LoopDetector::record_from_input`], or via
-    /// [`LoopDetector::record_from_input_with_error`].
+    /// Called by the framework once per completed tool invocation — the
+    /// single record point for loop detection. Hosts driving the detector
+    /// directly may also use [`LoopDetector::record_from_input`] or
+    /// [`LoopDetector::record_from_input_with_error`] for input-only
+    /// records (no result yet).
     pub fn record(&self, operation: Operation) {
         let should_clear_history = {
             let mut clear = false;
@@ -1387,8 +1389,10 @@ impl LoopDetector {
     ///
     /// # When Called
     ///
-    /// Called by the framework after each tool invocation, typically
-    /// immediately after [`record`](LoopDetector::record).
+    /// Called by the framework between tool invocations as a pure read —
+    /// the single record point is [`record`](LoopDetector::record), called
+    /// once per completed invocation, so examining a step twice (pre-checks,
+    /// re-derived steps) counts it once.
     pub fn check_loop(&self) -> LoopStatus {
         let Ok(ops) = self.operations.lock() else {
             return LoopStatus::default();
@@ -1412,6 +1416,24 @@ impl LoopDetector {
             repetition_count: max_repetitions,
             warning,
             should_stop,
+        }
+    }
+
+    /// Record the first repeated operation as warned.
+    ///
+    /// The mutating half of the one-shot warning contract:
+    /// [`build_warning`](Self::build_warning) reads `warned_operations`
+    /// to decide whether to emit, and only this method — called from the
+    /// recording paths — inserts. Pure queries
+    /// ([`check_loop`](Self::check_loop)) never call it, so an
+    /// observability poller running alongside the loop cannot consume the
+    /// agent's warning.
+    pub(super) fn mark_warned(&self, repeated_operations: &[Operation]) {
+        if let Some(first_op) = repeated_operations.first()
+            && let Ok(mut warned) = self.warned_operations.lock()
+            && !warned.contains(first_op)
+        {
+            warned.insert(first_op.clone());
         }
     }
 
@@ -1472,8 +1494,10 @@ impl LoopDetector {
     /// Build the warning string for repeated operations.
     ///
     /// Returns `None` when not looping, or when already warned and
-    /// not stopping.  When a new warning is produced, the first
-    /// repeated operation is recorded in `warned_operations`.
+    /// not stopping. A pure read of `warned_operations` — the insert
+    /// lives in [`mark_warned`](Self::mark_warned), which only the
+    /// recording paths call, so pollers cannot consume the one-shot
+    /// warning.
     fn build_warning(
         &self,
         repeated_operations: &[Operation],
@@ -1493,10 +1517,6 @@ impl LoopDetector {
 
         if already_warned && !should_stop {
             return None;
-        }
-
-        if !already_warned && let Ok(mut warned) = self.warned_operations.lock() {
-            warned.insert(first_op.clone());
         }
 
         let stop_msg = if should_stop {
@@ -2091,6 +2111,8 @@ mod tests {
         assert!(status1.is_looping);
         assert!(status1.warning.is_some());
 
+        detector.mark_warned(&status1.repeated_operations);
+
         let status2 = detector.check_loop();
         assert!(status2.is_looping);
         assert!(status2.warning.is_none());
@@ -2224,6 +2246,7 @@ mod tests {
 
         let status1 = detector.check_loop();
         assert!(status1.warning.is_some());
+        detector.mark_warned(&status1.repeated_operations);
 
         let hash2 = hash_result("different output - progress!");
         detector.record(Operation::new("Bash", "git status").with_result_hash(hash2));
@@ -2283,6 +2306,7 @@ mod tests {
         }
         let status1 = detector.check_loop();
         assert!(status1.warning.is_some());
+        detector.mark_warned(&status1.repeated_operations);
 
         let status2 = detector.check_loop();
         assert!(status2.warning.is_none());
@@ -2517,13 +2541,17 @@ mod tests {
         let detector = test_detector();
         let ops = vec![Operation::new("Bash", "ls")];
 
-        // First call produces a warning and records the op as warned
         let w1 = detector.build_warning(&ops, 3, true, false);
         assert!(w1.is_some());
 
-        // Second call suppresses because already warned
+        // Pure rebuilds do not consume the warning — only the mutating
+        // path's mark does.
+        let w_pure = detector.build_warning(&ops, 3, true, false);
+        assert!(w_pure.is_some(), "a pure rebuild must still warn");
+
+        detector.mark_warned(&ops);
         let w2 = detector.build_warning(&ops, 3, true, false);
-        assert!(w2.is_none());
+        assert!(w2.is_none(), "after the mark the warning is consumed");
     }
 
     #[test]

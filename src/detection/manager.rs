@@ -319,7 +319,10 @@ pub struct DetectionConfig {
     /// detector.
     pub enable_convergence_detection: bool,
 
-    /// Action on convergence. Default: [`ConvergenceAction::default()`].
+    /// Action on convergence. Default: [`ConvergenceAction::Warn`] —
+    /// text similarity is a heuristic with irreducible false positives, so
+    /// its default punishment is not execution. Set
+    /// [`ConvergenceAction::Stop`] to restore stop-on-converge.
     ///
     /// The [`ConvergenceAction`] forwarded to callers once convergence is
     /// detected — stop, warn, switch phase, ask the user, or compact the
@@ -738,6 +741,9 @@ impl DetectionManager {
         self.loop_detector.record(operation);
 
         let status = self.loop_detector.check_loop();
+        if status.should_stop {
+            self.loop_detector.mark_warned(&status.repeated_operations);
+        }
         if status.is_looping {
             let mut guard = self.stats.lock().unwrap_or_else(|e| {
                 tracing::warn!("stats lock poisoned, recovering");
@@ -762,6 +768,27 @@ impl DetectionManager {
             guard.turns_analyzed = guard.turns_analyzed.saturating_add(1);
             DetectedPattern::NoPattern
         }
+    }
+
+    /// Acknowledge a delivered loop warning so it is not rebuilt on
+    /// every subsequent poll.
+    ///
+    /// Call this once you have actually *delivered* a non-stopping
+    /// warning (logged it, surfaced it to a user, fed it to a monitor)
+    /// — the acknowledgement marks the pattern's first repeated
+    /// operation as warned, suppressing the same warning until the
+    /// pattern changes. Pure queries
+    /// ([`check_loop`](Self::check_loop),
+    /// [`check_loop_pattern`](Self::check_loop_pattern)) never
+    /// acknowledge implicitly; the stopping path marks automatically
+    /// inside [`record_operation`](Self::record_operation).
+    ///
+    /// # Arguments
+    ///
+    /// * `repeated_operations` — the slice carried on the
+    ///   [`LoopStatus`] whose warning was delivered.
+    pub fn acknowledge_loop_warning(&self, repeated_operations: &[Operation]) {
+        self.loop_detector.mark_warned(repeated_operations);
     }
 
     /// Returns the tool signature used for extracting primary parameters.
@@ -910,6 +937,82 @@ impl DetectionManager {
         self.loop_detector.check_loop()
     }
 
+    /// Build the convergence-only [`DetectedPattern`] as a pure query.
+    ///
+    /// The read side of [`record_response`](Self::record_response); used
+    /// directly when loop detection is disabled so
+    /// [`check_current_pattern`](Self::check_current_pattern) still reports
+    /// convergence.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::detection::{DetectedPattern, DetectionManager};
+    ///
+    /// let manager = DetectionManager::new().unwrap();
+    /// assert!(matches!(
+    ///     manager.check_convergence_pattern(),
+    ///     DetectedPattern::NoPattern
+    /// ));
+    /// ```
+    #[must_use]
+    pub fn check_convergence_pattern(&self) -> DetectedPattern {
+        let convergence = self.check_convergence();
+        if convergence.detected {
+            return DetectedPattern::ConvergenceDetected {
+                similarity: convergence.similarity_score,
+                consecutive_count: convergence.consecutive_count,
+            };
+        }
+        DetectedPattern::NoPattern
+    }
+
+    /// Build the loop-only [`DetectedPattern`] without recording anything.
+    ///
+    /// A pure query over the recorded window — the read side of
+    /// [`record_operation`](Self::record_operation), which owns the single
+    /// write per invocation. Callers that drive dispatch (pre-checks,
+    /// idempotent re-derivations) use this so a step examined twice is
+    /// counted once.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::detection::{DetectedPattern, DetectionManager, Operation};
+    ///
+    /// let manager = DetectionManager::new().unwrap();
+    /// assert!(matches!(
+    ///     manager.check_loop_pattern(),
+    ///     DetectedPattern::NoPattern
+    /// ));
+    ///
+    /// for _ in 0..3 {
+    ///     manager.record_operation(Operation::new("Read", "/f.txt"));
+    /// }
+    /// assert!(matches!(
+    ///     manager.check_loop_pattern(),
+    ///     DetectedPattern::LoopDetected { repetitions, .. } if repetitions >= 3
+    /// ));
+    /// ```
+    #[must_use]
+    pub fn check_loop_pattern(&self) -> DetectedPattern {
+        if !self.config.enable_loop_detection {
+            return DetectedPattern::NoPattern;
+        }
+        let status = self.loop_detector.check_loop();
+        if status.is_looping {
+            return DetectedPattern::LoopDetected {
+                repetitions: status.repetition_count,
+                pattern_description: status
+                    .repeated_operations
+                    .first()
+                    .map(|op| format!("{}({})", op.tool, op.primary_param))
+                    .unwrap_or_default(),
+            };
+        }
+        DetectedPattern::NoPattern
+    }
+
     /// Obtain a shared reference to the [`LoopDetector`].
     ///
     /// Useful for direct access to loop state, e.g. inspecting
@@ -989,8 +1092,10 @@ impl DetectionManager {
     ///
     /// # When called
     ///
-    /// After each assistant response during an agent turn — typically by
-    /// the framework's turn-processing loop.
+    /// After each *terminal* assistant response — a response with no tool
+    /// calls — typically by the framework's turn-processing loop. Acting
+    /// turns (tool calls pending) do not feed convergence: their preamble
+    /// text is by definition not a converged final answer.
     ///
     /// # Returns
     ///
@@ -1130,6 +1235,9 @@ impl DetectionManager {
     /// - [`Self::check_convergence`] — convergence-only check.
     #[must_use]
     pub fn check_current_pattern(&self) -> DetectedPattern {
+        if !self.config.enable_loop_detection {
+            return self.check_convergence_pattern();
+        }
         let loop_status = self.loop_detector.check_loop();
         if loop_status.is_looping {
             return DetectedPattern::LoopDetected {
@@ -1141,14 +1249,7 @@ impl DetectionManager {
                     .unwrap_or_default(),
             };
         }
-        let convergence = self.check_convergence();
-        if convergence.detected {
-            return DetectedPattern::ConvergenceDetected {
-                similarity: convergence.similarity_score,
-                consecutive_count: convergence.consecutive_count,
-            };
-        }
-        DetectedPattern::NoPattern
+        self.check_convergence_pattern()
     }
 
     /// Take a snapshot of the cumulative detection statistics.
@@ -1479,5 +1580,63 @@ mod tests {
         assert!((default.convergence_threshold - 0.95).abs() < f32::EPSILON);
         assert_eq!(default.convergence_count, 3);
         assert!(default.enable_convergence_detection);
+    }
+
+    #[test]
+    fn check_loop_pattern_respects_disabled_loop_detection() {
+        let config = DetectionConfig {
+            enable_loop_detection: false,
+            ..DetectionConfig::default()
+        };
+        let manager = DetectionManager::new_with_config(config).unwrap();
+        for _ in 0..12 {
+            manager.record_operation(Operation::new("Read", "/f.txt"));
+        }
+        assert!(
+            matches!(manager.check_loop_pattern(), DetectedPattern::NoPattern),
+            "with loop detection disabled the pure query must never report a loop"
+        );
+    }
+
+    #[test]
+    fn check_loop_does_not_consume_the_warning() {
+        let manager = DetectionManager::new().unwrap();
+        for _ in 0..3 {
+            manager.record_operation(Operation::new("Read", "/f.txt"));
+        }
+        let first = manager.check_loop();
+        let second = manager.check_loop();
+        assert!(first.warning.is_some(), "first poll must warn");
+        assert!(
+            second.warning.is_some(),
+            "doc: any observability layer may poll without side effects"
+        );
+    }
+
+    #[test]
+    fn acknowledge_loop_warning_suppresses_rebuilds() {
+        let manager = DetectionManager::new().unwrap();
+        for _ in 0..3 {
+            manager.record_operation(Operation::new("Read", "/f.txt"));
+        }
+
+        let delivered = manager.check_loop();
+        let repeated = delivered.repeated_operations.clone();
+        assert!(
+            delivered.warning.is_some(),
+            "precondition: a warning is pending"
+        );
+
+        manager.acknowledge_loop_warning(&repeated);
+
+        let after = manager.check_loop();
+        assert!(
+            after.warning.is_none(),
+            "an acknowledged warning must not rebuild while the pattern is unchanged"
+        );
+        assert!(
+            after.is_looping,
+            "the acknowledgement suppresses the warning only — the pattern itself is still live"
+        );
     }
 }

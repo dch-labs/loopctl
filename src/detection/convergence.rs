@@ -91,7 +91,8 @@ use serde::{Deserialize, Serialize};
 /// of these actions. The caller (typically the `DetectionManager`) interprets
 /// the action to decide how to proceed.
 ///
-/// The default is [`ConvergenceAction::Stop`], which halts the agent loop.
+/// The default is [`ConvergenceAction::Warn`], which surfaces the
+/// convergence without halting the loop.
 ///
 /// # Choosing an Action
 ///
@@ -126,21 +127,23 @@ pub enum ConvergenceAction {
     /// Stop the agent loop entirely.
     ///
     /// The agent has converged and is unlikely to make further progress.
-    /// Default action — halt the agent loop and report the situation
-    /// to the user and await new instructions.
+    /// Halt the agent loop and report the situation to the user and await
+    /// new instructions. Opt-in — text similarity is a heuristic with
+    /// irreducible false positives, so stopping must be a deliberate
+    /// choice.
     ///
     /// The `DetectionManager` will
     /// propagate this as a terminal signal, causing the outer agent loop
     /// to exit cleanly.
-    #[default]
     Stop,
 
     /// Continue execution but emit a warning log.
     ///
-    /// Useful in long-running sessions where occasional convergence is
-    /// acceptable but worth flagging for diagnostics. The agent loop
-    /// continues running; the warning is surfaced through the
+    /// Default action. Useful in long-running sessions where occasional
+    /// convergence is acceptable but worth flagging for diagnostics. The
+    /// agent loop continues running; the warning is surfaced through the
     /// logging pipeline.
+    #[default]
     Warn,
 
     /// Switch to a different agent phase or strategy.
@@ -151,6 +154,11 @@ pub enum ConvergenceAction {
     ///
     /// The specific phase transition is left to the caller's discretion;
     /// the detector signals that the current strategy has stagnated.
+    ///
+    /// Engine note: the loop itself does not switch phases on this
+    /// action — it continues the run, surfacing the action through
+    /// [`ConvergenceStatus::action`](ConvergenceStatus::action) for the
+    /// host to execute the transition.
     SwitchPhase,
 
     /// Ask the user for guidance before continuing.
@@ -175,6 +183,11 @@ pub enum ConvergenceAction {
     /// Useful when convergence is caused by the agent repeatedly
     /// revisiting earlier context — compaction removes the redundant
     /// history that may be driving the repetition.
+    ///
+    /// Engine note: the loop itself does not compact on this action —
+    /// it continues the run, surfacing the action through
+    /// [`ConvergenceStatus::action`](ConvergenceStatus::action) for the
+    /// host to invoke its compaction strategy.
     Compact,
 }
 
@@ -242,7 +255,7 @@ pub enum ConvergenceConfigError {
 /// | `enabled`             | `true`   |
 /// | `window_size`         | `3`      |
 /// | `similarity_threshold`| `0.95`   |
-/// | `on_converge`         | `Stop`   |
+/// | `on_converge`         | `Warn`   |
 ///
 /// # Tuning Guidelines
 ///
@@ -292,7 +305,7 @@ pub struct ConvergenceConfig {
     /// near-verbatim matches.
     pub similarity_threshold: f32,
 
-    /// Action on convergence. Defaults to [`ConvergenceAction::Stop`].
+    /// Action on convergence. Defaults to [`ConvergenceAction::Warn`].
     ///
     /// The [`ConvergenceAction`] returned inside [`ConvergenceStatus`] once
     /// convergence is detected, telling the caller whether to halt, warn,
@@ -311,7 +324,7 @@ impl Default for ConvergenceConfig {
     /// | [`enabled`](ConvergenceConfig::enabled)                           | `true`                      |
     /// | [`window_size`](ConvergenceConfig::window_size)                   | `3`                         |
     /// | [`similarity_threshold`](ConvergenceConfig::similarity_threshold) | `0.95`                      |
-    /// | [`on_converge`](ConvergenceConfig::on_converge)                   | [`ConvergenceAction::Stop`] |
+    /// | [`on_converge`](ConvergenceConfig::on_converge)                   | [`ConvergenceAction::Warn`] |
     ///
     /// # Example
     ///
@@ -327,7 +340,7 @@ impl Default for ConvergenceConfig {
             enabled: true,
             window_size: 3,
             similarity_threshold: 0.95,
-            on_converge: ConvergenceAction::Stop,
+            on_converge: ConvergenceAction::default(),
         }
     }
 }
@@ -410,8 +423,8 @@ impl ConvergenceStatus {
     /// Returns a [`ConvergenceStatus`] with `detected = false`,
     /// `consecutive_count = 0`, `similarity_score = 0.0`, and empty
     /// `similar_responses`. The `action` defaults to
-    /// [`ConvergenceAction::Stop`] but is irrelevant since `detected` is
-    /// `false`.
+    /// [`ConvergenceAction::Warn`] (matching the enum default) but is
+    /// irrelevant since `detected` is `false`.
     ///
     /// # Example
     ///
@@ -429,7 +442,7 @@ impl ConvergenceStatus {
             consecutive_count: 0,
             similarity_score: 0.0,
             similar_responses: Vec::new(),
-            action: ConvergenceAction::Stop,
+            action: ConvergenceAction::Warn,
         }
     }
 }
@@ -569,7 +582,7 @@ impl ConvergenceDetector {
     /// | `enabled`             | `true` |
     /// | `window_size`         | `3`    |
     /// | `similarity_threshold`| `0.95` |
-    /// | `on_converge`         | `Stop` |
+    /// | `on_converge`         | `Warn` |
     ///
     /// # Example
     ///
@@ -590,10 +603,12 @@ impl ConvergenceDetector {
 
     /// Add a response and check for convergence in one step.
     ///
-    /// Primary entry point. The response is compared against
-    /// every prior response in the window. If any comparison exceeds
-    /// [`ConvergenceConfig::similarity_threshold`], the consecutive count
-    /// is incremented; otherwise it resets to `1`.
+    /// Primary entry point. The streak is driven by similarity to the
+    /// immediately preceding response only: when that comparison exceeds
+    /// [`ConvergenceConfig::similarity_threshold`] the consecutive count
+    /// increments, otherwise it resets to `1`. Similarity to older window
+    /// members feeds the reported peak score for diagnostics but never
+    /// extends the streak, so an A/B/A/A progression does not flag.
     ///
     /// When the consecutive count reaches [`ConvergenceConfig::window_size`],
     /// `detected` is set to `true` in the returned [`ConvergenceStatus`].
@@ -606,8 +621,10 @@ impl ConvergenceDetector {
     ///
     /// # Early Returns
     ///
-    /// If [`ConvergenceConfig::enabled`] is `false` or `response` is empty,
-    /// returns [`ConvergenceStatus::no_convergence`] immediately.
+    /// If [`ConvergenceConfig::enabled`] is `false`, returns
+    /// [`ConvergenceStatus::no_convergence`] immediately. An empty response
+    /// resets the streak to zero — an acting turn's silence is a break in
+    /// the repetition, not a preservation of it.
     ///
     /// # Example
     ///
@@ -620,7 +637,12 @@ impl ConvergenceDetector {
     /// # Ok::<(), loopctl::detection::convergence::ConvergenceConfigError>(())
     /// ```
     pub fn add_response(&mut self, response: &str) -> ConvergenceStatus {
-        if !self.config.enabled || response.is_empty() {
+        if !self.config.enabled {
+            return ConvergenceStatus::no_convergence();
+        }
+        if response.is_empty() {
+            self.consecutive_count = 0;
+            self.similar_responses.clear();
             return ConvergenceStatus::no_convergence();
         }
 
@@ -849,6 +871,28 @@ impl Default for ConvergenceDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_response_resets_the_streak() {
+        let mut detector = ConvergenceDetector::new(ConvergenceConfig::default()).unwrap();
+        detector.add_response("alpha");
+        detector.add_response("alpha");
+        assert_eq!(detector.consecutive_count(), 2);
+
+        detector.add_response("");
+        assert_eq!(
+            detector.consecutive_count(),
+            0,
+            "an empty response is a break in the repetition, not a preservation of it"
+        );
+
+        detector.add_response("alpha");
+        assert_eq!(
+            detector.consecutive_count(),
+            1,
+            "the streak restarts from one"
+        );
+    }
 
     #[test]
     fn compute_similarity_result_unchanged_after_cast_fix() {

@@ -243,12 +243,15 @@ impl ToolStats {
     /// Record a failed tool execution.
     ///
     /// Increments the total and failure counters, accumulates the
-    /// duration, and pushes the EWMA toward 0.0.
+    /// duration, updates the max-duration high-water mark (a timed-out
+    /// call is a tail-latency outlier too), and pushes the EWMA toward
+    /// 0.0.
     pub fn record_failure(&self, duration: Duration) {
         self.total_calls.fetch_add(1, Ordering::Relaxed);
         self.failure_count.fetch_add(1, Ordering::Relaxed);
         let ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         self.total_duration_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_duration_ns.fetch_max(ns, Ordering::Relaxed);
         self.ewma_success
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
                 Some(update_ewma(prev, false))
@@ -1875,5 +1878,17 @@ mod tests {
                 "tool_{i}: expected ~34 failures, got {failures}"
             );
         }
+    }
+
+    #[test]
+    fn tool_stats_max_duration_counts_failed_calls() {
+        let stats = ToolStats::new();
+        stats.record_success(Duration::from_millis(100));
+        stats.record_failure(Duration::from_secs(5));
+        assert_eq!(
+            stats.max_duration(),
+            Duration::from_secs(5),
+            "doc: maximum single-call duration recorded so far"
+        );
     }
 }

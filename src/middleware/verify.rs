@@ -17,7 +17,8 @@
 //! Register `VerifyMiddleware` before `.with_core(registry)` in the pipeline
 //! so it wraps the result on the way out. To bound diagnostics size,
 //! pair it with [`OutputLimitMiddleware`](super::OutputLimitMiddleware)
-//! registered *after* `VerifyMiddleware`, so the limit wraps the
+//! registered *before* `VerifyMiddleware` (first-registered is outermost,
+//! so its post-processing runs last) — that way the limit wraps the
 //! verify-appended output too.
 
 use std::future::Future;
@@ -172,8 +173,9 @@ impl Verifier for NoopVerifier {
 /// ```
 ///
 /// To bound diagnostics size, also register
-/// [`OutputLimitMiddleware`](super::OutputLimitMiddleware) *after*
-/// `VerifyMiddleware`.
+/// [`OutputLimitMiddleware`](super::OutputLimitMiddleware) *before*
+/// `VerifyMiddleware` — first-registered is outermost, so the limit's
+/// post-processing runs after the verify block is appended.
 pub struct VerifyMiddleware {
     /// The verifier this middleware invokes after write-class tool calls.
     ///
@@ -281,7 +283,7 @@ fn append_verify_result(output: &mut ToolContent, verify: &VerifyResult) {
 mod tests {
     use super::*;
     use crate::message::ToolContent;
-    use crate::middleware::{ToolDispatchContext, ToolPipeline};
+    use crate::middleware::{OutputLimitMiddleware, ToolDispatchContext, ToolPipeline};
     use crate::tool::{PermissionCheck, ToolContext, ToolRegistry};
     use std::sync::Arc;
 
@@ -629,6 +631,33 @@ mod tests {
         assert!(
             rendered.contains("[verify] passed:"),
             "appended block reports passed status: got {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn documented_output_limit_pairing_bounds_verify_diagnostics() {
+        let (v, _called) = make_verifier(true, &"d".repeat(500));
+        let limit = 20;
+        let registry = Arc::new(ToolRegistry::new());
+        let pipeline = ToolPipeline::builder()
+            .with_middleware(OutputLimitMiddleware::new(limit))
+            .with_middleware(VerifyMiddleware::new(v, write_tools()))
+            .with_middleware(FixedOutputMiddleware {
+                output: ToolContent::from_string("0123456789"),
+                is_error: false,
+            })
+            .with_core(registry)
+            .build()
+            .expect("pipeline builds");
+
+        let mut ctx = ctx_for("Write");
+        let result = pipeline.dispatch(&mut ctx).await;
+        let len = result.output.to_string().chars().count();
+        let expected = limit;
+        assert_eq!(
+            len, expected,
+            "doc: the limit registered first (outermost) wraps the verify-appended output — \
+             exactly the cap — the marker is inside the budget"
         );
     }
 }

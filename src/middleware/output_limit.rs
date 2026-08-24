@@ -59,6 +59,15 @@ impl OutputLimitMiddleware {
     /// `max_chars` is the maximum number of characters of text output
     /// (markers included once a part is cut). Outputs at or below this
     /// limit pass through unchanged. `0` disables the middleware.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::middleware::{OutputLimitMiddleware, ToolMiddleware};
+    ///
+    /// let limiter = OutputLimitMiddleware::new(10_000);
+    /// assert_eq!(limiter.name(), "output_limit");
+    /// ```
     #[must_use]
     pub fn new(max_chars: usize) -> Self {
         Self { max_chars }

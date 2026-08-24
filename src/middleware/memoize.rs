@@ -241,8 +241,8 @@ pub struct MemoizingMiddleware {
     ///
     /// An entry expires when
     /// `current_turn.saturating_sub(turn_inserted) >= ttl_turns`. So a
-    /// `ttl_turns` of 1 means the entry is valid on the turn after
-    /// insertion but expires on the second turn after.
+    /// `ttl_turns` of 1 means the entry expires on the turn after
+    /// insertion — validity spans the insertion turn only.
     ttl_turns: u32,
 }
 
@@ -1384,6 +1384,40 @@ mod tests {
             r3.output.to_string().contains("[cached]"),
             "NoopPathExtractor disables path invalidation; read still cached: {}",
             r3.output
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_of_one_expires_on_the_next_turn() {
+        // Expiry is >=: turn 1 - turn 0 = 1 >= ttl_turns, so validity
+        // spans the insertion turn only.
+        let mw = make_middleware(Arc::new(NoPaths), 1);
+        let (pipeline, calls) = pipeline(mw, ToolContent::from_string("v"), false);
+
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "x"}), 0);
+        let _ = pipeline.dispatch(&mut ctx).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "x"}), 0);
+        let same_turn = pipeline.dispatch(&mut ctx).await;
+        assert!(
+            same_turn.output.to_string().contains("[cached]"),
+            "the insertion turn is still within the ttl: {}",
+            same_turn.output
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "x"}), 1);
+        let next_turn = pipeline.dispatch(&mut ctx).await;
+        assert!(
+            !next_turn.output.to_string().contains("[cached]"),
+            "a ttl_turns of 1 expires on the turn after insertion: {}",
+            next_turn.output
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the expired entry re-runs the inner dispatch"
         );
     }
 }

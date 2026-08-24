@@ -12,8 +12,10 @@ use std::pin::Pin;
 /// `[truncated]` marker stays within the remaining budget, and once the
 /// budget is exhausted every later text part is emptied (a marker per
 /// part would overflow the cap it enforces; when an earlier part was
-/// cut, its marker already signals the truncation). Image parts are
-/// left unchanged.
+/// cut, its marker already signals the truncation). A remaining budget
+/// smaller than the marker itself still yields the bare marker on a
+/// cut part — truncation must stay visible, so the cap floors at one
+/// marker. Image parts are left unchanged.
 ///
 /// A `max_chars` of `0` disables the middleware entirely (the crate-wide
 /// zero-disables sentinel) — output passes through untouched.
@@ -59,7 +61,10 @@ impl OutputLimitMiddleware {
     ///
     /// `max_chars` is the maximum number of characters of text output
     /// (markers included once a part is cut). Outputs at or below this
-    /// limit pass through unchanged. `0` disables the middleware.
+    /// limit pass through unchanged. A cap smaller than the
+    /// `[truncated]` marker still leaves the bare marker on a cut
+    /// part, so the effective floor is one marker. `0` disables the
+    /// middleware.
     ///
     /// # Example
     ///

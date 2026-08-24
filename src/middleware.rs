@@ -25,7 +25,7 @@
 //! | [`PermissionMiddleware`]  | Checks [`PermissionCheck`] before execution                       |
 //! | [`TimeoutMiddleware`]     | Wraps execution in a deadline with retry                          |
 //! | [`UnknownToolMiddleware`] | Suggests closest matching tool on "not found"                     |
-//! | [`OutputLimitMiddleware`] | Truncates output to a whole-output character cap                  |
+//! | [`OutputLimitMiddleware`] | Truncates output to a whole-output cap (floored at one marker)    |
 //! | [`VerifyMiddleware`]      | Runs a verifier after write-class tools, appends the result       |
 //! | [`MemoizingMiddleware`]   | Caches repeat calls keyed on `(tool_name, canonical input)`       |
 //!

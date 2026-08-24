@@ -109,16 +109,20 @@ impl ConstrainedProfile {
 
     /// A [`ToolPipeline`] builder pre-loaded with the small-model middleware stack.
     ///
-    /// Middleware order (execution order, outermost last): verify → memoize
-    /// → output-limit. Verify's appended diagnostics flow through memoize
-    /// (cached alongside the result) and then through the output cap
-    /// (truncated if the combined output exceeds the cap).
+    /// Middleware registration order (first-registered outermost):
+    /// output-limit → verify → memoize. Memoize (innermost) caches the
+    /// raw tool result before verify appends its diagnostics — the cache
+    /// never holds a verify block, and every successful write-class
+    /// call is verified anew — while the output cap (outermost,
+    /// post-processing last) truncates the combined output, so
+    /// verify-appended diagnostics cannot escape the cap.
     ///
     /// No `.with_core()` is set — pass the result to
     /// [`BareLoop::set_pipeline`], which attaches the tool registry.
     #[must_use]
     pub fn pipeline_builder() -> crate::middleware::ToolPipelineBuilder {
         ToolPipeline::builder()
+            .with_middleware(OutputLimitMiddleware::new(OUTPUT_CAP_CHARS))
             .with_middleware(VerifyMiddleware::new(
                 Arc::new(NoopVerifier),
                 WRITE_TOOLS.iter().map(|s| (*s).to_string()).collect(),
@@ -129,7 +133,6 @@ impl ConstrainedProfile {
                 Arc::new(NoopPathExtractor),
                 MEMOIZE_TTL_TURNS,
             ))
-            .with_middleware(OutputLimitMiddleware::new(OUTPUT_CAP_CHARS))
     }
 
     /// [`RequestOptions`] requesting strict tool-call decoding.
@@ -437,5 +440,83 @@ mod tests {
             }
             other => panic!("expected Text part, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn constrained_profile_output_cap_bounds_final_tool_output() {
+        use crate::message::{ToolContent, ToolContentPart};
+        use crate::middleware::ToolDispatchContext;
+        use crate::tool::{
+            PermissionCheck, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSchema,
+        };
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Arc;
+
+        struct CapSizedWriteTool;
+
+        impl Tool for CapSizedWriteTool {
+            fn name(&self) -> &'static str {
+                "Write"
+            }
+            fn description(&self) -> &'static str {
+                "Returns exactly the profile cap in characters"
+            }
+            fn schema(&self) -> ToolSchema {
+                ToolSchema {
+                    tool: self.name().to_string(),
+                    description: self.description().to_string(),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+            fn call(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &ToolContext,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, crate::tool::ToolError>> + Send + '_>>
+            {
+                Box::pin(async move {
+                    Ok(ToolOutput {
+                        payload: ToolContent::Text("w".repeat(OUTPUT_CAP_CHARS)),
+                        is_error: false,
+                        display_hint: None,
+                    })
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::new();
+        registry.register(CapSizedWriteTool);
+        let pipeline = ConstrainedProfile::pipeline_builder()
+            .with_core(Arc::new(registry))
+            .build()
+            .expect("pipeline builds");
+
+        let ctx = ToolDispatchContext {
+            tool_name: "Write".to_string(),
+            input: serde_json::json!({}),
+            call_id: "c1".to_string(),
+            turn_number: 0,
+            cancel: Arc::new(crate::cancel::CancelSignal::new()),
+            permission: PermissionCheck::Allow,
+            tool_context: ToolContext::default(),
+        };
+        let result = pipeline.invoke(ctx).await;
+        let len = match &result.output {
+            ToolContent::Text(text) => text.chars().count(),
+            ToolContent::Multipart(parts) => parts
+                .iter()
+                .map(|p| match p {
+                    ToolContentPart::Text { text } => text.chars().count(),
+                    ToolContentPart::Image { .. } => 0,
+                })
+                .sum(),
+        };
+        let expected = OUTPUT_CAP_CHARS;
+        assert_eq!(
+            len, expected,
+            "doc: verify's appended diagnostics flow through the output cap — the combined \
+             output must truncate to exactly the cap — the marker is inside the budget"
+        );
     }
 }

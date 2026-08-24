@@ -25,6 +25,9 @@
 //! | [`PermissionMiddleware`]  | Checks [`PermissionCheck`] before execution                       |
 //! | [`TimeoutMiddleware`]     | Wraps execution in a deadline with retry                          |
 //! | [`UnknownToolMiddleware`] | Suggests closest matching tool on "not found"                     |
+//! | [`OutputLimitMiddleware`] | Truncates output to a whole-output cap (floored at one marker)    |
+//! | [`VerifyMiddleware`]      | Runs a verifier after write-class tools, appends the result       |
+//! | [`MemoizingMiddleware`]   | Caches repeat calls keyed on `(tool_name, canonical input)`       |
 //!
 //! # Example
 //!
@@ -139,8 +142,10 @@ pub struct ToolDispatchContext {
 /// 3. [`UnknownToolMiddleware`] — intercept "not found" errors
 /// 4. (innermost) [`ToolCallMiddleware`] — the actual `Tool::call()`
 ///
-/// Post-processing middlewares (e.g. output limiting) are registered
-/// *after* the core so they wrap the result on the way out.
+/// Post-processing middlewares (e.g. output limiting) follow the same
+/// rule: the first-registered middleware post-processes last, so an
+/// output cap registered before everything else bounds whatever the
+/// layers below it append to the result.
 ///
 /// # Example
 ///
@@ -1639,6 +1644,92 @@ mod tests {
                 }
             }
             ToolContent::Text(t) => panic!("expected Multipart, got Text({t})"),
+        }
+    }
+
+    /// A tool that returns two text parts, the second larger than the
+    /// budget the first leaves.
+    struct SizedPartsTool;
+
+    impl Tool for SizedPartsTool {
+        fn name(&self) -> &'static str {
+            "sized_parts"
+        }
+        fn description(&self) -> &'static str {
+            "Returns two text parts of 80 and 40 chars"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: self.name().to_string(),
+                description: self.description().to_string(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(ToolOutput {
+                    payload: ToolContent::Multipart(vec![
+                        ToolContentPart::Text {
+                            text: "a".repeat(80),
+                        },
+                        ToolContentPart::Text {
+                            text: "b".repeat(40),
+                        },
+                    ]),
+                    is_error: false,
+                    display_hint: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn output_limit_multipart_shares_one_budget() {
+        // The cap is one whole-output budget, not a per-part allowance:
+        // the 80-char first part consumes 80 of the 100 chars, so the
+        // 40-char second part is cut to the 20 that remain.
+        let mut registry = ToolRegistry::new();
+        registry.register(SizedPartsTool);
+        let pipeline = ToolPipeline::builder()
+            .with_middleware(OutputLimitMiddleware::new(100))
+            .with_core(Arc::new(registry))
+            .build()
+            .expect("pipeline builds");
+
+        let result = pipeline.invoke(test_ctx("sized_parts")).await;
+        match result.output {
+            ToolContent::Multipart(parts) => {
+                assert_eq!(
+                    parts.len(),
+                    2,
+                    "the cap truncates in place, it never resizes"
+                );
+                match &parts[0] {
+                    ToolContentPart::Text { text } => {
+                        assert_eq!(
+                            text,
+                            &"a".repeat(80),
+                            "part 0 fits the shared budget and passes unchanged: got {text:?}"
+                        );
+                    }
+                    ToolContentPart::Image { .. } => panic!("expected Text part 0"),
+                }
+                match &parts[1] {
+                    ToolContentPart::Text { text } => {
+                        assert_eq!(
+                            text,
+                            &format!("{}\n[truncated]", "b".repeat(8)),
+                            "part 1 gets the 20 remaining chars minus the marker (12): got {text:?}"
+                        );
+                    }
+                    ToolContentPart::Image { .. } => panic!("expected Text part 1"),
+                }
+            }
+            other @ ToolContent::Text(_) => panic!("expected Multipart, got {other:?}"),
         }
     }
 }

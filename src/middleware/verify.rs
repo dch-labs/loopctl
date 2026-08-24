@@ -17,7 +17,8 @@
 //! Register `VerifyMiddleware` before `.with_core(registry)` in the pipeline
 //! so it wraps the result on the way out. To bound diagnostics size,
 //! pair it with [`OutputLimitMiddleware`](super::OutputLimitMiddleware)
-//! registered *after* `VerifyMiddleware`, so the limit wraps the
+//! registered *before* `VerifyMiddleware` (first-registered is outermost,
+//! so its post-processing runs last) — that way the limit wraps the
 //! verify-appended output too.
 
 use std::future::Future;
@@ -172,8 +173,24 @@ impl Verifier for NoopVerifier {
 /// ```
 ///
 /// To bound diagnostics size, also register
-/// [`OutputLimitMiddleware`](super::OutputLimitMiddleware) *after*
-/// `VerifyMiddleware`.
+/// [`OutputLimitMiddleware`](super::OutputLimitMiddleware) *before*
+/// `VerifyMiddleware` — first-registered is outermost, so the limit's
+/// post-processing runs after the verify block is appended.
+///
+/// # Cap interaction
+///
+/// When the cap is registered outermost (the
+/// [`ConstrainedProfile`](crate::presets::ConstrainedProfile)
+/// ordering), a verify block appended to output that already fills the
+/// cap is truncated away — cut to the marker, or emptied outright when
+/// the budget is exactly consumed — so the model never sees the
+/// verifier's verdict. This is the inherent tradeoff of a bounded
+/// output: when the raw output alone consumes the budget, there is no
+/// room for diagnostics. Hosts that need guaranteed diagnostic
+/// delivery should size the cap to leave headroom for the verifier's
+/// typical output, or observe the untruncated block from a middleware
+/// registered between the cap and this one — it post-processes after
+/// the block is appended but before the cap truncates it.
 pub struct VerifyMiddleware {
     /// The verifier this middleware invokes after write-class tool calls.
     ///
@@ -281,7 +298,10 @@ fn append_verify_result(output: &mut ToolContent, verify: &VerifyResult) {
 mod tests {
     use super::*;
     use crate::message::ToolContent;
-    use crate::middleware::{ToolDispatchContext, ToolPipeline};
+    use crate::middleware::{
+        MemoizingMiddleware, NoopPathExtractor, OutputLimitMiddleware, ToolDispatchContext,
+        ToolPipeline,
+    };
     use crate::tool::{PermissionCheck, ToolContext, ToolRegistry};
     use std::sync::Arc;
 
@@ -629,6 +649,121 @@ mod tests {
         assert!(
             rendered.contains("[verify] passed:"),
             "appended block reports passed status: got {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn documented_output_limit_pairing_bounds_verify_diagnostics() {
+        let (v, _called) = make_verifier(true, &"d".repeat(500));
+        let limit = 20;
+        let registry = Arc::new(ToolRegistry::new());
+        let pipeline = ToolPipeline::builder()
+            .with_middleware(OutputLimitMiddleware::new(limit))
+            .with_middleware(VerifyMiddleware::new(v, write_tools()))
+            .with_middleware(FixedOutputMiddleware {
+                output: ToolContent::from_string("0123456789"),
+                is_error: false,
+            })
+            .with_core(registry)
+            .build()
+            .expect("pipeline builds");
+
+        let mut ctx = ctx_for("Write");
+        let result = pipeline.dispatch(&mut ctx).await;
+        let rendered = result.output.to_string();
+        let len = rendered.chars().count();
+        let expected = limit;
+        assert_eq!(
+            len, expected,
+            "doc: the limit registered first (outermost) wraps the verify-appended output — \
+             exactly the cap — the marker is inside the budget"
+        );
+        assert!(
+            rendered.contains("[truncated]"),
+            "the cut stays visible at the cap: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("[verify]"),
+            "an output that already fills the cap leaves no room for diagnostics — the \
+             verdict is truncated away: {rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_re_runs_on_a_memoize_cache_hit_and_the_cache_holds_no_verify_block() {
+        struct CountingVerifier {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Verifier for CountingVerifier {
+            fn verify<'a>(
+                &'a self,
+                _ctx: &'a ToolContext,
+                _tool_name: &'a str,
+            ) -> Pin<Box<dyn Future<Output = VerifyResult> + Send + 'a>> {
+                let calls = self.calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    VerifyResult {
+                        passed: true,
+                        diagnostics: "ok".to_string(),
+                    }
+                })
+            }
+        }
+
+        let verifier_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Arc::new(ToolRegistry::new());
+        let pipeline = ToolPipeline::builder()
+            .with_middleware(VerifyMiddleware::new(
+                Arc::new(CountingVerifier {
+                    calls: Arc::clone(&verifier_calls),
+                }),
+                write_tools(),
+            ))
+            .with_middleware(MemoizingMiddleware::new(
+                write_tools(),
+                Vec::new(),
+                Arc::new(NoopPathExtractor),
+                10,
+            ))
+            .with_middleware(FixedOutputMiddleware {
+                output: ToolContent::from_string("wrote"),
+                is_error: false,
+            })
+            .with_core(registry)
+            .build()
+            .expect("pipeline builds");
+
+        let mut ctx = ctx_for("Write");
+        let miss = pipeline.dispatch(&mut ctx).await;
+        let miss_rendered = miss.output.to_string();
+        assert!(
+            miss_rendered.contains("[verify]"),
+            "the cache miss is verified: {miss_rendered}"
+        );
+        assert!(
+            !miss_rendered.contains("[cached]"),
+            "the miss executes the tool: {miss_rendered}"
+        );
+
+        let mut ctx = ctx_for("Write");
+        let hit = pipeline.dispatch(&mut ctx).await;
+        let hit_rendered = hit.output.to_string();
+        assert!(
+            hit_rendered.contains("[cached]"),
+            "the repeat call is served from the cache: {hit_rendered}"
+        );
+        assert_eq!(
+            verifier_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a successful write-class call is verified anew even on a cache hit"
+        );
+        assert_eq!(
+            hit_rendered.matches("[verify]").count(),
+            1,
+            "the cached value carries no verify block — only the freshly appended one: \
+             {hit_rendered}"
         );
     }
 }

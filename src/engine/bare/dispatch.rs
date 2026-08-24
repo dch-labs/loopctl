@@ -519,7 +519,7 @@ impl<C: ApiClient> BareLoop<C> {
                 return Ok(blocked);
             }
 
-            if let Some(blocked) = self.pre_detection(&tc, turn_idx)? {
+            if let Some(blocked) = self.pre_detection(turn_idx)? {
                 self.notify_tool_post(turn_idx, &tc, &blocked);
                 return Ok(blocked);
             }
@@ -613,26 +613,20 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Record the tool call's input signature and check for loop patterns.
+    /// Query the loop detector before dispatch, without recording.
     ///
-    /// Returns `Some(blocked_result)` if loop detection blocks the call,
+    /// A pure read of the sliding window: the single record point per
+    /// invocation is [`post_detection`](Self::post_detection), so a
+    /// re-derived or re-driven step cannot double-count. Returns
+    /// `Some(blocked_result)` if loop detection blocks the call,
     /// or `None` if dispatch should proceed.
     ///
     /// # Errors
     ///
     /// Returns [`LoopError::LoopDetected`] if the detection manager signals
     /// a hard stop.
-    fn pre_detection(
-        &self,
-        tc: &ToolCall,
-        turn_idx: usize,
-    ) -> Result<Option<ToolDispatchResult>, LoopError> {
-        let operation = Operation::from_input_with_signature(
-            &tc.tool,
-            &tc.input,
-            self.managers.detection().signature(),
-        );
-        let pattern = self.managers.detection().record_operation(operation);
+    fn pre_detection(&self, turn_idx: usize) -> Result<Option<ToolDispatchResult>, LoopError> {
+        let pattern = self.managers.detection().check_loop_pattern();
 
         self.managers.notify_detected_pattern(&pattern, turn_idx);
         match self.decide_detected_pattern(&pattern) {
@@ -641,14 +635,17 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Record the tool result's output hash for loop detection.
+    /// Record the completed invocation for loop detection.
     ///
-    /// Lets the detector distinguish "same input, same output" (stuck) from
-    /// "same input, different output" (progress).
+    /// The single write point per invocation: hashes the result — multipart
+    /// by its rendered text — so the detector distinguishes "same input,
+    /// same output" (stuck) from "same input, different output" (progress).
     fn post_detection(&self, tc: &ToolCall, tool_result: &ToolDispatchResult) {
         let result_hash = match &tool_result.output {
             ToolContent::Text(t) => loop_detector::hash_result(t),
-            ToolContent::Multipart(_) => None,
+            ToolContent::Multipart(_) => {
+                loop_detector::hash_result(&tool_result.output.to_string())
+            }
         };
         let operation = Operation::from_input_with_result_and_signature(
             &tc.tool,

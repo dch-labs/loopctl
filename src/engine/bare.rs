@@ -63,6 +63,7 @@ use std::time::{Duration, Instant};
 use crate::cancel::CancelSignal;
 use crate::compact::{ContextManager, TruncatingCompactor};
 use crate::config::SessionConfig;
+use crate::detection::DetectedPattern;
 use crate::engine::core::{
     LoopMachine, MachineOutcome, MachinePolicy, MachineState, MachineStep, ModelResponse,
     PendingToolCall, Run, RunConfig, RunResult, Session, StopReason, ToolCall, TurnMode,
@@ -946,7 +947,24 @@ impl<C: ApiClient> BareLoop<C> {
 
         let text = msg.text_content();
         let (turn_in, turn_out) = Self::usage_tokens(usage.as_ref());
-        let pattern = self.managers.detection().record_response(&text);
+
+        let tool_calls: Vec<ToolCall> = msg
+            .tool_call_parts()
+            .into_iter()
+            .map(|(id, tool, input)| ToolCall {
+                id: id.to_string(),
+                tool: tool.to_string(),
+                input: input.clone(),
+            })
+            .collect();
+
+        // Only terminal responses feed convergence: an acting turn's
+        // preamble is by definition not a converged final answer.
+        let pattern = if tool_calls.is_empty() {
+            self.managers.detection().record_response(&text)
+        } else {
+            DetectedPattern::NoPattern
+        };
         self.notify_response(turn, &text, usage);
 
         if let Some(e) = self.apply_loop_detection(turn, &pattern) {
@@ -962,15 +980,6 @@ impl<C: ApiClient> BareLoop<C> {
             return Err(e);
         }
 
-        let tool_calls: Vec<ToolCall> = msg
-            .tool_call_parts()
-            .into_iter()
-            .map(|(id, tool, input)| ToolCall {
-                id: id.to_string(),
-                tool: tool.to_string(),
-                input: input.clone(),
-            })
-            .collect();
         let stop_reason = match stream_stop {
             StreamStopReason::ToolCall => StopReason::ToolCall,
             StreamStopReason::MaxTokens => StopReason::MaxTokens,

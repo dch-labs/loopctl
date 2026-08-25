@@ -1131,9 +1131,30 @@ pub struct ToolContext {
 
     /// Path to the session's temporary directory.
     ///
-    /// Each session gets its own temp directory so tools can write
-    /// intermediate files without colliding with other sessions. Defaults
-    /// to [`std::env::temp_dir`].
+    /// **Per-session when the context is built by
+    /// [`BareLoop`](crate::engine::BareLoop):** each session gets a
+    /// fresh `loopctl-{session_id}/` subdir, isolated from other
+    /// sessions and removed when the `BareLoop` that owns it is
+    /// dropped. By default the subdir lives under the OS temp
+    /// (`{std::env::temp_dir()}/loopctl-{session_id}/`);
+    /// [`with_temp_dir`](crate::engine::BareLoop::with_temp_dir) moves
+    /// it under a caller-supplied base, and
+    /// [`with_managed_temp_disabled`](crate::engine::BareLoop::with_managed_temp_disabled)
+    /// disables managed temp entirely — contexts get the process-wide
+    /// temp path and dropping the loop removes nothing. A tool can
+    /// write intermediate files here without colliding with other
+    /// sessions and without leaking across runs.
+    ///
+    /// **Distinct from a host-owned session directory.** A host that
+    /// needs a durable, host-managed session path (e.g.
+    /// `~/.myapp/conversations/<uuid>/`) stores it in
+    /// [`extensions`](Self::extensions), *not* here: `temp_dir` is
+    /// loopctl-owned and cleaned on loop drop. Mixing the two would
+    /// make the host's durable path vanish when the loop drops.
+    ///
+    /// When a `ToolContext` is constructed directly (not via
+    /// `BareLoop`), `temp_dir` defaults to [`std::env::temp_dir`] and is
+    /// **not** cleaned up — the caller owns cleanup in that case.
     pub temp_dir: String,
 
     /// Whether the agent is running in non-interactive (headless) mode.
@@ -1227,7 +1248,7 @@ impl fmt::Debug for ToolContext {
 /// |---------------------|--------------------------------------|
 /// | `cwd`               | `"."` (process current directory)    |
 /// | `session_id`        | new UUID v4                          |
-/// | `temp_dir`          | [`std::env::temp_dir`]               |
+/// | `temp_dir`          | [`std::env::temp_dir`] (per-session via `BareLoop`, cleaned on drop) |
 /// | `is_non_interactive`| `false`                              |
 /// | `user_context`      | empty [`HashMap`]                    |
 /// | `extensions`        | empty [`HashMap`]                    |

@@ -16,6 +16,7 @@ use super::{
     ApiClient, Arc, BareLoop, ContextContributor, ContextManager, LoopError, RecoveryStrategy,
     Reflector, RequestOptions, TurnMode,
 };
+use std::path::PathBuf;
 
 /// Shared callback invoked once per text delta during streaming.
 ///
@@ -148,6 +149,54 @@ impl<C: ApiClient> BareLoop<C> {
     #[must_use]
     pub fn with_token_counter(mut self, counter: Arc<dyn crate::compact::TokenCounter>) -> Self {
         self.set_token_counter(counter);
+        self
+    }
+
+    /// Override the base directory under which the per-session temp
+    /// subdir is created.
+    ///
+    /// By default the subdir lives under [`std::env::temp_dir()`]. Pass
+    /// a custom `base` (e.g. `/var/cache/myapp/sessions`) and the subdir
+    /// becomes `{base}/loopctl-{session_id}/`. Pass the empty path to
+    /// opt out of managed temp entirely — the same effect as
+    /// [`with_managed_temp_disabled`](Self::with_managed_temp_disabled).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut agent = BareLoop::new(client, registry, config)
+    ///     .with_temp_dir("/var/cache/myapp/sessions");
+    /// ```
+    #[must_use]
+    pub fn with_temp_dir(mut self, base: impl Into<PathBuf>) -> Self {
+        self.debug_assert_idle();
+        let base = base.into();
+        self.session_temp_dir = if base.as_os_str().is_empty() {
+            None
+        } else {
+            Some(Self::session_temp_subdir(&base, self.session.id))
+        };
+        self
+    }
+
+    /// Opt out of loopctl-managed temp entirely.
+    ///
+    /// Tool contexts then set `temp_dir` to [`std::env::temp_dir()`]
+    /// (the process-wide temp) and dropping the loop removes nothing.
+    /// Use this only when the host manages its own temp lifecycle and
+    /// wants the old behaviour.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
+    #[must_use]
+    pub fn with_managed_temp_disabled(mut self) -> Self {
+        self.debug_assert_idle();
+        self.session_temp_dir = None;
         self
     }
 

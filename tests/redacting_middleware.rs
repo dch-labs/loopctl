@@ -2,9 +2,12 @@
 //!
 //! Pins the curated pattern set (bearer, key-value tokens, AWS keys,
 //! PEM blocks, GitHub/GitLab PATs), the high-entropy heuristic's
-//! on/off behaviour and false-positive discipline, host extension, the
-//! text/multipart walk, and the advisory-only contract (loop semantics
-//! untouched).
+//! on/off behaviour, exact boundaries, and false-positive discipline,
+//! host extension, the text/multipart walk, the advisory-only contract
+//! (loop semantics untouched), honest redaction counts (an echoed
+//! placeholder is not a new redaction), and a randomized property
+//! holding completeness, survivor preservation, and idempotence over
+//! mixed token soup.
 //!
 //! Requires the `redaction` feature.
 
@@ -328,4 +331,206 @@ async fn redacted_result_keeps_error_state_and_display_hint() {
         matches!(result.display_hint, Some(loopctl::tool::DisplayHint::Diff)),
         "the original display hint is preserved"
     );
+}
+
+#[test]
+fn entropy_boundary_is_thirty_two_characters_and_four_point_five_bits() {
+    let alphabet = "q7Xk2Lm9Pz4Rt6Vb8Nc1Sd3Gf5HjKWyU6MxE0gT8vC5nB1sA4dF2hJ";
+    let tok31: String = alphabet.chars().take(31).collect();
+    let mut text = format!("id {tok31} end");
+    SecretPatternSet::default_common().scrub(&mut text);
+    assert!(
+        text.contains(&tok31),
+        "a 31-char token stays visible even at high entropy: {text}"
+    );
+
+    let tok32: String = alphabet.chars().take(32).collect();
+    let mut text = format!("id {tok32} end");
+    SecretPatternSet::default_common().scrub(&mut text);
+    assert!(
+        !text.contains(&tok32),
+        "a 32-char high-entropy token is redacted: {text}"
+    );
+
+    let sha256_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let mut text = format!("commit {sha256_hex}");
+    SecretPatternSet::default_common().scrub(&mut text);
+    assert!(
+        text.contains(sha256_hex),
+        "hex tops out at 4.0 bits per byte and stays visible: {text}"
+    );
+
+    let b64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = format!("payload {b64_alphabet}");
+    SecretPatternSet::default_common().scrub(&mut text);
+    assert!(
+        !text.contains(b64_alphabet),
+        "a full-diversity base64 token is redacted: {text}"
+    );
+}
+
+#[test]
+fn case_and_separator_variants_and_repeated_secrets_all_redacted() {
+    let mut text = String::from(
+        "AUTHORIZATION:  BEARER abcdefghijklmnopqrstuvwxyz012345 then \
+         token: abcdefghijklmnop0123 and SECRET=\"ABCDEFGHIJKLMNOPQRSTUVWXYZ01\"",
+    );
+    let count = SecretPatternSet::default_common().scrub(&mut text);
+    assert_eq!(count, 3, "case and separator variants all fire: {text}");
+
+    let mut both = String::from(
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345 and \
+         Authorization: Bearer zyxwvutsrqponmlkjihgfedcba543210",
+    );
+    let count = SecretPatternSet::default_common().scrub(&mut both);
+    assert_eq!(count, 2, "two secrets on one line each count: {both}");
+    assert!(
+        !both.contains("abcdefghijkl"),
+        "no residue survives: {both}"
+    );
+}
+
+#[test]
+fn echoed_placeholder_is_not_counted_again() {
+    let clean = "prior result: [REDACTED:high_entropy] and nothing else";
+    let mut text = clean.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut text);
+    assert_eq!(
+        count, 0,
+        "a pre-existing placeholder is not a new redaction"
+    );
+    assert_eq!(text, clean, "byte-identical pass-through");
+}
+
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 16
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// A 62-character mixed alphabet for high-entropy secret bodies.
+const TOKEN_ALPHABET: &str = "q7Xk2Lm9Pz4Rt6Vb8Nc1Sd3Gf5HjKWyU6MxE0gT8vC5nB1sA4dF2hJ3gZ5lQ";
+
+/// The 16 hex digits, for low-entropy survivors (4.0 bits per byte).
+const HEX_ALPHABET: &str = "0123456789abcdef";
+
+/// Uppercase alphanumerics, the AWS access-key-id character class.
+const UPPER_ALNUM: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/// A distinct-chars body of exactly `len` characters — guaranteed
+/// high-entropy when `len` is large (all characters distinct).
+fn distinct_body(rng: &mut Lcg, len: usize) -> String {
+    let mut chars: Vec<char> = TOKEN_ALPHABET.chars().collect();
+    let n = chars.len();
+    for i in 0..len.min(n) {
+        let j = i + (rng.below((n - i) as u64) as usize);
+        chars.swap(i, j);
+    }
+    chars.into_iter().take(len).collect()
+}
+
+/// A hex string of exactly `len` digits — always at hex's 4.0-bit
+/// ceiling, so it must survive scrubbing.
+fn hex_body(rng: &mut Lcg, len: usize) -> String {
+    (0..len)
+        .map(|_| {
+            HEX_ALPHABET
+                .chars()
+                .nth(rng.below(16) as usize)
+                .unwrap_or('0')
+        })
+        .collect()
+}
+
+/// Generate one output: `(text, planted secret bodies, benign survivors)`.
+fn gen_output(rng: &mut Lcg) -> (String, Vec<String>, Vec<String>) {
+    let mut text = String::from("log line\n");
+    let mut secrets = Vec::new();
+    let mut survivors = Vec::new();
+    let pieces = 3 + rng.below(8);
+    for i in 0..pieces {
+        let extra = rng.below(10) as usize;
+        let body = distinct_body(rng, 32 + extra);
+        match rng.below(4) {
+            0 => {
+                let secret = match i % 6 {
+                    0 => format!("Authorization: Bearer {body}"),
+                    1 => format!("api_key={body}"),
+                    2 => {
+                        let tail: String = UPPER_ALNUM
+                            .chars()
+                            .cycle()
+                            .skip(rng.below(36) as usize)
+                            .take(16)
+                            .collect();
+                        format!("AKIA{tail}")
+                    }
+                    3 => format!("-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----"),
+                    4 => format!("ghp_{body}"),
+                    _ => format!("glpat-{body}"),
+                };
+                secrets.push(body);
+                text.push_str(&secret);
+            }
+            1 => {
+                let sha = hex_body(rng, 40);
+                survivors.push(format!("sha1:{sha}"));
+                text.push_str(&format!("sha1:{sha}"));
+            }
+            _ => {
+                let word = match rng.below(3) {
+                    0 => "build ok".to_string(),
+                    1 => format!("file{}.rs", hex_body(rng, 4)),
+                    _ => "warnings: none".to_string(),
+                };
+                survivors.push(word.clone());
+                text.push_str(&word);
+            }
+        }
+        text.push(' ');
+    }
+    (text, secrets, survivors)
+}
+
+#[test]
+fn scrub_is_complete_survivor_preserving_and_idempotent() {
+    let mut rng = Lcg(0x5EED_C0DE);
+    for iter in 0..500 {
+        let (text, secrets, survivors) = gen_output(&mut rng);
+        let set = SecretPatternSet::default_common();
+
+        let mut once = text.clone();
+        let count = set.scrub(&mut once);
+
+        for body in &secrets {
+            assert!(
+                !once.contains(body.as_str()),
+                "iter {iter}: secret body {body} survived: {once}"
+            );
+        }
+        for s in &survivors {
+            assert!(
+                once.contains(s.as_str()),
+                "iter {iter}: benign survivor {s} was eaten: {once}"
+            );
+        }
+        assert!(
+            count >= secrets.len(),
+            "iter {iter}: {count} redactions for {} planted secrets",
+            secrets.len()
+        );
+
+        let mut twice = once.clone();
+        let second = set.scrub(&mut twice);
+        assert_eq!(twice, once, "iter {iter}: scrub is not idempotent: {twice}");
+        assert_eq!(second, 0, "iter {iter}: second pass found work");
+    }
 }

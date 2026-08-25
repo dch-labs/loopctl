@@ -237,25 +237,31 @@ fn curated(kind: &'static str, literal: &'static str) -> Option<SecretPattern> {
 /// Shannon entropy reaches [`ENTROPY_THRESHOLD`]. Returns the number of
 /// tokens redacted.
 fn scrub_high_entropy(text: &mut String) -> usize {
-    let pieces: Vec<String> = std::mem::take(text)
+    let pieces: Vec<(String, bool)> = std::mem::take(text)
         .split(' ')
         .map(redact_piece_if_high_entropy)
         .collect();
-    let count = pieces
-        .iter()
-        .filter(|p| p.contains("[REDACTED:high_entropy]"))
-        .count();
-    *text = pieces.join(" ");
+    let count = pieces.iter().filter(|(_, changed)| *changed).count();
+    *text = pieces
+        .into_iter()
+        .map(|(piece, _)| piece)
+        .collect::<Vec<_>>()
+        .join(" ");
     count
 }
 
 /// Redact the token core of one space-delimited piece, if it qualifies.
-fn redact_piece_if_high_entropy(piece: &str) -> String {
+///
+/// Returns the (possibly rewritten) piece and whether a substitution
+/// happened — the flag, not marker sniffing, is what counts, so a
+/// piece already carrying a placeholder (an echoed earlier redaction)
+/// is passed through without being counted again.
+fn redact_piece_if_high_entropy(piece: &str) -> (String, bool) {
     let core = piece.trim_matches(|c: char| !is_token_char(c));
     if core.len() < MIN_ENTROPY_TOKEN_LEN || shannon_entropy(core) < ENTROPY_THRESHOLD {
-        return piece.to_string();
+        return (piece.to_string(), false);
     }
-    piece.replace(core, "[REDACTED:high_entropy]")
+    (piece.replace(core, "[REDACTED:high_entropy]"), true)
 }
 
 /// Whether `c` appears in the token alphabet the heuristic scans.

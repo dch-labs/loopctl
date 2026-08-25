@@ -151,6 +151,12 @@ pub struct ToolDispatchContext {
 /// rule: the first-registered middleware post-processes last, so an
 /// output cap registered before everything else bounds whatever the
 /// layers below it append to the result.
+/// [`RedactingMiddleware`] prefers the
+/// early slot for a related reason: registered outside the verifier, it
+/// also scrubs what the layers below append — a verifier's diagnostics
+/// can echo the secret the tool emitted — while a content-comparing
+/// verifier registered outside it sees already-scrubbed text and may
+/// misjudge it.
 ///
 /// # Example
 ///

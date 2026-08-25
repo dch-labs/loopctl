@@ -322,7 +322,7 @@ impl ContextCompactor for TruncatingCompactor {
         Box::pin(async move {
             let total = messages.len();
             if total <= self.min_messages {
-                return Self::unchanged(messages);
+                return Self::unchanged(messages, &context);
             }
 
             // Determine split point: keep `preserve_recent` from the end.
@@ -350,7 +350,7 @@ impl ContextCompactor for TruncatingCompactor {
             // report no change instead of a compaction that reduced
             // nothing.
             if split == 0 {
-                return Self::unchanged(messages);
+                return Self::unchanged(messages, &context);
             }
 
             let recent: Vec<Message> = messages.get(split..).unwrap_or_default().to_vec();
@@ -370,7 +370,7 @@ impl ContextCompactor for TruncatingCompactor {
             // an empty history must never replace a non-empty one, so
             // decline to reduce instead.
             if preserved.is_empty() {
-                return Self::unchanged(messages);
+                return Self::unchanged(messages, &context);
             }
 
             let tokens_after = context.counter.count(&preserved);
@@ -466,18 +466,41 @@ impl TruncatingCompactor {
     /// the input verbatim, carrying garbage the assembled path strips.
     /// The same filtering applies here: a result with no call before it
     /// is dropped, a call awaiting its result is kept, and emptied
-    /// messages are removed. A conversation consisting solely of
+    /// messages are removed. When the filtering removes anything, the
+    /// outcome reports the reduction with the caller's configured
+    /// counter (`tokens_after`/`tokens_saved`), matching the assembled
+    /// path; when nothing was filtered, the plain no-change outcome
+    /// (zero savings) is returned. A conversation consisting solely of
     /// orphaned results is returned as received — filtering it would
     /// produce an empty history, which is never an outcome.
-    fn unchanged(messages: Vec<Message>) -> CompactionOutcome {
+    fn unchanged(messages: Vec<Message>, context: &CompactionContext) -> CompactionOutcome {
         let pairing = ToolPairing::scan(&messages);
         if pairing.all_parts_lone_results() {
             return CompactionOutcome::no_change(messages);
         }
-        let origins: Vec<usize> = (0..messages.len()).collect();
+        let input_len = messages.len();
+        let input_parts = messages
+            .iter()
+            .map(|msg| msg.parts.len())
+            .fold(0usize, usize::saturating_add);
+        let origins: Vec<usize> = (0..input_len).collect();
         let mut out = messages;
         Self::sanitize_tool_parts(&mut out, &origins, &pairing, 0);
-        CompactionOutcome::no_change(out)
+        let filtered_parts = out
+            .iter()
+            .map(|msg| msg.parts.len())
+            .fold(0usize, usize::saturating_add);
+        if out.len() == input_len && filtered_parts == input_parts {
+            return CompactionOutcome::no_change(out);
+        }
+        let tokens_after = context.counter.count(&out);
+        CompactionOutcome {
+            messages: out,
+            tokens_after,
+            tokens_saved: context.tokens_before.saturating_sub(tokens_after),
+            success: true,
+            error: None,
+        }
     }
 
     /// Enforce the pairing contract on the assembled output.
@@ -1912,5 +1935,64 @@ mod tests {
                  {calls} calls vs {results} results"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn sanitized_no_change_passes_report_their_savings() {
+        // A short conversation below min_messages loses its orphaned
+        // result to the no-change filtering: the outcome must account
+        // for that reduction instead of claiming zero savings.
+        let messages = vec![
+            Message::user("a reasonably long first message"),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "ghost",
+                    "Read",
+                    ToolContent::from_string("a sizeable orphaned payload"),
+                    false,
+                )],
+            ),
+            Message::assistant("a1"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(6)
+            .with_preserve_recent(3);
+        let tokens_before = crate::compact::CompactionOutcome::estimate_tokens(&messages);
+        let context = CompactionContext {
+            tokens_before,
+            reason: CompactReason::ThresholdExceeded,
+            context_window: 8_000,
+            turn: 3,
+            counter: std::sync::Arc::new(crate::compact::HeuristicTokenCounter),
+        };
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+        assert_eq!(outcome.messages.len(), 2, "the garbage message is dropped");
+        assert!(
+            outcome.tokens_saved > 0,
+            "a pass that dropped content must report the reduction — \
+             claimed {} saved with tokens_after {}",
+            outcome.tokens_saved,
+            outcome.tokens_after
+        );
+
+        // With nothing to filter, the no-change semantics hold: zero
+        // savings.
+        let clean = vec![Message::user("q1"), Message::assistant("a1")];
+        let tokens_before = crate::compact::CompactionOutcome::estimate_tokens(&clean);
+        let context = CompactionContext {
+            tokens_before,
+            reason: CompactReason::ThresholdExceeded,
+            context_window: 8_000,
+            turn: 3,
+            counter: std::sync::Arc::new(crate::compact::HeuristicTokenCounter),
+        };
+        let outcome = compactor.compact(clean, 1, context).await;
+        assert!(outcome.success);
+        assert_eq!(
+            outcome.tokens_saved, 0,
+            "nothing was filtered, so nothing is claimed as saved"
+        );
     }
 }

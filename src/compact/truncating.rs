@@ -17,7 +17,7 @@ use std::pin::Pin;
 ///
 /// Built by [`ToolPairing::scan`] as it walks the message list: every
 /// call and result part ends up either paired with the occurrence it
-/// belongs to or marked unpaired.
+/// belongs to or marked as a lone call or lone result.
 #[derive(Debug, Clone, Copy)]
 enum PartMate {
     /// The part is paired with a counterpart in another message.
@@ -33,13 +33,20 @@ enum PartMate {
         /// that message is not recorded.
         message: usize,
     },
-    /// The part is a call or result whose counterpart never appears.
+
+    /// A call whose result never appears after it.
     ///
-    /// A call that never received a result, or a result with no
-    /// preceding call. Split decisions leave such parts untouched:
-    /// repairing a conversation already broken at the input is not the
-    /// compactor's job.
-    Unpaired,
+    /// Legal as an in-flight state mid-run (compaction can run
+    /// between a response and its tool results), so it survives
+    /// outside the pulled region; reconstructed content drops it.
+    LoneCall,
+
+    /// A result whose call never appears before it.
+    ///
+    /// A result cannot be in flight (it exists only after its call
+    /// did), so it is dropped from every output — carrying it forward
+    /// only produces a provider-rejecting history.
+    LoneResult,
 }
 
 /// Occurrence-aware pairing between tool calls and tool results.
@@ -49,16 +56,16 @@ enum PartMate {
 /// earlier result has already claimed, so a call id reused across
 /// separate conversation turns yields two distinct pairs instead of one
 /// conflated one. A call that never receives a result, or a result with
-/// no preceding call, is [`Unpaired`](PartMate::Unpaired) — split
-/// decisions leave such parts alone rather than inventing a pair for
-/// them.
+/// no preceding call, is a [`LoneCall`](PartMate::LoneCall) or
+/// [`LoneResult`](PartMate::LoneResult) — split decisions leave pairs
+/// alone rather than inventing one for a lone part.
 struct ToolPairing {
     /// The pairing state of every part, mirroring the message list's
     /// shape.
     ///
-    /// Indexed as `mates[message][part]`: `Some(Paired)` or
-    /// `Some(Unpaired)` for call and result parts, `None` for every
-    /// other part kind.
+    /// Indexed as `mates[message][part]`: `Some(Paired)`,
+    /// `Some(LoneCall)`, or `Some(LoneResult)` for call and result
+    /// parts, `None` for every other part kind.
     mates: Vec<Vec<Option<PartMate>>>,
 }
 
@@ -92,7 +99,7 @@ impl ToolPairing {
                                 }
                                 PartMate::Paired { message: cm }
                             }
-                            None => PartMate::Unpaired,
+                            None => PartMate::LoneResult,
                         };
                         if let Some(slot) = mates.get_mut(i).and_then(|row| row.get_mut(p)) {
                             *slot = Some(state);
@@ -104,7 +111,7 @@ impl ToolPairing {
         }
         for (i, p) in pending.into_values().flatten() {
             if let Some(slot) = mates.get_mut(i).and_then(|row| row.get_mut(p)) {
-                *slot = Some(PartMate::Unpaired);
+                *slot = Some(PartMate::LoneCall);
             }
         }
         Self { mates }
@@ -173,24 +180,18 @@ impl ToolPairing {
         indices
     }
 
-    /// Whether the part at `origin`'s given position keeps its pair in
-    /// the assembled output.
+    /// Whether every part in the whole list is a result with no call
+    /// before it.
     ///
-    /// Non-tool parts always survive; a tool part survives exactly when
-    /// its mate's message is among the live originals. Mates inside
-    /// the pulled region survive mutually, so a single filtering pass
-    /// is consistent.
-    fn part_survives(&self, origin: usize, part: usize, live: &HashSet<usize>) -> bool {
-        match self
-            .mates
-            .get(origin)
-            .and_then(|row| row.get(part))
-            .and_then(|state| state.as_ref())
-        {
-            None => true,
-            Some(PartMate::Unpaired) => false,
-            Some(PartMate::Paired { message: m, .. }) => live.contains(m),
-        }
+    /// `true` only for a conversation consisting solely of
+    /// [`LoneResult`](PartMate::LoneResult) parts (an empty list
+    /// included) — the one shape whose garbage filtering would leave
+    /// nothing behind.
+    fn all_parts_lone_results(&self) -> bool {
+        self.mates
+            .iter()
+            .flatten()
+            .all(|state| matches!(state, Some(PartMate::LoneResult)))
     }
 }
 
@@ -207,15 +208,22 @@ impl ToolPairing {
 ///  ↑ kept   ↑ discarded ↑            ↑ preserved ↑
 /// ```
 ///
-/// The first message is always retained (if present) because it usually
+/// The first message is retained (if present) because it usually
 /// contains the system prompt or conversation instructions. This prevents
 /// the compactor from discarding essential context that shapes the agent's
-/// behavior. Tool-call/result pairs are never split: the split point
+/// behavior; the only way it leaves the output is by losing its every
+/// part to the garbage filtering described below. Tool-call/result
+/// pairs are never split: the split point
 /// moves to keep a pair together, and a result that would be dropped
 /// behind a call carried by the preserved first message is pulled back
 /// alongside it. Pairs are matched per occurrence — a call id reused
 /// in a later turn is a different pair, never a substitute for an
-/// earlier one. If the conversation is shorter than `min_messages`, no
+/// earlier one. A tool result whose call never appears before it is
+/// dropped rather than carried forward (a result cannot be in flight);
+/// a recent call awaiting its result is preserved, since compaction
+/// can run before results land — both rules hold on every outcome
+/// path, including the no-change passes, and the output is never an
+/// empty list. If the conversation is shorter than `min_messages`, no
 /// compaction occurs.
 ///
 /// # Example
@@ -314,7 +322,7 @@ impl ContextCompactor for TruncatingCompactor {
         Box::pin(async move {
             let total = messages.len();
             if total <= self.min_messages {
-                return CompactionOutcome::no_change(messages);
+                return Self::unchanged(messages);
             }
 
             // Determine split point: keep `preserve_recent` from the end.
@@ -342,7 +350,7 @@ impl ContextCompactor for TruncatingCompactor {
             // report no change instead of a compaction that reduced
             // nothing.
             if split == 0 {
-                return CompactionOutcome::no_change(messages);
+                return Self::unchanged(messages);
             }
 
             let recent: Vec<Message> = messages.get(split..).unwrap_or_default().to_vec();
@@ -356,6 +364,14 @@ impl ContextCompactor for TruncatingCompactor {
             }
             preserved.extend(recent);
             let preserved = Self::reattach_dropped_results(&messages, split, preserved);
+
+            // Garbage filtering can empty every kept message (a first
+            // message and recent slice made solely of orphaned results);
+            // an empty history must never replace a non-empty one, so
+            // decline to reduce instead.
+            if preserved.is_empty() {
+                return Self::unchanged(messages);
+            }
 
             let tokens_after = context.counter.count(&preserved);
             CompactionOutcome {
@@ -405,11 +421,13 @@ impl TruncatingCompactor {
     /// pair-mate: both directions of the pairing contract hold in the
     /// output (no call without its result that the input did not already
     /// carry, and no result without its call). The first message and the
-    /// recent slice are emitted exactly as received. Pairing is per
-    /// occurrence (see [`ToolPairing`]): a result message is pulled only
-    /// when it is the exact occurrence mated to a first-message call —
-    /// a later pair reusing the same id neither satisfies that call nor
-    /// gets pulled in its place.
+    /// recent slice keep their parts as received except for the
+    /// unpaired-result rule applied by
+    /// [`sanitize_tool_parts`](Self::sanitize_tool_parts). Pairing is
+    /// per occurrence (see [`ToolPairing`]): a result message is pulled
+    /// only when it is the exact occurrence mated to a first-message
+    /// call — a later pair reusing the same id neither satisfies that
+    /// call nor gets pulled in its place.
     fn reattach_dropped_results(
         messages: &[Message],
         split: usize,
@@ -417,9 +435,6 @@ impl TruncatingCompactor {
     ) -> Vec<Message> {
         let pairing = ToolPairing::scan(messages);
         let pull_indices = pairing.first_message_dropped_result_indices(split);
-        if pull_indices.is_empty() {
-            return kept;
-        }
 
         let pulled: Vec<Message> = pull_indices
             .iter()
@@ -439,41 +454,77 @@ impl TruncatingCompactor {
         origins.extend(pull_indices.iter().copied());
         origins.extend(split..messages.len());
         out.extend(kept_iter);
-        Self::drop_unmatched_pair_parts(&mut out, &origins, &pairing, pulled_len);
+        Self::sanitize_tool_parts(&mut out, &origins, &pairing, pulled_len);
         out
     }
 
-    /// Remove pair-mate-less tool parts from the pulled region of a
-    /// reassembled list.
+    /// Return the conversation as a no-change outcome with orphaned
+    /// tool results filtered.
     ///
-    /// A part is removed exactly when its paired counterpart's message
-    /// is not among the assembled output (`origins` maps each output
-    /// slot to its original message index) or when it has no
-    /// counterpart at all — removing such a part can never orphan a
-    /// kept one, and mates inside the pulled region survive mutually,
-    /// so one filtering pass is consistent. Only the pulled messages
-    /// (output indices `1..=pulled_len`) are filtered; the first
-    /// message and the recent slice pass through as-is. Every pulled
-    /// message keeps at least the result it was pulled for (its call
-    /// rides in the first message), so filtering cannot empty a
-    /// message.
-    fn drop_unmatched_pair_parts(
-        out: &mut [Message],
+    /// The no-change paths (conversations below `min_messages`, and a
+    /// split pulled to zero by the pair adjustment) previously returned
+    /// the input verbatim, carrying garbage the assembled path strips.
+    /// The same filtering applies here: a result with no call before it
+    /// is dropped, a call awaiting its result is kept, and emptied
+    /// messages are removed. A conversation consisting solely of
+    /// orphaned results is returned as received — filtering it would
+    /// produce an empty history, which is never an outcome.
+    fn unchanged(messages: Vec<Message>) -> CompactionOutcome {
+        let pairing = ToolPairing::scan(&messages);
+        if pairing.all_parts_lone_results() {
+            return CompactionOutcome::no_change(messages);
+        }
+        let origins: Vec<usize> = (0..messages.len()).collect();
+        let mut out = messages;
+        Self::sanitize_tool_parts(&mut out, &origins, &pairing, 0);
+        CompactionOutcome::no_change(out)
+    }
+
+    /// Enforce the pairing contract on the assembled output.
+    ///
+    /// Two policies by region. The pulled messages (output indices
+    /// `1..=pulled_len`) are reconstructed content and are strict: a
+    /// part survives only when its mate's message is among the output
+    /// (`origins` maps each output slot to its original message index)
+    /// — removing such a part can never orphan a kept one, and mates
+    /// inside the pulled region survive mutually, so one pass is
+    /// consistent. The first message and the recent slice are live
+    /// conversation state and keep their paired parts as received,
+    /// except that a [`LoneResult`](PartMate::LoneResult) is dropped
+    /// everywhere: a result cannot be in flight (it exists only after
+    /// its call did), so carrying it forward only produces a
+    /// provider-rejecting output. A [`LoneCall`](PartMate::LoneCall)
+    /// outside the pulled region is preserved — compaction can run
+    /// between a response and its tool results, and stripping the call
+    /// would orphan the result that arrives next. Messages left with
+    /// no parts after filtering are dropped.
+    fn sanitize_tool_parts(
+        out: &mut Vec<Message>,
         origins: &[usize],
         pairing: &ToolPairing,
         pulled_len: usize,
     ) {
-        if pulled_len == 0 {
-            return;
-        }
         let live: HashSet<usize> = origins.iter().copied().collect();
         let pulled_end = pulled_len.saturating_add(1);
-        for (slot, msg) in out.iter_mut().enumerate().take(pulled_end).skip(1) {
+        for (slot, msg) in out.iter_mut().enumerate() {
             let Some(&origin) = origins.get(slot) else {
                 continue;
             };
+            let strict = slot > 0 && slot < pulled_end;
             let keeps: Vec<bool> = (0..msg.parts.len())
-                .map(|p| pairing.part_survives(origin, p, &live))
+                .map(|p| {
+                    let state = pairing
+                        .mates
+                        .get(origin)
+                        .and_then(|row| row.get(p))
+                        .and_then(|s| s.as_ref());
+                    match state {
+                        Some(PartMate::Paired { message: m, .. }) if strict => live.contains(m),
+                        Some(PartMate::LoneCall) => !strict,
+                        Some(PartMate::LoneResult) => false,
+                        _ => true,
+                    }
+                })
                 .collect();
             msg.parts = msg
                 .parts
@@ -483,6 +534,7 @@ impl TruncatingCompactor {
                 .map(|(part, _)| part.clone())
                 .collect();
         }
+        out.retain(|msg| !msg.parts.is_empty());
     }
 }
 
@@ -1524,6 +1576,340 @@ mod tests {
                 calls, results,
                 "id {id:?}: the kept portion holds complete pairs — {calls} \
                  calls vs {results} results"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn orphaned_result_in_the_recent_slice_is_dropped() {
+        // A duplicate result whose call was already answered earlier:
+        // the input is broken, but the compacted output must not carry
+        // the orphan forward — a result part with no call anywhere in
+        // the output is a guaranteed provider rejection.
+        let messages = vec![
+            Message::user("q1"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call("a", "Read", json!({"i": 1}))],
+            ),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call("b", "Read", json!({"i": 2}))],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "b",
+                    "Read",
+                    ToolContent::from_string("r3"),
+                    false,
+                )],
+            ),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call("a", "Read", json!({"i": 4}))],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "b",
+                    "Read",
+                    ToolContent::from_string("r5"),
+                    false,
+                )],
+            ),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(2)
+            .with_preserve_recent(1);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+
+        for (id, calls, results) in part_counts(&outcome.messages) {
+            assert_eq!(
+                calls, results,
+                "id {id:?}: the output must not carry a result with no call \
+                 — {calls} calls vs {results} results"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_call_without_a_result_is_preserved() {
+        // Compaction can run between a response and its tool results,
+        // so a recent call without a result is a legal in-flight state:
+        // stripping it would orphan the result that arrives next.
+        let messages = vec![
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call("c", "Read", json!({"i": 3}))],
+            ),
+            Message::user("q3"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(2)
+            .with_preserve_recent(2);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+
+        let pending_call_kept = outcome.messages.iter().any(|m| {
+            m.parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::ToolCall { id, .. } if id == "c"))
+        });
+        assert!(
+            pending_call_kept,
+            "a recent call awaiting its result is a legal in-flight state \
+             and must survive compaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn garbage_only_messages_are_dropped_rather_than_emptied() {
+        // A message whose every part is an orphaned result — here the
+        // first message itself — is removed from the output instead of
+        // surviving as an empty message.
+        let messages = vec![
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "ghost",
+                    "Read",
+                    ToolContent::from_string("nowhere"),
+                    false,
+                )],
+            ),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+            Message::user("q3"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(2)
+            .with_preserve_recent(2);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+        assert!(
+            outcome.messages.iter().all(|m| !m.parts.is_empty()),
+            "no message may survive as an empty shell after filtering"
+        );
+        assert!(
+            !outcome
+                .messages
+                .iter()
+                .any(|m| m.parts.iter().any(|p| matches!(
+                    p,
+                    MessagePart::ToolResult { call_id, .. } if call_id == "ghost"
+                ))),
+            "the orphaned result is dropped with its emptied message"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_never_returns_an_empty_list() {
+        // The first message and the recent slice are orphaned results
+        // only; the valid pair in the middle is droppable content. The
+        // filtering empties the kept slice, and the pass must decline
+        // to reduce instead of replacing the history with nothing.
+        let messages = vec![
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "ghost0",
+                    "Read",
+                    ToolContent::from_string("nowhere"),
+                    false,
+                )],
+            ),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call("a", "Read", json!({"i": 1}))],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "a",
+                    "Read",
+                    tool_text("ok"),
+                    false,
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "ghost3",
+                    "Read",
+                    ToolContent::from_string("nowhere"),
+                    false,
+                )],
+            ),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(2)
+            .with_preserve_recent(1);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+        assert!(
+            !outcome.messages.is_empty(),
+            "compaction must never replace a non-empty history with an \
+             empty list (got {} messages)",
+            outcome.messages.len()
+        );
+        assert!(
+            outcome.messages.iter().any(|m| {
+                m.parts
+                    .iter()
+                    .any(|p| matches!(p, MessagePart::ToolCall { id, .. } if id == "a"))
+            }),
+            "the fallback keeps the valid pair rather than the garbage"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_change_paths_do_not_carry_orphaned_results() {
+        // Split pulled to zero: the first message's call has its result
+        // in the recent slice, so nothing can be dropped — the garbage
+        // result riding along must still be filtered.
+        let straddle = vec![
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "c1",
+                    "Read",
+                    json!({"path": "a.rs"}),
+                )],
+            ),
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::new(
+                Role::User,
+                vec![
+                    MessagePart::tool_result("c1", "Read", tool_text("ok"), false),
+                    MessagePart::tool_result(
+                        "ghost",
+                        "Read",
+                        ToolContent::from_string("nowhere"),
+                        false,
+                    ),
+                ],
+            ),
+            Message::user("q2"),
+            Message::assistant("a2"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(4)
+            .with_preserve_recent(3);
+        let context = make_context(&straddle);
+        let outcome = compactor.compact(straddle, 1, context).await;
+        assert!(outcome.success);
+        assert!(
+            !outcome.messages.iter().any(|m| {
+                m.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::ToolResult { call_id, .. } if call_id == "ghost"
+                    )
+                })
+            }),
+            "the split-zero no-change pass filters orphaned results like \
+             every other path"
+        );
+
+        // Below min_messages: the same rule on the short-conversation
+        // path.
+        let short = vec![
+            Message::user("q1"),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "ghost",
+                    "Read",
+                    ToolContent::from_string("nowhere"),
+                    false,
+                )],
+            ),
+            Message::assistant("a1"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(6)
+            .with_preserve_recent(3);
+        let context = make_context(&short);
+        let outcome = compactor.compact(short, 1, context).await;
+        assert!(outcome.success);
+        assert!(
+            !outcome.messages.iter().any(|m| {
+                m.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::ToolResult { call_id, .. } if call_id == "ghost"
+                    )
+                })
+            }),
+            "the short-conversation no-change pass filters orphaned \
+             results like every other path"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_message_calls_resolving_in_one_message_pull_it_once() {
+        // Two first-message calls whose results share one user
+        // message: the pull brings that message back once, adjacent to
+        // both calls.
+        let messages = vec![
+            Message::new(
+                Role::Assistant,
+                vec![
+                    MessagePart::tool_call("c1", "Read", json!({"path": "a.rs"})),
+                    MessagePart::tool_call("c2", "Read", json!({"path": "b.rs"})),
+                ],
+            ),
+            Message::new(
+                Role::User,
+                vec![
+                    MessagePart::tool_result("c1", "Read", tool_text("ok1"), false),
+                    MessagePart::tool_result("c2", "Read", tool_text("ok2"), false),
+                ],
+            ),
+            Message::user("q2"),
+            Message::assistant("a2"),
+            Message::user("q3"),
+            Message::assistant("a3"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(4)
+            .with_preserve_recent(3);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+
+        let shared_pulls = outcome
+            .messages
+            .iter()
+            .filter(|m| {
+                m.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::ToolResult { call_id, .. } if call_id == "c1"
+                    )
+                })
+            })
+            .count();
+        assert_eq!(
+            shared_pulls, 1,
+            "the shared result message is pulled back exactly once"
+        );
+        for (id, calls, results) in part_counts(&outcome.messages) {
+            assert_eq!(
+                calls, results,
+                "id {id:?}: both first-message calls keep their results — \
+                 {calls} calls vs {results} results"
             );
         }
     }

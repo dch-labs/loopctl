@@ -9,9 +9,190 @@
 use crate::compact::ContextCompactor;
 use crate::compact::types::{CompactionContext, CompactionOutcome};
 use crate::message::{Message, MessagePart, Role};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+
+/// The pairing state of one tool part.
+///
+/// Built by [`ToolPairing::scan`] as it walks the message list: every
+/// call and result part ends up either paired with the occurrence it
+/// belongs to or marked unpaired.
+#[derive(Debug, Clone, Copy)]
+enum PartMate {
+    /// The part is paired with a counterpart in another message.
+    ///
+    /// Calls carry their result's location and results their call's —
+    /// which side is which follows from message order, since a call
+    /// never appears after its own result in a well-formed history.
+    Paired {
+        /// Message index of the counterpart part.
+        ///
+        /// Pairing decisions work at message granularity (split
+        /// points, pulls, live-message sets), so the part index within
+        /// that message is not recorded.
+        message: usize,
+    },
+    /// The part is a call or result whose counterpart never appears.
+    ///
+    /// A call that never received a result, or a result with no
+    /// preceding call. Split decisions leave such parts untouched:
+    /// repairing a conversation already broken at the input is not the
+    /// compactor's job.
+    Unpaired,
+}
+
+/// Occurrence-aware pairing between tool calls and tool results.
+///
+/// Pairing is positional, not by id alone: a result part pairs with the
+/// most recent *preceding* call part carrying the same id that no
+/// earlier result has already claimed, so a call id reused across
+/// separate conversation turns yields two distinct pairs instead of one
+/// conflated one. A call that never receives a result, or a result with
+/// no preceding call, is [`Unpaired`](PartMate::Unpaired) — split
+/// decisions leave such parts alone rather than inventing a pair for
+/// them.
+struct ToolPairing {
+    /// The pairing state of every part, mirroring the message list's
+    /// shape.
+    ///
+    /// Indexed as `mates[message][part]`: `Some(Paired)` or
+    /// `Some(Unpaired)` for call and result parts, `None` for every
+    /// other part kind.
+    mates: Vec<Vec<Option<PartMate>>>,
+}
+
+impl ToolPairing {
+    /// Pair every call and result occurrence in a message list.
+    ///
+    /// One forward scan with a per-id stack of unconsumed calls: each
+    /// result claims the most recent unconsumed preceding call with the
+    /// same id (last-in-first-out), which keeps reused ids in separate
+    /// turns as separate pairs.
+    fn scan(messages: &[Message]) -> Self {
+        let mut mates: Vec<Vec<Option<PartMate>>> = messages
+            .iter()
+            .map(|msg| msg.parts.iter().map(|_| None).collect())
+            .collect();
+        let mut pending: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        for (i, msg) in messages.iter().enumerate() {
+            for (p, part) in msg.parts.iter().enumerate() {
+                match part {
+                    MessagePart::ToolCall { id, .. } => {
+                        pending.entry(id.clone()).or_default().push((i, p));
+                    }
+                    MessagePart::ToolResult { call_id, .. } => {
+                        let claimed = pending.get_mut(call_id).and_then(Vec::pop);
+                        let state = match claimed {
+                            Some((cm, cp)) => {
+                                if let Some(slot) =
+                                    mates.get_mut(cm).and_then(|row| row.get_mut(cp))
+                                {
+                                    *slot = Some(PartMate::Paired { message: i });
+                                }
+                                PartMate::Paired { message: cm }
+                            }
+                            None => PartMate::Unpaired,
+                        };
+                        if let Some(slot) = mates.get_mut(i).and_then(|row| row.get_mut(p)) {
+                            *slot = Some(state);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (i, p) in pending.into_values().flatten() {
+            if let Some(slot) = mates.get_mut(i).and_then(|row| row.get_mut(p)) {
+                *slot = Some(PartMate::Unpaired);
+            }
+        }
+        Self { mates }
+    }
+
+    /// Move a split back to the earliest call a straddling result
+    /// would orphan, or return it unchanged.
+    ///
+    /// A straddling result is a paired result part at or after `split`
+    /// whose paired call sits before it (calls precede their results),
+    /// so a call id reused later in the kept range does not count as a
+    /// match for the earlier occurrence.
+    fn adjusted_split(&self, split: usize) -> usize {
+        let mut new_split = split;
+        for row in self.mates.iter().skip(split) {
+            for mate in row.iter().flatten() {
+                if let PartMate::Paired { message: m, .. } = mate
+                    && *m < split
+                    && *m < new_split
+                {
+                    new_split = *m;
+                }
+            }
+        }
+        new_split
+    }
+
+    /// Whether splitting at `index` keeps every paired result with its
+    /// call.
+    ///
+    /// `false` when any paired result at or after `index` has its call
+    /// before `index` — judged per occurrence, so a reused id's later
+    /// pair does not vouch for the earlier one.
+    fn boundary_pair_safe(&self, index: usize) -> bool {
+        !self.mates.iter().enumerate().skip(index).any(|(i, row)| {
+            row.iter().flatten().any(|mate| {
+                matches!(
+                    mate,
+                    PartMate::Paired { message: m, .. } if *m < index && *m < i
+                )
+            })
+        })
+    }
+
+    /// Result-message indices in `1..split` paired with calls carried
+    /// by the first message.
+    ///
+    /// The exact occurrences mated to message 0's call parts — a later
+    /// pair reusing the same id does not satisfy the first message's
+    /// call. Sorted ascending; one index per message even when several
+    /// of message 0's calls resolved in it.
+    fn first_message_dropped_result_indices(&self, split: usize) -> Vec<usize> {
+        let mut indices: Vec<usize> = Vec::new();
+        if let Some(first_row) = self.mates.first() {
+            for mate in first_row.iter().flatten() {
+                if let PartMate::Paired { message: m, .. } = mate
+                    && *m > 0
+                    && *m < split
+                    && !indices.contains(m)
+                {
+                    indices.push(*m);
+                }
+            }
+        }
+        indices.sort_unstable();
+        indices
+    }
+
+    /// Whether the part at `origin`'s given position keeps its pair in
+    /// the assembled output.
+    ///
+    /// Non-tool parts always survive; a tool part survives exactly when
+    /// its mate's message is among the live originals. Mates inside
+    /// the pulled region survive mutually, so a single filtering pass
+    /// is consistent.
+    fn part_survives(&self, origin: usize, part: usize, live: &HashSet<usize>) -> bool {
+        match self
+            .mates
+            .get(origin)
+            .and_then(|row| row.get(part))
+            .and_then(|state| state.as_ref())
+        {
+            None => true,
+            Some(PartMate::Unpaired) => false,
+            Some(PartMate::Paired { message: m, .. }) => live.contains(m),
+        }
+    }
+}
 
 /// A simple compactor that drops the oldest messages.
 ///
@@ -32,7 +213,9 @@ use std::pin::Pin;
 /// behavior. Tool-call/result pairs are never split: the split point
 /// moves to keep a pair together, and a result that would be dropped
 /// behind a call carried by the preserved first message is pulled back
-/// alongside it. If the conversation is shorter than `min_messages`, no
+/// alongside it. Pairs are matched per occurrence — a call id reused
+/// in a later turn is a different pair, never a substitute for an
+/// earlier one. If the conversation is shorter than `min_messages`, no
 /// compaction occurs.
 ///
 /// # Example
@@ -190,65 +373,17 @@ impl TruncatingCompactor {
     /// Adjust the split index to avoid orphaning tool-call/result pairs.
     ///
     /// If the "recent" portion (from `split` onward) contains any
-    /// [`MessagePart::ToolResult`] whose matching
-    /// [`MessagePart::ToolCall`] (identified by `call_id` == `id`) would
-    /// be in the dropped portion (before `split`), the split is moved
-    /// backward to include the message containing the orphaned call.
+    /// [`MessagePart::ToolResult`] whose paired
+    /// [`MessagePart::ToolCall`] would be in the dropped portion
+    /// (before `split`), the split is moved backward to include the
+    /// message containing that call. Pairing is per occurrence (see
+    /// [`ToolPairing`]): a call id reused in a later turn is a
+    /// different pair and never substitutes for the stranded one.
     fn adjust_for_tool_pairs(messages: &[Message], split: usize) -> usize {
         if split == 0 {
             return 0;
         }
-
-        // Collect call IDs from the recent portion — those whose calls
-        // are already preserved need no adjustment.
-        let recent = messages.get(split..).unwrap_or_default();
-        let recent_call_ids: HashSet<&String> = recent
-            .iter()
-            .flat_map(|msg| msg.parts.iter())
-            .filter_map(|part| match part {
-                MessagePart::ToolCall { id, .. } => Some(id),
-                _ => None,
-            })
-            .collect();
-
-        // Check each result in the recent portion: if its call_id is not
-        // among the recent calls, the call is in the dropped portion.
-        let orphaned_ids: Vec<&String> = recent
-            .iter()
-            .flat_map(|msg| msg.parts.iter())
-            .filter_map(|part| match part {
-                MessagePart::ToolResult { call_id, .. } => {
-                    if recent_call_ids.contains(call_id) {
-                        None
-                    } else {
-                        Some(call_id)
-                    }
-                }
-                _ => None,
-            })
-            .collect();
-
-        if orphaned_ids.is_empty() {
-            return split;
-        }
-
-        // Walk backward from the split point to find the earliest message
-        // that contains a ToolCall matching any orphaned ID.
-        let mut new_split = split;
-        for i in (0..split).rev() {
-            let Some(msg) = messages.get(i) else {
-                continue;
-            };
-            let has_orphaned_call = msg.parts.iter().any(|part| match part {
-                MessagePart::ToolCall { id, .. } => orphaned_ids.contains(&id),
-                _ => false,
-            });
-            if has_orphaned_call {
-                new_split = i;
-            }
-        }
-
-        new_split
+        ToolPairing::scan(messages).adjusted_split(split)
     }
 
     /// Pull dropped [`MessagePart::ToolResult`]s back into the kept slice
@@ -270,58 +405,26 @@ impl TruncatingCompactor {
     /// pair-mate: both directions of the pairing contract hold in the
     /// output (no call without its result that the input did not already
     /// carry, and no result without its call). The first message and the
-    /// recent slice are emitted exactly as received.
+    /// recent slice are emitted exactly as received. Pairing is per
+    /// occurrence (see [`ToolPairing`]): a result message is pulled only
+    /// when it is the exact occurrence mated to a first-message call —
+    /// a later pair reusing the same id neither satisfies that call nor
+    /// gets pulled in its place.
     fn reattach_dropped_results(
         messages: &[Message],
         split: usize,
         kept: Vec<Message>,
     ) -> Vec<Message> {
-        let first_call_ids: HashSet<&String> = kept
-            .first()
-            .into_iter()
-            .flat_map(|msg| msg.parts.iter())
-            .filter_map(|part| match part {
-                MessagePart::ToolCall { id, .. } => Some(id),
-                _ => None,
-            })
-            .collect();
-        if first_call_ids.is_empty() {
+        let pairing = ToolPairing::scan(messages);
+        let pull_indices = pairing.first_message_dropped_result_indices(split);
+        if pull_indices.is_empty() {
             return kept;
         }
 
-        let kept_result_ids: HashSet<&String> = kept
+        let pulled: Vec<Message> = pull_indices
             .iter()
-            .flat_map(|msg| msg.parts.iter())
-            .filter_map(|part| match part {
-                MessagePart::ToolResult { call_id, .. } => Some(call_id),
-                _ => None,
-            })
+            .filter_map(|&i| messages.get(i).cloned())
             .collect();
-        let missing: Vec<&String> = first_call_ids
-            .iter()
-            .filter(|id| !kept_result_ids.contains(*id))
-            .copied()
-            .collect();
-        if missing.is_empty() {
-            return kept;
-        }
-
-        let pulled: Vec<Message> = messages
-            .get(1..split)
-            .unwrap_or_default()
-            .iter()
-            .filter(|msg| {
-                msg.parts.iter().any(|part| match part {
-                    MessagePart::ToolResult { call_id, .. } => missing.contains(&call_id),
-                    _ => false,
-                })
-            })
-            .cloned()
-            .collect();
-        if pulled.is_empty() {
-            return kept;
-        }
-
         let mut kept_iter = kept.into_iter();
         let Some(first) = kept_iter.next() else {
             return pulled;
@@ -329,51 +432,56 @@ impl TruncatingCompactor {
         let pulled_len = pulled.len();
         let mut out =
             Vec::with_capacity(pulled_len.saturating_add(kept_iter.len()).saturating_add(1));
+        let mut origins: Vec<usize> = Vec::with_capacity(out.capacity());
         out.push(first);
+        origins.push(0);
         out.extend(pulled);
+        origins.extend(pull_indices.iter().copied());
+        origins.extend(split..messages.len());
         out.extend(kept_iter);
-        Self::drop_unmatched_pair_parts(&mut out, pulled_len);
+        Self::drop_unmatched_pair_parts(&mut out, &origins, &pairing, pulled_len);
         out
     }
 
     /// Remove pair-mate-less tool parts from the pulled region of a
     /// reassembled list.
     ///
-    /// Operates on the assembled output's own id sets, so a part is
-    /// removed exactly when no matching part exists anywhere in the
-    /// output — removing an unmatched part can never orphan a matched
-    /// one. Only the pulled messages (indices `1..=pulled_len`) are
-    /// filtered; the first message and the recent slice pass through
-    /// as-is. Every pulled message keeps at least the result it was
-    /// pulled for (its call rides in the first message), so filtering
-    /// cannot empty a message.
-    fn drop_unmatched_pair_parts(out: &mut [Message], pulled_len: usize) {
+    /// A part is removed exactly when its paired counterpart's message
+    /// is not among the assembled output (`origins` maps each output
+    /// slot to its original message index) or when it has no
+    /// counterpart at all — removing such a part can never orphan a
+    /// kept one, and mates inside the pulled region survive mutually,
+    /// so one filtering pass is consistent. Only the pulled messages
+    /// (output indices `1..=pulled_len`) are filtered; the first
+    /// message and the recent slice pass through as-is. Every pulled
+    /// message keeps at least the result it was pulled for (its call
+    /// rides in the first message), so filtering cannot empty a
+    /// message.
+    fn drop_unmatched_pair_parts(
+        out: &mut [Message],
+        origins: &[usize],
+        pairing: &ToolPairing,
+        pulled_len: usize,
+    ) {
         if pulled_len == 0 {
             return;
         }
-        let call_ids: HashSet<String> = out
-            .iter()
-            .flat_map(|msg| msg.parts.iter())
-            .filter_map(|part| match part {
-                MessagePart::ToolCall { id, .. } => Some(id.clone()),
-                _ => None,
-            })
-            .collect();
-        let result_ids: HashSet<String> = out
-            .iter()
-            .flat_map(|msg| msg.parts.iter())
-            .filter_map(|part| match part {
-                MessagePart::ToolResult { call_id, .. } => Some(call_id.clone()),
-                _ => None,
-            })
-            .collect();
+        let live: HashSet<usize> = origins.iter().copied().collect();
         let pulled_end = pulled_len.saturating_add(1);
-        for msg in out.get_mut(1..pulled_end).unwrap_or_default() {
-            msg.parts.retain(|part| match part {
-                MessagePart::ToolResult { call_id, .. } => call_ids.contains(call_id),
-                MessagePart::ToolCall { id, .. } => result_ids.contains(id),
-                _ => true,
-            });
+        for (slot, msg) in out.iter_mut().enumerate().take(pulled_end).skip(1) {
+            let Some(&origin) = origins.get(slot) else {
+                continue;
+            };
+            let keeps: Vec<bool> = (0..msg.parts.len())
+                .map(|p| pairing.part_survives(origin, p, &live))
+                .collect();
+            msg.parts = msg
+                .parts
+                .iter()
+                .zip(keeps)
+                .filter(|(_, keep)| *keep)
+                .map(|(part, _)| part.clone())
+                .collect();
         }
     }
 }
@@ -579,35 +687,15 @@ impl TokenSplitter {
     /// Whether splitting at `index` keeps every tool call with its
     /// result.
     ///
-    /// `false` when any message in the kept portion (from `index` on)
-    /// carries a `ToolResult` whose `ToolCall` sits in the dropped
-    /// portion (before `index`) — regardless of how far apart the two
-    /// messages are, so histories with interleaved or consecutive user
-    /// messages are covered, not just the canonical call-then-result
-    /// seam.
+    /// `false` when any paired result in the kept portion (from
+    /// `index` on) has its call in the dropped portion (before
+    /// `index`) — judged per occurrence regardless of how far apart
+    /// the two messages are, so histories with interleaved or
+    /// consecutive user messages are covered, and a call id reused by
+    /// a later complete pair does not vouch for an earlier occurrence
+    /// being split off.
     fn split_is_pair_safe(messages: &[Message], index: usize) -> bool {
-        let dropped_call_ids: HashSet<&String> = messages
-            .get(..index)
-            .unwrap_or_default()
-            .iter()
-            .flat_map(|msg| msg.parts.iter())
-            .filter_map(|part| match part {
-                MessagePart::ToolCall { id, .. } => Some(id),
-                _ => None,
-            })
-            .collect();
-        if dropped_call_ids.is_empty() {
-            return true;
-        }
-        !messages
-            .get(index..)
-            .unwrap_or_default()
-            .iter()
-            .flat_map(|msg| msg.parts.iter())
-            .any(|part| match part {
-                MessagePart::ToolResult { call_id, .. } => dropped_call_ids.contains(call_id),
-                _ => false,
-            })
+        ToolPairing::scan(messages).boundary_pair_safe(index)
     }
 }
 
@@ -1200,5 +1288,243 @@ mod tests {
             split.to_compact.is_empty(),
             "the whole conversation stays preserved"
         );
+    }
+
+    fn part_counts(messages: &[Message]) -> Vec<(String, usize, usize)> {
+        let mut calls: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut results: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for msg in messages {
+            for part in &msg.parts {
+                match part {
+                    MessagePart::ToolCall { id, .. } => {
+                        let counter = calls.entry(id.clone()).or_insert(0);
+                        *counter = counter.saturating_add(1);
+                    }
+                    MessagePart::ToolResult { call_id, .. } => {
+                        let counter = results.entry(call_id.clone()).or_insert(0);
+                        *counter = counter.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let orphaned: Vec<(String, usize, usize)> = results
+            .iter()
+            .filter(|(id, _)| !calls.contains_key(id.as_str()))
+            .map(|(id, r)| (id.clone(), 0, *r))
+            .collect();
+        calls
+            .into_iter()
+            .map(|(id, c)| {
+                let r = results.get(&id).copied().unwrap_or(0);
+                (id, c, r)
+            })
+            .chain(orphaned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reused_call_id_across_turns_keeps_pairs_distinct() {
+        // Two completed turns reuse the id "x". A split between the
+        // first turn's call and its result must not be fooled by the
+        // second turn's call carrying the same id.
+        let messages = vec![
+            Message::user("q1"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call("x", "Read", json!({"path": "x.rs"}))],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "x",
+                    "Read",
+                    tool_text("ok"),
+                    false,
+                )],
+            ),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "x",
+                    "Read",
+                    json!({"path": "x2.rs"}),
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "x",
+                    "Read",
+                    tool_text("ok2"),
+                    false,
+                )],
+            ),
+            Message::assistant("a2"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(4)
+            .with_preserve_recent(6);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+
+        for (id, calls, results) in part_counts(&outcome.messages) {
+            assert_eq!(
+                calls, results,
+                "each occurrence of reused call id {id:?} must keep its own \
+                 pair — output carries {calls} calls and {results} results"
+            );
+        }
+        let turn_one_call_kept = outcome.messages.iter().any(|m| {
+            m.parts.iter().any(|p| {
+                matches!(
+                    p,
+                    MessagePart::ToolCall { id, input, .. }
+                        if id == "x" && input.get("path").is_some_and(|v| v == "x.rs")
+                )
+            })
+        });
+        let turn_one_result_kept = outcome.messages.iter().any(|m| {
+            m.parts.iter().any(|p| {
+                matches!(
+                    p,
+                    MessagePart::ToolResult { call_id, output, .. }
+                        if call_id == "x" && output.to_string().contains("ok")
+                )
+            })
+        });
+        assert!(
+            turn_one_call_kept && turn_one_result_kept,
+            "the straddled first-turn pair is kept whole, not dropped to the \
+             second turn's reused id"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_message_pull_targets_its_own_result_occurrence() {
+        // The preserved first message's call shares its id with a later
+        // complete pair inside the recent slice; the pull must bring back
+        // the first occurrence's own result, not accept the later one.
+        let messages = vec![
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call("x", "Read", json!({"path": "x.rs"}))],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "x",
+                    "Read",
+                    tool_text("first"),
+                    false,
+                )],
+            ),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call("x", "Read", json!({"path": "y.rs"}))],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "x",
+                    "Read",
+                    tool_text("second"),
+                    false,
+                )],
+            ),
+            Message::assistant("a2"),
+            Message::user("q3"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(4)
+            .with_preserve_recent(4);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+
+        for (id, calls, results) in part_counts(&outcome.messages) {
+            assert_eq!(
+                calls, results,
+                "id {id:?}: every kept call occurrence must have its own \
+                 result occurrence — {calls} calls vs {results} results"
+            );
+        }
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .any(|m| m.parts.iter().any(|p| matches!(
+                    p,
+                    MessagePart::ToolResult { output, .. } if output.to_string().contains("first")
+                ))),
+            "the first message's own result is pulled back alongside its call"
+        );
+    }
+
+    #[test]
+    fn splitter_allows_a_split_between_turns_reusing_one_call_id() {
+        // Both turns are complete pairs; a boundary between them is
+        // pair-safe even though the dropped turn's call id reappears in
+        // the kept turn.
+        let messages = vec![
+            Message::user("q1"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call("x", "Read", json!({"path": "x.rs"}))],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "x",
+                    "Read",
+                    tool_text("ok"),
+                    false,
+                )],
+            ),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "x",
+                    "Read",
+                    json!({"path": "x2.rs"}),
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "x",
+                    "Read",
+                    tool_text("ok2"),
+                    false,
+                )],
+            ),
+            Message::assistant("a2"),
+        ];
+        let splitter = TokenSplitter::new()
+            .with_min_messages(4)
+            .with_preserve_recent(4);
+        let split = splitter.split(&messages);
+        assert!(
+            split.split_index > 0,
+            "a boundary between two complete turns is pair-safe even when \
+             they reuse one call id — refusing it keeps the whole \
+             conversation"
+        );
+        for (id, calls, results) in part_counts(&split.preserved) {
+            assert_eq!(
+                calls, results,
+                "id {id:?}: the kept portion holds complete pairs — {calls} \
+                 calls vs {results} results"
+            );
+        }
     }
 }

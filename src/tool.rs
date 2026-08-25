@@ -433,6 +433,28 @@ impl ToolOutput {
         self
     }
 
+    /// Replace the payload, consuming `self`. Fluent builder.
+    ///
+    /// Useful for constructing multipart outputs (`ToolOutput::text` only
+    /// builds plain text) or for adapting a text output into structured
+    /// content. [`is_error`](ToolOutput::is_error) and any attached hint
+    /// are preserved.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::message::ToolContent;
+    /// use loopctl::tool::ToolOutput;
+    ///
+    /// let out = ToolOutput::text("placeholder").with_payload(ToolContent::from_string("actual"));
+    /// assert_eq!(out.text_content(), "actual");
+    /// ```
+    #[must_use]
+    pub fn with_payload(mut self, payload: MessageToolContent) -> Self {
+        self.payload = payload;
+        self
+    }
+
     /// Extract all text content from the result, regardless of structure.
     ///
     /// Inspects the [`payload`](ToolOutput::payload) field and returns a

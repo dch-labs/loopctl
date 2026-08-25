@@ -584,12 +584,26 @@ mod tests {
 
         let strict = crate::structured::RequestOptions::default()
             .with_tool_constraint(crate::structured::ToolConstraint::Strict);
-        let mut stream = client.stream_messages_with_options(&req, strict);
+        let mut stream = client.stream_messages_with_options(&req, strict.clone());
         let first = stream.next().await;
         drop(stream);
         assert!(
             matches!(&first, Some(Err(err)) if err.to_string().contains("tool_constraint")),
             "a tool constraint the default impl cannot forward must fail loudly, got: {first:?}"
+        );
+        let result = client.create_message_with_options(&req, strict).await;
+        assert!(
+            result.is_err(),
+            "the non-streaming default must reject the same constraint"
+        );
+
+        let format = crate::structured::RequestOptions::default().with_response_format(
+            crate::structured::ResponseFormat::new("action", serde_json::json!({})),
+        );
+        let result = client.create_message_with_options(&req, format).await;
+        assert!(
+            result.is_err(),
+            "the non-streaming default must reject an unsupported response format"
         );
 
         let plain = crate::structured::RequestOptions::default();

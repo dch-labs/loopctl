@@ -252,6 +252,14 @@ impl TruncatingCompactor {
     /// right after the first message, keeping the pair adjacent.
     /// Results already present anywhere in the kept slice satisfy their
     /// calls and are not pulled twice.
+    ///
+    /// A pulled message can carry parts beyond the results it was pulled
+    /// for — e.g. a result for a call that stays dropped. Such parts are
+    /// removed from the pulled copy rather than stranded without their
+    /// pair-mate: both directions of the pairing contract hold in the
+    /// output (no call without its result that the input did not already
+    /// carry, and no result without its call). The first message and the
+    /// recent slice are emitted exactly as received.
     fn reattach_dropped_results(
         messages: &[Message],
         split: usize,
@@ -307,11 +315,55 @@ impl TruncatingCompactor {
         let Some(first) = kept_iter.next() else {
             return pulled;
         };
-        let mut out = Vec::with_capacity(pulled.len().saturating_add(kept_iter.len()));
+        let pulled_len = pulled.len();
+        let mut out =
+            Vec::with_capacity(pulled_len.saturating_add(kept_iter.len()).saturating_add(1));
         out.push(first);
         out.extend(pulled);
         out.extend(kept_iter);
+        Self::drop_unmatched_pair_parts(&mut out, pulled_len);
         out
+    }
+
+    /// Remove pair-mate-less tool parts from the pulled region of a
+    /// reassembled list.
+    ///
+    /// Operates on the assembled output's own id sets, so a part is
+    /// removed exactly when no matching part exists anywhere in the
+    /// output — removing an unmatched part can never orphan a matched
+    /// one. Only the pulled messages (indices `1..=pulled_len`) are
+    /// filtered; the first message and the recent slice pass through
+    /// as-is. Every pulled message keeps at least the result it was
+    /// pulled for (its call rides in the first message), so filtering
+    /// cannot empty a message.
+    fn drop_unmatched_pair_parts(out: &mut [Message], pulled_len: usize) {
+        if pulled_len == 0 {
+            return;
+        }
+        let call_ids: HashSet<String> = out
+            .iter()
+            .flat_map(|msg| msg.parts.iter())
+            .filter_map(|part| match part {
+                MessagePart::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let result_ids: HashSet<String> = out
+            .iter()
+            .flat_map(|msg| msg.parts.iter())
+            .filter_map(|part| match part {
+                MessagePart::ToolResult { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let pulled_end = pulled_len.saturating_add(1);
+        for msg in out.get_mut(1..pulled_end).unwrap_or_default() {
+            msg.parts.retain(|part| match part {
+                MessagePart::ToolResult { call_id, .. } => call_ids.contains(call_id),
+                MessagePart::ToolCall { id, .. } => result_ids.contains(id),
+                _ => true,
+            });
+        }
     }
 }
 
@@ -396,7 +448,9 @@ pub struct SplitResult {
 
     /// The index in the original message list where the split occurred.
     ///
-    /// Zero when no split was needed (the entire conversation was preserved).
+    /// Zero when no split was needed (the entire conversation was
+    /// preserved), or when no split is possible without separating a
+    /// tool call from its result.
     pub split_index: usize,
 }
 
@@ -436,8 +490,12 @@ impl TokenSplitter {
     /// Split the given messages into old and recent portions.
     ///
     /// The split point is chosen at a turn boundary (a role transition
-    /// from assistant to user) as close as possible to leaving
-    /// `preserve_recent` messages in the recent portion.
+    /// from assistant to a user message carrying no tool results) as
+    /// close as possible to leaving `preserve_recent` messages in the
+    /// recent portion. Splitting never separates a tool call from its
+    /// result: when no pair-safe boundary exists at or before the
+    /// target, the entire conversation is preserved and `to_compact`
+    /// is empty.
     ///
     /// If the conversation has fewer than `min_messages`, the entire
     /// conversation goes into `preserved` and `to_compact` is empty.
@@ -468,35 +526,77 @@ impl TokenSplitter {
         }
     }
 
-    /// Find the nearest turn boundary at or before the target index.
+    /// Find the nearest pair-safe turn boundary at or before the target
+    /// index.
     ///
     /// A turn boundary is a position where the previous message is
-    /// assistant-role and the next is user-role. This ensures we split
-    /// at a coherent conversation boundary.
+    /// assistant-role and the next is user-role, and no tool result in
+    /// the kept portion references a call that would be split off (see
+    /// [`split_is_pair_safe`](Self::split_is_pair_safe)) — a user
+    /// message delivering tool results continues the same turn, so
+    /// splitting there would separate a call from its result. This
+    /// ensures we split at a coherent conversation boundary. When no
+    /// such boundary exists at or before the target, `0` is returned:
+    /// nothing can be split off without breaking a call/result pair,
+    /// so the whole conversation stays preserved.
     fn find_turn_boundary(messages: &[Message], target: usize) -> usize {
         if target == 0 {
             return 0;
         }
 
-        // Search backwards from target for an assistant→user transition.
         for i in (1..=target).rev() {
-            if i < messages.len() {
-                let Some(prev) = messages.get(i.saturating_sub(1)) else {
-                    continue;
-                };
-                let Some(curr) = messages.get(i) else {
-                    continue;
-                };
-                let prev_is_assistant = prev.role == Role::Assistant;
-                let curr_is_user = curr.role == Role::User;
-                if prev_is_assistant && curr_is_user {
-                    return i;
-                }
+            if i >= messages.len() {
+                continue;
+            }
+            let Some(prev) = messages.get(i.saturating_sub(1)) else {
+                continue;
+            };
+            let Some(curr) = messages.get(i) else {
+                continue;
+            };
+            if prev.role == Role::Assistant
+                && curr.role == Role::User
+                && Self::split_is_pair_safe(messages, i)
+            {
+                return i;
             }
         }
 
-        // Fallback: no clean boundary found, split at target.
-        target
+        0
+    }
+
+    /// Whether splitting at `index` keeps every tool call with its
+    /// result.
+    ///
+    /// `false` when any message in the kept portion (from `index` on)
+    /// carries a `ToolResult` whose `ToolCall` sits in the dropped
+    /// portion (before `index`) — regardless of how far apart the two
+    /// messages are, so histories with interleaved or consecutive user
+    /// messages are covered, not just the canonical call-then-result
+    /// seam.
+    fn split_is_pair_safe(messages: &[Message], index: usize) -> bool {
+        let dropped_call_ids: HashSet<&String> = messages
+            .get(..index)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|msg| msg.parts.iter())
+            .filter_map(|part| match part {
+                MessagePart::ToolCall { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        if dropped_call_ids.is_empty() {
+            return true;
+        }
+        !messages
+            .get(index..)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|msg| msg.parts.iter())
+            .any(|part| match part {
+                MessagePart::ToolResult { call_id, .. } => dropped_call_ids.contains(call_id),
+                _ => false,
+            })
     }
 }
 
@@ -823,6 +923,195 @@ mod tests {
         assert_eq!(
             outcome.tokens_saved, 0,
             "no-action passes must claim zero savings"
+        );
+    }
+
+    #[tokio::test]
+    async fn pulled_result_message_does_not_strand_foreign_results() {
+        // The result message for the first message's call also carries a
+        // result for a call that stays dropped — the pull must not bring
+        // that foreign result back without its call.
+        let messages = vec![
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "c1",
+                    "Read",
+                    json!({"path": "a.rs"}),
+                )],
+            ),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "c2",
+                    "Read",
+                    json!({"path": "b.rs"}),
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![
+                    MessagePart::tool_result("c1", "Read", tool_text("ok"), false),
+                    MessagePart::tool_result("c2", "Read", tool_text("ok"), false),
+                ],
+            ),
+            Message::user("q2"),
+            Message::assistant("a2"),
+            Message::user("q3"),
+            Message::assistant("a3"),
+        ];
+        let compactor = TruncatingCompactor::new().with_min_messages(4);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+
+        let call_ids: Vec<&str> = outcome
+            .messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                MessagePart::ToolCall { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let result_ids: Vec<&str> = outcome
+            .messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                MessagePart::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let orphaned_results: Vec<&str> = result_ids
+            .iter()
+            .filter(|id| !call_ids.contains(id))
+            .copied()
+            .collect();
+        let orphaned_calls: Vec<&str> = call_ids
+            .iter()
+            .filter(|id| !result_ids.contains(id))
+            .copied()
+            .collect();
+        assert!(
+            orphaned_results.is_empty() && orphaned_calls.is_empty(),
+            "module doc: tool-call/result pairs are never split — the compacted \
+             list carries results without their calls {orphaned_results:?} and \
+             calls without their results {orphaned_calls:?}"
+        );
+        assert!(
+            call_ids.contains(&"c1") && result_ids.contains(&"c1"),
+            "the pair the pull exists to repair must survive it"
+        );
+    }
+
+    #[test]
+    fn token_splitter_does_not_separate_a_call_from_its_result() {
+        // The only boundary at or before the target sits between the
+        // call and its result — a user message delivering tool results
+        // continues the same turn, so the splitter must preserve the
+        // whole conversation rather than split the pair.
+        let messages = vec![
+            Message::user("q1"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "c1",
+                    "Read",
+                    json!({"path": "a.rs"}),
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "c1",
+                    "Read",
+                    tool_text("ok"),
+                    false,
+                )],
+            ),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+            Message::user("q3"),
+        ];
+        let splitter = TokenSplitter::new()
+            .with_min_messages(4)
+            .with_preserve_recent(5);
+        let split = splitter.split(&messages);
+        let old_calls: Vec<&str> = split
+            .to_compact
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                MessagePart::ToolCall { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let new_results: Vec<&str> = split
+            .preserved
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                MessagePart::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let separated: Vec<&str> = new_results
+            .iter()
+            .filter(|id| old_calls.contains(id))
+            .copied()
+            .collect();
+        assert!(
+            separated.is_empty(),
+            "the split must never put a call into to_compact while its \
+             result stays in preserved (split_index {}); the splitter \
+             keeps the whole conversation instead",
+            split.split_index
+        );
+    }
+
+    #[test]
+    fn splitter_skips_boundaries_that_straddle_a_later_result() {
+        // The boundary candidate itself carries no tool results, but a
+        // consecutive user message behind it delivers a result for a
+        // call that would be split off — the boundary is not pair-safe.
+        let messages = vec![
+            Message::user("q1"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "c1",
+                    "Read",
+                    json!({"path": "a.rs"}),
+                )],
+            ),
+            Message::user("ack"),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "c1",
+                    "Read",
+                    tool_text("ok"),
+                    false,
+                )],
+            ),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+        ];
+        let splitter = TokenSplitter::new()
+            .with_min_messages(4)
+            .with_preserve_recent(5);
+        let split = splitter.split(&messages);
+        assert_eq!(
+            split.split_index, 0,
+            "a boundary that strands a call behind a result delivered in a \
+             later message is not pair-safe — nothing is split"
+        );
+        assert!(
+            split.to_compact.is_empty(),
+            "the whole conversation stays preserved"
         );
     }
 }

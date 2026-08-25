@@ -780,6 +780,10 @@ impl ApiClient for MockApiClient {
     /// future resolves to an [`ApiError`] instead, bypassing the
     /// response queue entirely.
     ///
+    /// Usage mirrors the streaming twin: the response reports 50 input
+    /// tokens and 25 output tokens, so tests assert the same usage on
+    /// either path.
+    ///
     /// The `_request` parameter is accepted for trait compatibility but ignored.
     ///
     /// # Example
@@ -816,7 +820,7 @@ impl ApiClient for MockApiClient {
             Ok(crate::api::NonStreamingResponse {
                 message: Message::new(Role::Assistant, parts),
                 stop_reason,
-                usage: Some(crate::stream::Usage::default()),
+                usage: Some(crate::stream::Usage::new(50, 25)),
             })
         })
     }
@@ -1664,6 +1668,74 @@ mod tests {
         assert!(
             response.message.tool_call_parts().len() == 1,
             "the tool call rides alongside the text, mirroring the streaming twin"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_usage_matches_across_streaming_and_non_streaming() {
+        use futures::StreamExt;
+
+        let stream_client = MockApiClient::new("test-model").with_text_response("hi");
+        let mut stream = stream_client.stream_messages(&crate::api::StreamRequest::new(vec![]));
+        let mut streamed_usage = None;
+        while let Some(item) = stream.next().await {
+            if let Ok(crate::stream::StreamEvent::MessageDelta(delta)) = item {
+                streamed_usage = delta.usage;
+            }
+        }
+
+        let create_client = MockApiClient::new("test-model").with_text_response("hi");
+        let response = create_client
+            .create_message(&crate::api::StreamRequest::new(vec![]))
+            .await
+            .expect("mock must respond");
+
+        assert_eq!(
+            streamed_usage, response.usage,
+            "one mock, one usage story: the streaming twin reports \
+             {streamed_usage:?} while create_message reports {:?}",
+            response.usage
+        );
+    }
+
+    #[tokio::test]
+    async fn one_mock_response_builds_the_same_message_on_both_paths() {
+        use futures::StreamExt;
+
+        let scripted = MockResponse {
+            text: "Let me look that up.".to_string(),
+            tool_call: Some(MockToolCall {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                input: json!({"query": "loop"}),
+            }),
+            stop_reason: "tool_use".to_string(),
+        };
+        let client = MockApiClient::new("test-model").with_responses(vec![scripted]);
+
+        let mut stream = client.stream_messages(&crate::api::StreamRequest::new(vec![]));
+        let mut accumulator = crate::stream::StreamAccumulator::new();
+        while let Some(item) = stream.next().await {
+            accumulator
+                .process(&item.expect("mock stream must not carry errors"))
+                .expect("accumulator accepts mock events");
+        }
+        let streamed = accumulator.build();
+
+        let response = client
+            .create_message(&crate::api::StreamRequest::new(vec![]))
+            .await
+            .expect("mock must respond");
+
+        assert_eq!(
+            streamed.text_content(),
+            response.message.text_content(),
+            "the same scripted response must produce the same text on both paths"
+        );
+        assert_eq!(
+            streamed.tool_call_parts(),
+            response.message.tool_call_parts(),
+            "the same scripted response must produce the same tool call on both paths"
         );
     }
 

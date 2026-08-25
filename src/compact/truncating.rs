@@ -140,8 +140,19 @@ impl ContextCompactor for TruncatingCompactor {
             // Adjust split to avoid orphaning tool-call/result pairs.
             // If the "recent" portion contains a ToolResult whose matching
             // ToolCall would be dropped, move the split back to include the
-            // message containing that ToolCall.
-            let split = Self::adjust_for_tool_pairs(&messages, initial_split);
+            // message containing that ToolCall. Each backward move admits
+            // previously dropped messages that can themselves carry results
+            // whose calls stay dropped, so re-adjust until the split stops
+            // moving: the adjustment is non-increasing and bottoms out at
+            // 0, so the loop always terminates.
+            let mut split = initial_split;
+            loop {
+                let adjusted = Self::adjust_for_tool_pairs(&messages, split);
+                if adjusted == split {
+                    break;
+                }
+                split = adjusted;
+            }
 
             // A split of 0 means the adjustment pulled the whole
             // conversation into the recent slice — nothing is dropped, so
@@ -772,6 +783,82 @@ mod tests {
         assert!(
             !has_tool_result(&outcome.messages, "call_c"),
             "tool-result for 'call_c' should be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_rechecks_newly_admitted_messages_for_orphaned_results() {
+        // Interleaved ordering: pulling the split back for result "z"
+        // admits a message carrying result "w" whose call stays dropped.
+        // The adjustment must be re-applied until the split is stable, or
+        // an unmatched result reaches the compacted output.
+        let messages = vec![
+            Message::user("q0"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call("w", "Read", json!({"path": "w.rs"}))],
+            ),
+            Message::user("intermediate"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call("z", "Read", json!({"path": "z.rs"}))],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "w",
+                    "Read",
+                    tool_text("ok"),
+                    false,
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "z",
+                    "Read",
+                    tool_text("ok"),
+                    false,
+                )],
+            ),
+            Message::assistant("done"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_preserve_recent(2)
+            .with_min_messages(4);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 500, context).await;
+
+        let call_ids: Vec<&str> = outcome
+            .messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                MessagePart::ToolCall { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let result_ids: Vec<&str> = outcome
+            .messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                MessagePart::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let orphaned_results: Vec<&str> = result_ids
+            .iter()
+            .filter(|id| !call_ids.contains(id))
+            .copied()
+            .collect();
+        assert!(
+            orphaned_results.is_empty(),
+            "newly admitted messages must be rechecked for orphaned results: {orphaned_results:?}"
+        );
+        assert!(
+            has_tool_call(&outcome.messages, "w") && has_tool_result(&outcome.messages, "w"),
+            "the second adjustment must pull in call 'w' alongside its admitted result"
         );
     }
 

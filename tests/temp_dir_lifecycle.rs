@@ -3,8 +3,11 @@
 //! Pins the [`ToolContext::temp_dir`](loopctl::tool::ToolContext::temp_dir)
 //! contract: a loop-built context names a per-session subdir under the
 //! configured base, the subdir is materialised lazily on first dispatch,
-//! dropping the loop removes it (best-effort, never a panic), and the
-//! host can override the base or opt out entirely.
+//! dropping the loop removes it (best-effort, never a panic) — including
+//! via the husk dropped by [`into_machine`](loopctl::engine::BareLoop::into_machine)
+//! — and the host can override the base or opt out entirely. A
+//! randomized sequence test holds the leak-freedom property across
+//! dispatch, checkpoint-resume, and loop-replacement legs.
 //!
 //! Requires the `testing` feature.
 
@@ -85,13 +88,10 @@ fn unique_base() -> PathBuf {
     ))
 }
 
-/// Build a loop that dispatches the capture tool once per run for the
-/// next `dispatches` runs, finishing each run afterwards.
-fn loop_with_dispatches(
-    seen: Arc<Mutex<Vec<(String, String)>>>,
-    dispatches: usize,
-) -> BareLoop<MockApiClient> {
-    let single = vec![
+/// One scripted round: a response dispatching the capture tool, then a
+/// terminal reply.
+fn scripted_pair() -> Vec<MockResponse> {
+    vec![
         MockResponse {
             text: "let me check".to_string(),
             tool_call: Some(MockToolCall {
@@ -106,8 +106,16 @@ fn loop_with_dispatches(
             tool_call: None,
             stop_reason: "end_turn".to_string(),
         },
-    ];
-    let responses = (0..dispatches).flat_map(|_| single.clone()).collect();
+    ]
+}
+
+/// Build a loop that dispatches the capture tool once per run for the
+/// next `dispatches` runs, finishing each run afterwards.
+fn loop_with_dispatches(
+    seen: Arc<Mutex<Vec<(String, String)>>>,
+    dispatches: usize,
+) -> BareLoop<MockApiClient> {
+    let responses = (0..dispatches).flat_map(|_| scripted_pair()).collect();
     let client = MockApiClient::new("test-model").with_responses(responses);
     let mut registry = ToolRegistry::new();
     registry.register(CaptureCtxTool { seen });
@@ -203,6 +211,27 @@ async fn drop_removes_the_materialised_subdir() {
     assert!(
         std::fs::metadata(&temp_dir).is_err(),
         "dropping the loop must remove its per-session subdir: {temp_dir}"
+    );
+}
+
+#[tokio::test]
+async fn into_machine_cleans_the_session_temp_via_the_dropped_husk() {
+    let base = unique_base();
+    let _guard = ScratchGuard(base.clone());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut loop_ = loop_with_dispatches(Arc::clone(&seen), 1).with_temp_dir(base.clone());
+    let (temp_dir, _) = dispatch_and_capture(&mut loop_, seen).await;
+    assert!(
+        std::fs::metadata(&temp_dir).is_ok(),
+        "precondition: the subdir exists after dispatch"
+    );
+
+    let _machine = loop_.into_machine();
+    assert!(
+        std::fs::metadata(&temp_dir).is_err(),
+        "consuming the loop for its machine drops the husk, whose drop \
+         removes the session temp — the checkpoint path leaks nothing: \
+         {temp_dir}"
     );
 }
 
@@ -375,4 +404,88 @@ async fn drop_swallows_io_errors_from_cleanup() {
         std::fs::metadata(&temp_dir).is_ok(),
         "the blocked removal must leave the path untouched, and drop must not panic"
     );
+}
+
+/// A deterministic linear-congruential generator.
+///
+/// A fixed seed keeps the sequence reproducible by iteration number.
+struct Lcg(u64);
+
+impl Lcg {
+    /// Advance the generator and return the new high bits.
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 16
+    }
+
+    /// Draw a value below `n`.
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+#[tokio::test]
+async fn random_lifecycle_sequences_never_leak_session_dirs() {
+    let mut rng = Lcg(0xABCD_1234);
+    for iter in 0..300 {
+        let base = unique_base();
+        std::fs::create_dir_all(&base).expect("created scratch base");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        let mut loop_ = loop_with_dispatches(Arc::clone(&seen), 1).with_temp_dir(base.clone());
+        let mut dispatches: u32 = 0;
+        let rounds = 1 + rng.below(4);
+        for _ in 0..rounds {
+            match rng.below(3) {
+                0 | 1 => {
+                    loop_.run("q", &RunConfig::default()).await.expect("run");
+                    dispatches = dispatches.saturating_add(1);
+                }
+                _ => {
+                    // Replace the loop mid-life: via into_machine while
+                    // the machine is still Start (never run), otherwise
+                    // via a plain drop + fresh construction. Both paths
+                    // must clean the outgoing loop's session dir.
+                    if dispatches == 0 {
+                        let machine = loop_.into_machine();
+                        let client =
+                            MockApiClient::new("test-model").with_responses(scripted_pair());
+                        let mut registry = ToolRegistry::new();
+                        registry.register(CaptureCtxTool {
+                            seen: Arc::clone(&seen),
+                        });
+                        loop_ = BareLoop::from_machine(
+                            machine,
+                            SessionConfig::default(),
+                            Arc::new(client),
+                            registry,
+                        )
+                        .with_temp_dir(base.clone());
+                    } else {
+                        drop(loop_);
+                        loop_ =
+                            loop_with_dispatches(Arc::clone(&seen), 1).with_temp_dir(base.clone());
+                    }
+                }
+            }
+        }
+        drop(loop_);
+
+        let leftovers: Vec<String> = std::fs::read_dir(&base)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "iter {iter}: session dirs outlived their loops: {leftovers:?} \
+             ({dispatches} dispatches)"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
 }

@@ -36,11 +36,12 @@ mod scenarios {
         HeuristicTokenCounter, TokenCounter,
     };
     use loopctl::config::SessionConfig;
+    use loopctl::contributor::{ContextContributor, ContributorContext};
     use loopctl::engine::core::Loop;
     use loopctl::engine::{BareLoop, RunConfig};
     use loopctl::error::LoopError;
     use loopctl::message::Message;
-    use loopctl::observer::{CompactedContext, LoopObserver};
+    use loopctl::observer::{CompactedContext, LoopObserver, TurnStartContext};
     use loopctl::stream::StreamEvent;
     use loopctl::testing::{MockApiClient, MockResponse, MockToolCall};
     use loopctl::tool::{Tool, ToolContext, ToolOutput, ToolRegistry, ToolSchema};
@@ -60,7 +61,14 @@ mod scenarios {
         }
 
         fn record(&self, request: &StreamRequest) {
-            let tokens = HeuristicTokenCounter.count(&request.messages);
+            let mut tokens = HeuristicTokenCounter.count(&request.messages);
+            if let Some(system) = &request.system {
+                tokens += HeuristicTokenCounter.count(&[Message::user(system.clone())]);
+            }
+            if let Some(tools) = &request.tools {
+                let rendered = serde_json::to_string(tools).unwrap_or_default();
+                tokens += HeuristicTokenCounter.count(&[Message::user(rendered)]);
+            }
             self.request_tokens
                 .lock()
                 .expect("request log lock")
@@ -100,6 +108,44 @@ mod scenarios {
 
     struct CompactionCounter {
         events: AtomicUsize,
+    }
+
+    /// A contributor injecting a fixed chunk of transient context.
+    struct ChunkyContributor {
+        chars: usize,
+    }
+
+    impl ContextContributor for ChunkyContributor {
+        fn contribute(&self, _ctx: &ContributorContext<'_>) -> Option<Message> {
+            Some(Message::user("m".repeat(self.chars)))
+        }
+    }
+
+    /// A contributor that counts its consultations.
+    struct CountingContributor {
+        consultations: Arc<AtomicUsize>,
+    }
+
+    impl ContextContributor for CountingContributor {
+        fn contribute(&self, _ctx: &ContributorContext<'_>) -> Option<Message> {
+            self.consultations.fetch_add(1, Ordering::SeqCst);
+            Some(Message::user("m".repeat(400)))
+        }
+    }
+
+    /// An observer counting turn starts.
+    struct TurnStartCounter {
+        starts: Arc<AtomicUsize>,
+    }
+
+    impl LoopObserver for TurnStartCounter {
+        fn name(&self) -> &'static str {
+            "TurnStartCounter"
+        }
+
+        fn on_turn_start(&self, _ctx: &TurnStartContext) {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     impl LoopObserver for CompactionCounter {
@@ -232,8 +278,8 @@ mod scenarios {
         );
         for tokens in &served {
             assert!(
-                *tokens <= 200,
-                "no request may exceed the 200-token window; served estimates {served:?}"
+                *tokens <= 260,
+                "no request may exceed the 260-token window; served estimates {served:?}"
             );
         }
     }
@@ -248,12 +294,12 @@ mod scenarios {
         let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
 
         let config = SessionConfig::default()
-            .with_context_window(200)
+            .with_context_window(260)
             .with_compact_threshold(80);
         let client_handle = client.clone();
         let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
 
-        let first = agent.run(&"x".repeat(600), &RunConfig::default()).await;
+        let first = agent.run(&"x".repeat(500), &RunConfig::default()).await;
         assert!(
             first.is_ok(),
             "the first run starts under the threshold and completes: {first:?}"
@@ -327,7 +373,7 @@ mod scenarios {
         });
 
         let config = SessionConfig::default()
-            .with_context_window(600)
+            .with_context_window(700)
             .with_compact_threshold(80);
         let client_handle = client.clone();
         let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
@@ -367,9 +413,109 @@ mod scenarios {
         );
         for tokens in &served {
             assert!(
-                *tokens <= 600,
-                "no request may exceed the 600-token window; served \
+                *tokens <= 700,
+                "no request may exceed the 700-token window; served \
                  estimates {served:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn served_requests_count_the_whole_payload() {
+        // The invariant the history-scoped checks never pinned: the
+        // provider receives transients + history + system prompt +
+        // tool schemas, and no served request may exceed the window
+        // once the whole payload is counted.
+        let script = vec![
+            tool_turn_response(0, 40),
+            tool_turn_response(1, 40),
+            final_response(),
+        ];
+        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+
+        let config = SessionConfig::default()
+            .with_context_window(250)
+            .with_compact_threshold(80)
+            .with_system_prompt("s".repeat(200));
+        let client_handle = client.clone();
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+        agent.add_contributor(Box::new(ChunkyContributor { chars: 300 }));
+
+        let _outcome = agent.run("count everything", &RunConfig::default()).await;
+
+        let served = client_handle.served_request_tokens();
+        assert!(
+            !served.is_empty(),
+            "the run must attempt at least one request"
+        );
+        for tokens in &served {
+            assert!(
+                *tokens <= 250,
+                "no served request may exceed the window once history, \
+                 system prompt, tool schemas, and transients are all \
+                 counted; served {served:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_overload_defers_to_compaction_and_the_retry_proceeds() {
+        // The deferral contract: a turn whose transients push the
+        // payload over the threshold defers to compaction before its
+        // request — the deferred attempt fires no turn events, the
+        // retried turn re-consults the contributor against the
+        // compacted history, and its request is then served under the
+        // window.
+        let script = vec![
+            tool_turn_response(0, 40),
+            tool_turn_response(1, 40),
+            tool_turn_response(2, 40),
+            final_response(),
+        ];
+        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let consultations = Arc::new(AtomicUsize::new(0));
+        let starts = Arc::new(AtomicUsize::new(0));
+
+        let config = SessionConfig::default()
+            .with_context_window(400)
+            .with_compact_threshold(80);
+        let client_handle = client.clone();
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+        agent.add_contributor(Box::new(CountingContributor {
+            consultations: Arc::clone(&consultations),
+        }));
+        agent.register_observer(Arc::new(TurnStartCounter {
+            starts: Arc::clone(&starts),
+        }) as Arc<dyn LoopObserver>);
+
+        let result = agent.run("defer then retry", &RunConfig::default()).await;
+        assert!(
+            result.is_ok(),
+            "the deferring run compacts and completes: {result:?}"
+        );
+
+        let served = client_handle.served_request_tokens();
+        assert!(
+            !served.is_empty(),
+            "the deferred turn's retry must reach the provider"
+        );
+        assert!(
+            consultations.load(Ordering::SeqCst) > starts.load(Ordering::SeqCst),
+            "at least one consultation was consumed by a deferral — every \
+             served turn consults once, a deferred attempt consults \
+             without a turn starting"
+        );
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            served.len(),
+            "a deferred attempt fires no turn events — one turn start per \
+             served request"
+        );
+        for tokens in &served {
+            assert!(
+                *tokens <= 400,
+                "every served request carries the whole payload under the \
+                 window; served {served:?}"
             );
         }
     }

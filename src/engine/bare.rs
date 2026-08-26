@@ -254,12 +254,20 @@ pub struct BareLoop<C: ApiClient> {
 
     /// Turn-boundary context contributors.
     ///
-    /// Each registered contributor is consulted at the top of every turn
-    /// (after [`on_turn_start`](crate::observer::LoopObserver::on_turn_start),
-    /// before the model call); any message it returns is appended to the
-    /// conversation in registration order. Register via
+    /// Each registered contributor is consulted at the top of every turn,
+    /// before the model call and before that turn's observer events —
+    /// their messages are measured into the context estimate ahead of
+    /// the compaction decision, so a turn whose transients cross the
+    /// line defers to compaction rather than serving them unchecked.
+    /// Any message returned is prepended to the request in
+    /// registration order. Register via
     /// [`add_contributor`](BareLoop::add_contributor).
     contributors: Vec<Box<dyn ContextContributor>>,
+
+    /// Cached token cost of the per-request overhead (system prompt +
+    /// tool schemas), measured at first use — register tools before
+    /// the first run for the measurement to see them.
+    overhead: std::sync::OnceLock<u64>,
 
     /// Per-turn `RequestOptions` applied to every provider call.
     ///
@@ -459,6 +467,7 @@ impl<C: ApiClient> BareLoop<C> {
             #[cfg(feature = "streaming")]
             text_streamer: None,
             contributors: Vec::new(),
+            overhead: std::sync::OnceLock::new(),
             request_options: RequestOptions::default(),
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
@@ -584,6 +593,40 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
+    /// The token cost of the per-request overhead: the session system
+    /// prompt plus the advertised tool schemas.
+    ///
+    /// Both ride every outbound request but never enter the history
+    /// the machine's estimate counts, so every estimate feed adds this
+    /// on top — the window policy then compares against the payload
+    /// the provider actually receives. A turn running under a
+    /// `response_format` constraint suppresses its tools, so the
+    /// estimate over-reserves for that turn — conservative, never
+    /// under. Measured once at first use (register tools before the
+    /// first run for the measurement to see them) with the same
+    /// counter `count_context` uses, by counting each as a synthetic
+    /// message.
+    fn overhead_tokens(&self) -> u64 {
+        *self.overhead.get_or_init(|| {
+            let system = self
+                .session
+                .config
+                .system_prompt
+                .as_ref()
+                .map_or(0, |prompt| {
+                    self.count_context(&[Message::user(prompt.clone())])
+                });
+            let schemas = self.tools.all_schemas();
+            let tools = if schemas.is_empty() {
+                0
+            } else {
+                serde_json::to_string(&schemas)
+                    .map_or(0, |rendered| self.count_context(&[Message::user(rendered)]))
+            };
+            system.saturating_add(tools)
+        })
+    }
+
     /// Borrow the driving state machine.
     ///
     /// Returns a reference to the [`LoopMachine`] that owns the current run's
@@ -645,6 +688,7 @@ impl<C: ApiClient> BareLoop<C> {
             #[cfg(feature = "streaming")]
             text_streamer: None,
             contributors: Vec::new(),
+            overhead: std::sync::OnceLock::new(),
             request_options: RequestOptions::default(),
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
@@ -942,10 +986,29 @@ impl<C: ApiClient> BareLoop<C> {
         let turn_start = Instant::now();
         let turn_input = self.turn_input(turn);
 
-        self.notify_turn_start(turn, &turn_input);
-
         let mut messages = self.collect_contributor_messages(turn);
         self.collect_memories(&turn_input, &mut messages).await;
+
+        // The transients ride this turn's request but not the history:
+        // feed their size (plus the per-request overhead) before the
+        // request goes out, and re-check the machine — if the payload
+        // now crosses the line, the step becomes `Compact` and this
+        // turn defers to the outer loop's compaction arm (turn events
+        // have not fired yet; `next_step` is idempotent, so the
+        // re-check is a pure re-decision).
+        let payload = self
+            .count_context(&self.machine.full_history())
+            .saturating_add(self.overhead_tokens())
+            .saturating_add(self.count_context(&messages));
+        self.machine.set_context_tokens(payload);
+        if matches!(
+            self.machine.next_step(self.machine_policy()),
+            MachineStep::Compact { .. }
+        ) {
+            return Ok(());
+        }
+
+        self.notify_turn_start(turn, &turn_input);
 
         let turn_outcome = self.do_turn(turn, messages).await;
         let (msg, usage, stream_stop) = match turn_outcome {
@@ -1031,7 +1094,9 @@ impl<C: ApiClient> BareLoop<C> {
         };
         let mut context_history = self.machine.full_history();
         context_history.push(model_response.message.clone());
-        let context_tokens = self.count_context(&context_history);
+        let context_tokens = self
+            .count_context(&context_history)
+            .saturating_add(self.overhead_tokens());
         self.machine.model_response(model_response, context_tokens);
 
         let turn_index = turn;
@@ -1269,7 +1334,9 @@ impl<C: ApiClient> BareLoop<C> {
             Role::User,
             slots.into_iter().flatten().collect(),
         )]);
-        let estimate = self.count_context(&self.machine.full_history());
+        let estimate = self
+            .count_context(&self.machine.full_history())
+            .saturating_add(self.overhead_tokens());
         self.machine.set_context_tokens(estimate);
         Ok(())
     }
@@ -1353,7 +1420,9 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             self.session.runs.push(Run::new(input, run_config));
             self.notify_run_start();
             self.machine.accept_input(input);
-            let estimate = self.count_context(&self.machine.full_history());
+            let estimate = self
+                .count_context(&self.machine.full_history())
+                .saturating_add(self.overhead_tokens());
             self.machine.set_context_tokens(estimate);
 
             loop {

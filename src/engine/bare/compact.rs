@@ -86,7 +86,9 @@ impl<C: ApiClient> BareLoop<C> {
         reason: crate::compact::types::CompactReason,
     ) -> Result<CompactStepOutcome, LoopError> {
         let history = self.machine.full_history();
-        let tokens_before = self.count_context(&history);
+        let tokens_before = self
+            .count_context(&history)
+            .saturating_add(self.overhead_tokens());
         let Some(ctx_manager) = self.managers.context_manager() else {
             return Ok(CompactStepOutcome {
                 tokens_before,
@@ -144,7 +146,9 @@ impl<C: ApiClient> BareLoop<C> {
                 })
             }
             Ok(EnsureContextResult::NoAction(messages)) => {
-                let tokens_after = self.count_context(&messages);
+                let tokens_after = self
+                    .count_context(&messages)
+                    .saturating_add(self.overhead_tokens());
                 Ok(CompactStepOutcome {
                     tokens_before,
                     tokens_after,
@@ -180,7 +184,9 @@ impl<C: ApiClient> BareLoop<C> {
         let Some(executor) = self.managers.hook_executor() else {
             return crate::hooks::context::CompactResult::allow();
         };
-        let tokens_before = crate::compact::CompactionOutcome::estimate_tokens(history);
+        let tokens_before = self
+            .count_context(history)
+            .saturating_add(self.overhead_tokens());
         let ctx = PreCompactContext {
             trigger: CompactTrigger::from(reason),
             custom_instructions: None,

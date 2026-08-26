@@ -122,7 +122,7 @@ impl<C: ApiClient> BareLoop<C> {
 
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
-                let tokens_after = outcome.tokens_after;
+                let tokens_after = outcome.tokens_after.saturating_add(self.overhead_tokens());
                 let tokens_saved = tokens_before.saturating_sub(tokens_after);
                 #[cfg(feature = "hooks")]
                 let messages_after = outcome.messages.len();

@@ -981,7 +981,6 @@ impl<C: ApiClient> BareLoop<C> {
         {
             return Err(LoopError::FallbackExhausted);
         }
-        self.note_routed_model();
 
         let turn_start = Instant::now();
         let turn_input = self.turn_input(turn);
@@ -994,8 +993,9 @@ impl<C: ApiClient> BareLoop<C> {
         // request goes out, and re-check the machine — if the payload
         // now crosses the line, the step becomes `Compact` and this
         // turn defers to the outer loop's compaction arm (turn events
-        // have not fired yet; `next_step` is idempotent, so the
-        // re-check is a pure re-decision).
+        // and model-switch bookkeeping have not fired yet;
+        // `next_step` is idempotent, so the re-check is a pure
+        // re-decision).
         let payload = self
             .count_context(&self.machine.full_history())
             .saturating_add(self.overhead_tokens())
@@ -1007,6 +1007,7 @@ impl<C: ApiClient> BareLoop<C> {
         ) {
             return Ok(());
         }
+        self.note_routed_model();
 
         self.notify_turn_start(turn, &turn_input);
 

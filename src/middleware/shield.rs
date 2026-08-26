@@ -5,8 +5,10 @@
 //! call (the shield's `watched_tools` names the tools it inspects): a
 //! `Block` decision skips execution and surfaces as a soft error
 //! carrying the decision's reason (the model sees the refusal and can
-//! adapt; the run continues), while `Warn` and `Allow` proceed — advisory
-//! only, consistent with the shield's scoring contract. After the call,
+//! adapt; the run continues), while `Warn` proceeds and is emitted as
+//! a tracing warning carrying the decision's reason and category
+//! (advisory — the call still runs, consistent with the shield's
+//! scoring contract) and `Allow` proceeds. After the call,
 //! [`record_invocation`](crate::tool::shield::ToolSafetyShield::record_invocation)
 //! feeds the shield's internal history so multi-call combination rules
 //! (a `curl` followed by `| sh`) can fire across turns.
@@ -25,8 +27,9 @@ use crate::tool::shield::{SafetyAction, ShieldContext, ToolSafetyShield};
 /// Middleware enforcing a [`ToolSafetyShield`]'s decisions.
 ///
 /// Installed over a pipeline, it evaluates every watched call
-/// pre-dispatch and blocks (as a soft error) when the shield says
-/// `Block`. The shield is
+/// pre-dispatch: a `Block` decision becomes a soft error, and a
+/// `Warn` decision proceeds with its reason and category emitted
+/// as a tracing warning. The shield is
 /// shared behind an `Arc` so the same instance can serve a host's other
 /// evaluations; its internal history is updated by this middleware via
 /// `record_invocation`, so install it exactly once per session.
@@ -123,6 +126,16 @@ impl ToolMiddleware for SafetyShieldMiddleware {
             Some(true) => Some(self.shield.evaluate(&self.shield_ctx(ctx))),
             _ => None,
         };
+        if let Some(decision) = &decision
+            && decision.action == SafetyAction::Warn
+        {
+            tracing::warn!(
+                tool = %ctx.tool_name,
+                reason = decision.reason.as_deref().unwrap_or(""),
+                category = decision.category.as_deref().unwrap_or(""),
+                "safety shield warning"
+            );
+        }
         Box::pin(async move {
             if let Some(decision) = decision
                 && decision.action == SafetyAction::Block

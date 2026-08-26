@@ -342,7 +342,10 @@ pub struct ShieldContext {
     pub turn: usize,
 
     /// The most recent tool invocations in this session — the last 20
-    /// the middleware admitted — as `(tool_name, turn)` pairs.
+    /// the middleware admitted — as `(tool_name, turn)` pairs, in
+    /// arrival order (turns may interleave under parallel dispatch)
+    /// and snapshotted at evaluation time, before the current call's
+    /// own append.
     ///
     /// A read-only snapshot provided by the middleware for shields that
     /// prefer not to maintain their own history. Shields that *do*
@@ -369,7 +372,7 @@ pub struct ShieldContext {
 /// token boundaries, and a boundary is required only where the
 /// pattern's own edge is a word character — a symbol edge (`|`, `/`,
 /// `.`) cannot be extended into a longer token: `/etc/` matches
-/// `/etc/passwd` and `| sh` matches `cmd|sh`, while `| sh` does not
+/// `/etc/passwd` and `|sh` matches `cmd|sh`, while `| sh` does not
 /// match `| sha256sum` and `curl` does not match `mycurlcmd`. There
 /// is no regex and no JSON-aware path matching. Patterns must still
 /// be chosen so that a hit implies the intended risk (a bare `"rm"`
@@ -693,8 +696,9 @@ impl UnixShield {
     /// A boundary is required only where the pattern's own edge is a
     /// word character — a symbol edge (`|`, `/`, `.`) cannot be
     /// extended into a longer token, so it carries no adjacent
-    /// constraint: `/etc/` matches `/etc/passwd`, `| sh` matches
-    /// `cmd|sh` and `cmd | sh`. The word-character edges keep their
+    /// constraint: `/etc/` matches `/etc/passwd`, `|sh` matches
+    /// `cmd|sh`, and `| sh` matches `cmd | sh`. The word-character
+    /// edges keep their
     /// discipline: `| sh` does not match `| sha256sum`, and `curl`
     /// matches `curl http…` but not `mycurlcmd`. An empty or
     /// whitespace-only pattern matches nothing (a needle with no

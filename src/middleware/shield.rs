@@ -1,8 +1,9 @@
 //! Safety-shield enforcement for tool dispatch.
 //!
 //! [`SafetyShieldMiddleware`] wraps the dispatch pipeline and consults a
-//! [`ToolSafetyShield`] before every
-//! call: a `Block` decision skips execution and surfaces as a soft error
+//! [`ToolSafetyShield`] before every watched
+//! call (the shield's `watched_tools` names the tools it inspects): a
+//! `Block` decision skips execution and surfaces as a soft error
 //! carrying the decision's reason (the model sees the refusal and can
 //! adapt; the run continues), while `Warn` and `Allow` proceed — advisory
 //! only, consistent with the shield's scoring contract. After the call,
@@ -23,11 +24,27 @@ use crate::tool::shield::{SafetyAction, ShieldContext, ToolSafetyShield};
 
 /// Middleware enforcing a [`ToolSafetyShield`]'s decisions.
 ///
-/// Installed over a pipeline, it evaluates every call pre-dispatch and
-/// blocks (as a soft error) when the shield says `Block`. The shield is
+/// Installed over a pipeline, it evaluates every watched call
+/// pre-dispatch and blocks (as a soft error) when the shield says
+/// `Block`. The shield is
 /// shared behind an `Arc` so the same instance can serve a host's other
 /// evaluations; its internal history is updated by this middleware via
 /// `record_invocation`, so install it exactly once per session.
+///
+/// The shield evaluates the tool name as it reaches this layer.
+/// Middleware may rewrite [`ctx.tool_name`](ToolDispatchContext::tool_name)
+/// to redirect a call; install this middleware *after* (inside) any
+/// name-rewriting layer so aliases are evaluated under the name the
+/// registry will execute. A rewriter placed inside the shield redirects
+/// after evaluation, and the aliased call runs unshielded. For the
+/// same reason, install it *before* (outside)
+/// [`MemoizingMiddleware`](super::MemoizingMiddleware): a repeat
+/// served from an inner cache is still evaluated and recorded — the
+/// repetition dimension scores the model's behavior, not the tool's
+/// execution. The post-call record (`record_invocation`,
+/// `recent_calls`) describes the call as this middleware evaluated
+/// it: a name or input rewritten by an inner layer does not leak into
+/// the shield's history.
 ///
 /// # Example
 ///
@@ -49,15 +66,17 @@ pub struct SafetyShieldMiddleware {
     /// alongside this middleware.
     shield: Arc<dyn ToolSafetyShield>,
 
-    /// `(tool_name, turn)` for every executed call this middleware
-    /// dispatched.
+    /// `(tool_name, turn)` for the most recent 20 calls this
+    /// middleware dispatched.
     ///
     /// The snapshot source for
     /// [`ShieldContext::recent_calls`](crate::tool::shield::ShieldContext::recent_calls):
     /// shields that prefer not to keep their own history read the
     /// context field; shields that do (like `UnixShield`) ignore it.
-    /// Appended only for executed calls — blocked attempts never
-    /// happened, so they never enter the record.
+    /// A recency window, not a session archive — the per-evaluation
+    /// snapshot stays constant-cost. Blocked attempts never happened,
+    /// so they never enter the record; with an inner memoizer, a
+    /// cache-served repeat still enters — the call was made.
     recent: std::sync::Mutex<Vec<(String, usize)>>,
 }
 
@@ -110,7 +129,7 @@ impl ToolMiddleware for SafetyShieldMiddleware {
             {
                 let reason = decision.reason;
                 return ToolDispatchResult {
-                    tool_call_id: String::new(),
+                    tool_call_id: ctx.call_id.clone(),
                     output: ToolContent::Text(format!(
                         "blocked by safety shield: {}",
                         reason.as_deref().unwrap_or("high risk")
@@ -121,13 +140,18 @@ impl ToolMiddleware for SafetyShieldMiddleware {
                     display_hint: None,
                 };
             }
+            let (tool_name, input) = (ctx.tool_name.clone(), ctx.input.clone());
             let result = next.dispatch(ctx).await;
             if watched == Some(true) {
                 if let Ok(mut log) = self.recent.lock() {
-                    log.push((ctx.tool_name.clone(), ctx.turn_number));
+                    log.push((tool_name.clone(), ctx.turn_number));
+                    if log.len() > 20 {
+                        let drain_until = log.len().saturating_sub(20);
+                        log.drain(..drain_until);
+                    }
                 }
                 self.shield
-                    .record_invocation(&ctx.tool_name, &ctx.input, !result.is_error);
+                    .record_invocation(&tool_name, &input, !result.is_error);
             }
             result
         })

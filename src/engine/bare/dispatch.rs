@@ -1014,10 +1014,14 @@ impl<C: ApiClient> BareLoop<C> {
     /// unconditionally: middleware may synthesize or replay results (a
     /// memoize cache hit returns the first call's id), and only the
     /// engine knows which model-issued call each result answers. The
-    /// breaker gate keys on the *requested* tool name (no resolved name
-    /// exists before dispatch); health recording keys on the resolved
-    /// name when a routing middleware renamed the call — identical for
-    /// every in-tree pipeline, which renames nothing. Observer
+    /// breaker gate keys on the *requested* tool name because that is
+    /// the only name that exists before dispatch — renaming happens
+    /// inside the pipeline, as middleware rewrite `ctx.tool_name` on
+    /// the way to the core — so a host pipeline that renames diverges
+    /// the gate's key from the resolved name
+    /// [`record_tool_health`](Self::record_tool_health) records under;
+    /// the two key spaces are identical for every pipeline that
+    /// renames nothing (no in-tree middleware renames). Observer
     /// notifications are handled by the caller
     /// ([`execute_tool_call`](Self::execute_tool_call)).
     async fn dispatch_via_pipeline(

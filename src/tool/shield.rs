@@ -327,8 +327,9 @@ pub struct ShieldContext {
     /// The JSON input passed to the tool.
     ///
     /// Shield patterns operate on the stringified form of this value
-    /// (substring matching), so any JSON-shaped input is admissible —
-    /// objects, arrays, primitives. The same value is later handed to
+    /// (see [`RiskPattern`] for the matching rules), so any JSON-shaped
+    /// input is admissible — objects, arrays, primitives. The same
+    /// value is later handed to
     /// [`ToolSafetyShield::record_invocation`] so the shield can store
     /// it for combination-rule matching.
     pub input: Value,
@@ -340,8 +341,8 @@ pub struct ShieldContext {
     /// decisions with the turn that produced them.
     pub turn: usize,
 
-    /// Recent tool invocations in this session, as `(tool_name, turn)`
-    /// pairs.
+    /// The most recent tool invocations in this session — the last 20
+    /// the middleware admitted — as `(tool_name, turn)` pairs.
     ///
     /// A read-only snapshot provided by the middleware for shields that
     /// prefer not to maintain their own history. Shields that *do*
@@ -356,15 +357,23 @@ pub struct ShieldContext {
 ///
 /// Patterns are stored per tool name. When a tool call is evaluated,
 /// its stringified JSON input is checked against every pattern
-/// registered for that tool name; any pattern whose `pattern` substring
-/// appears contributes its `score` to the single-turn risk dimension.
+/// registered for that tool name; any pattern whose `pattern` matches
+/// contributes its `score` to the single-turn risk dimension.
 ///
 /// # Matching
 ///
-/// Matching is plain substring search on `input.to_string()` — there is
-/// no regex, word-boundary, or JSON-aware path matching. Patterns must
-/// be chosen so that a substring match implies the intended risk (e.g.
-/// `"rm -rf"` is distinctive enough; a bare `"rm"` would over-match).
+/// Matching is substring search in a normalized view of
+/// `input.to_string()` — lowercased, whitespace runs collapsed to
+/// single spaces (JSON-escaped whitespace folds into the run, since
+/// matching operates on the stringified JSON). A hit counts only on
+/// token boundaries, and a boundary is required only where the
+/// pattern's own edge is a word character — a symbol edge (`|`, `/`,
+/// `.`) cannot be extended into a longer token: `/etc/` matches
+/// `/etc/passwd` and `| sh` matches `cmd|sh`, while `| sh` does not
+/// match `| sha256sum` and `curl` does not match `mycurlcmd`. There
+/// is no regex and no JSON-aware path matching. Patterns must still
+/// be chosen so that a hit implies the intended risk (a bare `"rm"`
+/// would over-match).
 #[derive(Clone)]
 pub struct RiskPattern {
     /// Human-readable name for diagnostics and log messages.
@@ -388,8 +397,8 @@ pub struct RiskPattern {
 
     /// Substring to search for in the stringified input.
     ///
-    /// Matched verbatim (no regex, no case folding). Picked so that a
-    /// substring hit reliably indicates the intended risk — see the
+    /// Matched case-insensitively in a whitespace-collapsed view of the
+    /// input, and only on token boundaries (no regex) — see the
     /// type-level docs on matching.
     pub pattern: &'static str,
 }
@@ -400,8 +409,9 @@ pub struct RiskPattern {
 /// appear in recent history or the current call, in the order specified.
 /// Each trigger is a `(tool_name, optional_substring)` pair: the
 /// `tool_name` must match exactly, and when the substring is present the
-/// trigger only fires if that substring is in the call's stringified
-/// input.
+/// trigger only fires if that substring matches the call's stringified
+/// input the way [`RiskPattern`] matching does — in the normalized
+/// view, on token boundaries.
 ///
 /// # Example
 ///
@@ -436,9 +446,10 @@ pub struct CombinationRule {
     /// The match is chronological against the candidate sequence
     /// (recorded history followed by the current call). Each trigger
     /// advances only when both the tool name matches and, if a
-    /// substring is supplied, that substring appears in the call's
-    /// stringified input. A `None` substring means "any call to this
-    /// tool".
+    /// substring is supplied, that substring matches the call's
+    /// stringified input the way [`RiskPattern`] patterns do —
+    /// normalized, on token boundaries; an empty substring matches
+    /// nothing. A `None` substring means "any call to this tool".
     pub triggers: &'static [(&'static str, Option<&'static str>)],
 }
 
@@ -494,8 +505,11 @@ pub trait ToolSafetyShield: Send + Sync {
     ///
     /// Optimization: the middleware consults this before calling
     /// [`evaluate`](Self::evaluate) and skips evaluation for tools not
-    /// in the set. Shields should return the keys of their per-tool
-    /// pattern database. An empty set means "no tools watched" and
+    /// in the set. Shields should return every tool they want
+    /// evaluated — the keys of their per-tool pattern database and
+    /// any tools named in combination-rule triggers (a
+    /// combination-only shield with a blank pattern table still names
+    /// its trigger tools). An empty set means "no tools watched" and
     /// causes the middleware to skip evaluation entirely (used by
     /// [`NullShield`] to be truly zero-cost).
     ///
@@ -649,8 +663,9 @@ impl UnixShield {
     /// Assess single-turn risk by matching the tool input against the
     /// patterns registered for that tool.
     ///
-    /// Stringifies `input` and substring-matches it against every
-    /// [`RiskPattern`] keyed under `tool_name`. When multiple patterns
+    /// Stringifies `input` and matches every [`RiskPattern`] keyed
+    /// under `tool_name` in the normalized, token-boundary view
+    /// described on [`RiskPattern`]. When multiple patterns
     /// match, the highest `score` among them is returned (a single
     /// dangerous pattern dominates several minor ones). Returns `0.0`
     /// when the tool has no registered patterns or none of them match.
@@ -675,31 +690,50 @@ impl UnixShield {
     /// Whether `pattern` occurs in `input` on token boundaries, in a
     /// normalized view of both.
     ///
-    /// A match counts only when the characters immediately before and
-    /// after it are absent or non-alphanumeric: `| sh` matches a real
-    /// pipe-to-shell (`… | sh`, `… | sh; …`) but not `| sha256sum`, and
-    /// `curl` matches `curl http…` but not `mycurlcmd`. Patterns are
+    /// A boundary is required only where the pattern's own edge is a
+    /// word character — a symbol edge (`|`, `/`, `.`) cannot be
+    /// extended into a longer token, so it carries no adjacent
+    /// constraint: `/etc/` matches `/etc/passwd`, `| sh` matches
+    /// `cmd|sh` and `cmd | sh`. The word-character edges keep their
+    /// discipline: `| sh` does not match `| sha256sum`, and `curl`
+    /// matches `curl http…` but not `mycurlcmd`. An empty or
+    /// whitespace-only pattern matches nothing (a needle with no
+    /// edges would otherwise match at every position). Patterns are
     /// substring-shaped; this is their word-boundary discipline.
     ///
     /// The normalized view lowercases and collapses each run of
-    /// whitespace to a single space, so trivial command polymorphism
-    /// cannot bypass a pattern: `rm  -rf` (double space), `RM -RF`
-    /// (case), and `rm\t-rf` (tab) all match `rm -rf`. Long-flag and
-    /// split-flag spellings (`rm --recursive`, `rm -r -f`) are separate
-    /// patterns, not normalization.
+    /// whitespace to a single space (JSON-escaped whitespace folds
+    /// into the run), so trivial command polymorphism cannot bypass a
+    /// pattern: `rm  -rf` (double space), `RM -RF` (case), and
+    /// `rm\t-rf` (tab) all match `rm -rf`. Long-flag and split-flag
+    /// spellings (`rm --recursive`, `rm -r -f`) are separate patterns,
+    /// not normalization.
     fn pattern_matches_on_token_boundaries(input: &str, pattern: &str) -> bool {
         let normalized_input = Self::normalize_for_matching(input);
         let normalized_pattern = Self::normalize_for_matching(pattern);
+        if normalized_pattern.trim().is_empty() {
+            return false;
+        }
+        let lead_word = normalized_pattern
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric);
+        let tail_word = normalized_pattern
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
         normalized_input
             .match_indices(normalized_pattern.as_str())
             .any(|(start, matched)| {
                 let end = start.saturating_add(matched.len());
-                let before_ok = start == 0
+                let before_ok = !lead_word
+                    || start == 0
                     || !normalized_input[..start]
                         .chars()
                         .next_back()
                         .is_some_and(char::is_alphanumeric);
-                let after_ok = end == normalized_input.len()
+                let after_ok = !tail_word
+                    || end == normalized_input.len()
                     || !normalized_input[end..]
                         .chars()
                         .next()
@@ -709,7 +743,8 @@ impl UnixShield {
     }
 
     /// Assess multi-turn risk by counting prior calls to the same tool
-    /// in the recorded history.
+    /// in the recorded history (the most recent 20 calls — older
+    /// entries age out).
     ///
     /// The score graduates with repetition so that a single repeat is
     /// mild but a long run of the same tool flags as suspicious:
@@ -733,15 +768,18 @@ impl UnixShield {
     }
 
     /// Assess combination risk by detecting dangerous sequences of
-    /// tool calls in recorded history plus the current call.
+    /// tool calls in recorded history plus the current call. The
+    /// history is the most recent 20 calls — a trigger older than
+    /// that no longer arms the rule.
     ///
     /// Each [`CombinationRule`] specifies an ordered sequence of
     /// triggers (`(tool_name, optional_substring)` pairs). The match
     /// walks the candidate sequence — recorded history followed by the
     /// current call — and advances a per-rule trigger pointer only
     /// when both the tool name matches and, if a substring is
-    /// supplied, that substring appears in the call's stringified
-    /// input. A rule fires when its pointer reaches the end of its
+    /// supplied, that substring matches the call's stringified input
+    /// the way [`RiskPattern`] patterns do. A rule fires when its
+    /// pointer reaches the end of its
     /// trigger list, contributing its `score`.
     ///
     /// When multiple rules fire, the highest score wins. Returns `0.0`
@@ -895,6 +933,11 @@ impl UnixShield {
                     pattern: "| sh",
                 },
                 RiskPattern {
+                    name: "shell_pipe_to_sh_compact",
+                    score: 0.8,
+                    pattern: "|sh",
+                },
+                RiskPattern {
                     name: "curl_usage",
                     score: 0.3,
                     pattern: "curl",
@@ -1012,7 +1055,15 @@ impl ToolSafetyShield for UnixShield {
     }
 
     fn watched_tools(&self) -> HashSet<String> {
-        self.patterns.keys().map(|k| (*k).to_string()).collect()
+        self.patterns
+            .keys()
+            .map(|k| (*k).to_string())
+            .chain(
+                self.combination_rules
+                    .iter()
+                    .flat_map(|rule| rule.triggers.iter().map(|(tool, _)| (*tool).to_string())),
+            )
+            .collect()
     }
 }
 

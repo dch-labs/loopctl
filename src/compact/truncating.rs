@@ -799,6 +799,9 @@ mod tests {
             context_window: 1_000,
             turn: 5,
             counter: std::sync::Arc::new(crate::compact::HeuristicTokenCounter),
+
+            instructions: None,
+            additional_context: Vec::new(),
         }
     }
 
@@ -1965,6 +1968,9 @@ mod tests {
             context_window: 8_000,
             turn: 3,
             counter: std::sync::Arc::new(crate::compact::HeuristicTokenCounter),
+
+            instructions: None,
+            additional_context: Vec::new(),
         };
         let outcome = compactor.compact(messages, 1, context).await;
         assert!(outcome.success);
@@ -1987,6 +1993,9 @@ mod tests {
             context_window: 8_000,
             turn: 3,
             counter: std::sync::Arc::new(crate::compact::HeuristicTokenCounter),
+
+            instructions: None,
+            additional_context: Vec::new(),
         };
         let outcome = compactor.compact(clean, 1, context).await;
         assert!(outcome.success);

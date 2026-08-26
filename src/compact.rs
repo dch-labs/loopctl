@@ -641,6 +641,8 @@ impl ContextManager {
             context_window: self.context_window,
             turn,
             counter: Arc::clone(&self.token_counter),
+            instructions: None,
+            additional_context: Vec::new(),
         };
         let outcome = self
             .compactor
@@ -698,7 +700,7 @@ impl ContextManager {
         messages: Vec<Message>,
         turn: usize,
     ) -> Result<EnsureContextResult, ContextOverflow> {
-        self.compact_with_reason(messages, turn, CompactReason::Manual)
+        self.compact_with_reason(messages, turn, CompactReason::Manual, None, Vec::new())
             .await
     }
 
@@ -726,6 +728,8 @@ impl ContextManager {
         messages: Vec<Message>,
         turn: usize,
         reason: CompactReason,
+        instructions: Option<String>,
+        additional_context: Vec<String>,
     ) -> Result<EnsureContextResult, ContextOverflow> {
         let tokens_before = self.estimate_tokens(&messages);
 
@@ -741,6 +745,8 @@ impl ContextManager {
             context_window: self.context_window,
             turn,
             counter: Arc::clone(&self.token_counter),
+            instructions,
+            additional_context,
         };
         let outcome = self
             .compactor
@@ -1044,6 +1050,9 @@ mod tests {
             context_window: 1_000,
             turn: 1,
             counter: Arc::new(HeuristicTokenCounter),
+
+            instructions: None,
+            additional_context: Vec::new(),
         };
         let outcome = compactor.compact(msgs.clone(), 500, context).await;
         assert!(outcome.success);
@@ -1064,6 +1073,9 @@ mod tests {
             context_window: 1_000,
             turn: 5,
             counter: Arc::new(HeuristicTokenCounter),
+
+            instructions: None,
+            additional_context: Vec::new(),
         };
         let outcome = compactor.compact(msgs, 500, context).await;
         assert!(outcome.success);

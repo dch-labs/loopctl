@@ -1,7 +1,12 @@
 //! Detection false positives: progressing runs must survive the detectors.
 //!
 //! Run: `cargo test --all-features --test detection_false_positives -- --nocapture`
+//!
+//! Requires the `streaming` feature: the scripted model responses drive
+//! the streaming engine path, and without it every run fails before the
+//! detectors are consulted (all 11 contracts fail spuriously).
 
+#![cfg(feature = "streaming")]
 #![allow(
     dead_code,
     clippy::unwrap_used,

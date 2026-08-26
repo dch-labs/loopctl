@@ -462,6 +462,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compact_trigger_maps_every_compaction_reason() {
+        use crate::compact::types::CompactReason;
+        assert_eq!(
+            CompactTrigger::from(CompactReason::ThresholdExceeded),
+            CompactTrigger::Auto
+        );
+        assert_eq!(
+            CompactTrigger::from(CompactReason::Emergency),
+            CompactTrigger::Auto
+        );
+        assert_eq!(
+            CompactTrigger::from(CompactReason::Manual),
+            CompactTrigger::Manual
+        );
+    }
+
+    #[test]
     fn compact_result_allow_is_default() {
         let result = CompactResult::allow();
         assert!(!result.abort);

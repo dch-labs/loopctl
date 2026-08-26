@@ -1,7 +1,12 @@
 //! Fallback model switching: the tripped breaker routes requests.
 //!
 //! Run: `cargo test --all-features --test fallback_switch -- --nocapture`
+//!
+//! Requires the `streaming` feature: the scripted model responses drive
+//! the streaming engine path, and without it every run fails before the
+//! fallback machinery is consulted.
 
+#![cfg(feature = "streaming")]
 #![allow(
     dead_code,
     clippy::unwrap_used,

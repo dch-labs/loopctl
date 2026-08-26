@@ -560,6 +560,23 @@ impl<C: ApiClient> BareLoop<C> {
                 return Err(e);
             }
 
+            #[cfg(feature = "tool_health")]
+            if let Some(health) = self.managers.health_registry()
+                && !health.allow_request(&tc.tool)
+            {
+                let refused = Self::result_for_call(
+                    &tc,
+                    Duration::ZERO,
+                    ToolContent::Text(
+                        "tool temporarily unavailable: circuit breaker open".to_string(),
+                    ),
+                    true,
+                    None,
+                );
+                self.notify_tool_post(turn_idx, &tc, &refused);
+                return Ok(refused);
+            }
+
             let start = Instant::now();
             let tool_result = tokio::select! {
                 biased;
@@ -996,8 +1013,12 @@ impl<C: ApiClient> BareLoop<C> {
     /// `is_error: true`. The `tool_call_id` is stamped from the call
     /// unconditionally: middleware may synthesize or replay results (a
     /// memoize cache hit returns the first call's id), and only the
-    /// engine knows which model-issued call each result answers.
-    /// Observer notifications are handled by the caller
+    /// engine knows which model-issued call each result answers. The
+    /// breaker gate keys on the *requested* tool name (no resolved name
+    /// exists before dispatch); health recording keys on the resolved
+    /// name when a routing middleware renamed the call — identical for
+    /// every in-tree pipeline, which renames nothing. Observer
+    /// notifications are handled by the caller
     /// ([`execute_tool_call`](Self::execute_tool_call)).
     async fn dispatch_via_pipeline(
         &self,

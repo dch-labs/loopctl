@@ -9,6 +9,7 @@ check-default:
 	cargo clippy --all-targets -- -D warnings
 
 test:
+	cargo test
 	cargo test --all-features
 	cargo test --doc --all-features
 

@@ -102,6 +102,24 @@ pub struct CompactionContext {
     /// of the static [`CompactionOutcome::estimate_tokens`] to match the
     /// driver's configured counter.
     pub counter: Arc<dyn TokenCounter>,
+
+    /// Merged pre-compact hook instructions, when a hook supplied any.
+    ///
+    /// Populated by the driver from the pre-compact hooks' merged
+    /// [`CompactResult`](crate::hooks::context::CompactResult): the
+    /// last hook's `new_instructions` when hooks ran and supplied one.
+    /// `None` when no hooks are configured or none supplied
+    /// instructions — compactors that don't care simply ignore it.
+    pub instructions: Option<String>,
+
+    /// Merged pre-compact hook context fragments, when hooks supplied
+    /// any.
+    ///
+    /// Every hook's `additional_context` entry, in hook order.
+    /// Compact-but-informative fragments an LLM summarizer should weave
+    /// into its prompt; empty when no hooks are configured or none
+    /// supplied any.
+    pub additional_context: Vec<String>,
 }
 
 /// Result of a single compaction pass.

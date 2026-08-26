@@ -118,6 +118,35 @@ impl Default for RunConfig {
 }
 
 impl RunConfig {
+    /// Set the parallel tool-dispatch configuration for the run.
+    ///
+    /// `RunConfig` is `#[non_exhaustive]`, so this builder is the one
+    /// way a host opts a run into
+    /// [`ParallelMode::Parallel`](crate::config::ParallelMode::Parallel)
+    /// (or back to sequential) — the struct literal is not available
+    /// outside the crate.
+    ///
+    /// ```
+    /// use loopctl::config::{ParallelDispatchConfig, ParallelMode};
+    /// use loopctl::engine::RunConfig;
+    ///
+    /// let config = RunConfig::default().with_parallel_dispatch(
+    ///     ParallelDispatchConfig {
+    ///         mode: ParallelMode::Parallel,
+    ///         ..Default::default()
+    ///     },
+    /// );
+    /// assert!(matches!(
+    ///     config.parallel_tool_dispatch.mode,
+    ///     ParallelMode::Parallel
+    /// ));
+    /// ```
+    #[must_use]
+    pub fn with_parallel_dispatch(mut self, config: crate::config::ParallelDispatchConfig) -> Self {
+        self.parallel_tool_dispatch = config;
+        self
+    }
+
     /// Set the maximum number of turns for this run.
     ///
     /// Builder-style convenience for `#[non_exhaustive]` compliance.

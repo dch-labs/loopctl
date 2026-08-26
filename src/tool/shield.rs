@@ -372,7 +372,7 @@ pub struct RiskPattern {
     /// Appears in shield output and logs when this pattern is the
     /// matched one. Should be unique within a tool's pattern list and
     /// descriptive enough to identify the risk at a glance (e.g.
-    /// `"recursive_delete"`, `"write_ssh"`, `"curl_pipe_sh"`).
+    /// `"recursive_delete"`, `"write_ssh"`, `"curl_usage"`).
     pub name: &'static str,
 
     /// Score contributed to the single-turn dimension if this pattern
@@ -665,11 +665,47 @@ impl UnixShield {
         let input_str = input.to_string();
         let mut max_score = 0.0_f32;
         for p in patterns {
-            if input_str.contains(p.pattern) {
+            if Self::pattern_matches_on_token_boundaries(&input_str, p.pattern) {
                 max_score = max_score.max(p.score);
             }
         }
         max_score
+    }
+
+    /// Whether `pattern` occurs in `input` on token boundaries, in a
+    /// normalized view of both.
+    ///
+    /// A match counts only when the characters immediately before and
+    /// after it are absent or non-alphanumeric: `| sh` matches a real
+    /// pipe-to-shell (`… | sh`, `… | sh; …`) but not `| sha256sum`, and
+    /// `curl` matches `curl http…` but not `mycurlcmd`. Patterns are
+    /// substring-shaped; this is their word-boundary discipline.
+    ///
+    /// The normalized view lowercases and collapses each run of
+    /// whitespace to a single space, so trivial command polymorphism
+    /// cannot bypass a pattern: `rm  -rf` (double space), `RM -RF`
+    /// (case), and `rm\t-rf` (tab) all match `rm -rf`. Long-flag and
+    /// split-flag spellings (`rm --recursive`, `rm -r -f`) are separate
+    /// patterns, not normalization.
+    fn pattern_matches_on_token_boundaries(input: &str, pattern: &str) -> bool {
+        let normalized_input = Self::normalize_for_matching(input);
+        let normalized_pattern = Self::normalize_for_matching(pattern);
+        normalized_input
+            .match_indices(normalized_pattern.as_str())
+            .any(|(start, matched)| {
+                let end = start.saturating_add(matched.len());
+                let before_ok = start == 0
+                    || !normalized_input[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_alphanumeric);
+                let after_ok = end == normalized_input.len()
+                    || !normalized_input[end..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_alphanumeric);
+                before_ok && after_ok
+            })
     }
 
     /// Assess multi-turn risk by counting prior calls to the same tool
@@ -734,7 +770,9 @@ impl UnixShield {
                 let Some(&(tool, pattern)) = rule.triggers.get(trigger_idx) else {
                     break;
                 };
-                if *name == tool && pattern.is_none_or(|p| input.contains(p)) {
+                if *name == tool
+                    && pattern.is_none_or(|p| Self::pattern_matches_on_token_boundaries(input, p))
+                {
                     trigger_idx = trigger_idx.saturating_add(1);
                     if trigger_idx == rule.triggers.len() {
                         break;
@@ -746,6 +784,43 @@ impl UnixShield {
             }
         }
         max_risk
+    }
+
+    /// Lowercase, collapse whitespace runs to single spaces, and fold
+    /// JSON escape sequences for whitespace into the run.
+    ///
+    /// The normalized form pattern matching operates on, so spacing and
+    /// case variations of a command cannot slip past a pattern shaped
+    /// for its canonical spelling. The escape folding exists because
+    /// matching runs over the stringified JSON of the whole input,
+    /// where a literal tab serializes as the two characters `\` `t`.
+    fn normalize_for_matching(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut in_ws = false;
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let is_escaped_ws = chars.get(i) == Some(&'\\')
+                && chars
+                    .get(i.saturating_add(1))
+                    .is_some_and(|next| matches!(next, 't' | 'n' | 'r'));
+            if chars.get(i).is_some_and(|ch| ch.is_whitespace()) || is_escaped_ws {
+                if !in_ws {
+                    out.push(' ');
+                    in_ws = true;
+                }
+                i = i.saturating_add(if is_escaped_ws { 2 } else { 1 });
+            } else if let Some(ch) = chars.get(i) {
+                for lower in ch.to_lowercase() {
+                    out.push(lower);
+                }
+                in_ws = false;
+                i = i.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        out
     }
 
     /// Map an aggregate risk score to a [`RiskLevel`] using this
@@ -790,6 +865,16 @@ impl UnixShield {
                     pattern: "rm -rf",
                 },
                 RiskPattern {
+                    name: "recursive_delete_split",
+                    score: 0.9,
+                    pattern: "rm -r -f",
+                },
+                RiskPattern {
+                    name: "recursive_delete_long",
+                    score: 0.9,
+                    pattern: "rm --recursive",
+                },
+                RiskPattern {
                     name: "force_delete",
                     score: 0.7,
                     pattern: "rm -f",
@@ -810,13 +895,13 @@ impl UnixShield {
                     pattern: "| sh",
                 },
                 RiskPattern {
-                    name: "curl_pipe_sh",
-                    score: 0.9,
+                    name: "curl_usage",
+                    score: 0.3,
                     pattern: "curl",
                 },
                 RiskPattern {
-                    name: "wget_pipe",
-                    score: 0.7,
+                    name: "wget_usage",
+                    score: 0.3,
                     pattern: "wget",
                 },
             ],

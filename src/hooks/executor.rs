@@ -199,12 +199,17 @@ impl HookExecutor {
     #[must_use]
     pub fn check_pre_compact(&self, ctx: &PreCompactContext) -> CompactResult {
         let mut result = CompactResult::allow();
+        let mut current = ctx.clone();
         for hook in &self.hooks {
-            if let Some(hook_result) = hook.on_pre_compact(ctx) {
+            if let Some(hook_result) = hook.on_pre_compact(&current) {
                 if hook_result.abort {
                     return hook_result;
                 }
-                if let Some(instr) = hook_result.new_instructions {
+                if let Some(instr) = hook_result.new_instructions.clone() {
+                    current.custom_instructions = match &current.custom_instructions {
+                        Some(prev) => Some(format!("{prev}\n{instr}")),
+                        None => Some(instr.clone()),
+                    };
                     result.new_instructions = Some(instr);
                 }
                 result

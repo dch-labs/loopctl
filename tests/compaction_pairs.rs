@@ -152,6 +152,9 @@ fn ctx() -> CompactionContext {
         context_window: 8_000,
         turn: 3,
         counter: Arc::new(HeuristicTokenCounter),
+
+        instructions: None,
+        additional_context: Vec::new(),
     }
 }
 

@@ -96,19 +96,27 @@ impl<C: ApiClient> BareLoop<C> {
         };
 
         #[cfg(feature = "hooks")]
-        if self.pre_compact_hook_aborts(&history) {
+        let hook = self.pre_compact_hook(&history, reason);
+        #[cfg(feature = "hooks")]
+        if hook.abort {
             return Ok(CompactStepOutcome {
                 tokens_before,
                 tokens_after: tokens_before,
                 compacted: None,
             });
         }
+        #[cfg(not(feature = "hooks"))]
+        let (instructions, additional_context) = (None, Vec::new());
 
         #[cfg(feature = "hooks")]
         let messages_before = history.len();
         #[cfg(feature = "hooks")]
         let compact_start = Instant::now();
-        let result = ctx_manager.compact_with_reason(history, turn, reason).await;
+        #[cfg(feature = "hooks")]
+        let (instructions, additional_context) = (hook.new_instructions, hook.additional_context);
+        let result = ctx_manager
+            .compact_with_reason(history, turn, reason, instructions, additional_context)
+            .await;
 
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
@@ -150,31 +158,38 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Run the pre-compact hook, returning `true` if any hook aborts.
+    /// Run the pre-compact hooks, returning their merged result.
     ///
     /// Builds a [`PreCompactContext`] from the current history and
-    /// session config, then asks the
-    /// [`HookExecutor`](crate::hooks::HookExecutor) to run every
-    /// registered `on_pre_compact` hook. If any hook returns
-    /// [`abort: true`](crate::hooks::context::CompactResult::abort),
-    /// this returns `true` and [`run_compaction`](Self::run_compaction)
-    /// skips compaction entirely for this trigger. Returns `false`
-    /// when there is no hook executor or no hook vetoes the compaction.
+    /// session config — the trigger derived from the compaction
+    /// [`reason`](crate::compact::types::CompactReason), so `Manual`
+    /// reaches hooks as [`Manual`](CompactTrigger::Manual) — then asks
+    /// the [`HookExecutor`](crate::hooks::HookExecutor) to run every
+    /// registered `on_pre_compact` hook. An `abort: true` result makes
+    /// [`run_compaction`](Self::run_compaction) skip compaction
+    /// entirely for this trigger; the merged `new_instructions` and
+    /// `additional_context` are threaded into the compactor's
+    /// [`CompactionContext`](crate::compact::types::CompactionContext).
+    /// Returns an empty allow-result when there is no hook executor.
     #[cfg(feature = "hooks")]
-    fn pre_compact_hook_aborts(&self, history: &[Message]) -> bool {
+    fn pre_compact_hook(
+        &self,
+        history: &[Message],
+        reason: crate::compact::types::CompactReason,
+    ) -> crate::hooks::context::CompactResult {
         let Some(executor) = self.managers.hook_executor() else {
-            return false;
+            return crate::hooks::context::CompactResult::allow();
         };
         let tokens_before = crate::compact::CompactionOutcome::estimate_tokens(history);
         let ctx = PreCompactContext {
-            trigger: CompactTrigger::Auto,
+            trigger: CompactTrigger::from(reason),
             custom_instructions: None,
             message_count: history.len(),
             tokens_before,
             context_window: self.session.config.context_window,
             session_id: self.session.id,
         };
-        executor.check_pre_compact(&ctx).abort
+        executor.check_pre_compact(&ctx)
     }
 
     /// Notify the post-compact hook that compaction completed.

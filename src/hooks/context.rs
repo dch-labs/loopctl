@@ -274,9 +274,12 @@ pub struct CompactResult {
     /// Override custom instructions for the summarizer.
     ///
     /// When `Some`, replaces the summarizer's default instructions entirely.
-    /// Use sparingly; prefer appending to
-    /// [`additional_context`](Self::additional_context) when you only want to
-    /// add guidance.
+    /// When multiple hooks return instructions, the last-registered hook's
+    /// value is the one delivered (each hook sees earlier contributions via
+    /// [`PreCompactContext::custom_instructions`]);
+    /// [`additional_context`](Self::additional_context) is the channel that
+    /// accumulates across hooks. Use sparingly; prefer appending to it when
+    /// you only want to add guidance.
     pub new_instructions: Option<String>,
 
     /// Additional context strings to include in the summary.
@@ -460,6 +463,23 @@ pub struct RunEndContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_trigger_maps_every_compaction_reason() {
+        use crate::compact::types::CompactReason;
+        assert_eq!(
+            CompactTrigger::from(CompactReason::ThresholdExceeded),
+            CompactTrigger::Auto
+        );
+        assert_eq!(
+            CompactTrigger::from(CompactReason::Emergency),
+            CompactTrigger::Auto
+        );
+        assert_eq!(
+            CompactTrigger::from(CompactReason::Manual),
+            CompactTrigger::Manual
+        );
+    }
 
     #[test]
     fn compact_result_allow_is_default() {

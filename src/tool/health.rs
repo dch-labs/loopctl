@@ -2,9 +2,13 @@
 //!
 //! Per-tool health tracking using lock-free atomic counters,
 //! circuit-breaker state machines to prevent repeated calls to failing tools,
-//! and a registry that combines both into a unified health picture. A routing
-//! middleware uses the registry to redirect tool calls away from unhealthy tools
-//! toward healthy alternatives.
+//! and a registry that combines both into a unified health picture. When a
+//! registry is configured on a [`BareLoop`](crate::engine::BareLoop), the
+//! engine consults it before every dispatch: a tool whose breaker is open is
+//! refused with a soft error the model can see and adapt to, and recovery
+//! (half-open probing, cooldown expiry) is automatic — no middleware
+//! required. Hosts wanting redirection *instead of* refusal can install
+//! their own routing middleware reading the same registry.
 //!
 //! # Quick Start
 //!
@@ -1011,6 +1015,24 @@ impl ToolHealthRegistry {
 
     /// Quick health check: is this tool available for use?
     ///
+    /// Whether the breaker for `tool_name` grants this request, and to
+    /// grant it when it can.
+    ///
+    /// The mutating counterpart of
+    /// [`is_tool_available`](Self::is_tool_available): an expired
+    /// `Open` cooldown is normalized and the single recovery probe is
+    /// granted here (a concurrent second caller is refused for the
+    /// probe's lifetime — single-flight), so the dispatch gate that
+    /// calls this executes at most one probe per cooldown. Callers that
+    /// must not consume the probe (telemetry, routing hints) use the
+    /// pure `is_tool_available` instead.
+    #[must_use]
+    pub fn allow_request(&self, tool_name: &str) -> bool {
+        self.get_circuit_breaker(tool_name).allow_request()
+    }
+
+    /// Whether `tool_name` is currently available for dispatch.
+    ///
     /// Combines the circuit-breaker state (`Open` = unavailable) with the
     /// health score (`Unhealthy` = unavailable). Returns `true` when:
     /// - the breaker is not `Open` and the health score is not `Unhealthy`, or
@@ -1021,7 +1043,7 @@ impl ToolHealthRegistry {
     /// allowed without performing the `Open`→`HalfOpen` transition, so a
     /// bare availability check does not consume the single probe slot that
     /// belongs to the real dispatch path
-    /// ([`allow_request`](ToolCircuitBreaker::allow_request)).
+    /// ([`allow_request`](Self::allow_request)).
     #[must_use]
     pub fn is_tool_available(&self, tool_name: &str) -> bool {
         let breaker = self.get_circuit_breaker(tool_name);

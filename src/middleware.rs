@@ -26,6 +26,7 @@
 //! | [`TimeoutMiddleware`]     | Wraps execution in a deadline with retry                          |
 //! | [`UnknownToolMiddleware`] | Suggests closest matching tool on "not found"                     |
 //! | [`RedactingMiddleware`]    | Scrubs secrets from output via a configurable pattern set         |
+//! | [`SafetyShieldMiddleware`] | Enforces a tool-safety shield's Block decisions pre-dispatch       |
 //! | [`OutputLimitMiddleware`] | Truncates output to a whole-output cap (floored at one marker)    |
 //! | [`VerifyMiddleware`]      | Runs a verifier after write-class tools, appends the result       |
 //! | [`MemoizingMiddleware`]   | Caches repeat calls keyed on `(tool_name, canonical input)`       |
@@ -56,6 +57,8 @@ pub mod output_limit;
 pub mod permission;
 #[cfg(feature = "redaction")]
 pub mod redaction;
+#[cfg(feature = "tool_shield")]
+pub mod shield;
 pub mod timeout;
 pub mod tool_call;
 pub mod unknown_tool;
@@ -76,6 +79,8 @@ pub use output_limit::OutputLimitMiddleware;
 pub use permission::{AskResolverFn, PermissionCheckFn, PermissionMiddleware};
 #[cfg(feature = "redaction")]
 pub use redaction::{RedactingMiddleware, SecretPattern, SecretPatternSet};
+#[cfg(feature = "tool_shield")]
+pub use shield::SafetyShieldMiddleware;
 pub use timeout::{TimeoutConfig, TimeoutMiddleware};
 pub use tool_call::ToolCallMiddleware;
 pub use unknown_tool::UnknownToolMiddleware;

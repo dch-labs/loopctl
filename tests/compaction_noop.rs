@@ -307,6 +307,74 @@ mod scenarios {
     }
 
     #[tokio::test]
+    async fn run_start_compacts_at_the_threshold() {
+        // The policy twin of the invariant above: committed history left
+        // over the threshold (under the window) by a prior run compacts
+        // before the next run's first request — observer-visible, and
+        // the new run's first request carries the compacted history,
+        // not the grown one.
+        let script = vec![
+            tool_turn_response_with_fill(0, 40, 320),
+            tool_turn_response_with_fill(1, 40, 320),
+            tool_turn_response_with_fill(2, 40, 320),
+            tool_turn_response_with_fill(3, 40, 320),
+            final_response(),
+            final_response(),
+        ];
+        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let observer = Arc::new(CompactionCounter {
+            events: AtomicUsize::new(0),
+        });
+
+        let config = SessionConfig::default()
+            .with_context_window(600)
+            .with_compact_threshold(80);
+        let client_handle = client.clone();
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+        agent.register_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>);
+
+        let first = agent.run("grow the history", &RunConfig::default()).await;
+        assert!(
+            first.is_ok(),
+            "run 1 grows the history and completes: {first:?}"
+        );
+        let events_after_run1 = observer.events.load(Ordering::SeqCst);
+        let served_after_run1 = client_handle.served_request_tokens().len();
+        let last_of_run1 = client_handle
+            .served_request_tokens()
+            .get(served_after_run1.saturating_sub(1))
+            .copied()
+            .unwrap_or_default();
+
+        let second = agent.run(&"y".repeat(300), &RunConfig::default()).await;
+        assert!(
+            second.is_ok(),
+            "run 2 compacts at start and completes: {second:?}"
+        );
+
+        let served = client_handle.served_request_tokens();
+        assert!(
+            observer.events.load(Ordering::SeqCst) > events_after_run1,
+            "the run-start estimate feeds the trigger — compaction fires \
+             before the new run's first request"
+        );
+        let first_of_run2 = served.get(served_after_run1).copied().unwrap_or_default();
+        assert!(
+            first_of_run2 < last_of_run1,
+            "the new run's first request carries the compacted history, not \
+             the grown one: first of run 2 {first_of_run2}, last of run 1 \
+             {last_of_run1} (served {served:?})"
+        );
+        for tokens in &served {
+            assert!(
+                *tokens <= 600,
+                "no request may exceed the 600-token window; served \
+                 estimates {served:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn default_loop_compacts_at_the_threshold() {
         let client = RecordingClient::wrap(
             MockApiClient::new("test-model").with_responses(growing_conversation_script(12)),

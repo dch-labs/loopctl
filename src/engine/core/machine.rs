@@ -642,6 +642,12 @@ impl LoopMachine {
     /// steering message. The message becomes part
     /// of the record the driver builds the feed from on the next
     /// [`MachineStep::CallLLM`]. Has no effect once the machine is terminal.
+    ///
+    /// The context estimate is not refreshed here — the machine keeps no
+    /// counter. A caller injecting enough content to matter should pair
+    /// this with [`set_context_tokens`](Self::set_context_tokens),
+    /// measured by whoever owns the token counter; otherwise the next
+    /// step's compaction decision runs against the pre-inject estimate.
     pub fn inject(&mut self, message: Message) {
         if self.is_terminal() {
             return;

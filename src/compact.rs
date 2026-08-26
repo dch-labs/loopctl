@@ -700,7 +700,7 @@ impl ContextManager {
         messages: Vec<Message>,
         turn: usize,
     ) -> Result<EnsureContextResult, ContextOverflow> {
-        self.compact_with_reason(messages, turn, CompactReason::Manual, None, Vec::new())
+        self.compact_with_reason(messages, turn, CompactReason::Manual, None, Vec::new(), 0)
             .await
     }
 
@@ -719,6 +719,13 @@ impl ContextManager {
     /// are normalized to the same counter, so telemetry reflects the
     /// manager's measurements.
     ///
+    /// `reserved_tokens` is budget the compacted history must leave room
+    /// for — per-request overhead plus, when compaction serves a deferred
+    /// turn, that turn's transient messages: both the compaction target
+    /// and the fit check subtract it, so the post-compaction history plus
+    /// the reserve fits the window. Pass `0` when nothing rides the
+    /// request beyond the history.
+    ///
     /// # Errors
     ///
     /// Returns a [`ContextOverflow`] if compaction fails or the result
@@ -730,6 +737,7 @@ impl ContextManager {
         reason: CompactReason,
         instructions: Option<String>,
         additional_context: Vec<String>,
+        reserved_tokens: u64,
     ) -> Result<EnsureContextResult, ContextOverflow> {
         let tokens_before = self.estimate_tokens(&messages);
 
@@ -738,7 +746,7 @@ impl ContextManager {
         }
 
         let message_count = messages.len();
-        let target_tokens = self.compact_target_tokens();
+        let target_tokens = self.compact_target_tokens().saturating_sub(reserved_tokens);
         let context = CompactionContext {
             tokens_before,
             reason,
@@ -764,7 +772,7 @@ impl ContextManager {
         }
 
         let tokens_after = self.estimate_tokens(&outcome.messages);
-        if tokens_after > self.context_window {
+        if tokens_after > self.context_window.saturating_sub(reserved_tokens) {
             return Err(ContextOverflow {
                 tokens_used: tokens_after,
                 context_window: self.context_window,

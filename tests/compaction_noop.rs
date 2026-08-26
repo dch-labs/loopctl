@@ -521,6 +521,92 @@ mod scenarios {
     }
 
     #[tokio::test]
+    async fn a_deferred_compaction_reserves_the_transient_budget() {
+        // The deferred turn's transients ride the retry too: the
+        // compaction target and the fit check reserve room for them,
+        // so the retried full payload fits. Without the reserve, the
+        // first pass compacts to "fits the window" while ignoring the
+        // transients, the retry defers again, and the idempotent
+        // second pass dead-ends on ContextExceeded.
+        struct TargetSheddingCompactor {
+            targets: Arc<Mutex<Vec<u64>>>,
+        }
+
+        impl ContextCompactor for TargetSheddingCompactor {
+            fn compact(
+                &self,
+                messages: Vec<Message>,
+                target_tokens: u64,
+                context: CompactionContext,
+            ) -> Pin<Box<dyn Future<Output = CompactionOutcome> + Send + '_>> {
+                let targets = Arc::clone(&self.targets);
+                Box::pin(async move {
+                    targets.lock().expect("targets lock").push(target_tokens);
+                    let mut kept = messages;
+                    while kept.len() > 2 {
+                        if context.counter.count(&kept) <= target_tokens {
+                            break;
+                        }
+                        // Shed after the unconditionally-preserved first
+                        // message.
+                        kept.remove(1);
+                    }
+                    let tokens_after = context.counter.count(&kept);
+                    CompactionOutcome {
+                        tokens_saved: context.tokens_before.saturating_sub(tokens_after),
+                        messages: kept,
+                        tokens_after,
+                        success: true,
+                        error: None,
+                    }
+                })
+            }
+        }
+
+        let script = vec![
+            tool_turn_response(0, 40),
+            tool_turn_response(1, 40),
+            tool_turn_response(2, 40),
+            final_response(),
+        ];
+        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let targets = Arc::new(Mutex::new(Vec::new()));
+
+        let config = SessionConfig::default()
+            .with_context_window(300)
+            .with_compact_threshold(80);
+        let client_handle = client.clone();
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+        agent.set_context_manager(Arc::new(ContextManager::new(Arc::new(
+            TargetSheddingCompactor {
+                targets: Arc::clone(&targets),
+            },
+        ))));
+        agent.add_contributor(Box::new(ChunkyContributor { chars: 400 }));
+
+        let result = agent.run("reserve the budget", &RunConfig::default()).await;
+        assert!(
+            result.is_ok(),
+            "the compaction reserved the transient budget and the retried \
+             full payload fits: {result:?}"
+        );
+
+        let served = client_handle.served_request_tokens();
+        assert!(!served.is_empty(), "the retried turn reaches the provider");
+        for tokens in &served {
+            assert!(
+                *tokens <= 300,
+                "every served request carries the whole payload under the \
+                 window; served {served:?}"
+            );
+        }
+        assert!(
+            !targets.lock().expect("targets lock").is_empty(),
+            "the deferred turn's compaction ran"
+        );
+    }
+
+    #[tokio::test]
     async fn default_loop_compacts_at_the_threshold() {
         let client = RecordingClient::wrap(
             MockApiClient::new("test-model").with_responses(growing_conversation_script(12)),

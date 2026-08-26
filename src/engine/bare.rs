@@ -269,6 +269,16 @@ pub struct BareLoop<C: ApiClient> {
     /// the first run for the measurement to see them.
     overhead: std::sync::OnceLock<u64>,
 
+    /// Transient-message budget of the most recent deferred turn.
+    ///
+    /// Set when a turn defers to compaction because its transients
+    /// (contributors, memories) pushed the payload over the line;
+    /// consumed one-shot by the next compaction pass, which reserves
+    /// it so the retried turn's full payload fits. Cleared at run
+    /// start — a budget left over from a failed run must not reserve
+    /// room in the next one.
+    deferred_transient_tokens: u64,
+
     /// Per-turn `RequestOptions` applied to every provider call.
     ///
     /// Carries `tool_constraint` (strict/grammar-constrained tool-call
@@ -468,6 +478,7 @@ impl<C: ApiClient> BareLoop<C> {
             text_streamer: None,
             contributors: Vec::new(),
             overhead: std::sync::OnceLock::new(),
+            deferred_transient_tokens: 0,
             request_options: RequestOptions::default(),
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
@@ -689,6 +700,7 @@ impl<C: ApiClient> BareLoop<C> {
             text_streamer: None,
             contributors: Vec::new(),
             overhead: std::sync::OnceLock::new(),
+            deferred_transient_tokens: 0,
             request_options: RequestOptions::default(),
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
@@ -1005,6 +1017,7 @@ impl<C: ApiClient> BareLoop<C> {
             self.machine.next_step(self.machine_policy()),
             MachineStep::Compact { .. }
         ) {
+            self.deferred_transient_tokens = self.count_context(&messages);
             return Ok(());
         }
         self.note_routed_model();
@@ -1421,6 +1434,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             self.session.runs.push(Run::new(input, run_config));
             self.notify_run_start();
             self.machine.accept_input(input);
+            self.deferred_transient_tokens = 0;
             let estimate = self
                 .count_context(&self.machine.full_history())
                 .saturating_add(self.overhead_tokens());

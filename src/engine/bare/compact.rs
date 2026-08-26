@@ -116,8 +116,18 @@ impl<C: ApiClient> BareLoop<C> {
         let compact_start = Instant::now();
         #[cfg(feature = "hooks")]
         let (instructions, additional_context) = (hook.new_instructions, hook.additional_context);
+        let reserved = self
+            .overhead_tokens()
+            .saturating_add(std::mem::take(&mut self.deferred_transient_tokens));
         let result = ctx_manager
-            .compact_with_reason(history, turn, reason, instructions, additional_context)
+            .compact_with_reason(
+                history,
+                turn,
+                reason,
+                instructions,
+                additional_context,
+                reserved,
+            )
             .await;
 
         match result {

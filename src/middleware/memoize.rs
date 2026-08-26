@@ -316,6 +316,7 @@ impl ToolMiddleware for MemoizingMiddleware {
             {
                 let mut result = cached;
                 append_cached_marker(&mut result.output);
+                result.tool_call_id.clone_from(&ctx.call_id);
                 return result;
             }
 
@@ -513,7 +514,7 @@ mod tests {
                     output,
                     is_error,
                     resolved_tool_name: String::new(),
-                    tool_call_id: String::new(),
+                    tool_call_id: "fixture_call_id".to_string(),
                     duration: Duration::ZERO,
                     display_hint: None,
                 }
@@ -553,7 +554,7 @@ mod tests {
                     output,
                     is_error,
                     resolved_tool_name: String::new(),
-                    tool_call_id: String::new(),
+                    tool_call_id: "fixture_call_id".to_string(),
                     duration: Duration::ZERO,
                     display_hint: None,
                 }
@@ -628,6 +629,35 @@ mod tests {
         assert!(
             !first.output.to_string().contains("[cached]"),
             "first call output should not carry [cached]"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hit_returns_requesting_call_id() {
+        let mw = make_middleware(Arc::new(PathFromInput), 10);
+        let (pipeline, calls) = pipeline(mw, ToolContent::from_string("file contents"), false);
+
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "foo.rs"}), 0);
+        ctx.call_id = "call_first".to_string();
+        let first = pipeline.dispatch(&mut ctx).await;
+
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "foo.rs"}), 1);
+        ctx.call_id = "call_second".to_string();
+        let second = pipeline.dispatch(&mut ctx).await;
+
+        assert_eq!(
+            second.tool_call_id, "call_second",
+            "a cache hit must answer the requesting call, not replay the \
+             first call's id"
+        );
+        assert_eq!(
+            first.tool_call_id, "fixture_call_id",
+            "a miss passes the inner result through untouched"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second call was served from the cache"
         );
     }
 

@@ -658,10 +658,11 @@ pub struct ToolDispatchResult {
 
     /// Wall-clock execution time of the tool call.
     ///
-    /// Measured from dispatch start to completion by the engine. Zero on
-    /// cached results returned by `MemoizingMiddleware` (the cached call
-    /// didn't execute this turn). Useful for metrics, slow-tool
-    /// detection, and timeout diagnostics.
+    /// Measured from dispatch start to completion by the engine.
+    /// `MemoizingMiddleware` cache hits replay the original call's
+    /// recorded duration (the cached call didn't execute this turn, so
+    /// its duration is what the metrics should see). Useful for
+    /// metrics, slow-tool detection, and timeout diagnostics.
     pub duration: Duration,
 
     /// The tool name the call actually ran under.

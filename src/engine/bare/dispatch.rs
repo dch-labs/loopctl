@@ -993,7 +993,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// middleware chain (timeout, permissions, output limits, etc.).
     ///
     /// Always returns a [`ToolDispatchResult`] — soft errors are carried as
-    /// `is_error: true`. Observer notifications are handled by the caller
+    /// `is_error: true`. The `tool_call_id` is stamped from the call
+    /// unconditionally: middleware may synthesize or replay results (a
+    /// memoize cache hit returns the first call's id), and only the
+    /// engine knows which model-issued call each result answers.
+    /// Observer notifications are handled by the caller
     /// ([`execute_tool_call`](Self::execute_tool_call)).
     async fn dispatch_via_pipeline(
         &self,
@@ -1013,11 +1017,7 @@ impl<C: ApiClient> BareLoop<C> {
         };
         let dispatch_result = pipeline.invoke(ctx).await;
         ToolDispatchResult {
-            tool_call_id: if dispatch_result.tool_call_id.is_empty() {
-                tc.id.clone()
-            } else {
-                dispatch_result.tool_call_id
-            },
+            tool_call_id: tc.id.clone(),
             output: dispatch_result.output,
             is_error: dispatch_result.is_error,
             duration: dispatch_result.duration,

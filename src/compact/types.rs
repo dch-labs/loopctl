@@ -342,7 +342,11 @@ pub struct ContextOverflow {
     /// Estimated token count of the conversation.
     ///
     /// How many tokens the conversation occupies when it overflows — the same
-    /// heuristic estimate used everywhere else in the subsystem. Compare
+    /// heuristic estimate used everywhere else in the subsystem. When a
+    /// reserved budget forced the failure (see
+    /// [`compact_with_reason`](super::ContextManager::compact_with_reason)),
+    /// the estimate includes it, so the comparison below explains the
+    /// failure. Compare
     /// against [`context_window`](Self::context_window) (or use
     /// [`overflow`](Self::overflow)) to see by how much it exceeded the limit.
     pub tokens_used: u64,

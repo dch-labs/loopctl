@@ -766,7 +766,7 @@ impl ContextManager {
                 tokens_used: tokens_before,
                 context_window: self.context_window,
                 message_count,
-                trigger: CompactReason::Manual,
+                trigger: reason,
                 compactor_error: outcome.error,
             });
         }
@@ -774,10 +774,10 @@ impl ContextManager {
         let tokens_after = self.estimate_tokens(&outcome.messages);
         if tokens_after > self.context_window.saturating_sub(reserved_tokens) {
             return Err(ContextOverflow {
-                tokens_used: tokens_after,
+                tokens_used: tokens_after.saturating_add(reserved_tokens),
                 context_window: self.context_window,
                 message_count,
-                trigger: CompactReason::Manual,
+                trigger: reason,
                 compactor_error: None,
             });
         }

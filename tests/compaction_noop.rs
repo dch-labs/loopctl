@@ -32,7 +32,7 @@ mod scenarios {
     use loopctl::api::error::ApiError;
     use loopctl::api::{ApiClient, NonStreamingResponse, StreamRequest};
     use loopctl::compact::{
-        CompactionContext, CompactionOutcome, ContextCompactor, ContextManager,
+        CompactReason, CompactionContext, CompactionOutcome, ContextCompactor, ContextManager,
         HeuristicTokenCounter, TokenCounter,
     };
     use loopctl::config::SessionConfig;
@@ -130,6 +130,23 @@ mod scenarios {
         fn contribute(&self, _ctx: &ContributorContext<'_>) -> Option<Message> {
             self.consultations.fetch_add(1, Ordering::SeqCst);
             Some(Message::user("m".repeat(400)))
+        }
+    }
+
+    /// A contributor injecting its chunk only while armed — used to
+    /// overload exactly one run of a multi-run sequence.
+    struct ArmedContributor {
+        armed: Arc<AtomicBool>,
+        chars: usize,
+    }
+
+    impl ContextContributor for ArmedContributor {
+        fn contribute(&self, _ctx: &ContributorContext<'_>) -> Option<Message> {
+            if self.armed.load(Ordering::SeqCst) {
+                Some(Message::user("m".repeat(self.chars)))
+            } else {
+                None
+            }
         }
     }
 
@@ -521,6 +538,123 @@ mod scenarios {
     }
 
     #[tokio::test]
+    async fn a_reserved_overflow_reports_payload_comparable_numbers() {
+        // The reserved fit check fires when the history alone fits the
+        // window but history + reserve does not — the reported numbers
+        // must read as an overflow. A history-only `tokens_used`
+        // against the full window reads as a pass (170 under a limit
+        // of 300) and hides the reserve that forced the failure.
+        struct KeepEverythingCompactor;
+
+        impl ContextCompactor for KeepEverythingCompactor {
+            fn compact(
+                &self,
+                messages: Vec<Message>,
+                _target_tokens: u64,
+                context: CompactionContext,
+            ) -> Pin<Box<dyn Future<Output = CompactionOutcome> + Send + '_>> {
+                Box::pin(async move {
+                    let tokens_after = context.counter.count(&messages);
+                    CompactionOutcome {
+                        tokens_saved: 0,
+                        messages,
+                        tokens_after,
+                        success: true,
+                        error: None,
+                    }
+                })
+            }
+        }
+
+        let manager =
+            ContextManager::new(Arc::new(KeepEverythingCompactor)).with_context_window(300);
+        let messages = vec![Message::user("x".repeat(680))];
+        let overflow = manager
+            .compact_with_reason(
+                messages,
+                0,
+                CompactReason::ThresholdExceeded,
+                None,
+                Vec::new(),
+                143,
+            )
+            .await
+            .expect_err(
+                "170 history tokens against a window of 300 minus a \
+                         143-token reserve: the fit check fires",
+            );
+
+        assert!(
+            overflow.tokens_used >= overflow.context_window,
+            "the overflow reads as an overflow — the payload including the \
+             reserve against the window: used {}, window {}",
+            overflow.tokens_used,
+            overflow.context_window
+        );
+        assert!(
+            overflow.trigger == CompactReason::ThresholdExceeded,
+            "the overflow names the reason that triggered the failed pass, \
+             got {:?}",
+            overflow.trigger
+        );
+    }
+
+    #[tokio::test]
+    async fn growing_transients_never_serve_over_the_window() {
+        // Adversarial sequence: a contributor whose output grows with
+        // every consultation (including the extra consultations
+        // consumed by deferrals), so the transient budget compounds.
+        // Whatever the compaction loop does — fit, re-defer, or fail —
+        // no served request may exceed the window, and the run must
+        // terminate rather than loop.
+        struct IncreasingContributor {
+            consultations: Arc<AtomicUsize>,
+        }
+
+        impl ContextContributor for IncreasingContributor {
+            fn contribute(&self, _ctx: &ContributorContext<'_>) -> Option<Message> {
+                let n = self.consultations.fetch_add(1, Ordering::SeqCst) + 1;
+                Some(Message::user("g".repeat(80 * n)))
+            }
+        }
+
+        let script = vec![
+            tool_turn_response(0, 40),
+            tool_turn_response(1, 40),
+            tool_turn_response(2, 40),
+            tool_turn_response(3, 40),
+            final_response(),
+        ];
+        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+
+        let config = SessionConfig::default()
+            .with_context_window(350)
+            .with_compact_threshold(80);
+        let client_handle = client.clone();
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+        agent.add_contributor(Box::new(IncreasingContributor {
+            consultations: Arc::new(AtomicUsize::new(0)),
+        }));
+
+        let result = agent
+            .run("grow against the window", &RunConfig::default())
+            .await;
+        assert!(
+            matches!(result, Ok(_) | Err(LoopError::ContextExceeded { .. })),
+            "the run terminates — fitting or failing honestly: {result:?}"
+        );
+
+        let served = client_handle.served_request_tokens();
+        for tokens in &served {
+            assert!(
+                *tokens <= 350,
+                "no served request exceeds the window however the \
+                 transients grow; served {served:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_deferred_compaction_reserves_the_transient_budget() {
         // The deferred turn's transients ride the retry too: the
         // compaction target and the fit check reserve room for them,
@@ -603,6 +737,87 @@ mod scenarios {
         assert!(
             !targets.lock().expect("targets lock").is_empty(),
             "the deferred turn's compaction ran"
+        );
+    }
+
+    #[cfg(feature = "hooks")]
+    #[tokio::test]
+    async fn a_stale_deferred_budget_reserves_nothing_in_the_next_run() {
+        // A run that dies with an unconsumed deferred budget — its
+        // compaction was vetoed after the deferral set the budget —
+        // must not shrink the next run's compaction target: the budget
+        // is cleared at run start. The stale chunk here dwarfs the
+        // window, so a surviving budget zeroes the target and the fit
+        // limit and the next run dead-ends on ContextExceeded.
+        use loopctl::hooks::context::{CompactResult, PreCompactContext};
+        use loopctl::hooks::{Hook, HookExecutor};
+
+        struct VetoFirstArmedCompaction {
+            armed: Arc<AtomicBool>,
+            vetoed: AtomicBool,
+        }
+
+        impl Hook for VetoFirstArmedCompaction {
+            fn name(&self) -> &str {
+                "veto_first_armed_compaction"
+            }
+
+            fn on_pre_compact(&self, _ctx: &PreCompactContext) -> Option<CompactResult> {
+                if self.armed.load(Ordering::SeqCst) && !self.vetoed.swap(true, Ordering::SeqCst) {
+                    Some(CompactResult::abort("not now"))
+                } else {
+                    None
+                }
+            }
+        }
+
+        let script = vec![
+            tool_turn_response_with_fill(0, 40, 320),
+            tool_turn_response_with_fill(1, 40, 320),
+            tool_turn_response_with_fill(2, 40, 320),
+            tool_turn_response_with_fill(3, 40, 320),
+            final_response(),
+            tool_turn_response(0, 40),
+            final_response(),
+        ];
+        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+
+        let config = SessionConfig::default()
+            .with_context_window(700)
+            .with_compact_threshold(80);
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+        let mut executor = HookExecutor::new();
+        let armed = Arc::new(AtomicBool::new(false));
+        executor.register(Arc::new(VetoFirstArmedCompaction {
+            armed: Arc::clone(&armed),
+            vetoed: AtomicBool::new(false),
+        }));
+        agent.set_hook_executor(Arc::new(executor));
+        agent.add_contributor(Box::new(ArmedContributor {
+            armed: Arc::clone(&armed),
+            chars: 12_000,
+        }));
+
+        let first = agent.run("grow the history", &RunConfig::default()).await;
+        assert!(
+            first.is_ok(),
+            "run 1 grows the committed history and completes: {first:?}"
+        );
+
+        armed.store(true, Ordering::SeqCst);
+        let second = agent.run("overload now", &RunConfig::default()).await;
+        assert!(
+            matches!(second, Err(LoopError::ContextExceeded { .. })),
+            "run 2 defers on the transient overload and dies at the vetoed \
+             compaction with the budget unconsumed: {second:?}"
+        );
+
+        armed.store(false, Ordering::SeqCst);
+        let third = agent.run(&"y".repeat(300), &RunConfig::default()).await;
+        assert!(
+            third.is_ok(),
+            "run 3 compacts at start against the unreserved target — the \
+             stale budget was cleared at run start: {third:?}"
         );
     }
 

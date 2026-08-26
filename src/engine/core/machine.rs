@@ -479,7 +479,10 @@ impl LoopMachine {
     /// This is pure and idempotent: calling it twice with no intervening feed
     /// method ([`Self::model_response`], [`Self::tool_results`],
     /// [`Self::compaction_result`], [`Self::compaction_noop`],
-    /// [`Self::cancel`]) returns an equal step.
+    /// [`Self::set_context_tokens`], [`Self::cancel`]) returns an equal step.
+    /// A [`set_context_tokens`](Self::set_context_tokens) between polls can
+    /// change the decision without changing the state — the driver's
+    /// deferral re-check relies on exactly that.
     /// Once the machine is terminal, every subsequent call returns
     /// [`MachineStep::Done`] with the same [`MachineOutcome`].
     ///

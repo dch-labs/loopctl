@@ -70,7 +70,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// a configured manager the resolution is exclusive: outbound
     /// requests, breaker bookkeeping, recovery probes, and observer
     /// contexts all derive from this one value, overriding any
-    /// host-provided per-request model.
+    /// host-provided per-request model. Note the corollary: a manager
+    /// whose primary differs from the client's own model silently
+    /// reroutes every request to the primary — configure the manager
+    /// for the model the client actually serves.
     pub(super) fn routed_model(&self) -> Option<String> {
         let manager = self.managers.fallback();
         match manager.state() {

@@ -83,7 +83,8 @@ pub struct RunConfig {
     /// [`ParallelDispatchConfig`].
     pub parallel_tool_dispatch: ParallelDispatchConfig,
 
-    /// Whether to reset all managers to their initial state before this run.
+    /// Whether to reset the fallback, detection, and observer managers to
+    /// their initial state before this run.
     ///
     /// When `true`, [`LoopManagers::reset_all`] is called at the top of
     /// `run()`, clearing the fallback circuit breaker, loop/convergence

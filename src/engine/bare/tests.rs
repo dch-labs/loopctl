@@ -3304,13 +3304,45 @@ async fn switch_model_unsupported_client() {
     let tools = ToolRegistry::new();
     let mut loop_ = BareLoop::new(client, tools, SessionConfig::default());
 
-    // set_model returns false (unsupported), but apply() is best-effort
-    // and still updates the session/client state.
-    loop_.switch_model("new-model").apply().unwrap();
-
-    // The client is the source of truth for the model; an unsupported
-    // set_model leaves the client unchanged.
+    // A client that cannot switch models rejects the switch outright:
+    // the client keeps its model, the fallback tracker is not re-pointed
+    // at a model the client never adopted, and the caller learns of it.
+    let result = loop_.switch_model("new-model").apply();
+    let err = result.expect_err("a rejected switch is an error, not a warning");
+    assert!(
+        err.to_string().contains("rejected"),
+        "the error names the rejection: {err}"
+    );
     assert_eq!(loop_.client.model(), "static");
+    assert_eq!(
+        loop_.managers.fallback().original_model(),
+        None,
+        "the fallback tracker must not point at a model the client \
+         never adopted — the per-request override would serve it anyway"
+    );
+}
+
+#[test]
+fn set_context_manager_syncs_the_session_window_and_threshold() {
+    // The session config owns the window policy: a host manager that
+    // disagrees would trigger at the wrong point, so both knobs are
+    // synced — the same sync the default manager gets.
+    let client = std::sync::Arc::new(MockClient::new("m"));
+    let config = SessionConfig::default()
+        .with_context_window(700)
+        .with_compact_threshold(80);
+    let mut loop_ = BareLoop::new(client, ToolRegistry::new(), config);
+    let manager = crate::compact::ContextManager::new(std::sync::Arc::new(
+        crate::compact::TruncatingCompactor::default(),
+    ))
+    .with_context_window(32_000)
+    .with_threshold(50);
+    loop_.set_context_manager(std::sync::Arc::new(manager));
+    let Some(installed) = loop_.managers.context_manager() else {
+        panic!("the host manager must be installed");
+    };
+    assert_eq!(installed.context_window(), 700);
+    assert_eq!(installed.threshold(), 80);
 }
 
 #[tokio::test]

@@ -305,6 +305,12 @@ impl ToolMiddleware for MemoizingMiddleware {
         } else {
             None
         };
+        // The invalidation paths stored beside a cache entry must
+        // describe the same input the key was built from — an inner
+        // middleware may rewrite `ctx.input` during dispatch, and paths
+        // taken from the rewritten input would never match the writes
+        // that need to evict this entry.
+        let input_at_key = is_memoized.then(|| ctx.input.clone());
         let ttl_turns = self.ttl_turns;
         let current_turn = ctx.turn_number;
         let epoch_at_dispatch = is_memoized.then(|| current_epoch(&self.cache));
@@ -326,7 +332,8 @@ impl ToolMiddleware for MemoizingMiddleware {
                 let write_paths = self.path_extractor.paths(&ctx.tool_name, &ctx.input);
                 invalidate_paths(&self.cache, &write_paths);
             } else if is_memoized && !result.is_error {
-                let paths = self.path_extractor.paths(&ctx.tool_name, &ctx.input);
+                let input = input_at_key.as_ref().unwrap_or(&ctx.input);
+                let paths = self.path_extractor.paths(&ctx.tool_name, input);
                 if let (Some(key), Some(epoch)) = (key, epoch_at_dispatch) {
                     insert(&self.cache, key, result.clone(), current_turn, paths, epoch);
                 }
@@ -342,7 +349,10 @@ impl ToolMiddleware for MemoizingMiddleware {
 /// The input is canonicalized via `serde_json::to_string` (which, with
 /// the default `BTreeMap`-backed `serde_json::Map`, sorts object keys
 /// alphabetically — so semantically-equal inputs hash equally regardless
-/// of key order) and then hashed with `DefaultHasher`.
+/// of key order) and then hashed with `DefaultHasher`. The
+/// canonicalization relies on that default map: enabling the
+/// `preserve_order` feature anywhere in the dependency graph would
+/// silently break key equality for reordered objects.
 fn make_key(tool_name: &str, input: &Value) -> CacheKey {
     let canonical = serde_json::to_string(input).unwrap_or_default();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();

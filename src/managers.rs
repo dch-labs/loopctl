@@ -120,13 +120,20 @@ pub use crate::capabilities::*;
 /// # Reset
 ///
 /// Call [`reset_all`](LoopManagers::reset_all) at the start of a new
-/// session to reinitialise every manager and observer to its default state.
+/// session to reinitialise the fallback, detection, and observer state.
+/// Optional managers (compaction, hooks, pipeline, stream handler,
+/// tool health) keep whatever they hold across it.
 pub struct LoopManagers {
     /// Circuit breaker for API model fallback.
     ///
     /// Tracks consecutive API failures and, when the threshold is exceeded,
     /// switches to a configured backup model. Fresh on construction; call
     /// [`reset_all`](Self::reset_all) to reinitialise mid-session.
+    ///
+    /// The default manager carries no fallback chain: it counts and
+    /// trips, but with no chain the routed model is unchanged — a loop
+    /// without [`set_fallback_models`](crate::fallback) serves the
+    /// client's model throughout, whatever the breaker believes.
     fallback: FallbackManager,
 
     /// Loop and convergence detection orchestrator.

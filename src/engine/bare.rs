@@ -1476,6 +1476,10 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                                 self.finalize(Some(&err)).await?;
                                 return Err(err);
                             }
+                            // MachineOutcome is non_exhaustive; a future
+                            // variant that maps to no error must not spin
+                            // the loop — treat it as a hard stop.
+                            break;
                         }
                     },
                 }

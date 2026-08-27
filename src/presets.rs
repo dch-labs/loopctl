@@ -119,6 +119,10 @@ impl ConstrainedProfile {
     ///
     /// No `.with_core()` is set — pass the result to
     /// [`BareLoop::set_pipeline`], which attaches the tool registry.
+    /// Middleware a host chains onto this builder registers *inside* the
+    /// preset's memoize layer — for anything that must see the original
+    /// call (a redaction scrub, say) that is the wrong slot: chain it on
+    /// the pipeline after the preset's layers instead.
     #[must_use]
     pub fn pipeline_builder() -> crate::middleware::ToolPipelineBuilder {
         ToolPipeline::builder()

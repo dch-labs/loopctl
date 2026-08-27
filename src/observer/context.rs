@@ -403,7 +403,10 @@ pub struct CompactedContext {
     /// Estimated token count after compaction.
     ///
     /// The payload estimate of the compacted history plus the same
-    /// overhead — what subsequent model calls will carry.
+    /// overhead. Transient context (contributors, retrieved memories)
+    /// is not part of it — a retried turn regenerates its own, so
+    /// this number does not predict the next request's size when
+    /// transients ride it.
     pub tokens_after: u64,
 
     /// Estimated tokens saved by compaction.

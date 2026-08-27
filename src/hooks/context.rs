@@ -229,9 +229,11 @@ pub struct PostCompactContext {
 
     /// Estimated tokens after compaction.
     ///
-    /// The payload estimate once the compactor has finished — the compacted
-    /// history plus the per-request overhead — which subsequent model calls
-    /// will carry.
+    /// The payload estimate once the compactor has finished — the
+    /// compacted history plus the per-request overhead. Deferred
+    /// transient context (contributors, retrieved memories) is
+    /// excluded: a retried turn regenerates its own, so this number
+    /// does not predict that request's size.
     pub tokens_after: u64,
 
     /// Compaction duration in milliseconds.

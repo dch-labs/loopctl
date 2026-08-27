@@ -270,8 +270,8 @@ pub struct PreCompactStats {
     /// Estimated token count.
     ///
     /// The pre-compaction token estimate of the whole conversation, using the
-    /// standard 4-chars-per-token heuristic. This is the number compared against
-    /// the threshold to decide whether compaction was needed.
+    /// standard 4-chars-per-token heuristic — history only, without
+    /// per-request overhead or transients.
     pub estimated_tokens: u64,
 
     /// Number of user-role messages.

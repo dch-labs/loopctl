@@ -798,12 +798,13 @@ impl ContextManager {
 
     /// Build telemetry for a compaction operation.
     ///
-    /// Called by the engine after compaction to produce telemetry for
-    /// observers. Takes the pre/post message lists and the compaction
-    /// trigger reason, along with the start time of the operation.
-    ///
-    /// Note: Currently does not depend on instance state, but is a method
-    /// by design to allow future configuration-aware telemetry.
+    /// A standalone helper for hosts that run compaction themselves
+    /// (e.g. via [`compact_manual`](Self::compact_manual)) and want the
+    /// pre/post message-shape statistics. Takes the pre/post message
+    /// lists and the compaction trigger reason, along with the start
+    /// time of the operation. The token figures are history-only
+    /// heuristic estimates — per-request overhead and transients are
+    /// not part of them.
     #[must_use]
     pub fn build_telemetry(
         trigger: CompactReason,

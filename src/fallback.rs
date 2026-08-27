@@ -268,7 +268,8 @@ pub struct FallbackConfig {
     /// Once [`FallbackManager`] records this many failures in a row on the primary
     /// model, it transitions from [`FallbackState::Primary`] to
     /// [`FallbackState::Fallback`]. A higher value tolerates transient blips; a
-    /// lower value reacts faster to a degrading provider.
+    /// lower value reacts faster to a degrading provider. `0` is not "never
+    /// trip" — it trips on the first failure.
     pub trip_threshold: usize,
 
     /// Minimum time in fallback before probing the primary model again. Defaults to 60 s.
@@ -283,7 +284,8 @@ pub struct FallbackConfig {
     /// Number of healthy responses the primary model must produce while in
     /// [`FallbackState::Recovering`] before the manager transitions back to
     /// [`FallbackState::Primary`]. Requiring more than one guards against a
-    /// single lucky success masking an ongoing outage.
+    /// single lucky success masking an ongoing outage. `0` closes on the
+    /// first success.
     pub recovery_successes_needed: usize,
 
     /// Per-model failure threshold before a fallback model is skipped. Defaults to `2`.
@@ -291,7 +293,8 @@ pub struct FallbackConfig {
     /// Applied to each fallback model in the chain: once a single
     /// model accumulates this many recorded attempts, it is taken out of
     /// rotation and [`FallbackManager::active_model`] advances to the next
-    /// candidate.
+    /// candidate. Values below 1 (including `0`) clamp to 1 — the chain
+    /// advances after a single failed attempt.
     pub max_fail_count: usize,
 }
 
@@ -1428,14 +1431,23 @@ impl FallbackManager {
     /// assert!(!mgr.should_try_resume_primary(Duration::from_secs(10)));
     /// ```
     pub fn should_try_resume_primary(&self, min_fallback_duration: Duration) -> bool {
-        if self.state() != FallbackState::Fallback {
+        let state = crate::error::recover_guard(self.state.lock());
+        Self::should_try_resume_primary_impl(&state, min_fallback_duration)
+    }
+
+    /// [`should_try_resume_primary`](Self::should_try_resume_primary)
+    /// assuming the caller already holds the state lock — one consistent
+    /// read of the state and its switch timestamp.
+    fn should_try_resume_primary_impl(
+        state: &BreakerState,
+        min_fallback_duration: Duration,
+    ) -> bool {
+        if state.state != FallbackState::Fallback {
             return false;
         }
-        if let Some(switched_at) = self.fallback_switched_at() {
-            switched_at.elapsed() >= min_fallback_duration
-        } else {
-            false
-        }
+        state
+            .fallback_switched_at
+            .is_some_and(|switched_at| switched_at.elapsed() >= min_fallback_duration)
     }
 
     /// Transition to using fallback model (circuit open).
@@ -1489,6 +1501,12 @@ impl FallbackManager {
     /// returns `true`. Subsequent calls to
     /// [`record_success`](Self::record_success) will count
     /// toward the recovery threshold.
+    ///
+    /// Unguarded: callable from any state (the engine calls it only
+    /// from `Fallback`). Called from `Primary`, the breaker sits in
+    /// `Recovering` where transient failures reset the streak instead of
+    /// counting toward a trip — it cannot trip again until the recovery
+    /// successes close it.
     ///
     /// # Example
     ///

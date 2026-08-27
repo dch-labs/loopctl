@@ -125,11 +125,12 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Fire [`on_turn_start`](crate::observer::LoopObserver::on_turn_start).
     ///
-    /// Called once per turn, at the very top of [`handle_call_llm`](BareLoop::handle_call_llm)
-    /// — before contributor messages are gathered, before memory is retrieved,
-    /// and before the provider is contacted. This makes it the earliest signal
-    /// an observer receives that a new turn has begun, and it always has a
-    /// matching [`notify_turn_end`](Self::notify_turn_end) later in the same
+    /// Called once per served turn — after the turn's transient context
+    /// is gathered (contributors, memories) and after the window
+    /// re-decision, right before the provider is contacted. A turn that
+    /// defers to compaction fires no turn events at all; the retried
+    /// turn fires them once. Every fired start has a matching
+    /// [`notify_turn_end`](Self::notify_turn_end) later in the same
     /// turn (on the success, soft-error, or cancelled path).
     ///
     /// `query` is **not** the outbound request body — it is a text summary of
@@ -297,14 +298,12 @@ impl<C: ApiClient> BareLoop<C> {
                 .record_failure(crate::fallback::FailureKind::Transient)
         };
 
-        if tripped {
-            let from = self.client.model();
-            if let Some(to) = self.managers.fallback().fallback_model() {
-                tracing::warn!(from = %from, to = %to, "fallback manager tripped");
-                self.managers
-                    .observers()
-                    .on_fallback(&FallbackContext { from, to });
-            }
+        if tripped && let Some(to) = self.managers.fallback().fallback_model() {
+            tracing::warn!(from = %served, to = %to, "fallback manager tripped");
+            self.managers.observers().on_fallback(&FallbackContext {
+                from: served.clone(),
+                to,
+            });
         }
 
         if was_in_fallback && let Some(active) = self.managers.fallback().fallback_model() {

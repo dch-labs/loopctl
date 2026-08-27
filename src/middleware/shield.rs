@@ -31,8 +31,13 @@ use crate::tool::shield::{SafetyAction, ShieldContext, ToolSafetyShield};
 /// `Warn` decision proceeds with its reason and category emitted
 /// as a tracing warning. The shield is
 /// shared behind an `Arc` so the same instance can serve a host's other
-/// evaluations; its internal history is updated by this middleware via
-/// `record_invocation`, so install it exactly once per session.
+/// evaluations. `record_invocation` is the post-dispatch state update,
+/// not an evaluation step: this middleware calls it after every
+/// dispatched call so the shield's history stays current. Install the
+/// middleware exactly once per session — two installed instances
+/// evaluate every call twice, and a host also calling
+/// `record_invocation` on the shared handle records duplicate state,
+/// skewing the `recent_calls` window.
 ///
 /// The shield evaluates the tool name as it reaches this layer.
 /// Middleware may rewrite [`ctx.tool_name`](ToolDispatchContext::tool_name)
@@ -69,8 +74,9 @@ pub struct SafetyShieldMiddleware {
     /// alongside this middleware.
     shield: Arc<dyn ToolSafetyShield>,
 
-    /// `(tool_name, turn)` for the most recent 20 calls this
-    /// middleware dispatched.
+    /// `(tool_name, turn)` for the most recent 20 *watched* calls —
+    /// calls outside the watched set are neither evaluated nor recorded
+    /// here, so a shield reading this snapshot is blind to them.
     ///
     /// The snapshot source for
     /// [`ShieldContext::recent_calls`](crate::tool::shield::ShieldContext::recent_calls):

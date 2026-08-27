@@ -235,7 +235,7 @@ impl ToolStats {
         self.total_calls.fetch_add(1, Ordering::Relaxed);
         self.success_count.fetch_add(1, Ordering::Relaxed);
         let ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-        self.total_duration_ns.fetch_add(ns, Ordering::Relaxed);
+        saturating_add(&self.total_duration_ns, ns);
         self.max_duration_ns.fetch_max(ns, Ordering::Relaxed);
         self.ewma_success
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
@@ -254,7 +254,7 @@ impl ToolStats {
         self.total_calls.fetch_add(1, Ordering::Relaxed);
         self.failure_count.fetch_add(1, Ordering::Relaxed);
         let ns = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-        self.total_duration_ns.fetch_add(ns, Ordering::Relaxed);
+        saturating_add(&self.total_duration_ns, ns);
         self.max_duration_ns.fetch_max(ns, Ordering::Relaxed);
         self.ewma_success
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
@@ -370,6 +370,14 @@ fn update_ewma(prev: u64, is_success: bool) -> u64 {
         .saturating_add(sample.saturating_mul(3)))
         / 10;
     next.min(EWMA_SCALE)
+}
+
+/// Add `value` to `cell`, saturating at `u64::MAX` instead of wrapping.
+fn saturating_add(cell: &AtomicU64, value: u64) {
+    cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+        prev.checked_add(value).or(Some(u64::MAX))
+    })
+    .ok();
 }
 
 /// Circuit breaker state.
@@ -685,6 +693,12 @@ impl ToolCircuitBreaker {
     ///   grants a fresh probe in this same call — the pure
     ///   [`would_allow_request`](Self::would_allow_request) oracle and
     ///   this method agree at every instant.
+    ///
+    /// The single-flight guarantee is bounded by `probe_timeout`: a probe
+    /// stalled past its lease admits a replacement only after the lease
+    /// end plus the recovery cooldown, so a call executing longer than
+    /// `probe_timeout + recovery_duration` can overlap its replacement —
+    /// recovery liveness beats strict single-flight for a wedged probe.
     #[must_use]
     pub fn allow_request(&self) -> bool {
         let mut state = crate::error::recover_guard(self.state.lock());
@@ -768,12 +782,13 @@ impl ToolCircuitBreaker {
     /// Record a successful call.
     ///
     /// Resets consecutive failures to zero and transitions the breaker to
-    /// Closed — except for a `HalfOpen` probe whose lease has expired:
-    /// that success describes a probe the breaker has already abandoned,
-    /// so it re-arms recovery (cooldown anchored to the lease's end)
-    /// instead of closing. A success observed while `Open` closes
-    /// normally: the call that produced it completed just now, so it is
-    /// fresh evidence, not a stale probe result.
+    /// Closed — except in two cases. A `HalfOpen` probe whose lease has
+    /// expired describes a probe the breaker has already abandoned, so it
+    /// re-arms recovery (cooldown anchored to the lease's end) instead of
+    /// closing. And a success observed while `Open` is ignored entirely:
+    /// the only calls that can complete in `Open` were admitted before
+    /// the trip, so their success is stale evidence — recovery is decided
+    /// by a probe, not by a pre-trip straggler.
     pub fn record_success(&self) {
         let mut state = crate::error::recover_guard(self.state.lock());
         if matches!(state.circuit, CircuitState::HalfOpen)
@@ -783,6 +798,9 @@ impl ToolCircuitBreaker {
             state.last_failure_time =
                 probe_expires_at(&state, self.probe_timeout).or_else(|| Some(Instant::now()));
             state.probe_started_at = None;
+            return;
+        }
+        if matches!(state.circuit, CircuitState::Open) {
             return;
         }
         state.consecutive_failures = 0;
@@ -1271,6 +1289,36 @@ impl HealthRouterBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_success_cannot_untrip_a_freshly_opened_breaker() {
+        // A success arriving while the breaker is Open can only come
+        // from a call admitted before the trip — stale evidence.
+        // Recovery is decided by a probe, not by a pre-trip straggler.
+        let breaker = ToolCircuitBreaker::new(Duration::from_millis(50), 2);
+        breaker.record_failure();
+        breaker.record_failure();
+        assert!(breaker.is_open());
+        breaker.record_success();
+        assert!(
+            breaker.is_open(),
+            "a pre-trip straggler's success must not close a freshly \
+             opened breaker"
+        );
+    }
+
+    #[test]
+    fn duration_accumulation_saturates_rather_than_wraps() {
+        let stats = ToolStats::new();
+        stats.record_success(Duration::from_nanos(u64::MAX - 10));
+        stats.record_failure(Duration::from_nanos(u64::MAX - 10));
+        let avg = stats.avg_duration();
+        assert_eq!(
+            avg,
+            Duration::from_nanos(u64::MAX / 2),
+            "two near-max durations must saturate, not wrap to a tiny average"
+        );
+    }
 
     #[test]
     fn tool_stats_starts_healthy() {

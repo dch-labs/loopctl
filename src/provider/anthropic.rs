@@ -309,6 +309,11 @@ impl ApiClient for AnthropicClient {
                 Err(grammar_unsupported_error())
             }));
         }
+        if options.response_format.as_ref().is_some_and(|rf| rf.strict) {
+            return Box::pin(futures::stream::once(async move {
+                Err(strict_unsupported_error("Anthropic"))
+            }));
+        }
         let system = request.system.clone();
         let tools = request.tools.clone();
         let model = options
@@ -362,6 +367,9 @@ impl ApiClient for AnthropicClient {
         #[cfg(feature = "grammar")]
         if matches!(&options.tool_constraint, ToolConstraint::Grammar(_)) {
             return Box::pin(async move { Err(grammar_unsupported_error()) });
+        }
+        if options.response_format.as_ref().is_some_and(|rf| rf.strict) {
+            return Box::pin(async move { Err(strict_unsupported_error("Anthropic")) });
         }
         let system = request.system.clone();
         let tools = request.tools.clone();
@@ -686,10 +694,21 @@ struct RequestBodySpec<'a> {
 /// their absence from malformed tool calls downstream.
 #[cfg(feature = "grammar")]
 fn grammar_unsupported_error() -> ApiError {
-    ApiError::config(
+    ApiError::config_validation(
         "the Anthropic Messages API has no grammar-constrained decoding; \
          use ToolConstraint::Strict or an OpenAI-compatible endpoint",
     )
+}
+
+/// The Anthropic Messages API has no strict-mode switch for its forced
+/// tool — a `strict` response format would be silently served
+/// non-strict, so it is rejected loudly instead.
+fn strict_unsupported_error(provider: &str) -> ApiError {
+    ApiError::config_validation(format!(
+        "the {provider} API cannot express response_format.strict; the \
+         request would be served non-strict — use an OpenAI-compatible \
+         endpoint or drop strict"
+    ))
 }
 
 /// Build the JSON request body for the Anthropic Messages API.
@@ -704,6 +723,9 @@ fn grammar_unsupported_error() -> ApiError {
 ///   `input_schema` is tightened (`additionalProperties: false` and full
 ///   `required`) via [`convert_tools`] before submission. No `tool_choice`
 ///   is emitted — `Strict` constrains the call's shape, not its selection.
+/// - A `response_format` with `strict: true` never reaches this builder:
+///   the `*_with_options` entry points reject it up front with
+///   `ApiError::config_validation`.
 fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32) -> Value {
     let RequestBodySpec {
         model,
@@ -1466,6 +1488,38 @@ impl StreamEmitter {
 mod tests {
     use super::*;
     use crate::message::{Message, MessagePart, Role, ToolContent};
+
+    #[tokio::test]
+    async fn strict_response_format_is_rejected_loudly() {
+        use crate::structured::{RequestOptions, ResponseFormat};
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url("http://localhost:1".to_string())
+            .build()
+            .unwrap();
+        let rf = ResponseFormat {
+            name: "out".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        };
+        let err = client
+            .create_message_with_options(
+                &crate::api::StreamRequest::new(vec![]),
+                RequestOptions::default().with_response_format(rf),
+            )
+            .await
+            .expect_err("strict must fail fast, not be silently dropped");
+        assert!(
+            err.to_string().contains("strict"),
+            "the error names the dropped field: {err}"
+        );
+        assert_eq!(
+            err.code(),
+            crate::api::error::ErrorCode::ConfigValidationError,
+            "a semantic capability rejection classifies as a validation \
+             failure, not a parse error"
+        );
+    }
 
     #[test]
     fn request_body_user_text_single_string() {

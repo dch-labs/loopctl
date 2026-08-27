@@ -94,9 +94,10 @@ pub trait StructuredOutput: Sized + Send + 'static {
     /// Logical name for the schema.
     ///
     /// Used verbatim as the OpenAI `json_schema.name` field and as the
-    /// synthesized Anthropic forced-tool name. Must match
-    /// `^[a-zA-Z0-9_-]+$` (alphanumeric, underscore, hyphen only) because
-    /// both providers validate this identifier.
+    /// synthesized Anthropic forced-tool name. Expected to match
+    /// `^[a-zA-Z0-9_-]+$` (alphanumeric, underscore, hyphen only) — the
+    /// convention OpenAI's schema identifiers follow; neither the crate
+    /// nor the providers enforce it.
     fn name() -> &'static str;
 
     /// The JSON Schema (Draft 07) describing the desired output object.
@@ -141,7 +142,8 @@ pub struct ResponseFormat {
     ///
     /// Copied from [`StructuredOutput::name`] when constructed via
     /// [`from_type`](Self::from_type). Used as the OpenAI `json_schema.name`
-    /// and the Anthropic forced-tool name. Must match `^[a-zA-Z0-9_-]+$`.
+    /// and the Anthropic forced-tool name. The `^[a-zA-Z0-9_-]+$` shape is
+    /// the expected convention, not an enforced one.
     pub name: String,
 
     /// The JSON Schema the model's output must satisfy.
@@ -154,8 +156,9 @@ pub struct ResponseFormat {
     /// Whether to enforce the schema server-side ("strict" mode).
     ///
     /// When `true` (the default), OpenAI guarantees the output conforms to
-    /// the schema. Providers that lack strict mode (Anthropic tool-forcing)
-    /// ignore this flag.
+    /// the schema. Anthropic and Gemini cannot express strict mode and
+    /// reject a strict request before sending it
+    /// ([`ApiError::config_validation`](crate::api::error::ApiError::config_validation)).
     pub strict: bool,
 }
 
@@ -266,6 +269,10 @@ pub enum ToolConstraint {
 /// `tools` (and therefore makes `tool_constraint` a no-op for that
 /// request), while setting `tool_constraint` constrains the `tools` path
 /// itself.
+///
+/// Per-request sampling knobs (temperature, top-p, stop sequences,
+/// max response tokens) are deliberately out of scope: requests
+/// without them are served with the provider-side defaults.
 #[derive(Debug, Clone, Default)]
 pub struct RequestOptions {
     /// If set, ask the model to return JSON conforming to this schema.
@@ -308,8 +315,8 @@ impl RequestOptions {
     /// of the client's current model; the client itself is untouched, so
     /// concurrent loops over one shared client cannot cross-wire their
     /// models. An empty or whitespace-only name is ignored (the override
-    /// stays unset) — the client builders reject empty model names, and
-    /// an override that would request a nameless model is never that.
+    /// stays unset) — a nameless model override is never what a caller
+    /// means, and the providers reject it on the wire anyway.
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         let model = model.into();

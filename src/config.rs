@@ -43,12 +43,14 @@ pub struct SessionConfig {
     /// Threshold to trigger auto-compaction, as a fraction of the context
     /// window (0–100). Defaults to `80`.
     ///
-    /// When the estimated payload size reaches this percentage of
+    /// When the estimated payload size exceeds this percentage of
     /// [`context_window`](Self::context_window), the compaction subsystem is
     /// invoked to summarize or truncate older messages before the next model
-    /// call. Lower it to compact more aggressively; raise it to defer
-    /// compaction and preserve more raw history. A threshold of `0` disables
-    /// this trigger; the emergency line at 95% still applies.
+    /// call — the comparison is strict, so a payload sitting exactly at the
+    /// threshold does not trigger a pass. Lower it to compact more
+    /// aggressively; raise it to defer compaction and preserve more raw
+    /// history. A threshold of `0` disables this trigger; the emergency
+    /// line (at or above 95%) still applies.
     ///
     /// The `0..=100` invariant is enforced by [`Default`], by
     /// [`with_compact_threshold`](Self::with_compact_threshold), and by the

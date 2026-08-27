@@ -120,13 +120,20 @@ pub use crate::capabilities::*;
 /// # Reset
 ///
 /// Call [`reset_all`](LoopManagers::reset_all) at the start of a new
-/// session to reinitialise every manager and observer to its default state.
+/// session to reinitialise the fallback, detection, and observer state.
+/// Optional managers (compaction, hooks, pipeline, stream handler,
+/// tool health) keep whatever they hold across it.
 pub struct LoopManagers {
     /// Circuit breaker for API model fallback.
     ///
     /// Tracks consecutive API failures and, when the threshold is exceeded,
     /// switches to a configured backup model. Fresh on construction; call
     /// [`reset_all`](Self::reset_all) to reinitialise mid-session.
+    ///
+    /// The default manager carries no fallback chain: it counts and
+    /// trips, but with no chain the routed model is unchanged — a loop
+    /// without [`set_fallback_models`](crate::fallback) serves the
+    /// client's model throughout, whatever the breaker believes.
     fallback: FallbackManager,
 
     /// Loop and convergence detection orchestrator.
@@ -452,15 +459,19 @@ impl LoopManagers {
         self.memory.as_ref()
     }
 
-    /// Reset all managers and observers to their initial state.
+    /// Reset the fallback, detection, and observer managers to their
+    /// initial state.
     ///
     /// Clears the fallback circuit breaker, loop/convergence detection
-    /// history, and per-observer accumulators. Call this when you want a
-    /// clean slate mid-session — for example after a provider outage
-    /// resolves (so the circuit breaker does not stay tripped) or when
-    /// switching to an unrelated task (so stale detection history does not
-    /// skew the next run). The engine does not call this automatically;
-    /// manager state persists across `run()` calls within a session.
+    /// history, and per-observer accumulators. The compaction manager,
+    /// hook executor, tool pipeline, stream handler, tool-health
+    /// registry, and memory store keep whatever they hold. Call this
+    /// when you want a clean slate mid-session — for example after a
+    /// provider outage resolves (so the circuit breaker does not stay
+    /// tripped) or when switching to an unrelated task (so stale
+    /// detection history does not skew the next run). The engine does
+    /// not call this automatically; manager state persists across
+    /// `run()` calls within a session.
     ///
     /// # Example
     ///
@@ -469,7 +480,8 @@ impl LoopManagers {
     /// let managers = LoopManagers::new();
     /// // ... after several runs ...
     /// managers.reset_all();
-    /// // All managers are back to their initial state
+    /// // Breaker, detection, and observer state are back to initial;
+    /// // the optional managers keep theirs
     /// ```
     pub fn reset_all(&self) {
         self.fallback.reset();

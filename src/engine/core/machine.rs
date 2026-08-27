@@ -189,9 +189,11 @@ pub enum MachineOutcome {
     ///
     /// A clean, cooperative termination caused by [`LoopMachine::cancel`] (the
     /// driver calls it when its cancellation signal fires). Distinct from
-    /// [`Failed`](Self::Failed): cancellation is expected, not an error, and the
-    /// conversation may hold partial results in the history. Carries no extra
-    /// fields because there is nothing further to report.
+    /// [`Failed`](Self::Failed): cancellation is expected, not an error. The
+    /// driver discards the cancelled run's pending messages; only messages
+    /// a mid-run compaction already folded into the committed history
+    /// remain. Carries no extra fields because there is nothing further
+    /// to report.
     Cancelled,
 
     /// The run failed with an error.
@@ -290,9 +292,10 @@ pub struct MachinePolicy {
 
     /// Compaction threshold as a percentage of the context window (0–100).
     ///
-    /// When `context_tokens` reaches this percentage of `context_window`, the
-    /// machine emits a [`MachineStep::Compact`] with a threshold-exceeded
-    /// reason (if `auto_compact` is `true`).
+    /// When `context_tokens` exceeds this percentage of `context_window`
+    /// (strictly — exactly at the threshold no pass fires), the machine
+    /// emits a [`MachineStep::Compact`] with a threshold-exceeded reason
+    /// (if `auto_compact` is `true`).
     pub compact_threshold: u8,
 
     /// Whether automatic compaction is enabled.
@@ -816,8 +819,13 @@ impl LoopMachine {
     /// Discard the current run's pending messages without committing.
     ///
     /// Called by the driver on run failure. The committed history stays
-    /// clean — no orphaned tool calls, model responses, or tool results
-    /// from the abandoned run leak into the next run's context.
+    /// clean of the abandoned run's pending messages — no orphaned tool
+    /// calls, model responses, or tool results leak into the next run's
+    /// context. Messages a mid-run compaction already folded into the
+    /// committed history are the exception (see
+    /// [`compaction_result`](Self::compaction_result)): a run that
+    /// compacts and then fails leaves its compacted trace behind, the
+    /// same commit-point property compaction has always had.
     pub fn discard_pending(&mut self) {
         self.pending.clear();
     }
@@ -1192,6 +1200,39 @@ mod tests {
                 assert_eq!(reason, CompactReason::ThresholdExceeded);
             }
             other => panic!("expected Compact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exactly_at_the_threshold_does_not_compact_until_exceeded() {
+        // window 200_000, threshold 80 -> the trigger line is 160_000.
+        // The comparison is strict: sitting exactly on the line serves.
+        let mut machine = small_machine();
+        machine.set_context_tokens(160_000);
+        assert!(matches!(
+            machine.next_step(test_policy(5)),
+            MachineStep::CallLLM { .. }
+        ));
+        machine.set_context_tokens(160_001);
+        assert!(matches!(
+            machine.next_step(test_policy(5)),
+            MachineStep::Compact { .. }
+        ));
+    }
+
+    #[test]
+    fn exactly_at_the_emergency_line_compacts() {
+        // The 95% emergency line is inclusive: exactly 190_000 of
+        // 200_000 fires — even with auto-compaction off.
+        let mut machine = small_machine();
+        machine.set_context_tokens(190_000);
+        let mut policy = test_policy(5);
+        policy.auto_compact = false;
+        match machine.next_step(policy) {
+            MachineStep::Compact { reason } => {
+                assert_eq!(reason, CompactReason::Emergency);
+            }
+            other => panic!("expected emergency Compact at the line, got {other:?}"),
         }
     }
 

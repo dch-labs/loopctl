@@ -64,15 +64,15 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
 
     /// Apply the model switch.
     ///
-    /// Performs the following steps in order (best-effort, not transactional —
-    /// there is no rollback if an individual step fails):
+    /// Performs the following steps in order:
     /// 1. Validates the target model is non-empty.
-    /// 2. Delegates to [`ApiClient::set_model`] on the underlying client. When
-    ///    the client returns `false` (runtime switching unsupported), a warning
-    ///    is logged and the remaining steps still run — the client is the
-    ///    source of truth for the model name, so a rejected switch leaves the
-    ///    effective model unchanged while the session/fallback/observer state
-    ///    reflects the requested target.
+    /// 2. Delegates to [`ApiClient::set_model`] on the underlying client.
+    ///    When the client returns `false` (runtime switching unsupported),
+    ///    the switch is rejected outright — nothing downstream runs, and
+    ///    the effective model, the breaker, and the observers are left
+    ///    untouched. Proceeding would re-point the fallback manager at a
+    ///    model the client never adopted, and the per-request model
+    ///    override would then serve it anyway.
     /// 3. Updates the session context window.
     /// 4. Resets the [`FallbackManager`](crate::fallback::FallbackManager)
     ///    circuit breaker to `Primary` and updates the original-model
@@ -82,6 +82,8 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
     /// # Errors
     ///
     /// - [`LoopError::Config`] if the model name is empty/whitespace.
+    /// - [`LoopError::Config`] if the client rejects the switch
+    ///   (`set_model` returned `false`).
     pub fn apply(self) -> Result<(), LoopError> {
         let Self {
             loop_,
@@ -98,12 +100,10 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
 
         let from = loop_.client.model();
         if !loop_.client.set_model(trimmed) {
-            tracing::warn!(
-                from = %from,
-                to = %trimmed,
-                "client rejected model switch (set_model returned false); \
-                 proceeding best-effort — the client remains the source of truth"
-            );
+            return Err(LoopError::Config(format!(
+                "client rejected the model switch to {trimmed:?} \
+                 (set_model returned false); nothing was changed"
+            )));
         }
 
         if let Some(cw) = context_window {

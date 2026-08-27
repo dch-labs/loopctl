@@ -18,7 +18,9 @@ use super::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 /// all available tools via [`register`](ToolRegistry::register), and then
 /// uses [`get`](ToolRegistry::get) to dispatch invocations when the LLM
 /// selects a tool by name. The registry also provides bulk accessors for
-/// tool schemas and concurrency-safe tool lists.
+/// tool schemas, the full tool list in registration order
+/// ([`all_tools`](ToolRegistry::all_tools)), and the concurrency-safe
+/// subset.
 ///
 /// # Thread safety
 ///
@@ -52,6 +54,13 @@ pub struct ToolRegistry {
     /// ([`get`](ToolRegistry::get)) and schema enumeration
     /// ([`all_schemas`](ToolRegistry::all_schemas)) iterate this map.
     tools: HashMap<String, Box<dyn Tool>>,
+
+    /// Registration order of the tool names.
+    ///
+    /// A name is appended when first registered and keeps its position
+    /// when a same-name registration overwrites the tool — the source
+    /// of [`all_tools`](ToolRegistry::all_tools)'s ordering.
+    order: Vec<String>,
 }
 
 impl ToolRegistry {
@@ -63,6 +72,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            order: Vec::new(),
         }
     }
 
@@ -85,6 +95,8 @@ impl ToolRegistry {
                 tool = %name,
                 "overwriting previously registered tool with the same name"
             );
+        } else {
+            self.order.push(name.clone());
         }
         self.tools.insert(name, Box::new(tool));
     }
@@ -207,6 +219,21 @@ impl ToolRegistry {
             .values()
             .map(std::convert::AsRef::as_ref)
             .filter(|t| t.is_concurrency_safe())
+            .collect()
+    }
+
+    /// Every registered tool, in registration order.
+    ///
+    /// Unlike [`concurrent_safe_tools`](Self::concurrent_safe_tools),
+    /// this includes tools that are not concurrency-safe. A tool
+    /// registered again under the same name keeps its original
+    /// position; callers that need a sorted order should sort the
+    /// result, as [`tool_names`](Self::tool_names) does for names.
+    #[must_use]
+    pub fn all_tools(&self) -> Vec<&dyn Tool> {
+        self.order
+            .iter()
+            .filter_map(|name| self.tools.get(name).map(std::convert::AsRef::as_ref))
             .collect()
     }
 }
@@ -619,6 +646,65 @@ mod tests {
         registry.register(make_tool("tool_a"));
         registry.register(make_tool("tool_b"));
         assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn all_tools_returns_one_entry_per_registered_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_tool("tool_a"));
+        registry.register(make_tool("tool_b"));
+        registry.register(make_tool("tool_c"));
+        assert_eq!(
+            registry.all_tools().len(),
+            registry.tool_names().len(),
+            "one entry per registered tool"
+        );
+    }
+
+    #[test]
+    fn all_tools_includes_concurrency_unsafe_tools() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_tool("unsafe_tool"));
+        let all = registry.all_tools();
+        let safe = registry.concurrent_safe_tools();
+        assert_eq!(all.len(), 1, "the unsafe tool is included");
+        assert!(
+            safe.is_empty(),
+            "the concurrency-safe subset excludes it — the two sets differ \
+             exactly as documented"
+        );
+    }
+
+    #[test]
+    fn all_tools_preserves_registration_order() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_tool("first"));
+        registry.register(make_tool("second"));
+        registry.register(make_tool("third"));
+        let names: Vec<&str> = registry
+            .all_tools()
+            .iter()
+            .map(|tool| tool.name())
+            .collect();
+        assert_eq!(names, ["first", "second", "third"]);
+
+        registry.register(make_tool("first"));
+        let names: Vec<&str> = registry
+            .all_tools()
+            .iter()
+            .map(|tool| tool.name())
+            .collect();
+        assert_eq!(
+            names,
+            ["first", "second", "third"],
+            "an overwriting registration keeps the tool's original position"
+        );
+    }
+
+    #[test]
+    fn all_tools_empty_registry_yields_empty() {
+        let registry = ToolRegistry::new();
+        assert!(registry.all_tools().is_empty());
     }
 
     #[test]

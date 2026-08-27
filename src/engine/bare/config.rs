@@ -79,6 +79,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// triggers compaction when usage exceeds the configured threshold.
     /// Must be called before [`run()`](crate::engine::core::Loop::run).
     ///
+    /// The session's `context_window` and `compact_threshold` are synced
+    /// onto the manager (the same sync the default manager gets): the
+    /// session config owns the window policy, and a host-installed
+    /// manager that disagrees would trigger at the wrong point. Other
+    /// manager settings (compactor, target base, counter) are the
+    /// host's.
+    ///
     /// # Panics (debug only)
     ///
     /// In debug builds, panics if called after the session has started.
@@ -103,7 +110,8 @@ impl<C: ApiClient> BareLoop<C> {
         self.debug_assert_idle();
         let synced = Arc::try_unwrap(manager)
             .unwrap_or_else(|arc| (*arc).clone())
-            .with_context_window(self.session.config.context_window);
+            .with_context_window(self.session.config.context_window)
+            .with_threshold(self.session.config.compact_threshold);
         self.managers.set_context_manager(Arc::new(synced));
     }
 

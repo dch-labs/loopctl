@@ -165,10 +165,18 @@ impl<C: ApiClient> BareLoop<C> {
                     compacted: None,
                 })
             }
-            Err(overflow) => Err(LoopError::ContextExceeded {
-                used: overflow.tokens_used,
-                limit: overflow.context_window,
-            }),
+            Err(overflow) => {
+                if let Some(error) = &overflow.compactor_error {
+                    tracing::warn!(
+                        error = %error,
+                        "compaction failed; reporting the context overflow it could not fix"
+                    );
+                }
+                Err(LoopError::ContextExceeded {
+                    used: overflow.tokens_used,
+                    limit: overflow.context_window,
+                })
+            }
         }
     }
 

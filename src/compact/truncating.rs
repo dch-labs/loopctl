@@ -201,6 +201,11 @@ impl ToolPairing {
 /// number of recent messages. No LLM calls required — useful as a fallback
 /// or for contexts where summarization isn't available.
 ///
+/// The compaction target is ignored: the shed is by message count
+/// (`preserve_recent`), not token budget, so whether the result fits
+/// the window — including any budget reserved for content riding the
+/// request — is decided by the manager's fit check, not here.
+///
 /// # Strategy
 ///
 /// ```text

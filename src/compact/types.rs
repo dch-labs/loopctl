@@ -332,18 +332,19 @@ pub struct PostCompactStats {
     pub percent_saved: u8,
 }
 
-/// Error returned when the conversation cannot fit within the context
-/// window, even after compaction.
+/// Error returned when compaction cannot bring the request payload
+/// within the context window.
 ///
-/// Terminal condition — the conversation is too large and the
-/// compactor was unable to reduce it sufficiently.
+/// Terminal condition — either the payload is too large for the
+/// compactor to reduce sufficiently, or the compactor itself failed
+/// (see [`compactor_error`](Self::compactor_error)).
 #[derive(Debug, Clone)]
 pub struct ContextOverflow {
     /// Estimated token count of the conversation.
     ///
     /// How many tokens the conversation occupies when it overflows — the same
     /// heuristic estimate used everywhere else in the subsystem. When a
-    /// reserved budget forced the failure (see
+    /// reserve rode the request (see
     /// [`compact_with_reason`](super::ContextManager::compact_with_reason)),
     /// the estimate includes it, so the comparison below explains the
     /// failure. Compare

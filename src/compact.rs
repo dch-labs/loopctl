@@ -233,7 +233,11 @@ pub trait ContextCompactor: Send + Sync {
     /// # Arguments
     ///
     /// * `messages` — The full conversation history to compact.
-    /// * `target_tokens` — The target token count for the compacted output.
+    /// * `target_tokens` — The target token count for the compacted
+    ///   output, already reduced by any budget reserved for content
+    ///   riding the request alongside the history (see
+    ///   [`ContextManager::compact_with_reason`](ContextManager::compact_with_reason)),
+    ///   so fitting the target leaves room for it.
     /// * `context` — Metadata about the compaction trigger.
     // The return-type boxing is required for object safety.
     fn compact(
@@ -609,8 +613,9 @@ impl ContextManager {
 
     /// Ensure the conversation fits within the context window.
     ///
-    /// Main entry point called by the agent loop after each
-    /// turn. It:
+    /// Self-driven entry point for callers that manage the conversation
+    /// themselves: it decides whether compaction is needed and runs it in
+    /// one call. It:
     ///
     /// 1. Estimates the current token usage.
     /// 2. Checks if compaction is needed.
@@ -763,7 +768,7 @@ impl ContextManager {
 
         if !outcome.success {
             return Err(ContextOverflow {
-                tokens_used: tokens_before,
+                tokens_used: tokens_before.saturating_add(reserved_tokens),
                 context_window: self.context_window,
                 message_count,
                 trigger: reason,

@@ -702,8 +702,9 @@ impl LoopMachine {
     /// commit the current run's partial messages mid-run, so a later failure
     /// could no longer discard them.
     ///
-    /// `tokens_before` and `tokens_after` are the driver's measured estimates
-    /// of the conversation ahead of and after the pass (equal in practice,
+    /// `tokens_before` and `tokens_after` are the driver's measured
+    /// payload estimates ahead of and after the pass (history plus the
+    /// per-request overhead; equal in practice,
     /// since nothing changed); the machine adopts `tokens_after` as the
     /// current context size. The same no-progress guard as
     /// [`Self::compaction_result`] applies: when nothing was shaved off, the

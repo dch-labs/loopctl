@@ -184,8 +184,9 @@ pub struct PreCompactContext {
 
     /// Estimated token count before compaction.
     ///
-    /// The conversation's approximate token usage right before the compactor
-    /// runs, against which `context_window` is compared to trigger compaction.
+    /// The payload estimate right before the compactor runs — the history
+    /// plus the per-request overhead (system prompt, tool schemas) —
+    /// against which `context_window` is compared to trigger compaction.
     pub tokens_before: u64,
 
     /// Model context window size in tokens.
@@ -228,8 +229,9 @@ pub struct PostCompactContext {
 
     /// Estimated tokens after compaction.
     ///
-    /// The conversation's approximate token usage once the compactor has
-    /// finished, which will be used for subsequent model calls.
+    /// The payload estimate once the compactor has finished — the compacted
+    /// history plus the per-request overhead — which subsequent model calls
+    /// will carry.
     pub tokens_after: u64,
 
     /// Compaction duration in milliseconds.

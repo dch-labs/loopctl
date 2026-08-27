@@ -35,17 +35,20 @@ pub struct SessionConfig {
     /// Context window size in tokens.
     ///
     /// Must match the actual window of the configured model. Used by the
-    /// compaction subsystem to decide when the conversation exceeds the budget.
+    /// compaction subsystem to decide when the request payload exceeds the
+    /// budget. A window of `0` disables the window policy entirely — no
+    /// threshold and no emergency check, every request is served.
     pub context_window: u64,
 
     /// Threshold to trigger auto-compaction, as a fraction of the context
     /// window (0–100). Defaults to `80`.
     ///
-    /// When estimated token usage reaches this percentage of
+    /// When the estimated payload size reaches this percentage of
     /// [`context_window`](Self::context_window), the compaction subsystem is
     /// invoked to summarize or truncate older messages before the next model
     /// call. Lower it to compact more aggressively; raise it to defer
-    /// compaction and preserve more raw history.
+    /// compaction and preserve more raw history. A threshold of `0` disables
+    /// this trigger; the emergency line at 95% still applies.
     ///
     /// The `0..=100` invariant is enforced by [`Default`], by
     /// [`with_compact_threshold`](Self::with_compact_threshold), and by the
@@ -60,9 +63,12 @@ pub struct SessionConfig {
     /// Whether auto-compaction is enabled. Defaults to `true`.
     ///
     /// When `true` the loop automatically runs the compactor once the
-    /// [`compact_threshold`](Self::compact_threshold) is reached. When `false`
-    /// the loop never compacts on its own, even under token pressure, leaving
-    /// context management entirely to the caller.
+    /// [`compact_threshold`](Self::compact_threshold) is reached. When
+    /// `false` the threshold-based compaction is off, leaving routine
+    /// context management to the caller — but the 95%-of-window
+    /// emergency safety net still fires (see
+    /// [`LoopMachine`](crate::engine::core::LoopMachine)), so a run
+    /// never serves a payload it believes is over the window.
     pub auto_compact: bool,
 }
 

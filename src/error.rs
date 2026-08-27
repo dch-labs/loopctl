@@ -209,9 +209,10 @@ pub enum LoopError {
     ContextExceeded {
         /// Number of tokens consumed when the limit was exceeded.
         ///
-        /// An estimate derived from the current message history; it
-        /// includes both the prompt and any retained tool results. Pair
-        /// with `limit` to report utilization to the caller.
+        /// A payload-comparable estimate: the history plus what rides the
+        /// request — the system prompt, tool schemas, and any reserved
+        /// transient budget. Pair with `limit` to report utilization to
+        /// the caller.
         used: u64,
 
         /// The token budget that was exceeded.

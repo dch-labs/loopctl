@@ -694,7 +694,7 @@ struct RequestBodySpec<'a> {
 /// their absence from malformed tool calls downstream.
 #[cfg(feature = "grammar")]
 fn grammar_unsupported_error() -> ApiError {
-    ApiError::config(
+    ApiError::config_validation(
         "the Anthropic Messages API has no grammar-constrained decoding; \
          use ToolConstraint::Strict or an OpenAI-compatible endpoint",
     )
@@ -704,7 +704,7 @@ fn grammar_unsupported_error() -> ApiError {
 /// tool — a `strict` response format would be silently served
 /// non-strict, so it is rejected loudly instead.
 fn strict_unsupported_error(provider: &str) -> ApiError {
-    ApiError::config(format!(
+    ApiError::config_validation(format!(
         "the {provider} API cannot express response_format.strict; the \
          request would be served non-strict — use an OpenAI-compatible \
          endpoint or drop strict"
@@ -723,6 +723,9 @@ fn strict_unsupported_error(provider: &str) -> ApiError {
 ///   `input_schema` is tightened (`additionalProperties: false` and full
 ///   `required`) via [`convert_tools`] before submission. No `tool_choice`
 ///   is emitted — `Strict` constrains the call's shape, not its selection.
+/// - A `response_format` with `strict: true` never reaches this builder:
+///   the `*_with_options` entry points reject it up front with
+///   `ApiError::config_validation`.
 fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32) -> Value {
     let RequestBodySpec {
         model,
@@ -1509,6 +1512,12 @@ mod tests {
         assert!(
             err.to_string().contains("strict"),
             "the error names the dropped field: {err}"
+        );
+        assert_eq!(
+            err.code(),
+            crate::api::error::ErrorCode::ConfigValidationError,
+            "a semantic capability rejection classifies as a validation \
+             failure, not a parse error"
         );
     }
 

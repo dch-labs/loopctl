@@ -156,8 +156,9 @@ pub struct ResponseFormat {
     /// Whether to enforce the schema server-side ("strict" mode).
     ///
     /// When `true` (the default), OpenAI guarantees the output conforms to
-    /// the schema. Providers that lack strict mode (Anthropic tool-forcing)
-    /// ignore this flag.
+    /// the schema. Anthropic and Gemini cannot express strict mode and
+    /// reject a strict request before sending it
+    /// ([`ApiError::config_validation`](crate::api::error::ApiError::config_validation)).
     pub strict: bool,
 }
 

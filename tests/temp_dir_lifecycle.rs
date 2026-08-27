@@ -78,14 +78,37 @@ impl Drop for ScratchGuard {
 }
 
 /// A fresh scratch base directory path, unique per call.
+///
+/// The name combines the pid, a per-process counter, and the wall
+/// clock. The counter is the load-bearing part: on hosts whose clock
+/// granularity is coarse (VM runners), a tight loop can hand two
+/// calls the same nanosecond, and parallel tests sharing a base would
+/// delete each other's scratch — the counter keeps bases distinct
+/// regardless of the clock.
 fn unique_base() -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     std::env::temp_dir().join(format!(
-        "loopctl-temp-dir-test-{}-{}",
+        "loopctl-temp-dir-test-{}-{}-{}",
         std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos())
     ))
+}
+
+#[test]
+fn tight_loop_bases_stay_distinct() {
+    // The collision the counter exists for: a coarse wall clock hands
+    // a tight loop identical nanosecond stamps, and two tests drawing
+    // the same base would delete each other's scratch mid-flight.
+    let bases: Vec<PathBuf> = (0..256).map(|_| unique_base()).collect();
+    let distinct: std::collections::HashSet<&Path> = bases.iter().map(|b| b.as_path()).collect();
+    assert_eq!(
+        bases.len(),
+        distinct.len(),
+        "every base must be distinct even when timestamps repeat"
+    );
 }
 
 /// One scripted round: a response dispatching the capture tool, then a

@@ -638,6 +638,21 @@ impl MockApiClient {
 /// The `_messages`, `_system`, and `_tools` parameters are accepted for
 /// trait compatibility but ignored — the mock always
 /// returns its preconfigured response regardless of the input.
+/// The one request option the mock cannot serve: a tool-call
+/// constraint shapes the tool-calling path, which the mock scripts
+/// rather than executes against a real model.
+fn unsupported_mock_option(options: &crate::structured::RequestOptions) -> Option<ApiError> {
+    if !matches!(
+        options.tool_constraint,
+        crate::structured::ToolConstraint::None
+    ) {
+        return Some(ApiError::config(
+            "this client does not support tool-call constraints (tool_constraint)",
+        ));
+    }
+    None
+}
+
 impl ApiClient for MockApiClient {
     /// Return the model name this mock was created with.
     ///
@@ -725,8 +740,12 @@ impl ApiClient for MockApiClient {
 
     /// Streaming variant that honors the per-request model override.
     ///
-    /// Rejects `response_format` and `tool_constraint` loudly (the mock
-    /// implements neither) and serves the response under
+    /// Accepts a `response_format` by serving the canned response
+    /// unchanged — the mock cannot enforce a schema (it has no model),
+    /// so the canned text is the structured answer, well-formed or
+    /// deliberately malformed. Rejects `tool_constraint` loudly (a
+    /// constraint shapes the tool-calling path the mock scripts).
+    /// Serves the response under
     /// `options.model` when set — the mock's stand-in for the wire-level
     /// model switch real clients perform, so fallback-routing tests
     /// built on the mock observe the routed model instead of silently
@@ -758,7 +777,7 @@ impl ApiClient for MockApiClient {
         _request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
-        if let Some(err) = crate::api::unsupported_structured_output_error(&options) {
+        if let Some(err) = unsupported_mock_option(&options) {
             return Box::pin(futures::stream::once(async move { Err(err) }));
         }
         let model = options
@@ -827,8 +846,9 @@ impl ApiClient for MockApiClient {
 
     /// Non-streaming variant that accepts the per-request model override.
     ///
-    /// Rejects `response_format` and `tool_constraint` loudly (the mock
-    /// implements neither). The per-request `model` is accepted without
+    /// Accepts a `response_format` by serving the canned response
+    /// unchanged (see the streaming twin for why), and rejects
+    /// `tool_constraint` loudly. The per-request `model` is accepted without
     /// changing the response: a [`NonStreamingResponse`](crate::api::NonStreamingResponse)
     /// carries no model field, so there is nothing to vary — accepting
     /// the override keeps fallback-routing tests on the non-streaming
@@ -840,7 +860,7 @@ impl ApiClient for MockApiClient {
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
     {
-        if let Some(err) = crate::api::unsupported_structured_output_error(&options) {
+        if let Some(err) = unsupported_mock_option(&options) {
             return Box::pin(async move { Err(err) });
         }
         self.create_message(request)
@@ -1467,6 +1487,155 @@ pub fn test_config() -> SessionConfig {
 ///   [`test_tool_use_message`], [`test_config`].
 #[cfg(test)]
 mod tests {
+    #[derive(Debug, serde::Deserialize, PartialEq)]
+    struct Forecast {
+        role: String,
+    }
+
+    impl crate::structured::StructuredOutput for Forecast {
+        fn name() -> &'static str {
+            "forecast"
+        }
+
+        fn schema() -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {"role": {"type": "string"}},
+                "required": ["role"]
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn request_structured_against_the_mock_returns_the_deserialized_type() {
+        let client = MockApiClient::new("test-model").with_text_response(r#"{"role":"coding"}"#);
+        let got = crate::structured::request_structured::<Forecast>(
+            &client,
+            vec![crate::message::Message::user("hi")],
+            None,
+        )
+        .await;
+        match got {
+            Ok(forecast) => assert_eq!(forecast.role, "coding"),
+            Err(e) => panic!(
+                "the mock must serve the canned text to a structured \
+                             request: {e:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_structured_against_a_failing_mock_returns_the_api_error() {
+        let client = MockApiClient::new("test-model").with_error("boom");
+        let got = crate::structured::request_structured::<Forecast>(
+            &client,
+            vec![crate::message::Message::user("hi")],
+            None,
+        )
+        .await;
+        assert!(
+            matches!(got, Err(crate::structured::StructuredError::Api(_))),
+            "a failing provider surfaces as StructuredError::Api, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_structured_with_malformed_json_returns_deserialize() {
+        let client = MockApiClient::new("test-model").with_text_response("not json at all");
+        let got = crate::structured::request_structured::<Forecast>(
+            &client,
+            vec![crate::message::Message::user("hi")],
+            None,
+        )
+        .await;
+        assert!(
+            matches!(got, Err(crate::structured::StructuredError::Deserialize(_))),
+            "a struct type cannot fall back to prose, so malformed JSON \
+             reaches the caller as Deserialize, got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_serves_a_structured_request_instead_of_rejecting_it() {
+        use futures::StreamExt;
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        let opts = crate::structured::RequestOptions::default()
+            .with_response_format(crate::structured::ResponseFormat::from_type::<Forecast>());
+        let stream =
+            client.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), opts);
+        let events: Vec<_> = stream.collect().await;
+        assert!(
+            !events.is_empty() && events.iter().all(Result::is_ok),
+            "the canned stream is served under a response_format, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_mock_rejects_a_tool_constraint_loudly() {
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        let opts = crate::structured::RequestOptions {
+            tool_constraint: crate::structured::ToolConstraint::Strict,
+            ..Default::default()
+        };
+        let err = client
+            .create_message_with_options(&crate::api::StreamRequest::new(vec![]), opts)
+            .await
+            .expect_err("a tool constraint must be rejected loudly");
+        assert!(
+            err.to_string().contains("tool_constraint"),
+            "the error names the option: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_serves_a_structured_request_under_a_model_override() {
+        use futures::StreamExt;
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        let opts = crate::structured::RequestOptions::default()
+            .with_model("fallback")
+            .with_response_format(crate::structured::ResponseFormat::from_type::<Forecast>());
+        let stream =
+            client.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), opts);
+        let events: Vec<_> = stream.collect().await;
+        let model = events.iter().find_map(|e| {
+            e.as_ref().ok().and_then(|ev| match ev {
+                crate::stream::StreamEvent::MessageStart(start) => {
+                    Some(start.message.model.clone())
+                }
+                _ => None,
+            })
+        });
+        assert_eq!(
+            model.as_deref(),
+            Some("fallback"),
+            "accepting a response_format must not disturb the model \
+             override routing: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_still_rejects_a_tool_constraint() {
+        use futures::StreamExt;
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        let opts = crate::structured::RequestOptions {
+            tool_constraint: crate::structured::ToolConstraint::Strict,
+            ..Default::default()
+        };
+        let stream =
+            client.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), opts);
+        let events: Vec<_> = stream.collect().await;
+        let err = events
+            .first()
+            .and_then(|e| e.as_ref().err())
+            .unwrap_or_else(|| {
+                panic!("the streaming path must reject a constraint, got {events:?}")
+            });
+        assert!(
+            err.to_string().contains("tool_constraint"),
+            "the error names the option: {err}"
+        );
+    }
+
     use super::*;
     use crate::tool::ToolRegistry;
     use futures::StreamExt;

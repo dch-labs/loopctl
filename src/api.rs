@@ -385,9 +385,8 @@ pub(crate) fn unsupported_options_error(
 /// The config error for the structured-output option fields a client
 /// cannot forward (`response_format`, `tool_constraint`), or `None`.
 ///
-/// The shared core of [`unsupported_options_error`]; also used directly
-/// by clients that honor the per-request `model` override but implement
-/// neither structured-output field (e.g. `MockApiClient`).
+/// The shared core of [`unsupported_options_error`] — the default
+/// `*_with_options` implementations' guard.
 pub(crate) fn unsupported_structured_output_error(
     options: &crate::structured::RequestOptions,
 ) -> Option<ApiError> {

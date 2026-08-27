@@ -1,13 +1,13 @@
 //! Turn-boundary context injection.
 //!
 //! A [`ContextContributor`] produces an optional [`Message`] that the loop
-//! appends to the conversation before the next model call. Register one on
-//! [`BareLoop`](crate::engine::BareLoop) via
+//! prepends to the outbound request before the next model call. Register
+//! one on [`BareLoop`](crate::engine::BareLoop) via
 //! [`add_contributor`](crate::engine::BareLoop::add_contributor); the loop
-//! consults every registered contributor at the top of each turn, after
-//! [`on_turn_start`](crate::observer::LoopObserver::on_turn_start) and before
-//! the model is called. A typical use is re-emitting the agent's goal or
-//! current plan every few turns so a small model stays on-task.
+//! consults every registered contributor at the top of each turn, before
+//! that turn's observer events and before the model is called. A typical
+//! use is re-emitting the agent's goal or current plan every few turns so
+//! a small model stays on-task.
 
 use crate::message::Message;
 
@@ -55,12 +55,14 @@ use crate::message::Message;
 /// ```
 pub trait ContextContributor: Send + Sync {
     /// Inspect the current turn count and conversation snapshot, returning a
-    /// message to append to the conversation before the model call.
+    /// message to prepend to the outbound request before the model call.
     ///
-    /// The returned message is pushed onto the conversation history in
-    /// registration order alongside any other contributor messages, so it
-    /// reaches the model this turn and persists into subsequent turns (subject
-    /// to compaction).
+    /// The returned message is prepended to that turn's outbound request in
+    /// registration order, so it reaches the model this turn; it is **not**
+    /// persisted into history — it reappears in later turns only if the
+    /// contributor returns it again. When a turn defers to compaction after
+    /// the consultation, the retried turn consults the contributors again
+    /// against the compacted history.
     fn contribute(&self, ctx: &ContributorContext<'_>) -> Option<Message>;
 }
 

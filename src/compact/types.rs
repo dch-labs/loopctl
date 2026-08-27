@@ -270,8 +270,8 @@ pub struct PreCompactStats {
     /// Estimated token count.
     ///
     /// The pre-compaction token estimate of the whole conversation, using the
-    /// standard 4-chars-per-token heuristic. This is the number compared against
-    /// the threshold to decide whether compaction was needed.
+    /// standard 4-chars-per-token heuristic — history only, without
+    /// per-request overhead or transients.
     pub estimated_tokens: u64,
 
     /// Number of user-role messages.
@@ -332,17 +332,22 @@ pub struct PostCompactStats {
     pub percent_saved: u8,
 }
 
-/// Error returned when the conversation cannot fit within the context
-/// window, even after compaction.
+/// Error returned when compaction cannot bring the request payload
+/// within the context window.
 ///
-/// Terminal condition — the conversation is too large and the
-/// compactor was unable to reduce it sufficiently.
+/// Terminal condition — either the payload is too large for the
+/// compactor to reduce sufficiently, or the compactor itself failed
+/// (see [`compactor_error`](Self::compactor_error)).
 #[derive(Debug, Clone)]
 pub struct ContextOverflow {
     /// Estimated token count of the conversation.
     ///
     /// How many tokens the conversation occupies when it overflows — the same
-    /// heuristic estimate used everywhere else in the subsystem. Compare
+    /// heuristic estimate used everywhere else in the subsystem. When a
+    /// reserve rode the request (see
+    /// [`compact_with_reason`](super::ContextManager::compact_with_reason)),
+    /// the estimate includes it, so the comparison below explains the
+    /// failure. Compare
     /// against [`context_window`](Self::context_window) (or use
     /// [`overflow`](Self::overflow)) to see by how much it exceeded the limit.
     pub tokens_used: u64,

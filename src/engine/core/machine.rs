@@ -451,14 +451,18 @@ impl LoopMachine {
 
     /// Feed a driver-measured context estimate into the machine.
     ///
-    /// The driver calls this whenever history grows outside a model response
-    /// — after [`Self::accept_input`] at run start, so the first
-    /// [`Self::next_step`] sees the true size of the committed history plus
-    /// the new input instead of the zero `accept_input` reset to, and after
-    /// any other append the machine would otherwise not learn about until the
-    /// next response. Replaces the current estimate with `tokens`; performs
-    /// no state transition, so the compaction trigger evaluates it on the
-    /// next [`Self::next_step`]. No effect once the machine is terminal.
+    /// The estimate is the payload the provider would receive — history
+    /// plus the per-request overhead (system prompt, tool schemas) and,
+    /// when known ahead of the call, the turn's transient messages
+    /// (contributors, retrieved memories). The driver calls this
+    /// whenever that payload grows outside a model response — after
+    /// [`Self::accept_input`] at run start, after tool results land,
+    /// and before a model call that carries fresh transients — so the
+    /// first [`Self::next_step`] sees the true size instead of the zero
+    /// `accept_input` reset to. Replaces the current estimate with
+    /// `tokens`; performs no state transition, so the compaction
+    /// trigger evaluates it on the next [`Self::next_step`]. No effect
+    /// once the machine is terminal.
     pub fn set_context_tokens(&mut self, tokens: u64) {
         if self.is_terminal() {
             return;
@@ -475,7 +479,10 @@ impl LoopMachine {
     /// This is pure and idempotent: calling it twice with no intervening feed
     /// method ([`Self::model_response`], [`Self::tool_results`],
     /// [`Self::compaction_result`], [`Self::compaction_noop`],
-    /// [`Self::cancel`]) returns an equal step.
+    /// [`Self::set_context_tokens`], [`Self::cancel`]) returns an equal step.
+    /// A [`set_context_tokens`](Self::set_context_tokens) between polls can
+    /// change the decision without changing the state — the driver's
+    /// deferral re-check relies on exactly that.
     /// Once the machine is terminal, every subsequent call returns
     /// [`MachineStep::Done`] with the same [`MachineOutcome`].
     ///
@@ -642,6 +649,12 @@ impl LoopMachine {
     /// steering message. The message becomes part
     /// of the record the driver builds the feed from on the next
     /// [`MachineStep::CallLLM`]. Has no effect once the machine is terminal.
+    ///
+    /// The context estimate is not refreshed here — the machine keeps no
+    /// counter. A caller injecting enough content to matter should pair
+    /// this with [`set_context_tokens`](Self::set_context_tokens),
+    /// measured by whoever owns the token counter; otherwise the next
+    /// step's compaction decision runs against the pre-inject estimate.
     pub fn inject(&mut self, message: Message) {
         if self.is_terminal() {
             return;
@@ -653,11 +666,13 @@ impl LoopMachine {
     ///
     /// The driver calls this after servicing a [`MachineStep::Compact`] that
     /// rewrote the history, passing the compacted history plus two measured
-    /// estimates from the same token counter: `tokens_before` — the size of
-    /// the full history ahead of the compaction pass — and `tokens_after` —
-    /// the size of `compacted`. The machine adopts `tokens_after` as the
-    /// current context size so it does not immediately request another
-    /// compaction. The next [`Self::next_step`] then requests the deferred
+    /// estimates from the same counter: `tokens_before` — the payload the
+    /// provider would have received ahead of the compaction pass
+    /// (history plus the per-request overhead) — and `tokens_after` —
+    /// the same measure of `compacted`. The machine adopts
+    /// `tokens_after` as the current context size so it does not
+    /// immediately request another compaction. The next
+    /// [`Self::next_step`] then requests the deferred
     /// [`MachineStep::CallLLM`]. Has no effect once the machine is terminal.
     pub fn compaction_result(
         &mut self,
@@ -687,8 +702,9 @@ impl LoopMachine {
     /// commit the current run's partial messages mid-run, so a later failure
     /// could no longer discard them.
     ///
-    /// `tokens_before` and `tokens_after` are the driver's measured estimates
-    /// of the conversation ahead of and after the pass (equal in practice,
+    /// `tokens_before` and `tokens_after` are the driver's measured
+    /// payload estimates ahead of and after the pass (history plus the
+    /// per-request overhead; equal in practice,
     /// since nothing changed); the machine adopts `tokens_after` as the
     /// current context size. The same no-progress guard as
     /// [`Self::compaction_result`] applies: when nothing was shaved off, the

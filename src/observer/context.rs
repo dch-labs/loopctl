@@ -395,14 +395,18 @@ pub struct ToolPostContext {
 pub struct CompactedContext {
     /// Estimated token count before compaction.
     ///
-    /// The token count of the conversation before the compactor ran,
+    /// The payload estimate before the compactor ran — the history plus
+    /// the per-request overhead (system prompt, tool schemas) —
     /// reconstructed from `tokens_after + tokens_saved`.
     pub tokens_before: u64,
 
     /// Estimated token count after compaction.
     ///
-    /// The token count of the compacted conversation that will be used
-    /// for subsequent model calls.
+    /// The payload estimate of the compacted history plus the same
+    /// overhead. Transient context (contributors, retrieved memories)
+    /// is not part of it — a retried turn regenerates its own, so
+    /// this number does not predict the next request's size when
+    /// transients ride it.
     pub tokens_after: u64,
 
     /// Estimated tokens saved by compaction.

@@ -86,7 +86,9 @@ impl<C: ApiClient> BareLoop<C> {
         reason: crate::compact::types::CompactReason,
     ) -> Result<CompactStepOutcome, LoopError> {
         let history = self.machine.full_history();
-        let tokens_before = self.count_context(&history);
+        let tokens_before = self
+            .count_context(&history)
+            .saturating_add(self.overhead_tokens());
         let Some(ctx_manager) = self.managers.context_manager() else {
             return Ok(CompactStepOutcome {
                 tokens_before,
@@ -114,13 +116,23 @@ impl<C: ApiClient> BareLoop<C> {
         let compact_start = Instant::now();
         #[cfg(feature = "hooks")]
         let (instructions, additional_context) = (hook.new_instructions, hook.additional_context);
+        let reserved = self
+            .overhead_tokens()
+            .saturating_add(std::mem::take(&mut self.deferred_transient_tokens));
         let result = ctx_manager
-            .compact_with_reason(history, turn, reason, instructions, additional_context)
+            .compact_with_reason(
+                history,
+                turn,
+                reason,
+                instructions,
+                additional_context,
+                reserved,
+            )
             .await;
 
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
-                let tokens_after = outcome.tokens_after;
+                let tokens_after = outcome.tokens_after.saturating_add(self.overhead_tokens());
                 let tokens_saved = tokens_before.saturating_sub(tokens_after);
                 #[cfg(feature = "hooks")]
                 let messages_after = outcome.messages.len();
@@ -144,17 +156,27 @@ impl<C: ApiClient> BareLoop<C> {
                 })
             }
             Ok(EnsureContextResult::NoAction(messages)) => {
-                let tokens_after = self.count_context(&messages);
+                let tokens_after = self
+                    .count_context(&messages)
+                    .saturating_add(self.overhead_tokens());
                 Ok(CompactStepOutcome {
                     tokens_before,
                     tokens_after,
                     compacted: None,
                 })
             }
-            Err(overflow) => Err(LoopError::ContextExceeded {
-                used: overflow.tokens_used,
-                limit: overflow.context_window,
-            }),
+            Err(overflow) => {
+                if let Some(error) = &overflow.compactor_error {
+                    tracing::warn!(
+                        error = %error,
+                        "compaction failed; reporting the context overflow it could not fix"
+                    );
+                }
+                Err(LoopError::ContextExceeded {
+                    used: overflow.tokens_used,
+                    limit: overflow.context_window,
+                })
+            }
         }
     }
 
@@ -180,7 +202,9 @@ impl<C: ApiClient> BareLoop<C> {
         let Some(executor) = self.managers.hook_executor() else {
             return crate::hooks::context::CompactResult::allow();
         };
-        let tokens_before = crate::compact::CompactionOutcome::estimate_tokens(history);
+        let tokens_before = self
+            .count_context(history)
+            .saturating_add(self.overhead_tokens());
         let ctx = PreCompactContext {
             trigger: CompactTrigger::from(reason),
             custom_instructions: None,

@@ -233,7 +233,11 @@ pub trait ContextCompactor: Send + Sync {
     /// # Arguments
     ///
     /// * `messages` — The full conversation history to compact.
-    /// * `target_tokens` — The target token count for the compacted output.
+    /// * `target_tokens` — The target token count for the compacted
+    ///   output, already reduced by any budget reserved for content
+    ///   riding the request alongside the history (see
+    ///   [`ContextManager::compact_with_reason`](ContextManager::compact_with_reason)),
+    ///   so fitting the target leaves room for it.
     /// * `context` — Metadata about the compaction trigger.
     // The return-type boxing is required for object safety.
     fn compact(
@@ -609,8 +613,9 @@ impl ContextManager {
 
     /// Ensure the conversation fits within the context window.
     ///
-    /// Main entry point called by the agent loop after each
-    /// turn. It:
+    /// Self-driven entry point for callers that manage the conversation
+    /// themselves: it decides whether compaction is needed and runs it in
+    /// one call. It:
     ///
     /// 1. Estimates the current token usage.
     /// 2. Checks if compaction is needed.
@@ -700,7 +705,7 @@ impl ContextManager {
         messages: Vec<Message>,
         turn: usize,
     ) -> Result<EnsureContextResult, ContextOverflow> {
-        self.compact_with_reason(messages, turn, CompactReason::Manual, None, Vec::new())
+        self.compact_with_reason(messages, turn, CompactReason::Manual, None, Vec::new(), 0)
             .await
     }
 
@@ -719,6 +724,13 @@ impl ContextManager {
     /// are normalized to the same counter, so telemetry reflects the
     /// manager's measurements.
     ///
+    /// `reserved_tokens` is budget the compacted history must leave room
+    /// for — per-request overhead plus, when compaction serves a deferred
+    /// turn, that turn's transient messages: both the compaction target
+    /// and the fit check subtract it, so the post-compaction history plus
+    /// the reserve fits the window. Pass `0` when nothing rides the
+    /// request beyond the history.
+    ///
     /// # Errors
     ///
     /// Returns a [`ContextOverflow`] if compaction fails or the result
@@ -730,6 +742,7 @@ impl ContextManager {
         reason: CompactReason,
         instructions: Option<String>,
         additional_context: Vec<String>,
+        reserved_tokens: u64,
     ) -> Result<EnsureContextResult, ContextOverflow> {
         let tokens_before = self.estimate_tokens(&messages);
 
@@ -738,7 +751,7 @@ impl ContextManager {
         }
 
         let message_count = messages.len();
-        let target_tokens = self.compact_target_tokens();
+        let target_tokens = self.compact_target_tokens().saturating_sub(reserved_tokens);
         let context = CompactionContext {
             tokens_before,
             reason,
@@ -755,21 +768,21 @@ impl ContextManager {
 
         if !outcome.success {
             return Err(ContextOverflow {
-                tokens_used: tokens_before,
+                tokens_used: tokens_before.saturating_add(reserved_tokens),
                 context_window: self.context_window,
                 message_count,
-                trigger: CompactReason::Manual,
+                trigger: reason,
                 compactor_error: outcome.error,
             });
         }
 
         let tokens_after = self.estimate_tokens(&outcome.messages);
-        if tokens_after > self.context_window {
+        if tokens_after > self.context_window.saturating_sub(reserved_tokens) {
             return Err(ContextOverflow {
-                tokens_used: tokens_after,
+                tokens_used: tokens_after.saturating_add(reserved_tokens),
                 context_window: self.context_window,
                 message_count,
-                trigger: CompactReason::Manual,
+                trigger: reason,
                 compactor_error: None,
             });
         }
@@ -785,12 +798,13 @@ impl ContextManager {
 
     /// Build telemetry for a compaction operation.
     ///
-    /// Called by the engine after compaction to produce telemetry for
-    /// observers. Takes the pre/post message lists and the compaction
-    /// trigger reason, along with the start time of the operation.
-    ///
-    /// Note: Currently does not depend on instance state, but is a method
-    /// by design to allow future configuration-aware telemetry.
+    /// A standalone helper for hosts that run compaction themselves
+    /// (e.g. via [`compact_manual`](Self::compact_manual)) and want the
+    /// pre/post message-shape statistics. Takes the pre/post message
+    /// lists and the compaction trigger reason, along with the start
+    /// time of the operation. The token figures are history-only
+    /// heuristic estimates — per-request overhead and transients are
+    /// not part of them.
     #[must_use]
     pub fn build_telemetry(
         trigger: CompactReason,

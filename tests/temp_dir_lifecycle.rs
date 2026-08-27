@@ -87,14 +87,37 @@ impl Drop for ScratchGuard {
 /// regardless of the clock.
 fn unique_base() -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    std::env::temp_dir().join(format!(
-        "loopctl-temp-dir-test-{}-{}-{}",
+    std::env::temp_dir().join(base_name(
         std::process::id(),
         COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos())
+            .map_or(0, |d| d.as_nanos()),
     ))
+}
+
+/// The name-assembly core of [`unique_base`], pure so the collision
+/// property is testable without depending on the host clock.
+fn base_name(pid: u32, counter: u64, nanos: u128) -> String {
+    format!("loopctl-temp-dir-test-{pid}-{counter}-{nanos}")
+}
+
+#[test]
+fn identical_timestamps_still_yield_distinct_bases() {
+    // Coarse runner clocks hand tight loops identical nanosecond
+    // stamps — the exact condition that collided two tests on CI. The
+    // counter keeps the bases distinct no matter what the clock does.
+    let first = base_name(7, 1, 500);
+    let second = base_name(7, 2, 500);
+    assert_ne!(
+        first, second,
+        "same pid and timestamp must not collide — the counter decides"
+    );
+    assert_eq!(
+        first,
+        base_name(7, 1, 500),
+        "same inputs yield the same name — only the clock varies in production"
+    );
 }
 
 #[test]

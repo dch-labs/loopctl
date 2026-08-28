@@ -710,7 +710,16 @@ impl<C: ApiClient> BareLoop<C> {
             primary_param: self.detection_primary_param(&tc.tool, &tc.input),
             result_hash,
         };
-        self.managers.detection().record_operation(operation);
+        if let Err(crate::error::LoopError::LockPoisoned { what }) =
+            self.managers.detection().record_operation(operation)
+        {
+            // Detection is advisory: skip it for the rest of the
+            // session rather than failing the run.
+            tracing::warn!(
+                what = %what,
+                "detection state poisoned; skipping detection for this session"
+            );
+        }
     }
 
     /// The primary parameter one dispatch is recorded under.

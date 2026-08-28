@@ -742,9 +742,15 @@ impl DetectionManager {
     /// - [`Self::record_tool_call`] — convenience wrapper for hash-based calls.
     /// - [`Self::record_tool_call_with_result`] — result-aware variant.
     /// - [`Self::check_loop`] — read-only query without recording.
-    pub fn record_operation(&self, operation: Operation) -> DetectedPattern {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn record_operation(
+        &self,
+        operation: Operation,
+    ) -> Result<DetectedPattern, crate::error::LoopError> {
         if !self.config.enable_loop_detection {
-            return DetectedPattern::NoPattern;
+            return Ok(DetectedPattern::NoPattern);
         }
 
         self.loop_detector.record(operation);
@@ -754,29 +760,29 @@ impl DetectionManager {
             self.loop_detector.mark_warned(&status.repeated_operations);
         }
         if status.is_looping {
-            let mut guard = self.stats.lock().unwrap_or_else(|e| {
-                tracing::warn!("stats lock poisoned, recovering");
-                e.into_inner()
-            });
+            let mut guard = self
+                .stats
+                .lock()
+                .map_err(crate::error::from_poison("detection_stats"))?;
             guard.turns_analyzed = guard.turns_analyzed.saturating_add(1);
             guard.loops_detected = guard.loops_detected.saturating_add(1);
             guard.current_streak = status.repetition_count;
-            DetectedPattern::LoopDetected {
+            Ok(DetectedPattern::LoopDetected {
                 repetitions: status.repetition_count,
                 pattern_description: status
                     .repeated_operations
                     .first()
                     .map(|op| format!("{}({})", op.tool, op.primary_param))
                     .unwrap_or_default(),
-            }
+            })
         } else {
-            let mut guard = self.stats.lock().unwrap_or_else(|e| {
-                tracing::warn!("stats lock poisoned, recovering");
-                e.into_inner()
-            });
+            let mut guard = self
+                .stats
+                .lock()
+                .map_err(crate::error::from_poison("detection_stats"))?;
             guard.turns_analyzed = guard.turns_analyzed.saturating_add(1);
             guard.current_streak = self.loop_detector.max_operation_count();
-            DetectedPattern::NoPattern
+            Ok(DetectedPattern::NoPattern)
         }
     }
 
@@ -853,7 +859,14 @@ impl DetectionManager {
     ///
     /// - [`Self::record_tool_call_with_result`] — adds result hashing for progress detection.
     /// - [`Self::record_operation`] — full API with arbitrary [`Operation`] values.
-    pub fn record_tool_call(&self, tool: &str, input_hash: u64) -> DetectedPattern {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn record_tool_call(
+        &self,
+        tool: &str,
+        input_hash: u64,
+    ) -> Result<DetectedPattern, crate::error::LoopError> {
         let operation = Operation::new(tool, format!("hash:{input_hash}"));
         self.record_operation(operation)
     }
@@ -909,12 +922,15 @@ impl DetectionManager {
     /// - [`hash_result`] — utility for computing result hashes.
     ///
     /// [`hash_result`]: super::loop_detector::hash_result
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
     pub fn record_tool_call_with_result(
         &self,
         tool: &str,
         input_hash: u64,
         result_hash: Option<u64>,
-    ) -> DetectedPattern {
+    ) -> Result<DetectedPattern, crate::error::LoopError> {
         let operation =
             Operation::new(tool, format!("hash:{input_hash}")).with_result_hash(result_hash);
         self.record_operation(operation)
@@ -970,20 +986,22 @@ impl DetectionManager {
     ///
     /// let manager = DetectionManager::new().unwrap();
     /// assert!(matches!(
-    ///     manager.check_convergence_pattern(),
+    ///     manager.check_convergence_pattern().unwrap(),
     ///     DetectedPattern::NoPattern
     /// ));
     /// ```
-    #[must_use]
-    pub fn check_convergence_pattern(&self) -> DetectedPattern {
-        let convergence = self.check_convergence();
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn check_convergence_pattern(&self) -> Result<DetectedPattern, crate::error::LoopError> {
+        let convergence = self.check_convergence()?;
         if convergence.detected {
-            return DetectedPattern::ConvergenceDetected {
+            return Ok(DetectedPattern::ConvergenceDetected {
                 similarity: convergence.similarity_score,
                 consecutive_count: convergence.consecutive_count,
-            };
+            });
         }
-        DetectedPattern::NoPattern
+        Ok(DetectedPattern::NoPattern)
     }
 
     /// Build the loop-only [`DetectedPattern`] without recording anything.
@@ -1161,32 +1179,35 @@ impl DetectionManager {
     ///
     /// - [`Self::check_convergence`] — read-only check without recording.
     /// - [`Self::record_operation`] — the loop-detection counterpart for tool calls.
-    pub fn record_response(&self, response: &str) -> DetectedPattern {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn record_response(
+        &self,
+        response: &str,
+    ) -> Result<DetectedPattern, crate::error::LoopError> {
         if !self.config.enable_convergence_detection {
-            return DetectedPattern::NoPattern;
+            return Ok(DetectedPattern::NoPattern);
         }
 
         let status = self
             .convergence_detector
             .lock()
-            .unwrap_or_else(|e| {
-                tracing::warn!("convergence detector lock poisoned, recovering");
-                e.into_inner()
-            })
+            .map_err(crate::error::from_poison("convergence_detector"))?
             .add_response(response);
 
         if status.detected {
-            let mut guard = self.stats.lock().unwrap_or_else(|e| {
-                tracing::warn!("stats lock poisoned, recovering");
-                e.into_inner()
-            });
+            let mut guard = self
+                .stats
+                .lock()
+                .map_err(crate::error::from_poison("detection_stats"))?;
             guard.convergences_detected = guard.convergences_detected.saturating_add(1);
-            return DetectedPattern::ConvergenceDetected {
+            return Ok(DetectedPattern::ConvergenceDetected {
                 similarity: status.similarity_score,
                 consecutive_count: status.consecutive_count,
-            };
+            });
         }
-        DetectedPattern::NoPattern
+        Ok(DetectedPattern::NoPattern)
     }
 
     /// Query the [`ConvergenceDetector`] for the current
@@ -1219,15 +1240,15 @@ impl DetectionManager {
     ///
     /// - [`Self::record_response`] — records a response *and* checks convergence.
     /// - [`Self::check_current_pattern`] — checks both loop and convergence.
-    #[must_use]
-    pub fn check_convergence(&self) -> ConvergenceStatus {
-        self.convergence_detector
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn check_convergence(&self) -> Result<ConvergenceStatus, crate::error::LoopError> {
+        Ok(self
+            .convergence_detector
             .lock()
-            .unwrap_or_else(|e| {
-                tracing::warn!("convergence detector lock poisoned, recovering");
-                e.into_inner()
-            })
-            .check_convergence()
+            .map_err(crate::error::from_poison("convergence_detector"))?
+            .check_convergence())
     }
 
     /// Inspect the current detection state without recording new data.
@@ -1278,21 +1299,23 @@ impl DetectionManager {
     ///
     /// - [`Self::check_loop`] — loop-only check.
     /// - [`Self::check_convergence`] — convergence-only check.
-    #[must_use]
-    pub fn check_current_pattern(&self) -> DetectedPattern {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn check_current_pattern(&self) -> Result<DetectedPattern, crate::error::LoopError> {
         if !self.config.enable_loop_detection {
             return self.check_convergence_pattern();
         }
         let loop_status = self.loop_detector.check_loop();
         if loop_status.is_looping {
-            return DetectedPattern::LoopDetected {
+            return Ok(DetectedPattern::LoopDetected {
                 repetitions: loop_status.repetition_count,
                 pattern_description: loop_status
                     .repeated_operations
                     .first()
                     .map(|op| format!("{}({})", op.tool, op.primary_param))
                     .unwrap_or_default(),
-            };
+            });
         }
         self.check_convergence_pattern()
     }
@@ -1327,12 +1350,15 @@ impl DetectionManager {
     ///
     /// - [`DetectionStats`] — the struct returned by this method.
     /// - [`Self::reset`] — zeroes all counters.
-    #[must_use]
-    pub fn stats(&self) -> DetectionStats {
-        self.stats
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn stats(&self) -> Result<DetectionStats, crate::error::LoopError> {
+        Ok(self
+            .stats
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .map_err(crate::error::from_poison("detection_stats"))?
+            .clone())
     }
 
     /// Obtain a reference to the configuration snapshot.
@@ -1402,19 +1428,20 @@ impl DetectionManager {
     ///
     /// - [`Self::stats`] — check the stats before resetting.
     /// - [`LoopDetector::reset`] — the underlying reset.
-    pub fn reset(&self) {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn reset(&self) -> Result<(), crate::error::LoopError> {
         self.loop_detector.reset();
         self.convergence_detector
             .lock()
-            .unwrap_or_else(|e| {
-                tracing::warn!("convergence detector lock poisoned, recovering");
-                e.into_inner()
-            })
+            .map_err(crate::error::from_poison("convergence_detector"))?
             .clear();
         *self
             .stats
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = DetectionStats::default();
+            .map_err(crate::error::from_poison("detection_stats"))? = DetectionStats::default();
+        Ok(())
     }
 }
 
@@ -1443,13 +1470,86 @@ impl Default for DetectionManager {
 /// recording, and config mapping.
 #[cfg(test)]
 mod tests {
+    fn poison_convergence(mgr: &std::sync::Arc<DetectionManager>) {
+        let mgr = std::sync::Arc::clone(mgr);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = mgr
+                    .convergence_detector()
+                    .lock()
+                    .expect("lock before poison");
+                panic!("poison the convergence detector");
+            })
+            .join()
+            .is_err(),
+            "the poisoning thread must panic"
+        );
+    }
+
+    fn poison_stats(mgr: &std::sync::Arc<DetectionManager>) {
+        let mgr = std::sync::Arc::clone(mgr);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = mgr.stats.lock().expect("lock before poison");
+                panic!("poison the detection stats");
+            })
+            .join()
+            .is_err(),
+            "the poisoning thread must panic"
+        );
+    }
+
+    #[test]
+    fn record_response_propagates_convergence_poison() {
+        let mgr = std::sync::Arc::new(DetectionManager::default());
+        poison_convergence(&mgr);
+        match mgr.record_response("hello") {
+            Err(crate::error::LoopError::LockPoisoned { what }) => {
+                assert_eq!(what, "convergence_detector");
+            }
+            other => panic!("convergence poison must propagate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_operation_propagates_stats_poison() {
+        let mgr = std::sync::Arc::new(DetectionManager::default());
+        poison_stats(&mgr);
+        match mgr.record_operation(Operation::new("Read", "/f")) {
+            Err(crate::error::LoopError::LockPoisoned { what }) => {
+                assert_eq!(what, "detection_stats");
+            }
+            other => panic!("stats poison must propagate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_convergence_propagates_poison() {
+        let mgr = std::sync::Arc::new(DetectionManager::default());
+        poison_convergence(&mgr);
+        assert!(matches!(
+            mgr.check_convergence(),
+            Err(crate::error::LoopError::LockPoisoned { .. })
+        ));
+    }
+
+    #[test]
+    fn stats_propagates_poison() {
+        let mgr = std::sync::Arc::new(DetectionManager::default());
+        poison_stats(&mgr);
+        assert!(matches!(
+            mgr.stats(),
+            Err(crate::error::LoopError::LockPoisoned { .. })
+        ));
+    }
+
     use super::*;
 
     #[test]
     fn test_no_pattern_initially() {
         let dm = DetectionManager::new().unwrap();
         assert!(matches!(
-            dm.check_current_pattern(),
+            dm.check_current_pattern().unwrap(),
             DetectedPattern::NoPattern
         ));
     }
@@ -1458,7 +1558,7 @@ mod tests {
     fn test_loop_detection() {
         let dm = DetectionManager::new().unwrap();
         for _ in 0..5 {
-            let result = dm.record_tool_call("read_file", 42);
+            let result = dm.record_tool_call("read_file", 42).unwrap();
             if matches!(result, DetectedPattern::LoopDetected { .. }) {
                 return; // test passes
             }
@@ -1471,7 +1571,7 @@ mod tests {
         let dm = DetectionManager::new().unwrap();
         let response = "I am working on the task and making progress";
         for _ in 0..5 {
-            let result = dm.record_response(response);
+            let result = dm.record_response(response).unwrap();
             if matches!(result, DetectedPattern::ConvergenceDetected { .. }) {
                 return;
             }
@@ -1482,14 +1582,14 @@ mod tests {
     #[test]
     fn test_reset() {
         let dm = DetectionManager::new().unwrap();
-        dm.record_tool_call("read_file", 42);
-        dm.record_response("hello");
-        dm.reset();
+        dm.record_tool_call("read_file", 42).unwrap();
+        dm.record_response("hello").unwrap();
+        dm.reset().unwrap();
         assert!(matches!(
-            dm.check_current_pattern(),
+            dm.check_current_pattern().unwrap(),
             DetectedPattern::NoPattern
         ));
-        let stats = dm.stats();
+        let stats = dm.stats().unwrap();
         assert_eq!(stats.turns_analyzed, 0);
     }
 
@@ -1502,7 +1602,7 @@ mod tests {
         };
         let dm = DetectionManager::new_with_config(config).unwrap();
         for _ in 0..10 {
-            let result = dm.record_tool_call("read_file", 42);
+            let result = dm.record_tool_call("read_file", 42).unwrap();
             assert!(matches!(result, DetectedPattern::NoPattern));
         }
     }
@@ -1517,7 +1617,7 @@ mod tests {
         let dm = DetectionManager::new_with_config(config).unwrap();
 
         for _ in 0..5 {
-            dm.record_tool_call("read_file", 42);
+            dm.record_tool_call("read_file", 42).unwrap();
         }
 
         let status = dm.check_loop();
@@ -1532,7 +1632,8 @@ mod tests {
         let dm = DetectionManager::new().unwrap();
 
         for _ in 0..5 {
-            dm.record_operation(Operation::new("Read", "/test/file.txt"));
+            dm.record_operation(Operation::new("Read", "/test/file.txt"))
+                .unwrap();
         }
 
         let status = dm.check_loop();
@@ -1551,7 +1652,8 @@ mod tests {
                 "Read",
                 &input,
                 &NoOpToolSignature,
-            ));
+            ))
+            .unwrap();
         }
 
         let status = dm.check_loop();
@@ -1567,7 +1669,7 @@ mod tests {
         // Same operation, different results = not a loop
         for i in 0..5 {
             let hash = super::super::loop_detector::hash_result(&format!("output {i}"));
-            dm.record_tool_call_with_result("Bash", 42, hash);
+            dm.record_tool_call_with_result("Bash", 42, hash).unwrap();
         }
 
         let status = dm.check_loop();
@@ -1580,7 +1682,7 @@ mod tests {
 
         let hash = super::super::loop_detector::hash_result("same output");
         for _ in 0..5 {
-            dm.record_tool_call_with_result("Bash", 42, hash);
+            dm.record_tool_call_with_result("Bash", 42, hash).unwrap();
         }
 
         let status = dm.check_loop();
@@ -1635,7 +1737,9 @@ mod tests {
         };
         let manager = DetectionManager::new_with_config(config).unwrap();
         for _ in 0..12 {
-            manager.record_operation(Operation::new("Read", "/f.txt"));
+            manager
+                .record_operation(Operation::new("Read", "/f.txt"))
+                .unwrap();
         }
         assert!(
             matches!(manager.check_loop_pattern(), DetectedPattern::NoPattern),
@@ -1647,7 +1751,9 @@ mod tests {
     fn check_loop_does_not_consume_the_warning() {
         let manager = DetectionManager::new().unwrap();
         for _ in 0..3 {
-            manager.record_operation(Operation::new("Read", "/f.txt"));
+            manager
+                .record_operation(Operation::new("Read", "/f.txt"))
+                .unwrap();
         }
         let first = manager.check_loop();
         let second = manager.check_loop();
@@ -1662,7 +1768,9 @@ mod tests {
     fn acknowledge_loop_warning_suppresses_rebuilds() {
         let manager = DetectionManager::new().unwrap();
         for _ in 0..3 {
-            manager.record_operation(Operation::new("Read", "/f.txt"));
+            manager
+                .record_operation(Operation::new("Read", "/f.txt"))
+                .unwrap();
         }
 
         let delivered = manager.check_loop();
@@ -1693,18 +1801,24 @@ mod tests {
             ..DetectionConfig::default()
         })
         .unwrap();
-        manager.record_operation(Operation::new("Read", "/f.txt"));
+        manager
+            .record_operation(Operation::new("Read", "/f.txt"))
+            .unwrap();
         assert_eq!(
-            manager.stats().current_streak,
+            manager.stats().unwrap().current_streak,
             1,
             "the streak must be live in the build-up phase, not frozen at zero"
         );
-        manager.record_operation(Operation::new("Read", "/f.txt"));
-        assert_eq!(manager.stats().current_streak, 2);
+        manager
+            .record_operation(Operation::new("Read", "/f.txt"))
+            .unwrap();
+        assert_eq!(manager.stats().unwrap().current_streak, 2);
 
-        manager.record_operation(Operation::new("Read", "/other.txt"));
+        manager
+            .record_operation(Operation::new("Read", "/other.txt"))
+            .unwrap();
         assert_eq!(
-            manager.stats().current_streak,
+            manager.stats().unwrap().current_streak,
             2,
             "an unrelated operation leaves the most-repeated count alone — \
              the streak is the window's live maximum"
@@ -1720,7 +1834,9 @@ mod tests {
         })
         .unwrap();
         for _ in 0..3 {
-            manager.record_operation(Operation::new("Read", "/f.txt"));
+            manager
+                .record_operation(Operation::new("Read", "/f.txt"))
+                .unwrap();
         }
         manager.consume_pending_loop_stop();
         let below = manager.check_loop_pattern();
@@ -1730,7 +1846,9 @@ mod tests {
         );
 
         for _ in 0..2 {
-            manager.record_operation(Operation::new("Read", "/f.txt"));
+            manager
+                .record_operation(Operation::new("Read", "/f.txt"))
+                .unwrap();
         }
         manager.consume_pending_loop_stop();
         assert!(

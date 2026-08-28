@@ -110,11 +110,11 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
             loop_.session.config.context_window = cw;
         }
 
-        loop_.managers.fallback().reset();
+        loop_.managers.fallback().reset()?;
         loop_
             .managers
             .fallback()
-            .set_original_model(trimmed.to_string());
+            .set_original_model(trimmed.to_string())?;
         loop_
             .managers
             .observers()

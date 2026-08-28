@@ -30,16 +30,16 @@
 //! let mgr = FallbackManager::new(3, 2);
 //!
 //! // Simulate failures until the circuit trips
-//! mgr.record_failure(FailureKind::Transient);
-//! mgr.record_failure(FailureKind::Transient);
-//! assert!(mgr.record_failure(FailureKind::Transient)); // 3rd failure trips the circuit
-//! assert!(mgr.is_using_fallback());
+//! mgr.record_failure(FailureKind::Transient).unwrap();
+//! mgr.record_failure(FailureKind::Transient).unwrap();
+//! assert!(mgr.record_failure(FailureKind::Transient).unwrap()); // 3rd failure trips the circuit
+//! assert!(mgr.is_using_fallback().unwrap());
 //!
 //! // Manually transition to recovering, then record successes to resume primary
-//! mgr.transition_to_recovering();
-//! mgr.record_success(); // 1st success
-//! mgr.record_success(); // 2nd → back to Primary
-//! assert!(!mgr.is_using_fallback());
+//! mgr.transition_to_recovering().unwrap();
+//! mgr.record_success().unwrap(); // 1st success
+//! mgr.record_success().unwrap(); // 2nd → back to Primary
+//! assert!(!mgr.is_using_fallback().unwrap());
 //! ```
 
 use std::sync::Mutex;
@@ -339,17 +339,17 @@ impl Default for FallbackConfig {
 /// let mgr = Arc::new(FallbackManager::new(5, 3).with_config(FallbackConfig::default()));
 ///
 /// // Simulate failures
-/// assert!(!mgr.record_failure(FailureKind::Transient)); // 1
-/// assert!(!mgr.record_failure(FailureKind::Transient)); // 2
-/// assert!(mgr.record_failure(FailureKind::Transient));  // 3 → circuit trips
+/// assert!(!mgr.record_failure(FailureKind::Transient).unwrap()); // 1
+/// assert!(!mgr.record_failure(FailureKind::Transient).unwrap()); // 2
+/// assert!(mgr.record_failure(FailureKind::Transient).unwrap());  // 3 → circuit trips
 ///
-/// assert!(mgr.is_using_fallback());
+/// assert!(mgr.is_using_fallback().unwrap());
 ///
 /// // ... later, after cooldown ...
-/// if mgr.should_try_resume_primary(Duration::from_secs(60)) {
-///     mgr.transition_to_recovering();
-///     mgr.record_success();
-///     mgr.record_success(); // → back to Primary
+/// if mgr.should_try_resume_primary(Duration::from_secs(60)).unwrap() {
+///     mgr.transition_to_recovering().unwrap();
+///     mgr.record_success().unwrap();
+///     mgr.record_success().unwrap(); // → back to Primary
 /// }
 /// ```
 /// Consolidated mutex-protected fallback state.
@@ -468,6 +468,23 @@ pub struct FallbackManager {
 }
 
 impl FallbackManager {
+    /// Lock the breaker state, propagating poison.
+    ///
+    /// The whole state machine lives in this one mutex; a panic
+    /// mid-hold can leave its fields desynchronised, so poison is
+    /// surfaced as [`crate::error::LoopError::LockPoisoned`] instead of recovered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::LoopError::LockPoisoned`] when the lock is poisoned.
+    fn lock_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, BreakerState>, crate::error::LoopError> {
+        self.state
+            .lock()
+            .map_err(crate::error::from_poison("fallback"))
+    }
+
     /// Create a new fallback manager with the given thresholds.
     ///
     /// Starts in [`FallbackState::Primary`] with all counters zeroed.
@@ -584,16 +601,19 @@ impl FallbackManager {
     /// ```rust
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
-    /// let mgr = FallbackManager::for_model("llm-70b");
-    /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
-    /// assert!(!mgr.is_using_fallback());
+    /// let mgr = FallbackManager::for_model("llm-70b").unwrap();
+    /// assert_eq!(mgr.original_model().unwrap(), Some("llm-70b".to_string()));
+    /// assert!(!mgr.is_using_fallback().unwrap());
     /// ```
-    pub fn for_model(primary_model: impl Into<String>) -> Self {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn for_model(primary_model: impl Into<String>) -> Result<Self, crate::error::LoopError> {
         let mgr = Self::new(3, 2);
-        if let Ok(mut state) = mgr.state.lock() {
-            state.original_model = Some(primary_model.into());
-        }
-        mgr
+        let mut state = mgr.lock_state()?;
+        state.original_model = Some(primary_model.into());
+        drop(state);
+        Ok(mgr)
     }
 
     /// Get the current circuit breaker state.
@@ -604,12 +624,13 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// assert_eq!(mgr.state(), FallbackState::Primary);
+    /// assert_eq!(mgr.state().unwrap(), FallbackState::Primary);
     /// ```
-    pub fn state(&self) -> FallbackState {
-        self.state
-            .lock()
-            .map_or(FallbackState::Primary, |s| s.state)
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn state(&self) -> Result<FallbackState, crate::error::LoopError> {
+        Ok(self.lock_state()?.state)
     }
 
     /// Check if we're currently using a fallback model.
@@ -625,10 +646,13 @@ impl FallbackManager {
     /// ```rust
     /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
-    /// assert!(!mgr.is_using_fallback());
+    /// assert!(!mgr.is_using_fallback().unwrap());
     /// ```
-    pub fn is_using_fallback(&self) -> bool {
-        matches!(self.state(), FallbackState::Fallback)
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn is_using_fallback(&self) -> Result<bool, crate::error::LoopError> {
+        Ok(matches!(self.state()?, FallbackState::Fallback))
     }
 
     /// Check if fallback has ever been activated (sticky flag).
@@ -644,10 +668,13 @@ impl FallbackManager {
     /// ```rust
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
-    /// assert!(!mgr.is_fallback_active());
+    /// assert!(!mgr.is_fallback_active().unwrap());
     /// ```
-    pub fn is_fallback_active(&self) -> bool {
-        self.state.lock().is_ok_and(|s| s.fallback_activated)
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn is_fallback_active(&self) -> Result<bool, crate::error::LoopError> {
+        Ok(self.lock_state()?.fallback_activated)
     }
 
     /// Get the number of consecutive failures.
@@ -660,12 +687,15 @@ impl FallbackManager {
     /// ```rust
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
-    /// assert_eq!(mgr.consecutive_failures(), 0);
-    /// mgr.record_failure(FailureKind::Transient);
-    /// assert_eq!(mgr.consecutive_failures(), 1);
+    /// assert_eq!(mgr.consecutive_failures().unwrap(), 0);
+    /// mgr.record_failure(FailureKind::Transient).unwrap();
+    /// assert_eq!(mgr.consecutive_failures().unwrap(), 1);
     /// ```
-    pub fn consecutive_failures(&self) -> usize {
-        self.state.lock().map_or(0, |s| s.consecutive_failures)
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn consecutive_failures(&self) -> Result<usize, crate::error::LoopError> {
+        Ok(self.lock_state()?.consecutive_failures)
     }
 
     /// Get the original model name (before fallback).
@@ -679,14 +709,14 @@ impl FallbackManager {
     ///
     /// ```rust
     /// use loopctl::fallback::{FallbackManager, FailureKind};
-    /// let mgr = FallbackManager::for_model("llm-70b");
-    /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
+    /// let mgr = FallbackManager::for_model("llm-70b").unwrap();
+    /// assert_eq!(mgr.original_model().unwrap(), Some("llm-70b".to_string()));
     /// ```
-    pub fn original_model(&self) -> Option<String> {
-        self.state
-            .lock()
-            .ok()
-            .and_then(|s| s.original_model.clone())
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn original_model(&self) -> Result<Option<String>, crate::error::LoopError> {
+        Ok(self.lock_state()?.original_model.clone())
     }
 
     /// Set the original model name.
@@ -699,14 +729,18 @@ impl FallbackManager {
     /// ```rust
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
-    /// assert_eq!(mgr.original_model(), None);
-    /// mgr.set_original_model("llm-70b".into());
-    /// assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
+    /// assert_eq!(mgr.original_model().unwrap(), None);
+    /// mgr.set_original_model("llm-70b".into()).unwrap();
+    /// assert_eq!(mgr.original_model().unwrap(), Some("llm-70b".to_string()));
     /// ```
-    pub fn set_original_model(&self, model: String) {
-        if let Ok(mut state) = self.state.lock() {
-            state.original_model = Some(model);
-        }
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn set_original_model(&self, model: String) -> Result<(), crate::error::LoopError> {
+        let mut state = self.lock_state()?;
+        state.original_model = Some(model);
+
+        Ok(())
     }
 
     /// Get the time when fallback was activated.
@@ -725,10 +759,13 @@ impl FallbackManager {
     /// use std::time::Duration;
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// assert!(mgr.fallback_switched_at().is_none());
+    /// assert!(mgr.fallback_switched_at().unwrap().is_none());
     /// ```
-    pub fn fallback_switched_at(&self) -> Option<Instant> {
-        self.state.lock().ok().and_then(|s| s.fallback_switched_at)
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn fallback_switched_at(&self) -> Result<Option<Instant>, crate::error::LoopError> {
+        Ok(self.lock_state()?.fallback_switched_at)
     }
 
     /// Get the model that should be used for the next request.
@@ -756,21 +793,22 @@ impl FallbackManager {
     ///
     /// ```rust
     /// use loopctl::fallback::{FallbackManager, FailureKind};
-    /// let mgr = FallbackManager::for_model("llm-70b");
-    /// assert_eq!(mgr.active_model(), Some("llm-70b".to_string()));
+    /// let mgr = FallbackManager::for_model("llm-70b").unwrap();
+    /// assert_eq!(mgr.active_model().unwrap(), Some("llm-70b".to_string()));
     /// ```
-    pub fn active_model(&self) -> Option<String> {
-        let Ok(state) = self.state.lock() else {
-            return None;
-        };
-        match state.state {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn active_model(&self) -> Result<Option<String>, crate::error::LoopError> {
+        let state = self.lock_state()?;
+        Ok(match state.state {
             FallbackState::Primary | FallbackState::Recovering => state.original_model.clone(),
             FallbackState::Fallback => match &state.active_fallback {
                 Some(model) => Some(model.clone()),
                 None if state.fallback_models.is_empty() => state.original_model.clone(),
                 None => None,
             },
-        }
+        })
     }
 
     /// Set a single fallback model, clearing any existing chain.
@@ -790,30 +828,37 @@ impl FallbackManager {
     /// ```rust
     /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     ///
-    /// let mgr = FallbackManager::for_model("llm-1");
-    /// mgr.add_fallback_model("llm-2");
-    /// mgr.add_fallback_model("llm-3");
-    /// assert_eq!(mgr.fallback_models(), vec!["llm-2", "llm-3"]);
+    /// let mgr = FallbackManager::for_model("llm-1").unwrap();
+    /// mgr.add_fallback_model("llm-2").unwrap();
+    /// mgr.add_fallback_model("llm-3").unwrap();
+    /// assert_eq!(mgr.fallback_models().unwrap(), vec!["llm-2", "llm-3"]);
     ///
-    /// mgr.set_fallback_model("llm-4"); // clears chain, sets single model
-    /// assert_eq!(mgr.fallback_models(), vec!["llm-4"]);
+    /// mgr.set_fallback_model("llm-4").unwrap(); // clears chain, sets single model
+    /// assert_eq!(mgr.fallback_models().unwrap(), vec!["llm-4"]);
     ///
     /// // Simulate failures until circuit trips
-    /// mgr.record_failure(FailureKind::Transient);
-    /// mgr.record_failure(FailureKind::Transient);
-    /// mgr.record_failure(FailureKind::Transient); // trips to Fallback
+    /// mgr.record_failure(FailureKind::Transient).unwrap();
+    /// mgr.record_failure(FailureKind::Transient).unwrap();
+    /// mgr.record_failure(FailureKind::Transient).unwrap(); // trips to Fallback
     ///
-    /// assert_eq!(mgr.state(), FallbackState::Fallback);
-    /// assert_eq!(mgr.active_model(), Some("llm-4".to_string()));
+    /// assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
+    /// assert_eq!(mgr.active_model().unwrap(), Some("llm-4".to_string()));
     /// ```
-    pub fn set_fallback_model(&self, model: impl Into<String>) {
-        if let Ok(mut state) = self.state.lock() {
-            state.fallback_models.clear();
-            state
-                .fallback_models
-                .push(FallbackEntry::new(model).with_max_fail_count(self.config.max_fail_count));
-            Self::recompute_active_fallback_impl(&mut state);
-        }
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn set_fallback_model(
+        &self,
+        model: impl Into<String>,
+    ) -> Result<(), crate::error::LoopError> {
+        let mut state = self.lock_state()?;
+        state.fallback_models.clear();
+        state
+            .fallback_models
+            .push(FallbackEntry::new(model).with_max_fail_count(self.config.max_fail_count));
+        Self::recompute_active_fallback_impl(&mut state);
+
+        Ok(())
     }
 
     /// Get the first fallback model, if any are configured.
@@ -828,17 +873,17 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// assert!(mgr.fallback_model().is_none());
+    /// assert!(mgr.fallback_model().unwrap().is_none());
     ///
-    /// mgr.add_fallback_model("llm-70b");
-    /// mgr.add_fallback_model("llm-120b");
-    /// assert_eq!(mgr.fallback_model(), Some("llm-70b".to_string())); // first in chain
+    /// mgr.add_fallback_model("llm-70b").unwrap();
+    /// mgr.add_fallback_model("llm-120b").unwrap();
+    /// assert_eq!(mgr.fallback_model().unwrap(), Some("llm-70b".to_string())); // first in chain
     /// ```
-    pub fn fallback_model(&self) -> Option<String> {
-        self.state
-            .lock()
-            .ok()
-            .and_then(|s| s.active_fallback.clone())
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn fallback_model(&self) -> Result<Option<String>, crate::error::LoopError> {
+        Ok(self.lock_state()?.active_fallback.clone())
     }
 
     /// Get the full fallback model chain.
@@ -852,19 +897,23 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.add_fallback_model("llm-70b");
-    /// mgr.add_fallback_model("llm-120b");
-    /// mgr.add_fallback_model("llm-32b");
+    /// mgr.add_fallback_model("llm-70b").unwrap();
+    /// mgr.add_fallback_model("llm-120b").unwrap();
+    /// mgr.add_fallback_model("llm-32b").unwrap();
     ///
-    /// let chain = mgr.fallback_models();
+    /// let chain = mgr.fallback_models().unwrap();
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b", "llm-32b"]);
     /// ```
-    pub fn fallback_models(&self) -> Vec<String> {
-        self.state
-            .lock()
-            .ok()
-            .map(|s| s.fallback_models.iter().map(|e| e.name.clone()).collect())
-            .unwrap_or_default()
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn fallback_models(&self) -> Result<Vec<String>, crate::error::LoopError> {
+        Ok(self
+            .lock_state()?
+            .fallback_models
+            .iter()
+            .map(|e| e.name.clone())
+            .collect())
     }
 
     /// Add a fallback model to the end of the fallback chain.
@@ -883,19 +932,26 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.add_fallback_model("llm-70b");
-    /// mgr.add_fallback_model("llm-120b");
+    /// mgr.add_fallback_model("llm-70b").unwrap();
+    /// mgr.add_fallback_model("llm-120b").unwrap();
     ///
-    /// let chain = mgr.fallback_models();
+    /// let chain = mgr.fallback_models().unwrap();
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b"]);
     /// ```
-    pub fn add_fallback_model(&self, model: impl Into<String>) {
-        if let Ok(mut state) = self.state.lock() {
-            state
-                .fallback_models
-                .push(FallbackEntry::new(model).with_max_fail_count(self.config.max_fail_count));
-            Self::recompute_active_fallback_impl(&mut state);
-        }
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn add_fallback_model(
+        &self,
+        model: impl Into<String>,
+    ) -> Result<(), crate::error::LoopError> {
+        let mut state = self.lock_state()?;
+        state
+            .fallback_models
+            .push(FallbackEntry::new(model).with_max_fail_count(self.config.max_fail_count));
+        Self::recompute_active_fallback_impl(&mut state);
+
+        Ok(())
     }
 
     /// Insert a fallback model at a specific position in the chain.
@@ -914,23 +970,31 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.add_fallback_model("llm-70b");
-    /// mgr.add_fallback_model("llm-32b");
-    /// mgr.insert_fallback_model(1, "llm-120b"); // insert between them
+    /// mgr.add_fallback_model("llm-70b").unwrap();
+    /// mgr.add_fallback_model("llm-32b").unwrap();
+    /// mgr.insert_fallback_model(1, "llm-120b").unwrap(); // insert between them
     ///
-    /// let chain = mgr.fallback_models();
+    /// let chain = mgr.fallback_models().unwrap();
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b", "llm-32b"]);
     /// ```
-    pub fn insert_fallback_model(&self, index: usize, model: impl Into<String>) {
-        if let Ok(mut state) = self.state.lock() {
-            let entry = FallbackEntry::new(model).with_max_fail_count(self.config.max_fail_count);
-            if index >= state.fallback_models.len() {
-                state.fallback_models.push(entry);
-            } else {
-                state.fallback_models.insert(index, entry);
-            }
-            Self::recompute_active_fallback_impl(&mut state);
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn insert_fallback_model(
+        &self,
+        index: usize,
+        model: impl Into<String>,
+    ) -> Result<(), crate::error::LoopError> {
+        let mut state = self.lock_state()?;
+        let entry = FallbackEntry::new(model).with_max_fail_count(self.config.max_fail_count);
+        if index >= state.fallback_models.len() {
+            state.fallback_models.push(entry);
+        } else {
+            state.fallback_models.insert(index, entry);
         }
+        Self::recompute_active_fallback_impl(&mut state);
+
+        Ok(())
     }
 
     /// Remove a fallback model by name.
@@ -945,27 +1009,29 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.add_fallback_model("llm-70b");
-    /// mgr.add_fallback_model("llm-120b");
+    /// mgr.add_fallback_model("llm-70b").unwrap();
+    /// mgr.add_fallback_model("llm-120b").unwrap();
     ///
-    /// assert!(mgr.remove_fallback_model("llm-70b"));
-    /// assert!(!mgr.remove_fallback_model("nonexistent"));
+    /// assert!(mgr.remove_fallback_model("llm-70b").unwrap());
+    /// assert!(!mgr.remove_fallback_model("nonexistent").unwrap());
     ///
-    /// let chain = mgr.fallback_models();
+    /// let chain = mgr.fallback_models().unwrap();
     /// assert_eq!(chain, vec!["llm-120b"]);
     /// ```
-    pub fn remove_fallback_model(&self, model: &str) -> bool {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn remove_fallback_model(&self, model: &str) -> Result<bool, crate::error::LoopError> {
         let mut removed = false;
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(pos) = state.fallback_models.iter().position(|x| x.name == model) {
-                state.fallback_models.remove(pos);
-                removed = true;
-            }
-            if removed {
-                Self::recompute_active_fallback_impl(&mut state);
-            }
+        let mut state = self.lock_state()?;
+        if let Some(pos) = state.fallback_models.iter().position(|x| x.name == model) {
+            state.fallback_models.remove(pos);
+            removed = true;
         }
-        removed
+        if removed {
+            Self::recompute_active_fallback_impl(&mut state);
+        }
+        Ok(removed)
     }
 
     /// Replace the entire fallback model chain.
@@ -983,20 +1049,24 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.set_fallback_models(vec!["llm-70b".into(), "llm-120b".into(), "llm-32b".into()]);
+    /// mgr.set_fallback_models(vec!["llm-70b".into(), "llm-120b".into(), "llm-32b".into()]).unwrap();
     ///
-    /// let chain = mgr.fallback_models();
+    /// let chain = mgr.fallback_models().unwrap();
     /// assert_eq!(chain, vec!["llm-70b", "llm-120b", "llm-32b"]);
     /// ```
-    pub fn set_fallback_models(&self, models: Vec<String>) {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn set_fallback_models(&self, models: Vec<String>) -> Result<(), crate::error::LoopError> {
         let max_fc = self.config.max_fail_count;
-        if let Ok(mut state) = self.state.lock() {
-            state.fallback_models = models
-                .into_iter()
-                .map(|name| FallbackEntry::new(name).with_max_fail_count(max_fc))
-                .collect();
-            Self::recompute_active_fallback_impl(&mut state);
-        }
+        let mut state = self.lock_state()?;
+        state.fallback_models = models
+            .into_iter()
+            .map(|name| FallbackEntry::new(name).with_max_fail_count(max_fc))
+            .collect();
+        Self::recompute_active_fallback_impl(&mut state);
+
+        Ok(())
     }
 
     /// Mark a fallback model as failed by name.
@@ -1013,35 +1083,37 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.add_fallback_model("llm-2");
-    /// mgr.add_fallback_model("llm-3");
+    /// mgr.add_fallback_model("llm-2").unwrap();
+    /// mgr.add_fallback_model("llm-3").unwrap();
     ///
-    /// assert!(mgr.mark_fallback_failed("llm-2"));
-    /// assert!(!mgr.mark_fallback_failed("nonexistent"));
+    /// assert!(mgr.mark_fallback_failed("llm-2").unwrap());
+    /// assert!(!mgr.mark_fallback_failed("nonexistent").unwrap());
     ///
     /// // Mark again to exceed max_fail_count (default = 2)
-    /// mgr.mark_fallback_failed("llm-2");
+    /// mgr.mark_fallback_failed("llm-2").unwrap();
     ///
     /// // active_model skips failed, returns next available
-    /// assert_eq!(mgr.fallback_model(), Some("llm-3".to_string()));
+    /// assert_eq!(mgr.fallback_model().unwrap(), Some("llm-3".to_string()));
     /// ```
     ///
     /// The agent loop calls this automatically whenever a turn fails while
     /// the breaker is already in [`FallbackState::Fallback`] — hosts
     /// driving the manager directly must call it themselves to advance the
     /// chain.
-    pub fn mark_fallback_failed(&self, model: &str) -> bool {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn mark_fallback_failed(&self, model: &str) -> Result<bool, crate::error::LoopError> {
         let mut found = false;
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(entry) = state.fallback_models.iter_mut().find(|e| e.name == model) {
-                entry.record_attempt();
-                found = true;
-            }
-            if found {
-                Self::recompute_active_fallback_impl(&mut state);
-            }
+        let mut state = self.lock_state()?;
+        if let Some(entry) = state.fallback_models.iter_mut().find(|e| e.name == model) {
+            entry.record_attempt();
+            found = true;
         }
-        found
+        if found {
+            Self::recompute_active_fallback_impl(&mut state);
+        }
+        Ok(found)
     }
 
     /// Clear the failed flag on a fallback model by name.
@@ -1056,26 +1128,28 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.add_fallback_model("llm-2");
-    /// mgr.mark_fallback_failed("llm-2");
-    /// mgr.mark_fallback_failed("llm-2"); // exceeds max_fail_count (default = 2)
-    /// assert!(mgr.failed_fallbacks().contains(&"llm-2".to_string()));
+    /// mgr.add_fallback_model("llm-2").unwrap();
+    /// mgr.mark_fallback_failed("llm-2").unwrap();
+    /// mgr.mark_fallback_failed("llm-2").unwrap(); // exceeds max_fail_count
+    /// assert!(mgr.failed_fallbacks().unwrap().contains(&"llm-2".to_string()));
     ///
-    /// mgr.clear_fallback_failed("llm-2");
-    /// assert!(mgr.failed_fallbacks().is_empty());
+    /// mgr.clear_fallback_failed("llm-2").unwrap();
+    /// assert!(mgr.failed_fallbacks().unwrap().is_empty());
     /// ```
-    pub fn clear_fallback_failed(&self, model: &str) -> bool {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn clear_fallback_failed(&self, model: &str) -> Result<bool, crate::error::LoopError> {
         let mut found = false;
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(entry) = state.fallback_models.iter_mut().find(|e| e.name == model) {
-                entry.clear_attempts();
-                found = true;
-            }
-            if found {
-                Self::recompute_active_fallback_impl(&mut state);
-            }
+        let mut state = self.lock_state()?;
+        if let Some(entry) = state.fallback_models.iter_mut().find(|e| e.name == model) {
+            entry.clear_attempts();
+            found = true;
         }
-        found
+        if found {
+            Self::recompute_active_fallback_impl(&mut state);
+        }
+        Ok(found)
     }
 
     /// Clear all failed flags, making every fallback model available again.
@@ -1089,24 +1163,28 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.add_fallback_model("llm-2");
-    /// mgr.add_fallback_model("llm-3");
-    /// mgr.mark_fallback_failed("llm-2");
-    /// mgr.mark_fallback_failed("llm-2"); // exceeds max_fail_count
-    /// mgr.mark_fallback_failed("llm-3");
-    /// mgr.mark_fallback_failed("llm-3"); // exceeds max_fail_count
-    /// assert_eq!(mgr.failed_fallbacks().len(), 2);
+    /// mgr.add_fallback_model("llm-2").unwrap();
+    /// mgr.add_fallback_model("llm-3").unwrap();
+    /// mgr.mark_fallback_failed("llm-2").unwrap();
+    /// mgr.mark_fallback_failed("llm-2").unwrap(); // exceeds max_fail_count
+    /// mgr.mark_fallback_failed("llm-3").unwrap();
+    /// mgr.mark_fallback_failed("llm-3").unwrap(); // exceeds max_fail_count
+    /// assert_eq!(mgr.failed_fallbacks().unwrap().len(), 2);
     ///
-    /// mgr.clear_all_fallback_failed();
-    /// assert!(mgr.failed_fallbacks().is_empty());
+    /// mgr.clear_all_fallback_failed().unwrap();
+    /// assert!(mgr.failed_fallbacks().unwrap().is_empty());
     /// ```
-    pub fn clear_all_fallback_failed(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            for entry in &mut state.fallback_models {
-                entry.clear_attempts();
-            }
-            Self::recompute_active_fallback_impl(&mut state);
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn clear_all_fallback_failed(&self) -> Result<(), crate::error::LoopError> {
+        let mut state = self.lock_state()?;
+        for entry in &mut state.fallback_models {
+            entry.clear_attempts();
         }
+        Self::recompute_active_fallback_impl(&mut state);
+
+        Ok(())
     }
 
     /// Get the names of all fallback models marked as failed.
@@ -1120,26 +1198,26 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.add_fallback_model("llm-2");
-    /// mgr.add_fallback_model("llm-3");
-    /// mgr.mark_fallback_failed("llm-3");
-    /// mgr.mark_fallback_failed("llm-3"); // exceeds max_fail_count (default = 2)
+    /// mgr.add_fallback_model("llm-2").unwrap();
+    /// mgr.add_fallback_model("llm-3").unwrap();
+    /// mgr.mark_fallback_failed("llm-3").unwrap();
+    /// mgr.mark_fallback_failed("llm-3").unwrap(); // exceeds max_fail_count (default = 2)
     ///
-    /// let failed = mgr.failed_fallbacks();
+    /// let failed = mgr.failed_fallbacks().unwrap();
     /// assert_eq!(failed, vec!["llm-3"]);
     /// ```
-    pub fn failed_fallbacks(&self) -> Vec<String> {
-        self.state
-            .lock()
-            .ok()
-            .map(|s| {
-                s.fallback_models
-                    .iter()
-                    .filter(|e| e.failed())
-                    .map(|e| e.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn failed_fallbacks(&self) -> Result<Vec<String>, crate::error::LoopError> {
+        Ok(self
+            .lock_state()?
+            .fallback_models
+            .iter()
+            .filter(|e| e.failed())
+            .map(|e| e.name.clone())
+            .collect())
     }
 
     /// Get the names of all non-failed (available) fallback models.
@@ -1153,26 +1231,26 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.add_fallback_model("llm-2");
-    /// mgr.add_fallback_model("llm-3");
-    /// mgr.mark_fallback_failed("llm-3");
-    /// mgr.mark_fallback_failed("llm-3"); // exceeds max_fail_count (default = 2)
+    /// mgr.add_fallback_model("llm-2").unwrap();
+    /// mgr.add_fallback_model("llm-3").unwrap();
+    /// mgr.mark_fallback_failed("llm-3").unwrap();
+    /// mgr.mark_fallback_failed("llm-3").unwrap(); // exceeds max_fail_count (default = 2)
     ///
-    /// let available = mgr.available_fallbacks();
+    /// let available = mgr.available_fallbacks().unwrap();
     /// assert_eq!(available, vec!["llm-2"]);
     /// ```
-    pub fn available_fallbacks(&self) -> Vec<String> {
-        self.state
-            .lock()
-            .ok()
-            .map(|s| {
-                s.fallback_models
-                    .iter()
-                    .filter(|e| !e.failed())
-                    .map(|e| e.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn available_fallbacks(&self) -> Result<Vec<String>, crate::error::LoopError> {
+        Ok(self
+            .lock_state()?
+            .fallback_models
+            .iter()
+            .filter(|e| !e.failed())
+            .map(|e| e.name.clone())
+            .collect())
     }
 
     /// Set the `available` flag on a fallback model.
@@ -1192,31 +1270,37 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.add_fallback_model("llm-2");
-    /// mgr.add_fallback_model("llm-3");
+    /// mgr.add_fallback_model("llm-2").unwrap();
+    /// mgr.add_fallback_model("llm-3").unwrap();
     ///
     /// // Take llm-2 out of rotation (e.g. API key revoked)
-    /// assert!(mgr.set_fallback_available("llm-2", false));
+    /// assert!(mgr.set_fallback_available("llm-2", false).unwrap());
     ///
     /// // active_model now skips llm-2
-    /// assert_eq!(mgr.fallback_model(), Some("llm-3".to_string()));
+    /// assert_eq!(mgr.fallback_model().unwrap(), Some("llm-3".to_string()));
     ///
     /// // Bring it back
-    /// mgr.set_fallback_available("llm-2", true);
-    /// assert_eq!(mgr.fallback_model(), Some("llm-2".to_string()));
+    /// mgr.set_fallback_available("llm-2", true).unwrap();
+    /// assert_eq!(mgr.fallback_model().unwrap(), Some("llm-2".to_string()));
     /// ```
-    pub fn set_fallback_available(&self, model: &str, available: bool) -> bool {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn set_fallback_available(
+        &self,
+        model: &str,
+        available: bool,
+    ) -> Result<bool, crate::error::LoopError> {
         let mut found = false;
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(entry) = state.fallback_models.iter_mut().find(|e| e.name == model) {
-                entry.set_available(available);
-                found = true;
-            }
-            if found {
-                Self::recompute_active_fallback_impl(&mut state);
-            }
+        let mut state = self.lock_state()?;
+        if let Some(entry) = state.fallback_models.iter_mut().find(|e| e.name == model) {
+            entry.set_available(available);
+            found = true;
         }
-        found
+        if found {
+            Self::recompute_active_fallback_impl(&mut state);
+        }
+        Ok(found)
     }
 
     /// Record an API failure and check if fallback should be triggered.
@@ -1239,10 +1323,10 @@ impl FallbackManager {
     /// ```rust
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
-    /// assert!(!mgr.record_failure(FailureKind::Transient)); // 1
-    /// assert!(!mgr.record_failure(FailureKind::Transient)); // 2
-    /// assert!(mgr.record_failure(FailureKind::Transient));  // 3 — threshold reached, now activated
-    /// assert!(!mgr.record_failure(FailureKind::Transient)); // 4 — already activated, no re-trip
+    /// assert!(!mgr.record_failure(FailureKind::Transient).unwrap()); // 1
+    /// assert!(!mgr.record_failure(FailureKind::Transient).unwrap()); // 2
+    /// assert!(mgr.record_failure(FailureKind::Transient).unwrap());  // 3 — threshold reached, now activated
+    /// assert!(!mgr.record_failure(FailureKind::Transient).unwrap()); // 4 — already activated, no re-trip
     /// ```
     /// Record a failure on the current model and trip the circuit if the
     /// threshold is reached.
@@ -1276,16 +1360,17 @@ impl FallbackManager {
     /// ```rust
     /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
-    /// assert!(!mgr.record_failure(FailureKind::Transient)); // 1
-    /// assert!(!mgr.record_failure(FailureKind::Transient)); // 2
-    /// assert!(mgr.record_failure(FailureKind::Transient));  // 3 → trips to Fallback
-    /// assert_eq!(mgr.state(), FallbackState::Fallback);
+    /// assert!(!mgr.record_failure(FailureKind::Transient).unwrap()); // 1
+    /// assert!(!mgr.record_failure(FailureKind::Transient).unwrap()); // 2
+    /// assert!(mgr.record_failure(FailureKind::Transient).unwrap());  // 3 → trips to Fallback
+    /// assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
     /// ```
-    pub fn record_failure(&self, kind: FailureKind) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        match state.state {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn record_failure(&self, kind: FailureKind) -> Result<bool, crate::error::LoopError> {
+        let mut state = self.lock_state()?;
+        let tripped = match state.state {
             FallbackState::Primary => {
                 state.consecutive_failures = state.consecutive_failures.saturating_add(1);
                 if state.consecutive_failures >= self.config.trip_threshold {
@@ -1327,7 +1412,8 @@ impl FallbackManager {
                     false
                 }
             },
-        }
+        };
+        Ok(tripped)
     }
 
     /// Reset the consecutive failure counter.
@@ -1342,16 +1428,20 @@ impl FallbackManager {
     /// ```rust
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.record_failure(FailureKind::Transient);
-    /// mgr.record_failure(FailureKind::Transient);
-    /// assert_eq!(mgr.consecutive_failures(), 2);
+    /// mgr.record_failure(FailureKind::Transient).unwrap();
+    /// mgr.record_failure(FailureKind::Transient).unwrap();
+    /// assert_eq!(mgr.consecutive_failures().unwrap(), 2);
     /// mgr.reset_failure_counter();
-    /// assert_eq!(mgr.consecutive_failures(), 0);
+    /// assert_eq!(mgr.consecutive_failures().unwrap(), 0);
     /// ```
-    pub fn reset_failure_counter(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.consecutive_failures = 0;
-        }
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn reset_failure_counter(&self) -> Result<(), crate::error::LoopError> {
+        let mut state = self.lock_state()?;
+        state.consecutive_failures = 0;
+
+        Ok(())
     }
 
     /// Record a success on the current model.
@@ -1373,15 +1463,16 @@ impl FallbackManager {
     /// ```rust
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.record_failure(FailureKind::Transient);
-    /// assert_eq!(mgr.consecutive_failures(), 1);
-    /// mgr.record_success(); // resets failures to 0
-    /// assert_eq!(mgr.consecutive_failures(), 0);
+    /// mgr.record_failure(FailureKind::Transient).unwrap();
+    /// assert_eq!(mgr.consecutive_failures().unwrap(), 1);
+    /// mgr.record_success().unwrap(); // resets failures to 0
+    /// assert_eq!(mgr.consecutive_failures().unwrap(), 0);
     /// ```
-    pub fn record_success(&self) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn record_success(&self) -> Result<(), crate::error::LoopError> {
+        let mut state = self.lock_state()?;
         match state.state {
             FallbackState::Primary => {
                 state.consecutive_failures = 0;
@@ -1399,6 +1490,7 @@ impl FallbackManager {
                 }
             }
         }
+        Ok(())
     }
 
     /// Check if we should try resuming the primary model.
@@ -1428,11 +1520,20 @@ impl FallbackManager {
     ///
     /// let mgr = FallbackManager::new(3, 2);
     /// // Not in fallback state → false
-    /// assert!(!mgr.should_try_resume_primary(Duration::from_secs(10)));
+    /// assert!(!mgr.should_try_resume_primary(Duration::from_secs(10)).unwrap());
     /// ```
-    pub fn should_try_resume_primary(&self, min_fallback_duration: Duration) -> bool {
-        let state = crate::error::recover_guard(self.state.lock());
-        Self::should_try_resume_primary_impl(&state, min_fallback_duration)
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn should_try_resume_primary(
+        &self,
+        min_fallback_duration: Duration,
+    ) -> Result<bool, crate::error::LoopError> {
+        let state = self.lock_state()?;
+        Ok(Self::should_try_resume_primary_impl(
+            &state,
+            min_fallback_duration,
+        ))
     }
 
     /// [`should_try_resume_primary`](Self::should_try_resume_primary)
@@ -1468,13 +1569,17 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.transition_to_fallback();
-    /// assert_eq!(mgr.state(), FallbackState::Fallback);
+    /// mgr.transition_to_fallback().unwrap();
+    /// assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
     /// ```
-    pub fn transition_to_fallback(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            Self::transition_to_fallback_impl(&mut state);
-        }
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn transition_to_fallback(&self) -> Result<(), crate::error::LoopError> {
+        let mut state = self.lock_state()?;
+        Self::transition_to_fallback_impl(&mut state);
+
+        Ok(())
     }
 
     /// [`transition_to_fallback`](Self::transition_to_fallback) assuming
@@ -1514,14 +1619,18 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.transition_to_fallback();
-    /// mgr.transition_to_recovering();
-    /// assert_eq!(mgr.state(), FallbackState::Recovering);
+    /// mgr.transition_to_fallback().unwrap();
+    /// mgr.transition_to_recovering().unwrap();
+    /// assert_eq!(mgr.state().unwrap(), FallbackState::Recovering);
     /// ```
-    pub fn transition_to_recovering(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            Self::transition_to_recovering_impl(&mut state);
-        }
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn transition_to_recovering(&self) -> Result<(), crate::error::LoopError> {
+        let mut state = self.lock_state()?;
+        Self::transition_to_recovering_impl(&mut state);
+
+        Ok(())
     }
 
     /// [`transition_to_recovering`](Self::transition_to_recovering)
@@ -1550,15 +1659,19 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// mgr.transition_to_fallback();
-    /// mgr.transition_to_primary();
-    /// assert_eq!(mgr.state(), FallbackState::Primary);
-    /// assert!(!mgr.is_using_fallback());
+    /// mgr.transition_to_fallback().unwrap();
+    /// mgr.transition_to_primary().unwrap();
+    /// assert_eq!(mgr.state().unwrap(), FallbackState::Primary);
+    /// assert!(!mgr.is_using_fallback().unwrap());
     /// ```
-    pub fn transition_to_primary(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            Self::transition_to_primary_impl(&mut state);
-        }
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn transition_to_primary(&self) -> Result<(), crate::error::LoopError> {
+        let mut state = self.lock_state()?;
+        Self::transition_to_primary_impl(&mut state);
+
+        Ok(())
     }
 
     /// [`transition_to_primary`](Self::transition_to_primary) assuming
@@ -1598,18 +1711,21 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FallbackState, FailureKind};
     ///
     /// let mgr = FallbackManager::new(3, 2);
-    /// for _ in 0..3 { mgr.record_failure(FailureKind::Transient); }
-    /// assert_eq!(mgr.state(), FallbackState::Fallback);
+    /// for _ in 0..3 { mgr.record_failure(FailureKind::Transient).unwrap(); }
+    /// assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
     ///
-    /// mgr.reset();
-    /// assert_eq!(mgr.state(), FallbackState::Primary);
-    /// assert!(!mgr.is_fallback_active());
-    /// assert_eq!(mgr.consecutive_failures(), 0);
+    /// mgr.reset().unwrap();
+    /// assert_eq!(mgr.state().unwrap(), FallbackState::Primary);
+    /// assert!(!mgr.is_fallback_active().unwrap());
+    /// assert_eq!(mgr.consecutive_failures().unwrap(), 0);
     /// ```
-    pub fn reset(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            Self::transition_to_primary_impl(&mut state);
-        }
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
+    pub fn reset(&self) -> Result<(), crate::error::LoopError> {
+        let mut state = self.lock_state()?;
+        Self::transition_to_primary_impl(&mut state);
+        Ok(())
     }
 
     /// Recompute the cached [`active_fallback`](BreakerState::active_fallback)
@@ -1637,32 +1753,103 @@ impl Default for FallbackManager {
 
 #[cfg(test)]
 mod tests {
+    /// Poison the shared manager's state mutex by panicking while
+    /// holding it. The manager must be behind an `Arc` so the panicking
+    /// thread can own a handle.
+    fn poison(mgr: &std::sync::Arc<FallbackManager>) {
+        let m = std::sync::Arc::clone(mgr);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = m.state.lock().expect("lock before poison");
+                panic!("poison the breaker state");
+            })
+            .join()
+            .is_err(),
+            "the poisoning thread must panic"
+        );
+    }
+
+    #[test]
+    fn original_model_returns_poison_error_after_poison() {
+        let mgr = std::sync::Arc::new(FallbackManager::for_model("p").unwrap());
+        poison(&mgr);
+        match mgr.original_model() {
+            Err(crate::error::LoopError::LockPoisoned { what }) => {
+                assert_eq!(what, "fallback");
+            }
+            other => panic!("poison must propagate, not fail open: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_original_model_propagates_poison() {
+        let mgr = std::sync::Arc::new(FallbackManager::new(3, 2));
+        poison(&mgr);
+        assert!(
+            mgr.set_original_model("x".to_string()).is_err(),
+            "a poisoned breaker must not silently accept writes"
+        );
+    }
+
+    #[test]
+    fn active_model_propagates_poison() {
+        let mgr = std::sync::Arc::new(FallbackManager::for_model("p").unwrap());
+        poison(&mgr);
+        assert!(
+            matches!(
+                mgr.active_model(),
+                Err(crate::error::LoopError::LockPoisoned { .. })
+            ),
+            "model selection must not read desynchronised state"
+        );
+    }
+
+    #[test]
+    fn record_failure_propagates_when_poisoned() {
+        let mgr = std::sync::Arc::new(FallbackManager::new(3, 2));
+        poison(&mgr);
+        assert!(mgr.record_failure(FailureKind::Transient).is_err());
+    }
+
+    #[test]
+    fn state_returns_poison_error_not_primary() {
+        // The old fail-open idiom mapped poison to `Primary` while
+        // `active_model` mapped it to `None` — an inconsistent pair on
+        // a routing-critical read.
+        let mgr = std::sync::Arc::new(FallbackManager::new(3, 2));
+        poison(&mgr);
+        assert!(matches!(
+            mgr.state(),
+            Err(crate::error::LoopError::LockPoisoned { .. })
+        ));
+    }
+
     use super::*;
 
     #[test]
     fn test_initial_state() {
         let mgr = FallbackManager::new(3, 2);
-        assert_eq!(mgr.state(), FallbackState::Primary);
-        assert!(!mgr.is_using_fallback());
-        assert!(!mgr.is_fallback_active());
-        assert_eq!(mgr.consecutive_failures(), 0);
+        assert_eq!(mgr.state().unwrap(), FallbackState::Primary);
+        assert!(!mgr.is_using_fallback().unwrap());
+        assert!(!mgr.is_fallback_active().unwrap());
+        assert_eq!(mgr.consecutive_failures().unwrap(), 0);
     }
 
     #[test]
     fn test_failure_threshold() {
         let mgr = FallbackManager::new(3, 2);
-        assert!(!mgr.record_failure(FailureKind::Transient)); // 1
-        assert!(!mgr.record_failure(FailureKind::Transient)); // 2
-        assert!(mgr.record_failure(FailureKind::Transient)); // 3 — threshold reached
+        assert!(!mgr.record_failure(FailureKind::Transient).unwrap()); // 1
+        assert!(!mgr.record_failure(FailureKind::Transient).unwrap()); // 2
+        assert!(mgr.record_failure(FailureKind::Transient).unwrap()); // 3 — threshold reached
     }
 
     #[test]
     fn test_model_failure_triggers_fallback() {
         let mgr = FallbackManager::new(3, 2);
-        assert!(!mgr.record_failure(FailureKind::Transient)); // 1
-        assert!(!mgr.record_failure(FailureKind::Transient)); // 2
-        assert!(mgr.record_failure(FailureKind::Transient)); // 3 — triggers fallback
-        assert_eq!(mgr.state(), FallbackState::Fallback);
+        assert!(!mgr.record_failure(FailureKind::Transient).unwrap()); // 1
+        assert!(!mgr.record_failure(FailureKind::Transient).unwrap()); // 2
+        assert!(mgr.record_failure(FailureKind::Transient).unwrap()); // 3 — triggers fallback
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
     }
 
     #[test]
@@ -1670,58 +1857,67 @@ mod tests {
         let mgr = FallbackManager::new(3, 2);
         // Trigger fallback
         for _ in 0..3 {
-            mgr.record_failure(FailureKind::Transient);
+            mgr.record_failure(FailureKind::Transient).unwrap();
         }
-        assert_eq!(mgr.state(), FallbackState::Fallback);
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
 
         // Transition to recovering
-        mgr.transition_to_recovering();
-        assert_eq!(mgr.state(), FallbackState::Recovering);
+        mgr.transition_to_recovering().unwrap();
+        assert_eq!(mgr.state().unwrap(), FallbackState::Recovering);
 
         // Recover after enough successes
-        mgr.record_success(); // 1
-        mgr.record_success(); // 2 — threshold reached
-        assert_eq!(mgr.state(), FallbackState::Primary);
+        mgr.record_success().unwrap(); // 1
+        mgr.record_success().unwrap(); // 2 — threshold reached
+        assert_eq!(mgr.state().unwrap(), FallbackState::Primary);
     }
 
     #[test]
     fn test_recovery_failure_goes_back_to_fallback() {
         let mgr = FallbackManager::new(3, 2);
         for _ in 0..3 {
-            mgr.record_failure(FailureKind::Transient);
+            mgr.record_failure(FailureKind::Transient).unwrap();
         }
-        mgr.transition_to_recovering();
-        mgr.record_failure(FailureKind::RateLimit); // sustained failure during recovery re-trips
-        assert_eq!(mgr.state(), FallbackState::Fallback);
+        mgr.transition_to_recovering().unwrap();
+        mgr.record_failure(FailureKind::RateLimit).unwrap(); // sustained failure during recovery re-trips
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
     }
 
     #[test]
     fn test_should_try_resume_primary() {
         let mgr = FallbackManager::new(3, 2);
-        assert!(!mgr.should_try_resume_primary(Duration::from_secs(10)));
+        assert!(
+            !mgr.should_try_resume_primary(Duration::from_secs(10))
+                .unwrap()
+        );
 
         // Trigger fallback
         for _ in 0..3 {
-            mgr.record_failure(FailureKind::Transient);
+            mgr.record_failure(FailureKind::Transient).unwrap();
         }
         // Not enough time
-        assert!(!mgr.should_try_resume_primary(Duration::from_hours(1)));
+        assert!(
+            !mgr.should_try_resume_primary(Duration::from_hours(1))
+                .unwrap()
+        );
         // Enough time (0s timeout)
-        assert!(mgr.should_try_resume_primary(Duration::from_secs(0)));
+        assert!(
+            mgr.should_try_resume_primary(Duration::from_secs(0))
+                .unwrap()
+        );
     }
 
     #[test]
     fn test_reset() {
         let mgr = FallbackManager::new(3, 2);
         for _ in 0..3 {
-            mgr.record_failure(FailureKind::Transient);
+            mgr.record_failure(FailureKind::Transient).unwrap();
         }
-        assert_eq!(mgr.state(), FallbackState::Fallback);
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
 
-        mgr.reset();
-        assert_eq!(mgr.state(), FallbackState::Primary);
-        assert!(!mgr.is_fallback_active());
-        assert_eq!(mgr.consecutive_failures(), 0);
+        mgr.reset().unwrap();
+        assert_eq!(mgr.state().unwrap(), FallbackState::Primary);
+        assert!(!mgr.is_fallback_active().unwrap());
+        assert_eq!(mgr.consecutive_failures().unwrap(), 0);
     }
 
     #[test]
@@ -1729,31 +1925,31 @@ mod tests {
         let mgr = FallbackManager::new(3, 2);
         // Trip the circuit
         for _ in 0..3 {
-            mgr.record_failure(FailureKind::Transient);
+            mgr.record_failure(FailureKind::Transient).unwrap();
         }
         // Activate fallback
-        mgr.transition_to_fallback();
+        mgr.transition_to_fallback().unwrap();
 
         // Further failures should not return true (already activated)
-        assert!(!mgr.record_failure(FailureKind::Transient));
+        assert!(!mgr.record_failure(FailureKind::Transient).unwrap());
     }
 
     #[test]
     fn test_record_success_resets_on_primary() {
         let mgr = FallbackManager::new(3, 2);
-        mgr.record_failure(FailureKind::Transient);
-        mgr.record_failure(FailureKind::Transient);
-        assert_eq!(mgr.consecutive_failures(), 2);
+        mgr.record_failure(FailureKind::Transient).unwrap();
+        mgr.record_failure(FailureKind::Transient).unwrap();
+        assert_eq!(mgr.consecutive_failures().unwrap(), 2);
 
-        mgr.record_success();
-        assert_eq!(mgr.consecutive_failures(), 0);
+        mgr.record_success().unwrap();
+        assert_eq!(mgr.consecutive_failures().unwrap(), 0);
     }
 
     #[test]
     fn test_for_model() {
-        let mgr = FallbackManager::for_model("llm-70b");
-        assert_eq!(mgr.original_model(), Some("llm-70b".to_string()));
-        assert_eq!(mgr.state(), FallbackState::Primary);
+        let mgr = FallbackManager::for_model("llm-70b").unwrap();
+        assert_eq!(mgr.original_model().unwrap(), Some("llm-70b".to_string()));
+        assert_eq!(mgr.state().unwrap(), FallbackState::Primary);
     }
 
     #[test]
@@ -1767,10 +1963,10 @@ mod tests {
         for _ in 0..10 {
             let mgr = Arc::clone(&mgr);
             handles.push(thread::spawn(move || {
-                mgr.record_failure(FailureKind::Transient);
-                mgr.record_success();
-                mgr.state();
-                mgr.consecutive_failures();
+                mgr.record_failure(FailureKind::Transient).unwrap();
+                mgr.record_success().unwrap();
+                mgr.state().unwrap();
+                mgr.consecutive_failures().unwrap();
             }));
         }
 
@@ -1781,68 +1977,77 @@ mod tests {
 
     #[test]
     fn test_consolidated_mutex_fields_are_consistent() {
-        let mgr = FallbackManager::for_model("primary-model");
-        mgr.add_fallback_model("fallback-model");
+        let mgr = FallbackManager::for_model("primary-model").unwrap();
+        mgr.add_fallback_model("fallback-model").unwrap();
 
         // Before transition: using primary model, no switch time.
-        assert_eq!(mgr.active_model(), Some("primary-model".to_string()));
-        assert!(mgr.fallback_switched_at().is_none());
+        assert_eq!(
+            mgr.active_model().unwrap(),
+            Some("primary-model".to_string())
+        );
+        assert!(mgr.fallback_switched_at().unwrap().is_none());
 
         // Transition to fallback — updates multiple fields.
-        mgr.transition_to_fallback();
+        mgr.transition_to_fallback().unwrap();
 
         // After transition: both fields should be set together.
         // This verifies the consolidated Mutex prevents partial reads.
-        assert_eq!(mgr.active_model(), Some("fallback-model".to_string()));
+        assert_eq!(
+            mgr.active_model().unwrap(),
+            Some("fallback-model".to_string())
+        );
         assert!(
-            mgr.fallback_switched_at().is_some(),
+            mgr.fallback_switched_at().unwrap().is_some(),
             "switch time should be set after transition"
         );
     }
 
     #[test]
     fn test_consolidated_mutex_clears_fields_together() {
-        let mgr = FallbackManager::for_model("primary-model");
-        mgr.add_fallback_model("fallback-model");
-        mgr.transition_to_fallback();
+        let mgr = FallbackManager::for_model("primary-model").unwrap();
+        mgr.add_fallback_model("fallback-model").unwrap();
+        mgr.transition_to_fallback().unwrap();
 
         // Both fields are set.
-        assert_eq!(mgr.active_model(), Some("fallback-model".to_string()));
-        assert!(mgr.fallback_switched_at().is_some());
+        assert_eq!(
+            mgr.active_model().unwrap(),
+            Some("fallback-model".to_string())
+        );
+        assert!(mgr.fallback_switched_at().unwrap().is_some());
 
         // Transition back to primary.
-        mgr.transition_to_primary();
+        mgr.transition_to_primary().unwrap();
 
         // Both fields should be cleared together.
         assert!(
-            mgr.fallback_switched_at().is_none(),
+            mgr.fallback_switched_at().unwrap().is_none(),
             "switch time should be cleared after transition to primary"
         );
     }
 
     #[test]
     fn test_consolidated_mutex_reset_clears_all() {
-        let mgr = FallbackManager::for_model("primary-model");
-        mgr.add_fallback_model("fallback-model");
+        let mgr = FallbackManager::for_model("primary-model").unwrap();
+        mgr.add_fallback_model("fallback-model").unwrap();
         // Record a failure while in Primary to dirty the counter, then trip.
-        mgr.record_failure(FailureKind::Transient);
+        mgr.record_failure(FailureKind::Transient).unwrap();
         assert!(
-            mgr.consecutive_failures() > 0,
+            mgr.consecutive_failures().unwrap() > 0,
             "counter is dirty before the trip"
         );
-        mgr.transition_to_fallback();
+        mgr.transition_to_fallback().unwrap();
 
         // The trip itself resets the failure counter; the switch time is
         // the remaining dirty state a full reset must clear.
-        assert_eq!(mgr.consecutive_failures(), 0);
-        assert!(mgr.fallback_switched_at().is_some());
+        assert_eq!(mgr.consecutive_failures().unwrap(), 0);
+        assert!(mgr.fallback_switched_at().unwrap().is_some());
 
         // Full reset.
-        mgr.reset();
+        mgr.reset().unwrap();
 
         // Everything cleared.
-        assert_eq!(mgr.consecutive_failures(), 0);
-        assert!(mgr.fallback_switched_at().is_none());
+        assert_eq!(mgr.consecutive_failures().unwrap(), 0);
+        assert!(mgr.fallback_switched_at().unwrap().is_none());
     }
 
     #[test]
@@ -1901,12 +2106,12 @@ mod tests {
     #[test]
     fn consecutive_failures_resets_on_trip() {
         let mgr = FallbackManager::new(3, 2);
-        assert!(!mgr.record_failure(FailureKind::Transient));
-        assert!(!mgr.record_failure(FailureKind::Transient));
-        assert!(mgr.record_failure(FailureKind::Transient));
-        assert_eq!(mgr.state(), FallbackState::Fallback);
+        assert!(!mgr.record_failure(FailureKind::Transient).unwrap());
+        assert!(!mgr.record_failure(FailureKind::Transient).unwrap());
+        assert!(mgr.record_failure(FailureKind::Transient).unwrap());
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
         assert_eq!(
-            mgr.consecutive_failures(),
+            mgr.consecutive_failures().unwrap(),
             0,
             "field doc: reset to 0 on trip"
         );
@@ -1916,14 +2121,14 @@ mod tests {
     fn transient_failure_during_recovery_breaks_success_streak() {
         let mgr = FallbackManager::new(3, 2);
         for _ in 0..3 {
-            mgr.record_failure(FailureKind::Transient);
+            mgr.record_failure(FailureKind::Transient).unwrap();
         }
-        mgr.transition_to_recovering();
-        mgr.record_success();
-        mgr.record_failure(FailureKind::Transient);
-        mgr.record_success();
+        mgr.transition_to_recovering().unwrap();
+        mgr.record_success().unwrap();
+        mgr.record_failure(FailureKind::Transient).unwrap();
+        mgr.record_success().unwrap();
         assert_eq!(
-            mgr.state(),
+            mgr.state().unwrap(),
             FallbackState::Recovering,
             "field doc: only consecutive successes accumulate toward recovery"
         );
@@ -1931,17 +2136,17 @@ mod tests {
 
     #[test]
     fn active_model_does_not_return_primary_when_chain_is_exhausted() {
-        let mgr = FallbackManager::for_model("primary");
-        mgr.add_fallback_model("fb1");
-        mgr.add_fallback_model("fb2");
-        mgr.mark_fallback_failed("fb1");
-        mgr.mark_fallback_failed("fb1");
-        mgr.mark_fallback_failed("fb2");
-        mgr.mark_fallback_failed("fb2");
-        mgr.transition_to_fallback();
-        assert_eq!(mgr.state(), FallbackState::Fallback);
+        let mgr = FallbackManager::for_model("primary").unwrap();
+        mgr.add_fallback_model("fb1").unwrap();
+        mgr.add_fallback_model("fb2").unwrap();
+        mgr.mark_fallback_failed("fb1").unwrap();
+        mgr.mark_fallback_failed("fb1").unwrap();
+        mgr.mark_fallback_failed("fb2").unwrap();
+        mgr.mark_fallback_failed("fb2").unwrap();
+        mgr.transition_to_fallback().unwrap();
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
         assert_ne!(
-            mgr.active_model().as_deref(),
+            mgr.active_model().unwrap().as_deref(),
             Some("primary"),
             "a dedicated fallback is configured; the exhausted chain must not silently route back to the failed primary"
         );

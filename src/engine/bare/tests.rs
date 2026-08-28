@@ -3315,7 +3315,7 @@ async fn switch_model_unsupported_client() {
     );
     assert_eq!(loop_.client.model(), "static");
     assert_eq!(
-        loop_.managers.fallback().original_model(),
+        loop_.managers.fallback().original_model().unwrap(),
         None,
         "the fallback tracker must not point at a model the client \
          never adopted — the per-request override would serve it anyway"
@@ -3353,13 +3353,13 @@ async fn switch_model_updates_fallback_original() {
     let mut loop_ = BareLoop::new(client, tools, SessionConfig::default());
 
     // Before switch, fallback manager has no original model set.
-    assert_eq!(loop_.managers.fallback().original_model(), None);
+    assert_eq!(loop_.managers.fallback().original_model().unwrap(), None);
 
     loop_.switch_model("new-primary").apply().unwrap();
 
     // After switch, fallback manager tracks the new primary.
     assert_eq!(
-        loop_.managers.fallback().original_model(),
+        loop_.managers.fallback().original_model().unwrap(),
         Some("new-primary".to_string())
     );
 }
@@ -3450,17 +3450,28 @@ async fn switch_model_resets_fallback_circuit() {
     loop_
         .managers
         .fallback()
-        .set_original_model("primary".into());
-    loop_.managers.fallback().set_fallback_model("backup");
-    loop_.managers.fallback().transition_to_fallback();
-    assert_eq!(loop_.managers.fallback().state(), FallbackState::Fallback);
+        .set_original_model("primary".into())
+        .unwrap();
+    loop_
+        .managers
+        .fallback()
+        .set_fallback_model("backup")
+        .unwrap();
+    loop_.managers.fallback().transition_to_fallback().unwrap();
+    assert_eq!(
+        loop_.managers.fallback().state().unwrap(),
+        FallbackState::Fallback
+    );
 
     // Switch model — circuit should reset to Primary.
     loop_.switch_model("new-primary").apply().unwrap();
 
-    assert_eq!(loop_.managers.fallback().state(), FallbackState::Primary);
     assert_eq!(
-        loop_.managers.fallback().original_model(),
+        loop_.managers.fallback().state().unwrap(),
+        FallbackState::Primary
+    );
+    assert_eq!(
+        loop_.managers.fallback().original_model().unwrap(),
         Some("new-primary".to_string())
     );
 }
@@ -4059,11 +4070,13 @@ async fn escalation_trips_from_primary_state() {
         });
 
     let manager = FallbackManager::new(1, 2);
-    manager.set_original_model("primary-model".to_string());
-    manager.set_fallback_model("fallback-model");
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-model").unwrap();
     assert_eq!(
         manager.state(),
-        FallbackState::Primary,
+        Ok(FallbackState::Primary),
         "precondition: the rebuilt manager starts from a clean Primary state"
     );
     let managers = LoopManagers::new()
@@ -4080,7 +4093,7 @@ async fn escalation_trips_from_primary_state() {
     let result = agent.run("Hi", &RunConfig::default()).await;
     assert!(result.is_err(), "rate-limited turn should fail");
     assert!(
-        agent.managers.fallback().is_using_fallback(),
+        agent.managers.fallback().is_using_fallback().unwrap(),
         "escalation trips the circuit breaker to the fallback model"
     );
 

@@ -100,8 +100,8 @@ pub use crate::capabilities::*;
 /// use loopctl::fallback::FallbackManager;
 ///
 /// let managers = LoopManagers::new()
-///     .with_fallback(FallbackManager::for_model("llm-70b"));
-/// assert_eq!(managers.fallback().active_model().as_deref(), Some("llm-70b"));
+///     .with_fallback(FallbackManager::for_model("llm-70b").unwrap());
+/// assert_eq!(managers.fallback().active_model().unwrap().as_deref(), Some("llm-70b"));
 /// ```
 ///
 /// # Capability Traits
@@ -208,7 +208,7 @@ impl LoopManagers {
     /// # use loopctl::managers::LoopManagers;
     /// # use loopctl::managers::FallbackCapable;
     /// let managers = LoopManagers::new();
-    /// assert!(managers.fallback().active_model().is_none());
+    /// assert!(managers.fallback().active_model().unwrap().is_none());
     /// ```
     #[must_use]
     pub fn new() -> Self {
@@ -237,8 +237,8 @@ impl LoopManagers {
     /// # use loopctl::managers::FallbackCapable;
     /// # use loopctl::fallback::FallbackManager;
     /// let managers = LoopManagers::new()
-    ///     .with_fallback(FallbackManager::for_model("llm-70b"));
-    /// assert_eq!(managers.fallback().active_model().as_deref(), Some("llm-70b"));
+    ///     .with_fallback(FallbackManager::for_model("llm-70b").unwrap());
+    /// assert_eq!(managers.fallback().active_model().unwrap().as_deref(), Some("llm-70b"));
     /// ```
     #[must_use]
     pub fn with_fallback(mut self, fallback: FallbackManager) -> Self {
@@ -459,6 +459,10 @@ impl LoopManagers {
         self.memory.as_ref()
     }
 
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned)
+    /// when the fallback or detection state lock is poisoned.
     /// Reset the fallback, detection, and observer managers to their
     /// initial state.
     ///
@@ -479,14 +483,15 @@ impl LoopManagers {
     /// # use loopctl::managers::LoopManagers;
     /// let managers = LoopManagers::new();
     /// // ... after several runs ...
-    /// managers.reset_all();
+    /// managers.reset_all().unwrap();
     /// // Breaker, detection, and observer state are back to initial;
     /// // the optional managers keep theirs
     /// ```
-    pub fn reset_all(&self) {
-        self.fallback.reset();
-        self.detection.reset();
+    pub fn reset_all(&self) -> Result<(), crate::error::LoopError> {
+        self.fallback.reset()?;
+        self.detection.reset()?;
         self.observer_host.reset_all();
+        Ok(())
     }
 
     /// Fire tracing log lines and observer events for a detected pattern.
@@ -618,15 +623,15 @@ mod tests {
     #[test]
     fn test_runtime_default() {
         let managers = LoopManagers::default();
-        assert!(managers.fallback().active_model().is_none());
+        assert!(managers.fallback().active_model().unwrap().is_none());
     }
 
     #[test]
     fn test_runtime_with_custom_fallback() {
-        let fallback = FallbackManager::for_model("my-model");
+        let fallback = FallbackManager::for_model("my-model").unwrap();
         let managers = LoopManagers::new().with_fallback(fallback);
         assert_eq!(
-            managers.fallback().active_model().as_deref(),
+            managers.fallback().active_model().unwrap().as_deref(),
             Some("my-model")
         );
     }
@@ -634,7 +639,7 @@ mod tests {
     #[test]
     fn test_reset_all() {
         let managers = LoopManagers::new();
-        managers.reset_all();
+        managers.reset_all().unwrap();
     }
 
     #[test]
@@ -657,16 +662,19 @@ mod tests {
         let managers = LoopManagers::new().with_detection(detection);
         assert_eq!(managers.detection().config().loop_threshold, 7);
         assert_eq!(managers.detection().config().stop_threshold, 20);
-        assert!(managers.fallback().active_model().is_none());
+        assert!(managers.fallback().active_model().unwrap().is_none());
     }
 
     #[test]
     fn test_reset_all_clears_detection() {
         let managers = LoopManagers::new();
-        let _ = managers.detection().record_tool_call("Read", 12345);
-        managers.reset_all();
+        managers
+            .detection()
+            .record_tool_call("Read", 12345)
+            .unwrap();
+        managers.reset_all().unwrap();
         let pattern = managers.detection().record_tool_call("Read", 12345);
-        assert!(matches!(pattern, DetectedPattern::NoPattern));
+        assert!(matches!(pattern, Ok(DetectedPattern::NoPattern)));
     }
 
     #[test]
@@ -791,11 +799,12 @@ mod tests {
     #[test]
     fn test_reset_all_clears_fallback() {
         let managers = LoopManagers::new();
-        let _ = managers
+        managers
             .fallback()
-            .record_failure(crate::fallback::FailureKind::Transient);
-        managers.reset_all();
-        assert!(managers.fallback().active_model().is_none());
+            .record_failure(crate::fallback::FailureKind::Transient)
+            .unwrap();
+        managers.reset_all().unwrap();
+        assert!(managers.fallback().active_model().unwrap().is_none());
     }
 
     #[test]
@@ -813,7 +822,7 @@ mod tests {
         let mut managers = LoopManagers::new();
         managers.register_observer(Arc::new(NopObserver));
         assert_eq!(managers.observers().len(), 1);
-        managers.reset_all();
+        managers.reset_all().unwrap();
         // Observer count persists across reset — reset_all calls
         // reset_all on each observer, it doesn't remove them.
         assert_eq!(managers.observers().len(), 1);

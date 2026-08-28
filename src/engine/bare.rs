@@ -279,6 +279,12 @@ pub struct BareLoop<C: ApiClient> {
     /// room in the next one.
     deferred_transient_tokens: u64,
 
+    /// Sticky detection bypass, set once detection state is found
+    /// poisoned — detection is advisory, so the session continues with
+    /// it skipped rather than failing. Never cleared: poisoned locks do
+    /// not heal.
+    detection_disabled: bool,
+
     /// Per-turn `RequestOptions` applied to every provider call.
     ///
     /// Carries `tool_constraint` (strict/grammar-constrained tool-call
@@ -479,6 +485,7 @@ impl<C: ApiClient> BareLoop<C> {
             contributors: Vec::new(),
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
+            detection_disabled: false,
             request_options: RequestOptions::default(),
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
@@ -701,6 +708,7 @@ impl<C: ApiClient> BareLoop<C> {
             contributors: Vec::new(),
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
+            detection_disabled: false,
             request_options: RequestOptions::default(),
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
@@ -984,12 +992,12 @@ impl<C: ApiClient> BareLoop<C> {
     /// mid-stream, or any streaming / loop-detection error.
     async fn handle_call_llm(&mut self, turn: usize) -> Result<(), LoopError> {
         let fallback = self.managers.fallback();
-        if fallback.should_try_resume_primary(fallback.config().recovery_timeout) {
-            fallback.transition_to_recovering();
+        if fallback.should_try_resume_primary(fallback.config().recovery_timeout)? {
+            fallback.transition_to_recovering()?;
         }
-        if fallback.state() == crate::fallback::FallbackState::Fallback
-            && fallback.active_model().is_none()
-            && !fallback.fallback_models().is_empty()
+        if fallback.state()? == crate::fallback::FallbackState::Fallback
+            && fallback.active_model()?.is_none()
+            && !fallback.fallback_models()?.is_empty()
         {
             return Err(LoopError::FallbackExhausted);
         }
@@ -1020,7 +1028,7 @@ impl<C: ApiClient> BareLoop<C> {
             self.deferred_transient_tokens = self.count_context(&messages);
             return Ok(());
         }
-        self.note_routed_model();
+        self.note_routed_model()?;
 
         self.notify_turn_start(turn, &turn_input);
 
@@ -1067,8 +1075,21 @@ impl<C: ApiClient> BareLoop<C> {
 
         // Only terminal responses feed convergence: an acting turn's
         // preamble is by definition not a converged final answer.
-        let pattern = if tool_calls.is_empty() {
-            self.managers.detection().record_response(&text)
+        let pattern = if tool_calls.is_empty() && !self.detection_disabled {
+            match self.managers.detection().record_response(&text) {
+                Ok(pattern) => pattern,
+                Err(crate::error::LoopError::LockPoisoned { what }) => {
+                    // Detection is advisory: skip it for the rest of the
+                    // session rather than failing the run.
+                    tracing::warn!(
+                        what = %what,
+                        "detection state poisoned; skipping detection for this session"
+                    );
+                    self.detection_disabled = true;
+                    DetectedPattern::NoPattern
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             DetectedPattern::NoPattern
         };
@@ -1428,7 +1449,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             }
 
             if run_config.reset_managers {
-                self.managers.reset_all();
+                self.managers.reset_all()?;
             }
 
             self.session.runs.push(Run::new(input, run_config));

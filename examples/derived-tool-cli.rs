@@ -18,7 +18,7 @@ use loopctl::testing::MockApiClient;
 use loopctl::tool::ToolRegistry;
 use serde::Deserialize;
 
-/// Echo a message back after a fixed number of repeats.
+/// Echo a message back to the caller.
 #[derive(Tool, Deserialize)]
 #[tool(name = "echo", description = "Echo back the provided message")]
 struct EchoInput {

@@ -1398,6 +1398,7 @@ impl Default for ToolContext {
 ///
 /// ```rust,ignore
 /// use loopctl::Tool;
+/// use loopctl::tool::{ToolContext, ToolError, ToolOutput};
 /// use serde::Deserialize;
 ///
 /// /// Echo a message back to the caller.

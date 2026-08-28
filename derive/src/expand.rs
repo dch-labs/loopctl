@@ -1,4 +1,10 @@
 //! The codegen core of `#[derive(Tool)]`.
+//!
+//! Walks the input struct's fields, reads the container and field
+//! attributes (via [`crate::attr`]), and emits the `impl Tool` block:
+//! `name`, `description`, a statically built JSON Schema from the
+//! field types, and a `call` that deserializes and dispatches to the
+//! handler. Errors surface as spanned `syn::Error`s — never panics.
 
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
@@ -6,8 +12,6 @@ use syn::{Data, DeriveInput, Fields, Ident, Type};
 
 use crate::attr::{self, ContainerAttrs};
 
-/// Expand a `#[derive(Tool)]` input into an `impl Tool` block (or a
-/// compile error with a span pointing at the offending part).
 /// Expand a `#[derive(Tool)]` input into an `impl Tool` block.
 ///
 /// # Errors
@@ -75,6 +79,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         .clone()
         .unwrap_or_else(|| to_snake_case(&ident.to_string()));
 
+    let rename_all = attr::serde_rename_all(&input.attrs);
     let mut properties = Vec::<TokenStream2>::new();
     let mut required = Vec::<String>::new();
     for field in fields {
@@ -87,7 +92,14 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             continue;
         }
         let rust_name = field_ident.to_string();
-        let json_name = field_attrs.name.clone().unwrap_or(rust_name);
+        let json_name = field_attrs
+            .name
+            .clone()
+            .or_else(|| attr::serde_rename(&field.attrs))
+            .unwrap_or_else(|| match rename_all {
+                Some(strategy) => strategy.apply(&rust_name),
+                None => rust_name.clone(),
+            });
         let field_doc = field_attrs
             .description
             .clone()
@@ -130,7 +142,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 loopctl::tool::ToolSchema {
                     tool: #tool_name.to_string(),
                     description: #description.to_string(),
-                    input_schema: serde_json::json!({
+                    input_schema: loopctl::__private::serde_json::json!({
                         "type": "object",
                         #additional
                         "properties": { #(#properties),* },
@@ -141,7 +153,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
             fn call(
                 &self,
-                input: serde_json::Value,
+                input: loopctl::__private::serde_json::Value,
                 ctx: &loopctl::tool::ToolContext,
             ) -> std::pin::Pin<
                 std::boxed::Box<
@@ -158,7 +170,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 // `self`'s lifetime alone, so it cannot borrow `ctx`.
                 let ctx = std::clone::Clone::clone(ctx);
                 std::boxed::Box::pin(async move {
-                    let parsed: Self = match serde_json::from_value(input) {
+                    let parsed: Self = match loopctl::__private::serde_json::from_value(input) {
                         Ok(value) => value,
                         Err(err) => {
                             return Err(
@@ -262,9 +274,8 @@ fn type_schema(ty: &Type) -> syn::Result<(TokenStream2, bool)> {
             }
         }
         "bool" => Ok((quote! { "type": "boolean" }, false)),
-        "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "usize" => {
-            Ok((quote! { "type": "integer" }, false))
-        }
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
+        | "usize" => Ok((quote! { "type": "integer" }, false)),
         "f32" | "f64" => Ok((quote! { "type": "number" }, false)),
         "Vec" => {
             let inner = generic_arg(seg)?;
@@ -345,10 +356,14 @@ fn is_option(ty: &Type) -> Option<&Type> {
 fn generic_arg(segment: &syn::PathSegment) -> syn::Result<&Type> {
     match &segment.arguments {
         syn::PathArguments::AngleBracketed(args) => {
-            let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
-                return Err(unmappable_of(segment));
-            };
-            Ok(inner)
+            let inner = args.args.iter().find_map(|arg| {
+                if let syn::GenericArgument::Type(ty) = arg {
+                    Some(ty)
+                } else {
+                    None
+                }
+            });
+            inner.ok_or_else(|| unmappable_of(segment))
         }
         _ => Err(unmappable_of(segment)),
     }
@@ -368,12 +383,18 @@ fn generic_arg(segment: &syn::PathSegment) -> syn::Result<&Type> {
 fn second_generic_arg(segment: &syn::PathSegment) -> syn::Result<&Type> {
     match &segment.arguments {
         syn::PathArguments::AngleBracketed(args) => {
-            let mut iter = args.args.iter();
-            let _key = iter.next();
-            let Some(syn::GenericArgument::Type(inner)) = iter.next() else {
-                return Err(unmappable_of(segment));
-            };
-            Ok(inner)
+            let inner = args
+                .args
+                .iter()
+                .filter_map(|arg| {
+                    if let syn::GenericArgument::Type(ty) = arg {
+                        Some(ty)
+                    } else {
+                        None
+                    }
+                })
+                .nth(1);
+            inner.ok_or_else(|| unmappable_of(segment))
         }
         _ => Err(unmappable_of(segment)),
     }

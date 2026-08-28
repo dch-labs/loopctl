@@ -7,6 +7,37 @@
 //! deserializes the incoming `Value` into the struct and dispatches to
 //! an inherent `async fn run` handler you supply.
 //!
+//! # Attribute Grammar
+//!
+//! On the struct (container attributes):
+//!
+//! ```text
+//! #[tool(
+//!     name = "snake_case_name",       // default: snake_cased struct ident
+//!     description = "one-liner",       // default: struct doc comment
+//!     read_only,                       // override is_read_only() -> true
+//!     concurrency_safe,                // override is_concurrency_safe() -> true
+//!     system_prompt = "extra hint",    // override system_prompt()
+//!     handler = "my_run",              // default: "run"
+//!     allow_extra                      // omit additionalProperties: false
+//! )]
+//! ```
+//!
+//! On each field:
+//!
+//! ```text
+//! #[tool(
+//!     name = "json_key",               // default: Rust field name (or serde's rename)
+//!     description = "field help",      // default: field doc comment
+//!     skip,                            // exclude from schema + required
+//!     default                          // omit from required, keep in properties
+//! )]
+//! ```
+//!
+//! `#[serde(rename = "…")]` and `#[serde(rename_all = "…")]` are
+//! honored for schema naming, mirroring what serde deserializes with;
+//! `#[tool(name = "…")]` takes precedence over both.
+//!
 //! Re-exported from the `loopctl` crate behind its `derive` feature, so
 //! the usual spelling is:
 //!

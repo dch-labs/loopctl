@@ -459,10 +459,6 @@ impl LoopManagers {
         self.memory.as_ref()
     }
 
-    /// # Errors
-    ///
-    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned)
-    /// when the fallback or detection state lock is poisoned.
     /// Reset the fallback, detection, and observer managers to their
     /// initial state.
     ///
@@ -487,6 +483,11 @@ impl LoopManagers {
     /// // Breaker, detection, and observer state are back to initial;
     /// // the optional managers keep theirs
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned)
+    /// when the fallback or detection state lock is poisoned.
     pub fn reset_all(&self) -> Result<(), crate::error::LoopError> {
         self.fallback.reset()?;
         self.detection.reset()?;

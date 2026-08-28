@@ -242,6 +242,18 @@ pub enum LoopError {
     /// Not recoverable: poison does not clear on retry — the only safe
     /// response is to surface the error (and, for a long-running host,
     /// restart the affected subsystem).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::error::LoopError;
+    ///
+    /// let err = LoopError::LockPoisoned {
+    ///     what: "fallback".to_string(),
+    /// };
+    /// assert!(!err.is_recoverable());
+    /// assert!(err.to_string().contains("fallback"));
+    /// ```
     #[error("Lock poisoned: {what}")]
     LockPoisoned {
         /// Which subsystem's lock was poisoned.

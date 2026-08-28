@@ -1431,7 +1431,7 @@ impl FallbackManager {
     /// mgr.record_failure(FailureKind::Transient).unwrap();
     /// mgr.record_failure(FailureKind::Transient).unwrap();
     /// assert_eq!(mgr.consecutive_failures().unwrap(), 2);
-    /// mgr.reset_failure_counter();
+    /// mgr.reset_failure_counter().unwrap();
     /// assert_eq!(mgr.consecutive_failures().unwrap(), 0);
     /// ```
     /// # Errors

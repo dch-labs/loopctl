@@ -681,6 +681,12 @@ impl<C: ApiClient> BareLoop<C> {
     /// pattern at or over the stop threshold. Convergence patterns are
     /// decided on the response path, not here.
     fn pre_detection(&self, turn_idx: usize) -> Result<(), LoopError> {
+        if self
+            .detection_disabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
         let pattern = self.managers.detection().check_loop_pattern();
 
         self.managers.notify_detected_pattern(&pattern, turn_idx);
@@ -714,11 +720,9 @@ impl<C: ApiClient> BareLoop<C> {
             self.managers.detection().record_operation(operation)
         {
             // Detection is advisory: skip it for the rest of the
-            // session rather than failing the run.
-            tracing::warn!(
-                what = %what,
-                "detection state poisoned; skipping detection for this session"
-            );
+            // session rather than failing the run. The first
+            // successful transition warns; later ones are silent.
+            self.disable_detection_once(&what);
         }
     }
 

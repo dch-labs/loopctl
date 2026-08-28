@@ -1024,7 +1024,9 @@ impl DetectionManager {
     /// ));
     ///
     /// for _ in 0..3 {
-    ///     manager.record_operation(Operation::new("Read", "/f.txt"));
+    ///     manager
+    ///         .record_operation(Operation::new("Read", "/f.txt"))
+    ///         .unwrap();
     /// }
     /// assert!(matches!(
     ///     manager.check_loop_pattern(),
@@ -1112,9 +1114,11 @@ impl DetectionManager {
     /// # Thread safety
     ///
     /// The returned `Mutex` guards the detector's mutable state. Callers
-    /// must lock before accessing. If the lock is poisoned (due to a panic
-    /// in another thread), the framework recovers automatically in
-    /// [`Self::record_response`] and [`Self::check_convergence`].
+    /// must lock before accessing. A poisoned lock (a panic in another
+    /// thread while holding it) is not recovered: the facade methods
+    /// [`Self::record_response`] and [`Self::check_convergence`]
+    /// propagate [`LockPoisoned`](crate::error::LoopError::LockPoisoned)
+    /// in that case.
     ///
     /// # When called
     ///

@@ -66,18 +66,21 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
     ///
     /// Performs the following steps in order:
     /// 1. Validates the target model is non-empty.
-    /// 2. Delegates to [`ApiClient::set_model`] on the underlying client.
+    /// 2. Preflights the fallback manager: a poisoned breaker aborts
+    ///    the switch before any state — the client's model included —
+    ///    changes.
+    /// 3. Delegates to [`ApiClient::set_model`] on the underlying client.
     ///    When the client returns `false` (runtime switching unsupported),
     ///    the switch is rejected outright — nothing downstream runs, and
     ///    the effective model, the breaker, and the observers are left
     ///    untouched. Proceeding would re-point the fallback manager at a
     ///    model the client never adopted, and the per-request model
     ///    override would then serve it anyway.
-    /// 3. Updates the session context window.
-    /// 4. Resets the [`FallbackManager`](crate::fallback::FallbackManager)
+    /// 4. Updates the session context window.
+    /// 5. Resets the [`FallbackManager`](crate::fallback::FallbackManager)
     ///    circuit breaker to `Primary` and updates the original-model
     ///    tracker to the new model.
-    /// 5. Fires [`on_model_switched`](crate::observer::LoopObserver::on_model_switched).
+    /// 6. Fires [`on_model_switched`](crate::observer::LoopObserver::on_model_switched).
     ///
     /// # Errors
     ///
@@ -98,6 +101,9 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
             ));
         }
 
+        // Poison preflight: a poisoned breaker must abort the switch
+        // before any state — the client's model included — changes.
+        loop_.managers.fallback().state()?;
         let from = loop_.client.model();
         if !loop_.client.set_model(trimmed) {
             return Err(LoopError::Config(format!(

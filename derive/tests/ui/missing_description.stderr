@@ -1,0 +1,5 @@
+error: `NoDocs` has no description: set `#[tool(description = "…")]` or add a `///` doc comment
+ --> tests/ui/missing_description.rs:5:8
+  |
+5 | struct NoDocs {
+  |        ^^^^^^

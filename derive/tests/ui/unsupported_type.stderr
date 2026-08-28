@@ -1,0 +1,7 @@
+error: the derive cannot map `(String, i32)` to a JSON Schema type; implement `Tool` manually or use `#[tool(skip)]`
+ --> tests/ui/unsupported_type.rs:5:10
+  |
+5 | #[derive(Tool, Deserialize)]
+  |          ^^^^
+  |
+  = note: this error originates in the derive macro `Tool` (in Nightly builds, run with -Z macro-backtrace for more info)

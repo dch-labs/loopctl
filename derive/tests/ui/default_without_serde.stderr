@@ -1,0 +1,5 @@
+error: `#[tool(default)]` on a non-`Option` field also needs `#[serde(default)]` — without it the schema says optional but deserialization still fails when the model omits the field.
+  --> tests/ui/default_without_serde.rs:10:5
+   |
+10 |     b: u32,
+   |     ^

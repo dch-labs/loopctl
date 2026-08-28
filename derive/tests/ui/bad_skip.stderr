@@ -1,0 +1,5 @@
+error: `#[tool(skip)]` requires the field to be `Option<T>` or carry `#[serde(default)]` so deserialization succeeds when the property is absent
+ --> tests/ui/bad_skip.rs:9:5
+  |
+9 |     b: String,
+  |     ^

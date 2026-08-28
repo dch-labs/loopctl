@@ -65,6 +65,22 @@
     )
 )]
 
+pub use tool::Tool;
+
+/// Re-export for `#[derive(Tool)]`-generated code, so downstream
+/// crates do not need a direct `serde_json` dependency.
+///
+/// Not part of the stable API surface; used only by the code the
+/// derive macro emits.
+#[cfg(feature = "derive")]
+#[doc(hidden)]
+pub mod __private {
+    pub use serde_json;
+}
+
+#[cfg(feature = "derive")]
+pub use loopctl_derive::Tool;
+
 pub mod api;
 pub mod cancel;
 pub mod capabilities;

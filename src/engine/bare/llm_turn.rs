@@ -74,9 +74,12 @@ impl<C: ApiClient> BareLoop<C> {
     /// whose primary differs from the client's own model silently
     /// reroutes every request to the primary — configure the manager
     /// for the model the client actually serves.
-    pub(super) fn routed_model(&self) -> Option<String> {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.
+    pub(super) fn routed_model(&self) -> Result<Option<String>, LoopError> {
         let manager = self.managers.fallback();
-        match manager.state() {
+        match manager.state()? {
             crate::fallback::FallbackState::Primary => manager.original_model(),
             _ => manager.active_model(),
         }
@@ -87,12 +90,15 @@ impl<C: ApiClient> BareLoop<C> {
     /// Applies [`routed_model`](Self::routed_model) as the per-request
     /// model override; anything the host set on `request_options` passes
     /// through untouched when no manager is configured.
-    fn turn_request_options(&self) -> crate::structured::RequestOptions {
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.
+    fn turn_request_options(&self) -> Result<crate::structured::RequestOptions, LoopError> {
         let mut options = self.request_options.clone();
-        if let Some(model) = self.routed_model() {
+        if let Some(model) = self.routed_model()? {
             options.model = Some(model);
         }
-        options
+        Ok(options)
     }
 
     /// Fire [`on_model_switched`] when the routed model changed since the
@@ -101,8 +107,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// One mechanical signal for every cause of a model change — trip,
     /// chain advance, recovery — instead of observers piecing it together
     /// from breaker callbacks. No-op while no manager routes models.
-    pub(super) fn note_routed_model(&mut self) {
-        let served = self.routed_or_client_model();
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.
+    pub(super) fn note_routed_model(&mut self) -> Result<(), LoopError> {
+        let served = self.routed_or_client_model()?;
         if self
             .last_routed_model
             .as_ref()
@@ -117,6 +126,7 @@ impl<C: ApiClient> BareLoop<C> {
                 });
         }
         self.last_routed_model = Some(served);
+        Ok(())
     }
 
     /// Dispatch one LLM turn according to [`turn_mode`](BareLoop::turn_mode).
@@ -168,7 +178,7 @@ impl<C: ApiClient> BareLoop<C> {
         let request = self.build_turn_request(messages);
         let cancel = std::sync::Arc::clone(&self.cancelled);
         let client = &self.client;
-        let options = self.turn_request_options();
+        let options = self.turn_request_options()?;
         let timeout = self.turn_timeout();
         let result = tokio::select! {
             biased;
@@ -186,7 +196,7 @@ impl<C: ApiClient> BareLoop<C> {
         };
         match result {
             Ok(response) => {
-                self.record_turn_success(turn, response.usage.as_ref());
+                self.record_turn_success(turn, response.usage.as_ref())?;
                 Ok((response.message, response.usage, response.stop_reason))
             }
             Err(e) => Err(self.record_turn_failure(turn, e)),
@@ -210,7 +220,7 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
         match self.stream_turn(messages).await {
             Ok((msg, usage, stop)) => {
-                self.record_turn_success(turn, usage.as_ref());
+                self.record_turn_success(turn, usage.as_ref())?;
                 Ok((msg, usage, stop))
             }
             Err(e) => Err(self.record_turn_failure(turn, e)),
@@ -237,7 +247,7 @@ impl<C: ApiClient> BareLoop<C> {
         let mut stream = handler.stream_turn(
             &*self.client,
             &request,
-            self.turn_request_options(),
+            self.turn_request_options()?,
             &self.cancelled,
         );
 
@@ -390,6 +400,9 @@ impl<C: ApiClient> BareLoop<C> {
     pub(super) fn map_handler_error(error: StreamHandlerError) -> LoopError {
         match error {
             StreamHandlerError::Cancelled => LoopError::Cancelled,
+            StreamHandlerError::Poisoned(what) => LoopError::LockPoisoned {
+                what: what.to_string(),
+            },
             StreamHandlerError::InitFailed(outcome) => {
                 LoopError::Api(format!("stream failed before completing: {outcome}"))
             }

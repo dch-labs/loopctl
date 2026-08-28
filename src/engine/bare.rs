@@ -279,6 +279,14 @@ pub struct BareLoop<C: ApiClient> {
     /// room in the next one.
     deferred_transient_tokens: u64,
 
+    /// Sticky detection bypass, set once detection state is found
+    /// poisoned — detection is advisory, so the session continues with
+    /// it skipped rather than failing. Atomic so the `&self` tool-path
+    /// consults can set it too; the first successful `false → true`
+    /// transition warns, later attempts are silent. Never cleared:
+    /// poisoned locks do not heal.
+    detection_disabled: std::sync::atomic::AtomicBool,
+
     /// Per-turn `RequestOptions` applied to every provider call.
     ///
     /// Carries `tool_constraint` (strict/grammar-constrained tool-call
@@ -479,6 +487,7 @@ impl<C: ApiClient> BareLoop<C> {
             contributors: Vec::new(),
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
+            detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
@@ -701,6 +710,7 @@ impl<C: ApiClient> BareLoop<C> {
             contributors: Vec::new(),
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
+            detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
@@ -950,6 +960,26 @@ impl<C: ApiClient> BareLoop<C> {
 }
 
 impl<C: ApiClient> BareLoop<C> {
+    /// Mark detection disabled for the session, warning only on the
+    /// first successful transition.
+    fn disable_detection_once(&self, what: &str) {
+        if self
+            .detection_disabled
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            tracing::warn!(
+                what = %what,
+                "detection state poisoned; skipping detection for this session"
+            );
+        }
+    }
+
     /// Collect transient contributor messages for the current turn.
     ///
     /// Each registered [`ContextContributor`] is consulted against the
@@ -984,12 +1014,12 @@ impl<C: ApiClient> BareLoop<C> {
     /// mid-stream, or any streaming / loop-detection error.
     async fn handle_call_llm(&mut self, turn: usize) -> Result<(), LoopError> {
         let fallback = self.managers.fallback();
-        if fallback.should_try_resume_primary(fallback.config().recovery_timeout) {
-            fallback.transition_to_recovering();
+        if fallback.should_try_resume_primary(fallback.config().recovery_timeout)? {
+            fallback.transition_to_recovering()?;
         }
-        if fallback.state() == crate::fallback::FallbackState::Fallback
-            && fallback.active_model().is_none()
-            && !fallback.fallback_models().is_empty()
+        if fallback.state()? == crate::fallback::FallbackState::Fallback
+            && fallback.active_model()?.is_none()
+            && !fallback.fallback_models()?.is_empty()
         {
             return Err(LoopError::FallbackExhausted);
         }
@@ -1020,7 +1050,7 @@ impl<C: ApiClient> BareLoop<C> {
             self.deferred_transient_tokens = self.count_context(&messages);
             return Ok(());
         }
-        self.note_routed_model();
+        self.note_routed_model()?;
 
         self.notify_turn_start(turn, &turn_input);
 
@@ -1067,8 +1097,21 @@ impl<C: ApiClient> BareLoop<C> {
 
         // Only terminal responses feed convergence: an acting turn's
         // preamble is by definition not a converged final answer.
-        let pattern = if tool_calls.is_empty() {
-            self.managers.detection().record_response(&text)
+        let pattern = if tool_calls.is_empty()
+            && !self
+                .detection_disabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            match self.managers.detection().record_response(&text) {
+                Ok(pattern) => pattern,
+                Err(crate::error::LoopError::LockPoisoned { what }) => {
+                    // Detection is advisory: skip it for the rest of the
+                    // session rather than failing the run.
+                    self.disable_detection_once(&what);
+                    DetectedPattern::NoPattern
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             DetectedPattern::NoPattern
         };
@@ -1428,7 +1471,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             }
 
             if run_config.reset_managers {
-                self.managers.reset_all();
+                self.managers.reset_all()?;
             }
 
             self.session.runs.push(Run::new(input, run_config));

@@ -25,6 +25,21 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Outcome of a rate-limit acquisition attempt.
+///
+/// Splits the two ways a token take can fail: the healthy wait path
+/// (no token yet — retry after [`Wait`](Self::Wait) elapses) and the
+/// poisoned-bucket path (the mutex protecting the token count was
+/// poisoned; the count is not trustworthy and pacing must stop).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RateLimitError {
+    /// The caller must wait this long before retrying.
+    Wait(Duration),
+    /// The bucket's mutex was poisoned; the token count is not trustworthy.
+    Poisoned,
+}
+
 /// A continuous-fill token bucket: the standard client-side rate-limiting algorithm.
 ///
 /// - **Capacity** = max burst size.
@@ -113,22 +128,22 @@ impl TokenBucket {
     ///
     /// # Errors
     ///
-    /// Returns `Err(wait)` with the [`Duration`] until one token will have
-    /// refilled when no token is currently available.
-    pub fn take_at(&self, at: Instant) -> Result<(), Duration> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// Returns [`Err(RateLimitError::Wait(d))`](RateLimitError::Wait)
+    /// with the [`Duration`] until one token will have refilled when no
+    /// token is currently available, or
+    /// [`Err(RateLimitError::Poisoned)`](RateLimitError::Poisoned) when
+    /// the bucket's mutex is poisoned.
+    pub fn take_at(&self, at: Instant) -> Result<(), RateLimitError> {
+        let mut state = self.state.lock().map_err(|_| RateLimitError::Poisoned)?;
         let refill = elapsed_refill(&mut state, at, self.capacity, self.refill_per_sec);
         if refill >= 1.0 {
             state.tokens = refill - 1.0;
             Ok(())
         } else if self.refill_per_sec <= 0.0 {
-            Err(Duration::MAX)
+            Err(RateLimitError::Wait(Duration::MAX))
         } else {
             let wait_secs = (1.0 - refill) / self.refill_per_sec;
-            Err(Duration::from_secs_f64(wait_secs))
+            Err(RateLimitError::Wait(Duration::from_secs_f64(wait_secs)))
         }
     }
 
@@ -136,9 +151,9 @@ impl TokenBucket {
     ///
     /// # Errors
     ///
-    /// Returns `Err(wait)` when no token is currently available; see
+    /// Returns the [`RateLimitError`] `take_at` would; see
     /// [`take_at`](Self::take_at).
-    pub fn take(&self) -> Result<(), Duration> {
+    pub fn take(&self) -> Result<(), RateLimitError> {
         self.take_at(Instant::now())
     }
 
@@ -149,16 +164,30 @@ impl TokenBucket {
     /// `last_refill` advances only to the fill instant (the moment capacity
     /// was hit), not to `at` — the excess time beyond capacity is irrelevant
     /// and is discarded so a far-future `at` cannot freeze the refill clock.
-    pub fn available_at(&self, at: Instant) -> f64 {
+    /// # Errors
+    ///
+    /// Returns [`crate::error::LoopError::LockPoisoned`] when the bucket's mutex is
+    /// poisoned — the token count is not trustworthy.
+    pub fn available_at(&self, at: Instant) -> Result<f64, crate::error::LoopError> {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        elapsed_refill(&mut state, at, self.capacity, self.refill_per_sec)
+            .map_err(crate::error::from_poison("rate_limit_bucket"))?;
+        Ok(elapsed_refill(
+            &mut state,
+            at,
+            self.capacity,
+            self.refill_per_sec,
+        ))
     }
 
     /// Tokens available right now (after a lazy refill).
-    pub fn available(&self) -> f64 {
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::error::LoopError::LockPoisoned`] from
+    /// [`available_at`](Self::available_at).
+    pub fn available(&self) -> Result<f64, crate::error::LoopError> {
         self.available_at(Instant::now())
     }
 }
@@ -251,17 +280,17 @@ impl RateLimiter {
     ///
     /// # Errors
     ///
-    /// Returns `Err(wait)` with the [`Duration`] until one token will have
-    /// refilled when no token is currently available for `base_url`.
-    pub fn acquire(&self, base_url: &str) -> Result<(), Duration> {
+    /// Returns the bucket's [`RateLimitError`] — `Wait` with the
+    /// [`Duration`] until one token will have refilled, or `Poisoned`
+    /// when the bucket's mutex is poisoned.
+    pub fn acquire(&self, base_url: &str) -> Result<(), RateLimitError> {
         if self.requests_per_minute == 0 {
             return Ok(());
         }
         let bucket = {
-            let mut map = self
-                .buckets
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The bucket map is single-operation data: recovery on
+            // poison is safe here (contrast the bucket state itself).
+            let mut map = crate::error::recover_guard(self.buckets.lock());
             Arc::clone(
                 map.entry(base_url.to_owned())
                     .or_insert_with(|| Arc::new(TokenBucket::new(self.requests_per_minute))),
@@ -283,6 +312,71 @@ impl RateLimiter {
 
 #[cfg(test)]
 mod tests {
+    fn poison(bucket: &std::sync::Arc<TokenBucket>) {
+        let bucket = std::sync::Arc::clone(bucket);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = bucket.state.lock().expect("lock before poison");
+                panic!("poison the bucket");
+            })
+            .join()
+            .is_err(),
+            "the poisoning thread must panic"
+        );
+    }
+
+    #[test]
+    fn take_at_returns_poisoned_after_poison() {
+        let bucket = std::sync::Arc::new(TokenBucket::new(5));
+        poison(&bucket);
+        assert_eq!(
+            bucket.take_at(Instant::now()),
+            Err(RateLimitError::Poisoned)
+        );
+    }
+
+    #[test]
+    fn take_at_wait_path_unchanged() {
+        let bucket = TokenBucket::new(1);
+        assert!(bucket.take_at(Instant::now()).is_ok());
+        match bucket.take_at(Instant::now()) {
+            Err(RateLimitError::Wait(d)) => assert!(!d.is_zero()),
+            other => panic!("an empty bucket waits, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn available_at_propagates_poison() {
+        let bucket = std::sync::Arc::new(TokenBucket::new(5));
+        poison(&bucket);
+        match bucket.available_at(Instant::now()) {
+            Err(crate::error::LoopError::LockPoisoned { what }) => {
+                assert_eq!(what, "rate_limit_bucket");
+            }
+            other => panic!("bucket poison must propagate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acquire_poisons_map_to_poisoned() {
+        let limiter = RateLimiter::new(60);
+        assert!(limiter.acquire("https://x").is_ok());
+        let bucket = {
+            let map = crate::error::recover_guard(limiter.buckets.lock());
+            std::sync::Arc::clone(map.get("https://x").expect("bucket created"))
+        };
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = bucket.state.lock().expect("lock before poison");
+                panic!("poison the bucket");
+            })
+            .join()
+            .is_err(),
+            "the poisoning thread must panic"
+        );
+        assert_eq!(limiter.acquire("https://x"), Err(RateLimitError::Poisoned));
+    }
+
     use super::*;
 
     #[test]
@@ -299,7 +393,10 @@ mod tests {
             .expect_err("sixth take should wait for a refill");
         // refill_per_sec = 5/60 ≈ 0.0833, so one token takes ≈ 12s.
         assert!(
-            wait >= Duration::from_secs(10) && wait <= Duration::from_secs(14),
+            matches!(
+                wait,
+                RateLimitError::Wait(d) if d >= Duration::from_secs(10) && d <= Duration::from_secs(14)
+            ),
             "expected ~12s wait, got {wait:?}"
         );
     }
@@ -312,10 +409,13 @@ mod tests {
         for _ in 0..5 {
             bucket.take_at(t0).expect("drain should succeed while full");
         }
-        assert!(bucket.available_at(t0) < 1.0, "bucket should be drained");
+        assert!(
+            bucket.available_at(t0).unwrap() < 1.0,
+            "bucket should be drained"
+        );
         // After 60s it should be back at capacity.
         let t1 = t0 + Duration::from_mins(1);
-        let available = bucket.available_at(t1);
+        let available = bucket.available_at(t1).unwrap();
         assert!(
             (available - 5.0).abs() < 0.5,
             "expected ~5.0 after 60s idle, got {available}"
@@ -332,7 +432,7 @@ mod tests {
         }
         // Advance 6s: refill = 6 * (10/60) = 1.0 token.
         let t1 = t0 + Duration::from_secs(6);
-        let available = bucket.available_at(t1);
+        let available = bucket.available_at(t1).unwrap();
         assert!(
             (available - 1.0).abs() < 0.1,
             "expected ~1.0 after 6s, got {available}"
@@ -343,8 +443,8 @@ mod tests {
     fn available_is_non_consuming() {
         let bucket = TokenBucket::new(5);
         let now = Instant::now();
-        let a = bucket.available_at(now);
-        let b = bucket.available_at(now);
+        let a = bucket.available_at(now).unwrap();
+        let b = bucket.available_at(now).unwrap();
         assert!(
             (a - b).abs() < f64::EPSILON,
             "available must be non-consuming"
@@ -353,7 +453,7 @@ mod tests {
         bucket
             .take_at(now)
             .expect("take should succeed on a full bucket");
-        let c = bucket.available_at(now);
+        let c = bucket.available_at(now).unwrap();
         assert!(c < a, "take must decrement available");
     }
 

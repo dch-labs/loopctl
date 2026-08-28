@@ -253,16 +253,26 @@ impl<C: ApiClient> BareLoop<C> {
     /// and a failure may advance the chain, and the observer context
     /// should name the model that was serving, not the one that serves
     /// next.
-    pub(super) fn routed_or_client_model(&self) -> String {
-        self.routed_model().unwrap_or_else(|| self.client.model())
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.
+    pub(super) fn routed_or_client_model(&self) -> Result<String, LoopError> {
+        Ok(self.routed_model()?.unwrap_or_else(|| self.client.model()))
     }
 
     /// Record a successful LLM turn: tells the fallback manager the model is
     /// healthy and fires
     /// [`on_stream_success`](crate::observer::LoopObserver::on_stream_success).
-    pub(super) fn record_turn_success(&mut self, turn: usize, usage: Option<&Usage>) {
-        let served = self.routed_or_client_model();
-        self.managers.fallback().record_success();
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.
+    pub(super) fn record_turn_success(
+        &mut self,
+        turn: usize,
+        usage: Option<&Usage>,
+    ) -> Result<(), LoopError> {
+        let served = self.routed_or_client_model()?;
+        self.managers.fallback().record_success()?;
         let (in_tok, out_tok) = Self::usage_tokens(usage);
         self.managers.observers().on_stream_success(&StreamContext {
             turn,
@@ -270,6 +280,7 @@ impl<C: ApiClient> BareLoop<C> {
             input_tokens: in_tok,
             output_tokens: out_tok,
         });
+        Ok(())
     }
 
     /// Record an LLM-turn failure and return the error to propagate.
@@ -281,13 +292,35 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`on_fallback`](crate::observer::LoopObserver::on_fallback). Always fires
     /// [`on_stream_failure`](crate::observer::LoopObserver::on_stream_failure)
     /// (except for the cancel short-circuit) and returns the original error.
+    /// # Errors
+    ///
+    /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.
     pub(super) fn record_turn_failure(&mut self, turn: usize, e: LoopError) -> LoopError {
         if matches!(e, LoopError::Cancelled) {
             return e;
         }
-        let served = self.routed_or_client_model();
+        // A poisoned breaker while recording a failure is the more
+        // severe condition — surface it instead of the original error.
+        self.record_turn_failure_inner(turn, e)
+            .unwrap_or_else(|poison| poison)
+    }
+
+    /// The `?`-propagating body of [`record_turn_failure`](Self::record_turn_failure):
+    /// `Ok` carries the error to propagate (the original, normally);
+    /// `Err` carries a poison that supersedes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original error (`Ok`) or a poison that supersedes it
+    /// (`Err`).
+    fn record_turn_failure_inner(
+        &mut self,
+        turn: usize,
+        e: LoopError,
+    ) -> Result<LoopError, LoopError> {
+        let served = self.routed_or_client_model()?;
         let was_in_fallback =
-            self.managers.fallback().state() == crate::fallback::FallbackState::Fallback;
+            self.managers.fallback().state()? == crate::fallback::FallbackState::Fallback;
         let tripped = if matches!(e, LoopError::RateLimitEscalation { .. }) {
             self.managers
                 .fallback()
@@ -296,9 +329,9 @@ impl<C: ApiClient> BareLoop<C> {
             self.managers
                 .fallback()
                 .record_failure(crate::fallback::FailureKind::Transient)
-        };
+        }?;
 
-        if tripped && let Some(to) = self.managers.fallback().fallback_model() {
+        if tripped && let Some(to) = self.managers.fallback().fallback_model()? {
             tracing::warn!(from = %served, to = %to, "fallback manager tripped");
             self.managers.observers().on_fallback(&FallbackContext {
                 from: served.clone(),
@@ -306,8 +339,8 @@ impl<C: ApiClient> BareLoop<C> {
             });
         }
 
-        if was_in_fallback && let Some(active) = self.managers.fallback().fallback_model() {
-            self.managers.fallback().mark_fallback_failed(&active);
+        if was_in_fallback && let Some(active) = self.managers.fallback().fallback_model()? {
+            self.managers.fallback().mark_fallback_failed(&active)?;
         }
 
         self.managers
@@ -318,7 +351,7 @@ impl<C: ApiClient> BareLoop<C> {
                 error: e.clone(),
             });
 
-        e
+        Ok(e)
     }
 
     /// Pull per-turn `(input_tokens, output_tokens)` from optional [`Usage`].

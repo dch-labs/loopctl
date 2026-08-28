@@ -64,6 +64,10 @@
 /// - [`ContextExceeded`](LoopError::ContextExceeded) — Token usage
 ///   overflowed the model's context window and compaction could not
 ///   recover.
+/// - [`LockPoisoned`](LoopError::LockPoisoned) — A mutex protecting a
+///   multi-field state machine (fallback, detection, rate limiting) was
+///   found poisoned; the state may be desynchronised and must not be
+///   used.
 /// - [`PhaseFailed`](LoopError::PhaseFailed) — A named pipeline
 ///   phase (e.g. "reflection", "compaction") failed.
 /// - [`Memory`](LoopError::Memory) — A memory
@@ -225,6 +229,44 @@ pub enum LoopError {
         /// because compaction could not reduce the conversation. Pair
         /// with `used` to report utilization to the caller.
         limit: u64,
+    },
+
+    /// A mutex protecting multi-field state with cross-field invariants
+    /// was found poisoned on lock acquisition.
+    ///
+    /// Returned by the detection, fallback, and rate-limit subsystems
+    /// when a panic left their protected state machine potentially
+    /// desynchronised. The caller must not continue as if the state
+    /// were consistent.
+    ///
+    /// Not recoverable: poison does not clear on retry — the only safe
+    /// response is to surface the error (and, for a long-running host,
+    /// restart the affected subsystem).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::error::LoopError;
+    ///
+    /// let err = LoopError::LockPoisoned {
+    ///     what: "fallback".to_string(),
+    /// };
+    /// assert!(!err.is_recoverable());
+    /// assert!(err.to_string().contains("fallback"));
+    /// ```
+    #[error("Lock poisoned: {what}")]
+    LockPoisoned {
+        /// Which subsystem's lock was poisoned.
+        ///
+        /// One of a closed set of labels — `"fallback"`,
+        /// `"convergence_detector"`, `"detection_stats"`,
+        /// `"rate_limit_bucket"` — produced by
+        /// [`from_poison`] at every
+        /// construction site. Match or log it to identify which state
+        /// machine is unusable. A `String` rather than `&'static str`
+        /// so the enum round-trips through serde for machine
+        /// checkpointing.
+        what: String,
     },
 
     /// A phase in the execution pipeline failed.
@@ -581,8 +623,24 @@ impl LoopError {
 ///   agree (e.g. a state machine with `state` + `failures` +
 ///   `last_failure`). A panic between field updates desynchronises the
 ///   struct; recovering silently continues with inconsistent state.
-pub(crate) fn recover_guard<T>(result: std::sync::LockResult<T>) -> T {
+///   These propagate instead — see
+///   [`LockPoisoned`](LoopError::LockPoisoned) and
+///   [`from_poison`].
+pub fn recover_guard<T>(result: std::sync::LockResult<T>) -> T {
     result.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Map any lock-poison error to [`LoopError::LockPoisoned`] with the
+/// given subsystem label — the propagation half of the poison policy,
+/// for mutexes protecting multi-field state
+/// (contrast [`recover_guard`], the recovery half for single-operation
+/// data).
+///
+/// Used as `self.state.lock().map_err(from_poison("fallback"))?`.
+pub fn from_poison<E>(what: &'static str) -> impl FnOnce(E) -> LoopError {
+    move |_| LoopError::LockPoisoned {
+        what: what.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -697,6 +755,39 @@ mod tests {
         let mutex = std::sync::Mutex::new(42);
         let guard = recover_guard(mutex.lock());
         assert_eq!(*guard, 42);
+    }
+
+    #[test]
+    fn lock_poisoned_is_not_recoverable() {
+        let err = LoopError::LockPoisoned {
+            what: "fallback".to_string(),
+        };
+        assert!(!err.is_recoverable(), "poison does not clear on retry");
+    }
+
+    #[test]
+    fn lock_poisoned_display_names_subsystem() {
+        let err = LoopError::LockPoisoned {
+            what: "convergence_detector".to_string(),
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("convergence_detector"),
+            "the subsystem label reaches the operator: {text}"
+        );
+    }
+
+    #[test]
+    fn from_poison_maps_to_lock_poisoned() {
+        let mapped = crate::error::from_poison::<std::sync::PoisonError<()>>("rate_limit_bucket")(
+            std::sync::PoisonError::new(()),
+        );
+        assert_eq!(
+            mapped,
+            LoopError::LockPoisoned {
+                what: "rate_limit_bucket".to_string()
+            }
+        );
     }
 
     #[test]

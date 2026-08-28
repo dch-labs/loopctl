@@ -147,8 +147,10 @@ fn make_agent(client: ScriptedClient, manager: FallbackManager) -> BareLoop<Scri
 #[tokio::test]
 async fn tripped_breaker_routes_subsequent_requests_to_fallback_model() {
     let manager = FallbackManager::new(1, 1);
-    manager.set_original_model("primary-model".to_string());
-    manager.set_fallback_model("fallback-model");
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-model").unwrap();
 
     let client = ScriptedClient::new(vec![Step::AuthFail, Step::Text("recovered".into())]);
     let requests = Arc::clone(&client.requests);
@@ -190,8 +192,10 @@ async fn recovery_probe_returns_to_primary() {
         ..loopctl::fallback::FallbackConfig::default()
     };
     let manager = FallbackManager::new_with_config(config);
-    manager.set_original_model("primary-model".to_string());
-    manager.set_fallback_model("fallback-model");
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-model").unwrap();
 
     let client = ScriptedClient::new(vec![
         Step::AuthFail,
@@ -227,9 +231,11 @@ async fn recovery_probe_returns_to_primary() {
 #[tokio::test]
 async fn failure_while_on_fallback_advances_the_chain() {
     let manager = FallbackManager::new(1, 1);
-    manager.set_original_model("primary-model".to_string());
-    manager.set_fallback_model("fallback-1");
-    manager.add_fallback_model("fallback-2");
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-1").unwrap();
+    manager.add_fallback_model("fallback-2").unwrap();
 
     // fallback-1 needs max_fail_count (2) failing turns before the chain
     // advances, so the script fails twice on it before fallback-2 serves.
@@ -287,8 +293,10 @@ async fn model_switch_observer_fires_on_trip_and_recovery() {
         ..loopctl::fallback::FallbackConfig::default()
     };
     let manager = FallbackManager::new_with_config(config);
-    manager.set_original_model("primary-model".to_string());
-    manager.set_fallback_model("fallback-model");
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-model").unwrap();
 
     let client = ScriptedClient::new(vec![
         Step::AuthFail,
@@ -326,8 +334,10 @@ async fn host_model_override_yields_to_the_configured_chain() {
         ..loopctl::fallback::FallbackConfig::default()
     };
     let manager = FallbackManager::new_with_config(config);
-    manager.set_original_model("primary-model".to_string());
-    manager.set_fallback_model("fallback-1");
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-1").unwrap();
 
     let client = ScriptedClient::new(vec![
         Step::Text("served by the primary".into()),
@@ -406,8 +416,10 @@ async fn stream_observers_report_the_model_that_served_the_turn() {
         ..loopctl::fallback::FallbackConfig::default()
     };
     let manager = FallbackManager::new_with_config(config);
-    manager.set_original_model("primary-model".to_string());
-    manager.set_fallback_model("fallback-1");
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-1").unwrap();
 
     let client = ScriptedClient::new(vec![
         Step::AuthFail,
@@ -442,9 +454,11 @@ async fn stream_observers_report_the_model_that_served_the_turn() {
 #[tokio::test]
 async fn exhausted_chain_fails_the_turn_instead_of_serving_the_primary() {
     let manager = FallbackManager::new(1, 2);
-    manager.set_original_model("primary-model".to_string());
-    manager.set_fallback_model("fallback-1");
-    manager.add_fallback_model("fallback-2");
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-1").unwrap();
+    manager.add_fallback_model("fallback-2").unwrap();
 
     // Trip on the primary, then two failing turns each on fallback-1 and
     // fallback-2 to exhaust them.
@@ -490,8 +504,10 @@ async fn exhausted_chain_recovers_to_primary_after_cooldown() {
         ..loopctl::fallback::FallbackConfig::default()
     };
     let manager = FallbackManager::new_with_config(config);
-    manager.set_original_model("primary-model".to_string());
-    manager.set_fallback_model("fallback-1");
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-1").unwrap();
 
     let client = ScriptedClient::new(vec![
         Step::AuthFail,
@@ -550,8 +566,10 @@ async fn probe_failure_retrips_to_the_fallback_model() {
         ..loopctl::fallback::FallbackConfig::default()
     };
     let manager = FallbackManager::new_with_config(config);
-    manager.set_original_model("primary-model".to_string());
-    manager.set_fallback_model("fallback-model");
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-model").unwrap();
 
     // The retrip arm fires on a rate-limit escalation, which only the
     // escalation-armed handler produces (fallback_after_retries = 0) — the

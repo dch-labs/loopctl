@@ -37,6 +37,7 @@ use crate::api::ApiClient;
 use crate::api::error::{ApiError, http_status_from_message, parse_retry_after};
 use crate::cancel::CancelSignal;
 use crate::message::Message;
+use crate::stream::rate_limit;
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
 use futures::StreamExt;
 use futures::stream::Stream;
@@ -1300,6 +1301,13 @@ pub enum StreamHandlerError {
     /// before the stream completed. Partial data may be available.
     Cancelled,
 
+    /// A mutex protecting pacing or routing state was found poisoned.
+    ///
+    /// Carries the subsystem label (e.g. `"rate_limit"`). Pacing or
+    /// routing decisions cannot be made safely from desynchronised
+    /// state; the caller must surface this rather than continue.
+    Poisoned(&'static str),
+
     /// Rate-limit retries on the current model were exhausted.
     ///
     /// The handler honored the provider's `Retry-After` up to the configured
@@ -1343,6 +1351,7 @@ impl fmt::Display for StreamHandlerError {
                 )
             }
             Self::Cancelled => write!(f, "cancelled"),
+            Self::Poisoned(what) => write!(f, "lock poisoned: {what}"),
             Self::RateLimitEscalation {
                 attempts,
                 retry_after,
@@ -2180,7 +2189,11 @@ impl StreamHandler {
         loop {
             match limiter.acquire(&key) {
                 Ok(()) => return Ok(()),
-                Err(wait) => {
+                Err(rate_limit::RateLimitError::Poisoned) => {
+                    tracing::warn!("rate-limit bucket poisoned; pacing unavailable");
+                    return Err(StreamHandlerError::Poisoned("rate_limit"));
+                }
+                Err(rate_limit::RateLimitError::Wait(wait)) => {
                     if waited >= max_wait {
                         return Ok(());
                     }

@@ -65,6 +65,11 @@
     )
 )]
 
+pub use tool::Tool;
+
+#[cfg(feature = "derive")]
+pub use loopctl_derive::Tool;
+
 pub mod api;
 pub mod cancel;
 pub mod capabilities;

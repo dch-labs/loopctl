@@ -1,0 +1,5 @@
+error: `Tool` cannot be derived for generic structs; implement it manually
+ --> tests/ui/generic_struct.rs:5:8
+  |
+5 | struct Generic<T> {
+  |        ^^^^^^^

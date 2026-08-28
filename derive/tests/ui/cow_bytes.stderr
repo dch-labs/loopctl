@@ -1,0 +1,5 @@
+error: the derive cannot map this type's generic arguments
+ --> tests/ui/cow_bytes.rs:7:24
+  |
+7 |     blob: std::borrow::Cow<'static, [u8]>,
+  |                        ^^^

@@ -142,6 +142,7 @@ let agent = BareLoop::new(
 
 | Feature | Default | Depends on | Description |
 |---------|---------|------------|-------------|
+| `derive` | No | — | Re-exports `loopctl-derive`: `#[derive(Tool)]` generates the `Tool` impl (name, description, schema, dispatch) from a `Deserialize` input struct |
 | `hooks` | No | — | Bidirectional lifecycle hooks (allow/block/ask before tool use, compaction) |
 | `testing` | No | — | Mock clients, tools, and test fixtures |
 | `tool_health` | No | — | Per-tool health monitoring, circuit breakers, and self-healing routing |

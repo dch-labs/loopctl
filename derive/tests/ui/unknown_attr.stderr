@@ -1,0 +1,5 @@
+error: unknown `tool` attribute; expected one of: name, description, read_only, concurrency_safe, system_prompt, handler, allow_extra
+ --> tests/ui/unknown_attr.rs:6:27
+  |
+6 | #[tool(description = "x", totally_made_up = 1)]
+  |                           ^^^^^^^^^^^^^^^

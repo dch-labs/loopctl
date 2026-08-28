@@ -1,0 +1,5 @@
+error: `Tool` can only be derived on structs
+ --> tests/ui/enum_input.rs:4:6
+  |
+4 | enum NotAStruct {
+  |      ^^^^^^^^^^

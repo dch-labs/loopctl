@@ -1389,6 +1389,39 @@ impl Default for ToolContext {
 ///     fn is_read_only(&self) -> bool { true }
 /// }
 /// ```
+/// # Deriving `Tool`
+///
+/// With the `derive` feature, a `Deserialize` struct plus an inherent
+/// `async fn run(&self, input: Self, ctx: &ToolContext)` handler is the
+/// whole implementation — the derive emits this trait's four required
+/// methods, building the JSON Schema statically from the fields:
+///
+/// ```rust,ignore
+/// use loopctl::Tool;
+/// use serde::Deserialize;
+///
+/// /// Echo a message back to the caller.
+/// #[derive(Tool, Deserialize)]
+/// #[tool(name = "echo", description = "Echo back the provided message")]
+/// struct EchoInput {
+///     /// The text to echo.
+///     message: String,
+/// }
+///
+/// impl EchoInput {
+///     async fn run(&self, input: EchoInput, _ctx: &ToolContext)
+///         -> Result<ToolOutput, ToolError>
+///     {
+///         Ok(ToolOutput::text(input.message))
+///     }
+/// }
+/// ```
+///
+/// Container attributes: `name`, `description`, `read_only`,
+/// `concurrency_safe`, `system_prompt`, `handler`, `allow_extra`.
+/// Field attributes: `name`, `description`, `skip`, `default`.
+/// Tools with dynamic schemas or unmappable field types fall back to a
+/// manual `impl` — the derive is opt-in.
 pub trait Tool: Send + Sync {
     /// The tool's unique name (e.g., `"read_file"`, `"bash"`).
     ///

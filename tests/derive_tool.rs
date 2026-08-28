@@ -448,8 +448,9 @@ fn serde_rename_all_applies_the_strategy() {
     assert_eq!(output.text_content(), "f");
 }
 
-/// `#[tool(name)]` with a matching `#[serde(rename)]` — the two must
-/// agree; the compile-time check enforces it.
+/// `#[tool(name)]` with a matching `#[serde(rename)]` — the schema
+/// and deserialization use the same agreed key; disagreeing names are
+/// a compile error (see the `name_disagreement` UI fixture).
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Override fixture")]
 struct OverridePrecedenceInput {
@@ -469,7 +470,7 @@ impl OverridePrecedenceInput {
 }
 
 #[test]
-fn tool_name_wins_over_serde_rename() {
+fn tool_and_serde_names_agree_and_round_trip() {
     let tool = OverridePrecedenceInput {
         field: String::new(),
     };

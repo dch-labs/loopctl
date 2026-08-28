@@ -7,7 +7,7 @@
 //! handler. Errors surface as spanned `syn::Error`s — never panics.
 
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote};
+use quote::quote;
 use syn::{Data, DeriveInput, Fields, Ident, Type};
 
 use crate::attr::{self, ContainerAttrs};
@@ -117,7 +117,13 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     };
     let required_tokens: Vec<&str> = required.iter().map(String::as_str).collect();
 
-    let handler = format_ident!("{}", container.handler.as_deref().unwrap_or("run"));
+    let handler_str = container.handler.as_deref().unwrap_or("run");
+    let handler = syn::parse_str::<Ident>(handler_str).map_err(|_| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!("handler `{handler_str}` is not a valid identifier"),
+        )
+    })?;
     let overrides = provided_overrides(&container);
 
     Ok(quote! {

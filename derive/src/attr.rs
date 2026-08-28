@@ -236,18 +236,45 @@ pub(crate) fn has_serde_default(attrs: &[Attribute]) -> bool {
 /// looks for would make the schema lie about what the model should
 /// send.
 pub(crate) fn serde_rename(attrs: &[Attribute]) -> Option<String> {
-    let mut out = None;
+    let mut plain = None;
+    let mut deserialize = None;
     for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("rename")
-                && let Ok(lit) = meta.value()?.parse::<LitStr>()
-            {
-                out = Some(lit.value());
+        let Ok(list) = attr
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        else {
+            continue;
+        };
+        for meta in &list {
+            match meta {
+                Meta::NameValue(nv) if nv.path.is_ident("rename") => {
+                    if let Expr::Lit(expr) = &nv.value
+                        && let Lit::Str(lit) = &expr.lit
+                    {
+                        plain = Some(lit.value());
+                    }
+                }
+                Meta::List(ml) if ml.path.is_ident("rename") => {
+                    let Ok(inner) = syn::parse::Parser::parse2(
+                        &syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+                        ml.tokens.clone(),
+                    ) else {
+                        continue;
+                    };
+                    for meta in &inner {
+                        if let Meta::NameValue(nv) = meta
+                            && nv.path.is_ident("deserialize")
+                            && let Expr::Lit(expr) = &nv.value
+                            && let Lit::Str(lit) = &expr.lit
+                        {
+                            deserialize = Some(lit.value());
+                        }
+                    }
+                }
+                _ => {}
             }
-            Ok(())
-        });
+        }
     }
-    out
+    deserialize.or(plain)
 }
 
 /// The `#[serde(rename_all = "…")]` strategy on the struct, if any.
@@ -326,10 +353,10 @@ impl RenameAll {
                     None => String::new(),
                 }
             }
-            Self::Snake => to_snake_case(name),
-            Self::ScreamingSnake => to_snake_case(name).to_uppercase(),
-            Self::Kebab => to_snake_case(name).replace('_', "-"),
-            Self::ScreamingKebab => to_snake_case(name).replace('_', "-").to_uppercase(),
+            Self::Snake => serde_snake_case(name),
+            Self::ScreamingSnake => serde_snake_case(name).to_uppercase(),
+            Self::Kebab => serde_snake_case(name).replace('_', "-"),
+            Self::ScreamingKebab => serde_snake_case(name).replace('_', "-").to_uppercase(),
         }
     }
 }
@@ -352,15 +379,27 @@ fn to_pascal_case(name: &str) -> String {
         .collect()
 }
 
-/// `snake_case` from a `PascalCase` or `camelCase` input.
+/// `snake_case` matching serde's field-rename behavior.
 ///
-/// Each uppercase boundary starts a new underscore-separated word.
-/// Already-lowercase input passes through unchanged.
-fn to_snake_case(name: &str) -> String {
+/// An underscore is inserted before an uppercase character only when
+/// the previous character is lowercase or a digit — consecutive
+/// uppercase (an acronym like `ID` in `userID`) stays together:
+/// `userID` becomes `user_id`, not `user_i_d`.
+fn serde_snake_case(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
     let mut out = String::new();
-    for (index, ch) in name.chars().enumerate() {
+    for (i, &ch) in chars.iter().enumerate() {
         if ch.is_uppercase() {
-            if index != 0 {
+            let prev_lower = i > 0
+                && chars
+                    .get(i.wrapping_sub(1))
+                    .is_some_and(|c| c.is_lowercase() || c.is_numeric());
+            let next_lower = chars
+                .get(i.wrapping_add(1))
+                .is_some_and(|c| c.is_lowercase());
+            // Insert before an uppercase that starts a word —
+            // after lowercase/digit, or at an acronym-to-word boundary.
+            if prev_lower || (i > 0 && next_lower) {
                 out.push('_');
             }
             out.extend(ch.to_lowercase());
@@ -384,8 +423,8 @@ mod tests {
             ("camelCase", "file_name", "fileName"),
             ("snake_case", "FileName", "file_name"),
             ("SCREAMING_SNAKE_CASE", "FileName", "FILE_NAME"),
-            ("kebab-case", "FileName", "file-name"),
-            ("SCREAMING_KEBAB_CASE", "FileName", "FILE-NAME"),
+            ("kebab-case", "file_name", "file-name"),
+            ("SCREAMING_KEBAB_CASE", "file_name", "FILE-NAME"),
         ];
         for (name, input, expected) in cases {
             let strategy =
@@ -396,6 +435,41 @@ mod tests {
                 "strategy {name:?} on {input:?}"
             );
         }
+    }
+
+    #[test]
+    fn snake_case_preserves_consecutive_uppercase() {
+        assert_eq!(
+            RenameAll::from_str("snake_case").unwrap().apply("userID"),
+            "user_id"
+        );
+        assert_eq!(
+            RenameAll::from_str("snake_case")
+                .unwrap()
+                .apply("parseHTTPResponse"),
+            "parse_http_response"
+        );
+        assert_eq!(
+            RenameAll::from_str("snake_case").unwrap().apply("htmlID"),
+            "html_id"
+        );
+    }
+
+    #[test]
+    fn serde_rename_deserialize_form_is_preferred() {
+        use syn::parse_quote;
+        let attr: Attribute = parse_quote! {
+            #[serde(rename(deserialize = "from_wire", serialize = "to_wire"))]
+        };
+        assert_eq!(
+            serde_rename(&[attr]),
+            Some("from_wire".to_string()),
+            "the deserialize half wins over the serialize half"
+        );
+        let attr: Attribute = parse_quote! {
+            #[serde(rename = "simple")]
+        };
+        assert_eq!(serde_rename(&[attr]), Some("simple".to_string()));
     }
 
     #[test]

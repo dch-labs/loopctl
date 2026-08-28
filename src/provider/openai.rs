@@ -815,7 +815,7 @@ impl RequestBody {
 /// result's `is_error` flag is not forwarded — the Chat Completions `tool`
 /// message has no error field; the output text itself conveys failures
 /// (Anthropic's wire format is the one that carries an explicit flag).
-fn convert_message(m: &Message) -> Vec<Value> {
+pub(super) fn convert_message(m: &Message) -> Vec<Value> {
     let role = match m.role {
         Role::User => "user",
         Role::Assistant => "assistant",

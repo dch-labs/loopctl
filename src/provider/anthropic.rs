@@ -785,7 +785,7 @@ fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32)
 /// - Messages with only a single text part use a plain string for `content`
 ///   (Anthropic's recommended optimization).
 /// - Messages with tool calls or tool results use the full `content` array.
-fn convert_message(m: &Message) -> Value {
+pub(super) fn convert_message(m: &Message) -> Value {
     // System messages are folded into the top-level `system` field by
     // `build_request_body` before this function is reached, so the `System`
     // pattern below is defensive: if one ever reaches here, route it to `user`
@@ -877,7 +877,7 @@ fn convert_message(m: &Message) -> Value {
 /// When structured output is active (`response_format` set), this function is
 /// not called — instead, [`build_request_body`] synthesizes a single forced
 /// tool whose `input_schema` is the target `ResponseFormat::schema`.
-fn convert_tools(tools: &[ToolSchema], strict: bool) -> Vec<Value> {
+pub(super) fn convert_tools(tools: &[ToolSchema], strict: bool) -> Vec<Value> {
     tools
         .iter()
         .map(|t| {
@@ -973,7 +973,7 @@ impl SseReader {
 /// - Emitting [`PartStop`] when parts finish.
 /// - Emitting the final [`MessageDelta`] with stop reason and usage.
 #[derive(Default)]
-struct StreamEmitter {
+pub(super) struct StreamEmitter {
     /// Whether [`MessageStart`] has been emitted for the current stream.
     ///
     /// The Anthropic stream opens with one `message_start` event; the

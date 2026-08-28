@@ -15,6 +15,9 @@
 //! | `DeepSeek`   | `deepseek` | OpenAI-compatible       |
 //! | `Grok` (xAI) | `grok`     | OpenAI-compatible       |
 //! | `Z.ai`       | `zai`      | Anthropic Messages      |
+//! | Azure OpenAI | `azure`    | OpenAI-compatible       |
+//! | Moonshot AI  | `moonshot` | OpenAI-compatible       |
+//! | AWS Bedrock  | `bedrock`  | Bedrock Converse/native |
 //! | Self-hosted  | any        | OpenAI-compatible       |
 //!
 //! Any provider that exposes an OpenAI-compatible Chat Completions API
@@ -550,11 +553,26 @@ const GROK_BASE_URL: &str = "https://api.x.ai/v1";
 #[cfg(feature = "grok")]
 const GROK_DEFAULT_MODEL: &str = "grok-beta";
 
+#[cfg(feature = "bedrock")]
+pub mod bedrock;
+
+#[cfg(feature = "bedrock")]
+pub use bedrock::BedrockClient;
+
 #[cfg(feature = "zai")]
 const ZAI_BASE_URL: &str = "https://api.z.ai/api/anthropic";
 
 #[cfg(feature = "zai")]
 const ZAI_DEFAULT_MODEL: &str = "glm-4.7";
+
+#[cfg(feature = "azure")]
+const AZURE_DEFAULT_MODEL: &str = "gpt-4o";
+
+#[cfg(feature = "moonshot")]
+const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
+
+#[cfg(feature = "moonshot")]
+const MOONSHOT_DEFAULT_MODEL: &str = "kimi-k2-0905-preview";
 
 /// Read an environment variable, falling back to a second name, then a
 /// default value.
@@ -568,14 +586,22 @@ const ZAI_DEFAULT_MODEL: &str = "glm-4.7";
     feature = "deepseek",
     feature = "grok",
     feature = "zai",
-    feature = "openai"
+    feature = "openai",
+    feature = "azure",
+    feature = "moonshot"
 ))]
 fn env_or_default(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.into())
 }
 
 /// Read a primary env var, falling back to a secondary if unset.
-#[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
+#[cfg(any(
+    feature = "deepseek",
+    feature = "grok",
+    feature = "zai",
+    feature = "azure",
+    feature = "moonshot"
+))]
 fn env_or_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)
         .or_else(|_| std::env::var(fallback))
@@ -587,7 +613,13 @@ fn env_or_fallback(primary: &str, fallback: &str) -> Option<String> {
 /// # Errors
 ///
 /// Returns [`ApiError::auth_invalid_key`] if neither environment variable is set.
-#[cfg(any(feature = "deepseek", feature = "grok", feature = "zai"))]
+#[cfg(any(
+    feature = "deepseek",
+    feature = "grok",
+    feature = "zai",
+    feature = "azure",
+    feature = "moonshot"
+))]
 fn require_api_key(primary: &str, fallback: Option<&str>) -> Result<String, ApiError> {
     if let Some(fb) = fallback {
         if let Some(val) = env_or_fallback(primary, fb) {
@@ -702,6 +734,69 @@ pub fn deepseek() -> Result<OpenAiClient, ApiError> {
     OpenAiClient::builder()
         .with_api_key(api_key)
         .with_base_url(DEEPSEEK_BASE_URL)
+        .with_model(model)
+        .build()
+}
+
+/// Azure OpenAI client — an [`OpenAiClient`] pointed at the resource's
+/// v1 API.
+///
+/// The v1 surface (`https://{resource}.openai.azure.com/openai/v1`)
+/// speaks the OpenAI wire format with standard Bearer auth. Reads
+/// `AZURE_OPENAI_API_KEY` (required) and optionally
+/// `AZURE_OPENAI_MODEL` (defaults to `gpt-4o`; on the v1 surface the
+/// model name identifies the deployment). The legacy
+/// deployment-URL scheme is not supported.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use loopctl::provider;
+///
+/// let client = provider::azure("my-resource")?;
+/// ```
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if no API key is found.
+#[cfg(feature = "azure")]
+pub fn azure(resource: impl AsRef<str>) -> Result<OpenAiClient, ApiError> {
+    let api_key = require_api_key("AZURE_OPENAI_API_KEY", None)?;
+    let model = env_or_default("AZURE_OPENAI_MODEL", AZURE_DEFAULT_MODEL);
+    let base = format!("https://{}.openai.azure.com/openai/v1", resource.as_ref());
+
+    OpenAiClient::builder()
+        .with_api_key(api_key)
+        .with_base_url(base)
+        .with_model(model)
+        .build()
+}
+
+/// Moonshot AI (Kimi) client — an [`OpenAiClient`] pointed at the
+/// Moonshot API.
+///
+/// Reads `MOONSHOT_API_KEY` (required) and optionally `MOONSHOT_MODEL`
+/// (defaults to `kimi-k2-0905-preview`).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use loopctl::provider;
+///
+/// let client = provider::moonshot()?;
+/// ```
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if no API key is found.
+#[cfg(feature = "moonshot")]
+pub fn moonshot() -> Result<OpenAiClient, ApiError> {
+    let api_key = require_api_key("MOONSHOT_API_KEY", None)?;
+    let model = env_or_default("MOONSHOT_MODEL", MOONSHOT_DEFAULT_MODEL);
+
+    OpenAiClient::builder()
+        .with_api_key(api_key)
+        .with_base_url(MOONSHOT_BASE_URL)
         .with_model(model)
         .build()
 }

@@ -1,0 +1,5 @@
+error: `#[tool(name = "schema_key")]` disagrees with serde's key `"rust_field"` — the model sends what the schema says, but deserialization looks for serde's key. Set `#[serde(rename = "schema_key")]` to match, or remove the `tool(name)` override.
+ --> tests/ui/name_disagreement.rs:9:5
+  |
+9 |     rust_field: String,
+  |     ^^^^^^^^^^

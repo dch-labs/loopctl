@@ -9,4 +9,6 @@ fn ui() {
     t.compile_fail("tests/ui/enum_input.rs");
     t.compile_fail("tests/ui/generic_struct.rs");
     t.compile_fail("tests/ui/cow_bytes.rs");
+    t.compile_fail("tests/ui/name_disagreement.rs");
+    t.compile_fail("tests/ui/default_without_serde.rs");
 }

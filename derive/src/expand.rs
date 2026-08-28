@@ -91,15 +91,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             check_skip_validity(field_ident, &field.ty, &field.attrs)?;
             continue;
         }
-        let rust_name = field_ident.to_string();
-        let json_name = field_attrs
-            .name
-            .clone()
-            .or_else(|| attr::serde_rename(&field.attrs))
-            .unwrap_or_else(|| match rename_all {
-                Some(strategy) => strategy.apply(&rust_name),
-                None => rust_name.clone(),
-            });
+        let json_name = resolve_json_name(field_ident, &field_attrs, &field.attrs, rename_all)?;
         let field_doc = field_attrs
             .description
             .clone()
@@ -112,6 +104,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         properties.push(quote! {
             #json_name: { #schema_value #description_part }
         });
+        check_default_agreement(field_ident, &field_attrs, &field.attrs, optional)?;
         if !optional && !field_attrs.default && !attr::has_serde_default(&field.attrs) {
             required.push(json_name);
         }
@@ -221,6 +214,69 @@ fn provided_overrides(container: &ContainerAttrs) -> TokenStream2 {
 /// `#[tool(skip)]` requires the field to deserialize without LLM input.
 /// # Errors
 ///
+/// Resolve the JSON property name for a field, enforcing that the
+/// schema name agrees with what serde will deserialize.
+///
+/// # Errors
+///
+/// Returns a spanned error when `#[tool(name)]` produces a key that
+/// differs from serde's — the model would send the schema's key but
+/// deserialization would reject it.
+fn resolve_json_name(
+    field_ident: &Ident,
+    field_attrs: &crate::attr::FieldAttrs,
+    field: &[syn::Attribute],
+    rename_all: Option<crate::attr::RenameAll>,
+) -> syn::Result<String> {
+    let rust_name = field_ident.to_string();
+    let serde_name = attr::serde_rename(field).unwrap_or_else(|| match rename_all {
+        Some(strategy) => strategy.apply(&rust_name),
+        None => rust_name.clone(),
+    });
+    match &field_attrs.name {
+        Some(tool_name) => {
+            if *tool_name != serde_name {
+                return Err(syn::Error::new(
+                    field_ident.span(),
+                    format!(
+                        "`#[tool(name = \"{tool_name}\")]` disagrees with serde's \
+                         key `\"{serde_name}\"` — the model sends what the schema \
+                         says, but deserialization looks for serde's key. Set \
+                         `#[serde(rename = \"{tool_name}\")]` to match, or remove \
+                         the `tool(name)` override."
+                    ),
+                ));
+            }
+            Ok(tool_name.clone())
+        }
+        None => Ok(serde_name),
+    }
+}
+
+/// Enforce that `#[tool(default)]` on a non-`Option` field also has
+/// `#[serde(default)]` — without it the schema says optional but
+/// deserialization fails when the model omits the field.
+///
+/// # Errors
+///
+/// Returns a spanned error naming the precondition.
+fn check_default_agreement(
+    field_ident: &Ident,
+    field_attrs: &crate::attr::FieldAttrs,
+    field: &[syn::Attribute],
+    optional: bool,
+) -> syn::Result<()> {
+    if field_attrs.default && !optional && !attr::has_serde_default(field) {
+        return Err(syn::Error::new(
+            field_ident.span(),
+            "`#[tool(default)]` on a non-`Option` field also needs \
+             `#[serde(default)]` — without it the schema says optional \
+             but deserialization still fails when the model omits the field.",
+        ));
+    }
+    Ok(())
+}
+
 /// Enforce the deserialization precondition of `#[tool(skip)]`.
 ///
 /// A skipped field never reaches the model, so serde must be able to

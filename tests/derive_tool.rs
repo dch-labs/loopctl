@@ -448,12 +448,12 @@ fn serde_rename_all_applies_the_strategy() {
     assert_eq!(output.text_content(), "f");
 }
 
-/// `#[tool(name)]` wins over `#[serde(rename)]` — the tool attribute
-/// is the explicit override.
+/// `#[tool(name)]` with a matching `#[serde(rename)]` — the two must
+/// agree; the compile-time check enforces it.
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Override fixture")]
 struct OverridePrecedenceInput {
-    #[serde(rename = "serde_name")]
+    #[serde(rename = "tool_name")]
     #[tool(name = "tool_name")]
     field: String,
 }
@@ -477,9 +477,9 @@ fn tool_name_wins_over_serde_rename() {
     let props = &schema.input_schema["properties"];
     assert!(props.get("tool_name").is_some(), "the tool attr wins");
     assert!(props.get("serde_name").is_none());
-    // deserialization uses serde's name, the schema uses the tool's
-    let output = call(&tool, serde_json::json!({"serde_name": "v"}))
-        .expect("serde still renames the Rust field");
+    // both the schema and serde use the agreed name
+    let output =
+        call(&tool, serde_json::json!({"tool_name": "v"})).expect("the agreed name deserializes");
     assert_eq!(output.text_content(), "v");
 }
 

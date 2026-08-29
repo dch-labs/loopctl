@@ -51,7 +51,9 @@ pub enum BedrockPath {
 ///
 /// Implements [`ApiClient`] by routing through the Bedrock runtime.
 /// Credentials are signed with AWS Signature Version 4 — there is no
-/// bearer API key.
+/// bearer API key. They are fixed at build time: rotating keys (an
+/// IRSA/SSO role refresh, say) means building a new client, while the
+/// model remains mutable per request via [`set_model`](ApiClient::set_model).
 ///
 /// # Construction
 ///
@@ -222,6 +224,7 @@ impl BedrockClientBuilder {
     /// missing or empty, or when the HTTP client cannot be constructed.
     pub fn build(self) -> Result<BedrockClient, ApiError> {
         let region = require_non_empty("region", self.region)?;
+        validate_region(&region)?;
         let access_key_id = require_non_empty("access_key_id", self.access_key_id)?;
         let secret_access_key = require_non_empty("secret_access_key", self.secret_access_key)?;
         let model = require_non_empty("model", self.model)?;
@@ -255,6 +258,32 @@ fn require_non_empty(field: &str, value: Option<String>) -> Result<String, ApiEr
     value
         .filter(|v| !v.is_empty())
         .ok_or_else(|| ApiError::config(format!("bedrock: {field} is missing")))
+}
+
+/// Validate the AWS region grammar.
+///
+/// Region names are lowercase alphanumerics and hyphens (`us-east-1`,
+/// `cn-north-1`, `us-gov-west-1`, `us-iso-east-1`). Enforcing this at
+/// build time keeps the interpolated host
+/// (`bedrock-runtime.{region}.amazonaws.com`) a genuine AWS endpoint —
+/// a region containing dots or slashes would change which host the
+/// request is sent to, redirecting the (TLS-protected but still
+/// delivered) conversation body.
+///
+/// # Errors
+///
+/// Returns [`ApiError::config_validation`] for any other shape.
+fn validate_region(region: &str) -> Result<(), ApiError> {
+    if region
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        Ok(())
+    } else {
+        Err(ApiError::config_validation(format!(
+            "bedrock: region {region:?} must be lowercase alphanumerics and hyphens"
+        )))
+    }
 }
 
 /// Auto-select the invoke path from a Bedrock model id.
@@ -765,12 +794,15 @@ fn parse_headers(bytes: &[u8]) -> Vec<(String, String)> {
 /// [`crate::provider::anthropic`]'s message translation and system
 /// folding. Unused fields (`system`, `tools`) are omitted rather than
 /// sent empty — Anthropic's schema rejects an empty `tools` array, so
-/// the default no-tools request must not carry one.
+/// the default no-tools request must not carry one. Messages with no
+/// parts are dropped: they would serialize to an empty content array
+/// the API rejects.
 fn anthropic_body(request: &StreamRequest) -> serde_json::Value {
     let (messages, system) =
         crate::provider::fold_system_messages(&request.messages, request.system.as_deref());
     let converted: Vec<serde_json::Value> = messages
         .iter()
+        .filter(|m| !m.parts.is_empty())
         .map(|m| crate::provider::anthropic::convert_message(m))
         .collect();
     let mut body = serde_json::json!({
@@ -802,11 +834,16 @@ fn anthropic_body(request: &StreamRequest) -> serde_json::Value {
 /// (`text`, `toolUse`, `toolResult`), the system prompt a top-level
 /// list of text blocks, and tools a `toolConfig` of `toolSpec`
 /// entries. Fields the request doesn't exercise (system, `toolConfig`)
-/// are omitted rather than sent empty.
+/// are omitted rather than sent empty, and messages with no parts are
+/// dropped — an empty `content` array fails Converse validation.
 fn converse_body(request: &StreamRequest) -> serde_json::Value {
     let (messages, system) =
         crate::provider::fold_system_messages(&request.messages, request.system.as_deref());
-    let converted: Vec<serde_json::Value> = messages.iter().map(|m| converse_message(m)).collect();
+    let converted: Vec<serde_json::Value> = messages
+        .iter()
+        .filter(|m| !m.parts.is_empty())
+        .map(|m| converse_message(m))
+        .collect();
     let mut body = serde_json::json!({
         "messages": converted,
         "inferenceConfig": {
@@ -970,12 +1007,18 @@ impl ConverseStreamEmitter {
     /// Recognizes the six documented chunk kinds; anything else
     /// (future Converse events, guardrail trace detail) yields no
     /// events. `messageStop` only latches state; `metadata` emits the
-    /// terminal [`MessageDelta`]+[`MessageStop`] pair.
+    /// terminal [`MessageDelta`]+[`MessageStop`] pair. Once that pair
+    /// is out, every further chunk is ignored — a desynced stream must
+    /// not append parts to a message the consumer has already been
+    /// told is complete.
     ///
     /// [`MessageDelta`]: crate::stream::MessageDelta
     /// [`MessageStop`]: crate::stream::MessageStop
     fn process_chunk(&mut self, chunk: &serde_json::Value) -> Vec<StreamEvent> {
         let mut out = Vec::new();
+        if self.finished {
+            return out;
+        }
         if chunk.get("messageStart").is_some() {
             if !self.started {
                 self.started = true;
@@ -1729,6 +1772,13 @@ mod tests {
             BedrockPath::Converse
         );
         assert_eq!(
+            auto_path(
+                "arn:aws:bedrock:us-east-1:123456789012:foundation-model/anthropic.claude-v1:0"
+            ),
+            BedrockPath::Converse,
+            "ARN ids do not carry the anthropic. prefix — Converse is the safe route"
+        );
+        assert_eq!(
             auto_path("us.anthropic.claude-sonnet-4-5-v1:0"),
             BedrockPath::Converse,
             "inference-profile prefixes are not the native anthropic. prefix — \
@@ -2330,6 +2380,28 @@ mod tests {
     }
 
     #[test]
+    fn converse_stream_ignores_chunks_after_metadata() {
+        let mut emitter = ConverseStreamEmitter::default();
+        emitter.process_chunk(&serde_json::json!({
+            "metadata": {"usage": {"inputTokens": 1, "outputTokens": 1}}
+        }));
+        for late in [
+            serde_json::json!({"contentBlockStart": {
+                "contentBlockIndex": 0, "start": {"toolUse": {"toolUseId": "t9", "name": "x"}}
+            }}),
+            serde_json::json!({"contentBlockDelta": {
+                "contentBlockIndex": 0, "delta": {"text": "late"}
+            }}),
+            serde_json::json!({"messageStart": {"role": "assistant"}}),
+        ] {
+            assert!(
+                emitter.process_chunk(&late).is_empty(),
+                "nothing may follow the terminal pair: {late}"
+            );
+        }
+    }
+
+    #[test]
     fn converse_stream_late_message_stop_after_metadata_is_ignored() {
         let mut emitter = ConverseStreamEmitter::default();
         emitter.process_chunk(&serde_json::json!({
@@ -2417,6 +2489,75 @@ mod tests {
             body["inferenceConfig"]["maxTokens"],
             crate::provider::anthropic::DEFAULT_MAX_TOKENS
         );
+    }
+
+    #[test]
+    fn stop_reason_mapping_covers_both_vocabularies() {
+        assert_eq!(anthropic_stop_to_engine("max_tokens"), Stop::MaxTokens);
+        assert_eq!(
+            anthropic_stop_to_engine("stop_sequence"),
+            Stop::StopSequence
+        );
+        assert_eq!(anthropic_stop_to_engine("tool_use"), Stop::ToolCall);
+        assert_eq!(anthropic_stop_to_engine("end_turn"), Stop::EndTurn);
+        for converse_only in ["content_filtered", "guardrail_intervened", "refusal"] {
+            assert_eq!(
+                anthropic_stop_to_engine(converse_only),
+                Stop::EndTurn,
+                "Converse-only values land on the completed-turn default"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_headers_decodes_boolean_and_skips_unknown_value_types() {
+        // ":flagA" with value type 0 (true), ":flagB" with type 1
+        // (false), ":weird" with an undocumented type — values carry
+        // no bytes for non-string types.
+        let bytes: Vec<u8> = b"\x06:flagA\x00\x06:flagB\x01\x06:weird\x09".to_vec();
+        let headers = parse_headers(&bytes);
+        assert_eq!(
+            headers,
+            vec![
+                (":flagA".to_string(), "true".to_string()),
+                (":flagB".to_string(), "false".to_string()),
+                (":weird".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn converse_usage_partial_object_defaults_missing_side_to_zero() {
+        let mut emitter = ConverseStreamEmitter::default();
+        let events = emitter.process_chunk(&serde_json::json!({
+            "metadata": {"usage": {"inputTokens": 7}}
+        }));
+        assert!(
+            events.first().is_some_and(|e| matches!(e,
+            StreamEvent::MessageDelta(d)
+                if d.usage == Some(crate::stream::Usage {
+                    input_tokens: 7,
+                    output_tokens: 0,
+                }))),
+            "a usage object reporting only one side zeroes the other: {events:?}"
+        );
+    }
+
+    #[test]
+    fn endpoint_urls_encode_non_ascii_model_bytes() {
+        assert_eq!(
+            stream_url("us-east-1", "ünïcode", BedrockPath::Converse),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/%C3%BCn%C3%AFcode/converse-stream",
+            "multibyte UTF-8 encodes per byte, per RFC 3986"
+        );
+    }
+
+    #[test]
+    fn amz_date_clamps_pre_epoch_clocks_to_1970() {
+        let before_epoch = std::time::SystemTime::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(10))
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        assert_eq!(format_amz_date(before_epoch), "19700101T000000Z");
     }
 
     #[test]
@@ -2743,6 +2884,58 @@ mod tests {
     }
 
     #[test]
+    fn stream_state_decodes_empty_responses_on_both_paths() {
+        // A model may return no content at all: the wire is just the
+        // start/terminal events. Both paths must complete cleanly and
+        // the engine accumulator must build an empty message.
+        let converse_wire: Vec<u8> = [
+            build_frame("chunk", br#"{"messageStart":{"role":"assistant"}}"#),
+            build_frame("chunk", br#"{"messageStop":{"stopReason":"end_turn"}}"#),
+            build_frame(
+                "chunk",
+                br#"{"metadata":{"usage":{"inputTokens":1,"outputTokens":0}}}"#,
+            ),
+        ]
+        .concat();
+        let mut state = BedrockStreamState::new(BedrockPath::Converse);
+        let events = state.process_bytes(&converse_wire).unwrap();
+        assert!(
+            events
+                .last()
+                .is_some_and(|e| matches!(e, StreamEvent::MessageStop)),
+            "an empty response still terminates: {events:?}"
+        );
+
+        let anthropic_wire: Vec<u8> = [
+            build_frame(
+                "chunk",
+                br#"{"type":"message_start","message":{"id":"m","model":"claude","usage":{"input_tokens":1}}}"#,
+            ),
+            build_frame(
+                "chunk",
+                br#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#,
+            ),
+            build_frame("chunk", br#"{"type":"message_stop"}"#),
+        ]
+        .concat();
+        let mut state = BedrockStreamState::new(BedrockPath::Anthropic);
+        let mut events = state.process_bytes(&anthropic_wire).unwrap();
+        events.extend(state.finish().unwrap());
+        assert!(
+            events
+                .last()
+                .is_some_and(|e| matches!(e, StreamEvent::MessageStop)),
+            "the anthropic path terminates via finish: {events:?}"
+        );
+
+        let mut acc = crate::stream::StreamAccumulator::new();
+        for ev in &events {
+            acc.process(ev).unwrap();
+        }
+        assert!(acc.build().text_content().is_empty());
+    }
+
+    #[test]
     fn stream_state_truncated_converse_wire_emits_no_terminal() {
         let wire: Vec<u8> = [
             build_frame("chunk", br#"{"messageStart":{"role":"assistant"}}"#),
@@ -2914,6 +3107,112 @@ mod tests {
             client.effective_path("anthropic.claude-v1:0"),
             BedrockPath::Converse,
             "the explicit override pins the path regardless of model"
+        );
+    }
+
+    #[cfg(all(feature = "bedrock", feature = "testing"))]
+    #[test]
+    fn from_env_reads_aws_variables() {
+        use crate::testing::EnvGuard;
+
+        let env = EnvGuard::acquire(&[
+            "AWS_REGION",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_BEDROCK_MODEL",
+        ]);
+        env.set("AWS_REGION", "us-east-1");
+        env.set("AWS_ACCESS_KEY_ID", "k");
+        env.set("AWS_SECRET_ACCESS_KEY", "s");
+        env.remove("AWS_SESSION_TOKEN");
+        env.remove("AWS_BEDROCK_MODEL");
+        let client = BedrockClient::from_env().unwrap();
+        assert_eq!(
+            client.model(),
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "the documented Sonnet default"
+        );
+
+        env.set("AWS_BEDROCK_MODEL", "amazon.nova-pro-v1:0");
+        let client = BedrockClient::from_env().unwrap();
+        assert_eq!(client.model(), "amazon.nova-pro-v1:0");
+        assert_eq!(
+            client.effective_path("amazon.nova-pro-v1:0"),
+            BedrockPath::Converse
+        );
+
+        env.set("AWS_SESSION_TOKEN", "tok");
+        BedrockClient::from_env().unwrap();
+
+        env.set("AWS_REGION", "bad region");
+        let err = BedrockClient::from_env().unwrap_err();
+        assert!(
+            err.to_string().contains("region"),
+            "a malformed region fails at build, not at the first request: {err}"
+        );
+
+        env.remove("AWS_ACCESS_KEY_ID");
+        let err = BedrockClient::from_env().unwrap_err();
+        assert!(err.to_string().contains("AWS_ACCESS_KEY_ID"), "{err}");
+    }
+
+    #[test]
+    fn builder_rejects_non_aws_region_shapes() {
+        for bad in [
+            "x.evil.com",
+            "us east 1",
+            "US-EAST-1",
+            "us/east",
+            "us\teast",
+        ] {
+            let err = BedrockClientBuilder::default()
+                .region(bad)
+                .access_key_id("k")
+                .secret_access_key("s")
+                .model("m")
+                .build()
+                .unwrap_err();
+            assert!(err.to_string().contains("region"), "{bad:?}: {err}");
+            assert_eq!(
+                err.code(),
+                crate::api::error::ErrorCode::ConfigValidationError,
+                "{bad:?}: {err}"
+            );
+        }
+
+        for good in ["us-east-1", "cn-north-1", "us-gov-west-1", "us-iso-east-1"] {
+            BedrockClientBuilder::default()
+                .region(good)
+                .access_key_id("k")
+                .secret_access_key("s")
+                .model("anthropic.claude-v1:0")
+                .build()
+                .unwrap_or_else(|e| panic!("valid region rejected: {good:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn bodies_drop_empty_messages() {
+        let request = StreamRequest {
+            messages: vec![
+                Message::new(crate::message::Role::Assistant, vec![]),
+                Message::user("hi"),
+            ],
+            system: None,
+            tools: None,
+        };
+        let anthropic = anthropic_body(&request);
+        assert_eq!(
+            anthropic["messages"].as_array().map(Vec::len),
+            Some(1),
+            "zero-part messages must not serialize to an empty content array"
+        );
+        let converse = converse_body(&request);
+        assert_eq!(converse["messages"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            converse["messages"][0]["content"].as_array().map(Vec::len),
+            Some(1)
         );
     }
 

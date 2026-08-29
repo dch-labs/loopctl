@@ -1044,11 +1044,13 @@ pub(super) struct StreamEmitter {
 
     /// Whether the terminal stop signal has been processed.
     ///
-    /// Set by either `message_delta` (which carries the stop reason and
-    /// usage) or `message_stop`. Guards against emitting the final
-    /// [`StreamEvent::MessageDelta`] twice when both events arrive, and
-    /// against `finish` appending a spurious [`StreamEvent::MessageStop`]
-    /// after the stream already terminated.
+    /// Set by `message_stop` — the one and only writer — and read by
+    /// [`process_event`](Self::process_event), which ignores every
+    /// event once it is set, and by
+    /// [`on_message_delta`](Self::on_message_delta), which no-ops when
+    /// `message_stop` arrived first (an out-of-order stream).
+    /// [`finish`](Self::finish) does not consult it: it only surfaces
+    /// a recorded `error` event and drains pending output.
     finished: bool,
 
     /// A terminal error delivered as an `event: error` SSE event, if any.
@@ -1094,7 +1096,15 @@ impl StreamEmitter {
     ///
     /// Also the entry point for the Bedrock Anthropic path, whose
     /// event-stream frame payloads are the same event objects.
+    ///
+    /// Once [`message_stop`](Self::on_message_stop) has been processed,
+    /// every further event is ignored: `message_stop` terminates the
+    /// message, and a desynced stream must not append parts to a
+    /// message the consumer has already been told is complete.
     pub(super) fn process_event(&mut self, event_type: &str, data: Option<Value>) {
+        if self.finished {
+            return;
+        }
         match event_type {
             "message_start" => self.on_message_start(data.as_ref()),
             "content_block_start" => self.on_block_start(data),
@@ -1504,6 +1514,45 @@ impl StreamEmitter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn emitter_ignores_events_after_message_stop() {
+        let mut emitter = StreamEmitter::default();
+        emitter.process_event(
+            "message_stop",
+            Some(serde_json::json!({"type": "message_stop"})),
+        );
+        assert!(!emitter.drain().is_empty(), "message_stop emits the stop");
+        emitter.process_event(
+            "content_block_delta",
+            Some(serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "late"},
+            })),
+        );
+        assert!(
+            emitter.drain().is_empty(),
+            "a desynced stream must not append parts after the stop"
+        );
+        assert!(
+            emitter.finish().unwrap_or_default().is_empty(),
+            "nothing queued behind the guard"
+        );
+        emitter.process_event(
+            "error",
+            Some(serde_json::json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "late"}
+            })),
+        );
+        assert!(
+            emitter.finish().is_ok(),
+            "a late error after a completed message is swallowed — the \
+             stream already terminated cleanly, the contradiction is not \
+             allowed to fail it"
+        );
+    }
+
     use super::*;
     use crate::message::{Message, MessagePart, Role, ToolContent};
 

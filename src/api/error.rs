@@ -1454,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "providers")]
+    #[cfg(all(feature = "streaming", feature = "providers"))]
     fn parse_retry_after_http_date() {
         let parsed = parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT");
         assert!(parsed.is_some(), "HTTP-date should parse under providers");

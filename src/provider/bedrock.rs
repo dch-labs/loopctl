@@ -225,7 +225,7 @@ impl BedrockClientBuilder {
         let access_key_id = require_non_empty("access_key_id", self.access_key_id)?;
         let secret_access_key = require_non_empty("secret_access_key", self.secret_access_key)?;
         let model = require_non_empty("model", self.model)?;
-        let http = reqwest::Client::builder()
+        let http = crate::provider::HttpClientConfig::default()
             .build()
             .map_err(|e| ApiError::config(format!("bedrock: HTTP client: {e}")))?;
         Ok(BedrockClient {
@@ -254,7 +254,7 @@ impl BedrockClientBuilder {
 fn require_non_empty(field: &str, value: Option<String>) -> Result<String, ApiError> {
     value
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| ApiError::config(format!("bedrock: {field} is required")))
+        .ok_or_else(|| ApiError::config(format!("bedrock: {field} is missing")))
 }
 
 /// Auto-select the invoke path from a Bedrock model id.
@@ -360,7 +360,14 @@ fn sigv4_sign(
 /// `Content-Type`, `X-Amz-Content-Sha256`, and — when credentials
 /// carry one — `X-Amz-Security-Token`. The caller supplies the body
 /// separately so the same signed builder serves both the buffered and
-/// streaming requests.
+/// streaming requests. The `Authorization` and session-token header
+/// values are marked sensitive so they never appear in debug output.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] when a credential or the signature contains
+/// characters HTTP header values reject — control or non-ASCII bytes,
+/// which real AWS credentials never contain.
 fn apply_sigv4(
     mut request: reqwest::RequestBuilder,
     url: &str,
@@ -369,7 +376,7 @@ fn apply_sigv4(
     secret_access_key: &str,
     session_token: Option<&str>,
     body: &[u8],
-) -> reqwest::RequestBuilder {
+) -> Result<reqwest::RequestBuilder, ApiError> {
     let uri = url
         .split_once("amazonaws.com")
         .map_or("/".to_string(), |(_, rest)| rest.to_string());
@@ -384,8 +391,11 @@ fn apply_sigv4(
         body,
         std::time::SystemTime::now(),
     );
+    let mut authorization = reqwest::header::HeaderValue::from_str(&creds.authorization)
+        .map_err(|e| ApiError::config(format!("bedrock: authorization header: {e}")))?;
+    authorization.set_sensitive(true);
     request = request
-        .header("Authorization", creds.authorization)
+        .header("Authorization", authorization)
         .header("X-Amz-Date", creds.amz_date)
         .header("Content-Type", "application/json")
         .header(
@@ -393,9 +403,12 @@ fn apply_sigv4(
             hex::encode(sha2::Sha256::digest(body)),
         );
     if let Some(token) = session_token {
-        request = request.header("X-Amz-Security-Token", token);
+        let mut value = reqwest::header::HeaderValue::from_str(token)
+            .map_err(|e| ApiError::config(format!("bedrock: session token header: {e}")))?;
+        value.set_sensitive(true);
+        request = request.header("X-Amz-Security-Token", value);
     }
-    request
+    Ok(request)
 }
 
 /// Format a `SystemTime` as an AMZ date (`YYYYMMDD'T'HHMMSS'Z'`).
@@ -524,11 +537,12 @@ fn invoke_url(region: &str, model: &str, path: BedrockPath) -> String {
 /// frame yields a decoded [`AwsEvent`] — its event-type header and
 /// payload bytes. Frame CRCs are read past but not validated (the
 /// transport is TLS, so corruption is unlikely and dropping the stream
-/// on a checksum would not recover more than erroring does); a frame
-/// whose declared length is out of bounds clears the buffer — after a
-/// corrupt length prefix the byte stream is unsynchronized and cannot
-/// be recovered, so the remaining bytes are discarded rather than
-/// misdecoded.
+/// on a checksum would not recover more than erroring does). A frame
+/// that is structurally invalid but whose extent is known (headers
+/// overrun the declared length) is skipped individually and decoding
+/// continues with the bytes after it; only an out-of-bounds length
+/// prefix — which leaves the stream unsynchronized, with no trustworthy
+/// extent to skip — clears the buffer.
 #[derive(Debug, Default)]
 struct AwsEventStreamDecoder {
     /// Bytes received but not yet consumed by a complete frame.
@@ -573,44 +587,80 @@ struct AwsEvent {
     payload: Vec<u8>,
 }
 
+/// The outcome of one decoding step over the buffer front.
+///
+/// Distinguishes the three states [`AwsEventStreamDecoder::push`] loops
+/// on: wait for more bytes, discard a malformed frame and keep going,
+/// or emit a decoded frame.
+enum DecodeStep {
+    /// The buffer holds less than one complete frame.
+    ///
+    /// The front bytes may be a valid frame prefix — nothing is
+    /// discarded and decoding stops until more bytes arrive.
+    NeedMore,
+
+    /// A malformed frame was discarded.
+    ///
+    /// Decoding continues from the bytes after it: the frame's declared
+    /// extent was trustworthy enough to skip exactly (or, for an
+    /// out-of-bounds length, the whole buffer was cleared as
+    /// unsynchronized).
+    Skipped,
+
+    /// One complete frame decoded.
+    ///
+    /// Carries the [`AwsEvent`] assembled from the frame's headers and
+    /// payload; the frame's bytes are drained from the buffer front.
+    Event(AwsEvent),
+}
+
 impl AwsEventStreamDecoder {
     /// Feed raw bytes; returns every complete frame decoded so far.
     ///
     /// Bytes are buffered until they form whole frames, so partial
     /// network chunks may return nothing and a later call may return
-    /// several frames at once.
+    /// several frames at once. A skipped malformed frame does not stop
+    /// the scan — frames after it in the same buffer still decode.
     fn push(&mut self, bytes: &[u8]) -> Vec<AwsEvent> {
         self.buf.extend_from_slice(bytes);
         let mut events = Vec::new();
-        while let Some(event) = self.decode_frame() {
-            events.push(event);
+        loop {
+            match self.decode_frame() {
+                DecodeStep::NeedMore => break,
+                DecodeStep::Skipped => {}
+                DecodeStep::Event(event) => events.push(event),
+            }
         }
         events
     }
 
-    /// Try to decode one frame from the buffer front.
+    /// Take one decoding step over the buffer front.
     ///
-    /// Returns `None` when the buffer holds less than a complete
-    /// frame. A frame whose declared length is out of bounds clears
-    /// the buffer (the stream is unsynchronized); a frame whose
-    /// headers overrun its declared length is skipped entirely.
-    fn decode_frame(&mut self) -> Option<AwsEvent> {
+    /// [`NeedMore`](DecodeStep::NeedMore) when the buffer holds less
+    /// than a complete frame; [`Skipped`](DecodeStep::Skipped) when a
+    /// frame is discarded (structurally invalid frames drain exactly
+    /// their declared extent; an out-of-bounds length prefix clears the
+    /// buffer, as the stream is unsynchronized); [`Event`](DecodeStep::Event)
+    /// for a decoded frame, which drains the buffer front.
+    fn decode_frame(&mut self) -> DecodeStep {
         if self.buf.len() < 12 {
-            return None;
+            return DecodeStep::NeedMore;
         }
-        let total_len = be_u32(&self.buf, 0)? as usize;
-        if !(16..=16 * 1024 * 1024).contains(&total_len) {
+        let Some(total_len) = be_u32(&self.buf, 0)
+            .and_then(|len| usize::try_from(len).ok())
+            .filter(|len| (16..=16 * 1024 * 1024).contains(len))
+        else {
             self.buf.clear();
-            return None;
-        }
+            return DecodeStep::Skipped;
+        };
         if self.buf.len() < total_len {
-            return None;
+            return DecodeStep::NeedMore;
         }
-        let headers_len = be_u32(&self.buf, 4)? as usize;
+        let headers_len = be_u32(&self.buf, 4).map_or(0, |len| len as usize);
         let headers_end = 12usize.saturating_add(headers_len);
         if headers_end > total_len {
             self.buf.drain(..total_len);
-            return None;
+            return DecodeStep::Skipped;
         }
         let headers = self
             .buf
@@ -624,7 +674,7 @@ impl AwsEventStreamDecoder {
             .unwrap_or(&[])
             .to_vec();
         self.buf.drain(..total_len);
-        Some(AwsEvent {
+        DecodeStep::Event(AwsEvent {
             event_type: headers
                 .iter()
                 .find(|(k, _)| k == ":event-type")
@@ -1300,7 +1350,7 @@ impl BedrockClient {
             &self.secret_access_key,
             self.session_token.as_deref(),
             body,
-        );
+        )?;
         request
             .body(body.to_vec())
             .send()
@@ -1356,7 +1406,7 @@ impl ApiClient for BedrockClient {
                 &secret,
                 session_token.as_deref(),
                 &bytes,
-            );
+            )?;
             let response = req
                 .body(bytes)
                 .send()
@@ -2380,6 +2430,83 @@ mod tests {
     }
 
     #[test]
+    fn signed_request_marks_credential_headers_sensitive() {
+        let builder = apply_sigv4(
+            reqwest::Client::new()
+                .post("https://bedrock-runtime.us-east-1.amazonaws.com/model/m/invoke"),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/m/invoke",
+            "us-east-1",
+            "AKID",
+            "secret",
+            Some("session-token"),
+            b"{}",
+        )
+        .unwrap();
+        let request = builder.build().unwrap();
+        let headers = request.headers();
+        assert!(
+            headers
+                .get(reqwest::header::AUTHORIZATION)
+                .is_some_and(reqwest::header::HeaderValue::is_sensitive),
+            "Authorization must never surface in debug output"
+        );
+        assert!(
+            headers
+                .get("x-amz-security-token")
+                .is_some_and(reqwest::header::HeaderValue::is_sensitive),
+            "the session token must never surface in debug output"
+        );
+        assert!(
+            !headers
+                .get("x-amz-date")
+                .is_some_and(reqwest::header::HeaderValue::is_sensitive),
+            "the timestamp is not a secret"
+        );
+    }
+
+    #[test]
+    fn signed_request_rejects_control_characters_in_credentials() {
+        let err = apply_sigv4(
+            reqwest::Client::new()
+                .post("https://bedrock-runtime.us-east-1.amazonaws.com/model/m/invoke"),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/m/invoke",
+            "us-east-1",
+            "AKID",
+            "secret",
+            Some("bad\ntoken"),
+            b"{}",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("session token"),
+            "the error names the offending header: {err}"
+        );
+    }
+
+    #[test]
+    fn event_stream_decoder_continues_after_skipped_frame() {
+        // A structurally invalid frame (headers_len overruns total_len)
+        // whose declared extent is trustworthy is skipped alone; the
+        // good frame behind it in the same buffer must still decode.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&16u32.to_be_bytes());
+        bad.extend_from_slice(&100u32.to_be_bytes());
+        bad.extend_from_slice(&0u32.to_be_bytes());
+        bad.extend_from_slice(&[0u8; 4]);
+        let mut wire = bad;
+        wire.extend_from_slice(&build_frame("chunk", br#"{"ok":true}"#));
+
+        let mut decoder = AwsEventStreamDecoder::default();
+        let events = decoder.push(&wire);
+        assert_eq!(
+            events.len(),
+            1,
+            "the good frame after the discarded one still decodes"
+        );
+        assert_eq!(events[0].event_type, "chunk");
+    }
+
+    #[test]
     fn event_stream_decoder_clears_on_oversized_frame() {
         let mut decoder = AwsEventStreamDecoder::default();
         // total_len = 0xFFFFFFFF is far beyond the 16 MiB cap
@@ -2800,6 +2927,11 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("region"));
+        assert_eq!(
+            err.code(),
+            crate::api::error::ErrorCode::ConfigMissing,
+            "{err}"
+        );
 
         let err = BedrockClientBuilder::default()
             .region("us-east-1")

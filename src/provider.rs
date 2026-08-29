@@ -742,11 +742,14 @@ pub fn deepseek() -> Result<OpenAiClient, ApiError> {
 /// v1 API.
 ///
 /// The v1 surface (`https://{resource}.openai.azure.com/openai/v1`)
-/// speaks the OpenAI wire format with standard Bearer auth. Reads
-/// `AZURE_OPENAI_API_KEY` (required) and `AZURE_OPENAI_MODEL`
-/// (required — set it to the deployment name configured in the Azure
-/// OpenAI resource; on the v1 surface the model name identifies the
-/// deployment). The legacy deployment-URL scheme is not supported.
+/// speaks the OpenAI wire format with standard Bearer auth. The
+/// resource name must be 2–64 characters of alphanumerics and hyphens,
+/// starting and ending with an alphanumeric (Azure's account-name
+/// rule). Reads `AZURE_OPENAI_API_KEY` (required) and
+/// `AZURE_OPENAI_MODEL` (required — set it to the deployment name
+/// configured in the Azure OpenAI resource; on the v1 surface the
+/// model name identifies the deployment). The legacy deployment-URL
+/// scheme is not supported.
 ///
 /// # Example
 ///
@@ -763,20 +766,27 @@ pub fn deepseek() -> Result<OpenAiClient, ApiError> {
 #[cfg(feature = "azure")]
 pub fn azure(resource: impl AsRef<str>) -> Result<OpenAiClient, ApiError> {
     let resource = resource.as_ref();
-    if resource.is_empty()
-        || !resource
+    let chars_ok = resource
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let edges_ok = resource
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && resource
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        return Err(ApiError::config(format!(
-            "azure: resource name {resource:?} contains invalid characters; \
-             expected alphanumeric and hyphens only"
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    if !(2..=64).contains(&resource.chars().count()) || !chars_ok || !edges_ok {
+        return Err(ApiError::config_validation(format!(
+            "azure: resource name {resource:?} must be 2–64 characters of \
+             alphanumerics and hyphens, starting and ending with an alphanumeric"
         )));
     }
     let api_key = require_api_key("AZURE_OPENAI_API_KEY", None)?;
     let deployment = std::env::var("AZURE_OPENAI_MODEL").map_err(|_| {
         ApiError::config(
-            "azure: AZURE_OPENAI_MODEL is required — set it to the deployment \
+            "azure: AZURE_OPENAI_MODEL is missing — set it to the deployment \
              name configured in your Azure OpenAI resource",
         )
     })?;
@@ -917,16 +927,42 @@ mod tests {
     #[cfg(feature = "testing")]
     use crate::testing::EnvGuard;
 
-    #[cfg(feature = "azure")]
+    #[cfg(all(feature = "azure", feature = "testing"))]
     #[test]
     fn azure_rejects_invalid_resource_names() {
-        for bad in ["", "under_score", "sp ace", "res.name", "res!name"] {
+        let too_long = "r".repeat(65);
+        let bads = [
+            "",
+            "a",
+            "under_score",
+            "sp ace",
+            "res.name",
+            "-lead",
+            "trail-",
+            too_long.as_str(),
+        ];
+        for bad in bads {
             let Err(err) = azure(bad) else {
                 panic!("validation runs before any env access: {bad:?} accepted");
             };
-            assert!(
-                err.to_string().contains("invalid characters"),
+            assert!(err.to_string().contains("resource name"), "{bad:?}: {err}");
+            assert_eq!(
+                err.code(),
+                crate::api::error::ErrorCode::ConfigValidationError,
                 "{bad:?}: {err}"
+            );
+        }
+
+        let env = EnvGuard::acquire(&["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_MODEL"]);
+        env.remove("AZURE_OPENAI_API_KEY");
+        env.remove("AZURE_OPENAI_MODEL");
+        for good in ["ab", "my-resource", &"r".repeat(64)] {
+            let Err(err) = azure(good) else {
+                panic!("valid name rejected: {good:?}")
+            };
+            assert!(
+                !err.to_string().contains("resource name"),
+                "{good:?} is valid; the failure must be env-related: {err}"
             );
         }
     }
@@ -957,6 +993,11 @@ mod tests {
             panic!("missing AZURE_OPENAI_MODEL must fail the build");
         };
         assert!(err.to_string().contains("AZURE_OPENAI_MODEL"), "{err}");
+        assert_eq!(
+            err.code(),
+            crate::api::error::ErrorCode::ConfigMissing,
+            "{err}"
+        );
 
         env.remove("AZURE_OPENAI_API_KEY");
         let Err(err) = azure("res") else {
@@ -1340,11 +1381,13 @@ mod tests {
         assert_eq!(system.as_deref(), Some("part one\npart two"));
     }
 
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
     #[test]
     fn default_builds_clean() {
         assert!(HttpClientConfig::default().build().is_ok());
     }
 
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
     #[test]
     fn accepts_injected_http_client() {
         let shared = reqwest::Client::new();
@@ -1352,6 +1395,7 @@ mod tests {
         assert!(config.build().is_ok());
     }
 
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
     #[test]
     fn injected_client_supersedes_timeouts() {
         let shared = reqwest::Client::builder()
@@ -1364,6 +1408,7 @@ mod tests {
         assert!(config.build().is_ok());
     }
 
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
     #[test]
     fn pool_knobs_build_clean() {
         let config = HttpClientConfig::default()
@@ -1373,17 +1418,20 @@ mod tests {
         assert!(config.build().is_ok());
     }
 
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
     #[test]
     fn tcp_nodelay_default_is_true() {
         assert!(HttpClientConfig::default().tcp_nodelay);
     }
 
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
     #[test]
     fn with_tcp_nodelay_can_disable() {
         let config = HttpClientConfig::default().with_tcp_nodelay(false);
         assert!(!config.tcp_nodelay);
     }
 
+    #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
     #[test]
     fn injected_client_ignores_pool_knobs() {
         let shared = reqwest::Client::new();

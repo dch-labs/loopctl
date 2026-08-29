@@ -951,10 +951,11 @@ impl SseReader {
 
     /// Parse the accumulated `data` string into JSON, logging on failure.
     ///
-    /// Returns `None` for empty payloads and unparseable JSON; a parse
-    /// failure logs the event type and payload size at `warn` and skips
-    /// the event rather than failing the stream — one malformed chunk
-    /// must not drop the turns around it.
+    /// Returns `None` for empty payloads and unparseable JSON, `Some`
+    /// otherwise; a parse failure logs the event type and payload size
+    /// at `warn`. What an absent payload means — ignored, defaulted, or
+    /// fatal — is decided by the handlers that consume
+    /// [`next_event`](Self::next_event)'s `Option<Value>`, not here.
     fn parse_event_data(data: &str, event_type: &str) -> Option<Value> {
         if data.is_empty() {
             return None;

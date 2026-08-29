@@ -47,13 +47,41 @@ pub enum BedrockPath {
     Converse,
 }
 
+/// The `SigV4` signing triple for one credential generation.
+///
+/// Swapped as a unit (never field-by-field) so every request signs
+/// with a key id and secret from the same generation — a mixed pair
+/// fails signature verification on every call.
+#[derive(Clone)]
+struct Credentials {
+    /// The IAM access key id.
+    ///
+    /// Identifies the credentials that sign each request.
+    access_key_id: String,
+
+    /// The IAM secret access key.
+    ///
+    /// Used for `SigV4` signing only; never sent on the wire.
+    secret_access_key: String,
+
+    /// The optional STS / role session token.
+    ///
+    /// Included in the signed headers when present; rotates together
+    /// with the pair because temporary credentials bind all three.
+    session_token: Option<String>,
+}
+
 /// An AWS Bedrock chat client with streaming support, SigV4-authenticated.
 ///
 /// Implements [`ApiClient`] by routing through the Bedrock runtime.
 /// Credentials are signed with AWS Signature Version 4 — there is no
-/// bearer API key. They are fixed at build time: rotating keys (an
-/// IRSA/SSO role refresh, say) means building a new client, while the
-/// model remains mutable per request via [`set_model`](ApiClient::set_model).
+/// bearer API key. The model is mutable per request via
+/// [`set_model`](ApiClient::set_model), and the credential triple can
+/// be swapped atomically on a live client via
+/// [`set_credentials`](Self::set_credentials) for short-lived
+/// STS/IRSA-style credentials; each request signs with a single
+/// consistent snapshot, so an in-flight request never sees a torn
+/// pair.
 ///
 /// # Construction
 ///
@@ -78,20 +106,21 @@ pub struct BedrockClient {
     /// Determines the endpoint host (`bedrock-runtime.{region}.amazonaws.com`).
     region: String,
 
-    /// The IAM access key id.
+    /// The `SigV4` credential triple, swappable as one unit.
     ///
-    /// Identifies the credentials that sign each request.
-    access_key_id: String,
+    /// Held behind a lock so [`set_credentials`](Self::set_credentials)
+    /// can rotate short-lived STS/IRSA credentials on a live client:
+    /// readers take a snapshot of the whole triple, so key id and
+    /// secret are always from the same generation. Category 1 poison
+    /// policy (single-struct swap).
+    credentials: std::sync::RwLock<Credentials>,
 
-    /// The IAM secret access key.
+    /// The output-token budget sent with every request.
     ///
-    /// Used for `SigV4` signing only; never sent on the wire.
-    secret_access_key: String,
-
-    /// Optional STS / role session token.
-    ///
-    /// Included in the signed headers when present.
-    session_token: Option<String>,
+    /// Defaults to the engine-wide shared constant; models whose own
+    /// cap is lower (Claude 3 Haiku and Sonnet at 4096) reject a budget
+    /// above their cap, so set it per client when targeting those.
+    max_tokens: u32,
 
     /// The current Bedrock model id.
     ///
@@ -116,9 +145,9 @@ pub struct BedrockClient {
 
 /// Builder for [`BedrockClient`].
 ///
-/// Collects the AWS credentials, region, model, and optional path
-/// override; [`build`](Self::build) validates that the required fields
-/// are present and non-empty. The invoke path itself is derived per
+/// Collects the AWS credentials, region, model, optional path override,
+/// and optional output-token budget; [`build`](Self::build) validates
+/// that the required fields are present and non-empty. The invoke path itself is derived per
 /// request from the current model id unless the override pins it (see
 /// [`set_model`](ApiClient::set_model), which the path follows).
 #[derive(Debug, Default)]
@@ -156,6 +185,12 @@ pub struct BedrockClientBuilder {
     /// model id via [`auto_path`]; when set, the path is pinned
     /// regardless of model.
     path: Option<BedrockPath>,
+
+    /// The output-token budget override, if set.
+    ///
+    /// When absent, requests carry the engine-wide shared default;
+    /// set it below that for models whose own cap is lower.
+    max_tokens: Option<u32>,
 }
 
 impl BedrockClientBuilder {
@@ -216,6 +251,19 @@ impl BedrockClientBuilder {
         self
     }
 
+    /// Set the output-token budget sent with every request.
+    ///
+    /// Defaults to the engine-wide shared constant. Models whose own
+    /// cap is lower — Claude 3 Haiku and Sonnet at 4096 — reject a
+    /// budget above their cap, so configure it per client when
+    /// targeting those. A zero budget is rejected at
+    /// [`build`](Self::build).
+    #[must_use]
+    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
@@ -228,14 +276,26 @@ impl BedrockClientBuilder {
         let access_key_id = require_non_empty("access_key_id", self.access_key_id)?;
         let secret_access_key = require_non_empty("secret_access_key", self.secret_access_key)?;
         let model = require_non_empty("model", self.model)?;
+        let max_tokens = match self.max_tokens {
+            None => crate::provider::anthropic::DEFAULT_MAX_TOKENS,
+            Some(0) => {
+                return Err(ApiError::config_validation(
+                    "bedrock: max_tokens must be greater than zero",
+                ));
+            }
+            Some(max) => max,
+        };
         let http = crate::provider::HttpClientConfig::default()
             .build()
             .map_err(|e| ApiError::config(format!("bedrock: HTTP client: {e}")))?;
         Ok(BedrockClient {
             region,
-            access_key_id,
-            secret_access_key,
-            session_token: self.session_token,
+            credentials: std::sync::RwLock::new(Credentials {
+                access_key_id,
+                secret_access_key,
+                session_token: self.session_token,
+            }),
+            max_tokens,
             model: Mutex::new(model),
             path: self.path,
             http,
@@ -796,8 +856,11 @@ fn parse_headers(bytes: &[u8]) -> Vec<(String, String)> {
 /// sent empty — Anthropic's schema rejects an empty `tools` array, so
 /// the default no-tools request must not carry one. Messages with no
 /// parts are dropped: they would serialize to an empty content array
-/// the API rejects.
-fn anthropic_body(request: &StreamRequest) -> serde_json::Value {
+/// the API rejects. The output budget comes from the client's
+/// [`max_tokens`](BedrockClientBuilder::max_tokens) setting — models
+/// whose own cap is lower (Claude 3 Haiku and Sonnet at 4096) reject a
+/// budget above it, so configure it per client for those.
+fn anthropic_body(request: &StreamRequest, max_tokens: u32) -> serde_json::Value {
     let (messages, system) =
         crate::provider::fold_system_messages(&request.messages, request.system.as_deref());
     let converted: Vec<serde_json::Value> = messages
@@ -807,7 +870,7 @@ fn anthropic_body(request: &StreamRequest) -> serde_json::Value {
         .collect();
     let mut body = serde_json::json!({
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": crate::provider::anthropic::DEFAULT_MAX_TOKENS,
+        "max_tokens": max_tokens,
         "messages": converted,
     });
     if let Some(obj) = body.as_object_mut() {
@@ -835,8 +898,12 @@ fn anthropic_body(request: &StreamRequest) -> serde_json::Value {
 /// list of text blocks, and tools a `toolConfig` of `toolSpec`
 /// entries. Fields the request doesn't exercise (system, `toolConfig`)
 /// are omitted rather than sent empty, and messages with no parts are
-/// dropped — an empty `content` array fails Converse validation.
-fn converse_body(request: &StreamRequest) -> serde_json::Value {
+/// dropped — an empty `content` array fails Converse validation. The
+/// output budget comes from the client's
+/// [`max_tokens`](BedrockClientBuilder::max_tokens) setting — models
+/// whose own cap is lower reject a budget above it, so configure it
+/// per client for those.
+fn converse_body(request: &StreamRequest, max_tokens: u32) -> serde_json::Value {
     let (messages, system) =
         crate::provider::fold_system_messages(&request.messages, request.system.as_deref());
     let converted: Vec<serde_json::Value> = messages
@@ -847,7 +914,7 @@ fn converse_body(request: &StreamRequest) -> serde_json::Value {
     let mut body = serde_json::json!({
         "messages": converted,
         "inferenceConfig": {
-            "maxTokens": crate::provider::anthropic::DEFAULT_MAX_TOKENS,
+            "maxTokens": max_tokens,
         },
     });
     if let Some(obj) = body.as_object_mut() {
@@ -1299,12 +1366,8 @@ impl std::fmt::Debug for BedrockClient {
             .field("region", &self.region)
             .field("model", &self.model)
             .field("path", &self.path)
-            .field("access_key_id", &"<redacted>")
-            .field("secret_access_key", &"<redacted>")
-            .field(
-                "session_token",
-                &self.session_token.as_ref().map(|_| "<redacted>"),
-            )
+            .field("max_tokens", &self.max_tokens)
+            .field("credentials", &"<redacted>")
             .finish_non_exhaustive()
     }
 }
@@ -1359,6 +1422,45 @@ impl BedrockClient {
         crate::error::recover_guard(self.model.lock()).clone()
     }
 
+    /// Swap the `SigV4` credential triple on a live client.
+    ///
+    /// For short-lived credentials (STS assumed roles, EKS IRSA, SSO
+    /// sessions) whose lifetime is shorter than the process: the swap
+    /// replaces key id, secret, and session token as one unit, so a
+    /// request signing concurrently with the swap sees one consistent
+    /// generation, never a mixed pair. A rejected swap (empty values)
+    /// leaves the previous credentials in place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError`] (classified `ConfigMissing`) when the key
+    /// id or secret is empty.
+    pub fn set_credentials(
+        &self,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        session_token: Option<String>,
+    ) -> Result<(), ApiError> {
+        let access_key_id = require_non_empty("access_key_id", Some(access_key_id.into()))?;
+        let secret_access_key =
+            require_non_empty("secret_access_key", Some(secret_access_key.into()))?;
+        *crate::error::recover_guard(self.credentials.write()) = Credentials {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        };
+        Ok(())
+    }
+
+    /// Snapshot the current credential generation.
+    ///
+    /// One clone under the read lock; request paths sign with this
+    /// snapshot so an entire request belongs to a single generation
+    /// even if credentials rotate mid-flight.
+    fn credentials(&self) -> Credentials {
+        crate::error::recover_guard(self.credentials.read()).clone()
+    }
+
     /// The Bedrock runtime host for the configured region.
     ///
     /// `bedrock-runtime.{region}.amazonaws.com` — the value both the
@@ -1385,13 +1487,14 @@ impl BedrockClient {
     ///
     /// Returns [`ApiError`] on transport failure.
     async fn signed_post(&self, url: &str, body: &[u8]) -> Result<reqwest::Response, ApiError> {
+        let credentials = self.credentials();
         let request = apply_sigv4(
             self.http.post(url),
             url,
             &self.region,
-            &self.access_key_id,
-            &self.secret_access_key,
-            self.session_token.as_deref(),
+            &credentials.access_key_id,
+            &credentials.secret_access_key,
+            credentials.session_token.as_deref(),
             body,
         )?;
         request
@@ -1428,15 +1531,13 @@ impl ApiClient for BedrockClient {
         let model = self.model();
         let path = self.effective_path(&model);
         let body = match path {
-            BedrockPath::Anthropic => anthropic_body(request),
-            BedrockPath::Converse => converse_body(request),
+            BedrockPath::Anthropic => anthropic_body(request, self.max_tokens),
+            BedrockPath::Converse => converse_body(request, self.max_tokens),
         };
         let url = stream_url(&self.region, &model, path);
         let client = self.http.clone();
         let region = self.region.clone();
-        let access_key_id = self.access_key_id.clone();
-        let secret = self.secret_access_key.clone();
-        let session_token = self.session_token.clone();
+        let credentials = self.credentials();
 
         Box::pin(async_stream::try_stream! {
             let bytes = serde_json::to_vec(&body)
@@ -1445,9 +1546,9 @@ impl ApiClient for BedrockClient {
                 client.post(&url),
                 &url,
                 &region,
-                &access_key_id,
-                &secret,
-                session_token.as_deref(),
+                &credentials.access_key_id,
+                &credentials.secret_access_key,
+                credentials.session_token.as_deref(),
                 &bytes,
             )?;
             let response = req
@@ -1491,8 +1592,8 @@ impl ApiClient for BedrockClient {
         let model = self.model();
         let path = self.effective_path(&model);
         let body = match path {
-            BedrockPath::Anthropic => anthropic_body(request),
-            BedrockPath::Converse => converse_body(request),
+            BedrockPath::Anthropic => anthropic_body(request, self.max_tokens),
+            BedrockPath::Converse => converse_body(request, self.max_tokens),
         };
         let url = invoke_url(&self.region, &model, path);
         Box::pin(async move {
@@ -1630,6 +1731,9 @@ mod tests {
     #![allow(clippy::duration_suboptimal_units)]
     use super::*;
     use crate::message::{Message, MessagePart};
+
+    /// The default budget body-builder tests exercise.
+    const BUDGET: u32 = crate::provider::anthropic::DEFAULT_MAX_TOKENS;
     /// Build one event-stream frame (for tests).
     #[allow(clippy::cast_possible_truncation, clippy::unreadable_literal)]
     fn build_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
@@ -1928,7 +2032,7 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
             }]),
         };
-        let body = anthropic_body(&request);
+        let body = anthropic_body(&request, BUDGET);
         assert_eq!(body["system"], "be terse");
         assert_eq!(body["anthropic_version"], "bedrock-2023-05-31");
         assert!(body["tools"].is_array());
@@ -1941,7 +2045,7 @@ mod tests {
             system: Some("sys".to_string()),
             tools: None,
         };
-        let body = converse_body(&request);
+        let body = converse_body(&request, BUDGET);
         assert_eq!(
             body["messages"][0],
             serde_json::json!({"role": "user", "content": [{"text": "hello"}]}),
@@ -1979,7 +2083,7 @@ mod tests {
             system: None,
             tools: None,
         };
-        let body = converse_body(&request);
+        let body = converse_body(&request, BUDGET);
         let blocks = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 2, "mixed parts become ordered blocks");
         assert_eq!(blocks[0]["text"], "thinking out loud");
@@ -2017,7 +2121,7 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
             }]),
         };
-        let body = converse_body(&with_tools);
+        let body = converse_body(&with_tools, BUDGET);
         assert_eq!(
             body["toolConfig"]["tools"][0]["toolSpec"],
             serde_json::json!({
@@ -2027,7 +2131,7 @@ mod tests {
             })
         );
 
-        let without = converse_body(&StreamRequest::new(vec![Message::user("hi")]));
+        let without = converse_body(&StreamRequest::new(vec![Message::user("hi")]), BUDGET);
         assert!(
             without.get("toolConfig").is_none(),
             "no tools → no toolConfig: {without}"
@@ -2423,17 +2527,20 @@ mod tests {
             system: None,
             tools: None,
         };
-        let body = converse_body(&request);
+        let body = converse_body(&request, BUDGET);
         assert!(
             body.get("system").is_none(),
             "no system → field omitted: {body}"
         );
 
-        let blank = converse_body(&StreamRequest {
-            messages: vec![Message::user("hello")],
-            system: Some(String::new()),
-            tools: None,
-        });
+        let blank = converse_body(
+            &StreamRequest {
+                messages: vec![Message::user("hello")],
+                system: Some(String::new()),
+                tools: None,
+            },
+            BUDGET,
+        );
         assert!(
             blank.get("system").is_none(),
             "empty-string system is dropped, not an empty text block: {blank}"
@@ -2443,7 +2550,7 @@ mod tests {
     #[test]
     fn anthropic_body_without_system_or_tools_minimizes() {
         let request = StreamRequest::new(vec![Message::user("hi")]);
-        let body = anthropic_body(&request);
+        let body = anthropic_body(&request, BUDGET);
         assert!(
             body.get("system").is_none(),
             "no system → field omitted, not null: {body}"
@@ -2470,21 +2577,21 @@ mod tests {
             system: Some("override".to_string()),
             tools: None,
         };
-        let anthropic = anthropic_body(&request);
+        let anthropic = anthropic_body(&request, BUDGET);
         assert_eq!(
             anthropic["system"], "override\nbe terse",
             "inline system messages join the top-level system, direct-path style"
         );
         assert_eq!(anthropic["messages"].as_array().map(Vec::len), Some(1));
 
-        let converse = converse_body(&request);
+        let converse = converse_body(&request, BUDGET);
         assert_eq!(converse["system"][0]["text"], "override\nbe terse");
         assert_eq!(converse["messages"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]
     fn converse_body_uses_the_shared_token_budget() {
-        let body = converse_body(&StreamRequest::new(vec![Message::user("hi")]));
+        let body = converse_body(&StreamRequest::new(vec![Message::user("hi")]), BUDGET);
         assert_eq!(
             body["inferenceConfig"]["maxTokens"],
             crate::provider::anthropic::DEFAULT_MAX_TOKENS
@@ -3158,6 +3265,273 @@ mod tests {
     }
 
     #[test]
+    fn set_credentials_swaps_for_new_requests() {
+        let client = BedrockClientBuilder::default()
+            .region("us-east-1")
+            .access_key_id("k1")
+            .secret_access_key("s1")
+            .model("m")
+            .build()
+            .unwrap();
+        let creds = client.credentials();
+        assert_eq!(creds.access_key_id, "k1");
+        assert_eq!(creds.secret_access_key, "s1");
+        assert!(creds.session_token.is_none());
+
+        client
+            .set_credentials("k2", "s2", Some("t2".to_string()))
+            .unwrap();
+        let creds = client.credentials();
+        assert_eq!(creds.access_key_id, "k2");
+        assert_eq!(creds.secret_access_key, "s2");
+        assert_eq!(creds.session_token.as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn set_credentials_clears_the_session_token() {
+        let client = BedrockClientBuilder::default()
+            .region("us-east-1")
+            .access_key_id("k1")
+            .secret_access_key("s1")
+            .session_token("t1")
+            .model("m")
+            .build()
+            .unwrap();
+        assert_eq!(client.credentials().session_token.as_deref(), Some("t1"));
+
+        client.set_credentials("k2", "s2", None).unwrap();
+        assert!(
+            client.credentials().session_token.is_none(),
+            "a rotation without a token clears the old one — temporary \
+             credentials bind all three values to one generation"
+        );
+    }
+
+    #[test]
+    fn concurrent_set_credentials_leave_a_matched_pair() {
+        use std::sync::Arc;
+
+        let client = Arc::new(
+            BedrockClientBuilder::default()
+                .region("us-east-1")
+                .access_key_id("k0")
+                .secret_access_key("s0")
+                .model("m")
+                .build()
+                .unwrap(),
+        );
+        let mut writers = Vec::new();
+        for i in 1..=8 {
+            let writer = Arc::clone(&client);
+            writers.push(std::thread::spawn(move || {
+                writer
+                    .set_credentials(format!("k{i}"), format!("s{i}"), None)
+                    .unwrap();
+            }));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let creds = client.credentials();
+        let generation = creds.access_key_id.strip_prefix('k').unwrap_or_default();
+        assert_eq!(
+            creds.secret_access_key,
+            format!("s{generation}"),
+            "racing writers serialize — the final state is one whole generation"
+        );
+    }
+
+    #[test]
+    fn credentials_recover_from_lock_poison() {
+        let client = BedrockClientBuilder::default()
+            .region("us-east-1")
+            .access_key_id("k0")
+            .secret_access_key("s0")
+            .model("m")
+            .build()
+            .unwrap();
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = client.credentials.write().unwrap();
+            panic!("poison the credentials lock");
+        }));
+        std::panic::set_hook(previous_hook);
+        assert!(poisoned.is_err(), "the lock is now poisoned");
+
+        assert_eq!(
+            client.credentials().access_key_id,
+            "k0",
+            "Category 1 policy: snapshots recover from poison"
+        );
+        client.set_credentials("k9", "s9", None).unwrap();
+        assert_eq!(
+            client.credentials().access_key_id,
+            "k9",
+            "so do swaps — a poisoned lock degrades nothing here"
+        );
+    }
+
+    #[test]
+    fn builder_full_configuration_composes() {
+        let client = BedrockClientBuilder::default()
+            .region("us-gov-west-1")
+            .access_key_id("k")
+            .secret_access_key("s")
+            .session_token("t")
+            .model("anthropic.claude-v1:0")
+            .path(BedrockPath::Converse)
+            .max_tokens(1024)
+            .build()
+            .unwrap();
+        assert_eq!(client.max_tokens, 1024);
+        assert_eq!(
+            client.effective_path("anthropic.claude-v1:0"),
+            BedrockPath::Converse,
+            "the override pins the path over the model's own prefix"
+        );
+        assert_eq!(client.model(), "anthropic.claude-v1:0");
+        assert_eq!(
+            client.base_url(),
+            "https://bedrock-runtime.us-gov-west-1.amazonaws.com"
+        );
+        assert_eq!(client.credentials().session_token.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn set_credentials_validates_non_empty_values() {
+        let client = BedrockClientBuilder::default()
+            .region("us-east-1")
+            .access_key_id("k")
+            .secret_access_key("s")
+            .model("m")
+            .build()
+            .unwrap();
+
+        let Err(err) = client.set_credentials("", "s", None) else {
+            panic!("an empty access key id must fail the swap");
+        };
+        assert!(err.to_string().contains("access_key_id"), "{err}");
+        assert_eq!(
+            err.code(),
+            crate::api::error::ErrorCode::ConfigMissing,
+            "{err}"
+        );
+
+        let Err(err) = client.set_credentials("k", "", None) else {
+            panic!("an empty secret must fail the swap");
+        };
+        assert!(err.to_string().contains("secret_access_key"), "{err}");
+        // the previous credentials survive a rejected swap
+        assert_eq!(client.credentials().access_key_id, "k");
+    }
+
+    #[test]
+    fn set_credentials_swaps_never_expose_torn_pairs() {
+        use std::sync::Arc;
+
+        let client = Arc::new(
+            BedrockClientBuilder::default()
+                .region("us-east-1")
+                .access_key_id("k0")
+                .secret_access_key("s0")
+                .model("m")
+                .build()
+                .unwrap(),
+        );
+        let mut readers = Vec::new();
+        for _ in 0..3 {
+            let reader = Arc::clone(&client);
+            readers.push(std::thread::spawn(move || {
+                for _ in 0..3000 {
+                    let creds = reader.credentials();
+                    assert!(
+                        creds.access_key_id.starts_with('k')
+                            && creds.secret_access_key.starts_with('s')
+                            && creds.access_key_id[1..] == creds.secret_access_key[1..],
+                        "torn pair observed: {:?} / {:?}",
+                        creds.access_key_id,
+                        creds.secret_access_key
+                    );
+                }
+            }));
+        }
+        for i in 1..=100 {
+            client
+                .set_credentials(format!("k{i}"), format!("s{i}"), None)
+                .unwrap();
+        }
+        for reader in readers {
+            reader.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn debug_output_redacts_all_credentials() {
+        let client = BedrockClientBuilder::default()
+            .region("us-east-1")
+            .access_key_id("AKIA_SECRETTOKEN")
+            .secret_access_key("wJalrXUtnFEMI_SUPERSECRET")
+            .session_token("SESSION_SUPERSECRET")
+            .model("m")
+            .build()
+            .unwrap();
+        let debug = format!("{client:?}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        for secret in [
+            "AKIA_SECRETTOKEN",
+            "wJalrXUtnFEMI_SUPERSECRET",
+            "SESSION_SUPERSECRET",
+        ] {
+            assert!(!debug.contains(secret), "{debug}");
+        }
+    }
+
+    #[test]
+    fn builder_max_tokens_defaults_to_the_engine_constant() {
+        let client = BedrockClientBuilder::default()
+            .region("us-east-1")
+            .access_key_id("k")
+            .secret_access_key("s")
+            .model("m")
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.max_tokens,
+            crate::provider::anthropic::DEFAULT_MAX_TOKENS
+        );
+    }
+
+    #[test]
+    fn builder_rejects_zero_max_tokens() {
+        let err = BedrockClientBuilder::default()
+            .region("us-east-1")
+            .access_key_id("k")
+            .secret_access_key("s")
+            .model("m")
+            .max_tokens(0)
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("max_tokens"), "{err}");
+        assert_eq!(
+            err.code(),
+            crate::api::error::ErrorCode::ConfigValidationError,
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bodies_honor_the_configured_token_budget() {
+        let request = StreamRequest::new(vec![Message::user("hi")]);
+        assert_eq!(anthropic_body(&request, 512)["max_tokens"], 512);
+        assert_eq!(
+            converse_body(&request, 512)["inferenceConfig"]["maxTokens"],
+            512
+        );
+    }
+
+    #[test]
     fn builder_rejects_non_aws_region_shapes() {
         for bad in [
             "x.evil.com",
@@ -3202,13 +3576,13 @@ mod tests {
             system: None,
             tools: None,
         };
-        let anthropic = anthropic_body(&request);
+        let anthropic = anthropic_body(&request, BUDGET);
         assert_eq!(
             anthropic["messages"].as_array().map(Vec::len),
             Some(1),
             "zero-part messages must not serialize to an empty content array"
         );
-        let converse = converse_body(&request);
+        let converse = converse_body(&request, BUDGET);
         assert_eq!(converse["messages"].as_array().map(Vec::len), Some(1));
         assert_eq!(
             converse["messages"][0]["content"].as_array().map(Vec::len),

@@ -3916,7 +3916,9 @@ mod tests {
         .unwrap();
         emitter.process_chunk(&chunk);
         let _ = emitter.drain();
-        let events = emitter.finish().unwrap_or_default();
+        let events = emitter
+            .finish()
+            .expect("finish without a recorded error must be Ok");
         assert!(
             !events.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
             "a bare EOF never masquerades as a clean completion"

@@ -3887,12 +3887,18 @@ mod tests {
             crate::structured::RequestOptions::default(),
             &cancel,
         );
+        let mut events_seen = 0usize;
         while let Some(item) = stream.next().await {
+            events_seen += 1;
             assert!(
                 !matches!(item.expect("clean stream item"), HandlerEvent::AttemptReset),
                 "a clean first attempt never announces a reset"
             );
         }
+        assert!(
+            events_seen > 0,
+            "the silence assertion only counts on a stream that produced events"
+        );
     }
 
     #[tokio::test]

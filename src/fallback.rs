@@ -231,11 +231,13 @@ impl FallbackEntry {
         self.attempt_count = self.attempt_count.saturating_add(1);
     }
 
-    /// Clear all recorded attempts, resetting [`failed`](Self::failed)
-    /// to `false`.
+    /// Clear all recorded attempts.
     ///
-    /// The availability flag set by [`set_available`](Self::set_available)
-    /// is untouched — a manual re-enable and an attempt reset are
+    /// Drops the count to zero, so the attempt side of
+    /// [`failed`](Self::failed) no longer reports the entry as failed.
+    /// An entry separately disabled via
+    /// [`set_available`](Self::set_available) stays failed — that flag
+    /// is untouched here; a manual re-enable and an attempt reset are
     /// separate operations.
     pub(crate) fn clear_attempts(&mut self) {
         self.attempt_count = 0;

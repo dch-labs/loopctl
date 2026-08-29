@@ -644,9 +644,15 @@ mod tests {
                 .unwrap(),
             "precondition: the breaker trips"
         );
+        let mut last_pattern = DetectedPattern::NoPattern;
         for _ in 0..8 {
-            let _ = managers.detection().record_tool_call("grep", 7).unwrap();
+            last_pattern = managers.detection().record_tool_call("grep", 7).unwrap();
         }
+        assert!(
+            matches!(last_pattern, DetectedPattern::LoopDetected { .. }),
+            "precondition: repeated identical calls raised a loop pattern \
+             (default loop_threshold is 3)"
+        );
 
         managers.reset_all().unwrap();
 

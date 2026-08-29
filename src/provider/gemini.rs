@@ -2534,6 +2534,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hello\n".into(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "data: hello");
@@ -2545,6 +2546,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "partial".into(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert!(reader.take_line().unwrap().is_none());
@@ -2555,6 +2557,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "line1\nline2\n".into(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "line1");
@@ -2566,6 +2569,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hi\r\n".into(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "data: hi");
@@ -2611,6 +2615,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: {\"candidates\":[]}\n\n".to_string().into_bytes(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert_eq!(
@@ -2629,6 +2634,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let result = reader.next_gemini_data().await.unwrap();
@@ -2645,6 +2651,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         // First call should skip malformed and return the valid one.
@@ -2661,6 +2668,7 @@ mod tests {
         let mut reader = super::SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let result = reader.next_gemini_data().await;
@@ -3502,6 +3510,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let parsed = reader
@@ -3696,6 +3705,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let parsed = reader

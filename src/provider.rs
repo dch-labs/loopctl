@@ -565,9 +565,6 @@ const ZAI_BASE_URL: &str = "https://api.z.ai/api/anthropic";
 #[cfg(feature = "zai")]
 const ZAI_DEFAULT_MODEL: &str = "glm-4.7";
 
-#[cfg(feature = "azure")]
-const AZURE_DEFAULT_MODEL: &str = "gpt-4o";
-
 #[cfg(feature = "moonshot")]
 const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 
@@ -595,6 +592,9 @@ fn env_or_default(name: &str, default: &str) -> String {
 }
 
 /// Read a primary env var, falling back to a secondary if unset.
+///
+/// Returns `None` only when neither variable is set; providers use
+/// this for key aliases (e.g. `XAI_API_KEY` or `GROK_API_KEY`).
 #[cfg(any(
     feature = "deepseek",
     feature = "grok",
@@ -743,10 +743,10 @@ pub fn deepseek() -> Result<OpenAiClient, ApiError> {
 ///
 /// The v1 surface (`https://{resource}.openai.azure.com/openai/v1`)
 /// speaks the OpenAI wire format with standard Bearer auth. Reads
-/// `AZURE_OPENAI_API_KEY` (required) and optionally
-/// `AZURE_OPENAI_MODEL` (defaults to `gpt-4o`; on the v1 surface the
-/// model name identifies the deployment). The legacy
-/// deployment-URL scheme is not supported.
+/// `AZURE_OPENAI_API_KEY` (required) and `AZURE_OPENAI_MODEL`
+/// (required — set it to the deployment name configured in the Azure
+/// OpenAI resource; on the v1 surface the model name identifies the
+/// deployment). The legacy deployment-URL scheme is not supported.
 ///
 /// # Example
 ///
@@ -758,17 +758,34 @@ pub fn deepseek() -> Result<OpenAiClient, ApiError> {
 ///
 /// # Errors
 ///
-/// Returns [`ApiError`] if no API key is found.
+/// Returns [`ApiError`] if no API key is found, the resource name is
+/// invalid, or `AZURE_OPENAI_MODEL` is not set.
 #[cfg(feature = "azure")]
 pub fn azure(resource: impl AsRef<str>) -> Result<OpenAiClient, ApiError> {
+    let resource = resource.as_ref();
+    if resource.is_empty()
+        || !resource
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(ApiError::config(format!(
+            "azure: resource name {resource:?} contains invalid characters; \
+             expected alphanumeric and hyphens only"
+        )));
+    }
     let api_key = require_api_key("AZURE_OPENAI_API_KEY", None)?;
-    let model = env_or_default("AZURE_OPENAI_MODEL", AZURE_DEFAULT_MODEL);
-    let base = format!("https://{}.openai.azure.com/openai/v1", resource.as_ref());
+    let deployment = std::env::var("AZURE_OPENAI_MODEL").map_err(|_| {
+        ApiError::config(
+            "azure: AZURE_OPENAI_MODEL is required — set it to the deployment \
+             name configured in your Azure OpenAI resource",
+        )
+    })?;
+    let base = format!("https://{resource}.openai.azure.com/openai/v1");
 
     OpenAiClient::builder()
         .with_api_key(api_key)
         .with_base_url(base)
-        .with_model(model)
+        .with_model(deployment)
         .build()
 }
 
@@ -896,8 +913,81 @@ pub fn self_hosted(base_url: &str, model: &str) -> Result<OpenAiClient, ApiError
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[cfg(feature = "testing")]
     use crate::testing::EnvGuard;
+
+    #[cfg(feature = "azure")]
+    #[test]
+    fn azure_rejects_invalid_resource_names() {
+        for bad in ["", "under_score", "sp ace", "res.name", "res!name"] {
+            let Err(err) = azure(bad) else {
+                panic!("validation runs before any env access: {bad:?} accepted");
+            };
+            assert!(
+                err.to_string().contains("invalid characters"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "azure", feature = "testing"))]
+    #[test]
+    fn azure_builds_the_v1_client_from_env() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_MODEL"]);
+        env.set("AZURE_OPENAI_API_KEY", "key");
+        env.set("AZURE_OPENAI_MODEL", "my-deployment");
+        let client = azure("my-resource").unwrap();
+        assert_eq!(
+            client.base_url(),
+            "https://my-resource.openai.azure.com/openai/v1"
+        );
+        assert_eq!(client.model(), "my-deployment");
+    }
+
+    #[cfg(all(feature = "azure", feature = "testing"))]
+    #[test]
+    fn azure_requires_key_and_model() {
+        let env = EnvGuard::acquire(&["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_MODEL"]);
+        env.set("AZURE_OPENAI_API_KEY", "key");
+        env.remove("AZURE_OPENAI_MODEL");
+        let Err(err) = azure("res") else {
+            panic!("missing AZURE_OPENAI_MODEL must fail the build");
+        };
+        assert!(err.to_string().contains("AZURE_OPENAI_MODEL"), "{err}");
+
+        env.remove("AZURE_OPENAI_API_KEY");
+        let Err(err) = azure("res") else {
+            panic!("missing AZURE_OPENAI_API_KEY must fail the build");
+        };
+        assert!(err.to_string().contains("AZURE_OPENAI_API_KEY"), "{err}");
+    }
+
+    #[cfg(all(feature = "moonshot", feature = "testing"))]
+    #[test]
+    fn moonshot_builds_client_and_defaults_model() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["MOONSHOT_API_KEY", "MOONSHOT_MODEL"]);
+        env.set("MOONSHOT_API_KEY", "key");
+        env.remove("MOONSHOT_MODEL");
+        let client = moonshot().unwrap();
+        assert_eq!(client.base_url(), "https://api.moonshot.ai/v1");
+        assert_eq!(client.model(), MOONSHOT_DEFAULT_MODEL);
+
+        env.set("MOONSHOT_MODEL", "custom");
+        assert_eq!(moonshot().unwrap().model(), "custom");
+    }
+
+    #[cfg(all(feature = "moonshot", feature = "testing"))]
+    #[test]
+    fn moonshot_requires_key() {
+        let env = EnvGuard::acquire(&["MOONSHOT_API_KEY"]);
+        env.remove("MOONSHOT_API_KEY");
+        assert!(moonshot().is_err());
+    }
 
     #[cfg(any(
         feature = "ollama",

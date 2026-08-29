@@ -1205,7 +1205,7 @@ fn http_status_is_retryable(msg: &str) -> bool {
 /// Returns `None` for anything unparseable. This is the single parser shared
 /// by the provider clients (which read the header while the response is in
 /// hand) and the stream handler's detection for hand-built errors.
-#[cfg(any(feature = "streaming", feature = "providers"))]
+#[cfg(feature = "streaming")]
 pub(crate) fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1425,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(feature = "streaming", feature = "providers"))]
+    #[cfg(feature = "streaming")]
     fn parse_retry_after_delta_seconds() {
         assert_eq!(
             parse_retry_after("12"),
@@ -1439,14 +1439,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(feature = "streaming", feature = "providers"))]
+    #[cfg(feature = "streaming")]
     fn parse_retry_after_huge_value_parses_without_panicking() {
         let parsed = parse_retry_after("999999999999");
         assert!(parsed.is_some(), "huge value should parse, not panic");
     }
 
     #[test]
-    #[cfg(any(feature = "streaming", feature = "providers"))]
+    #[cfg(feature = "streaming")]
     fn parse_retry_after_garbage_returns_none() {
         assert_eq!(parse_retry_after("soon"), None);
         assert_eq!(parse_retry_after(""), None);

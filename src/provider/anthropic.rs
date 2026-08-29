@@ -39,7 +39,12 @@ use crate::tool::ToolSchema;
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const DEFAULT_MAX_TOKENS: u32 = 8192;
+/// The output-token budget used when a request carries none.
+///
+/// Shared by the direct Anthropic path and the Bedrock Anthropic-native
+/// path (and, as `maxTokens`, by Bedrock Converse) so switching between
+/// them never silently changes the output budget.
+pub(super) const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// An Anthropic Claude chat client with streaming support.
 ///
@@ -1081,7 +1086,10 @@ impl StreamEmitter {
     /// types are ignored. Any events produced are appended to the pending
     /// queue; an `error` event records the terminal error that
     /// [`finish`](Self::finish) surfaces.
-    fn process_event(&mut self, event_type: &str, data: Option<Value>) {
+    ///
+    /// Also the entry point for the Bedrock Anthropic path, whose
+    /// event-stream frame payloads are the same event objects.
+    pub(super) fn process_event(&mut self, event_type: &str, data: Option<Value>) {
         match event_type {
             "message_start" => self.on_message_start(data.as_ref()),
             "content_block_start" => self.on_block_start(data),
@@ -1453,7 +1461,7 @@ impl StreamEmitter {
     ///
     /// Returns the recorded terminal error, if an `event: error` arrived
     /// during the stream.
-    fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
+    pub(super) fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
         if let Some(err) = self.error.take() {
             return Err(err);
         }
@@ -1470,7 +1478,12 @@ impl StreamEmitter {
     }
 
     /// Drain all pending events.
-    fn drain(&mut self) -> Vec<StreamEvent> {
+    ///
+    /// Takes the queued events produced since the last drain — the
+    /// stream loop calls this after every `process_event` (and the
+    /// Bedrock path after every frame) so events yield promptly
+    /// instead of accumulating until stream end.
+    pub(super) fn drain(&mut self) -> Vec<StreamEvent> {
         std::mem::take(&mut self.pending)
     }
 
@@ -2226,6 +2239,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "event: ping\n".into(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "event: ping");
@@ -2237,6 +2251,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "partial".into(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert!(reader.take_line().unwrap().is_none());
@@ -2247,6 +2262,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "line1\nline2\n".into(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "line1");
@@ -2258,6 +2274,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hi\r\n".into(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "data: hi");
@@ -2280,6 +2297,7 @@ mod tests {
             buf: "event: message_start\ndata: {}\n\n"
                 .to_string()
                 .into_bytes(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert_eq!(
@@ -2298,6 +2316,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let result = reader.next_event().await.unwrap();
@@ -2315,6 +2334,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let result = reader.next_event().await.unwrap();
@@ -2340,6 +2360,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let result = reader.next_event().await.unwrap();
@@ -2356,6 +2377,7 @@ mod tests {
         let mut reader = super::SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let result = reader.next_event().await;
@@ -3199,6 +3221,7 @@ mod tests {
                 data.to_string().into(),
             )])),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let parsed = reader.next_event().await.expect("reader must not err");
@@ -3282,6 +3305,7 @@ mod tests {
                 data.to_string().into(),
             )])),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let parsed = reader.next_event().await.expect("reader must not err");
@@ -3504,6 +3528,7 @@ mod tests {
                 data.to_string().into(),
             )])),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let parsed = reader.next_event().await.expect("reader must not err");

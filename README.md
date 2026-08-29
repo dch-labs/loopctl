@@ -143,9 +143,9 @@ let agent = BareLoop::new(
 | Feature | Default | Depends on | Description |
 |---------|---------|------------|-------------|
 | `derive` | No | — | Re-exports `loopctl-derive`: `#[derive(Tool)]` generates the `Tool` impl (name, description, schema, dispatch) from a `Deserialize` input struct |
-| `azure` | No | — | Azure OpenAI via the v1 API — an `OpenAiClient` profile (`AZURE_OPENAI_API_KEY`, resource-named endpoint) |
-| `moonshot` | No | — | Moonshot AI (Kimi) — an `OpenAiClient` profile (`MOONSHOT_API_KEY`, `api.moonshot.ai`) |
-| `bedrock` | No | `hmac`, `sha2`, `hex` | AWS Bedrock (`BedrockClient`) — SigV4 auth, Anthropic-native + Converse paths, binary event-stream decoding |
+| `azure` | No | `providers`, `openai` | Azure OpenAI via the v1 API — an `OpenAiClient` profile (`AZURE_OPENAI_API_KEY`, resource-named endpoint) |
+| `moonshot` | No | `providers`, `openai` | Moonshot AI (Kimi) — an `OpenAiClient` profile (`MOONSHOT_API_KEY`, `api.moonshot.ai`) |
+| `bedrock` | No | `providers`, `streaming`, `anthropic`, `hmac`, `sha2`, `hex` | AWS Bedrock (`BedrockClient`) — SigV4 auth, Anthropic-native + Converse paths, binary event-stream decoding |
 | `hooks` | No | — | Bidirectional lifecycle hooks (allow/block/ask before tool use, compaction) |
 | `testing` | No | — | Mock clients, tools, and test fixtures |
 | `tool_health` | No | — | Per-tool health monitoring, circuit breakers, and self-healing routing |

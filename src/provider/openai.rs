@@ -3903,6 +3903,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn finish_without_done_marker_emits_no_message_stop() {
+        // A stream whose body ended without `data: [DONE]` must not
+        // complete cleanly: no MessageStop is emitted, so the handler
+        // reads the missing terminal as truncation and routes the turn
+        // through the failure ladder instead of committing it.
+        let mut emitter = super::StreamEmitter::default();
+        let chunk = super::OpenAiChunk::parse(
+            r#"{"id":"c1","model":"m","choices":[{"delta":{"content":"partial"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        emitter.process_chunk(&chunk);
+        let _ = emitter.drain();
+        let events = emitter.finish().unwrap_or_default();
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
+            "a bare EOF never masquerades as a clean completion"
+        );
+    }
+
     #[tokio::test]
     async fn compact_done_marker_terminates_the_stream() {
         let data = "data:[DONE]\n\n";

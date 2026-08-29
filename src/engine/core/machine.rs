@@ -1108,6 +1108,124 @@ mod tests {
     }
 
     #[test]
+    fn emergency_check_fires_even_with_auto_compact_disabled() {
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: false,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(250))]);
+        machine.set_context_tokens(96);
+        assert!(
+            matches!(machine.next_step(policy), MachineStep::Compact { .. }),
+            "the machine's 95% emergency check is not behind the auto_compact \
+             toggle — only the threshold line is"
+        );
+    }
+
+    #[test]
+    fn cancel_during_awaiting_compaction_yields_done_cancelled_not_compact() {
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: true,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(250))]);
+        let _ = machine.next_step(policy);
+        machine.model_response(tool_response("echo", &["echo"], 0), count_tokens(&machine));
+        let _ = machine.next_step(policy);
+        machine.tool_results(vec![Message::user(long_text(250))]);
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::Compact { .. }
+        ));
+        machine.cancel();
+        assert!(
+            matches!(
+                machine.next_step(test_policy(5)),
+                MachineStep::Done(MachineOutcome::Cancelled)
+            ),
+            "a cancel during AwaitingCompaction terminates the run — it does \
+             not run the compaction it was holding"
+        );
+    }
+
+    #[test]
+    fn fail_during_awaiting_tools_yields_done_failed() {
+        let mut machine = small_machine();
+        let _ = machine.next_step(test_policy(5));
+        machine.model_response(tool_response("search", &[], 10), 10);
+        assert!(matches!(
+            machine.next_step(test_policy(5)),
+            MachineStep::CallTools { .. }
+        ));
+        let err = LoopError::Api("dispatch exploded".to_string());
+        machine.fail(err.clone());
+        assert!(
+            matches!(
+                machine.next_step(test_policy(5)),
+                MachineStep::Done(MachineOutcome::Failed { error }) if error == err
+            ),
+            "a dispatch failure during AwaitingTools is terminal"
+        );
+    }
+
+    #[test]
+    fn inject_during_awaiting_model_is_consumed_after_the_in_flight_turn() {
+        let mut machine = small_machine();
+        let _ = machine.next_step(test_policy(5));
+        machine.inject(Message::user("interjected"));
+
+        machine.model_response(tool_response("echo", &["echo"], 0), count_tokens(&machine));
+        assert!(matches!(
+            machine.next_step(test_policy(5)),
+            MachineStep::CallTools { .. }
+        ));
+        machine.tool_results(vec![Message::user("tool-out")]);
+        assert!(
+            machine
+                .full_history()
+                .iter()
+                .any(|m| m.text_content() == "interjected"),
+            "the injection waited out the whole in-flight turn cycle"
+        );
+        assert!(matches!(
+            machine.next_step(test_policy(5)),
+            MachineStep::CallLLM { turn: 1 }
+        ));
+    }
+
+    #[test]
+    fn accept_input_on_a_terminal_machine_starts_a_clean_run() {
+        let mut machine = small_machine();
+        let _ = machine.next_step(test_policy(5));
+        machine.model_response(text_response("done", 10, 5), 15);
+        assert!(matches!(
+            machine.next_step(test_policy(5)),
+            MachineStep::Done(MachineOutcome::Completed { .. })
+        ));
+        assert!(machine.is_terminal());
+
+        machine.accept_input("fresh start");
+        assert!(
+            !machine.is_terminal(),
+            "accept_input resurrects the machine — a session runs many runs"
+        );
+        assert!(matches!(
+            machine.next_step(test_policy(5)),
+            MachineStep::CallLLM { turn: 0 }
+        ));
+        assert!(
+            machine
+                .full_history()
+                .iter()
+                .any(|m| m.text_content() == "fresh start")
+        );
+    }
+
+    #[test]
     fn fail_returns_done_failed_at_next_step() {
         let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));

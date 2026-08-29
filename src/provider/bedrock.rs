@@ -2716,6 +2716,53 @@ mod tests {
     }
 
     #[test]
+    fn signed_request_debug_never_shows_credential_values() {
+        let builder = apply_sigv4(
+            reqwest::Client::new()
+                .post("https://bedrock-runtime.us-east-1.amazonaws.com/model/m/invoke"),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/m/invoke",
+            "us-east-1",
+            "AKID",
+            "SECRET-MATERIAL",
+            Some("SESSION-SECRET-MATERIAL"),
+            b"{}",
+        )
+        .unwrap();
+        let request = builder.build().unwrap();
+        let debug = format!("{request:?}");
+        for secret in ["SECRET-MATERIAL", "SESSION-SECRET-MATERIAL"] {
+            assert!(
+                !debug.contains(secret),
+                "the built request's Debug output must never carry the \
+                 credential values (sensitive headers render redacted): {debug}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_header_error_message_carries_no_value() {
+        let err = apply_sigv4(
+            reqwest::Client::new()
+                .post("https://bedrock-runtime.us-east-1.amazonaws.com/model/m/invoke"),
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/m/invoke",
+            "us-east-1",
+            "AKID",
+            "SECRET-MATERIAL",
+            Some("TOKEN-SECRET-MATERIAL\ninvalid"),
+            b"{}",
+        )
+        .unwrap_err();
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        for (label, text) in [("display", &display), ("debug", &debug)] {
+            assert!(
+                !text.contains("TOKEN-SECRET-MATERIAL"),
+                "the error's {label} form must not echo the rejected value: {text}"
+            );
+        }
+    }
+
+    #[test]
     fn signed_request_marks_credential_headers_sensitive() {
         let builder = apply_sigv4(
             reqwest::Client::new()

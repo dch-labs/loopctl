@@ -622,6 +622,61 @@ mod tests {
     use crate::detection::{DetectedPattern, DetectionManager};
 
     #[test]
+    fn reset_all_clears_a_tripped_breaker_and_dirty_detection() {
+        use crate::detection::DetectedPattern;
+        use crate::fallback::{FailureKind, FallbackConfig, FallbackState};
+
+        let fallback = FallbackManager::for_model("primary")
+            .unwrap()
+            .with_config(FallbackConfig {
+                trip_threshold: 1,
+                recovery_successes_needed: 1,
+                ..FallbackConfig::default()
+            });
+        let managers = LoopManagers::new().with_fallback(fallback).with_detection(
+            crate::detection::DetectionManager::new().expect("valid detection config"),
+        );
+
+        assert!(
+            managers
+                .fallback()
+                .record_failure(FailureKind::Transient)
+                .unwrap(),
+            "precondition: the breaker trips"
+        );
+        let mut last_pattern = DetectedPattern::NoPattern;
+        for _ in 0..8 {
+            last_pattern = managers.detection().record_tool_call("grep", 7).unwrap();
+        }
+        assert!(
+            matches!(last_pattern, DetectedPattern::LoopDetected { .. }),
+            "precondition: repeated identical calls raised a loop pattern \
+             (default loop_threshold is 3)"
+        );
+
+        managers.reset_all().unwrap();
+
+        assert_eq!(
+            managers.fallback().state().unwrap(),
+            FallbackState::Primary,
+            "reset_all clears a tripped breaker"
+        );
+        assert_eq!(
+            managers.fallback().consecutive_failures().unwrap(),
+            0,
+            "and the failure counter with it"
+        );
+        assert!(
+            !matches!(
+                managers.detection().record_tool_call("grep", 7).unwrap(),
+                DetectedPattern::LoopDetected { .. }
+            ),
+            "the loop detector starts from scratch after reset — the same \
+             call that contributed to a warned pattern reads as fresh"
+        );
+    }
+
+    #[test]
     fn test_runtime_default() {
         let managers = LoopManagers::default();
         assert!(managers.fallback().active_model().unwrap().is_none());

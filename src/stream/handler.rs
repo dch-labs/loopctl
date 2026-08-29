@@ -3804,6 +3804,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clean_first_attempt_emits_no_attempt_reset() {
+        // The reset signal exists to discard partial state between
+        // attempts; a clean first attempt must stay silent — consumers
+        // reset on every occurrence.
+        struct OneShotMock;
+        impl ApiClient for OneShotMock {
+            fn model(&self) -> String {
+                "one-shot".to_string()
+            }
+            fn base_url(&self) -> String {
+                "one-shot".to_string()
+            }
+            fn set_model(&self, _: &str) -> bool {
+                false
+            }
+            fn stream_messages(
+                &self,
+                request: &crate::api::StreamRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+            {
+                self.stream_messages_with_options(
+                    request,
+                    crate::structured::RequestOptions::default(),
+                )
+            }
+            fn create_message(
+                &self,
+                request: &crate::api::StreamRequest,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                self.create_message_with_options(
+                    request,
+                    crate::structured::RequestOptions::default(),
+                )
+            }
+            fn stream_messages_with_options(
+                &self,
+                _request: &crate::api::StreamRequest,
+                _options: crate::structured::RequestOptions,
+            ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+            {
+                Box::pin(futures::stream::iter(happy_stream_events()))
+            }
+            fn create_message_with_options(
+                &self,
+                _request: &crate::api::StreamRequest,
+                _options: crate::structured::RequestOptions,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<crate::api::NonStreamingResponse, ApiError>,
+                        > + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(crate::api::NonStreamingResponse {
+                        message: crate::message::Message::assistant(""),
+                        stop_reason: crate::stream::StreamStopReason::EndTurn,
+                        usage: Some(crate::stream::Usage::default()),
+                    })
+                })
+            }
+            fn extract_structured(&self, _: &crate::message::Message) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+        }
+
+        let handler = StreamHandler::new();
+        let cancel = Arc::new(CancelSignal::new());
+        let req = crate::api::StreamRequest::new(vec![]);
+        let mut stream = handler.stream_turn(
+            &OneShotMock,
+            &req,
+            crate::structured::RequestOptions::default(),
+            &cancel,
+        );
+        let mut events_seen = 0usize;
+        while let Some(item) = stream.next().await {
+            events_seen += 1;
+            assert!(
+                !matches!(item.expect("clean stream item"), HandlerEvent::AttemptReset),
+                "a clean first attempt never announces a reset"
+            );
+        }
+        assert!(
+            events_seen > 0,
+            "the silence assertion only counts on a stream that produced events"
+        );
+    }
+
+    #[tokio::test]
     async fn stream_turn_yields_attempt_reset_on_retry() {
         // A retried transport failure must emit AttemptReset before the
         // retried attempt's events. Engine uses this to discard partial state.

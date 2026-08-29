@@ -223,11 +223,22 @@ impl FallbackEntry {
     }
 
     /// Record a new failure attempt.
+    ///
+    /// Saturating — the count is only ever compared against
+    /// [`max_fail_count`](Self::max_fail_count), never used as an
+    /// index or duration.
     pub(crate) fn record_attempt(&mut self) {
         self.attempt_count = self.attempt_count.saturating_add(1);
     }
 
-    /// Clear all recorded attempts, resetting [`failed`](Self::failed) to `false`.
+    /// Clear all recorded attempts.
+    ///
+    /// Drops the count to zero, so the attempt side of
+    /// [`failed`](Self::failed) no longer reports the entry as failed.
+    /// An entry separately disabled via
+    /// [`set_available`](Self::set_available) stays failed — that flag
+    /// is untouched here; a manual re-enable and an attempt reset are
+    /// separate operations.
     pub(crate) fn clear_attempts(&mut self) {
         self.attempt_count = 0;
     }
@@ -2048,6 +2059,158 @@ mod tests {
         // Everything cleared.
         assert_eq!(mgr.consecutive_failures().unwrap(), 0);
         assert!(mgr.fallback_switched_at().unwrap().is_none());
+    }
+
+    #[test]
+    fn configured_max_fail_count_advances_the_chain_after_that_many_failures() {
+        let mgr = FallbackManager::for_model("primary")
+            .unwrap()
+            .with_config(FallbackConfig {
+                trip_threshold: 1,
+                recovery_successes_needed: 1,
+                max_fail_count: 3,
+                ..FallbackConfig::default()
+            });
+        mgr.add_fallback_model("fb-1").unwrap();
+        mgr.add_fallback_model("fb-2").unwrap();
+        assert!(
+            mgr.record_failure(FailureKind::Transient).unwrap(),
+            "threshold 1 trips on the first primary failure"
+        );
+        assert_eq!(mgr.active_model().unwrap().as_deref(), Some("fb-1"));
+
+        mgr.mark_fallback_failed("fb-1").unwrap();
+        mgr.mark_fallback_failed("fb-1").unwrap();
+        assert_eq!(
+            mgr.active_model().unwrap().as_deref(),
+            Some("fb-1"),
+            "two failures stay on fb-1 — its configured budget is three"
+        );
+
+        mgr.mark_fallback_failed("fb-1").unwrap();
+        assert_eq!(
+            mgr.active_model().unwrap().as_deref(),
+            Some("fb-2"),
+            "the third failure exhausts fb-1's configured budget, not the \
+             default of two"
+        );
+    }
+
+    #[test]
+    fn zero_trip_threshold_trips_on_the_first_failure() {
+        let mgr = FallbackManager::for_model("primary")
+            .unwrap()
+            .with_config(FallbackConfig {
+                trip_threshold: 0,
+                recovery_successes_needed: 1,
+                max_fail_count: 2,
+                ..FallbackConfig::default()
+            });
+        mgr.add_fallback_model("fb-1").unwrap();
+        assert_eq!(mgr.state().unwrap(), FallbackState::Primary);
+
+        assert!(
+            mgr.record_failure(FailureKind::Transient).unwrap(),
+            "a zero threshold trips on the very first failure"
+        );
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
+        assert_eq!(mgr.active_model().unwrap().as_deref(), Some("fb-1"));
+    }
+
+    #[test]
+    fn bulk_chain_apis_roundtrip() {
+        let mgr = FallbackManager::for_model("primary").unwrap();
+        mgr.set_fallback_models(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+            .unwrap();
+        assert_eq!(
+            mgr.fallback_models().unwrap(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "set_fallback_models replaces the whole chain"
+        );
+
+        mgr.insert_fallback_model(1, "d").unwrap();
+        assert_eq!(
+            mgr.fallback_models().unwrap(),
+            vec![
+                "a".to_string(),
+                "d".to_string(),
+                "b".to_string(),
+                "c".to_string()
+            ],
+            "insert_fallback_model splices at the index"
+        );
+        mgr.insert_fallback_model(usize::MAX, "e").unwrap();
+        assert_eq!(
+            mgr.fallback_models().unwrap().last().map(String::as_str),
+            Some("e"),
+            "an out-of-range index appends"
+        );
+
+        assert!(mgr.remove_fallback_model("b").unwrap());
+        assert!(!mgr.remove_fallback_model("b").unwrap());
+        assert_eq!(
+            mgr.fallback_models().unwrap(),
+            vec![
+                "a".to_string(),
+                "d".to_string(),
+                "c".to_string(),
+                "e".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn half_open_probe_targets_the_original_model() {
+        let mgr = FallbackManager::for_model("primary")
+            .unwrap()
+            .with_config(FallbackConfig {
+                trip_threshold: 1,
+                recovery_successes_needed: 1,
+                max_fail_count: 2,
+                ..FallbackConfig::default()
+            });
+        mgr.set_fallback_models(vec!["fb-1".to_string()]).unwrap();
+        assert!(mgr.record_failure(FailureKind::Transient).unwrap());
+        assert_eq!(mgr.active_model().unwrap().as_deref(), Some("fb-1"));
+
+        mgr.transition_to_recovering().unwrap();
+        assert_eq!(
+            mgr.active_model().unwrap().as_deref(),
+            Some("primary"),
+            "the half-open state probes the PRIMARY — a configured, healthy \
+             fallback must not capture the recovery probe"
+        );
+    }
+
+    #[test]
+    fn tripped_breaker_with_empty_chain_keeps_serving_the_primary() {
+        let mgr = FallbackManager::for_model("primary")
+            .unwrap()
+            .with_config(FallbackConfig {
+                trip_threshold: 1,
+                recovery_successes_needed: 1,
+                max_fail_count: 2,
+                ..FallbackConfig::default()
+            });
+        assert!(
+            mgr.record_failure(FailureKind::Transient).unwrap(),
+            "the breaker trips with no fallbacks configured"
+        );
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
+        assert_eq!(
+            mgr.active_model().unwrap().as_deref(),
+            Some("primary"),
+            "an empty chain keeps serving the primary — the trip state is \
+             bookkeeping, not an outage"
+        );
+
+        mgr.transition_to_recovering().unwrap();
+        mgr.record_success().unwrap();
+        assert_eq!(
+            mgr.state().unwrap(),
+            FallbackState::Primary,
+            "and the normal resume path recovers it"
+        );
     }
 
     #[test]

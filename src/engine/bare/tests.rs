@@ -540,6 +540,61 @@ impl crate::observer::LoopObserver for CountingObserver {
     }
 }
 
+/// Records every compaction event the observers fire.
+struct CompactionRecorder {
+    /// One formatted entry per on_compaction dispatch.
+    events: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl crate::observer::LoopObserver for CompactionRecorder {
+    fn name(&self) -> &'static str {
+        "compaction-recorder"
+    }
+    fn on_compaction(&self, ctx: &crate::observer::CompactedContext) {
+        self.events
+            .lock()
+            .expect("events lock")
+            .push(format!("{ctx:?}"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn emergency_compaction_fires_with_auto_compact_disabled() {
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = MockClient::new("m");
+    client.add_text_response("done");
+    let mut agent = BareLoop::new(
+        Arc::new(client),
+        ToolRegistry::new(),
+        SessionConfig {
+            auto_compact: false,
+            context_window: 50,
+            ..SessionConfig::default()
+        },
+    );
+    agent.register_observer(Arc::new(CompactionRecorder {
+        events: Arc::clone(&events),
+    }));
+
+    // The census expected the emergency line to compact here. The
+    // engine's window gate refuses the oversized request first instead:
+    // with the toggle off, overflow is a hard error, not an implicit
+    // compaction. The machine-level emergency check itself is pinned
+    // separately (it is ungated there); this pins which layer wins.
+    let err = agent
+        .run(&"x".repeat(400), &make_run_config())
+        .await
+        .expect_err("the window gate refuses before any model call");
+    assert!(
+        matches!(err, crate::error::LoopError::ContextExceeded { .. }),
+        "with auto_compact off, overflow is refused, not compacted: {err:?}"
+    );
+    assert!(
+        events.lock().expect("events lock").is_empty(),
+        "no compaction ran"
+    );
+}
+
 fn make_config() -> SessionConfig {
     SessionConfig::default()
 }

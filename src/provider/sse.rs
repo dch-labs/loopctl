@@ -155,6 +155,25 @@ mod tests {
         assert!(result.is_err(), "invalid UTF-8 must surface as an error");
     }
 
+    #[tokio::test]
+    async fn buffer_overflow_errors_instead_of_growing_unbounded() {
+        let big = vec![b'a'; super::SSE_MAX_BUFFER + 1];
+        let mut reader = SseReader {
+            bytes: Box::pin(futures::stream::iter(vec![Ok(bytes::Bytes::from(big))])),
+            buf: Vec::new(),
+            #[cfg(feature = "openai")]
+            done_marker_seen: false,
+        };
+        let err = reader
+            .next_chunk()
+            .await
+            .expect_err("a newline-less oversize chunk must error, not buffer");
+        assert!(
+            err.to_string().contains("exceeded"),
+            "the error names the guard: {err}"
+        );
+    }
+
     #[test]
     fn take_line_valid_utf8_returns_ok() {
         let mut reader = SseReader {

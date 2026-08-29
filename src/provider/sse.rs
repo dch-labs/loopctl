@@ -45,7 +45,9 @@ pub(super) struct SseReader {
     /// Set by the OpenAI data reader when it consumes the sentinel; read
     /// by the stream loop to tell a provider-signalled end apart from a
     /// bare EOF (a cut connection), so the emitter only completes a
-    /// stream the provider actually terminated.
+    /// stream the provider actually terminated. Only OpenAI-wire
+    /// providers have the sentinel, hence the gate.
+    #[cfg(feature = "openai")]
     pub(super) done_marker_seen: bool,
 }
 
@@ -63,6 +65,7 @@ impl SseReader {
         Self {
             bytes: Box::pin(bytes),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         }
     }
@@ -94,6 +97,7 @@ impl SseReader {
     ///
     /// Pure read over [`done_marker_seen`](Self::done_marker_seen); see
     /// that field for why the distinction matters.
+    #[cfg(feature = "openai")]
     pub(super) fn done_marker_seen(&self) -> bool {
         self.done_marker_seen
     }
@@ -103,6 +107,7 @@ impl SseReader {
     /// The OpenAI data reader calls this when it consumes the sentinel;
     /// the flag then serves both the sentinel's `Ok(None)` return and
     /// later [`done_marker_seen`](Self::done_marker_seen) polls.
+    #[cfg(feature = "openai")]
     pub(super) fn mark_done_marker_seen(&mut self) {
         self.done_marker_seen = true;
     }
@@ -143,6 +148,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: vec![0xFF, 0xFE, 0xFD, b'\n'],
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let result = reader.take_line();
@@ -154,6 +160,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: b"data: hello\n".to_vec(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let line = reader.take_line().unwrap().unwrap();

@@ -39,7 +39,12 @@ use crate::tool::ToolSchema;
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const DEFAULT_MAX_TOKENS: u32 = 8192;
+/// The output-token budget used when a request carries none.
+///
+/// Shared by the direct Anthropic path and the Bedrock Anthropic-native
+/// path (and, as `maxTokens`, by Bedrock Converse) so switching between
+/// them never silently changes the output budget.
+pub(super) const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// An Anthropic Claude chat client with streaming support.
 ///
@@ -785,7 +790,7 @@ fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32)
 /// - Messages with only a single text part use a plain string for `content`
 ///   (Anthropic's recommended optimization).
 /// - Messages with tool calls or tool results use the full `content` array.
-fn convert_message(m: &Message) -> Value {
+pub(super) fn convert_message(m: &Message) -> Value {
     // System messages are folded into the top-level `system` field by
     // `build_request_body` before this function is reached, so the `System`
     // pattern below is defensive: if one ever reaches here, route it to `user`
@@ -877,7 +882,7 @@ fn convert_message(m: &Message) -> Value {
 /// When structured output is active (`response_format` set), this function is
 /// not called — instead, [`build_request_body`] synthesizes a single forced
 /// tool whose `input_schema` is the target `ResponseFormat::schema`.
-fn convert_tools(tools: &[ToolSchema], strict: bool) -> Vec<Value> {
+pub(super) fn convert_tools(tools: &[ToolSchema], strict: bool) -> Vec<Value> {
     tools
         .iter()
         .map(|t| {
@@ -900,11 +905,15 @@ use super::sse::SseReader;
 impl SseReader {
     /// Extract the next SSE event as `(event_type, data_json)`.
     ///
-    /// Returns `Ok(None)` at end-of-stream.
+    /// Returns `Ok(None)` at end-of-stream. A `data:` payload that is
+    /// empty or unparseable JSON yields `None` for the `Value` half —
+    /// the event type still surfaces, and the emitter's handlers
+    /// decide what an absent payload means.
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError`] if the underlying HTTP stream fails.
+    /// Returns [`ApiError`] if the underlying HTTP stream fails, or if
+    /// a completed line is not valid UTF-8 (malformed provider data).
     async fn next_event(&mut self) -> Result<Option<(String, Option<Value>)>, ApiError> {
         let mut event_type = String::new();
         let mut data = String::new();
@@ -945,6 +954,12 @@ impl SseReader {
     }
 
     /// Parse the accumulated `data` string into JSON, logging on failure.
+    ///
+    /// Returns `None` for empty payloads and unparseable JSON, `Some`
+    /// otherwise; a parse failure logs the event type and payload size
+    /// at `warn`. What an absent payload means — ignored, defaulted, or
+    /// fatal — is decided by the handlers that consume
+    /// [`next_event`](Self::next_event)'s `Option<Value>`, not here.
     fn parse_event_data(data: &str, event_type: &str) -> Option<Value> {
         if data.is_empty() {
             return None;
@@ -973,7 +988,7 @@ impl SseReader {
 /// - Emitting [`PartStop`] when parts finish.
 /// - Emitting the final [`MessageDelta`] with stop reason and usage.
 #[derive(Default)]
-struct StreamEmitter {
+pub(super) struct StreamEmitter {
     /// Whether [`MessageStart`] has been emitted for the current stream.
     ///
     /// The Anthropic stream opens with one `message_start` event; the
@@ -1034,11 +1049,13 @@ struct StreamEmitter {
 
     /// Whether the terminal stop signal has been processed.
     ///
-    /// Set by either `message_delta` (which carries the stop reason and
-    /// usage) or `message_stop`. Guards against emitting the final
-    /// [`StreamEvent::MessageDelta`] twice when both events arrive, and
-    /// against `finish` appending a spurious [`StreamEvent::MessageStop`]
-    /// after the stream already terminated.
+    /// Set by `message_stop` — the one and only writer — and read by
+    /// [`process_event`](Self::process_event), which ignores every
+    /// event once it is set, and by
+    /// [`on_message_delta`](Self::on_message_delta), which no-ops when
+    /// `message_stop` arrived first (an out-of-order stream).
+    /// [`finish`](Self::finish) does not consult it: it only surfaces
+    /// a recorded `error` event and drains pending output.
     finished: bool,
 
     /// A terminal error delivered as an `event: error` SSE event, if any.
@@ -1081,7 +1098,18 @@ impl StreamEmitter {
     /// types are ignored. Any events produced are appended to the pending
     /// queue; an `error` event records the terminal error that
     /// [`finish`](Self::finish) surfaces.
-    fn process_event(&mut self, event_type: &str, data: Option<Value>) {
+    ///
+    /// Also the entry point for the Bedrock Anthropic path, whose
+    /// event-stream frame payloads are the same event objects.
+    ///
+    /// Once [`message_stop`](Self::on_message_stop) has been processed,
+    /// every further event is ignored: `message_stop` terminates the
+    /// message, and a desynced stream must not append parts to a
+    /// message the consumer has already been told is complete.
+    pub(super) fn process_event(&mut self, event_type: &str, data: Option<Value>) {
+        if self.finished {
+            return;
+        }
         match event_type {
             "message_start" => self.on_message_start(data.as_ref()),
             "content_block_start" => self.on_block_start(data),
@@ -1453,7 +1481,7 @@ impl StreamEmitter {
     ///
     /// Returns the recorded terminal error, if an `event: error` arrived
     /// during the stream.
-    fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
+    pub(super) fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
         if let Some(err) = self.error.take() {
             return Err(err);
         }
@@ -1470,7 +1498,12 @@ impl StreamEmitter {
     }
 
     /// Drain all pending events.
-    fn drain(&mut self) -> Vec<StreamEvent> {
+    ///
+    /// Takes the queued events produced since the last drain — the
+    /// stream loop calls this after every `process_event` (and the
+    /// Bedrock path after every frame) so events yield promptly
+    /// instead of accumulating until stream end.
+    pub(super) fn drain(&mut self) -> Vec<StreamEvent> {
         std::mem::take(&mut self.pending)
     }
 
@@ -1486,6 +1519,45 @@ impl StreamEmitter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn emitter_ignores_events_after_message_stop() {
+        let mut emitter = StreamEmitter::default();
+        emitter.process_event(
+            "message_stop",
+            Some(serde_json::json!({"type": "message_stop"})),
+        );
+        assert!(!emitter.drain().is_empty(), "message_stop emits the stop");
+        emitter.process_event(
+            "content_block_delta",
+            Some(serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "late"},
+            })),
+        );
+        assert!(
+            emitter.drain().is_empty(),
+            "a desynced stream must not append parts after the stop"
+        );
+        assert!(
+            emitter.finish().unwrap_or_default().is_empty(),
+            "nothing queued behind the guard"
+        );
+        emitter.process_event(
+            "error",
+            Some(serde_json::json!({
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "late"}
+            })),
+        );
+        assert!(
+            emitter.finish().is_ok(),
+            "a late error after a completed message is swallowed — the \
+             stream already terminated cleanly, the contradiction is not \
+             allowed to fail it"
+        );
+    }
+
     use super::*;
     use crate::message::{Message, MessagePart, Role, ToolContent};
 
@@ -2226,6 +2298,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "event: ping\n".into(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "event: ping");
@@ -2237,6 +2310,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "partial".into(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert!(reader.take_line().unwrap().is_none());
@@ -2247,6 +2321,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "line1\nline2\n".into(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "line1");
@@ -2258,6 +2333,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(futures::stream::empty()),
             buf: "data: hi\r\n".into(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert_eq!(reader.take_line().unwrap().unwrap(), "data: hi");
@@ -2280,6 +2356,7 @@ mod tests {
             buf: "event: message_start\ndata: {}\n\n"
                 .to_string()
                 .into_bytes(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         assert_eq!(
@@ -2298,6 +2375,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let result = reader.next_event().await.unwrap();
@@ -2315,6 +2393,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let result = reader.next_event().await.unwrap();
@@ -2340,6 +2419,7 @@ mod tests {
         let mut reader = SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let result = reader.next_event().await.unwrap();
@@ -2356,6 +2436,7 @@ mod tests {
         let mut reader = super::SseReader {
             bytes: Box::pin(stream),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let result = reader.next_event().await;
@@ -3199,6 +3280,7 @@ mod tests {
                 data.to_string().into(),
             )])),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let parsed = reader.next_event().await.expect("reader must not err");
@@ -3282,6 +3364,7 @@ mod tests {
                 data.to_string().into(),
             )])),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let parsed = reader.next_event().await.expect("reader must not err");
@@ -3504,6 +3587,7 @@ mod tests {
                 data.to_string().into(),
             )])),
             buf: Vec::new(),
+            #[cfg(feature = "openai")]
             done_marker_seen: false,
         };
         let parsed = reader.next_event().await.expect("reader must not err");

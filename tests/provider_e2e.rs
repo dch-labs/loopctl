@@ -7,7 +7,7 @@
 //! streamed usage support varies by model.
 //!
 //! Run:
-//!   `set -a; source .env; set +a; LOOPCTL_E2E=1 cargo test --features ollama,openai,anthropic,gemini,grok,deepseek,zai --test provider_e2e -- --nocapture --test-threads=1`
+//!   `set -a; source .env; set +a; LOOPCTL_E2E=1 cargo test --features ollama,openai,anthropic,gemini,grok,deepseek,zai,azure,moonshot,bedrock --test provider_e2e -- --nocapture --test-threads=1`
 //!
 //! The whole file compiles only when at least one provider feature is on;
 //! without a provider the helpers have no callers and would trip the
@@ -22,6 +22,9 @@
     feature = "xai",
     feature = "gemini",
     feature = "zai",
+    feature = "azure",
+    feature = "moonshot",
+    feature = "bedrock",
 ))]
 #![allow(
     clippy::pedantic,
@@ -231,4 +234,58 @@ async fn zai_streamed_usage_test() {
     }
     let client = loopctl::provider::zai().unwrap();
     run_streamed_usage_test(&client, "Z.ai streamed usage").await;
+}
+
+/// Live check of streamed usage on Azure OpenAI via the v1 API profile:
+/// the resource name comes from `LOOPCTL_AZURE_RESOURCE` (it is an
+/// argument, not an env var, in `provider::azure`).
+#[cfg(feature = "azure")]
+#[tokio::test]
+async fn azure_streamed_usage_test() {
+    if std::env::var("LOOPCTL_E2E").as_deref() != Ok("1")
+        || std::env::var("AZURE_OPENAI_API_KEY").is_err()
+        || std::env::var("AZURE_OPENAI_MODEL").is_err()
+        || std::env::var("LOOPCTL_AZURE_RESOURCE").is_err()
+    {
+        eprintln!("{DIM}skip{RESET}  Azure streamed usage");
+        return;
+    }
+    let resource = std::env::var("LOOPCTL_AZURE_RESOURCE").unwrap();
+    let client = loopctl::provider::azure(resource).unwrap();
+    run_streamed_usage_test(&client, "Azure streamed usage").await;
+}
+
+/// Live check of streamed usage on Moonshot AI (Kimi): the
+/// OpenAI-compatible server reports streamed usage like the other
+/// profiles.
+#[cfg(feature = "moonshot")]
+#[tokio::test]
+async fn moonshot_streamed_usage_test() {
+    if std::env::var("LOOPCTL_E2E").as_deref() != Ok("1")
+        || std::env::var("MOONSHOT_API_KEY").is_err()
+    {
+        eprintln!("{DIM}skip{RESET}  Moonshot streamed usage");
+        return;
+    }
+    let client = loopctl::provider::moonshot().unwrap();
+    run_streamed_usage_test(&client, "Moonshot streamed usage").await;
+}
+
+/// Live check of streamed usage on AWS Bedrock: exercises whichever
+/// invoke path the configured `AWS_BEDROCK_MODEL` selects (native
+/// Anthropic or Converse), the SigV4 chain, and the event-stream
+/// decoder against the real runtime.
+#[cfg(feature = "bedrock")]
+#[tokio::test]
+async fn bedrock_streamed_usage_test() {
+    if std::env::var("LOOPCTL_E2E").as_deref() != Ok("1")
+        || std::env::var("AWS_REGION").is_err()
+        || std::env::var("AWS_ACCESS_KEY_ID").is_err()
+        || std::env::var("AWS_SECRET_ACCESS_KEY").is_err()
+    {
+        eprintln!("{DIM}skip{RESET}  Bedrock streamed usage");
+        return;
+    }
+    let client = loopctl::provider::BedrockClient::from_env().unwrap();
+    run_streamed_usage_test(&client, "Bedrock streamed usage").await;
 }

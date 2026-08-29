@@ -959,7 +959,8 @@ impl SseReader {
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError`] if the underlying HTTP stream fails.
+    /// Returns [`ApiError`] if the underlying HTTP stream fails, or if
+    /// a completed line is not valid UTF-8 (malformed provider data).
     async fn next_openai_data(&mut self) -> Result<Option<String>, ApiError> {
         loop {
             while let Some(line) = self.take_line()? {
@@ -1177,10 +1178,18 @@ struct OpenAiChoice {
 #[derive(Deserialize)]
 struct OpenAiUsage {
     /// Number of tokens in the input prompt.
+    ///
+    /// The provider names it `prompt_tokens`; defaults to 0 when the
+    /// usage object omits it (see the struct docs on non-conforming
+    /// providers).
     #[serde(default)]
     prompt_tokens: u64,
 
     /// Number of tokens in the output completion.
+    ///
+    /// The provider names it `completion_tokens`; defaults to 0 when
+    /// omitted, and `From<&OpenAiUsage>` saturates it into the
+    /// engine's `u32` counter.
     #[serde(default)]
     completion_tokens: u64,
 }

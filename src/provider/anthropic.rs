@@ -905,11 +905,15 @@ use super::sse::SseReader;
 impl SseReader {
     /// Extract the next SSE event as `(event_type, data_json)`.
     ///
-    /// Returns `Ok(None)` at end-of-stream.
+    /// Returns `Ok(None)` at end-of-stream. A `data:` payload that is
+    /// empty or unparseable JSON yields `None` for the `Value` half —
+    /// the event type still surfaces, and the emitter's handlers
+    /// decide what an absent payload means.
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError`] if the underlying HTTP stream fails.
+    /// Returns [`ApiError`] if the underlying HTTP stream fails, or if
+    /// a completed line is not valid UTF-8 (malformed provider data).
     async fn next_event(&mut self) -> Result<Option<(String, Option<Value>)>, ApiError> {
         let mut event_type = String::new();
         let mut data = String::new();

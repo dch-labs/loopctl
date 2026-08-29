@@ -150,7 +150,7 @@ pub struct BedrockClient {
 /// that the required fields are present and non-empty. The invoke path itself is derived per
 /// request from the current model id unless the override pins it (see
 /// [`set_model`](ApiClient::set_model), which the path follows).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct BedrockClientBuilder {
     /// The AWS region, if set.
     ///
@@ -191,6 +191,32 @@ pub struct BedrockClientBuilder {
     /// When absent, requests carry the engine-wide shared default;
     /// set it below that for models whose own cap is lower.
     max_tokens: Option<u32>,
+}
+
+impl std::fmt::Debug for SigV4Headers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SigV4Headers")
+            .field("authorization", &"<redacted>")
+            .field("amz_date", &self.amz_date)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for BedrockClientBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BedrockClientBuilder")
+            .field("region", &self.region)
+            .field("model", &self.model)
+            .field("path", &self.path)
+            .field("max_tokens", &self.max_tokens)
+            .field("access_key_id", &"<redacted>")
+            .field("secret_access_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl BedrockClientBuilder {
@@ -365,8 +391,10 @@ fn auto_path(model: &str) -> BedrockPath {
 ///
 /// Produced by [`sigv4_sign`]; carries the two values the caller does
 /// not already know: the composed `Authorization` header and the
-/// timestamp it was signed at.
-#[derive(Debug)]
+/// timestamp it was signed at. `Debug` redacts the authorization — it
+/// embeds the access key id and a signature derived from the secret —
+/// while keeping the timestamp, which is the diagnostically useful
+/// half.
 struct SigV4Headers {
     /// The full `Authorization` header value.
     ///
@@ -1819,6 +1847,16 @@ mod tests {
              Signature=72851c9c080d2a817323fa59da0a21c9ffe8141b57e30ec956834db9467c39e4"
         );
         assert_eq!(headers.amz_date, "20150830T123600Z");
+
+        let debug = format!("{headers:?}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(
+            !debug.contains("AKIDEXAMPLE")
+                && !debug
+                    .contains("72851c9c080d2a817323fa59da0a21c9ffe8141b57e30ec956834db9467c39e4"),
+            "the signing output's Debug carries neither the key id nor the \
+             signature: {debug}"
+        );
     }
 
     // The AWS general reference's derive-signing-key example: for
@@ -3465,6 +3503,29 @@ mod tests {
         for reader in readers {
             reader.join().unwrap();
         }
+    }
+
+    #[test]
+    fn builder_debug_redacts_credentials() {
+        let builder = BedrockClient::builder()
+            .region("us-east-1")
+            .access_key_id("AKIA_SECRETTOKEN")
+            .secret_access_key("wJalrXUtnFEMI_SUPERSECRET")
+            .session_token("SESSION_SUPERSECRET")
+            .model("m");
+        let debug = format!("{builder:?}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        for secret in [
+            "AKIA_SECRETTOKEN",
+            "wJalrXUtnFEMI_SUPERSECRET",
+            "SESSION_SUPERSECRET",
+        ] {
+            assert!(!debug.contains(secret), "{debug}");
+        }
+        assert!(
+            debug.contains("us-east-1"),
+            "non-secret configuration stays visible: {debug}"
+        );
     }
 
     #[test]

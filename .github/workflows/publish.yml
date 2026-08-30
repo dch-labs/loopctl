@@ -28,6 +28,8 @@ jobs:
           fi
 
       - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
 
@@ -42,8 +44,16 @@ jobs:
           git tag "v${{ steps.version.outputs.version }}"
           git push origin "v${{ steps.version.outputs.version }}"
 
+      - name: Publish companion crate
+        run: cargo publish -p loopctl-derive
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for the crate index to list the companion
+        run: sleep 30
+
       - name: Publish to crates.io
-        run: cargo publish
+        run: cargo publish -p loopctl
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

@@ -416,7 +416,10 @@ struct SigV4Headers {
 /// token, when present, is signed into the canonical headers (the
 /// caller attaches the header itself). The signature covers the payload
 /// hash, so it must be computed over the exact bytes that go on the
-/// wire.
+/// wire. The canonical request carries the wire path re-encoded per
+/// segment (see [`canonical_uri`]) — the non-S3 `SigV4` convention, so a
+/// path that already contains `%XX` escapes signs with each `%`
+/// doubled.
 #[allow(clippy::too_many_arguments)]
 fn sigv4_sign(
     access_key_id: &str,
@@ -449,8 +452,9 @@ fn sigv4_sign(
         ),
     };
 
+    let canonical = canonical_uri(uri);
     let canonical_request =
-        format!("POST\n{uri}\n\n{canonical_headers}\n{signed_header_list}\n{payload_hash}");
+        format!("POST\n{canonical}\n\n{canonical_headers}\n{signed_header_list}\n{payload_hash}");
     let credential_scope = format!("{date_stamp}/{region}/bedrock/aws4_request");
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
@@ -596,11 +600,11 @@ fn hmac_key(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// Percent-encode one URI path segment.
 ///
 /// Model ids contain `:` (every versioned id, e.g. `…-v1:0`) and ARN ids
-/// additionally contain `/`; the AWS SDKs send these percent-encoded, and
-/// the `SigV4` canonical URI is the encoded form. Keeps the RFC 3986
-/// unreserved set (`A-Za-z0-9-._~`) verbatim and escapes every other
-/// byte as `%XX` with uppercase hex, so the signed path and the sent
-/// path are always the same string.
+/// additionally contain `/`; the AWS SDKs send these percent-encoded.
+/// Keeps the RFC 3986 unreserved set (`A-Za-z0-9-._~`) verbatim and
+/// escapes every other byte as `%XX` with uppercase hex. This builds
+/// the wire path; the canonical request re-encodes it again via
+/// [`canonical_uri`].
 fn encode_path_segment(segment: &str) -> String {
     segment
         .bytes()
@@ -614,13 +618,28 @@ fn encode_path_segment(segment: &str) -> String {
         .collect()
 }
 
+/// The `SigV4` canonical URI for a wire path.
+///
+/// Non-S3 AWS services sign the path *re-encoded*: every segment of the
+/// request path percent-encodes one more time, so an escape already on
+/// the wire (`%3A` in a versioned Bedrock model id) enters the canonical
+/// request as `%253A`, while `/` separators stay literal. The request
+/// itself is sent with the unchanged wire path.
+fn canonical_uri(path: &str) -> String {
+    path.split('/')
+        .map(encode_path_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The streaming endpoint URL for a model and region.
 ///
 /// Both invoke paths keep the model id in the URI path, as the Bedrock
 /// runtime routes on it: `…/model/{model}/invoke-with-response-stream`
 /// for the native Anthropic path, `…/model/{model}/converse-stream`
 /// for Converse. The id is percent-encoded per
-/// [`encode_path_segment`] — the same string is signed and sent.
+/// [`encode_path_segment`]; signing derives the canonical form from the
+/// wire path via [`canonical_uri`].
 fn stream_url(region: &str, model: &str, path: BedrockPath) -> String {
     let suffix = match path {
         BedrockPath::Anthropic => "invoke-with-response-stream",
@@ -1901,6 +1920,48 @@ mod tests {
              SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token, \
              Signature=9ce96e944e65159a25532face326f1d424a45f9d94e9851c2770e6677f8fbf02"
         );
+    }
+
+    // A wire path carrying percent-escapes: the canonical request
+    // re-encodes each path segment, so the `%3A` of a versioned model
+    // id signs as `%253A` — the non-S3 SigV4 convention. The expected
+    // signature was computed independently (a from-spec Python
+    // implementation) over the re-encoded canonical path; the rule
+    // itself was reported by the live Bedrock runtime in a 403's
+    // canonical-string diagnostic.
+    #[test]
+    fn sigv4_reencodes_percent_escapes_in_the_canonical_uri() {
+        let headers = sigv4_sign(
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            None,
+            "us-east-1",
+            "bedrock-runtime.us-east-1.amazonaws.com",
+            "/model/amazon.nova-micro-v1%3A0/converse-stream",
+            b"{}",
+            std::time::SystemTime::UNIX_EPOCH
+                .checked_add(std::time::Duration::from_secs(1_440_938_160))
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        );
+        assert_eq!(
+            headers.authorization,
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/bedrock/aws4_request, \
+             SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, \
+             Signature=1bf11a3718447e27cc1d8adbc898af34060dd965dcdd2268dbb09b466fc3dc0c"
+        );
+    }
+
+    // The canonical-string half of the same rule, pinned verbatim to
+    // the canonical URI the live Bedrock runtime printed in a 403's
+    // signature diagnostic: the wire path's `%3A` doubles to `%253A`,
+    // literal segments unchanged.
+    #[test]
+    fn canonical_uri_doubles_percent_escapes() {
+        assert_eq!(
+            canonical_uri("/model/amazon.nova-micro-v1%3A0/converse-stream"),
+            "/model/amazon.nova-micro-v1%253A0/converse-stream"
+        );
+        assert_eq!(canonical_uri("/model/test/invoke"), "/model/test/invoke");
     }
 
     #[test]

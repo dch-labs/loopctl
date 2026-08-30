@@ -114,7 +114,7 @@ let mut agent = BareLoop::new(client, registry, config);
 
 ```toml
 [dev-dependencies]
-loopctl = { version = "0.1", features = ["testing"] }
+loopctl = { version = "0.3", features = ["testing"] }
 ```
 
 ```rust,no_run

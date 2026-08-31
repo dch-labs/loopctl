@@ -442,6 +442,13 @@ pub struct AnthropicClientBuilder {
     /// internally-built `reqwest::Client`, or an externally-supplied client
     /// injected via [`with_http_client`](Self::with_http_client).
     http: super::HttpClientConfig,
+
+    /// Error-reporting state for values seeded by the provider-profile
+    /// builders.
+    ///
+    /// Carries the credential variable a seeded key came from; consulted
+    /// by [`build`](Self::build).
+    seed: super::ProfileSeed,
 }
 
 impl Default for AnthropicClientBuilder {
@@ -452,6 +459,7 @@ impl Default for AnthropicClientBuilder {
             model: DEFAULT_MODEL.into(),
             max_tokens: DEFAULT_MAX_TOKENS,
             http: super::HttpClientConfig::default(),
+            seed: super::ProfileSeed::default(),
         }
     }
 }
@@ -460,10 +468,28 @@ impl AnthropicClientBuilder {
     /// Set the API key for authentication.
     ///
     /// Required — [`build`](Self::build) returns an error if this is not set.
-    /// The key is sent as the `x-api-key` header on every request.
+    /// The key is sent as the `x-api-key` header on every request. An
+    /// explicit key supersedes a seeded one, including the missing-key
+    /// error the seed would otherwise name.
     #[must_use]
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
+        self.seed.key_env_name = None;
+        self
+    }
+
+    /// Seed the API key from a resolved environment lookup.
+    ///
+    /// Provider-profile builders call this with the value of the
+    /// provider's credential variable (or `None` when unset). An absent
+    /// seed leaves the key unset — [`build`](Self::build) then fails
+    /// naming `missing_env` — while an explicit
+    /// [`with_api_key`](Self::with_api_key) overrides the seed.
+    #[cfg(feature = "zai")]
+    #[must_use]
+    pub(super) fn with_key_seed(mut self, key: Option<String>, missing_env: &'static str) -> Self {
+        self.api_key = key;
+        self.seed.seed_key(missing_env);
         self
     }
 
@@ -592,12 +618,15 @@ impl AnthropicClientBuilder {
     /// # Errors
     ///
     /// Returns [`ApiError`] if no API key was set via
-    /// [`with_api_key`](Self::with_api_key), or when `max_tokens` is
+    /// [`with_api_key`](Self::with_api_key) — naming the provider's
+    /// credential variable when the key came seeded from a
+    /// provider-profile builder — or when `max_tokens` is
     /// zero (the Messages API requires at least 1).
     pub fn build(self) -> Result<AnthropicClient, ApiError> {
-        let api_key = self
-            .api_key
-            .ok_or_else(|| ApiError::auth_invalid_key("API key not provided"))?;
+        let api_key = self.api_key.ok_or_else(|| match self.seed.key_env_name {
+            Some(name) => ApiError::auth_invalid_key(format!("{name} not set")),
+            None => ApiError::auth_invalid_key("API key not provided"),
+        })?;
         let http = self.http.build()?;
         if self.max_tokens == 0 {
             return Err(ApiError::config(

@@ -13,6 +13,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -191,6 +192,14 @@ pub struct BedrockClientBuilder {
     /// When absent, requests carry the engine-wide shared default;
     /// set it below that for models whose own cap is lower.
     max_tokens: Option<u32>,
+
+    /// Shared HTTP client configuration (timeouts, pool, TCP).
+    ///
+    /// Holds the timeout, connection-pool, and TCP knobs that apply to the
+    /// internally-built `reqwest::Client`, or an externally-supplied client
+    /// injected via [`with_http_client`](Self::with_http_client). Applied
+    /// by [`build`](Self::build) when it constructs the client.
+    http: super::HttpClientConfig,
 }
 
 impl std::fmt::Debug for SigV4Headers {
@@ -290,6 +299,83 @@ impl BedrockClientBuilder {
         self
     }
 
+    /// Set the HTTP read timeout.
+    ///
+    /// This bounds *idleness* — how long a gap between bytes on the
+    /// connection may last — not the total request lifetime: a stream
+    /// that keeps producing bytes runs as long as it keeps producing.
+    /// Defaults to 120 seconds. Ignored when a client was supplied via
+    /// [`with_http_client`](Self::with_http_client); bound the whole
+    /// turn with a [`StreamHandler`](crate::stream::handler::StreamHandler)
+    /// total timeout instead.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.http = self.http.with_timeout(timeout);
+        self
+    }
+
+    /// Set the TCP connection establishment timeout.
+    ///
+    /// Defaults to 10 seconds. Ignored when a client was supplied via
+    /// [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.http = self.http.with_connect_timeout(timeout);
+        self
+    }
+
+    /// Inject a pre-built, shared `reqwest::Client`.
+    ///
+    /// When set, the client's connection pool is shared with every other
+    /// provider built from the same handle, and the pool/TCP knobs are
+    /// ignored. Configure timeouts on the injected client, not here.
+    #[must_use]
+    pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
+        self.http = self.http.with_http_client(client);
+        self
+    }
+
+    /// Set the maximum idle connections kept alive per host.
+    ///
+    /// Defaults to reqwest's built-in default (unlimited). Ignored when a
+    /// client was supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_pool_max_idle_per_host(mut self, n: usize) -> Self {
+        self.http = self.http.with_pool_max_idle_per_host(n);
+        self
+    }
+
+    /// Set how long an idle connection stays in the pool before being closed.
+    ///
+    /// Defaults to reqwest's built-in default (90s). Ignored when a
+    /// client was supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_pool_idle_timeout(mut self, d: Duration) -> Self {
+        self.http = self.http.with_pool_idle_timeout(d);
+        self
+    }
+
+    /// Set the OS-level TCP keepalive interval.
+    ///
+    /// Defaults to disabled (reqwest default). Ignored when a
+    /// client was supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_tcp_keepalive(mut self, d: Duration) -> Self {
+        self.http = self.http.with_tcp_keepalive(d);
+        self
+    }
+
+    /// Control whether `TCP_NODELAY` is set on connections.
+    ///
+    /// Defaults to `true` — streaming responses benefit from disabling
+    /// Nagle's algorithm. Pass `false` to re-enable it. Ignored when a
+    /// client was supplied via [`with_http_client`](Self::with_http_client).
+    #[must_use]
+    pub fn with_tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.http = self.http.with_tcp_nodelay(enabled);
+        self
+    }
+
     /// Build the client.
     ///
     /// # Errors
@@ -311,7 +397,8 @@ impl BedrockClientBuilder {
             }
             Some(max) => max,
         };
-        let http = crate::provider::HttpClientConfig::default()
+        let http = self
+            .http
             .build()
             .map_err(|e| ApiError::config(format!("bedrock: HTTP client: {e}")))?;
         Ok(BedrockClient {
@@ -2317,6 +2404,43 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("secret_access_key"));
+    }
+
+    #[test]
+    fn bedrock_builder_accepts_the_http_knobs() {
+        let client = BedrockClientBuilder::default()
+            .region("us-east-1")
+            .access_key_id("k")
+            .secret_access_key("s")
+            .model("anthropic.claude-sonnet-4-5-20250929-v1:0")
+            .with_timeout(Duration::from_secs(45))
+            .with_connect_timeout(Duration::from_secs(5))
+            .with_pool_max_idle_per_host(2)
+            .with_pool_idle_timeout(Duration::from_secs(30))
+            .with_tcp_keepalive(Duration::from_secs(60))
+            .with_tcp_nodelay(false)
+            .build();
+        assert!(client.is_ok(), "build should succeed with HTTP knobs set");
+    }
+
+    #[test]
+    fn bedrock_builder_accepts_an_injected_http_client() {
+        let shared = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let client = BedrockClientBuilder::default()
+            .region("us-east-1")
+            .access_key_id("k")
+            .secret_access_key("s")
+            .model("anthropic.claude-sonnet-4-5-20250929-v1:0")
+            .with_http_client(shared)
+            .with_timeout(Duration::from_secs(99))
+            .build();
+        assert!(
+            client.is_ok(),
+            "an injected client must satisfy the HTTP configuration"
+        );
     }
 
     #[test]

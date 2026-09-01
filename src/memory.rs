@@ -62,9 +62,14 @@ use std::pin::Pin;
 
 pub use builtin::InMemoryStore;
 pub use entry::{ConsolidationStats, MemoryCategory, MemoryEntry};
+pub use trajectory::{
+    TokenSummary, TrajectoryObserver, TrajectoryOutcome, TrajectoryRecord, TrajectoryToolCall,
+    TrajectoryTurn,
+};
 
 pub mod builtin;
 pub mod entry;
+pub mod trajectory;
 
 /// A memory system for agent loops.
 ///

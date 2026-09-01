@@ -27,7 +27,7 @@ and tool implementations; the framework handles the rest.
 | [`engine`](https://docs.rs/loopctl/latest/loopctl/engine/index.html) | `BareLoop<C>` — the default agent loop engine (stream → accumulate → dispatch tools → repeat) |
 | [`error`](https://docs.rs/loopctl/latest/loopctl/error/index.html) | Central `LoopError` enum for all framework operations |
 | [`fallback`](https://docs.rs/loopctl/latest/loopctl/fallback/index.html) | Circuit-breaker pattern for automatic API model fallback (`FallbackManager`) |
-| [`memory`](https://docs.rs/loopctl/latest/loopctl/memory/index.html) | `LoopMemory` trait and entry types; `memory::builtin` provides `InMemoryStore` |
+| [`memory`](https://docs.rs/loopctl/latest/loopctl/memory/index.html) | `LoopMemory` trait and entry types; `memory::builtin` provides `InMemoryStore`; `memory::trajectory` captures runs as `TrajectoryRecord`s (JSONL or in-memory) via `TrajectoryObserver` |
 | [`message`](https://docs.rs/loopctl/latest/loopctl/message/index.html) | Conversation types: `Message`, `MessagePart`, `ToolContent`, roles |
 | [`middleware`](https://docs.rs/loopctl/latest/loopctl/middleware/index.html) | Tool dispatch pipeline: timeouts, permissions, output limits, unknown-tool handling |
 | [`observer`](https://docs.rs/loopctl/latest/loopctl/observer/index.html) | `LoopObserver` trait and `ObserverHost` for lifecycle event observation |

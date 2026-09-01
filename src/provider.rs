@@ -22,7 +22,12 @@
 //!
 //! Any provider that exposes an OpenAI-compatible Chat Completions API
 //! can use [`OpenAiClient`] with a custom base URL. The convenience
-//! constructors below pre-configure the correct endpoints.
+//! constructors below pre-configure the correct endpoints; each profile
+//! also exposes a `*_builder()` function returning the underlying client
+//! builder with the provider's facts pre-seeded, so configuration-driven
+//! hosts can apply their own precedence (config over environment,
+//! explicit timeouts) without re-encoding endpoints or environment
+//! variable names.
 //!
 //! # Quick Start
 //!
@@ -528,9 +533,13 @@ pub mod grammar;
 
 #[cfg(feature = "openai")]
 pub use openai::OpenAiClient;
+#[cfg(feature = "openai")]
+pub use openai::OpenAiClientBuilder;
 
 #[cfg(feature = "anthropic")]
 pub use anthropic::AnthropicClient;
+#[cfg(feature = "anthropic")]
+pub use anthropic::AnthropicClientBuilder;
 
 #[cfg(feature = "gemini")]
 pub use gemini::GeminiClient;
@@ -569,7 +578,7 @@ const ZAI_DEFAULT_MODEL: &str = "glm-4.7";
 const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 
 #[cfg(feature = "moonshot")]
-const MOONSHOT_DEFAULT_MODEL: &str = "kimi-k2-0905-preview";
+const MOONSHOT_DEFAULT_MODEL: &str = "kimi-k3";
 
 /// Read an environment variable, falling back to a second name, then a
 /// default value.
@@ -608,11 +617,11 @@ fn env_or_fallback(primary: &str, fallback: &str) -> Option<String> {
         .ok()
 }
 
-/// Look up a required API key from the environment.
+/// Read a credential environment variable, falling back to an alias.
 ///
-/// # Errors
-///
-/// Returns [`ApiError::auth_invalid_key`] if neither environment variable is set.
+/// The provider-profile builders use this to seed a client's API key:
+/// `None` means neither the variable nor its alias is set, and the
+/// builder's `build` reports the failure naming the primary variable.
 #[cfg(any(
     feature = "deepseek",
     feature = "grok",
@@ -620,15 +629,96 @@ fn env_or_fallback(primary: &str, fallback: &str) -> Option<String> {
     feature = "azure",
     feature = "moonshot"
 ))]
-fn require_api_key(primary: &str, fallback: Option<&str>) -> Result<String, ApiError> {
-    if let Some(fb) = fallback {
-        if let Some(val) = env_or_fallback(primary, fb) {
-            return Ok(val);
-        }
-    } else if let Ok(val) = std::env::var(primary) {
-        return Ok(val);
+fn env_key(primary: &str, alias: Option<&str>) -> Option<String> {
+    match alias {
+        Some(alias) => env_or_fallback(primary, alias),
+        None => std::env::var(primary).ok(),
     }
-    Err(ApiError::auth_invalid_key(format!("{primary} not set")))
+}
+
+/// Error-reporting state for the facts a provider-profile builder seeds.
+///
+/// The profile builders resolve provider facts from the environment into
+/// a client builder's plain fields; this struct carries the residue
+/// needed to report a bad fact accurately at
+/// [`build`](OpenAiClientBuilder::build) time: the credential variable a
+/// seeded key came from, a fatal seed problem raised ahead of the
+/// credential check, and the error for a required seeded model that was
+/// absent. An explicit
+/// [`with_api_key`](OpenAiClientBuilder::with_api_key) or
+/// [`with_model`](OpenAiClientBuilder::with_model) supersedes the
+/// corresponding entry, while the fatal seed problem is unconditional.
+#[cfg(any(feature = "openai", feature = "anthropic"))]
+#[derive(Default)]
+struct ProfileSeed {
+    /// The credential environment variable a seeded key was read from.
+    ///
+    /// When the seeded key is absent and no explicit key was set, the
+    /// build's auth error names this variable (e.g. `MOONSHOT_API_KEY`)
+    /// instead of the generic message. Cleared by
+    /// [`with_api_key`](OpenAiClientBuilder::with_api_key), whose value
+    /// supersedes the seed.
+    key_env_name: Option<&'static str>,
+
+    /// The error for a fatal seed problem, raised before the credential
+    /// check.
+    ///
+    /// Carries the exact [`ApiError`] a profile builder wants reported —
+    /// today, Azure's resource-name validation — so the build reproduces
+    /// the constructor's variant, message, and position in the error
+    /// order. Never cleared: an invalid seeded fact fails the build
+    /// regardless of any override.
+    #[cfg(feature = "openai")]
+    seed_error: Option<ApiError>,
+
+    /// The error for a required seeded model that was absent.
+    ///
+    /// Set when a profile's model variable is unset and the profile has
+    /// no pinned default (Azure's deployment name); the build raises it
+    /// after the credential check, matching the constructor's error
+    /// order. Cleared by
+    /// [`with_model`](OpenAiClientBuilder::with_model), whose value
+    /// supersedes the seed.
+    #[cfg(feature = "openai")]
+    missing_model_error: Option<ApiError>,
+}
+
+impl ProfileSeed {
+    /// Record the credential variable a seeded key was read from.
+    ///
+    /// Profile builders call this after resolving the key from the
+    /// environment, whether or not the variable was set: the name is
+    /// what the build's missing-key error should cite.
+    #[cfg(any(
+        feature = "deepseek",
+        feature = "grok",
+        feature = "azure",
+        feature = "moonshot",
+        feature = "zai"
+    ))]
+    fn seed_key(&mut self, missing_env: &'static str) {
+        self.key_env_name = Some(missing_env);
+    }
+
+    /// Record a fatal seed problem to raise before the credential check.
+    ///
+    /// The build returns the carried [`ApiError`] verbatim, so the
+    /// constructor's variant and message survive the deferred check.
+    #[cfg(feature = "azure")]
+    fn reject_seed(&mut self, error: ApiError) {
+        self.seed_error = Some(error);
+    }
+
+    /// Record the error for a required seeded model that was absent.
+    ///
+    /// The build raises the carried [`ApiError`] only if no explicit
+    /// model was supplied in the meantime:
+    /// [`with_model`](OpenAiClientBuilder::with_model) clears the entry
+    /// when it sets a value.
+    #[cfg(feature = "azure")]
+    fn require_model(&mut self, error: ApiError) {
+        self.missing_model_error = Some(error);
+    }
 }
 
 /// Separate inline `Role::System` messages from the rest of the history and
@@ -671,6 +761,47 @@ fn fold_system_messages<'a>(
     (non_system, effective)
 }
 
+/// Builder for an Ollama client with the provider's facts pre-seeded.
+///
+/// Seeds the endpoint (`OLLAMA_BASE_URL`, defaulting to
+/// `http://localhost:11434/v1`), the API key (`OLLAMA_API_KEY`, defaulting
+/// to the `ollama` placeholder local servers accept), and disables
+/// `stream_options.include_usage` for servers that reject it — the same
+/// facts [`ollama`] applies. Works for both a local server (no
+/// configuration) and Ollama Cloud (environment variables or explicit
+/// overrides). Apply [`with_base_url`](OpenAiClientBuilder::with_base_url)
+/// or [`with_api_key`](OpenAiClientBuilder::with_api_key) before
+/// [`build`](OpenAiClientBuilder::build) to override a seed — an explicit
+/// value wins over the environment — and use the HTTP knobs such as
+/// [`with_timeout`](OpenAiClientBuilder::with_timeout) to configure what
+/// the seed does not touch. Configuration-driven hosts keep their own
+/// precedence without re-encoding provider facts.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::provider;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config_base_url = Some("http://10.0.0.8:11434/v1".to_string());
+/// let mut builder = provider::ollama_builder("llama3");
+/// if let Some(url) = config_base_url {
+///     builder = builder.with_base_url(url);
+/// }
+/// let client = builder.with_timeout(std::time::Duration::from_secs(30)).build()?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "ollama")]
+#[must_use]
+pub fn ollama_builder(model: &str) -> OpenAiClientBuilder {
+    OpenAiClient::builder()
+        .with_api_key(env_or_default("OLLAMA_API_KEY", "ollama"))
+        .with_base_url(env_or_default("OLLAMA_BASE_URL", OLLAMA_BASE_URL))
+        .with_model(model)
+        .with_stream_usage(false)
+}
+
 /// Ollama client — an [`OpenAiClient`] pointed at an Ollama server.
 ///
 /// Works with both local Ollama (`http://localhost:11434/v1`, no API key
@@ -699,15 +830,45 @@ fn fold_system_messages<'a>(
 /// Returns [`ApiError`] if the HTTP client cannot be built.
 #[cfg(feature = "ollama")]
 pub fn ollama(model: &str) -> Result<OpenAiClient, ApiError> {
-    let base = env_or_default("OLLAMA_BASE_URL", OLLAMA_BASE_URL);
-    let api_key = env_or_default("OLLAMA_API_KEY", "ollama");
+    ollama_builder(model).build()
+}
 
+/// Builder for a `DeepSeek` client with the provider's facts pre-seeded.
+///
+/// Seeds the endpoint (`https://api.deepseek.com/v1`), the default model
+/// (`deepseek-chat`, overridable via `DEEPSEEK_MODEL`), and the API key
+/// from `DEEPSEEK_API_KEY` — the same facts [`deepseek`] applies. Apply
+/// [`with_api_key`](OpenAiClientBuilder::with_api_key) or
+/// [`with_model`](OpenAiClientBuilder::with_model) before
+/// [`build`](OpenAiClientBuilder::build) to override a seed — an explicit
+/// value wins over the seeded environment — and use the HTTP knobs such
+/// as [`with_timeout`](OpenAiClientBuilder::with_timeout) to configure
+/// what the seed does not touch. When neither a seed nor an
+/// explicit key is present, [`build`](OpenAiClientBuilder::build) fails
+/// naming `DEEPSEEK_API_KEY`.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::provider;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config_api_key = Some("sk-...");
+/// let mut builder = provider::deepseek_builder();
+/// if let Some(key) = config_api_key {
+///     builder = builder.with_api_key(key);
+/// }
+/// let client = builder.build()?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "deepseek")]
+#[must_use]
+pub fn deepseek_builder() -> OpenAiClientBuilder {
     OpenAiClient::builder()
-        .with_api_key(api_key)
-        .with_base_url(base)
-        .with_model(model)
-        .with_stream_usage(false)
-        .build()
+        .with_key_seed(env_key("DEEPSEEK_API_KEY", None), "DEEPSEEK_API_KEY")
+        .with_base_url(DEEPSEEK_BASE_URL)
+        .with_model(env_or_default("DEEPSEEK_MODEL", DEEPSEEK_DEFAULT_MODEL))
 }
 
 /// `DeepSeek` client — an [`OpenAiClient`] pointed at the `DeepSeek` API.
@@ -728,14 +889,95 @@ pub fn ollama(model: &str) -> Result<OpenAiClient, ApiError> {
 /// Returns [`ApiError`] if no API key is found.
 #[cfg(feature = "deepseek")]
 pub fn deepseek() -> Result<OpenAiClient, ApiError> {
-    let api_key = require_api_key("DEEPSEEK_API_KEY", None)?;
-    let model = env_or_default("DEEPSEEK_MODEL", DEEPSEEK_DEFAULT_MODEL);
+    deepseek_builder().build()
+}
 
+/// Builder for an Azure OpenAI client with the provider's facts pre-seeded.
+///
+/// Seeds the v1 endpoint (`https://{resource}.openai.azure.com/openai/v1`)
+/// and the API key from `AZURE_OPENAI_API_KEY` — the same facts [`azure`]
+/// applies. Azure has no default model: call
+/// [`with_model`](OpenAiClientBuilder::with_model) with the deployment
+/// name before [`build`](OpenAiClientBuilder::build). An explicit key or
+/// model passed to the builder wins over the seeded environment, so
+/// configuration-driven hosts keep their own precedence without
+/// re-encoding provider facts; the HTTP knobs configure what the seed
+/// does not touch.
+///
+/// Bad seeded facts are reported by
+/// [`build`](OpenAiClientBuilder::build), in the order the [`azure`]
+/// constructor has always reported them: an invalid resource name
+/// (Azure's account-name rule) first, then a missing credential naming
+/// `AZURE_OPENAI_API_KEY`, then a missing deployment naming
+/// `AZURE_OPENAI_MODEL`.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::provider;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config_api_key = Some("sk-...");
+/// let config_deployment = "my-deployment";
+/// let mut builder = provider::azure_builder("my-resource");
+/// builder = builder.with_model(config_deployment);
+/// if let Some(key) = config_api_key {
+///     builder = builder.with_api_key(key);
+/// }
+/// let client = builder.build()?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "azure")]
+#[must_use]
+pub fn azure_builder(resource: impl AsRef<str>) -> OpenAiClientBuilder {
+    let resource = resource.as_ref();
+    let seed_error = validate_azure_resource(resource).err();
     OpenAiClient::builder()
-        .with_api_key(api_key)
-        .with_base_url(DEEPSEEK_BASE_URL)
-        .with_model(model)
-        .build()
+        .with_key_seed(
+            env_key("AZURE_OPENAI_API_KEY", None),
+            "AZURE_OPENAI_API_KEY",
+        )
+        .with_base_url(format!("https://{resource}.openai.azure.com/openai/v1"))
+        .with_seed_error(seed_error)
+        .with_required_model_seed(
+            std::env::var("AZURE_OPENAI_MODEL").ok(),
+            ApiError::config(
+                "azure: AZURE_OPENAI_MODEL is missing — set it to the deployment \
+                 name configured in your Azure OpenAI resource",
+            ),
+        )
+}
+
+/// Enforce Azure's account-name rule for a resource name.
+///
+/// The name must be 2–64 characters of alphanumerics and hyphens,
+/// starting and ending with an alphanumeric.
+///
+/// # Errors
+///
+/// Returns [`ApiError::config_validation`] with the same message the
+/// [`azure`] constructor has always reported.
+#[cfg(feature = "azure")]
+fn validate_azure_resource(resource: &str) -> Result<(), ApiError> {
+    let chars_ok = resource
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let edges_ok = resource
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && resource
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    if !(2..=64).contains(&resource.chars().count()) || !chars_ok || !edges_ok {
+        return Err(ApiError::config_validation(format!(
+            "azure: resource name {resource:?} must be 2–64 characters of \
+             alphanumerics and hyphens, starting and ending with an alphanumeric"
+        )));
+    }
+    Ok(())
 }
 
 /// Azure OpenAI client — an [`OpenAiClient`] pointed at the resource's
@@ -765,45 +1007,53 @@ pub fn deepseek() -> Result<OpenAiClient, ApiError> {
 /// invalid, or `AZURE_OPENAI_MODEL` is not set.
 #[cfg(feature = "azure")]
 pub fn azure(resource: impl AsRef<str>) -> Result<OpenAiClient, ApiError> {
-    let resource = resource.as_ref();
-    let chars_ok = resource
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-');
-    let edges_ok = resource
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric())
-        && resource
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_ascii_alphanumeric());
-    if !(2..=64).contains(&resource.chars().count()) || !chars_ok || !edges_ok {
-        return Err(ApiError::config_validation(format!(
-            "azure: resource name {resource:?} must be 2–64 characters of \
-             alphanumerics and hyphens, starting and ending with an alphanumeric"
-        )));
-    }
-    let api_key = require_api_key("AZURE_OPENAI_API_KEY", None)?;
-    let deployment = std::env::var("AZURE_OPENAI_MODEL").map_err(|_| {
-        ApiError::config(
-            "azure: AZURE_OPENAI_MODEL is missing — set it to the deployment \
-             name configured in your Azure OpenAI resource",
-        )
-    })?;
-    let base = format!("https://{resource}.openai.azure.com/openai/v1");
+    azure_builder(resource).build()
+}
 
+/// Builder for a Moonshot AI (Kimi) client with the provider's facts
+/// pre-seeded.
+///
+/// Seeds the endpoint (`https://api.moonshot.ai/v1`), the default model
+/// (`kimi-k3`, overridable via `MOONSHOT_MODEL`), and the
+/// API key from `MOONSHOT_API_KEY` — the same facts [`moonshot`]
+/// applies. Apply [`with_api_key`](OpenAiClientBuilder::with_api_key) or
+/// [`with_model`](OpenAiClientBuilder::with_model) before
+/// [`build`](OpenAiClientBuilder::build) to override a seed — an explicit
+/// value wins over the seeded environment — and use the HTTP knobs such
+/// as [`with_timeout`](OpenAiClientBuilder::with_timeout) to configure
+/// what the seed does not touch. When neither a seed nor an
+/// explicit key is present, [`build`](OpenAiClientBuilder::build) fails
+/// naming `MOONSHOT_API_KEY`.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::provider;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config_timeout = std::time::Duration::from_secs(30);
+/// let client = provider::moonshot_builder()
+///     .with_api_key("sk-...")
+///     .with_model("my-model")
+///     .with_timeout(config_timeout)
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "moonshot")]
+#[must_use]
+pub fn moonshot_builder() -> OpenAiClientBuilder {
     OpenAiClient::builder()
-        .with_api_key(api_key)
-        .with_base_url(base)
-        .with_model(deployment)
-        .build()
+        .with_key_seed(env_key("MOONSHOT_API_KEY", None), "MOONSHOT_API_KEY")
+        .with_base_url(MOONSHOT_BASE_URL)
+        .with_model(env_or_default("MOONSHOT_MODEL", MOONSHOT_DEFAULT_MODEL))
 }
 
 /// Moonshot AI (Kimi) client — an [`OpenAiClient`] pointed at the
 /// Moonshot API.
 ///
 /// Reads `MOONSHOT_API_KEY` (required) and optionally `MOONSHOT_MODEL`
-/// (defaults to `kimi-k2-0905-preview`).
+/// (defaults to `kimi-k3`).
 ///
 /// # Example
 ///
@@ -818,14 +1068,46 @@ pub fn azure(resource: impl AsRef<str>) -> Result<OpenAiClient, ApiError> {
 /// Returns [`ApiError`] if no API key is found.
 #[cfg(feature = "moonshot")]
 pub fn moonshot() -> Result<OpenAiClient, ApiError> {
-    let api_key = require_api_key("MOONSHOT_API_KEY", None)?;
-    let model = env_or_default("MOONSHOT_MODEL", MOONSHOT_DEFAULT_MODEL);
+    moonshot_builder().build()
+}
 
+/// Builder for a `Grok` (xAI) client with the provider's facts pre-seeded.
+///
+/// Seeds the endpoint (`https://api.x.ai/v1`), the default model
+/// (`grok-beta`, overridable via `XAI_MODEL` or `GROK_MODEL`), and the
+/// API key from `XAI_API_KEY` (falling back to `GROK_API_KEY`) — the
+/// same facts [`grok`] applies. Apply
+/// [`with_api_key`](OpenAiClientBuilder::with_api_key) or
+/// [`with_model`](OpenAiClientBuilder::with_model) before
+/// [`build`](OpenAiClientBuilder::build) to override a seed — an explicit
+/// value wins over the seeded environment — and use the HTTP knobs such
+/// as [`with_timeout`](OpenAiClientBuilder::with_timeout) to configure
+/// what the seed does not touch. When neither a seed nor an
+/// explicit key is present, [`build`](OpenAiClientBuilder::build) fails
+/// naming `XAI_API_KEY`.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::provider;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let client = provider::grok_builder()
+///     .with_api_key("sk-...")
+///     .with_timeout(std::time::Duration::from_secs(30))
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "grok")]
+#[must_use]
+pub fn grok_builder() -> OpenAiClientBuilder {
     OpenAiClient::builder()
-        .with_api_key(api_key)
-        .with_base_url(MOONSHOT_BASE_URL)
-        .with_model(model)
-        .build()
+        .with_key_seed(env_key("XAI_API_KEY", Some("GROK_API_KEY")), "XAI_API_KEY")
+        .with_base_url(GROK_BASE_URL)
+        .with_model(
+            env_or_fallback("XAI_MODEL", "GROK_MODEL").unwrap_or_else(|| GROK_DEFAULT_MODEL.into()),
+        )
 }
 
 /// `Grok` (xAI) client — an [`OpenAiClient`] pointed at the xAI API.
@@ -846,16 +1128,48 @@ pub fn moonshot() -> Result<OpenAiClient, ApiError> {
 /// Returns [`ApiError`] if no API key is found.
 #[cfg(feature = "grok")]
 pub fn grok() -> Result<OpenAiClient, ApiError> {
-    let api_key = require_api_key("XAI_API_KEY", Some("GROK_API_KEY"))?;
-    let model = std::env::var("XAI_MODEL")
-        .or_else(|_| std::env::var("GROK_MODEL"))
-        .unwrap_or_else(|_| GROK_DEFAULT_MODEL.into());
+    grok_builder().build()
+}
 
-    OpenAiClient::builder()
-        .with_api_key(api_key)
-        .with_base_url(GROK_BASE_URL)
-        .with_model(model)
-        .build()
+/// Builder for a `Z.ai` (`ZhipuAI` / `BigModel`) client with the
+/// provider's facts pre-seeded.
+///
+/// Seeds the Anthropic-compatible endpoint
+/// (`https://api.z.ai/api/anthropic`), the default model (`glm-4.7`,
+/// overridable via `ZAI_MODEL`), and the API key from `ZAI_API_KEY`
+/// (falling back to `ZHIPUAI_API_KEY`) — the same facts [`zai`]
+/// applies. Apply [`with_api_key`](AnthropicClientBuilder::with_api_key)
+/// or [`with_model`](AnthropicClientBuilder::with_model) before
+/// [`build`](AnthropicClientBuilder::build) to override a seed — an
+/// explicit value wins over the seeded environment — and use the HTTP
+/// knobs such as [`with_timeout`](AnthropicClientBuilder::with_timeout)
+/// to configure what the seed does not touch. When neither a seed
+/// nor an explicit key is present,
+/// [`build`](AnthropicClientBuilder::build) fails naming `ZAI_API_KEY`.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::provider;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let client = provider::zai_builder()
+///     .with_api_key("sk-...")
+///     .with_timeout(std::time::Duration::from_secs(30))
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "zai")]
+#[must_use]
+pub fn zai_builder() -> AnthropicClientBuilder {
+    AnthropicClient::builder()
+        .with_key_seed(
+            env_key("ZAI_API_KEY", Some("ZHIPUAI_API_KEY")),
+            "ZAI_API_KEY",
+        )
+        .with_base_url(ZAI_BASE_URL)
+        .with_model(env_or_default("ZAI_MODEL", ZAI_DEFAULT_MODEL))
 }
 
 /// `Z.ai` (`ZhipuAI` / `BigModel`) client — an [`AnthropicClient`] pointed
@@ -880,14 +1194,7 @@ pub fn grok() -> Result<OpenAiClient, ApiError> {
 /// Returns [`ApiError`] if no API key is found.
 #[cfg(feature = "zai")]
 pub fn zai() -> Result<AnthropicClient, ApiError> {
-    let api_key = require_api_key("ZAI_API_KEY", Some("ZHIPUAI_API_KEY"))?;
-    let model = env_or_default("ZAI_MODEL", ZAI_DEFAULT_MODEL);
-
-    AnthropicClient::builder()
-        .with_api_key(api_key)
-        .with_base_url(ZAI_BASE_URL)
-        .with_model(model)
-        .build()
+    zai_builder().build()
 }
 
 /// Self-hosted client — an [`OpenAiClient`] pointed at any custom endpoint.
@@ -1030,6 +1337,343 @@ mod tests {
         assert!(moonshot().is_err());
     }
 
+    #[cfg(all(feature = "moonshot", feature = "testing"))]
+    #[test]
+    fn moonshot_builder_seeds_the_documented_facts() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["MOONSHOT_API_KEY", "MOONSHOT_MODEL"]);
+        env.set("MOONSHOT_API_KEY", "key");
+        env.remove("MOONSHOT_MODEL");
+        let client = moonshot_builder().build().unwrap();
+        assert_eq!(client.base_url(), MOONSHOT_BASE_URL);
+        assert_eq!(client.model(), MOONSHOT_DEFAULT_MODEL);
+    }
+
+    #[cfg(all(feature = "moonshot", feature = "testing"))]
+    #[test]
+    fn explicit_overrides_beat_the_seeded_environment() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["MOONSHOT_API_KEY", "MOONSHOT_MODEL"]);
+        env.set("MOONSHOT_API_KEY", "env-key");
+        env.set("MOONSHOT_MODEL", "env-model");
+        let client = moonshot_builder()
+            .with_api_key("config-key")
+            .with_model("config-model")
+            .with_timeout(Duration::from_secs(31))
+            .build()
+            .unwrap();
+        assert_eq!(client.model(), "config-model");
+    }
+
+    #[cfg(all(feature = "moonshot", feature = "testing"))]
+    #[test]
+    fn explicit_key_builds_without_env_key() {
+        let env = EnvGuard::acquire(&["MOONSHOT_API_KEY"]);
+        env.remove("MOONSHOT_API_KEY");
+        let client = moonshot_builder().with_api_key("config-key").build();
+        assert!(
+            client.is_ok(),
+            "explicit key must override the missing seed"
+        );
+    }
+
+    #[cfg(all(feature = "moonshot", feature = "testing"))]
+    #[test]
+    fn moonshot_constructor_and_builder_agree() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["MOONSHOT_API_KEY", "MOONSHOT_MODEL"]);
+        env.set("MOONSHOT_API_KEY", "key");
+        env.set("MOONSHOT_MODEL", "same-model");
+        let from_constructor = moonshot().unwrap();
+        let from_builder = moonshot_builder().build().unwrap();
+        assert_eq!(from_constructor.model(), from_builder.model());
+        assert_eq!(from_constructor.base_url(), from_builder.base_url());
+    }
+
+    #[cfg(all(feature = "deepseek", feature = "testing"))]
+    #[test]
+    fn deepseek_builder_seeds_the_documented_facts() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["DEEPSEEK_API_KEY", "DEEPSEEK_MODEL"]);
+        env.set("DEEPSEEK_API_KEY", "key");
+        env.remove("DEEPSEEK_MODEL");
+        let client = deepseek_builder().build().unwrap();
+        assert_eq!(client.base_url(), DEEPSEEK_BASE_URL);
+        assert_eq!(client.model(), DEEPSEEK_DEFAULT_MODEL);
+    }
+
+    #[cfg(all(feature = "grok", feature = "testing"))]
+    #[test]
+    fn grok_builder_missing_key_names_the_primary_variable() {
+        let env = EnvGuard::acquire(&["XAI_API_KEY", "GROK_API_KEY"]);
+        env.remove("XAI_API_KEY");
+        env.remove("GROK_API_KEY");
+        let err = grok_builder()
+            .build()
+            .err()
+            .expect("build must fail without a key");
+        assert!(
+            err.to_string().contains("XAI_API_KEY"),
+            "missing-key error must name the primary variable: {err}"
+        );
+    }
+
+    #[cfg(all(feature = "grok", feature = "testing"))]
+    #[test]
+    fn grok_builder_seeds_the_documented_facts() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["XAI_API_KEY", "GROK_MODEL"]);
+        env.set("XAI_API_KEY", "key");
+        env.remove("GROK_MODEL");
+        let client = grok_builder().build().unwrap();
+        assert_eq!(client.base_url(), GROK_BASE_URL);
+        assert_eq!(client.model(), GROK_DEFAULT_MODEL);
+    }
+
+    #[cfg(all(feature = "grok", feature = "testing"))]
+    #[test]
+    fn grok_builder_builds_from_the_alias_variable() {
+        let env = EnvGuard::acquire(&["XAI_API_KEY", "GROK_API_KEY"]);
+        env.remove("XAI_API_KEY");
+        env.set("GROK_API_KEY", "alias-key");
+        let client = grok_builder().build();
+        assert!(
+            client.is_ok(),
+            "the alias variable must satisfy the seeded key"
+        );
+    }
+
+    #[cfg(all(feature = "moonshot", feature = "testing"))]
+    #[test]
+    fn explicit_base_url_beats_the_seeded_endpoint() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["MOONSHOT_API_KEY"]);
+        env.set("MOONSHOT_API_KEY", "key");
+        let client = moonshot_builder()
+            .with_base_url("https://moonshot.example/v1/")
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.base_url(),
+            "https://moonshot.example/v1",
+            "an explicit base URL must override the seeded endpoint (trailing slash trimmed)"
+        );
+    }
+
+    #[cfg(all(feature = "moonshot", feature = "testing"))]
+    #[test]
+    fn empty_seeded_values_are_accepted_as_before() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["MOONSHOT_API_KEY", "MOONSHOT_MODEL"]);
+        env.set("MOONSHOT_API_KEY", "");
+        env.set("MOONSHOT_MODEL", "");
+        let client = moonshot_builder().build();
+        assert!(
+            client.is_ok(),
+            "an empty environment value is set, not missing — used verbatim, \
+             matching the constructors' historical behavior"
+        );
+        assert_eq!(client.unwrap().model(), "");
+    }
+
+    #[cfg(all(feature = "deepseek", feature = "testing"))]
+    #[test]
+    fn deepseek_builder_overrides_beat_the_seeded_environment() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["DEEPSEEK_API_KEY", "DEEPSEEK_MODEL"]);
+        env.set("DEEPSEEK_API_KEY", "env-key");
+        env.set("DEEPSEEK_MODEL", "env-model");
+        let client = deepseek_builder()
+            .with_api_key("config-key")
+            .with_model("config-model")
+            .build()
+            .unwrap();
+        assert_eq!(client.model(), "config-model");
+    }
+
+    #[cfg(all(feature = "grok", feature = "testing"))]
+    #[test]
+    fn grok_builder_model_override_beats_the_seeded_environment() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["XAI_API_KEY", "GROK_MODEL"]);
+        env.set("XAI_API_KEY", "key");
+        env.set("GROK_MODEL", "env-model");
+        let client = grok_builder().with_model("config-model").build().unwrap();
+        assert_eq!(client.model(), "config-model");
+    }
+
+    #[cfg(all(feature = "azure", feature = "testing"))]
+    #[test]
+    fn azure_builder_overrides_beat_the_seeded_environment() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_MODEL"]);
+        env.set("AZURE_OPENAI_API_KEY", "env-key");
+        env.set("AZURE_OPENAI_MODEL", "env-deployment");
+        let client = azure_builder("my-resource")
+            .with_api_key("config-key")
+            .with_model("config-deployment")
+            .build()
+            .unwrap();
+        assert_eq!(client.model(), "config-deployment");
+    }
+
+    #[cfg(all(feature = "ollama", feature = "testing"))]
+    #[test]
+    fn ollama_builder_explicit_key_and_endpoint_beat_the_environment() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["OLLAMA_BASE_URL", "OLLAMA_API_KEY"]);
+        env.remove("OLLAMA_BASE_URL");
+        env.remove("OLLAMA_API_KEY");
+        let client = ollama_builder("llama3")
+            .with_api_key("config-key")
+            .with_base_url("http://10.0.0.8:11434/v1")
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.base_url(),
+            "http://10.0.0.8:11434/v1",
+            "an explicit endpoint must override the localhost seed"
+        );
+    }
+
+    #[cfg(all(feature = "azure", feature = "testing"))]
+    #[test]
+    fn azure_builder_rejects_invalid_resource_with_the_constructor_message() {
+        let err = azure_builder("under_score")
+            .build()
+            .err()
+            .expect("an invalid resource name must be rejected");
+        assert!(
+            err.to_string().contains(
+                "azure: resource name \"under_score\" must be 2–64 characters of \
+                 alphanumerics and hyphens, starting and ending with an alphanumeric"
+            ),
+            "the constructor's validation message must be preserved: {err}"
+        );
+    }
+
+    #[cfg(all(feature = "azure", feature = "testing"))]
+    #[test]
+    fn azure_builder_reports_the_resource_before_the_credential() {
+        let env = EnvGuard::acquire(&["AZURE_OPENAI_API_KEY"]);
+        env.remove("AZURE_OPENAI_API_KEY");
+        let err = azure_builder("under_score")
+            .build()
+            .err()
+            .expect("an invalid resource name must be rejected");
+        assert!(
+            err.to_string().contains("resource name"),
+            "the resource check precedes the credential check: {err}"
+        );
+    }
+
+    #[cfg(all(feature = "azure", feature = "testing"))]
+    #[test]
+    fn azure_builder_requires_a_model_naming_the_env_var() {
+        let env = EnvGuard::acquire(&["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_MODEL"]);
+        env.set("AZURE_OPENAI_API_KEY", "key");
+        env.remove("AZURE_OPENAI_MODEL");
+        let err = azure_builder("my-resource")
+            .build()
+            .err()
+            .expect("build must fail without a model");
+        assert!(
+            err.to_string().contains("AZURE_OPENAI_MODEL"),
+            "missing-model error must name the variable: {err}"
+        );
+        let client = azure_builder("my-resource")
+            .with_model("config-deployment")
+            .build();
+        assert!(
+            client.is_ok(),
+            "an explicit model must override the missing seed"
+        );
+    }
+
+    #[cfg(all(feature = "ollama", feature = "testing"))]
+    #[test]
+    fn ollama_builder_seeds_local_defaults_and_cloud_env() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["OLLAMA_BASE_URL", "OLLAMA_API_KEY"]);
+        env.remove("OLLAMA_BASE_URL");
+        env.remove("OLLAMA_API_KEY");
+        let local = ollama_builder("llama3").build().unwrap();
+        assert_eq!(local.base_url(), "http://localhost:11434/v1");
+
+        env.set("OLLAMA_BASE_URL", "https://api.ollama.com/v1");
+        env.set("OLLAMA_API_KEY", "cloud-key");
+        let cloud = ollama_builder("llama3").build().unwrap();
+        assert_eq!(cloud.base_url(), "https://api.ollama.com/v1");
+    }
+
+    #[cfg(all(feature = "zai", feature = "testing"))]
+    #[test]
+    fn zai_builder_seeds_the_anthropic_compatible_facts() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["ZAI_API_KEY", "ZAI_MODEL"]);
+        env.set("ZAI_API_KEY", "key");
+        env.remove("ZAI_MODEL");
+        let client = zai_builder().build().unwrap();
+        assert_eq!(client.base_url(), ZAI_BASE_URL);
+        assert_eq!(client.model(), ZAI_DEFAULT_MODEL);
+    }
+
+    #[cfg(all(feature = "zai", feature = "testing"))]
+    #[test]
+    fn zai_builder_builds_from_the_alias_variable() {
+        let env = EnvGuard::acquire(&["ZAI_API_KEY", "ZHIPUAI_API_KEY"]);
+        env.remove("ZAI_API_KEY");
+        env.set("ZHIPUAI_API_KEY", "alias-key");
+        let client = zai_builder().build();
+        assert!(
+            client.is_ok(),
+            "the alias variable must satisfy the seeded key"
+        );
+    }
+
+    #[cfg(all(feature = "zai", feature = "testing"))]
+    #[test]
+    fn zai_builder_missing_key_names_the_primary_variable() {
+        let env = EnvGuard::acquire(&["ZAI_API_KEY", "ZHIPUAI_API_KEY"]);
+        env.remove("ZAI_API_KEY");
+        env.remove("ZHIPUAI_API_KEY");
+        let err = zai_builder()
+            .build()
+            .err()
+            .expect("build must fail without a key");
+        assert!(
+            err.to_string().contains("ZAI_API_KEY"),
+            "missing-key error must name the primary variable: {err}"
+        );
+    }
+
+    #[cfg(all(feature = "zai", feature = "testing"))]
+    #[test]
+    fn zai_constructor_and_builder_agree() {
+        use crate::api::ApiClient as _;
+
+        let env = EnvGuard::acquire(&["ZAI_API_KEY", "ZAI_MODEL"]);
+        env.set("ZAI_API_KEY", "key");
+        env.set("ZAI_MODEL", "same-model");
+        let from_constructor = zai().unwrap();
+        let from_builder = zai_builder().build().unwrap();
+        assert_eq!(from_constructor.model(), from_builder.model());
+        assert_eq!(from_constructor.base_url(), from_builder.base_url());
+    }
+
     #[cfg(any(
         feature = "ollama",
         feature = "deepseek",
@@ -1123,75 +1767,109 @@ mod tests {
     }
 
     #[cfg(all(
-        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        any(
+            feature = "deepseek",
+            feature = "grok",
+            feature = "zai",
+            feature = "azure",
+            feature = "moonshot"
+        ),
         feature = "testing"
     ))]
     #[test]
-    fn require_api_key_primary_set() {
+    fn env_key_primary_set() {
         let env = EnvGuard::acquire(&["LOOPCTL_TEST_KEY_PRIMARY", "LOOPCTL_TEST_KEY_FALLBACK"]);
         env.set("LOOPCTL_TEST_KEY_PRIMARY", "secret");
         env.remove("LOOPCTL_TEST_KEY_FALLBACK");
-        let key = require_api_key(
-            "LOOPCTL_TEST_KEY_PRIMARY",
-            Some("LOOPCTL_TEST_KEY_FALLBACK"),
-        )
-        .unwrap();
-        assert_eq!(key, "secret");
+        assert_eq!(
+            env_key(
+                "LOOPCTL_TEST_KEY_PRIMARY",
+                Some("LOOPCTL_TEST_KEY_FALLBACK")
+            ),
+            Some("secret".to_string())
+        );
     }
 
     #[cfg(all(
-        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        any(
+            feature = "deepseek",
+            feature = "grok",
+            feature = "zai",
+            feature = "azure",
+            feature = "moonshot"
+        ),
         feature = "testing"
     ))]
     #[test]
-    fn require_api_key_fallback_used() {
+    fn env_key_fallback_used() {
         let env = EnvGuard::acquire(&["LOOPCTL_TEST_KEY_PRIMARY2", "LOOPCTL_TEST_KEY_FALLBACK2"]);
         env.remove("LOOPCTL_TEST_KEY_PRIMARY2");
         env.set("LOOPCTL_TEST_KEY_FALLBACK2", "fallback-secret");
-        let key = require_api_key(
-            "LOOPCTL_TEST_KEY_PRIMARY2",
-            Some("LOOPCTL_TEST_KEY_FALLBACK2"),
-        )
-        .unwrap();
-        assert_eq!(key, "fallback-secret");
+        assert_eq!(
+            env_key(
+                "LOOPCTL_TEST_KEY_PRIMARY2",
+                Some("LOOPCTL_TEST_KEY_FALLBACK2")
+            ),
+            Some("fallback-secret".to_string())
+        );
     }
 
     #[cfg(all(
-        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        any(
+            feature = "deepseek",
+            feature = "grok",
+            feature = "zai",
+            feature = "azure",
+            feature = "moonshot"
+        ),
         feature = "testing"
     ))]
     #[test]
-    fn require_api_key_no_fallback_set() {
+    fn env_key_without_alias_reads_primary() {
         let env = EnvGuard::acquire(&["LOOPCTL_TEST_KEY_ONLY"]);
         env.set("LOOPCTL_TEST_KEY_ONLY", "only-val");
-        let key = require_api_key("LOOPCTL_TEST_KEY_ONLY", None).unwrap();
-        assert_eq!(key, "only-val");
+        assert_eq!(
+            env_key("LOOPCTL_TEST_KEY_ONLY", None),
+            Some("only-val".to_string())
+        );
     }
 
     #[cfg(all(
-        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        any(
+            feature = "deepseek",
+            feature = "grok",
+            feature = "zai",
+            feature = "azure",
+            feature = "moonshot"
+        ),
         feature = "testing"
     ))]
     #[test]
-    fn require_api_key_errors_when_missing() {
+    fn env_key_is_none_when_missing() {
         let env = EnvGuard::acquire(&["LOOPCTL_TEST_MISSING_KEY"]);
         env.remove("LOOPCTL_TEST_MISSING_KEY");
-        let err = require_api_key("LOOPCTL_TEST_MISSING_KEY", None).unwrap_err();
-        assert!(err.to_string().contains("LOOPCTL_TEST_MISSING_KEY"));
+        assert_eq!(env_key("LOOPCTL_TEST_MISSING_KEY", None), None);
     }
 
     #[cfg(all(
-        any(feature = "deepseek", feature = "grok", feature = "zai"),
+        any(
+            feature = "deepseek",
+            feature = "grok",
+            feature = "zai",
+            feature = "azure",
+            feature = "moonshot"
+        ),
         feature = "testing"
     ))]
     #[test]
-    fn require_api_key_errors_when_both_missing() {
+    fn env_key_is_none_when_both_missing() {
         let env = EnvGuard::acquire(&["LOOPCTL_TEST_MISSING_A", "LOOPCTL_TEST_MISSING_B"]);
         env.remove("LOOPCTL_TEST_MISSING_A");
         env.remove("LOOPCTL_TEST_MISSING_B");
-        let err =
-            require_api_key("LOOPCTL_TEST_MISSING_A", Some("LOOPCTL_TEST_MISSING_B")).unwrap_err();
-        assert!(err.to_string().contains("LOOPCTL_TEST_MISSING_A"));
+        assert_eq!(
+            env_key("LOOPCTL_TEST_MISSING_A", Some("LOOPCTL_TEST_MISSING_B")),
+            None
+        );
     }
 
     #[cfg(all(feature = "ollama", feature = "testing"))]

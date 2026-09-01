@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **Configurable provider-profile builders (`*_builder()`)** — a middle tier between the zero-argument profile constructors and the bare client builders: `provider::deepseek_builder()`, `grok_builder()`, `moonshot_builder()`, `ollama_builder(model)`, and `azure_builder(resource)` (each behind that provider's existing feature, returning `OpenAiClientBuilder`), plus `zai_builder()` (returning `AnthropicClientBuilder`). Each returns the underlying client builder with the provider's facts pre-seeded — endpoint, credential environment variable (alias fallbacks preserved), and default model. Hosts driven by a configuration file apply their own precedence: an explicit `with_api_key`/`with_model`/`with_base_url`/`with_timeout` overrides the seeded environment, and a bad seeded fact — an invalid Azure resource name, a missing seeded key, or Azure's missing deployment model — fails at `build()`, in the order the constructors have always reported, naming the variable (`MOONSHOT_API_KEY`, `AZURE_OPENAI_MODEL`, …), so no provider fact (endpoint string, env-var name, default model) needs to be duplicated outside the crate. The zero-argument constructors are now thin wrappers over these builders and behave identically (their error messages included). `BedrockClientBuilder` also gains the shared HTTP configuration surface the other builders already delegate to — `with_timeout` (read-timeout semantics), `with_connect_timeout`, `with_http_client`, and the pool/TCP knobs — instead of a hardcoded default client. Pinned by `moonshot_builder_seeds_the_documented_facts`, `explicit_overrides_beat_the_seeded_environment`, `azure_builder_requires_a_model_naming_the_env_var`, `ollama_builder_seeds_local_defaults_and_cloud_env`, `bedrock_builder_accepts_the_http_knobs`, and the `moonshot_constructor_and_builder_agree` / `zai_constructor_and_builder_agree` tests.
+
+### Changed
+
+- **Moonshot's default model is now `kimi-k3`** (was `kimi-k2-0905-preview`) — the pinned default used by `provider::moonshot()` and `moonshot_builder()` when `MOONSHOT_MODEL` is unset. Migration: set `MOONSHOT_MODEL=kimi-k2-0905-preview` to keep the old default. Pinned by `moonshot_builds_client_and_defaults_model` and `moonshot_builder_seeds_the_documented_facts`.
+
 ## [0.3.0] - 2026-08-30
 
 ### Added

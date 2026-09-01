@@ -471,6 +471,14 @@ pub struct OpenAiClientBuilder {
     /// the parameter (older Ollama, some self-hosted deployments). Read by
     /// [`build`](Self::build) and stored on [`OpenAiClient`].
     stream_usage: bool,
+
+    /// Error-reporting state for values seeded by the provider-profile
+    /// builders.
+    ///
+    /// Carries the credential variable a seeded key came from and the
+    /// error for a required seeded model that was absent; consulted by
+    /// [`build`](Self::build).
+    seed: super::ProfileSeed,
 }
 
 impl Default for OpenAiClientBuilder {
@@ -481,6 +489,7 @@ impl Default for OpenAiClientBuilder {
             model: DEFAULT_MODEL.into(),
             http: super::HttpClientConfig::default(),
             stream_usage: true,
+            seed: super::ProfileSeed::default(),
         }
     }
 }
@@ -490,10 +499,12 @@ impl OpenAiClientBuilder {
     ///
     /// Required — [`build`](Self::build) returns an error if this is not set.
     /// The key is sent as the `Authorization: Bearer <key>` header on every
-    /// request.
+    /// request. An explicit key supersedes a seeded one, including the
+    /// missing-key error the seed would otherwise name.
     #[must_use]
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
+        self.seed.key_env_name = None;
         self
     }
 
@@ -516,10 +527,71 @@ impl OpenAiClientBuilder {
     /// unless a per-request
     /// [`RequestOptions::model`](crate::structured::RequestOptions::model)
     /// override names another. Can also be swapped wholesale at runtime
-    /// via [`OpenAiClient::set_model`].
+    /// via [`OpenAiClient::set_model`]. An explicit model overrides any
+    /// seeded value from the provider-profile builders, including a
+    /// required seed whose environment variable was unset.
     #[must_use]
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
+        self.seed.missing_model_error = None;
+        self
+    }
+
+    /// Seed the API key from a resolved environment lookup.
+    ///
+    /// Provider-profile builders call this with the value of the
+    /// provider's credential variable (or `None` when unset). An absent
+    /// seed leaves the key unset — [`build`](Self::build) then fails
+    /// naming `missing_env` — while an explicit
+    /// [`with_api_key`](Self::with_api_key) overrides the seed.
+    #[cfg(any(
+        feature = "deepseek",
+        feature = "grok",
+        feature = "azure",
+        feature = "moonshot"
+    ))]
+    #[must_use]
+    pub(super) fn with_key_seed(mut self, key: Option<String>, missing_env: &'static str) -> Self {
+        self.api_key = key;
+        self.seed.seed_key(missing_env);
+        self
+    }
+
+    /// Record a fatal seeded-fact problem to raise before the credential
+    /// check.
+    ///
+    /// [`azure_builder`](crate::provider::azure_builder) calls this with
+    /// its resource-name validation outcome; the carried [`ApiError`] is
+    /// returned verbatim by [`build`](Self::build), ahead of the
+    /// credential and model checks, preserving the constructor's error
+    /// order.
+    #[cfg(feature = "azure")]
+    #[must_use]
+    pub(super) fn with_seed_error(mut self, error: Option<ApiError>) -> Self {
+        if let Some(error) = error {
+            self.seed.reject_seed(error);
+        }
+        self
+    }
+
+    /// Seed a required model from a resolved environment lookup.
+    ///
+    /// [`azure_builder`](crate::provider::azure_builder) calls this with
+    /// the deployment variable's value (or `None` when unset); the
+    /// carried error is raised by [`build`](Self::build) when the seed
+    /// is absent and [`with_model`](Self::with_model) does not supply
+    /// one.
+    #[cfg(feature = "azure")]
+    #[must_use]
+    pub(super) fn with_required_model_seed(
+        mut self,
+        model: Option<String>,
+        missing_error: ApiError,
+    ) -> Self {
+        match model {
+            Some(model) => self.model = model,
+            None => self.seed.require_model(missing_error),
+        }
         self
     }
 
@@ -619,11 +691,22 @@ impl OpenAiClientBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`ApiError`] if no API key was set.
+    /// Returns [`ApiError`] if a seeded fact is invalid or missing — an
+    /// invalid Azure resource name first, then the credential (naming the
+    /// provider's variable when the key came seeded from a
+    /// provider-profile builder), then a required seeded model (Azure's
+    /// deployment name) — or if no API key was set at all.
     pub fn build(self) -> Result<OpenAiClient, ApiError> {
-        let api_key = self
-            .api_key
-            .ok_or_else(|| ApiError::auth_invalid_key("API key not provided"))?;
+        if let Some(error) = self.seed.seed_error {
+            return Err(error);
+        }
+        let api_key = self.api_key.ok_or_else(|| match self.seed.key_env_name {
+            Some(name) => ApiError::auth_invalid_key(format!("{name} not set")),
+            None => ApiError::auth_invalid_key("API key not provided"),
+        })?;
+        if let Some(error) = self.seed.missing_model_error {
+            return Err(error);
+        }
         let http = self.http.build()?;
 
         Ok(OpenAiClient {

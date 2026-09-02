@@ -60,6 +60,8 @@
 //! }
 //! ```
 
+#[cfg(feature = "builtin_tools")]
+pub mod builtin;
 #[cfg(feature = "tool_health")]
 pub mod health;
 #[cfg(feature = "tool_shield")]

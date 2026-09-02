@@ -444,3 +444,37 @@ async fn a_zero_retention_cap_retains_nothing() {
         "a zero retention cap retains nothing, while the run itself is unaffected"
     );
 }
+
+#[tokio::test]
+async fn the_degenerate_config_combination_stays_consistent() {
+    let dir = std::env::temp_dir().join(format!("trajectory-degenerate-{}", uuid::Uuid::new_v4()));
+    let observer = Arc::new(
+        TrajectoryObserver::writing_to(&dir)
+            .with_capture_limit(0)
+            .with_memory_retention(Some(0)),
+    );
+    let mut loop_ = scripted_loop(
+        Arc::clone(&observer),
+        vec![vec![terminal()]].into_iter().flatten().collect(),
+    );
+
+    loop_
+        .run("everything minimized", &RunConfig::default())
+        .await
+        .expect("run completes");
+
+    assert!(
+        observer.records().is_empty(),
+        "zero retention retains nothing"
+    );
+    let raw = std::fs::read_to_string(dir.join("trajectory.jsonl")).expect("ledger exists");
+    let lines: Vec<&str> = raw.lines().collect();
+    assert_eq!(lines.len(), 1, "the ledger keeps the record memory dropped");
+    let record: TrajectoryRecord = serde_json::from_str(lines[0]).expect("the line parses");
+    assert_eq!(
+        record.turns[0].response_text, "",
+        "zero capture limit captures no response text"
+    );
+    assert_eq!(record.outcome, TrajectoryOutcome::Success);
+    std::fs::remove_dir_all(&dir).expect("cleanup succeeds");
+}

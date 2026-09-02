@@ -165,10 +165,12 @@ pub struct TrajectoryRecord {
     /// the detail fields.
     pub token_summary: TokenSummary,
 
-    /// The run's turns, in execution order.
+    /// The run's turns, ordered by turn index.
     ///
     /// Each entry is self-contained: the query, the truncated response,
-    /// and the turn's tool calls.
+    /// and the turn's tool calls. Ordering is by index, which is the
+    /// execution order for an in-order event stream and stays total
+    /// under any interleaving.
     pub turns: Vec<TrajectoryTurn>,
 }
 
@@ -342,10 +344,11 @@ struct RecordBuilder {
     /// more than the configured limit.
     capture_limit: usize,
 
-    /// Turns that received their end event, in execution order.
+    /// Turns that received their end event.
     ///
     /// Immutable once closed; converted from the in-flight builder at
-    /// close time.
+    /// close time. A reopened turn re-appends at the back; the record
+    /// orders turns by index at run end.
     turns: Vec<TrajectoryTurn>,
 
     /// The turn in flight, if any event of a turn has been seen.
@@ -649,10 +652,11 @@ impl TrajectoryObserver {
     /// content is plaintext prompt, response, and tool text; the ledger
     /// and its directory are to be treated as sensitive.
     ///
-    /// One ledger per process: this crate does not serialize appends
-    /// across processes, so point two concurrently running hosts at the
-    /// same `dir` only if interleaving their records in one file is
-    /// acceptable.
+    /// Observers in one process writing to the same directory are
+    /// serialized, so their records interleave as whole lines. Across
+    /// processes nothing is serialized: point two concurrently running
+    /// hosts at the same `dir` only if interleaving their records in
+    /// one file is acceptable.
     #[must_use]
     pub fn writing_to(dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -858,6 +862,7 @@ impl LoopObserver for TrajectoryObserver {
             builder.abandon_call(tool_call_id, open);
         }
         builder.close_current();
+        builder.turns.sort_by_key(|turn| turn.turn);
 
         let any_call_ok = builder
             .turns
@@ -2074,6 +2079,10 @@ mod tests {
                 indices.iter().collect::<std::collections::HashSet<_>>().len(),
                 "turn indices stay unique under any event order"
             );
+            prop_assert!(
+                indices.windows(2).all(|pair| pair[0] < pair[1]),
+                "turns stay ordered by index under any event order"
+            );
             for turn in &record.turns {
                 prop_assert!(turn.response_text.chars().count() <= 5);
                 for call in &turn.tool_calls {
@@ -2188,6 +2197,10 @@ mod tests {
     fn rfc3339_rendering_preserves_chronological_order() {
         use proptest::prelude::*;
 
+        assert!(
+            format_rfc3339(u64::MAX).is_some(),
+            "the whole u64 second range renders without panic or overflow"
+        );
         proptest!(|(secs in 0u64..4_000_000_000u64)| {
             let a = format_rfc3339(secs).expect("renders");
             let b = format_rfc3339(secs.saturating_add(1)).expect("renders");
@@ -2232,5 +2245,65 @@ mod tests {
         assert_eq!(turn.query, "the real query");
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].tool_call_id, "call_first");
+    }
+    #[test]
+    fn a_reopened_turn_lands_in_execution_order() {
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 3,
+            query: "first phase".to_string(),
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 3,
+            success: true,
+            error: None,
+            duration_ms: 1,
+            input_tokens: 1,
+            output_tokens: 1,
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 4,
+            query: "later".to_string(),
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 4,
+            success: true,
+            error: None,
+            duration_ms: 2,
+            input_tokens: 1,
+            output_tokens: 1,
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 3,
+            query: "reopened".to_string(),
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 3,
+            success: true,
+            error: None,
+            duration_ms: 3,
+            input_tokens: 2,
+            output_tokens: 2,
+        });
+        observer.on_run_end(&RunEndContext {
+            success: true,
+            error: None,
+            total_turns: 5,
+            duration_ms: 10,
+        });
+
+        let record = &observer.records()[0];
+        let indices: Vec<usize> = record.turns.iter().map(|turn| turn.turn).collect();
+        assert_eq!(
+            indices,
+            vec![3, 4],
+            "the reopened turn lands in execution order, not appended after later turns"
+        );
+        let reopened = &record.turns[0];
+        assert_eq!(reopened.query, "reopened");
+        assert_eq!(reopened.duration_ms, 3);
     }
 }

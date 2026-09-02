@@ -80,8 +80,9 @@
 //! order; `outcome` is one of `success`, `failure`, `partial`
 //! (`snake_case`);
 //! unknown fields are tolerated when deserializing (forward compatibility);
-//! `token_summary`'s detail fields are `null` when the provider did not
-//! report them — `null` means *unreported*, never zero.
+//! `token_summary`'s detail fields are reserved and always `null` in this
+//! version — the provider's usage breakdown does not yet reach the
+//! observer, so a `null` there carries no information.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -151,11 +152,10 @@ pub struct TrajectoryRecord {
     /// be shorter when the observer attached mid-run.
     pub total_turns: usize,
 
-    /// Token totals over the run's turns, plus the provider's usage detail
-    /// when it reported any.
+    /// Token totals over the run's turns.
     ///
-    /// See [`TokenSummary`] for the unreported-versus-zero distinction on
-    /// the detail fields.
+    /// See [`TokenSummary`]; its detail fields are reserved and always
+    /// `null` in this version.
     pub token_summary: TokenSummary,
 
     /// The run's turns, ordered by turn index.
@@ -196,12 +196,13 @@ pub enum TrajectoryOutcome {
     Partial,
 }
 
-/// Token totals over a run's turns, plus usage detail when reported.
+/// Token totals over a run's turns, with reserved usage-detail fields.
 ///
-/// The sums aggregate every captured turn. The detail fields forward the
-/// provider's per-run usage breakdown when present; `None` means the
-/// provider did not report the figure. An unreported value is never
-/// represented as a measured zero.
+/// The sums aggregate every captured turn. The detail fields are reserved
+/// for the provider's per-run usage breakdown, which does not yet reach
+/// the observer: they are always `None` in this version and carry no
+/// information. The `Option` shape keeps the interchange schema stable
+/// for the version that starts forwarding the figures.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenSummary {
     /// Total input tokens across the run's turns.
@@ -216,21 +217,21 @@ pub struct TokenSummary {
     /// turns reports zero.
     pub output_tokens: u64,
 
-    /// Input tokens served from the provider's cache, if reported.
+    /// Input tokens served from the provider's cache.
     ///
-    /// `None` until the provider's usage detail reaches the observer —
-    /// unreported is never collapsed to a measured zero.
+    /// Reserved and always `None` in this version: the provider's usage
+    /// detail does not yet reach the observer.
     pub cached_input_tokens: Option<u64>,
 
-    /// Tokens written to the provider's cache, if reported.
+    /// Tokens written to the provider's cache.
     ///
-    /// Same `None`-means-unreported contract as
+    /// Reserved and always `None` in this version, like
     /// [`cached_input_tokens`](Self::cached_input_tokens).
     pub cache_write_tokens: Option<u64>,
 
-    /// Reasoning tokens the provider charged separately, if reported.
+    /// Reasoning tokens the provider charges separately.
     ///
-    /// Same `None`-means-unreported contract as
+    /// Reserved and always `None` in this version, like
     /// [`cached_input_tokens`](Self::cached_input_tokens).
     pub reasoning_tokens: Option<u64>,
 }
@@ -1290,6 +1291,10 @@ mod tests {
             tool: "slow".to_string(),
             tool_call_id: "call_x".to_string(),
         });
+        // The sleep guarantees the dispatch-to-run-end gap exceeds five
+        // milliseconds, so the truncation to whole milliseconds cannot
+        // zero it and the duration assertion below is deterministic.
+        std::thread::sleep(std::time::Duration::from_millis(5));
         observer.on_run_end(&RunEndContext {
             success: false,
             error: Some("cancelled".to_string()),
@@ -1303,6 +1308,10 @@ mod tests {
         assert!(
             !calls[0].ok,
             "a call still in flight at run end renders as unfinished"
+        );
+        assert!(
+            calls[0].duration_ms >= 1,
+            "an abandoned call's duration is measured from dispatch to run end, not zeroed"
         );
         assert_eq!(
             record.outcome,

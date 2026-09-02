@@ -36,8 +36,9 @@ static LEDGER_APPEND_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// One instance per writer: the enqueueing threads and the worker both
 /// reach it through `Arc`, with `state` guarding every mutation and
-/// `idle` coordinating the three waiters — the worker waiting for
-/// work, `flush` waiting for drain, and drop waiting to close.
+/// `idle` coordinating its two waiters — the worker waiting for work
+/// and `flush` waiting for drain — as well as carrying the close and
+/// batch-completion broadcasts.
 struct WriterShared {
     /// Directory the ledger is appended to.
     ///
@@ -63,12 +64,17 @@ struct WriterShared {
     /// the worker loop and `flush`.
     ///
     /// The associated mutex is always `state`. Wakeup safety rests on
-    /// one invariant: the worker sleeps only after observing an empty
-    /// queue with no batch in flight, while `flush` waits only when
-    /// the queue is non-empty or a batch is in flight — so the two are
-    /// never waiting at the same time and a single `notify_one` from
-    /// enqueue or close cannot be misdirected away from the worker.
-    /// Preserve that invariant when changing either wait condition.
+    /// one invariant: every state change that can satisfy a waiter —
+    /// an enqueue, a close, and a batch completion — wakes *all*
+    /// waiters, never just one. The parked worker and a parked
+    /// `flush` wait on opposite predicates (the worker while the
+    /// queue is empty, `flush` while records are outstanding), and
+    /// both can be parked at once: an enqueue that lands after the
+    /// worker observed an empty queue can park `flush` before the
+    /// enqueuer's wakeup fires. A single directed wakeup can then be
+    /// handed to the waiter whose predicate is still false, losing
+    /// the wakeup the other waiter needed. Preserve the notify-all
+    /// discipline when changing any wait condition.
     idle: Condvar,
 }
 
@@ -123,7 +129,10 @@ fn append_line(dir: &Path, line: &str) {
         .open(&path)
         .and_then(|mut file| {
             use std::io::Write as _;
-            let start = file.metadata().map_or(0, |m| m.len());
+            let start = match file.metadata() {
+                Ok(metadata) => metadata.len(),
+                Err(error) => return Err(error),
+            };
             let mut out = String::with_capacity(line.len().saturating_add(1));
             out.push_str(line);
             out.push('\n');
@@ -212,11 +221,13 @@ pub(crate) struct LedgerWriter {
     /// records are written before the writer goes away.
     handle: Option<JoinHandle<()>>,
 
-    /// Whether enqueues must write inline after a failed thread spawn.
+    /// Whether the worker failed to start, making every enqueue a drop.
     ///
     /// Set only when spawning was attempted and failed; a deliberately
-    /// unspawned writer (tests) still queues normally.
-    inline: bool,
+    /// unspawned writer (tests) still queues normally. Records are
+    /// dropped with a warning rather than written inline, preserving
+    /// the contract that observer callbacks never touch the filesystem.
+    failed: bool,
 }
 
 impl LedgerWriter {
@@ -232,8 +243,9 @@ impl LedgerWriter {
     /// A writer with an explicit queue capacity.
     ///
     /// `spawn` starts the worker thread; when spawning fails the writer
-    /// degrades to inline writes on the calling thread so capture still
-    /// functions, at the cost of the responsiveness the worker provides.
+    /// drops every record with a warning rather than writing inline, so
+    /// observer callbacks never perform filesystem work regardless of
+    /// the worker's fate.
     fn with_capacity(dir: PathBuf, capacity: usize, spawn: bool) -> Self {
         let inner = Arc::new(WriterShared {
             dir,
@@ -250,17 +262,18 @@ impl LedgerWriter {
         } else {
             None
         };
-        let inline = spawn && handle.is_none();
-        if inline {
+        let failed = spawn && handle.is_none();
+        if failed {
             tracing::warn!(
                 target: "loopctl::trajectory",
-                "trajectory ledger worker could not be spawned; writes run inline"
+                records_lost = 1,
+                "trajectory ledger worker could not be spawned; ledger records will be dropped"
             );
         }
         Self {
             inner,
             handle,
-            inline,
+            failed,
         }
     }
 
@@ -274,12 +287,17 @@ impl LedgerWriter {
 
     /// Queue a serialized record for writing.
     ///
-    /// Never blocks on filesystem I/O. When the queue is at capacity the
-    /// oldest queued record is dropped with a warning; when the worker
-    /// could not be spawned, the write happens inline instead.
+    /// Never blocks on filesystem I/O and never touches the filesystem
+    /// on the calling thread. When the queue is at capacity the oldest
+    /// queued record is dropped with a warning; when the worker could
+    /// not be spawned, the record itself is dropped with a warning.
     pub(crate) fn enqueue(&self, line: String) {
-        if self.inline {
-            append_line(&self.inner.dir, &line);
+        if self.failed {
+            tracing::warn!(
+                target: "loopctl::trajectory",
+                records_lost = 1,
+                "trajectory ledger worker unavailable; record dropped"
+            );
             return;
         }
         let mut state = recover_guard(self.inner.state.lock());
@@ -303,7 +321,7 @@ impl LedgerWriter {
         }
         state.lines.push_back(line);
         drop(state);
-        self.inner.idle.notify_one();
+        self.inner.idle.notify_all();
     }
 
     /// Block until every record accepted before this call has been written.
@@ -325,7 +343,7 @@ impl Drop for LedgerWriter {
         let mut state = recover_guard(self.inner.state.lock());
         state.closed = true;
         drop(state);
-        self.inner.idle.notify_one();
+        self.inner.idle.notify_all();
         if let Some(handle) = self.handle.take() {
             let _joined = handle.join();
         }
@@ -399,13 +417,11 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_enqueue_and_flush_never_deadlocks() {
+    fn concurrent_enqueue_and_flush_lose_no_records() {
         let dir = temp_dir("soak");
         // Capacity above the full burst keeps the documented drop-oldest
-        // policy out of the picture; this pins no-loss, no-duplication,
-        // and no deadlock under concurrent enqueue and flush. The burst
-        // behavior *with* the default cap is the overflow test above —
-        // the soak's first draft lost 74 of 800 records to that policy.
+        // policy out of the picture; the burst behavior *with* the
+        // default cap is the overflow test above.
         let writer = LedgerWriter::with_capacity(dir.clone(), 1024, true);
         let writer = std::sync::Arc::new(writer);
         let mut handles = Vec::new();
@@ -434,13 +450,10 @@ mod tests {
     #[test]
     fn dropping_the_writer_drains_the_queue() {
         let dir = temp_dir("drain");
-        let mut lines_expected = Vec::new();
         {
             let writer = LedgerWriter::new(dir.clone());
             for index in 0..3 {
-                let line = format!("{{\"run\":\"{index}\"}}");
-                lines_expected.push(line.clone());
-                writer.enqueue(line);
+                writer.enqueue(format!("{{\"run\":\"{index}\"}}"));
             }
         }
         let raw = std::fs::read_to_string(dir.join(LEDGER_FILE)).expect("drained on drop");

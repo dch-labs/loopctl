@@ -265,8 +265,11 @@ pub struct TrajectoryTurn {
     /// The turn's tool calls, in completion order.
     ///
     /// Pairing is by `tool_call_id`, so parallel and interleaved calls
-    /// land on their own entries. Calls closed at run end (never
-    /// completed) are appended afterwards, in unspecified order.
+    /// land on their own entries. A call the engine retried appears once
+    /// per attempt, oldest first — the entries tell the recovery story,
+    /// and id-pairing keys attempts, not unique calls. Calls closed at
+    /// run end (never completed) are appended afterwards, in unspecified
+    /// order.
     pub tool_calls: Vec<TrajectoryToolCall>,
 
     /// Wall-clock duration of the turn, in milliseconds.
@@ -291,10 +294,20 @@ pub struct TrajectoryTurn {
 }
 
 /// One tool call within a turn.
+///
+/// A call is captured by pairing its dispatch and result events on
+/// `tool_call_id`, so parallel and interleaved calls land on their own
+/// entries; the slot is opened by whichever of the two events arrives
+/// first. A call still in flight when the run ends is closed as
+/// unfinished rather than dropped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrajectoryToolCall {
     /// The model-issued call id — the pairing key between dispatch and
     /// result, stable under parallel and same-tool-retry traffic.
+    ///
+    /// A retried call keeps its id across attempts, so the record holds
+    /// one entry per attempt; consumers keying on this field see the
+    /// attempts, not one unique call.
     pub tool_call_id: String,
 
     /// The name the tool is registered under.
@@ -446,6 +459,12 @@ impl RecordBuilder {
 }
 
 /// A turn being assembled.
+///
+/// One builder exists per open turn: its events accumulate here — the
+/// query, the capture-limited response, completed tool calls — until the
+/// turn's end event converts it into an immutable [`TrajectoryTurn`]. A
+/// start event for a closed index reopens its slot as a fresh builder
+/// carrying the phase's captures.
 #[derive(Debug)]
 struct TurnBuilder {
     /// Turn number.
@@ -507,6 +526,10 @@ impl TurnBuilder {
 }
 
 /// A tool dispatch awaiting its result.
+///
+/// Opened by the dispatch event and removed by the result event, keyed
+/// by `tool_call_id`. Anything still here when the run ends is closed
+/// as an unfinished call through [`RecordBuilder::abandon_call`].
 #[derive(Debug)]
 struct OpenCall {
     /// Tool name from the dispatch.
@@ -957,8 +980,13 @@ impl TrajectoryObserver {
     }
 }
 
-/// Emit the run-end telemetry signals: the summary span and the outcome
-/// counter.
+/// Emit the run-end telemetry signals for a finished record.
+///
+/// Opens the `trajectory.run` summary span (outcome, turn, tool-call,
+/// duration, and token figures) and, entered within it, emits the
+/// `loopctl.trajectory.records` counter labeled by outcome. Called once
+/// per finished record, before the sink and retention steps, so capture
+/// telemetry never depends on file output succeeding.
 fn emit_run_signals(record: &TrajectoryRecord) {
     let outcome = outcome_label(&record.outcome);
     let tool_calls: usize = record.turns.iter().map(|turn| turn.tool_calls.len()).sum();
@@ -1904,6 +1932,71 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn a_retried_call_appears_once_per_attempt_oldest_first() {
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 0,
+            query: "retry me".to_string(),
+        });
+        observer.on_tool_pre(&ToolPreContext {
+            turn: 0,
+            tool: "flaky".to_string(),
+            tool_call_id: "call_r".to_string(),
+        });
+        observer.on_tool_post(&ToolPostContext {
+            tool_call_id: "call_r".to_string(),
+            turn: 0,
+            tool: "flaky".to_string(),
+            result_hash: None,
+            is_error: true,
+            duration: std::time::Duration::from_millis(3),
+            display_hint: None,
+        });
+        observer.on_tool_pre(&ToolPreContext {
+            turn: 0,
+            tool: "flaky".to_string(),
+            tool_call_id: "call_r".to_string(),
+        });
+        observer.on_tool_post(&ToolPostContext {
+            tool_call_id: "call_r".to_string(),
+            turn: 0,
+            tool: "flaky".to_string(),
+            result_hash: None,
+            is_error: false,
+            duration: std::time::Duration::from_millis(4),
+            display_hint: None,
+        });
+        observer.on_run_end(&RunEndContext {
+            success: true,
+            error: None,
+            total_turns: 1,
+            duration_ms: 12,
+        });
+
+        let record = &observer.records()[0];
+        assert_unique_turn_indices(record);
+        let calls = &record.turns[0].tool_calls;
+        assert_eq!(
+            calls.len(),
+            2,
+            "a recovered call keeps one entry per attempt rather than deduplicating"
+        );
+        assert!(
+            calls.iter().all(|call| call.tool_call_id == "call_r"),
+            "retry attempts share the call id they recover"
+        );
+        assert!(
+            !calls[0].ok && calls[1].ok,
+            "entries appear attempt by attempt, oldest first"
+        );
+        assert_eq!(calls[0].duration_ms, 3);
+        assert_eq!(calls[1].duration_ms, 4);
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //! [`TrajectoryRecord`] per run — every turn's query and response, every tool
 //! call paired by `tool_call_id`, durations, and token sums. Records are kept
 //! in memory ([`records`](TrajectoryObserver::records)) and, optionally,
-//! appended to a JSON Lines file. The record is the substrate downstream
-//! consumers for experience extraction, and suitable for attachment to
+//! appended to a JSON Lines file. The record is the substrate for
+//! downstream experience extraction and is suitable for attachment to
 //! bug reports.
 //!
 //! # Quick Start
@@ -158,8 +158,8 @@ pub struct TrajectoryRecord {
 
     /// The run's turns, in execution order.
     ///
-    /// Each entry is a self-contained dialogue: query, (truncated)
-    /// response, and the turn's tool calls.
+    /// Each entry is self-contained: the query, the truncated response,
+    /// and the turn's tool calls.
     pub turns: Vec<TrajectoryTurn>,
 }
 
@@ -252,14 +252,15 @@ pub struct TrajectoryTurn {
 
     /// The model's text response, truncated to the observer's capture limit.
     ///
-    /// Truncation happens on character boundaries at turn close; the
-    /// default limit is 2,000 characters.
+    /// Truncation happens on character boundaries when the response is
+    /// captured; the default limit is 2,000 characters.
     pub response_text: String,
 
     /// The turn's tool calls, in completion order.
     ///
     /// Pairing is by `tool_call_id`, so parallel and interleaved calls
-    /// land on their own entries.
+    /// land on their own entries. Calls closed at run end (never
+    /// completed) are appended afterwards, in unspecified order.
     pub tool_calls: Vec<TrajectoryToolCall>,
 
     /// Wall-clock duration of the turn, in milliseconds.
@@ -327,8 +328,8 @@ struct RecordBuilder {
 
     /// Response-text cap, carried from the observer's configuration.
     ///
-    /// Applied when a turn closes, not per event, so later events of a
-    /// turn can replace earlier text before the cap bites.
+    /// Applied when a response is captured, so the builder never holds
+    /// more than the configured limit.
     capture_limit: usize,
 
     /// Turns that received their end event, in execution order.
@@ -349,7 +350,7 @@ struct RecordBuilder {
 }
 
 impl RecordBuilder {
-    /// A builder for the run's opening turn.
+    /// A builder for a run's record, opened at the run's start.
     fn new(session_id: String, capture_limit: usize) -> Self {
         Self {
             session_id,
@@ -398,7 +399,7 @@ impl RecordBuilder {
     /// Close a still-open tool call as unfinished, timed to now.
     fn abandon_call(&mut self, tool_call_id: String, open: OpenCall) {
         let duration_ms = millis(open.started.elapsed());
-        let turn = self.turn_mut(self.current.as_ref().map_or(0, |t| t.turn));
+        let turn = self.turn_mut(open.turn);
         turn.tool_calls.push(TrajectoryToolCall {
             tool_call_id,
             tool: open.tool,
@@ -423,10 +424,10 @@ struct TurnBuilder {
     /// attach).
     query: String,
 
-    /// Model text response, capture-limited at close.
+    /// Model text response, already capture-limited.
     ///
-    /// Held in full while the turn is open; truncated only when the turn
-    /// is converted into a [`TrajectoryTurn`].
+    /// Truncated when captured, so the builder never holds more than the
+    /// configured limit regardless of response size.
     response_text: String,
 
     /// Tool calls completed so far, in completion order.
@@ -475,6 +476,12 @@ struct OpenCall {
     /// targeted, even though its result never arrived.
     tool: String,
 
+    /// Turn the dispatch belonged to.
+    ///
+    /// Carried from the dispatch event so a call abandoned at run end is
+    /// attributed to the correct turn even when no turn was open.
+    turn: usize,
+
     /// Monotonic dispatch instant.
     ///
     /// The duration source for a call abandoned at run end — the only
@@ -499,7 +506,9 @@ struct OpenCall {
 /// [`TrajectoryObserver`] is `Send + Sync`. Interior mutability is handled
 /// via internal mutexes (recovered, never propagated), so every callback
 /// takes `&self` and the observer can be shared as
-/// `Arc<TrajectoryObserver>` or registered on several loops. Sharing one
+/// `Arc<TrajectoryObserver>` or registered on several loops. Locks are
+/// held only for in-memory state updates; the sink write at run end
+/// happens outside the locks. Sharing one
 /// observer between *concurrently running* loops interleaves their
 /// events; the clobbering run start warns and discards the orphaned
 /// record.
@@ -514,7 +523,6 @@ struct OpenCall {
 /// // finished records are then available via `records()`.
 /// # assert!(observer.records().is_empty());
 /// ```
-#[derive(Debug)]
 pub struct TrajectoryObserver {
     /// The run being assembled, if one is in flight.
     ///
@@ -537,6 +545,20 @@ pub struct TrajectoryObserver {
 
     /// How many finished records memory retains; `None` retains all.
     retention: Option<usize>,
+}
+
+impl std::fmt::Debug for TrajectoryObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let finished = recover_guard(self.finished.lock()).len();
+        let in_flight = recover_guard(self.inner.lock()).is_some();
+        f.debug_struct("TrajectoryObserver")
+            .field("finished_records", &finished)
+            .field("run_in_flight", &in_flight)
+            .field("sink", &self.sink)
+            .field("capture_limit", &self.capture_limit)
+            .field("retention", &self.retention)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for TrajectoryObserver {
@@ -593,8 +615,8 @@ impl TrajectoryObserver {
 
     /// Set the maximum characters of response text kept per turn.
     ///
-    /// Defaults to 2,000 — enough for extraction, small enough that a long
-    /// small-model session's ledger does not outgrow the work it describes.
+    /// Defaults to 2,000 characters: sized for extraction while bounding
+    /// the ledger growth of long, many-turn sessions.
     #[must_use]
     pub fn with_capture_limit(mut self, chars: usize) -> Self {
         self.capture_limit = chars;
@@ -604,7 +626,8 @@ impl TrajectoryObserver {
     /// The finished records, oldest first.
     ///
     /// Only runs whose end was observed appear here; a run in flight is not
-    /// included.
+    /// included. The retained set is cloned on every call, so the cost is
+    /// proportional to the retained records' size.
     #[must_use]
     pub fn records(&self) -> Vec<TrajectoryRecord> {
         recover_guard(self.finished.lock())
@@ -666,10 +689,8 @@ impl LoopObserver for TrajectoryObserver {
         let Some(builder) = guard.as_mut() else {
             return;
         };
-        builder
-            .turn_mut(ctx.turn)
-            .response_text
-            .clone_from(&ctx.text);
+        let text = truncate_chars(&ctx.text, self.capture_limit);
+        builder.turn_mut(ctx.turn).response_text = text;
     }
 
     fn on_tool_pre(&self, ctx: &ToolPreContext) {
@@ -681,6 +702,7 @@ impl LoopObserver for TrajectoryObserver {
             ctx.tool_call_id.clone(),
             OpenCall {
                 tool: ctx.tool.clone(),
+                turn: ctx.turn,
                 started: Instant::now(),
             },
         );
@@ -725,6 +747,10 @@ impl LoopObserver for TrajectoryObserver {
         let Some(mut builder) = guard.take() else {
             return;
         };
+        // The builder is fully owned from here; release the lock so a
+        // concurrently attached callback on a shared observer never waits
+        // on the sink's write.
+        drop(guard);
 
         // Calls still open at run end never produced a result; close
         // them as unsuccessful, timed from dispatch to run end.
@@ -1438,5 +1464,50 @@ mod tests {
     fn observer_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TrajectoryObserver>();
+    }
+    #[test]
+    fn debug_rendering_does_not_expose_captured_text() {
+        let observer = TrajectoryObserver::in_memory();
+        feed_interleaved_calls(&observer);
+        let rendered = format!("{observer:?}");
+        assert!(
+            !rendered.contains("parallel work"),
+            "Debug output must not include captured query text: {rendered}"
+        );
+        assert!(
+            rendered.contains("finished_records"),
+            "Debug output summarizes observer state: {rendered}"
+        );
+    }
+    #[test]
+    fn abandoned_call_is_attributed_to_its_dispatch_turn() {
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        // Mid-run attach: a dispatch on turn 5 with no turn ever opened.
+        observer.on_tool_pre(&ToolPreContext {
+            turn: 5,
+            tool: "slow".to_string(),
+            tool_call_id: "call_late".to_string(),
+        });
+        observer.on_run_end(&RunEndContext {
+            success: false,
+            error: None,
+            total_turns: 6,
+            duration_ms: 40,
+        });
+
+        let record = &observer.records()[0];
+        assert_eq!(
+            record.turns.len(),
+            1,
+            "the abandoned call opens exactly one turn slot"
+        );
+        assert_eq!(
+            record.turns[0].turn, 5,
+            "an abandoned call is attributed to the turn it was dispatched on"
+        );
+        assert_eq!(record.turns[0].tool_calls[0].tool_call_id, "call_late");
     }
 }

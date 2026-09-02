@@ -383,3 +383,64 @@ async fn memory_retention_drops_the_oldest_records() {
     );
     std::fs::remove_dir_all(&dir).expect("cleanup succeeds");
 }
+
+#[tokio::test]
+async fn concurrent_observers_sharing_a_ledger_keep_every_line_whole() {
+    let dir = std::env::temp_dir().join(format!("trajectory-concurrent-{}", uuid::Uuid::new_v4()));
+    let writers: Vec<std::sync::Arc<TrajectoryObserver>> = (0..4)
+        .map(|_| std::sync::Arc::new(TrajectoryObserver::writing_to(&dir)))
+        .collect();
+    let mut loops: Vec<_> = writers
+        .iter()
+        .map(|observer| {
+            scripted_loop(
+                std::sync::Arc::clone(observer),
+                vec![vec![terminal()]].into_iter().flatten().collect(),
+            )
+        })
+        .collect();
+
+    let mut joins = Vec::new();
+    for mut loop_ in loops.drain(..) {
+        joins.push(tokio::spawn(async move {
+            for _ in 0..5 {
+                loop_
+                    .run("concurrent", &RunConfig::default())
+                    .await
+                    .expect("run completes");
+            }
+        }));
+    }
+    for join in joins {
+        join.await.expect("writer task completes");
+    }
+
+    let raw = std::fs::read_to_string(dir.join("trajectory.jsonl")).expect("the ledger exists");
+    let lines: Vec<&str> = raw.lines().collect();
+    assert_eq!(lines.len(), 20, "four writers x five runs, one line each");
+    for line in &lines {
+        let parsed: TrajectoryRecord =
+            serde_json::from_str(line).expect("every interleaved line stays a whole record");
+        assert!(!parsed.run_id.is_empty());
+    }
+    std::fs::remove_dir_all(&dir).expect("cleanup succeeds");
+}
+
+#[tokio::test]
+async fn a_zero_retention_cap_retains_nothing() {
+    let observer = Arc::new(TrajectoryObserver::in_memory().with_memory_retention(Some(0)));
+    let mut loop_ = scripted_loop(
+        Arc::clone(&observer),
+        vec![vec![terminal()]].into_iter().flatten().collect(),
+    );
+
+    loop_
+        .run("gone immediately", &RunConfig::default())
+        .await
+        .expect("run completes");
+
+    assert!(
+        observer.records().is_empty(),
+        "a zero retention cap retains nothing, while the run itself is unaffected"
+    );
+}

@@ -103,6 +103,15 @@ const DEFAULT_CAPTURE_LIMIT: usize = 2_000;
 /// File name of the JSON Lines ledger inside the sink directory.
 const LEDGER_FILE: &str = "trajectory.jsonl";
 
+/// Serializes ledger appends process-wide.
+///
+/// The append's rollback (truncating to the pre-write length after a
+/// failed write) must not clip a record another observer appended
+/// between this observer's write and its repair, so metadata capture,
+/// append, and rollback run as one critical section. Cross-process
+/// interleaving remains the documented host responsibility.
+static LEDGER_APPEND_LOCK: Mutex<()> = Mutex::new(());
+
 /// One run's full trajectory, captured by [`TrajectoryObserver`].
 ///
 /// A session with N runs produces N records, correlated by `session_id` and
@@ -352,6 +361,11 @@ struct RecordBuilder {
 
 impl RecordBuilder {
     /// A builder for a run's record, opened at the run's start.
+    ///
+    /// Mints the run's `run_id` and freezes its RFC 3339 start
+    /// timestamp; every subsequent event of the run accumulates here
+    /// until the run's end event converts it into a
+    /// [`TrajectoryRecord`].
     fn new(session_id: String, capture_limit: usize) -> Self {
         Self {
             session_id,
@@ -362,6 +376,15 @@ impl RecordBuilder {
             current: None,
             open_calls: HashMap::new(),
         }
+    }
+
+    /// A closed turn with the given index, if one exists.
+    ///
+    /// Events arriving for a turn that is already closed (out-of-order
+    /// emission) are applied to the closed turn rather than opening a
+    /// duplicate slot with the same index.
+    fn closed_turn_mut(&mut self, turn: usize) -> Option<&mut TrajectoryTurn> {
+        self.turns.iter_mut().rev().find(|done| done.turn == turn)
     }
 
     /// The turn a within-turn event belongs to, opened on demand.
@@ -398,15 +421,26 @@ impl RecordBuilder {
     }
 
     /// Close a still-open tool call as unfinished, timed to now.
+    ///
+    /// Called only at run end, for dispatches that never produced a
+    /// result event: the call is recorded as unsuccessful rather than
+    /// inferred to have succeeded, its duration measured from dispatch
+    /// to run end, and it lands on its dispatch turn, patching that
+    /// turn if it already closed.
     fn abandon_call(&mut self, tool_call_id: String, open: OpenCall) {
         let duration_ms = millis(open.started.elapsed());
-        let turn = self.turn_mut(open.turn);
-        turn.tool_calls.push(TrajectoryToolCall {
+        let call = TrajectoryToolCall {
             tool_call_id,
             tool: open.tool,
             ok: false,
             duration_ms,
-        });
+        };
+        if let Some(done) = self.closed_turn_mut(open.turn) {
+            done.tool_calls.push(call);
+        } else {
+            let turn = self.turn_mut(open.turn);
+            turn.tool_calls.push(call);
+        }
     }
 }
 
@@ -421,8 +455,8 @@ struct TurnBuilder {
 
     /// Query that initiated the turn.
     ///
-    /// Empty when the turn was opened without a start event (mid-run
-    /// attach).
+    /// Empty while a lazily opened slot awaits its start event; the
+    /// start event fills it in authoritatively when it arrives.
     query: String,
 
     /// Model text response, already capture-limited.
@@ -455,6 +489,9 @@ struct TurnBuilder {
 
 impl TurnBuilder {
     /// A fresh turn builder with nothing captured yet.
+    ///
+    /// The query is empty when the turn was opened without a start
+    /// event; every other field fills in as the turn's events arrive.
     fn new(turn: usize, query: String) -> Self {
         Self {
             turn,
@@ -539,12 +576,22 @@ pub struct TrajectoryObserver {
     finished: Mutex<VecDeque<TrajectoryRecord>>,
 
     /// Directory the JSONL ledger is appended to, when disk capture is on.
+    ///
+    /// `None` on the in-memory form. The ledger file inside the
+    /// directory is fixed ([`LEDGER_FILE`]); the directory is created
+    /// best-effort on first write.
     sink: Option<PathBuf>,
 
     /// Maximum characters of response text kept per turn.
+    ///
+    /// Applied when a response is captured, so no builder or record
+    /// ever holds more than the limit regardless of response size.
     capture_limit: usize,
 
     /// How many finished records memory retains; `None` retains all.
+    ///
+    /// Enforced after each record is pushed: past the cap, the oldest
+    /// records are dropped. The disk ledger is unaffected by this cap.
     retention: Option<usize>,
 }
 
@@ -681,8 +728,35 @@ impl LoopObserver for TrajectoryObserver {
         let Some(builder) = guard.as_mut() else {
             return;
         };
+        if builder
+            .current
+            .as_ref()
+            .is_some_and(|open| open.turn == ctx.turn)
+        {
+            // The slot was opened lazily by an earlier event of this turn;
+            // the start event supplies the authoritative query.
+            if let Some(open) = builder.current.as_mut() {
+                open.query.clone_from(&ctx.query);
+            }
+            return;
+        }
         builder.close_current();
-        builder.current = Some(TurnBuilder::new(ctx.turn, ctx.query.clone()));
+        if let Some(pos) = builder.turns.iter().rposition(|done| done.turn == ctx.turn) {
+            // A start for a turn that already closed reopens it, merging
+            // whatever both phases captured into one slot per index.
+            let done = builder.turns.remove(pos);
+            builder.current = Some(TurnBuilder {
+                turn: done.turn,
+                query: ctx.query.clone(),
+                response_text: done.response_text,
+                tool_calls: done.tool_calls,
+                duration_ms: done.duration_ms,
+                input_tokens: done.input_tokens,
+                output_tokens: done.output_tokens,
+            });
+        } else {
+            builder.current = Some(TurnBuilder::new(ctx.turn, ctx.query.clone()));
+        }
     }
 
     fn on_response(&self, ctx: &ResponseContext) {
@@ -691,6 +765,14 @@ impl LoopObserver for TrajectoryObserver {
             return;
         };
         let text = truncate_chars(&ctx.text, self.capture_limit);
+        let matches_current = builder
+            .current
+            .as_ref()
+            .is_some_and(|open| open.turn == ctx.turn);
+        if !matches_current && let Some(done) = builder.closed_turn_mut(ctx.turn) {
+            done.response_text = text;
+            return;
+        }
         builder.turn_mut(ctx.turn).response_text = text;
     }
 
@@ -715,13 +797,17 @@ impl LoopObserver for TrajectoryObserver {
             return;
         };
         let _ = builder.open_calls.remove(&ctx.tool_call_id);
-        let turn = builder.turn_mut(ctx.turn);
-        turn.tool_calls.push(TrajectoryToolCall {
+        let call = TrajectoryToolCall {
             tool_call_id: ctx.tool_call_id.clone(),
             tool: ctx.tool.clone(),
             ok: !ctx.is_error,
             duration_ms: millis(ctx.duration),
-        });
+        };
+        if let Some(done) = builder.closed_turn_mut(ctx.turn) {
+            done.tool_calls.push(call);
+        } else {
+            builder.turn_mut(ctx.turn).tool_calls.push(call);
+        }
     }
 
     fn on_turn_end(&self, ctx: &TurnEndContext) {
@@ -740,15 +826,23 @@ impl LoopObserver for TrajectoryObserver {
             builder.close_current();
         } else if let Some(done) = builder
             .turns
-            .last_mut()
-            .filter(|done| done.turn == ctx.turn)
+            .iter_mut()
+            .rev()
+            .find(|done| done.turn == ctx.turn)
         {
             done.duration_ms = ctx.duration_ms;
             done.input_tokens = ctx.input_tokens;
             done.output_tokens = ctx.output_tokens;
         } else {
-            builder.turn_mut(ctx.turn);
-            builder.close_current();
+            builder.turns.push(TrajectoryTurn {
+                turn: ctx.turn,
+                query: String::new(),
+                response_text: String::new(),
+                tool_calls: Vec::new(),
+                duration_ms: ctx.duration_ms,
+                input_tokens: ctx.input_tokens,
+                output_tokens: ctx.output_tokens,
+            });
         }
     }
 
@@ -825,6 +919,7 @@ impl TrajectoryObserver {
         let Some(dir) = &self.sink else {
             return;
         };
+        let _append_guard = recover_guard(LEDGER_APPEND_LOCK.lock());
         let line = match serde_json::to_string(record) {
             Ok(line) => line,
             Err(error) => {
@@ -919,6 +1014,10 @@ fn emit_run_signals(record: &TrajectoryRecord) {
 }
 
 /// The stable JSONL/telemetry label for an outcome.
+///
+/// The strings match the serde `snake_case` rendering of
+/// [`TrajectoryOutcome`], so the counter's label values and the
+/// serialized records agree without sharing code.
 fn outcome_label(outcome: &TrajectoryOutcome) -> &'static str {
     match outcome {
         TrajectoryOutcome::Success => "success",
@@ -928,6 +1027,10 @@ fn outcome_label(outcome: &TrajectoryOutcome) -> &'static str {
 }
 
 /// Truncate to at most `limit` characters, on char boundaries.
+///
+/// Counts by `char`, never bytes, so a multi-byte character is kept
+/// whole rather than split; text at or under the limit passes through
+/// unchanged.
 fn truncate_chars(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
@@ -936,6 +1039,10 @@ fn truncate_chars(text: &str, limit: usize) -> String {
 }
 
 /// Milliseconds of a duration, saturating at `u64` instead of overflowing.
+///
+/// Conversion goes through `u128`, whose realistic durations cannot
+/// exceed `u64`; the saturating fallback exists so that capture
+/// arithmetic can never panic.
 fn millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -1581,5 +1688,549 @@ mod tests {
         );
         assert_eq!(patched.input_tokens, 7);
         assert_eq!(patched.output_tokens, 9);
+    }
+
+    #[test]
+    fn a_late_turn_end_after_two_later_turns_patches_its_own_turn() {
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 3,
+            query: "the late one".to_string(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 4,
+            query: "first to close".to_string(),
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 4,
+            success: true,
+            error: None,
+            duration_ms: 10,
+            input_tokens: 1,
+            output_tokens: 1,
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 5,
+            query: "second to close".to_string(),
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 5,
+            success: true,
+            error: None,
+            duration_ms: 11,
+            input_tokens: 1,
+            output_tokens: 1,
+        });
+        // Turn 3's end arrives only after two later turns have closed.
+        observer.on_turn_end(&TurnEndContext {
+            turn: 3,
+            success: true,
+            error: None,
+            duration_ms: 42,
+            input_tokens: 7,
+            output_tokens: 9,
+        });
+        observer.on_run_end(&RunEndContext {
+            success: true,
+            error: None,
+            total_turns: 6,
+            duration_ms: 90,
+        });
+
+        let record = &observer.records()[0];
+        let indices: Vec<usize> = record.turns.iter().map(|turn| turn.turn).collect();
+        assert_eq!(
+            indices.len(),
+            indices
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "no two captured turns share an index, however late the end arrives"
+        );
+        let patched = record
+            .turns
+            .iter()
+            .find(|turn| turn.turn == 3)
+            .expect("turn 3 is captured exactly once");
+        assert_eq!(patched.duration_ms, 42);
+        assert_eq!(patched.input_tokens, 7);
+        assert_eq!(patched.output_tokens, 9);
+        assert_eq!(patched.query, "the late one");
+    }
+
+    #[test]
+    fn a_turn_end_without_any_prior_event_creates_its_own_completed_turn() {
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        // Only the end event is ever observed for this turn.
+        observer.on_turn_end(&TurnEndContext {
+            turn: 2,
+            success: true,
+            error: None,
+            duration_ms: 33,
+            input_tokens: 4,
+            output_tokens: 6,
+        });
+        // A later turn remains in flight; the late end must not close it.
+        observer.on_turn_start(&TurnStartContext {
+            turn: 3,
+            query: "still open".to_string(),
+        });
+        observer.on_run_end(&RunEndContext {
+            success: true,
+            error: None,
+            total_turns: 4,
+            duration_ms: 50,
+        });
+
+        let record = &observer.records()[0];
+        let orphan = record
+            .turns
+            .iter()
+            .find(|turn| turn.turn == 2)
+            .expect("the end-only turn is captured");
+        assert_eq!(orphan.duration_ms, 33, "figures come from the end event");
+        assert_eq!(orphan.input_tokens, 4);
+        let open = record
+            .turns
+            .iter()
+            .find(|turn| turn.turn == 3)
+            .expect("the open turn is still captured at run end");
+        assert_eq!(open.query, "still open");
+    }
+    fn assert_unique_turn_indices(record: &TrajectoryRecord) {
+        let indices: Vec<usize> = record.turns.iter().map(|turn| turn.turn).collect();
+        assert_eq!(
+            indices.len(),
+            indices
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "no two captured turns share an index"
+        );
+    }
+
+    #[test]
+    fn a_late_response_patches_the_closed_turn() {
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 1,
+            query: "first".to_string(),
+        });
+        observer.on_response(&ResponseContext {
+            turn: 1,
+            text: "early".to_string(),
+            usage: None,
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 1,
+            success: true,
+            error: None,
+            duration_ms: 5,
+            input_tokens: 1,
+            output_tokens: 1,
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 2,
+            query: "later".to_string(),
+        });
+
+        observer.on_response(&ResponseContext {
+            turn: 1,
+            text: "late correction".to_string(),
+            usage: None,
+        });
+        observer.on_run_end(&RunEndContext {
+            success: true,
+            error: None,
+            total_turns: 3,
+            duration_ms: 30,
+        });
+
+        let record = &observer.records()[0];
+        assert_unique_turn_indices(record);
+        let first = record.turns.iter().find(|t| t.turn == 1).expect("present");
+        assert_eq!(
+            first.response_text, "late correction",
+            "a late response patches its closed turn"
+        );
+        assert_eq!(first.duration_ms, 5, "the end figures survive the patch");
+    }
+
+    #[test]
+    fn a_late_tool_result_lands_on_its_closed_turn() {
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 0,
+            query: "dispatched here".to_string(),
+        });
+        observer.on_tool_pre(&ToolPreContext {
+            turn: 0,
+            tool: "slow".to_string(),
+            tool_call_id: "call_late".to_string(),
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 0,
+            success: true,
+            error: None,
+            duration_ms: 5,
+            input_tokens: 1,
+            output_tokens: 1,
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 1,
+            query: "next".to_string(),
+        });
+
+        observer.on_tool_post(&ToolPostContext {
+            tool_call_id: "call_late".to_string(),
+            turn: 0,
+            tool: "slow".to_string(),
+            result_hash: None,
+            is_error: false,
+            duration: std::time::Duration::from_millis(8),
+            display_hint: None,
+        });
+        observer.on_run_end(&RunEndContext {
+            success: true,
+            error: None,
+            total_turns: 2,
+            duration_ms: 20,
+        });
+
+        let record = &observer.records()[0];
+        assert_unique_turn_indices(record);
+        let first = record.turns.iter().find(|t| t.turn == 0).expect("present");
+        assert_eq!(first.tool_calls.len(), 1);
+        assert_eq!(first.tool_calls[0].tool_call_id, "call_late");
+        assert_eq!(first.tool_calls[0].duration_ms, 8);
+    }
+
+    #[test]
+    fn an_abandoned_call_lands_on_its_closed_turn() {
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 7,
+            query: "dispatch turn".to_string(),
+        });
+        observer.on_tool_pre(&ToolPreContext {
+            turn: 7,
+            tool: "slow".to_string(),
+            tool_call_id: "call_never".to_string(),
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 7,
+            success: true,
+            error: None,
+            duration_ms: 5,
+            input_tokens: 1,
+            output_tokens: 1,
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 8,
+            query: "after".to_string(),
+        });
+        observer.on_run_end(&RunEndContext {
+            success: false,
+            error: Some("cancelled".to_string()),
+            total_turns: 9,
+            duration_ms: 25,
+        });
+
+        let record = &observer.records()[0];
+        assert_unique_turn_indices(record);
+        let dispatch = record.turns.iter().find(|t| t.turn == 7).expect("present");
+        assert_eq!(dispatch.tool_calls.len(), 1);
+        assert_eq!(dispatch.tool_calls[0].tool_call_id, "call_never");
+        assert!(!dispatch.tool_calls[0].ok);
+    }
+
+    #[test]
+    fn millis_saturates_instead_of_overflowing() {
+        assert_eq!(millis(std::time::Duration::from_millis(u64::MAX)), u64::MAX);
+        assert_eq!(millis(std::time::Duration::from_millis(0)), 0);
+    }
+    #[test]
+    fn arbitrary_event_sequences_preserve_the_record_invariants() {
+        use proptest::prelude::*;
+
+        #[derive(Clone, Debug)]
+        enum Event {
+            TurnStart(usize, String),
+            Response(usize, String),
+            ToolPre(usize, String),
+            ToolPost(usize, String, bool),
+            TurnEnd(usize, bool, u64, u64),
+        }
+
+        fn event_strategy() -> impl Strategy<Value = Event> {
+            prop_oneof![
+                (0usize..6, ".*").prop_map(|(turn, query)| Event::TurnStart(turn, query)),
+                (0usize..6, "[abc]{0,24}").prop_map(|(turn, text)| Event::Response(turn, text)),
+                (0usize..6, "[abcd]").prop_map(|(turn, id)| Event::ToolPre(turn, id)),
+                (0usize..6, "[abcd]", any::<bool>())
+                    .prop_map(|(turn, id, ok)| Event::ToolPost(turn, id, ok),),
+                (0usize..6, any::<bool>(), 0u64..1000, 0u64..1000).prop_map(
+                    |(turn, success, input, output)| Event::TurnEnd(turn, success, input, output),
+                ),
+            ]
+        }
+
+        proptest!(|(events in proptest::collection::vec(event_strategy(), 0..60))| {
+            let run_success = events
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    Event::TurnEnd(_, success, _, _) => Some(*success),
+                    _ => None,
+                })
+                .unwrap_or(true);
+            let mut expected_query: std::collections::HashMap<usize, String> =
+                std::collections::HashMap::new();
+            let mut expected_response: std::collections::HashMap<usize, String> =
+                std::collections::HashMap::new();
+            let mut expected_tokens: std::collections::HashMap<usize, (u64, u64)> =
+                std::collections::HashMap::new();
+            let mut expected_any_ok = false;
+            let observer = TrajectoryObserver::in_memory().with_capture_limit(5);
+            let session = RunStartContext { session_id: uuid::Uuid::new_v4() };
+            observer.on_run_start(&session);
+            for event in &events {
+                match event {
+                    Event::TurnStart(turn, query) => {
+                        expected_query.insert(*turn, query.clone());
+                    }
+                    Event::Response(turn, text) => {
+                        expected_response
+                            .insert(*turn, truncate_chars(text, 5));
+                    }
+                    Event::ToolPost(_, _, true) => expected_any_ok = true,
+                    _ => {}
+                }
+                match event {
+                    Event::TurnStart(turn, query) => observer.on_turn_start(&TurnStartContext {
+                        turn: *turn,
+                        query: query.clone(),
+                    }),
+                    Event::Response(turn, text) => observer.on_response(&ResponseContext {
+                        turn: *turn,
+                        text: text.clone(),
+                        usage: None,
+                    }),
+                    Event::ToolPre(turn, id) => observer.on_tool_pre(&ToolPreContext {
+                        turn: *turn,
+                        tool: "t".to_string(),
+                        tool_call_id: id.clone(),
+                    }),
+                    Event::ToolPost(turn, id, ok) => observer.on_tool_post(&ToolPostContext {
+                        tool_call_id: id.clone(),
+                        turn: *turn,
+                        tool: "t".to_string(),
+                        result_hash: None,
+                        is_error: !*ok,
+                        duration: std::time::Duration::from_millis(1),
+                        display_hint: None,
+                    }),
+                    Event::TurnEnd(turn, success, input, output) => {
+                        expected_tokens.insert(*turn, (*input, *output));
+                        observer.on_turn_end(&TurnEndContext {
+                            turn: *turn,
+                            success: *success,
+                            error: None,
+                            duration_ms: 1,
+                            input_tokens: *input,
+                            output_tokens: *output,
+                        });
+                    }
+                }
+            }
+            observer.on_run_end(&RunEndContext {
+                success: run_success,
+                error: None,
+                total_turns: 6,
+                duration_ms: 10,
+            });
+
+            let records = observer.records();
+            prop_assert_eq!(records.len(), 1, "one run end produces exactly one record");
+            let record = &records[0];
+            let indices: Vec<usize> = record.turns.iter().map(|turn| turn.turn).collect();
+            prop_assert_eq!(
+                indices.len(),
+                indices.iter().collect::<std::collections::HashSet<_>>().len(),
+                "turn indices stay unique under any event order"
+            );
+            for turn in &record.turns {
+                prop_assert!(turn.response_text.chars().count() <= 5);
+                for call in &turn.tool_calls {
+                    prop_assert!(!call.tool_call_id.is_empty());
+                }
+            }
+            let recorded_calls: usize = record.turns.iter().map(|turn| turn.tool_calls.len()).sum();
+            prop_assert!(recorded_calls <= events.len());
+
+            let expected_outcome = if run_success {
+                TrajectoryOutcome::Success
+            } else if expected_any_ok {
+                TrajectoryOutcome::Partial
+            } else {
+                TrajectoryOutcome::Failure
+            };
+            prop_assert_eq!(
+                &record.outcome,
+                &expected_outcome,
+                "classification matches the independent model"
+            );
+            let mut input_sum = 0u64;
+            let mut output_sum = 0u64;
+            for turn in &record.turns {
+                let (input, output) = expected_tokens.get(&turn.turn).copied().unwrap_or((0, 0));
+                prop_assert_eq!((turn.input_tokens, turn.output_tokens), (input, output));
+                prop_assert_eq!(
+                    &turn.query,
+                    &expected_query.get(&turn.turn).cloned().unwrap_or_default()
+                );
+                prop_assert_eq!(
+                    &turn.response_text,
+                    &expected_response.get(&turn.turn).cloned().unwrap_or_default()
+                );
+                input_sum = input_sum.saturating_add(turn.input_tokens);
+                output_sum = output_sum.saturating_add(turn.output_tokens);
+            }
+            prop_assert_eq!(record.token_summary.input_tokens, input_sum);
+            prop_assert_eq!(record.token_summary.output_tokens, output_sum);
+        });
+    }
+
+    #[test]
+    fn arbitrary_records_round_trip_as_single_jsonl_lines() {
+        use proptest::prelude::*;
+
+        let text = "[a-zA-Z0-9 \"{}\\n\t]{0,60}";
+        let record_strategy = (
+            text,
+            text,
+            text,
+            proptest::collection::vec(
+                (
+                    0usize..6,
+                    text,
+                    proptest::collection::vec((text, text, any::<bool>(), 0u64..60), 0..4),
+                    0u64..60,
+                    0u64..1000,
+                    0u64..1000,
+                ),
+                0..4,
+            ),
+        )
+            .prop_map(|(session_id, run_id, started_at, turns)| TrajectoryRecord {
+                session_id,
+                run_id,
+                started_at,
+                outcome: TrajectoryOutcome::Success,
+                duration_ms: 42,
+                total_turns: turns.len(),
+                token_summary: TokenSummary::default(),
+                turns: turns
+                    .into_iter()
+                    .map(
+                        |(turn, response_text, tool_calls, duration_ms, input, output)| {
+                            TrajectoryTurn {
+                                turn,
+                                query: format!("q{turn}"),
+                                response_text,
+                                tool_calls: tool_calls
+                                    .into_iter()
+                                    .map(|(tool_call_id, tool, ok, duration_ms)| {
+                                        TrajectoryToolCall {
+                                            tool_call_id,
+                                            tool,
+                                            ok,
+                                            duration_ms,
+                                        }
+                                    })
+                                    .collect(),
+                                duration_ms,
+                                input_tokens: input,
+                                output_tokens: output,
+                            }
+                        },
+                    )
+                    .collect(),
+            });
+
+        proptest!(|(record in record_strategy)| {
+            let line = serde_json::to_string(&record).expect("serialization cannot fail");
+            prop_assert!(!line.contains('\n'), "one record is one line");
+            let parsed: TrajectoryRecord =
+                serde_json::from_str(&line).expect("the line parses back");
+            let parsed_value = serde_json::to_value(&parsed).expect("value");
+            let record_value = serde_json::to_value(&record).expect("value");
+            prop_assert_eq!(parsed_value, record_value);
+        });
+    }
+
+    #[test]
+    fn rfc3339_rendering_preserves_chronological_order() {
+        use proptest::prelude::*;
+
+        proptest!(|(secs in 0u64..4_000_000_000u64)| {
+            let a = format_rfc3339(secs).expect("renders");
+            let b = format_rfc3339(secs.saturating_add(1)).expect("renders");
+            prop_assert_eq!(a.len(), 20);
+            prop_assert!(a.ends_with('Z'));
+            prop_assert!(a < b, "lexicographic order matches chronological order");
+        });
+    }
+
+    #[test]
+    fn a_result_before_its_turn_start_does_not_duplicate_the_turn() {
+        // The exact shape proptest found: a tool result for a turn whose
+        // start event has not arrived yet opens the turn lazily; the
+        // start must fill the query in place, not close and reopen it.
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_tool_post(&ToolPostContext {
+            tool_call_id: "call_first".to_string(),
+            turn: 2,
+            tool: "t".to_string(),
+            result_hash: None,
+            is_error: false,
+            duration: std::time::Duration::from_millis(3),
+            display_hint: None,
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 2,
+            query: "the real query".to_string(),
+        });
+        observer.on_run_end(&RunEndContext {
+            success: true,
+            error: None,
+            total_turns: 3,
+            duration_ms: 12,
+        });
+
+        let record = &observer.records()[0];
+        assert_unique_turn_indices(record);
+        let turn = record.turns.iter().find(|t| t.turn == 2).expect("captured");
+        assert_eq!(turn.query, "the real query");
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].tool_call_id, "call_first");
     }
 }

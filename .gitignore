@@ -5,3 +5,6 @@
 *~
 .DS_Store
 .env
+
+# proptest's local failure-seed persistence (regressions are pinned as scenario tests instead)
+proptest-regressions/

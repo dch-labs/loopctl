@@ -76,6 +76,11 @@ const MEMOIZED_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
 /// middleware still registers and the cache still works by TTL; replacing
 /// [`NoopVerifier`] with `cargo check` / `tsc` and [`NoopPathExtractor`] with
 /// a path-aware extractor is the intended upgrade path.
+///
+/// Small-model recipe: register the `think` scratchpad tool
+/// (`tool::builtin::ThinkTool`, behind the `builtin_tools` feature)
+/// alongside this profile — a place to plan before acting is one of the
+/// cheapest accuracy levers for local models.
 pub struct ConstrainedProfile;
 
 impl ConstrainedProfile {

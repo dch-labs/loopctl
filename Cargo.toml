@@ -49,6 +49,7 @@ proptest = "1"
 
 [features]
 default = []
+builtin_tools = []
 derive = ["dep:loopctl-derive"]
 hooks = []
 testing = []

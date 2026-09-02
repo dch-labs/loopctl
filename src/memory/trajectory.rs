@@ -97,20 +97,13 @@ use crate::observer::{
     TurnEndContext, TurnStartContext,
 };
 
+mod sink;
+
+use sink::LedgerWriter;
+use std::sync::Arc as StdArc;
+
 /// Default bound on the response text captured per turn, in characters.
 const DEFAULT_CAPTURE_LIMIT: usize = 2_000;
-
-/// File name of the JSON Lines ledger inside the sink directory.
-const LEDGER_FILE: &str = "trajectory.jsonl";
-
-/// Serializes ledger appends process-wide.
-///
-/// The append's rollback (truncating to the pre-write length after a
-/// failed write) must not clip a record another observer appended
-/// between this observer's write and its repair, so metadata capture,
-/// append, and rollback run as one critical section. Cross-process
-/// interleaving remains the documented host responsibility.
-static LEDGER_APPEND_LOCK: Mutex<()> = Mutex::new(());
 
 /// One run's full trajectory, captured by [`TrajectoryObserver`].
 ///
@@ -538,9 +531,9 @@ struct OpenCall {
 /// inverts the dependency). The in-memory record survives either way and is
 /// reachable via [`records`](Self::records). Captured records contain
 /// prompt, response, and tool text; the records and any ledger directory
-/// are to be treated as sensitive data. The sink append at run end is
-/// the one synchronous operation on the run path; it is accepted in
-/// exchange for crash-safety and assumes local-disk latency.
+/// are to be treated as sensitive data. Ledger writes run on a bounded
+/// background worker: run completion serializes the record and enqueues
+/// it, and never waits on filesystem I/O.
 ///
 /// # Thread Safety
 ///
@@ -548,8 +541,8 @@ struct OpenCall {
 /// via internal mutexes (recovered, never propagated), so every callback
 /// takes `&self` and the observer can be shared as
 /// `Arc<TrajectoryObserver>` or registered on several loops. Locks are
-/// held only for in-memory state updates; the sink write at run end
-/// happens outside the locks. Sharing one
+/// held only for in-memory state updates; ledger writes happen on the
+/// sink's worker thread. Sharing one
 /// observer between *concurrently running* loops interleaves their
 /// events; the clobbering run start warns and discards the orphaned
 /// record.
@@ -578,12 +571,12 @@ pub struct TrajectoryObserver {
     /// set a cap; past the cap, the oldest records are dropped.
     finished: Mutex<VecDeque<TrajectoryRecord>>,
 
-    /// Directory the JSONL ledger is appended to, when disk capture is on.
+    /// The ledger's background writer, when disk capture is on.
     ///
-    /// `None` on the in-memory form. The ledger file inside the
-    /// directory is fixed ([`LEDGER_FILE`]); the directory is created
-    /// best-effort on first write.
-    sink: Option<PathBuf>,
+    /// `None` on the in-memory form. All filesystem work happens on the
+    /// writer's worker thread; the last dropped reference drains and
+    /// joins it.
+    sink: Option<StdArc<LedgerWriter>>,
 
     /// Maximum characters of response text kept per turn.
     ///
@@ -605,7 +598,13 @@ impl std::fmt::Debug for TrajectoryObserver {
         f.debug_struct("TrajectoryObserver")
             .field("finished_records", &finished)
             .field("run_in_flight", &in_flight)
-            .field("sink", &self.sink)
+            .field(
+                "sink",
+                &self
+                    .sink
+                    .as_ref()
+                    .map(|writer| writer.dir().display().to_string()),
+            )
             .field("capture_limit", &self.capture_limit)
             .field("retention", &self.retention)
             .finish_non_exhaustive()
@@ -638,19 +637,21 @@ impl TrajectoryObserver {
     /// Capture and append each finished record as one JSONL line.
     ///
     /// The ledger lives at `<dir>/trajectory.jsonl`; the directory is
-    /// created best-effort on first write. Every record is written with an
-    /// open-write-close pass — crash-safe by construction, nothing buffered
-    /// to lose — as a single append, so each record lands as one whole
-    /// line. A write failure emits one `warn!` per affected record and is
-    /// otherwise silent; the in-memory record survives.
+    /// created best-effort on first write. Records are handed to a
+    /// bounded background writer (see [`flush`](Self::flush)), so run
+    /// completion never waits on filesystem I/O; the write failure
+    /// handling — one `warn!` per affected record, a truncate-back
+    /// repair keeping every line whole — runs on the worker thread.
     ///
-    /// Two trade-offs apply. The append is performed synchronously during
-    /// run completion to preserve crash-safety; where storage latency is
-    /// significant, point the sink at fast local storage or use
-    /// [`in_memory`](Self::in_memory). The ledger grows without bound;
-    /// rotation and pruning are the host's responsibility. Captured
-    /// content is plaintext prompt, response, and tool text; the ledger
-    /// and its directory are to be treated as sensitive.
+    /// The queue is bounded (128 records). When storage stalls longer
+    /// than the queue absorbs, the oldest queued records are dropped
+    /// with a warning rather than blocking or failing runs; records
+    /// still queued at abrupt process exit are lost with it. Orderly
+    /// shutdown drains them — drop the observer, or call
+    /// [`flush`](Self::flush). The ledger grows without bound; rotation
+    /// and pruning are the host's responsibility. Captured content is
+    /// plaintext prompt, response, and tool text; the ledger and its
+    /// directory are to be treated as sensitive.
     ///
     /// Observers in one process writing to the same directory are
     /// serialized, so their records interleave as whole lines. Across
@@ -660,8 +661,19 @@ impl TrajectoryObserver {
     #[must_use]
     pub fn writing_to(dir: impl Into<PathBuf>) -> Self {
         Self {
-            sink: Some(dir.into()),
+            sink: Some(StdArc::new(LedgerWriter::new(dir.into()))),
             ..Self::in_memory()
+        }
+    }
+
+    /// Block until every accepted ledger record has been written.
+    ///
+    /// Intended for tests and orderly shutdown: returns once the
+    /// writer's queue is empty and no batch is mid-write. Does nothing
+    /// on the in-memory form.
+    pub fn flush(&self) {
+        if let Some(writer) = &self.sink {
+            writer.flush();
         }
     }
 
@@ -913,18 +925,16 @@ impl LoopObserver for TrajectoryObserver {
 }
 
 impl TrajectoryObserver {
-    /// Append one finished record to the JSONL ledger, when a sink is set.
+    /// Hand a finished record to the ledger writer, when one is set.
     ///
-    /// Best-effort by contract: any failure along the way emits exactly one
-    /// warning for the record and drops the file output. The in-memory copy
-    /// is unaffected. A failed write is repaired by truncating back to the
-    /// pre-write length, so a partial line never corrupts the ledger's
-    /// one-record-per-line contract for the records around it.
+    /// Serialization runs here; every filesystem operation runs on the
+    /// writer's worker thread. Best-effort by contract: a serialization
+    /// failure emits exactly one warning and drops the file output; the
+    /// in-memory record is unaffected either way.
     fn append_to_ledger(&self, record: &TrajectoryRecord) {
-        let Some(dir) = &self.sink else {
+        let Some(writer) = &self.sink else {
             return;
         };
-        let _append_guard = recover_guard(LEDGER_APPEND_LOCK.lock());
         let line = match serde_json::to_string(record) {
             Ok(line) => line,
             Err(error) => {
@@ -937,58 +947,7 @@ impl TrajectoryObserver {
                 return;
             }
         };
-        if std::fs::create_dir_all(dir).is_err() {
-            tracing::warn!(
-                target: "loopctl::trajectory",
-                records_lost = 1,
-                dir = %dir.display(),
-                "trajectory ledger directory could not be created; file output dropped"
-            );
-            return;
-        }
-        let path = dir.join(LEDGER_FILE);
-        let bytes = line.len().saturating_add(1) as u64;
-        let write = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut file| {
-                use std::io::Write as _;
-                let start = file.metadata().map_or(0, |m| m.len());
-                let mut out = line;
-                out.push('\n');
-                match file.write_all(out.as_bytes()) {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        if file.set_len(start).is_err() {
-                            tracing::debug!(
-                                target: "loopctl::trajectory",
-                                "ledger truncation after a failed write did not succeed"
-                            );
-                        }
-                        Err(error)
-                    }
-                }
-            });
-        match write {
-            Ok(()) => {
-                tracing::debug!(
-                    target: "loopctl::metrics",
-                    metric = "loopctl.trajectory.jsonl_bytes",
-                    value = bytes,
-                    "trajectory ledger flushed"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "loopctl::trajectory",
-                    error = %error,
-                    records_lost = 1,
-                    path = %path.display(),
-                    "trajectory ledger write failed; file output dropped"
-                );
-            }
-        }
+        writer.enqueue(line);
     }
 }
 

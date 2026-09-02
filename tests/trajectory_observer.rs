@@ -225,6 +225,7 @@ async fn jsonl_sink_writes_one_line_per_run() {
         .await
         .expect("second run completes");
 
+    observer.flush();
     let raw = std::fs::read_to_string(dir.join("trajectory.jsonl"))
         .expect("the ledger exists after two runs");
     let lines: Vec<&str> = raw.lines().collect();
@@ -314,6 +315,7 @@ async fn jsonl_lines_stay_line_delimited_under_hostile_text() {
         .await
         .expect("run completes");
 
+    observer.flush();
     let raw = std::fs::read_to_string(dir.join("trajectory.jsonl")).expect("the ledger exists");
     assert_eq!(
         raw.lines().count(),
@@ -375,6 +377,7 @@ async fn memory_retention_drops_the_oldest_records() {
         .await
         .expect("second run completes");
 
+    observer.flush();
     let raw = std::fs::read_to_string(dir.join("trajectory.jsonl")).expect("the ledger exists");
     assert_eq!(
         raw.lines().count(),
@@ -413,6 +416,9 @@ async fn concurrent_observers_sharing_a_ledger_keep_every_line_whole() {
     }
     for join in joins {
         join.await.expect("writer task completes");
+    }
+    for observer in &writers {
+        observer.flush();
     }
 
     let raw = std::fs::read_to_string(dir.join("trajectory.jsonl")).expect("the ledger exists");
@@ -467,6 +473,7 @@ async fn the_degenerate_config_combination_stays_consistent() {
         observer.records().is_empty(),
         "zero retention retains nothing"
     );
+    observer.flush();
     let raw = std::fs::read_to_string(dir.join("trajectory.jsonl")).expect("ledger exists");
     let lines: Vec<&str> = raw.lines().collect();
     assert_eq!(lines.len(), 1, "the ledger keeps the record memory dropped");

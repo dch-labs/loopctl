@@ -6,8 +6,8 @@
 //! call paired by `tool_call_id`, durations, and token sums. Records are kept
 //! in memory ([`records`](TrajectoryObserver::records)) and, optionally,
 //! appended to a JSON Lines file. The record is the substrate for
-//! downstream experience extraction and is suitable for attachment to
-//! bug reports.
+//! downstream experience extraction and, once the host applies its own
+//! redaction policy, is suitable for attachment to bug reports.
 //!
 //! # Quick Start
 //!
@@ -111,8 +111,9 @@ const DEFAULT_CAPTURE_LIMIT: usize = 2_000;
 /// A session with N runs produces N records, correlated by `session_id` and
 /// uniquely identified by `run_id`. The record is plain data — serializable,
 /// cloneable, and independent of engine types — so it can be written to
-/// disk, attached to a bug report, or consumed by downstream analysis
-/// without reference to the loop that produced it.
+/// disk, attached to a bug report (after the host applies its own redaction
+/// policy), or consumed by downstream analysis without reference to the
+/// loop that produced it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrajectoryRecord {
     /// The session the run belonged to.
@@ -270,9 +271,12 @@ pub struct TrajectoryTurn {
 
     /// Wall-clock duration of the turn, in milliseconds.
     ///
-    /// Carried from the turn's end event, whenever it arrives: a late end
-    /// patches the already-closed turn's figures; a turn that never
-    /// received one (mid-run attach, run ending first) reports zero.
+    /// The engine reports a tool turn's time as two disjoint per-phase
+    /// figures (the model phase and the tool phase); the recorded
+    /// duration is their saturating sum, so a well-formed stream
+    /// reconstructs the turn's full wall clock. End events arriving for
+    /// an already-closed turn add to it; a turn that never received one
+    /// (mid-run attach, run ending first) reports zero.
     pub duration_ms: u64,
 
     /// Input tokens the turn consumed.
@@ -657,8 +661,9 @@ impl TrajectoryObserver {
     /// Observers in one process writing to the same directory are
     /// serialized, so their records interleave as whole lines. Across
     /// processes nothing is serialized: point two concurrently running
-    /// hosts at the same `dir` only if interleaving their records in
-    /// one file is acceptable.
+    /// hosts at the same `dir` only if interleaving their records in one
+    /// file is acceptable — concurrent cross-process writers may also
+    /// overwrite one another's lines, not merely interleave them.
     #[must_use]
     pub fn writing_to(dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -837,7 +842,7 @@ impl LoopObserver for TrajectoryObserver {
             .as_mut()
             .filter(|open| open.turn == ctx.turn)
         {
-            turn.duration_ms = ctx.duration_ms;
+            turn.duration_ms = turn.duration_ms.saturating_add(ctx.duration_ms);
             turn.input_tokens = ctx.input_tokens;
             turn.output_tokens = ctx.output_tokens;
             builder.close_current();
@@ -847,7 +852,7 @@ impl LoopObserver for TrajectoryObserver {
             .rev()
             .find(|done| done.turn == ctx.turn)
         {
-            done.duration_ms = ctx.duration_ms;
+            done.duration_ms = done.duration_ms.saturating_add(ctx.duration_ms);
             done.input_tokens = ctx.input_tokens;
             done.output_tokens = ctx.output_tokens;
         } else {
@@ -1776,6 +1781,53 @@ mod tests {
             .expect("the open turn is still captured at run end");
         assert_eq!(open.query, "still open");
     }
+
+    #[test]
+    fn a_tool_turn_sums_its_two_phase_end_durations() {
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 0,
+            query: "tool turn".to_string(),
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 0,
+            success: true,
+            error: None,
+            duration_ms: 20,
+            input_tokens: 10,
+            output_tokens: 5,
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 0,
+            success: true,
+            error: None,
+            duration_ms: 22,
+            input_tokens: 30,
+            output_tokens: 15,
+        });
+        observer.on_run_end(&RunEndContext {
+            success: true,
+            error: None,
+            total_turns: 1,
+            duration_ms: 50,
+        });
+
+        let record = &observer.records()[0];
+        assert_unique_turn_indices(record);
+        let turn = &record.turns[0];
+        assert_eq!(
+            turn.duration_ms, 42,
+            "the two per-phase end durations sum to the turn's wall clock"
+        );
+        assert_eq!(
+            (turn.input_tokens, turn.output_tokens),
+            (30, 15),
+            "repeated accounting totals stay last-wins, not summed"
+        );
+    }
     fn assert_unique_turn_indices(record: &TrajectoryRecord) {
         let indices: Vec<usize> = record.turns.iter().map(|turn| turn.turn).collect();
         assert_eq!(
@@ -1786,6 +1838,72 @@ mod tests {
                 .len(),
             "no two captured turns share an index"
         );
+    }
+
+    /// One observer callback event, generated and replayed by the
+    /// event-sequence property.
+    #[derive(Clone, Debug)]
+    enum Event {
+        TurnStart(usize, String),
+        Response(usize, String),
+        ToolPre(usize, String),
+        ToolPost(usize, String, bool),
+        TurnEnd(usize, bool, u64, u64, u64),
+    }
+
+    fn event_strategy() -> impl proptest::strategy::Strategy<Value = Event> {
+        use proptest::prelude::*;
+
+        prop_oneof![
+            (0usize..6, ".*").prop_map(|(turn, query)| Event::TurnStart(turn, query)),
+            (0usize..6, "[abc]{0,24}").prop_map(|(turn, text)| Event::Response(turn, text)),
+            (0usize..6, "[abcd]").prop_map(|(turn, id)| Event::ToolPre(turn, id)),
+            (0usize..6, "[abcd]", any::<bool>())
+                .prop_map(|(turn, id, ok)| Event::ToolPost(turn, id, ok),),
+            (0usize..6, any::<bool>(), 0u64..1000, 0u64..1000, 0u64..1000).prop_map(
+                |(turn, success, input, output, duration)| {
+                    Event::TurnEnd(turn, success, input, output, duration)
+                },
+            ),
+        ]
+    }
+
+    fn apply_event(observer: &TrajectoryObserver, event: &Event) {
+        match event {
+            Event::TurnStart(turn, query) => observer.on_turn_start(&TurnStartContext {
+                turn: *turn,
+                query: query.clone(),
+            }),
+            Event::Response(turn, text) => observer.on_response(&ResponseContext {
+                turn: *turn,
+                text: text.clone(),
+                usage: None,
+            }),
+            Event::ToolPre(turn, id) => observer.on_tool_pre(&ToolPreContext {
+                turn: *turn,
+                tool: "t".to_string(),
+                tool_call_id: id.clone(),
+            }),
+            Event::ToolPost(turn, id, ok) => observer.on_tool_post(&ToolPostContext {
+                tool_call_id: id.clone(),
+                turn: *turn,
+                tool: "t".to_string(),
+                result_hash: None,
+                is_error: !*ok,
+                duration: std::time::Duration::from_millis(1),
+                display_hint: None,
+            }),
+            Event::TurnEnd(turn, success, input, output, duration) => {
+                observer.on_turn_end(&TurnEndContext {
+                    turn: *turn,
+                    success: *success,
+                    error: None,
+                    duration_ms: *duration,
+                    input_tokens: *input,
+                    output_tokens: *output,
+                });
+            }
+        }
     }
 
     #[test]
@@ -1941,34 +2059,12 @@ mod tests {
     fn arbitrary_event_sequences_preserve_the_record_invariants() {
         use proptest::prelude::*;
 
-        #[derive(Clone, Debug)]
-        enum Event {
-            TurnStart(usize, String),
-            Response(usize, String),
-            ToolPre(usize, String),
-            ToolPost(usize, String, bool),
-            TurnEnd(usize, bool, u64, u64),
-        }
-
-        fn event_strategy() -> impl Strategy<Value = Event> {
-            prop_oneof![
-                (0usize..6, ".*").prop_map(|(turn, query)| Event::TurnStart(turn, query)),
-                (0usize..6, "[abc]{0,24}").prop_map(|(turn, text)| Event::Response(turn, text)),
-                (0usize..6, "[abcd]").prop_map(|(turn, id)| Event::ToolPre(turn, id)),
-                (0usize..6, "[abcd]", any::<bool>())
-                    .prop_map(|(turn, id, ok)| Event::ToolPost(turn, id, ok),),
-                (0usize..6, any::<bool>(), 0u64..1000, 0u64..1000).prop_map(
-                    |(turn, success, input, output)| Event::TurnEnd(turn, success, input, output),
-                ),
-            ]
-        }
-
         proptest!(|(events in proptest::collection::vec(event_strategy(), 0..60))| {
             let run_success = events
                 .iter()
                 .rev()
                 .find_map(|event| match event {
-                    Event::TurnEnd(_, success, _, _) => Some(*success),
+                    Event::TurnEnd(_, success, _, _, _) => Some(*success),
                     _ => None,
                 })
                 .unwrap_or(true);
@@ -1977,6 +2073,8 @@ mod tests {
             let mut expected_response: std::collections::HashMap<usize, String> =
                 std::collections::HashMap::new();
             let mut expected_tokens: std::collections::HashMap<usize, (u64, u64)> =
+                std::collections::HashMap::new();
+            let mut expected_duration: std::collections::HashMap<usize, u64> =
                 std::collections::HashMap::new();
             let mut expected_any_ok = false;
             let observer = TrajectoryObserver::in_memory().with_capture_limit(5);
@@ -1992,44 +2090,14 @@ mod tests {
                             .insert(*turn, truncate_chars(text, 5));
                     }
                     Event::ToolPost(_, _, true) => expected_any_ok = true,
+                    Event::TurnEnd(turn, _, input, output, duration) => {
+                        expected_tokens.insert(*turn, (*input, *output));
+                        let total = expected_duration.entry(*turn).or_insert(0);
+                        *total = total.saturating_add(*duration);
+                    }
                     _ => {}
                 }
-                match event {
-                    Event::TurnStart(turn, query) => observer.on_turn_start(&TurnStartContext {
-                        turn: *turn,
-                        query: query.clone(),
-                    }),
-                    Event::Response(turn, text) => observer.on_response(&ResponseContext {
-                        turn: *turn,
-                        text: text.clone(),
-                        usage: None,
-                    }),
-                    Event::ToolPre(turn, id) => observer.on_tool_pre(&ToolPreContext {
-                        turn: *turn,
-                        tool: "t".to_string(),
-                        tool_call_id: id.clone(),
-                    }),
-                    Event::ToolPost(turn, id, ok) => observer.on_tool_post(&ToolPostContext {
-                        tool_call_id: id.clone(),
-                        turn: *turn,
-                        tool: "t".to_string(),
-                        result_hash: None,
-                        is_error: !*ok,
-                        duration: std::time::Duration::from_millis(1),
-                        display_hint: None,
-                    }),
-                    Event::TurnEnd(turn, success, input, output) => {
-                        expected_tokens.insert(*turn, (*input, *output));
-                        observer.on_turn_end(&TurnEndContext {
-                            turn: *turn,
-                            success: *success,
-                            error: None,
-                            duration_ms: 1,
-                            input_tokens: *input,
-                            output_tokens: *output,
-                        });
-                    }
-                }
+                apply_event(&observer, event);
             }
             observer.on_run_end(&RunEndContext {
                 success: run_success,
@@ -2077,6 +2145,11 @@ mod tests {
             for turn in &record.turns {
                 let (input, output) = expected_tokens.get(&turn.turn).copied().unwrap_or((0, 0));
                 prop_assert_eq!((turn.input_tokens, turn.output_tokens), (input, output));
+                prop_assert_eq!(
+                    turn.duration_ms,
+                    expected_duration.get(&turn.turn).copied().unwrap_or(0),
+                    "per-phase end durations sum to the turn's recorded duration"
+                );
                 prop_assert_eq!(
                     &turn.query,
                     &expected_query.get(&turn.turn).cloned().unwrap_or_default()
@@ -2272,6 +2345,9 @@ mod tests {
         );
         let reopened = &record.turns[0];
         assert_eq!(reopened.query, "reopened");
-        assert_eq!(reopened.duration_ms, 3);
+        assert_eq!(
+            reopened.duration_ms, 4,
+            "phase durations on both sides of the reopen sum"
+        );
     }
 }

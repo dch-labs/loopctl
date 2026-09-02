@@ -107,10 +107,13 @@ struct QueueState {
 
 /// Appends one serialized record to a ledger directory.
 ///
-/// Performs the open-write-close pass as a single append; a failed write
-/// is repaired by truncating back to the pre-write length so a partial
-/// line never corrupts the one-record-per-line contract. Best-effort:
-/// any failure emits exactly one warning.
+/// Performs the open-seek-write-close pass as a single append; a failed
+/// write is repaired by truncating back to the pre-write length so a
+/// partial line never corrupts the one-record-per-line contract. When
+/// the repair itself fails (on some platforms the open handle cannot
+/// set the file length), the torn line is sealed with a newline so the
+/// damage is bounded to one corrupt line, and the failure is warned.
+/// Best-effort overall: any failure emits exactly one warning.
 fn append_line(dir: &Path, line: &str) {
     if std::fs::create_dir_all(dir).is_err() {
         tracing::warn!(
@@ -125,14 +128,12 @@ fn append_line(dir: &Path, line: &str) {
     let _append_guard = recover_guard(LEDGER_APPEND_LOCK.lock());
     let write = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(false)
         .open(&path)
         .and_then(|mut file| {
-            use std::io::Write as _;
-            let start = match file.metadata() {
-                Ok(metadata) => metadata.len(),
-                Err(error) => return Err(error),
-            };
+            use std::io::{Seek, SeekFrom, Write as _};
+            let start = file.seek(SeekFrom::End(0))?;
             let mut out = String::with_capacity(line.len().saturating_add(1));
             out.push_str(line);
             out.push('\n');
@@ -140,9 +141,15 @@ fn append_line(dir: &Path, line: &str) {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     if file.set_len(start).is_err() {
-                        tracing::debug!(
+                        let sealed = file
+                            .seek(SeekFrom::End(0))
+                            .and_then(|_| file.write_all(b"\n"))
+                            .is_ok();
+                        tracing::warn!(
                             target: "loopctl::trajectory",
-                            "ledger truncation after a failed write did not succeed"
+                            path = %path.display(),
+                            sealed,
+                            "ledger repair after a failed write did not succeed; the ledger may hold one corrupt line"
                         );
                     }
                     Err(error)

@@ -265,8 +265,9 @@ pub struct TrajectoryTurn {
 
     /// Wall-clock duration of the turn, in milliseconds.
     ///
-    /// Carried from the turn's end event; a turn closed without one
-    /// (mid-run attach, run ending first) reports zero.
+    /// Carried from the turn's end event, whenever it arrives: a late end
+    /// patches the already-closed turn's figures; a turn that never
+    /// received one (mid-run attach, run ending first) reports zero.
     pub duration_ms: u64,
 
     /// Input tokens the turn consumed.
@@ -713,8 +714,6 @@ impl LoopObserver for TrajectoryObserver {
         let Some(builder) = guard.as_mut() else {
             return;
         };
-        // The post is answered even when its dispatch was never observed
-        // (mid-run attach): the slot opens lazily from the result alone.
         let _ = builder.open_calls.remove(&ctx.tool_call_id);
         let turn = builder.turn_mut(ctx.turn);
         turn.tool_calls.push(TrajectoryToolCall {
@@ -738,8 +737,19 @@ impl LoopObserver for TrajectoryObserver {
             turn.duration_ms = ctx.duration_ms;
             turn.input_tokens = ctx.input_tokens;
             turn.output_tokens = ctx.output_tokens;
+            builder.close_current();
+        } else if let Some(done) = builder
+            .turns
+            .last_mut()
+            .filter(|done| done.turn == ctx.turn)
+        {
+            done.duration_ms = ctx.duration_ms;
+            done.input_tokens = ctx.input_tokens;
+            done.output_tokens = ctx.output_tokens;
+        } else {
+            builder.turn_mut(ctx.turn);
+            builder.close_current();
         }
-        builder.close_current();
     }
 
     fn on_run_end(&self, ctx: &RunEndContext) {
@@ -747,13 +757,8 @@ impl LoopObserver for TrajectoryObserver {
         let Some(mut builder) = guard.take() else {
             return;
         };
-        // The builder is fully owned from here; release the lock so a
-        // concurrently attached callback on a shared observer never waits
-        // on the sink's write.
         drop(guard);
 
-        // Calls still open at run end never produced a result; close
-        // them as unsuccessful, timed from dispatch to run end.
         let unanswered: Vec<(String, OpenCall)> = builder.open_calls.drain().collect();
         for (tool_call_id, open) in unanswered {
             builder.abandon_call(tool_call_id, open);
@@ -813,7 +818,9 @@ impl TrajectoryObserver {
     ///
     /// Best-effort by contract: any failure along the way emits exactly one
     /// warning for the record and drops the file output. The in-memory copy
-    /// is unaffected.
+    /// is unaffected. A failed write is repaired by truncating back to the
+    /// pre-write length, so a partial line never corrupts the ledger's
+    /// one-record-per-line contract for the records around it.
     fn append_to_ledger(&self, record: &TrajectoryRecord) {
         let Some(dir) = &self.sink else {
             return;
@@ -847,9 +854,21 @@ impl TrajectoryObserver {
             .open(&path)
             .and_then(|mut file| {
                 use std::io::Write as _;
+                let start = file.metadata().map_or(0, |m| m.len());
                 let mut out = line;
                 out.push('\n');
-                file.write_all(out.as_bytes())
+                match file.write_all(out.as_bytes()) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        if file.set_len(start).is_err() {
+                            tracing::debug!(
+                                target: "loopctl::trajectory",
+                                "ledger truncation after a failed write did not succeed"
+                            );
+                        }
+                        Err(error)
+                    }
+                }
             });
         match write {
             Ok(()) => {
@@ -1509,5 +1528,58 @@ mod tests {
             "an abandoned call is attributed to the turn it was dispatched on"
         );
         assert_eq!(record.turns[0].tool_calls[0].tool_call_id, "call_late");
+    }
+    #[test]
+    fn a_late_turn_end_patches_its_own_turn() {
+        let observer = TrajectoryObserver::in_memory();
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 3,
+            query: "first".to_string(),
+        });
+        // A later turn's event closes turn 3 before its end event arrives.
+        observer.on_response(&ResponseContext {
+            turn: 4,
+            text: "next turn".to_string(),
+            usage: None,
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 3,
+            success: true,
+            error: None,
+            duration_ms: 42,
+            input_tokens: 7,
+            output_tokens: 9,
+        });
+        observer.on_run_end(&RunEndContext {
+            success: true,
+            error: None,
+            total_turns: 5,
+            duration_ms: 60,
+        });
+
+        let record = &observer.records()[0];
+        let indices: Vec<usize> = record.turns.iter().map(|turn| turn.turn).collect();
+        assert_eq!(
+            indices.len(),
+            indices
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "no two captured turns share an index"
+        );
+        let patched = record
+            .turns
+            .iter()
+            .find(|turn| turn.turn == 3)
+            .expect("turn 3 is captured");
+        assert_eq!(
+            patched.duration_ms, 42,
+            "the late end event patches its turn"
+        );
+        assert_eq!(patched.input_tokens, 7);
+        assert_eq!(patched.output_tokens, 9);
     }
 }

@@ -254,7 +254,7 @@ Two cross-cutting concerns run alongside the main loop:
 ## Development
 
 ```bash
-make ci        # fmt + check + clippy + tests + docs + examples + redaction minimal-graph gate
+make ci        # fmt + check + clippy + tests + docs + examples + redaction minimal-feature gate
 make test      # run all tests
 make lint      # auto-format
 ```

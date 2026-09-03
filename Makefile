@@ -1,5 +1,8 @@
 .PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal
 
+CRATE_EDITION := $(shell grep -m1 '^edition' Cargo.toml | cut -d'"' -f2)
+CRATE_RUST_VERSION := $(shell grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+
 ci: fmt check check-default clippy test docs examples redaction-minimal
 
 check:
@@ -30,13 +33,11 @@ examples:
 
 redaction-minimal:
 	@tmp=$$(mktemp -d); \
-	mkdir -p $$tmp/src; \
-	printf '[package]\nname = "redaction-minimal-probe"\nversion = "0.0.0"\nedition = "2024"\nrust-version = "1.98"\npublish = false\n\n[dependencies]\nloopctl = { path = "$(CURDIR)", features = ["redaction"] }\n\n[workspace]\n' > $$tmp/Cargo.toml; \
-	printf 'fn main() {\n    let token = "abcdef12345678901234";\n    let mut text = format!("Authorization: Bearer {token}");\n    let count = loopctl::middleware::redaction::SecretPatternSet::default_common().scrub(&mut text);\n    assert!(count > 0, "the curated bearer pattern must compile and redact");\n    assert!(text.contains("[REDACTED:"), "the bearer header must be scrubbed, got: {text}");\n    for i in 0..=token.len() - 8 {\n        assert!(!text.contains(&token[i..i + 8]), "token material survived: {} in {text}", &token[i..i + 8]);\n    }\n}\n' > $$tmp/src/main.rs; \
-	CARGO_TARGET_DIR=$(CURDIR)/target cargo run --quiet --manifest-path $$tmp/Cargo.toml; \
-	status=$$?; \
-	rm -rf $$tmp; \
-	exit $$status
+	trap 'rm -rf "$$tmp"' EXIT INT TERM; \
+	mkdir -p "$$tmp/src"; \
+	printf '[package]\nname = "redaction-minimal-probe"\nversion = "0.0.0"\nedition = "$(CRATE_EDITION)"\nrust-version = "$(CRATE_RUST_VERSION)"\npublish = false\n\n[dependencies]\nloopctl = { path = "$(CURDIR)", features = ["redaction"] }\n\n[workspace]\n' > "$$tmp/Cargo.toml"; \
+	printf 'fn main() {\n    let token = "abcdef12345678901234";\n    assert!(token.len() >= 8, "the probe token must be at least 8 bytes for the window scan");\n    let mut text = format!("Authorization: Bearer {token}");\n    let count = loopctl::middleware::redaction::SecretPatternSet::default_common().scrub(&mut text);\n    assert!(count > 0, "the curated bearer pattern must compile and redact");\n    assert!(text.contains("[REDACTED:"), "the bearer header must be scrubbed, got: {text}");\n    for i in 0..=token.len() - 8 {\n        assert!(!text.contains(&token[i..i + 8]), "token material survived: {} in {text}", &token[i..i + 8]);\n    }\n}\n' > "$$tmp/src/main.rs"; \
+	CARGO_TARGET_DIR="$(CURDIR)/target" cargo run --quiet --manifest-path "$$tmp/Cargo.toml"
 
 e2e: e2e-providers e2e-ollama
 

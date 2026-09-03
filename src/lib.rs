@@ -14,6 +14,7 @@
 //!
 //! - **[`observer`]** — Lifecycle event observation ([`LoopObserver`](observer::LoopObserver), [`ObserverHost`](observer::ObserverHost)).
 //! - **[`memory`]** — Agent memory trait ([`LoopMemory`](memory::LoopMemory)) and entry types.
+//! - **`memory::vector`** — Vector primitives for semantic retrieval ([`EmbeddingProvider`](memory::vector::EmbeddingProvider), [`VectorIndex`](memory::vector::VectorIndex)). *Requires `vector_index` feature.*
 //! - **[`reflection`]** — Failure reflection and recovery strategies.
 //! - **[`detection`]** — Loop and convergence detection ([`DetectionManager`](detection::DetectionManager)).
 //! - **[`fallback`]** — Circuit breaker pattern for automatic API model fallback.

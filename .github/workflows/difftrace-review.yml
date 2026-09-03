@@ -1,0 +1,37 @@
+name: difftrace review
+
+on:
+  pull_request:
+    types: [opened]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number to review"
+        required: true
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  review:
+    name: Review the pull request
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    steps:
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Install difftrace
+        run: cargo install --git https://github.com/dch-labs/difftrace --locked
+
+      - name: Review the pull request
+        run: |
+          difftrace review \
+            --repo "${{ github.repository }}" \
+            --pr "${{ inputs.pr || github.event.pull_request.number }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          DIFFTRACE_PROFILE: zai

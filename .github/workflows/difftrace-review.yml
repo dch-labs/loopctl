@@ -36,11 +36,11 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      - name: Install difftrace v0.1.1
+      - name: Install difftrace v0.1.2
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.1.1/difftrace-0.1.1-x86_64-unknown-linux-gnu.tar.gz
-          echo "485e10e8192c2b7e88969ee6cd57c3b29c79a130305d213830be2e9687d0daa3  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.1.2/difftrace-0.1.2-x86_64-unknown-linux-gnu.tar.gz
+          echo "2ab1f6890650fe4e40c2ce6435dc18d4deb29278b2ccc20070b8deaa1f5e258f  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 

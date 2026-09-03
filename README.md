@@ -138,6 +138,50 @@ let agent = BareLoop::new(
 // let result = agent.run("test input").await?;
 ```
 
+### Structured Output
+
+Two paths, one decision: **native** enforcement where the provider supports it,
+**prompted** fallback where it doesn't (most local models behind Ollama/vLLM
+reject or ignore `response_format`, and loopctl since 0.3.0 rejects request
+options a client cannot forward rather than degrading silently).
+
+```rust,no_run
+# use loopctl::api::ApiClient;
+# use loopctl::message::Message;
+# use loopctl::structured::{request_structured, request_structured_prompted, StructuredOutput};
+# use serde::Deserialize;
+# #[derive(Deserialize)]
+# struct RouteDecision { route: String, confidence: f64 }
+# impl StructuredOutput for RouteDecision {
+#     fn name() -> &'static str { "route_decision" }
+#     fn schema() -> serde_json::Value {
+#         serde_json::json!({
+#             "type": "object",
+#             "properties": {
+#                 "route": {"type": "string"},
+#                 "confidence": {"type": "number"}
+#             },
+#             "required": ["route", "confidence"],
+#             "additionalProperties": false
+#         })
+#     }
+# }
+async fn demo(
+    client: &dyn ApiClient,
+    messages: Vec<Message>,
+) -> Result<(), loopctl::structured::StructuredError> {
+    // Native path — the provider enforces the schema (OpenAI strict mode,
+    // Anthropic forced tool):
+    let _decision: RouteDecision = request_structured(client, messages.clone(), None).await?;
+
+    // Prompted path — the schema rides the system prompt; the output is
+    // parsed leniently; one corrective retry is made on failure. Works on
+    // providers that reject or ignore `response_format`.
+    let _decision: RouteDecision = request_structured_prompted(client, messages, None).await?;
+    Ok(())
+}
+```
+
 ## Feature Flags
 
 | Feature | Default | Depends on | Description |

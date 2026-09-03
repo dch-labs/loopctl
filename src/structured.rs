@@ -9,6 +9,21 @@
 //! - [`StructuredError`] — errors raised by the structured-output machinery.
 //! - [`request_structured`] — a convenience helper that hides the
 //!   options/extraction dance behind a single generic call.
+//! - [`request_structured_prompted`] — the prompted fallback for
+//!   providers that reject or ignore `response_format` (most local
+//!   models): the schema rides the system prompt, the output is parsed
+//!   leniently, and one corrective retry is made on failure.
+//!
+//! # Choosing an extraction path
+//!
+//! | Path | Mechanism | Use when |
+//! |---|---|---|
+//! | [`request_structured`] | provider-native `response_format` | the provider enforces schemas (OpenAI strict mode; Anthropic forced tool) |
+//! | [`request_structured_prompted`] | schema in the system prompt + lenient parse + one corrective retry | the provider rejects or ignores `response_format` — most local models behind Ollama/vLLM |
+//! | tool-forced output | a forced tool call carrying the schema | not provided by this crate |
+//!
+//! Native enforcement beats prompt guidance; prefer
+//! [`request_structured`] wherever the provider supports it.
 //!
 //! # Quick Start
 //!
@@ -40,6 +55,9 @@
 //!
 //! // let action: Action = request_structured(&client, messages, system).await?;
 //! ```
+
+use serde::de::Error as _;
+use tracing::Instrument as _;
 
 use crate::api::ApiClient;
 use crate::message::Message;
@@ -354,10 +372,12 @@ impl RequestOptions {
 pub enum StructuredError {
     /// The model's output did not deserialize into the target type.
     ///
-    /// Carries the underlying `serde_json::Error` with its exact location
-    /// (line/column within the JSON). This typically means the model returned
-    /// valid JSON but with missing fields, wrong types, or unexpected
-    /// structure relative to `T`'s schema.
+    /// When raised from parsing a provider response, carries the
+    /// underlying `serde_json::Error` with its exact location
+    /// (line/column within the JSON). The prompted path
+    /// ([`request_structured_prompted`]) reuses this variant after a
+    /// failed corrective retry with a synthesized error whose message
+    /// carries the failure reason and the truncated last output.
     #[error("structured output did not match the expected schema: {0}")]
     Deserialize(#[from] serde_json::Error),
 
@@ -674,6 +694,399 @@ pub async fn request_structured<T: StructuredOutput + serde::de::DeserializeOwne
         .map_err(StructuredError::Api)?;
     let value = client.extract_structured(&response.message);
     T::from_value(value)
+}
+
+/// The exact system-prompt envelope used by
+/// [`request_structured_prompted`], public for hosts composing their own
+/// flows.
+///
+/// The wording is part of the feature: imperative, short sentences, one
+/// minified schema, and explicit "no fences" instructions. The lenient
+/// parser tolerates fences and prose anyway, but asking for none keeps
+/// the response free of clutter tokens. A caller-supplied system prompt
+/// is composed ahead of this envelope, never replaced by it.
+///
+/// The schema is embedded minified (`serde_json::to_string`) — token
+/// cheap, and small models read minified schemas fine; the wrapper text
+/// carries the explanation. That serialization is total for any
+/// `serde_json::Value` constructible in practice, so the guarded
+/// failure arm below cannot fire today; it warns instead of failing
+/// silently so the impossible stays observable if it ever stops being
+/// impossible.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::structured::{prompted_system_prefix, StructuredOutput};
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize)]
+/// struct Answer {
+///     text: String,
+/// }
+///
+/// impl StructuredOutput for Answer {
+///     fn name() -> &'static str {
+///         "answer"
+///     }
+///     fn schema() -> serde_json::Value {
+///         serde_json::json!({
+///             "type": "object",
+///             "properties": {"text": {"type": "string"}},
+///             "required": ["text"],
+///             "additionalProperties": false
+///         })
+///     }
+/// }
+///
+/// let prefix = prompted_system_prefix::<Answer>();
+/// assert!(prefix.contains("You will answer with JSON only."));
+/// assert!(prefix.contains(r#""required":["text"]"#));
+/// ```
+#[must_use]
+pub fn prompted_system_prefix<T: StructuredOutput>() -> String {
+    let schema_text = match serde_json::to_string(&T::schema()) {
+        Ok(schema) => schema,
+        Err(error) => {
+            tracing::warn!(
+                target: "loopctl::structured",
+                error = %error,
+                "the structured-output schema could not be serialized; the prompted envelope carries an empty schema"
+            );
+            String::new()
+        }
+    };
+    format!(
+        "You will answer with JSON only.\n\n\
+         The JSON must exactly match this schema:\n\
+         {schema_text}\n\n\
+         Rules:\n\
+         - Output ONE JSON object and nothing else — no prose, no markdown fences.\n\
+         - Include every required field with the correct type.\n\
+         - Strings must be valid JSON strings (escape newlines and quotes).",
+    )
+}
+
+/// Compose the caller's system prompt with the prompted envelope.
+///
+/// The caller's prompt comes first — it carries the host's persona and
+/// task framing — and the envelope follows as the last, most immediate
+/// instruction.
+fn compose_prompted_system<T: StructuredOutput>(system: Option<String>) -> String {
+    let prefix = prompted_system_prefix::<T>();
+    match system {
+        Some(user_system) => format!("{user_system}\n\n{prefix}"),
+        None => prefix,
+    }
+}
+
+/// The corrective retry message fed back to the model after a failed
+/// extraction.
+///
+/// The concrete error text is what makes one retry effective — serde
+/// messages ("missing field `tool` at line 1 column 5") are
+/// model-legible — but it is bounded before riding the retry wire: a
+/// long prose failure embeds the whole failed answer in the serde error
+/// text, and echoing it back whole could push a small local model's
+/// retry over its context window, corrupting the recovery path's own
+/// success condition.
+fn corrective_message(error: &StructuredError) -> String {
+    format!(
+        "Your previous answer was not valid JSON for the schema:\n\
+         {}\n\n\
+         Answer again with the corrected JSON object only.",
+        truncate_for_error(&error.to_string(), 2_000),
+    )
+}
+
+/// Render a response's output as plain text.
+///
+/// Text content plus, when the reply carried tool-call parts, their
+/// inputs: a reply whose only content is a schema-invalid tool-call
+/// input has empty text, and without the inputs neither the failure
+/// error nor the retry conversation would say anything about the
+/// output that failed. The rendering is never empty — a reply with no
+/// text and no tool parts renders as `(empty reply)` — so the failure
+/// error stays informative and the corrective retry can replay this
+/// rendering as an assistant turn on every provider: a replayed turn
+/// still carrying the tool-call parts would be rejected by providers
+/// that require a tool result after every tool call, and an empty
+/// assistant turn by those that validate content at all.
+fn last_output_text(message: &Message) -> String {
+    use std::fmt::Write as _;
+    let mut output = message.text_content();
+    for (_, name, input) in message.tool_call_parts() {
+        let _ignored = write!(output, "\n[tool call {name} input: {input}]");
+    }
+    if output.is_empty() {
+        return "(empty reply)".to_string();
+    }
+    output
+}
+
+/// Bound an error-embedded text to a human-readable size.
+///
+/// The raw output rides the error for humans and tests, not for
+/// re-feeding; bounding it keeps a pathological response from bloating
+/// the error while keeping its informative head. Truncation counts by
+/// `char` and never splits a multi-byte character.
+fn truncate_for_error(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(limit).collect();
+    format!("{head}…[truncated]")
+}
+
+/// The per-attempt telemetry span for the prompted extraction path.
+///
+/// Named `structured.extract` with `mode=prompted`, the zero-based
+/// `attempt` number, an `ok` field left empty until the attempt's
+/// outcome is known, and the OTel-convention
+/// `gen_ai.operation.name` field. The span is attached to the attempt's
+/// request future via [`Instrument`](tracing::Instrument) — never
+/// entered around an await — so a subscriber sees the attempt decorated
+/// and observes the recorded `ok` on close.
+fn extract_attempt_span(attempt: u64) -> tracing::Span {
+    tracing::debug_span!(
+        target: "loopctl::structured",
+        "structured.extract",
+        mode = "prompted",
+        attempt,
+        ok = tracing::field::Empty,
+        "gen_ai.operation.name" = "structured_extract",
+    )
+}
+
+/// The per-attempt usage counters, when the response carried usage.
+///
+/// Two metric-targeted debug events on
+/// `loopctl.structured.prompted.tokens` with `direction=in|out` and the
+/// provider-reported token figures as `value`; silent when the response
+/// carried no usage, so consumers can sum the counter without zero
+/// noise from providers that do not report.
+///
+/// Returns the number of events emitted — zero when there was no
+/// usage, two otherwise — so the silence contract is testable without
+/// a capturing subscriber.
+fn emit_usage(usage: Option<crate::stream::Usage>) -> usize {
+    let Some(usage) = usage else {
+        return 0;
+    };
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.structured.prompted.tokens",
+        direction = "in",
+        value = usage.input_tokens,
+        "structured prompted tokens in"
+    );
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.structured.prompted.tokens",
+        direction = "out",
+        value = usage.output_tokens,
+        "structured prompted tokens out"
+    );
+    2
+}
+
+/// The settle event: how many attempts the extraction took and how it
+/// ended.
+///
+/// Emits the `loopctl.structured.prompted` counter with
+/// `outcome=first_try|after_retry|failed|api_error` and the
+/// `loopctl.structured.prompted.attempts_count` event carrying the
+/// attempt count, so a consumer summing the counter sees every
+/// extraction — including the provider-failure cases where the metric
+/// matters most.
+fn emit_settled(outcome: &str, attempts: u64) {
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.structured.prompted",
+        outcome,
+        "structured prompted extraction settled"
+    );
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.structured.prompted.attempts_count",
+        value = attempts,
+        "structured prompted attempts"
+    );
+}
+
+/// One attempt of the prompted extraction: send the request, emit the
+/// usage counters, extract and parse — all inside the attempt's
+/// telemetry span.
+///
+/// The span is attached with [`Instrument`](tracing::Instrument), so
+/// the awaited request and the parse run decorated and the recorded
+/// `ok` is observable on the span's close. Returns the parse outcome
+/// together with the response message (the caller needs the failed
+/// answer for the retry conversation); an API failure marks the span
+/// unsuccessful and surfaces as [`StructuredError::Api`].
+///
+/// # Errors
+///
+/// [`StructuredError::Api`] when the underlying request fails; the
+/// parse failure itself is returned in the `Ok` arm, left for the
+/// caller to settle.
+async fn prompted_attempt<T>(
+    client: &dyn ApiClient,
+    request: &crate::api::StreamRequest,
+    span: &tracing::Span,
+) -> Result<(Result<T, StructuredError>, Message), StructuredError>
+where
+    T: StructuredOutput + serde::de::DeserializeOwned,
+{
+    let attempt = async {
+        let response = client.create_message(request).await?;
+        emit_usage(response.usage);
+        let parsed = T::from_value(client.extract_structured(&response.message));
+        Ok::<_, crate::api::error::ApiError>((response.message, parsed))
+    };
+    match attempt.instrument(span.clone()).await {
+        Ok((message, parsed)) => {
+            span.record("ok", parsed.is_ok());
+            Ok((parsed, message))
+        }
+        Err(error) => {
+            span.record("ok", false);
+            Err(StructuredError::Api(error))
+        }
+    }
+}
+
+/// Prompt-guided structured output for providers without native
+/// `response_format` support (most local models).
+///
+/// Unlike [`request_structured`] (which sets a provider
+/// [`ResponseFormat`]), this function embeds `T`'s JSON Schema in the
+/// system prompt with strict-JSON output instructions (see
+/// [`prompted_system_prefix`]), sends a plain request — no
+/// [`RequestOptions`] at all, so there is nothing for a local server to
+/// reject — and extracts the value leniently (fenced or prose-wrapped
+/// JSON is accepted). If the response does not parse or fails `T`'s
+/// schema, exactly one corrective retry is made with the concrete error
+/// fed back to the model; a second failure returns
+/// [`StructuredError::Deserialize`] carrying the failure and the last
+/// model output (truncated).
+///
+/// It works on every provider by construction: the request is an
+/// ordinary `create_message`. On providers with native support this is
+/// simply the worse option — prefer [`request_structured`] there, since
+/// native enforcement beats prompt guidance.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use loopctl::api::ApiClient;
+/// use loopctl::message::Message;
+/// use loopctl::structured::request_structured_prompted;
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize, Debug)]
+/// struct RouteDecision {
+///     route: String,
+///     confidence: f64,
+/// }
+///
+/// impl loopctl::structured::StructuredOutput for RouteDecision {
+///     fn name() -> &'static str {
+///         "route_decision"
+///     }
+///     fn schema() -> serde_json::Value {
+///         serde_json::json!({
+///             "type": "object",
+///             "properties": {
+///                 "route": {"type": "string"},
+///                 "confidence": {"type": "number"}
+///             },
+///             "required": ["route", "confidence"],
+///             "additionalProperties": false
+///         })
+///     }
+/// }
+///
+/// async fn demo(
+///     client: &dyn ApiClient,
+/// ) -> Result<(), loopctl::structured::StructuredError> {
+///     let decision: RouteDecision = request_structured_prompted(
+///         client,
+///         vec![Message::user("route this")],
+///         None,
+///     )
+///     .await?;
+///     println!("{decision:?}");
+///     Ok(())
+/// }
+/// ```
+///
+/// # Errors
+///
+/// [`StructuredError::Api`] if either request fails;
+/// [`StructuredError::Deserialize`] with the parse/schema error and the
+/// truncated last output if both attempts fail.
+pub async fn request_structured_prompted<T: StructuredOutput + serde::de::DeserializeOwned>(
+    client: &dyn ApiClient,
+    messages: Vec<Message>,
+    system: Option<String>,
+) -> Result<T, StructuredError> {
+    let system = compose_prompted_system::<T>(system);
+    let mut request = crate::api::StreamRequest {
+        messages,
+        system: Some(system),
+        tools: None,
+    };
+
+    let span = extract_attempt_span(0);
+    let (first_parsed, failed_answer) = match prompted_attempt::<T>(client, &request, &span).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            emit_settled("api_error", 1);
+            return Err(error);
+        }
+    };
+    let first_error = match first_parsed {
+        Ok(value) => {
+            emit_settled("first_try", 1);
+            return Ok(value);
+        }
+        Err(error) => error,
+    };
+
+    request
+        .messages
+        .push(Message::assistant(last_output_text(&failed_answer)));
+    request
+        .messages
+        .push(Message::user(corrective_message(&first_error)));
+
+    let span = extract_attempt_span(1);
+    let (second_parsed, second_answer) = match prompted_attempt::<T>(client, &request, &span).await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            emit_settled("api_error", 2);
+            return Err(error);
+        }
+    };
+    match second_parsed {
+        Ok(value) => {
+            emit_settled("after_retry", 2);
+            Ok(value)
+        }
+        Err(second_error) => {
+            emit_settled("failed", 2);
+            let raw_output = last_output_text(&second_answer);
+            Err(StructuredError::Deserialize(serde_json::Error::custom(
+                format!(
+                    "{}; the corrective retry also failed. Last output: {}",
+                    truncate_for_error(&second_error.to_string(), 300),
+                    truncate_for_error(&raw_output, 2_000),
+                ),
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1041,6 +1454,63 @@ mod tests {
         // Prose is a valid JSON string but doesn't match Action's schema,
         // so deserialization fails.
         assert!(matches!(err, StructuredError::Deserialize(_)));
+    }
+
+    #[test]
+    fn usageless_responses_emit_no_token_events() {
+        assert_eq!(
+            emit_usage(None),
+            0,
+            "a response without usage stays silent — no zero noise for consumers"
+        );
+        assert_eq!(
+            emit_usage(Some(crate::stream::Usage::new(0, 0))),
+            2,
+            "a zero usage still reports both directions"
+        );
+    }
+
+    #[test]
+    fn prompted_prefix_carries_the_schema_and_rules() {
+        let prefix = prompted_system_prefix::<Action>();
+        assert!(prefix.contains("You will answer with JSON only."));
+        assert!(
+            prefix.contains(r#""required":["tool","args"]"#),
+            "the schema is embedded minified, not pretty-printed"
+        );
+        assert!(prefix.contains("no prose, no markdown fences"));
+        assert!(prefix.contains("Include every required field with the correct type."));
+        assert!(prefix.contains("escape newlines and quotes"));
+    }
+
+    #[test]
+    fn truncate_for_error_bounds_the_output() {
+        assert_eq!(truncate_for_error("short", 2_000), "short");
+        let oversized = "x".repeat(5_000);
+        let bounded = truncate_for_error(&oversized, 2_000);
+        assert!(
+            bounded.chars().count() < 2_100,
+            "an error-embedded output stays bounded"
+        );
+        assert!(bounded.ends_with("…[truncated]"));
+        let tail_heavy = truncate_for_error(&oversized, 300);
+        assert!(
+            tail_heavy.chars().count() < 400,
+            "a tighter limit bounds harder"
+        );
+    }
+
+    #[test]
+    fn prompted_prefix_composes_after_the_user_system() {
+        let composed = compose_prompted_system::<Action>(Some("Be terse.".to_string()));
+        let user = composed.find("Be terse.").expect("user system preserved");
+        let prefix = composed
+            .find("You will answer with JSON only.")
+            .expect("envelope present");
+        assert!(
+            user < prefix,
+            "the caller's system prompt comes first, the envelope after"
+        );
     }
 
     #[test]

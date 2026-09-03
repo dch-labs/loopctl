@@ -2,12 +2,19 @@ name: difftrace review
 
 on:
   pull_request:
-    types: [opened]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
       pr:
         description: "Pull request number to review"
         required: true
+      model:
+        description: "Model to review with"
+        required: false
+
+concurrency:
+  group: difftrace-review-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   pull-requests: write
@@ -21,17 +28,47 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Resolve the pull request number
+        id: pr
+        env:
+          PR: ${{ inputs.pr || github.event.pull_request.number }}
+        run: |
+          case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      - name: Install difftrace
-        run: cargo install --git https://github.com/dch-labs/difftrace --locked
+      - name: Install difftrace v0.1.0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download v0.1.0 -R dch-labs/difftrace \
+            -p 'difftrace-*-x86_64-unknown-linux-gnu.tar.gz' -O /tmp/difftrace.tar.gz
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
+
+      - name: Mint the difftrace app token
+        uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.DIFFTRACE_APP_ID }}
+          private-key: ${{ secrets.DIFFTRACE_APP_PRIVATE_KEY }}
 
       - name: Review the pull request
         run: |
-          difftrace review \
-            --repo "${{ github.repository }}" \
-            --pr "${{ inputs.pr || github.event.pull_request.number }}"
+          difftrace review --repo "$REPO" --pr "$PR"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.pr.outputs.pr }}
+          REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           DIFFTRACE_PROFILE: zai
+          DIFFTRACE_MODEL: ${{ inputs.model || 'glm-4.7' }}
+          RUST_LOG: info
+
+      - name: Upload trajectory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: difftrace-trajectory-pr${{ steps.pr.outputs.pr }}
+          path: ~/.difftrace/trajectories/
+          if-no-files-found: ignore
+          retention-days: 7

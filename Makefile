@@ -32,8 +32,8 @@ redaction-minimal:
 	@tmp=$$(mktemp -d); \
 	mkdir -p $$tmp/src; \
 	printf '[package]\nname = "redaction-minimal-probe"\nversion = "0.0.0"\nedition = "2024"\nrust-version = "1.98"\npublish = false\n\n[dependencies]\nloopctl = { path = "$(CURDIR)", features = ["redaction"] }\n\n[workspace]\n' > $$tmp/Cargo.toml; \
-	printf 'fn main() {\n    let mut text = String::from("Authorization: Bearer abcdef12345678901234");\n    let count = loopctl::middleware::redaction::SecretPatternSet::default_common().scrub(&mut text);\n    assert!(count > 0, "the curated bearer pattern must compile and redact");\n    assert!(text.contains("[REDACTED:"), "the bearer header must be scrubbed, got: {text}");\n}\n' > $$tmp/src/main.rs; \
-	cargo run --quiet --manifest-path $$tmp/Cargo.toml; \
+	printf 'fn main() {\n    let token = "abcdef12345678901234";\n    let mut text = format!("Authorization: Bearer {token}");\n    let count = loopctl::middleware::redaction::SecretPatternSet::default_common().scrub(&mut text);\n    assert!(count > 0, "the curated bearer pattern must compile and redact");\n    assert!(text.contains("[REDACTED:"), "the bearer header must be scrubbed, got: {text}");\n    for i in 0..=token.len() - 8 {\n        assert!(!text.contains(&token[i..i + 8]), "token material survived: {} in {text}", &token[i..i + 8]);\n    }\n}\n' > $$tmp/src/main.rs; \
+	CARGO_TARGET_DIR=$(CURDIR)/target cargo run --quiet --manifest-path $$tmp/Cargo.toml; \
 	status=$$?; \
 	rm -rf $$tmp; \
 	exit $$status

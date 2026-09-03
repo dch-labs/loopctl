@@ -26,6 +26,9 @@
 //! # Supporting Types
 //!
 //! - [`TokenSplitter`] — splits a conversation at turn boundaries for coherent compaction.
+//! - [`RatioTokenCounter`] — a token counter dividing by per-provider preset
+//!   ratios (or a host-calibrated ratio), the middle tier between the built-in
+//!   heuristic counter and a vendored tokenizer.
 //! - [`CompactTelemetry`] — telemetry data for compaction operations.
 //! - [`CompactionOutcome`] — result of a single compaction pass.
 //! - [`CompactionContext`] — input context passed to compactors.
@@ -83,9 +86,11 @@ pub use types::{
 ///
 /// The default implementation, [`HeuristicTokenCounter`], uses a
 /// characters-per-token ratio and is intentionally conservative (it
-/// overestimates rather than underestimates). For production accuracy,
-/// implement this trait on top of a real tokenizer (e.g. `tiktoken` for
-/// OpenAI) and attach it via
+/// overestimates rather than underestimates). [`RatioTokenCounter`] is
+/// the in-crate middle tier: the same rendered character counts divided
+/// by a per-provider preset ratio, or by a ratio calibrated against the
+/// target model. For production accuracy, implement this trait on top
+/// of a real tokenizer (e.g. `tiktoken` for OpenAI) and attach it via
 /// [`BareLoop::set_token_counter`](crate::engine::BareLoop::set_token_counter)
 /// and
 /// [`ContextManager::with_token_counter`](ContextManager::with_token_counter).
@@ -208,12 +213,13 @@ fn rendered_message_chars(message: &Message) -> u64 {
 ///
 /// The numbers are ballpark calibrations from provider documentation
 /// and community measurements, not tokenizer-exact figures; the tests
-/// pin the constants, and [`new`](Self::new) is the door out.
+/// pin the constants, and [`new`](Self::new) accepts a measured ratio.
 ///
 /// # Calibrating for a local model
 ///
 /// Local tokenizers (qwen, llama, mistral) all differ, and a preset
-/// cannot chase them — a ratio knob can. Three-minute recipe: send one
+/// cannot track that spread — a calibrated ratio can. Three-minute
+/// recipe: send one
 /// known text through the model, read the reported `input_tokens` from
 /// the usage, compute `ratio = rendered_chars / input_tokens`, and
 /// build the counter with `RatioTokenCounter::new(ratio, 4)`.
@@ -1148,7 +1154,8 @@ mod tests {
             "each message contributes its own chars-over-ratio plus overhead"
         );
         // Two non-divisible messages floor ONCE at the end, not per
-        // message: per-message flooring would give 27 here.
+        // message: per-message flooring would give 54 here (27 per
+        // message) instead of the single-floored 55.
         let counter = RatioTokenCounter::new(3.6, 0);
         let messages = vec![
             Message::user("a".repeat(100)),

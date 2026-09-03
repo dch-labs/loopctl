@@ -40,7 +40,7 @@ jobs:
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
             https://github.com/dch-labs/difftrace/releases/download/v0.1.1/difftrace-0.1.1-x86_64-unknown-linux-gnu.tar.gz
-          echo "PENDING_V0_1_1_SHA256  /tmp/difftrace.tar.gz" | sha256sum -c -
+          echo "485e10e8192c2b7e88969ee6cd57c3b29c79a130305d213830be2e9687d0daa3  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 

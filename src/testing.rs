@@ -196,6 +196,16 @@ pub struct MockApiClient {
     /// other configuration — useful for testing error-handling paths.
     error: Option<String>,
 
+    /// Per-call failure script, consumed front-to-back one entry per
+    /// call.
+    ///
+    /// A `Some` entry fails that one call with the carried message; a
+    /// `None` entry (or an exhausted script) serves the configured
+    /// responses as usual. Set via [`MockApiClient::with_errors`]. The
+    /// static [`error`](MockApiClient::with_error) field takes
+    /// precedence when both are set.
+    errors: Arc<Mutex<Vec<Option<String>>>>,
+
     /// Non-streaming requests the mock has served, oldest first.
     ///
     /// Both non-streaming methods record a clone of every incoming
@@ -347,6 +357,8 @@ pub struct MockToolCall {
 /// - [`with_responses`](MockApiClient::with_responses) replaces the entire
 ///   response queue.
 /// - [`with_error`](MockApiClient::with_error) forces an error on every call.
+/// - [`with_errors`](MockApiClient::with_errors) fails exactly the scripted
+///   call positions.
 impl MockApiClient {
     /// Create a new mock client with the given model name.
     ///
@@ -384,6 +396,7 @@ impl MockApiClient {
             model_name: Arc::new(std::sync::Mutex::new(model.to_string())),
             responses: Arc::new(Mutex::new(vec![default_response])),
             error: None,
+            errors: Arc::new(Mutex::new(Vec::new())),
             requests: Arc::new(Mutex::new(Vec::new())),
             create_message_calls: Arc::new(Mutex::new(0)),
             with_options_calls: Arc::new(Mutex::new(0)),
@@ -537,6 +550,60 @@ impl MockApiClient {
         self
     }
 
+    /// Script per-call failures by call position, oldest first.
+    ///
+    /// Each call to [`create_message`](ApiClient::create_message) or
+    /// [`stream_messages`](ApiClient::stream_messages) (and their
+    /// options-carrying twins) consumes the front script entry: a
+    /// `Some` fails that one call with the carried message — the request
+    /// is still counted and captured, exactly like
+    /// [`with_error`](MockApiClient::with_error)'s — and a `None` serves
+    /// the configured responses as usual. Once the script is exhausted
+    /// every further call succeeds, so a test can fail exactly one
+    /// position (for example, only the corrective retry) while earlier
+    /// and later turns are served.
+    ///
+    /// An empty vector is a no-op, mirroring
+    /// [`with_responses`](MockApiClient::with_responses). The static
+    /// [`with_error`](MockApiClient::with_error) failure takes
+    /// precedence when both are configured.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// use loopctl::api::{ApiClient, StreamRequest};
+    /// use loopctl::testing::MockApiClient;
+    ///
+    /// let client = MockApiClient::new("test-model")
+    ///     .with_errors(vec![None, Some("pool timed out".to_string())]);
+    /// assert!(client.create_message(&StreamRequest::new(vec![])).await.is_ok());
+    /// assert!(client.create_message(&StreamRequest::new(vec![])).await.is_err());
+    /// assert!(client.create_message(&StreamRequest::new(vec![])).await.is_ok());
+    /// # });
+    /// ```
+    #[must_use]
+    pub fn with_errors(self, errors: Vec<Option<String>>) -> Self {
+        if !errors.is_empty() {
+            *crate::error::recover_guard(self.errors.lock()) = errors;
+        }
+        self
+    }
+
+    /// Pop the next scripted failure, if the script still has one.
+    ///
+    /// Consumes one entry per call; an exhausted or empty script yields
+    /// `None`, so later calls serve normally. The static `error` field
+    /// is checked by the callers before this.
+    fn next_scripted_error(&self) -> Option<String> {
+        let mut errors = crate::error::recover_guard(self.errors.lock());
+        if errors.is_empty() {
+            None
+        } else {
+            errors.remove(0)
+        }
+    }
+
     /// Every non-streaming request the mock has served, oldest first.
     ///
     /// Both [`create_message`](ApiClient::create_message) and the
@@ -635,6 +702,9 @@ impl MockApiClient {
     fn stream_events(&self, model: String) -> Vec<Result<StreamEvent, ApiError>> {
         if let Some(ref err) = self.error {
             return vec![Err(ApiError::api(err))];
+        }
+        if let Some(err) = self.next_scripted_error() {
+            return vec![Err(ApiError::api(&err))];
         }
 
         let response = self.pop_response();
@@ -743,6 +813,9 @@ impl MockApiClient {
     fn serve_non_streaming(&self) -> Result<crate::api::NonStreamingResponse, ApiError> {
         if let Some(ref err) = self.error {
             return Err(ApiError::api(err));
+        }
+        if let Some(err) = self.next_scripted_error() {
+            return Err(ApiError::api(&err));
         }
         let response = self.pop_response();
         let stop_reason = crate::stream::StreamStopReason::from_api_str(&response.stop_reason)

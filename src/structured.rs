@@ -799,17 +799,27 @@ fn corrective_message(error: &StructuredError) -> String {
     )
 }
 
-/// Render the informative head of a response for an error message.
+/// Render a response's output as plain text.
 ///
 /// Text content plus, when the reply carried tool-call parts, their
 /// inputs: a reply whose only content is a schema-invalid tool-call
-/// input has empty text, and without the inputs the error would report
-/// nothing about the output that failed.
+/// input has empty text, and without the inputs neither the failure
+/// error nor the retry conversation would say anything about the
+/// output that failed. The rendering is never empty — a reply with no
+/// text and no tool parts renders as `(empty reply)` — so the failure
+/// error stays informative and the corrective retry can replay this
+/// rendering as an assistant turn on every provider: a replayed turn
+/// still carrying the tool-call parts would be rejected by providers
+/// that require a tool result after every tool call, and an empty
+/// assistant turn by those that validate content at all.
 fn last_output_text(message: &Message) -> String {
     use std::fmt::Write as _;
     let mut output = message.text_content();
     for (_, name, input) in message.tool_call_parts() {
         let _ignored = write!(output, "\n[tool call {name} input: {input}]");
+    }
+    if output.is_empty() {
+        return "(empty reply)".to_string();
     }
     output
 }
@@ -1044,7 +1054,9 @@ pub async fn request_structured_prompted<T: StructuredOutput + serde::de::Deseri
         Err(error) => error,
     };
 
-    request.messages.push(failed_answer);
+    request
+        .messages
+        .push(Message::assistant(last_output_text(&failed_answer)));
     request
         .messages
         .push(Message::user(corrective_message(&first_error)));

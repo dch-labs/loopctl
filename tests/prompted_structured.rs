@@ -209,6 +209,65 @@ async fn a_tool_call_only_failure_still_reports_its_input() {
 }
 
 #[tokio::test]
+async fn a_tool_call_failure_replays_as_a_text_only_answer() {
+    let tool_call = MockToolCall {
+        id: "call_retry".to_string(),
+        name: "echo".to_string(),
+        input: json!({"wrong": "shape"}),
+    };
+    let client = MockApiClient::new("local-model").with_responses(vec![
+        MockResponse {
+            text: String::new(),
+            tool_call: Some(tool_call),
+            stop_reason: "end_turn".to_string(),
+        },
+        response("{\"route\": \"local\", \"confidence\": 0.9}"),
+    ]);
+    let decision: RouterDecision = loopctl::structured::request_structured_prompted(
+        &client,
+        vec![Message::user("route this")],
+        None,
+    )
+    .await
+    .expect("the corrective retry recovers after a tool-call-shaped failure");
+    assert_eq!(decision.route, "local");
+    let captured = client.captured_requests();
+    let replayed = &captured[1].messages[1];
+    assert!(
+        replayed.tool_call_parts().is_empty(),
+        "the replayed answer is text-only, so the retry turn cannot trip a provider's tool-call validation"
+    );
+    assert!(
+        replayed
+            .text_content()
+            .contains("[tool call echo input: {\"wrong\":\"shape\"}]"),
+        "the replayed text renders the tool-call input the model actually produced"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_first_answer_replays_as_a_non_empty_turn() {
+    let client = MockApiClient::new("local-model").with_responses(vec![
+        response(""),
+        response("{\"route\": \"local\", \"confidence\": 0.9}"),
+    ]);
+    let decision: RouterDecision = loopctl::structured::request_structured_prompted(
+        &client,
+        vec![Message::user("route this")],
+        None,
+    )
+    .await
+    .expect("the corrective retry recovers an empty first answer");
+    assert_eq!(decision.route, "local");
+    let replayed = &client.captured_requests()[1].messages[1];
+    assert_eq!(
+        replayed.text_content(),
+        "(empty reply)",
+        "an empty rendering becomes a non-empty assistant turn a provider will accept"
+    );
+}
+
+#[tokio::test]
 async fn a_second_failure_returns_the_reason_and_bounded_last_output() {
     let oversized = format!("Still no JSON here. {}", "x".repeat(6_000));
     let client = MockApiClient::new("local-model")
@@ -323,6 +382,34 @@ async fn an_api_failure_fails_fast_without_a_retry() {
         client.create_message_calls(),
         1,
         "an API failure never triggers the corrective retry"
+    );
+}
+
+#[tokio::test]
+async fn an_api_failure_on_the_retry_itself_surfaces_as_the_api_error() {
+    let client = MockApiClient::new("local-model")
+        .with_responses(vec![response("no json here")])
+        .with_errors(vec![None, Some("retry request failed".to_string())]);
+    let err = loopctl::structured::request_structured_prompted::<RouterDecision>(
+        &client,
+        vec![Message::user("route this")],
+        None,
+    )
+    .await
+    .expect_err("a retry that itself fails surfaces as the api error");
+    match err {
+        StructuredError::Api(_) => {}
+        other @ StructuredError::Deserialize(_) => panic!("expected Api, got {other:?}"),
+    }
+    assert_eq!(
+        client.create_message_calls(),
+        2,
+        "both attempts reached the provider before the failure"
+    );
+    assert_eq!(
+        client.captured_requests().len(),
+        2,
+        "the recovery request reached the wire before the retry failed"
     );
 }
 
@@ -472,6 +559,16 @@ async fn telemetry_names_and_outcomes_match_the_documented_contract() {
     )
     .await;
 
+    let retry_errored = MockApiClient::new("local-model")
+        .with_responses(vec![response("no json here")])
+        .with_errors(vec![None, Some("boom".to_string())]);
+    let _outcome: Result<RouterDecision, _> = loopctl::structured::request_structured_prompted(
+        &retry_errored,
+        vec![Message::user("route this")],
+        None,
+    )
+    .await;
+
     assert!(
         capture.events_containing("metric=loopctl.structured.prompted outcome=first_try") >= 1,
         "a first-try success settles with the documented outcome"
@@ -485,8 +582,8 @@ async fn telemetry_names_and_outcomes_match_the_documented_contract() {
         "a double failure settles with the failed outcome"
     );
     assert!(
-        capture.events_containing("metric=loopctl.structured.prompted outcome=api_error") >= 1,
-        "an api failure settles with the api_error outcome"
+        capture.events_containing("metric=loopctl.structured.prompted outcome=api_error") >= 2,
+        "an api failure settles with the api_error outcome, whether the first attempt or the retry failed"
     );
     assert!(
         capture.events_containing("metric=loopctl.structured.prompted.attempts_count value=1") >= 1,

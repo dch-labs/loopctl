@@ -57,6 +57,7 @@
 use crate::message::{Message, MessagePart, Role};
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
@@ -140,33 +141,258 @@ impl TokenCounter for HeuristicTokenCounter {
         const MESSAGE_OVERHEAD_CHARS: u64 = 20;
         let total_chars: u64 = messages
             .iter()
-            .map(|m| {
-                let part_chars: u64 = m
-                    .parts
-                    .iter()
-                    .map(|p| match p {
-                        MessagePart::Text { text } => text.chars().count() as u64,
-                        MessagePart::Image { .. } => 256,
-                        MessagePart::ToolCall { name, input, .. } => (name.chars().count() as u64)
-                            .saturating_add(input.to_string().chars().count() as u64),
-                        MessagePart::ToolResult { output, .. } => match output {
-                            crate::message::ToolContent::Text(s) => s.chars().count() as u64,
-                            crate::message::ToolContent::Multipart(parts) => parts
-                                .iter()
-                                .map(|p| match p {
-                                    crate::message::ToolContentPart::Text { text } => {
-                                        text.chars().count() as u64
-                                    }
-                                    crate::message::ToolContentPart::Image { .. } => 256,
-                                })
-                                .sum(),
-                        },
-                    })
-                    .sum();
-                MESSAGE_OVERHEAD_CHARS.saturating_add(part_chars)
-            })
+            .map(|m| rendered_message_chars(m).saturating_add(MESSAGE_OVERHEAD_CHARS))
             .sum();
         total_chars / CHARS_PER_TOKEN
+    }
+}
+
+/// Render one message's content to the character count every token
+/// counter estimates over.
+///
+/// Text parts count their `char`s, image parts a flat 256 (the
+/// vision-token ballpark), tool calls their name plus the JSON-rendered
+/// input, tool results their text or multipart content. Both
+/// [`HeuristicTokenCounter`] and [`RatioTokenCounter`] share this
+/// rendering so the counters cannot drift in *what* they count — only
+/// in how they divide it.
+fn rendered_message_chars(message: &Message) -> u64 {
+    message
+        .parts
+        .iter()
+        .map(|p| match p {
+            MessagePart::Text { text } => text.chars().count() as u64,
+            MessagePart::Image { .. } => 256,
+            MessagePart::ToolCall { name, input, .. } => (name.chars().count() as u64)
+                .saturating_add(input.to_string().chars().count() as u64),
+            MessagePart::ToolResult { output, .. } => match output {
+                crate::message::ToolContent::Text(s) => s.chars().count() as u64,
+                crate::message::ToolContent::Multipart(parts) => parts
+                    .iter()
+                    .map(|p| match p {
+                        crate::message::ToolContentPart::Text { text } => {
+                            text.chars().count() as u64
+                        }
+                        crate::message::ToolContentPart::Image { .. } => 256,
+                    })
+                    .sum(),
+            },
+        })
+        .sum()
+}
+
+/// A characters-per-token ratio estimator with a per-message overhead.
+///
+/// More accurate than the global heuristic once you know which
+/// provider's tokenizer dominates your workload: the rendered character
+/// counts are divided by the ratio as an exact integer rational — the
+/// decimal the validated `ratio` figure renders to — with the
+/// per-message overhead added once per message and a single floor at
+/// the end; every step saturates instead of overflowing.
+///
+/// # Presets
+///
+/// The presets calibrate the ratio on English prose and code mixed
+/// roughly 3:1. Non-English text (CJK especially) runs 10–30% *more*
+/// tokens per character — a lower ratio — and code- or whitespace-heavy
+/// workloads differ too; when your mix is far from the calibration,
+/// measure your own ratio and use [`new`](Self::new).
+///
+/// ```text
+/// Provider      ratio   per-message overhead (tokens)
+/// openai        4.30    4
+/// anthropic     3.60    5
+/// gemini        4.05    4
+/// local (any)   host-tuned (start: 3.80, 4)
+/// ```
+///
+/// The numbers are ballpark calibrations from provider documentation
+/// and community measurements, not tokenizer-exact figures; the tests
+/// pin the constants, and [`new`](Self::new) is the door out.
+///
+/// # Calibrating for a local model
+///
+/// Local tokenizers (qwen, llama, mistral) all differ, and a preset
+/// cannot chase them — a ratio knob can. Three-minute recipe: send one
+/// known text through the model, read the reported `input_tokens` from
+/// the usage, compute `ratio = rendered_chars / input_tokens`, and
+/// build the counter with `RatioTokenCounter::new(ratio, 4)`.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::compact::{RatioTokenCounter, TokenCounter};
+/// use loopctl::message::Message;
+///
+/// let counter = RatioTokenCounter::anthropic();
+/// let tokens = counter.count(&[Message::user("hello world")]);
+/// assert!(tokens > 0);
+/// ```
+#[derive(Debug, Clone)]
+pub struct RatioTokenCounter {
+    /// Chat-template overhead added per message, in tokens.
+    ///
+    /// Covers the role tags and chat formatting a provider wraps around
+    /// every message; it is added once per message *after* the ratio
+    /// division, because the wrapper is already tokenized — the
+    /// heuristic instead adds its overhead in characters before
+    /// dividing.
+    per_message: u64,
+
+    /// The ratio's decimal numerator: `ratio = ratio_num / chars_den`.
+    ///
+    /// Derived from the validated `f32` figure at construction, so the
+    /// counting arithmetic runs on exact integers rather than a stored
+    /// float. Never zero, which makes the final division total.
+    ratio_num: NonZeroU64,
+
+    /// The power-of-ten scale paired with [`ratio_num`](Self::ratio_num).
+    ///
+    /// Derived from the fraction length of the validated ratio's
+    /// decimal rendering (`3.6` renders one fractional digit, so
+    /// `chars_den` is 10), giving `ratio = ratio_num / chars_den`
+    /// exactly; the counting multiplies by this denominator to keep
+    /// the division in integers.
+    chars_den: u64,
+}
+
+impl RatioTokenCounter {
+    /// A counter with a host-calibrated ratio.
+    ///
+    /// `ratio` is the characters-per-token figure for your workload
+    /// (measure it — see the calibration recipe in the type docs);
+    /// `per_message` is the chat-template overhead in tokens per
+    /// message, `4` being a sound starting point. A ratio that is NaN,
+    /// infinite, or not positive is rejected with a warning and the 4.0
+    /// default takes its place — a stored NaN would poison every
+    /// estimate because arithmetic through NaN stays NaN. The same
+    /// fate (also warned) awaits ratios whose decimal rendering needs
+    /// more than 19 fractional digits (below ~1e-19) or a whole part
+    /// beyond `u64::MAX` (above ~1.8e19): outside that representable
+    /// range the counter cannot honor the request exactly, so it
+    /// substitutes the default loudly rather than silently.
+    #[must_use]
+    pub fn new(ratio: f32, per_message: u64) -> Self {
+        Self::validated(ratio, per_message, "custom")
+    }
+
+    /// The OpenAI-calibrated preset: 4.30 chars per token, 4 tokens of
+    /// per-message overhead.
+    #[must_use]
+    pub fn openai() -> Self {
+        Self::validated(4.3, 4, "openai")
+    }
+
+    /// The Anthropic-calibrated preset: 3.60 chars per token, 5 tokens
+    /// of per-message overhead.
+    #[must_use]
+    pub fn anthropic() -> Self {
+        Self::validated(3.6, 5, "anthropic")
+    }
+
+    /// The Gemini-calibrated preset: 4.05 chars per token, 4 tokens of
+    /// per-message overhead.
+    #[must_use]
+    pub fn gemini() -> Self {
+        Self::validated(4.05, 4, "gemini")
+    }
+
+    /// A conservative starting point for local models: 3.80 chars per
+    /// token, 4 tokens of per-message overhead. Under-promises the
+    /// window on purpose; tune per tokenizer with [`new`](Self::new)
+    /// using the calibration recipe in the type docs.
+    #[must_use]
+    pub fn local_default() -> Self {
+        Self::validated(3.8, 4, "local")
+    }
+
+    /// Validate the ratio, derive its exact decimal rational, emit the
+    /// governing-estimate telemetry, and build the counter.
+    ///
+    /// Every constructor funnels through here: validation rejects
+    /// non-finite, non-positive, and unrepresentable ratios with a
+    /// warning and the 4.0 default; the telemetry event names the
+    /// governing estimate so a misconfiguration cannot stay silent.
+    /// The `preset` label distinguishes the named presets from a
+    /// host-tuned `new` ("custom").
+    fn validated(ratio: f32, per_message: u64, preset: &'static str) -> Self {
+        let ratio = if ratio.is_finite() && ratio > 0.0 {
+            ratio
+        } else {
+            tracing::warn!(
+                target: "loopctl::compact",
+                ratio,
+                preset,
+                "token-counter ratio not finite or not positive; using the 4.0 default"
+            );
+            4.0
+        };
+        let (num, den) = if let Some(parts) = decimal_ratio(&format!("{ratio}")) {
+            parts
+        } else {
+            tracing::warn!(
+                target: "loopctl::compact",
+                ratio,
+                preset,
+                "token-counter ratio outside the representable decimal range; using the 4.0 default"
+            );
+            (4, 1)
+        };
+        let ratio_num = NonZeroU64::new(num).unwrap_or(NonZeroU64::MIN);
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.window.token_counter",
+            preset,
+            ratio = %ratio,
+            per_message,
+            "token counter chosen"
+        );
+        Self {
+            per_message,
+            ratio_num,
+            chars_den: den,
+        }
+    }
+}
+
+/// Split a decimal-rendered ratio into its exact integer rational.
+///
+/// `"3.6"` becomes `(36, 10)` — the ratio as `numerator / denominator`,
+/// both scaled by the fraction's decimal places. Returns `None` when
+/// either part would not fit a `u64` (a ratio with an absurd number of
+/// fractional digits), leaving the caller to fall back to the default.
+fn decimal_ratio(text: &str) -> Option<(u64, u64)> {
+    let (whole, fraction) = match text.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (text, ""),
+    };
+    let whole: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    if fraction.is_empty() {
+        return Some((whole, 1));
+    }
+    let den = 10_u64.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+    let num = whole
+        .checked_mul(den)?
+        .checked_add(fraction.parse().ok()?)?;
+    Some((num, den))
+}
+
+impl TokenCounter for RatioTokenCounter {
+    fn count(&self, messages: &[Message]) -> u64 {
+        let mut scaled_chars: u64 = 0;
+        for message in messages {
+            scaled_chars = scaled_chars
+                .saturating_add(rendered_message_chars(message).saturating_mul(self.chars_den));
+        }
+        let overhead = self
+            .per_message
+            .saturating_mul(self.ratio_num.get())
+            .saturating_mul(messages.len() as u64);
+        scaled_chars.saturating_add(overhead) / self.ratio_num
     }
 }
 
@@ -866,6 +1092,261 @@ impl fmt::Debug for ContextManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preset_constants_are_the_documented_values() {
+        let openai = RatioTokenCounter::openai();
+        assert_eq!(
+            openai.ratio_num.get(),
+            43,
+            "the OpenAI ratio is a pinned constant"
+        );
+        assert_eq!(openai.chars_den, 10);
+        assert_eq!(openai.per_message, 4);
+        let anthropic = RatioTokenCounter::anthropic();
+        assert_eq!(
+            anthropic.ratio_num.get(),
+            36,
+            "the Anthropic ratio is a pinned constant"
+        );
+        assert_eq!(anthropic.chars_den, 10);
+        assert_eq!(anthropic.per_message, 5);
+        let gemini = RatioTokenCounter::gemini();
+        assert_eq!(
+            gemini.ratio_num.get(),
+            405,
+            "the Gemini ratio is a pinned constant"
+        );
+        assert_eq!(gemini.chars_den, 100);
+        assert_eq!(gemini.per_message, 4);
+        let local = RatioTokenCounter::local_default();
+        assert_eq!(
+            local.ratio_num.get(),
+            38,
+            "the local starting point is a pinned constant"
+        );
+        assert_eq!(local.chars_den, 10);
+        assert_eq!(local.per_message, 4);
+    }
+
+    #[test]
+    fn count_is_chars_over_ratio_plus_overhead() {
+        let counter = RatioTokenCounter::new(4.0, 4);
+        let messages = vec![Message::user("a".repeat(40))];
+        assert_eq!(
+            counter.count(&messages),
+            14,
+            "40 chars over 4.0 plus 4 overhead tokens is 14"
+        );
+        let messages = vec![
+            Message::user("a".repeat(40)),
+            Message::assistant("a".repeat(40)),
+        ];
+        assert_eq!(
+            counter.count(&messages),
+            28,
+            "each message contributes its own chars-over-ratio plus overhead"
+        );
+        // Two non-divisible messages floor ONCE at the end, not per
+        // message: per-message flooring would give 27 here.
+        let counter = RatioTokenCounter::new(3.6, 0);
+        let messages = vec![
+            Message::user("a".repeat(100)),
+            Message::assistant("a".repeat(100)),
+        ];
+        assert_eq!(
+            counter.count(&messages),
+            55,
+            "the division floors once over the sum, not per message"
+        );
+    }
+
+    #[test]
+    fn non_finite_ratio_falls_back_with_a_warning() {
+        // A stored NaN would poison every estimate: arithmetic through
+        // NaN stays NaN. Zero and infinity are rejected with it so the
+        // policy is uniform; all fall back to the 4.0 default.
+        for ratio in [f32::NAN, 0.0, f32::INFINITY, -2.0] {
+            let counter = RatioTokenCounter::new(ratio, 4);
+            assert_eq!(
+                counter.ratio_num.get(),
+                4,
+                "ratio {ratio} falls back to the default"
+            );
+            assert_eq!(counter.chars_den, 1);
+        }
+        let counter = RatioTokenCounter::new(3.5, 4);
+        assert_eq!(
+            counter.ratio_num.get(),
+            35,
+            "a representable finite positive ratio is kept"
+        );
+        assert_eq!(counter.chars_den, 10);
+    }
+
+    #[test]
+    fn out_of_range_ratios_fall_back_with_a_warning() {
+        // Below ~1e-19 the decimal rendering needs more fractional
+        // digits than a u64 denominator can hold; above ~1.8e19 the
+        // whole part does. Both are finite and positive — and both
+        // fall back loudly to the 4.0 default.
+        for ratio in [1e-20_f32, 1e20] {
+            let counter = RatioTokenCounter::new(ratio, 4);
+            assert_eq!(
+                counter.ratio_num.get(),
+                4,
+                "ratio {ratio} falls back to the default"
+            );
+            assert_eq!(counter.chars_den, 1);
+        }
+    }
+
+    #[test]
+    fn renders_the_same_surface_as_the_heuristic() {
+        let messages = vec![
+            Message::new(
+                crate::message::Role::User,
+                vec![
+                    MessagePart::text("hello world"),
+                    MessagePart::Image {
+                        source: crate::message::ImageSource::new_base64("image/png", "aVZCT1I..."),
+                    },
+                ],
+            ),
+            Message::new(
+                crate::message::Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "call_1",
+                    "search",
+                    serde_json::json!({"q": "rust"}),
+                )],
+            ),
+            Message::new(
+                crate::message::Role::User,
+                vec![MessagePart::tool_result(
+                    "call_1",
+                    "search",
+                    "results found",
+                    false,
+                )],
+            ),
+        ];
+        // The heuristic divides by 4 with 20 chars of per-message
+        // overhead inside the division; the ratio counter reproduces
+        // exactly that with ratio 4.0 and 5 overhead tokens, so equal
+        // counts prove both counters rendered the identical surface.
+        let ratio = RatioTokenCounter::new(4.0, 5);
+        assert_eq!(
+            ratio.count(&messages),
+            HeuristicTokenCounter.count(&messages),
+            "the two counters see identical rendered chars"
+        );
+    }
+
+    #[test]
+    fn saturates_on_absurd_input() {
+        let huge = Message::user("x".repeat(10_000_000));
+        let counter = RatioTokenCounter::new(3.8, 4);
+        let count = counter.count(std::slice::from_ref(&huge));
+        let expected = (10_000_000_u64.saturating_mul(10) + 4 * 38) / 38;
+        assert_eq!(
+            count, expected,
+            "the integer-rational path is exact at absurd sizes"
+        );
+        assert!(count < u64::MAX, "this size is exact, not saturated");
+
+        // A tiny ratio scales a moderate text past `u64::MAX` in the
+        // numerator: saturation fires and the count clamps to `u64::MAX`
+        // instead of wrapping.
+        let tiny = RatioTokenCounter::new(1e-15, 0);
+        let moderate = Message::user("x".repeat(20_000));
+        assert_eq!(
+            tiny.count(std::slice::from_ref(&moderate)),
+            u64::MAX,
+            "a numerator beyond u64::MAX saturates to the maximum"
+        );
+    }
+
+    #[test]
+    fn construction_telemetry_names_the_governing_estimate() {
+        struct EventCapture {
+            events: std::sync::Mutex<Vec<String>>,
+        }
+        impl tracing::Subscriber for EventCapture {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                // Bound the capture to the crate's own events; nothing
+                // outside the `loopctl::` namespace can carry a pinned
+                // signal here.
+                meta.target().starts_with("loopctl::")
+            }
+            fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::Id {
+                tracing::Id::from_u64(1)
+            }
+            fn record(&self, _id: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _from: &tracing::Id, _to: &tracing::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct FieldVisitor {
+                    fields: Vec<String>,
+                }
+                impl tracing::field::Visit for FieldVisitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.fields.push(format!("{}={:?}", field.name(), value));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.fields.push(format!("{}={}", field.name(), value));
+                    }
+                }
+                let mut visitor = FieldVisitor { fields: Vec::new() };
+                event.record(&mut visitor);
+                self.events.lock().unwrap().push(visitor.fields.join(" "));
+            }
+            fn enter(&self, _id: &tracing::Id) {}
+            fn exit(&self, _id: &tracing::Id) {}
+        }
+
+        let capture = std::sync::Arc::new(EventCapture {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        // A global subscriber, not a thread-local `with_default`: parallel
+        // first-uses of the construction callsite without any dispatcher
+        // poison the callsite-interest cache, and a global registration
+        // rebuilds it so every construction event is observable. This is
+        // the binary's single global-subscriber claimant — a second test
+        // wanting one must serialize with this test or share its capture.
+        assert!(
+            tracing::subscriber::set_global_default(std::sync::Arc::clone(&capture)).is_ok(),
+            "this test owns the process-global subscriber"
+        );
+        let _anthropic = RatioTokenCounter::anthropic();
+        let _custom = RatioTokenCounter::new(5.0, 2);
+        let _rejected = RatioTokenCounter::new(f32::NAN, 4);
+        let events = capture.events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("metric=loopctl.window.token_counter")
+                    && e.contains("preset=anthropic")
+                    && e.contains("ratio=3.6")
+                    && e.contains("per_message=5")),
+            "the anthropic construction names the governing estimate: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("token-counter ratio not finite or not positive")),
+            "the rejected-ratio warning is part of the observable contract: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("preset=custom") && e.contains("ratio=5")),
+            "a host-tuned counter is labelled custom: {events:?}"
+        );
+    }
 
     fn make_conversation(n_turns: usize) -> Vec<Message> {
         let mut messages = Vec::new();

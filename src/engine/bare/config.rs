@@ -141,11 +141,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use loopctl::compact::HeuristicTokenCounter;
+    /// use loopctl::compact::RatioTokenCounter;
     /// use std::sync::Arc;
     ///
     /// let mut agent = BareLoop::new(client, registry, config);
-    /// agent.set_token_counter(Arc::new(HeuristicTokenCounter::anthropic()));
+    /// agent.set_token_counter(Arc::new(RatioTokenCounter::anthropic()));
     /// ```
     pub fn set_token_counter(&mut self, counter: Arc<dyn crate::compact::TokenCounter>) {
         self.debug_assert_idle();

@@ -195,6 +195,7 @@ async fn demo(
 | `tool_health` | No | — | Per-tool health monitoring, circuit breakers, and self-healing routing |
 | `tool_shield` | No | `tool_health` | `ToolSafetyShield` risk evaluation (`UnixShield` reference patterns) + opt-in `SafetyShieldMiddleware` enforcement of Block decisions |
 | `builtin_tools` | No | — | Built-in tools under `tool::builtin` (`ThinkTool`, a no-side-effect scratchpad the model reasons into before acting); explicit registration only |
+| `vector_index` | No | — | Vector primitives under `memory::vector`: `EmbeddingProvider` + `VectorIndex` traits, `HashingEmbedder` (deterministic test embedder) and `LinearVectorIndex` (brute-force cosine search) reference impls |
 | `streaming` | No | `async-stream` | Streaming engine path: `StreamHandler` (retry, timeout, fallback), per-delta observer callbacks (`on_text_delta`, `on_thinking_delta`), `text_streamer`. Without it the engine drives each turn via `ApiClient::create_message`. |
 | `providers` | No | `reqwest`, `httpdate`, `bytes` | Base HTTP provider support; enables the `provider` module |
 | `openai` | No | `providers`, `streaming` | OpenAI-compatible API client (`provider::openai`) |

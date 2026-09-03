@@ -66,10 +66,17 @@ pub use trajectory::{
     TokenSummary, TrajectoryObserver, TrajectoryOutcome, TrajectoryRecord, TrajectoryToolCall,
     TrajectoryTurn,
 };
+#[cfg(feature = "vector_index")]
+pub use vector::{
+    Embedding, EmbeddingProvider, HashingEmbedder, LinearVectorIndex, VectorIndex, VectorMatch,
+    cosine_similarity,
+};
 
 pub mod builtin;
 pub mod entry;
 pub mod trajectory;
+#[cfg(feature = "vector_index")]
+pub mod vector;
 
 /// A memory system for agent loops.
 ///

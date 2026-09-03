@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 - **Moonshot's default model is now `kimi-k3`** (was `kimi-k2-0905-preview`) — the pinned default used by `provider::moonshot()` and `moonshot_builder()` when `MOONSHOT_MODEL` is unset. Migration: set `MOONSHOT_MODEL=kimi-k2-0905-preview` to keep the old default. Pinned by `moonshot_builds_client_and_defaults_model` and `moonshot_builder_seeds_the_documented_facts`.
 
+### Fixed
+
+- **The `redaction` feature's curated patterns now compile under the feature's own minimal dependency graph** — the optional `regex` dependency was declared `default-features = false, features = ["std"]` (no Unicode tables) while the curated literals use `(?i)` and `\s`, so any downstream crate enabling only `redaction` built a `regex` on which `SecretPatternSet::default_common()` panicked in debug builds (the `curated` helper's `debug_assert`) and silently dropped the patterns — bearer-header redaction included — in release builds. loopctl's own CI could not see it: feature unification supplied the Unicode tables in every in-repo invocation (`--all-features` runs through `jsonschema`, and even a `--features redaction` test run through `proptest`'s dev-edge `regex-syntax` features). The feature now scopes its own requirement — `redaction = ["dep:regex", "regex/unicode-case", "regex/unicode-perl"]` — with `default = []` and every public API unchanged. Guarded by the new `redaction-minimal` make target, run both by `make ci` and as a dedicated remote CI job: it builds a scratch downstream crate against the path dependency with only `redaction` enabled and asserts the bearer header is actually scrubbed — the one graph shape in-repo test runs cannot produce.
+
 ## [0.3.0] - 2026-08-30
 
 ### Added

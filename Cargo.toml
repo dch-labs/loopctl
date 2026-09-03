@@ -75,7 +75,7 @@ gemini = ["providers", "streaming"]
 zai = ["providers", "anthropic"]
 grammar = ["providers"]
 schema_validation = ["dep:jsonschema"]
-redaction = ["dep:regex"]
+redaction = ["dep:regex", "regex/unicode-case", "regex/unicode-perl"]
 
 # MCP client adapter + transports (stdio, Streamable HTTP/SSE). Enables
 # `streaming` for `StreamRetryConfig` (reconnect backoff), `reqwest` for the

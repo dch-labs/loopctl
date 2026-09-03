@@ -195,6 +195,29 @@ pub struct MockApiClient {
     /// Set via [`MockApiClient::with_error`]. Takes precedence over all
     /// other configuration — useful for testing error-handling paths.
     error: Option<String>,
+
+    /// Non-streaming requests the mock has served, oldest first.
+    ///
+    /// Both non-streaming methods record a clone of every incoming
+    /// request at the point it is served to the mock provider, so tests
+    /// can assert on the exact wire shape a caller produced —
+    /// system-prompt composition, conversation shape, and the absence of
+    /// a tools payload. A request rejected before sending (unsupported
+    /// options) is counted by `with_options_calls` but not captured,
+    /// since it never reached the wire.
+    requests: Arc<Mutex<Vec<crate::api::StreamRequest>>>,
+
+    /// Count of plain [`create_message`](ApiClient::create_message) calls.
+    ///
+    /// The options-carrying variants are counted separately and never
+    /// increment this, so the two counters are disjoint.
+    create_message_calls: Arc<Mutex<usize>>,
+
+    /// Count of `create_message_with_options` calls.
+    ///
+    /// Rejecting calls (unsupported options) count too — the method was
+    /// called either way.
+    with_options_calls: Arc<Mutex<usize>>,
 }
 
 /// A single canned response produced by [`MockApiClient`].
@@ -361,6 +384,9 @@ impl MockApiClient {
             model_name: Arc::new(std::sync::Mutex::new(model.to_string())),
             responses: Arc::new(Mutex::new(vec![default_response])),
             error: None,
+            requests: Arc::new(Mutex::new(Vec::new())),
+            create_message_calls: Arc::new(Mutex::new(0)),
+            with_options_calls: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -511,6 +537,94 @@ impl MockApiClient {
         self
     }
 
+    /// Every non-streaming request the mock has served, oldest first.
+    ///
+    /// Both [`create_message`](ApiClient::create_message) and the
+    /// options-carrying variant record a clone of the incoming request
+    /// when it is served to the mock provider, so assertions can inspect
+    /// the exact wire shape a caller produced — system-prompt
+    /// composition, conversation shape, and the absence of a tools
+    /// payload. A request rejected before sending (unsupported
+    /// [`RequestOptions`](crate::structured::RequestOptions)) is counted
+    /// by [`with_options_calls`](MockApiClient::with_options_calls) but
+    /// never captured, since it never reached the wire. The vector is
+    /// cloned out under the lock; later calls do not mutate the returned
+    /// snapshots.
+    ///
+    /// Counting and capture happen at call time, before the returned
+    /// future is polled.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::api::{ApiClient, StreamRequest};
+    /// use loopctl::testing::MockApiClient;
+    ///
+    /// let client = MockApiClient::new("test-model");
+    /// let _future = client.create_message(&StreamRequest::new(vec![]));
+    /// assert_eq!(client.captured_requests().len(), 1);
+    /// ```
+    #[must_use]
+    pub fn captured_requests(&self) -> Vec<crate::api::StreamRequest> {
+        crate::error::recover_guard(self.requests.lock()).clone()
+    }
+
+    /// How many times the plain [`create_message`](ApiClient::create_message)
+    /// method was called.
+    ///
+    /// The options-carrying variants are counted separately by
+    /// [`with_options_calls`](MockApiClient::with_options_calls) and never
+    /// increment this counter, so a test can prove a caller used the
+    /// plain wire path — for example, a local-model flow that must never
+    /// send request options a server could reject.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::api::{ApiClient, StreamRequest};
+    /// use loopctl::testing::MockApiClient;
+    ///
+    /// let client = MockApiClient::new("test-model");
+    /// let _future = client.create_message(&StreamRequest::new(vec![]));
+    /// assert_eq!(client.create_message_calls(), 1);
+    /// ```
+    #[must_use]
+    pub fn create_message_calls(&self) -> usize {
+        *crate::error::recover_guard(self.create_message_calls.lock())
+    }
+
+    /// How many times an options-carrying non-streaming variant was
+    /// called.
+    ///
+    /// Counts `create_message_with_options` including its rejecting
+    /// calls. Paired with
+    /// [`create_message_calls`](MockApiClient::create_message_calls) to
+    /// pin which wire path a caller took; the two counters are disjoint.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use loopctl::api::{ApiClient, StreamRequest};
+    /// use loopctl::structured::RequestOptions;
+    /// use loopctl::testing::MockApiClient;
+    ///
+    /// let client = MockApiClient::new("test-model");
+    /// let _future = client.create_message_with_options(
+    ///     &StreamRequest::new(vec![]),
+    ///     RequestOptions::default(),
+    /// );
+    /// assert_eq!(client.with_options_calls(), 1);
+    /// assert_eq!(
+    ///     client.create_message_calls(),
+    ///     0,
+    ///     "the counters are disjoint"
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_options_calls(&self) -> usize {
+        *crate::error::recover_guard(self.with_options_calls.lock())
+    }
+
     /// Build one scripted response's stream events under the given model.
     ///
     /// The shared body of [`stream_messages`](ApiClient::stream_messages)
@@ -609,6 +723,39 @@ impl MockApiClient {
         } else {
             guard.first().cloned().unwrap_or_default()
         }
+    }
+
+    /// Render the next canned response as a non-streaming reply.
+    ///
+    /// The shared body of [`create_message`](ApiClient::create_message)
+    /// and
+    /// [`create_message_with_options`](ApiClient::create_message_with_options):
+    /// honors the configured error first, then pops the response queue
+    /// and builds the reply with both parts — text and, when set, the
+    /// tool call — mirroring the streaming twin's text-then-tool lane
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError`] when [`with_error`](MockApiClient::with_error) was
+    /// called — the configured failure stands in for the provider's
+    /// own.
+    fn serve_non_streaming(&self) -> Result<crate::api::NonStreamingResponse, ApiError> {
+        if let Some(ref err) = self.error {
+            return Err(ApiError::api(err));
+        }
+        let response = self.pop_response();
+        let stop_reason = crate::stream::StreamStopReason::from_api_str(&response.stop_reason)
+            .unwrap_or(crate::stream::StreamStopReason::EndTurn);
+        let mut parts = vec![MessagePart::text(response.text)];
+        if let Some(tc) = response.tool_call {
+            parts.push(MessagePart::tool_call(tc.id, tc.name, tc.input));
+        }
+        Ok(crate::api::NonStreamingResponse {
+            message: Message::new(Role::Assistant, parts),
+            stop_reason,
+            usage: Some(crate::stream::Usage::new(50, 25)),
+        })
     }
 }
 
@@ -819,29 +966,16 @@ impl ApiClient for MockApiClient {
     /// ```
     fn create_message(
         &self,
-        _request: &crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
     {
-        if let Some(ref err) = self.error {
-            let err = err.clone();
-            return Box::pin(async move { Err(ApiError::api(&err)) });
+        {
+            let mut calls = crate::error::recover_guard(self.create_message_calls.lock());
+            *calls = calls.saturating_add(1);
         }
-
-        let response = self.pop_response();
-        Box::pin(async move {
-            let stop_reason = crate::stream::StreamStopReason::from_api_str(&response.stop_reason)
-                .unwrap_or(crate::stream::StreamStopReason::EndTurn);
-            // Both parts, mirroring the streaming twin's text-then-tool lane order.
-            let mut parts = vec![MessagePart::text(response.text)];
-            if let Some(tc) = response.tool_call {
-                parts.push(MessagePart::tool_call(tc.id, tc.name, tc.input));
-            }
-            Ok(crate::api::NonStreamingResponse {
-                message: Message::new(Role::Assistant, parts),
-                stop_reason,
-                usage: Some(crate::stream::Usage::new(50, 25)),
-            })
-        })
+        crate::error::recover_guard(self.requests.lock()).push(request.clone());
+        let served = self.serve_non_streaming();
+        Box::pin(async move { served })
     }
 
     /// Non-streaming variant that accepts the per-request model override.
@@ -860,10 +994,16 @@ impl ApiClient for MockApiClient {
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
     {
+        {
+            let mut calls = crate::error::recover_guard(self.with_options_calls.lock());
+            *calls = calls.saturating_add(1);
+        }
         if let Some(err) = unsupported_mock_option(&options) {
             return Box::pin(async move { Err(err) });
         }
-        self.create_message(request)
+        crate::error::recover_guard(self.requests.lock()).push(request.clone());
+        let served = self.serve_non_streaming();
+        Box::pin(async move { served })
     }
 }
 
@@ -1584,6 +1724,52 @@ mod tests {
         assert!(
             err.to_string().contains("tool_constraint"),
             "the error names the option: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_two_wire_counters_stay_disjoint() {
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        client
+            .create_message(&crate::api::StreamRequest::new(vec![]))
+            .await
+            .expect("the plain path is served");
+        client
+            .create_message_with_options(
+                &crate::api::StreamRequest::new(vec![]),
+                crate::structured::RequestOptions::default(),
+            )
+            .await
+            .expect("an options call with default options is served");
+        assert_eq!(
+            client.create_message_calls(),
+            1,
+            "the options call never increments the plain counter"
+        );
+        assert_eq!(client.with_options_calls(), 1);
+        assert_eq!(
+            client.captured_requests().len(),
+            2,
+            "both wire paths are captured when served"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_options_call_is_counted_but_never_captured() {
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        let opts = crate::structured::RequestOptions {
+            tool_constraint: crate::structured::ToolConstraint::Strict,
+            ..Default::default()
+        };
+        let result = client
+            .create_message_with_options(&crate::api::StreamRequest::new(vec![]), opts)
+            .await;
+        assert!(result.is_err(), "the rejection still fails loudly");
+        assert_eq!(client.with_options_calls(), 1);
+        assert_eq!(
+            client.captured_requests().len(),
+            0,
+            "a request rejected before sending never reached the wire, so it is not captured"
         );
     }
 

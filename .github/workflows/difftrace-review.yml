@@ -41,11 +41,11 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      - name: Install difftrace v0.2.1
+      - name: Install difftrace v0.3.0
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.2.1/difftrace-0.2.1-x86_64-unknown-linux-gnu.tar.gz
-          echo "a9426505ca3e3d73d1250bcf65aa7d66da74e96b8318366affe849285f3e3a8c  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.3.0/difftrace-0.3.0-x86_64-unknown-linux-gnu.tar.gz
+          echo "d1559a9a332718c37722dd06e075ea70b64d0b8095530d7e5741b6c53a13cc0d  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -150,11 +150,11 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      - name: Install difftrace v0.2.1
+      - name: Install difftrace v0.3.0
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.2.1/difftrace-0.2.1-x86_64-unknown-linux-gnu.tar.gz
-          echo "a9426505ca3e3d73d1250bcf65aa7d66da74e96b8318366affe849285f3e3a8c  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.3.0/difftrace-0.3.0-x86_64-unknown-linux-gnu.tar.gz
+          echo "d1559a9a332718c37722dd06e075ea70b64d0b8095530d7e5741b6c53a13cc0d  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 

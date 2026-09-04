@@ -215,7 +215,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           DIFFTRACE_PROFILE: zai
-          DIFFTRACE_MODEL: ${{ inputs.model || vars.DIFFTRACE_MODEL || 'glm-4.7' }}
+          DIFFTRACE_MODEL: ${{ vars.DIFFTRACE_MODEL || 'glm-4.7' }}
           RUST_LOG: info
 
       - name: Upload trajectory

@@ -38,7 +38,7 @@ fn main() {
     assert!(count > 0, "the curated bearer pattern must compile and redact");
     assert!(text.contains("[REDACTED:"), "the bearer header must be scrubbed, got: {text}");
     for i in 0..=token.len() - 8 {
-        assert!(!text.contains(&token[i..i + 8]), "token material survived: {} in {text}", &token[i..i + 8]);
+        assert!(!text.contains(&token[i..i + 8]), "token material survived at offset {i}: {} in {text}", &token[i..i + 8]);
     }
     let aws_key = "AKIAIOSFODNN7EXAMPLE";
     let mut aws_text = format!("aws_access_key_id = {aws_key}");

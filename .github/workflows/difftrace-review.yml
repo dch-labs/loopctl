@@ -1,3 +1,6 @@
+# Reference consumer workflow, maintained in the difftrace repo
+# (examples/difftrace-review.yml). Copy verbatim; on every difftrace
+# release bump the two version+checksum pins below.
 name: difftrace review
 
 on:
@@ -25,7 +28,7 @@ jobs:
     name: Review the pull request
     runs-on: ubuntu-latest
     concurrency:
-      group: difftrace-run-${{ inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      group: difftrace-review-${{ inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id }}
       cancel-in-progress: true
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -41,6 +44,8 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
+      # The binary is pinned to the tagged v0.3.1 release; bump version and
+      # checksum together on every difftrace release.
       - name: Install difftrace v0.3.1
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
@@ -86,6 +91,7 @@ jobs:
         with:
           name: difftrace-trajectory-pr${{ steps.pr.outputs.pr }}
           path: ~/.difftrace/trajectories/
+          include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
 
@@ -100,6 +106,8 @@ jobs:
       skip: ${{ steps.cmd.outputs.skip }}
       verb: ${{ steps.cmd.outputs.verb }}
     steps:
+      # A comment triggers difftrace only when its first line addresses
+      # the bot — quoted mentions deeper in the body never fire.
       - name: Resolve the command
         id: cmd
         env:
@@ -107,11 +115,11 @@ jobs:
           AUTHOR: ${{ github.event.comment.user.login }}
         run: |
           case "$AUTHOR" in *"[bot]") echo "skip=bot" >> "$GITHUB_OUTPUT"; exit 0;; esac
-          if ! printf '%s' "$BODY" | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)([[:space:]]|$)'; then
+          if ! printf '%s' "$BODY" | head -n 1 | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]'; then
             echo "skip=mention" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "skip=" >> "$GITHUB_OUTPUT"
-          if printf '%s' "$BODY" | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]+re-review([[:space:]]|$)'; then
+          if printf '%s' "$BODY" | head -n 1 | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]+re-review([[:space:]]|$)'; then
             echo "verb=review" >> "$GITHUB_OUTPUT"
           else
             echo "verb=reply" >> "$GITHUB_OUTPUT"
@@ -128,7 +136,7 @@ jobs:
           case "$AUTHOR" in *[!A-Za-z0-9-]*) echo "invalid comment author login: $AUTHOR" >&2; exit 1;; esac
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           perm=$(gh api "repos/$REPO/collaborators/$AUTHOR/permission" --jq .permission)
-          case "$perm" in admin|maintain|write) ;; *) echo "$AUTHOR ($perm) may not trigger difftrace" >&2; exit 1;; esac
+          case "$perm" in admin|write) ;; *) echo "$AUTHOR ($perm) may not trigger difftrace" >&2; exit 1;; esac
           fork=$(gh api "repos/$REPO/pulls/$PR" --jq .head.repo.fork)
           if [ "$fork" = "true" ]; then echo "difftrace does not run on fork pull requests" >&2; exit 1; fi
 
@@ -137,8 +145,8 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     concurrency:
-      group: difftrace-run-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
-      cancel-in-progress: true
+      group: difftrace-chat-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      cancel-in-progress: false
     if: needs.gate.outputs.skip == ''
     steps:
 
@@ -150,6 +158,8 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
+      # The binary is pinned to the tagged v0.3.1 release; bump version and
+      # checksum together on every difftrace release.
       - name: Install difftrace v0.3.1
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
@@ -204,5 +214,6 @@ jobs:
         with:
           name: difftrace-trajectory-pr${{ steps.pr.outputs.pr }}-chat
           path: ~/.difftrace/trajectories/
+          include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7

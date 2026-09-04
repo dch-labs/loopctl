@@ -41,11 +41,11 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      - name: Install difftrace v0.3.0
+      - name: Install difftrace v0.3.1
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.3.0/difftrace-0.3.0-x86_64-unknown-linux-gnu.tar.gz
-          echo "d1559a9a332718c37722dd06e075ea70b64d0b8095530d7e5741b6c53a13cc0d  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.3.1/difftrace-0.3.1-x86_64-unknown-linux-gnu.tar.gz
+          echo "5b7989691b68678d163f9cfe504e127f3c7989bc834478c080a22459603f2dc7  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -77,7 +77,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           DIFFTRACE_PROFILE: zai
-          DIFFTRACE_MODEL: ${{ inputs.model || 'glm-4.7' }}
+          DIFFTRACE_MODEL: ${{ inputs.model || vars.DIFFTRACE_MODEL || 'glm-4.7' }}
           RUST_LOG: info
 
       - name: Upload trajectory
@@ -150,11 +150,11 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      - name: Install difftrace v0.3.0
+      - name: Install difftrace v0.3.1
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.3.0/difftrace-0.3.0-x86_64-unknown-linux-gnu.tar.gz
-          echo "d1559a9a332718c37722dd06e075ea70b64d0b8095530d7e5741b6c53a13cc0d  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.3.1/difftrace-0.3.1-x86_64-unknown-linux-gnu.tar.gz
+          echo "5b7989691b68678d163f9cfe504e127f3c7989bc834478c080a22459603f2dc7  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -195,7 +195,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           DIFFTRACE_PROFILE: zai
-          DIFFTRACE_MODEL: ${{ inputs.model || 'glm-4.7' }}
+          DIFFTRACE_MODEL: ${{ inputs.model || vars.DIFFTRACE_MODEL || 'glm-4.7' }}
           RUST_LOG: info
 
       - name: Upload trajectory

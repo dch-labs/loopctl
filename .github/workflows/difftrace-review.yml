@@ -3,6 +3,10 @@ name: difftrace review
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       pr:
@@ -13,7 +17,7 @@ on:
         required: false
 
 concurrency:
-  group: difftrace-review-${{ inputs.pr || github.event.pull_request.number || github.run_id }}
+  group: difftrace-review-${{ inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -26,7 +30,9 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.user.login != 'dependabot[bot]'
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.fork != true)
     steps:
       - name: Resolve the pull request number
         id: pr
@@ -36,11 +42,11 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      - name: Install difftrace v0.1.2
+      - name: Install difftrace v0.2.1
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.1.2/difftrace-0.1.2-x86_64-unknown-linux-gnu.tar.gz
-          echo "2ab1f6890650fe4e40c2ce6435dc18d4deb29278b2ccc20070b8deaa1f5e258f  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.2.1/difftrace-0.2.1-x86_64-unknown-linux-gnu.tar.gz
+          echo "a9426505ca3e3d73d1250bcf65aa7d66da74e96b8318366affe849285f3e3a8c  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -78,6 +84,110 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: difftrace-trajectory-pr${{ steps.pr.outputs.pr }}
+          path: ~/.difftrace/trajectories/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  chat:
+    name: Handle a difftrace command
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request_review_comment' ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null)
+    steps:
+      - name: Resolve the command
+        id: cmd
+        env:
+          BODY: ${{ github.event.comment.body }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+        run: |
+          case "$AUTHOR" in *"[bot]") echo "skip=bot" >> "$GITHUB_OUTPUT"; exit 0;; esac
+          if ! printf '%s' "$BODY" | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]'; then
+            echo "skip=mention" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "skip=" >> "$GITHUB_OUTPUT"
+          if printf '%s' "$BODY" | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]+re-review([[:space:]]|$)'; then
+            echo "verb=review" >> "$GITHUB_OUTPUT"
+          else
+            echo "verb=reply" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authorize the command author
+        if: steps.cmd.outputs.skip == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          case "$AUTHOR" in *[!A-Za-z0-9-]*) echo "invalid comment author login: $AUTHOR" >&2; exit 1;; esac
+          perm=$(gh api "repos/$REPO/collaborators/$AUTHOR/permission" --jq .permission)
+          case "$perm" in admin|maintain|write) ;; *) echo "$AUTHOR ($perm) may not trigger difftrace" >&2; exit 1;; esac
+
+      - name: Resolve the pull request number
+        if: steps.cmd.outputs.skip == ''
+        id: pr
+        env:
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+
+      - name: Install difftrace v0.2.1
+        if: steps.cmd.outputs.skip == ''
+        run: |
+          curl -fsSL -o /tmp/difftrace.tar.gz \
+            https://github.com/dch-labs/difftrace/releases/download/v0.2.1/difftrace-0.2.1-x86_64-unknown-linux-gnu.tar.gz
+          echo "a9426505ca3e3d73d1250bcf65aa7d66da74e96b8318366affe849285f3e3a8c  /tmp/difftrace.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
+
+      - name: Check the required secrets are present
+        if: steps.cmd.outputs.skip == ''
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          DIFFTRACE_APP_ID: ${{ secrets.DIFFTRACE_APP_ID }}
+          DIFFTRACE_APP_PRIVATE_KEY: ${{ secrets.DIFFTRACE_APP_PRIVATE_KEY }}
+        run: |
+          : "${ZAI_API_KEY:?ZAI_API_KEY is not set - the reply step would fail opaquely}"
+          : "${DIFFTRACE_APP_ID:?DIFFTRACE_APP_ID is not set - the reply step would fail opaquely}"
+          : "${DIFFTRACE_APP_PRIVATE_KEY:?DIFFTRACE_APP_PRIVATE_KEY is not set - the reply step would fail opaquely}"
+
+      - name: Mint the difftrace app token
+        if: steps.cmd.outputs.skip == ''
+        uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.DIFFTRACE_APP_ID }}
+          private-key: ${{ secrets.DIFFTRACE_APP_PRIVATE_KEY }}
+
+      - name: Run the command
+        if: steps.cmd.outputs.skip == ''
+        run: |
+          if [ "$VERB" = "review" ]; then
+            difftrace review --repo "$REPO" --pr "$PR"
+          elif [ "$COMMENT_KIND" = "issue" ]; then
+            difftrace reply --repo "$REPO" --pr "$PR" --issue-comment "$COMMENT_ID"
+          else
+            difftrace reply --repo "$REPO" --pr "$PR" --review-comment "$COMMENT_ID"
+          fi
+        env:
+          VERB: ${{ steps.cmd.outputs.verb }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_KIND: ${{ github.event_name == 'issue_comment' && 'issue' || 'review' }}
+          PR: ${{ steps.pr.outputs.pr }}
+          REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          DIFFTRACE_PROFILE: zai
+          DIFFTRACE_MODEL: ${{ inputs.model || 'glm-4.7' }}
+          RUST_LOG: info
+
+      - name: Upload trajectory
+        if: always() && steps.cmd.outputs.skip == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: difftrace-trajectory-pr${{ steps.pr.outputs.pr }}-chat
           path: ~/.difftrace/trajectories/
           if-no-files-found: ignore
           retention-days: 7

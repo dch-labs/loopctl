@@ -44,13 +44,13 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      # The binary is pinned to the tagged v0.3.1 release; bump version and
+      # The binary is pinned to the tagged v0.3.2 release; bump version and
       # checksum together on every difftrace release.
-      - name: Install difftrace v0.3.1
+      - name: Install difftrace v0.3.2
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.3.1/difftrace-0.3.1-x86_64-unknown-linux-gnu.tar.gz
-          echo "5b7989691b68678d163f9cfe504e127f3c7989bc834478c080a22459603f2dc7  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.3.2/difftrace-0.3.2-x86_64-unknown-linux-gnu.tar.gz
+          echo "8b351439345134754456cedb92e65034d384c94ebf4e4bef73d9e95e09d79c0e  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -158,13 +158,13 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      # The binary is pinned to the tagged v0.3.1 release; bump version and
+      # The binary is pinned to the tagged v0.3.2 release; bump version and
       # checksum together on every difftrace release.
-      - name: Install difftrace v0.3.1
+      - name: Install difftrace v0.3.2
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.3.1/difftrace-0.3.1-x86_64-unknown-linux-gnu.tar.gz
-          echo "5b7989691b68678d163f9cfe504e127f3c7989bc834478c080a22459603f2dc7  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.3.2/difftrace-0.3.2-x86_64-unknown-linux-gnu.tar.gz
+          echo "8b351439345134754456cedb92e65034d384c94ebf4e4bef73d9e95e09d79c0e  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 

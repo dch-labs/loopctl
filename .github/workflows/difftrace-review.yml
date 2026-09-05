@@ -129,7 +129,7 @@ jobs:
             echo "skip=mention" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "skip=" >> "$GITHUB_OUTPUT"
-          if printf '%s' "$BODY" | head -n 1 | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]+re-review([[:space:]]|$)'; then
+          if printf '%s' "$BODY" | head -n 1 | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]+review([[:space:]]|$)'; then
             echo "verb=review" >> "$GITHUB_OUTPUT"
           else
             echo "verb=reply" >> "$GITHUB_OUTPUT"

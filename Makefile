@@ -53,7 +53,9 @@ endef
 export PROBE_MAIN
 
 # The probe manifest embeds $(CURDIR) inside a quoted TOML basic string, so a
-# checkout path containing spaces stays valid.
+# checkout path containing spaces stays valid. The gate needs a POSIX
+# environment (make, mktemp, trap, sed); native Windows shells are not
+# supported.
 redaction-minimal:
 	@tmp=$$(mktemp -d); \
 	trap 'rm -rf "$$tmp"' EXIT INT TERM; \

@@ -53,7 +53,8 @@ fn main() {
 endef
 
 # The probe manifest embeds $(CURDIR) inside a quoted TOML basic string, so a
-# checkout path containing spaces stays valid. The gate needs a POSIX
+# checkout path containing spaces stays valid; a quote or backslash in the
+# path would still break the manifest. The gate needs a POSIX
 # environment (make, mktemp, trap, sed) and the cargo registry — a cold
 # machine downloads dependencies on the first run; native Windows shells
 # are not supported.
@@ -61,8 +62,8 @@ redaction-minimal: export PROBE_MAIN = $(PROBE_TEXT)
 redaction-minimal:
 	@tmp=$$(mktemp -d); \
 	trap 'rm -rf "$$tmp"' EXIT INT TERM; \
-	edition=$$(sed -n 's/^edition = "\(.*\)"/\1/p' Cargo.toml); \
-	rust_version=$$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml); \
+	edition=$$(sed -n 's/^edition = "\([^"]*\)".*/\1/p' Cargo.toml); \
+	rust_version=$$(sed -n 's/^rust-version = "\([^"]*\)".*/\1/p' Cargo.toml); \
 	[ -n "$$edition" ] && [ -n "$$rust_version" ] || { echo "redaction-minimal: cannot derive edition/rust-version from Cargo.toml" >&2; exit 1; }; \
 	mkdir -p "$$tmp/src"; \
 	printf '[package]\nname = "redaction-minimal-probe"\nversion = "0.0.0"\nedition = "%s"\nrust-version = "%s"\npublish = false\n\n[dependencies]\nloopctl = { path = "%s", features = ["redaction"] }\n\n[workspace]\n' "$$edition" "$$rust_version" "$(CURDIR)" > "$$tmp/Cargo.toml"; \

@@ -1,10 +1,12 @@
 # Reference consumer workflow, maintained in the difftrace repo
-# (examples/difftrace-review.yml). Copy verbatim; on every difftrace
-# release bump the two version+checksum pins below. Local deviations:
-# the token-mint steps note why contents:write is required, the chat
-# concurrency group is keyed by PR so re-reviews serialize, the chat
-# model env drops the dispatch-only inputs.model term, and the gate
-# job narrows its token to contents:read.
+# (examples/difftrace-review.yml). Copy verbatim, then bump the
+# DIFFTRACE_VERSION and DIFFTRACE_SHA256 env values together on every
+# difftrace release. Local deviations: the pin lives in workflow env
+# values (one copy), the token-mint steps note why contents:write is
+# required, the chat concurrency group is keyed by PR so re-reviews
+# serialize, the chat model env drops the dispatch-only inputs.model
+# term, the gate job narrows its token to contents:read, and trajectory
+# uploads wait for a successful token mint.
 name: difftrace review
 
 on:
@@ -27,6 +29,10 @@ permissions:
   pull-requests: write
   contents: read
 
+env:
+  DIFFTRACE_VERSION: 0.4.1
+  DIFFTRACE_SHA256: a92adaa9e816de63dbd0c31fef87027f2485ab5c11411c8d93ae4117125b95c9
+
 jobs:
   review:
     name: Review the pull request
@@ -48,6 +54,9 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
+      # pull_request events are fork-gated by the job-level `if`; this step
+      # covers workflow_dispatch, whose payload carries no fork flag — any
+      # new trigger type needs its own gate.
       - name: Reject fork pull requests
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -58,13 +67,14 @@ jobs:
           fork=$(gh api "repos/$REPO/pulls/$PR" --jq .head.repo.fork)
           case "$fork" in false) ;; *) echo "difftrace does not run on fork pull requests" >&2; exit 1;; esac
 
-      # The binary is pinned to the tagged v0.4.1 release; bump version and
-      # checksum together on every difftrace release.
-      - name: Install difftrace v0.4.1
+      # The binary is pinned by the DIFFTRACE_VERSION and DIFFTRACE_SHA256
+      # env values at the top of this file; bump both together on every
+      # difftrace release.
+      - name: Install difftrace
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.4.1/difftrace-0.4.1-x86_64-unknown-linux-gnu.tar.gz
-          echo "a92adaa9e816de63dbd0c31fef87027f2485ab5c11411c8d93ae4117125b95c9  /tmp/difftrace.tar.gz" | sha256sum -c -
+            "https://github.com/dch-labs/difftrace/releases/download/v${DIFFTRACE_VERSION}/difftrace-${DIFFTRACE_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${DIFFTRACE_SHA256}  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -102,7 +112,7 @@ jobs:
           RUST_LOG: info
 
       - name: Upload trajectory
-        if: always()
+        if: ${{ !cancelled() && steps.app-token.conclusion == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: difftrace-trajectory-pr${{ steps.pr.outputs.pr }}
@@ -176,13 +186,14 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      # The binary is pinned to the tagged v0.4.1 release; bump version and
-      # checksum together on every difftrace release.
-      - name: Install difftrace v0.4.1
+      # The binary is pinned by the DIFFTRACE_VERSION and DIFFTRACE_SHA256
+      # env values at the top of this file; bump both together on every
+      # difftrace release.
+      - name: Install difftrace
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.4.1/difftrace-0.4.1-x86_64-unknown-linux-gnu.tar.gz
-          echo "a92adaa9e816de63dbd0c31fef87027f2485ab5c11411c8d93ae4117125b95c9  /tmp/difftrace.tar.gz" | sha256sum -c -
+            "https://github.com/dch-labs/difftrace/releases/download/v${DIFFTRACE_VERSION}/difftrace-${DIFFTRACE_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${DIFFTRACE_SHA256}  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -229,7 +240,7 @@ jobs:
           RUST_LOG: info
 
       - name: Upload trajectory
-        if: always()
+        if: ${{ !cancelled() && steps.app-token.conclusion == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: difftrace-trajectory-pr${{ steps.pr.outputs.pr }}-chat

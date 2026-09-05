@@ -1,9 +1,10 @@
 # Reference consumer workflow, maintained in the difftrace repo
 # (examples/difftrace-review.yml). Copy verbatim; on every difftrace
 # release bump the two version+checksum pins below. Local deviations:
-# the token-mint steps note why contents:write is required, and the
-# chat concurrency group is keyed by PR, not comment id, so re-reviews
-# serialize per PR.
+# the token-mint steps note why contents:write is required, the chat
+# concurrency group is keyed by PR so re-reviews serialize, the chat
+# model env drops the dispatch-only inputs.model term, and the gate
+# job narrows its token to contents:read.
 name: difftrace review
 
 on:
@@ -113,6 +114,8 @@ jobs:
   gate:
     name: Authorize a difftrace command
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: >-
       github.event_name == 'pull_request_review_comment' ||
       (github.event_name == 'issue_comment' &&
@@ -222,7 +225,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           DIFFTRACE_PROFILE: zai
-          DIFFTRACE_MODEL: ${{ inputs.model || vars.DIFFTRACE_MODEL || 'glm-4.7' }}
+          DIFFTRACE_MODEL: ${{ vars.DIFFTRACE_MODEL || 'glm-4.7' }}
           RUST_LOG: info
 
       - name: Upload trajectory

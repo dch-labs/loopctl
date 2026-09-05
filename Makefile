@@ -37,6 +37,7 @@ fn main() {
     let count = patterns.scrub(&mut text);
     assert!(count > 0, "the curated bearer pattern must compile and redact");
     assert!(text.contains("[REDACTED:"), "the bearer header must be scrubbed, got: {text}");
+    // The window scan slices bytes, so keep the probe token ASCII.
     for i in 0..=token.len() - 8 {
         assert!(!text.contains(&token[i..i + 8]), "token material survived at offset {i}: {} in {text}", &token[i..i + 8]);
     }
@@ -53,8 +54,9 @@ endef
 
 # The probe manifest embeds $(CURDIR) inside a quoted TOML basic string, so a
 # checkout path containing spaces stays valid. The gate needs a POSIX
-# environment (make, mktemp, trap, sed); native Windows shells are not
-# supported.
+# environment (make, mktemp, trap, sed) and the cargo registry — a cold
+# machine downloads dependencies on the first run; native Windows shells
+# are not supported.
 redaction-minimal: export PROBE_MAIN = $(PROBE_TEXT)
 redaction-minimal:
 	@tmp=$$(mktemp -d); \

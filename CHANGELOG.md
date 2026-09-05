@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-05
+
 ### Added
 
 - **Vector primitives (`memory::vector`, feature `vector_index`)** — the two traits every semantic-retrieval memory store is built from, plus dependency-free reference implementations: `EmbeddingProvider` (`dim()`, required `embed(&str)`, provided `embed_batch` that loops `embed` and preserves input order) turns text into an `Embedding`; `VectorIndex` is a nearest-neighbour store keyed by `Uuid` (upsert on `add`, cosine-scored top-`k` `search` sorted descending with an id tiebreak, idempotent `remove`, `len`/`is_empty`, dimension mismatches surface as `LoopError::Memory`). Both traits are object-safe async — boxed futures exactly like `LoopMemory` — so a store can hold `Box<dyn EmbeddingProvider>` / `Box<dyn VectorIndex>` and swap backends without touching its contract. Reference impls: `LinearVectorIndex` (brute-force O(n) cosine scan, `RwLock` interior mutability, usable as the correctness oracle for faster indexes) and `HashingEmbedder` (a deterministic hashing embedder whose retrieval quality is unsuitable for real use but which exercises the whole layer with no network and no API key; zero-token input yields the documented zero vector). Free `cosine_similarity` helper, an example (`vector-index-demo`), and an integration suite. **`default = []` unchanged** — the feature adds no dependencies.
@@ -236,7 +238,8 @@ Initial crates.io release.
 - Built-in testing utilities for writing LLM loop tests
 - Example CLIs: hello, REPL, echo tool, and multi-provider chat
 
-[Unreleased]: https://github.com/dch-labs/loopctl/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/dch-labs/loopctl/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/dch-labs/loopctl/releases/tag/v0.3.1
 [0.3.0]: https://github.com/dch-labs/loopctl/releases/tag/v0.3.0
 [0.2.1]: https://github.com/dch-labs/loopctl/releases/tag/v0.2.1
 [0.2.0]: https://github.com/dch-labs/loopctl/releases/tag/v0.2.0

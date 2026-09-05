@@ -28,7 +28,7 @@ docs:
 examples:
 	cargo build --examples --all-features
 
-define PROBE_MAIN
+define PROBE_TEXT
 fn main() {
     let patterns = loopctl::middleware::redaction::SecretPatternSet::default_common();
     let token = "abcdef12345678901234";
@@ -50,12 +50,12 @@ fn main() {
     assert!(!plain.contains(entropy_token), "the high-entropy token survived: {plain}");
 }
 endef
-export PROBE_MAIN
 
 # The probe manifest embeds $(CURDIR) inside a quoted TOML basic string, so a
 # checkout path containing spaces stays valid. The gate needs a POSIX
 # environment (make, mktemp, trap, sed); native Windows shells are not
 # supported.
+redaction-minimal: export PROBE_MAIN = $(PROBE_TEXT)
 redaction-minimal:
 	@tmp=$$(mktemp -d); \
 	trap 'rm -rf "$$tmp"' EXIT INT TERM; \

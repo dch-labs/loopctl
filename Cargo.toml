@@ -75,7 +75,10 @@ gemini = ["providers", "streaming"]
 zai = ["providers", "anthropic"]
 grammar = ["providers"]
 schema_validation = ["dep:jsonschema"]
-redaction = ["dep:regex"]
+# The curated redaction literals match with `(?i)` (unicode-case) and
+# `\s` (unicode-perl); a future literal outgrowing these two features
+# fails the redaction-minimal CI gate loudly.
+redaction = ["dep:regex", "regex/unicode-case", "regex/unicode-perl"]
 
 # MCP client adapter + transports (stdio, Streamable HTTP/SSE). Enables
 # `streaming` for `StreamRetryConfig` (reconnect backoff), `reqwest` for the

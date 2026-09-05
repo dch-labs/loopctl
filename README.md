@@ -208,7 +208,7 @@ async fn demo(
 | `zai` | No | `providers`, `anthropic` | Z.AI API client (Anthropic-compatible) |
 | `grammar` | No | `providers` | Tool-call grammar providers for grammar-aware samplers (vLLM `guided_json`); enables the `Grammar` mode of `ToolConstraint` |
 | `schema_validation` | No | — | JSON Schema validation of `Correction::modified_input` in `LlmReflector` (pulls `jsonschema`); when off, validation is skipped |
-| `redaction` | No | `regex` | `RedactingMiddleware` — scrub secrets (bearer headers, AWS keys, PEM blocks, PATs, high-entropy tokens) from tool output as `[REDACTED:<kind>]` |
+| `redaction` | No | `regex` (+ `unicode-case`, `unicode-perl`) | `RedactingMiddleware` — scrub secrets (bearer headers, AWS keys, PEM blocks, PATs, high-entropy tokens) from tool output as `[REDACTED:<kind>]`; the curated literals need a Unicode-capable `regex`, so the feature scopes exactly those two `regex` features |
 | `mcp` | No | `rmcp`, `reqwest`, `async-stream`, `jsonschema` | MCP client + server adapters — adapt foreign MCP servers' tools as `Tool` impls (`McpToolProvider`), or serve a `ToolRegistry` over MCP/stdio to any MCP client (`McpServerAdapter`; served schemas are validated with `jsonschema`, external refs refused) |
 
 ### Streaming vs non-streaming
@@ -254,7 +254,8 @@ Two cross-cutting concerns run alongside the main loop:
 ## Development
 
 ```bash
-make ci        # fmt + check + clippy + test + docs (all features)
+make ci        # fmt + check + clippy + tests + docs + examples + redaction minimal-feature gate
+               # (the gate builds an isolated probe crate — a separate dependency build, cached under `target/redaction-minimal`)
 make test      # run all tests
 make lint      # auto-format
 ```

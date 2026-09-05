@@ -54,13 +54,13 @@ jobs:
           fork=$(gh api "repos/$REPO/pulls/$PR" --jq .head.repo.fork)
           case "$fork" in false) ;; *) echo "difftrace does not run on fork pull requests" >&2; exit 1;; esac
 
-      # The binary is pinned to the tagged v0.3.3 release; bump version and
+      # The binary is pinned to the tagged v0.4.1 release; bump version and
       # checksum together on every difftrace release.
-      - name: Install difftrace v0.3.3
+      - name: Install difftrace v0.4.1
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.3.3/difftrace-0.3.3-x86_64-unknown-linux-gnu.tar.gz
-          echo "ec66a01fb75d4eefb3ce3360c765488248c550f03aaad11c73b04dde5c7a6cc8  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.4.1/difftrace-0.4.1-x86_64-unknown-linux-gnu.tar.gz
+          echo "a92adaa9e816de63dbd0c31fef87027f2485ab5c11411c8d93ae4117125b95c9  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -168,13 +168,13 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      # The binary is pinned to the tagged v0.3.3 release; bump version and
+      # The binary is pinned to the tagged v0.4.1 release; bump version and
       # checksum together on every difftrace release.
-      - name: Install difftrace v0.3.3
+      - name: Install difftrace v0.4.1
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.3.3/difftrace-0.3.3-x86_64-unknown-linux-gnu.tar.gz
-          echo "ec66a01fb75d4eefb3ce3360c765488248c550f03aaad11c73b04dde5c7a6cc8  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.4.1/difftrace-0.4.1-x86_64-unknown-linux-gnu.tar.gz
+          echo "a92adaa9e816de63dbd0c31fef87027f2485ab5c11411c8d93ae4117125b95c9  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -215,7 +215,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           DIFFTRACE_PROFILE: zai
-          DIFFTRACE_MODEL: ${{ vars.DIFFTRACE_MODEL || 'glm-4.7' }}
+          DIFFTRACE_MODEL: ${{ inputs.model || vars.DIFFTRACE_MODEL || 'glm-4.7' }}
           RUST_LOG: info
 
       - name: Upload trajectory

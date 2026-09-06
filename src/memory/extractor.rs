@@ -673,6 +673,7 @@ fn summarize_trajectory(record: &TrajectoryRecord, budget: usize) -> String {
         "outcome: {:?}\ntotal turns: {}\n",
         record.outcome, record.total_turns
     );
+    let marker = "…\n";
     let mut lines: Vec<String> = Vec::new();
     let mut used = header.len();
     for turn in record.turns.iter().rev() {
@@ -695,8 +696,8 @@ fn summarize_trajectory(record: &TrajectoryRecord, budget: usize) -> String {
             truncate(&turn.query, 200),
             truncate(&turn.response_text, 160),
         );
-        if used.saturating_add(line.len()) > budget.saturating_sub(2) {
-            lines.push("…\n".to_string());
+        if used.saturating_add(line.len()) > budget.saturating_sub(marker.len()) {
+            lines.push(marker.to_string());
             break;
         }
         used = used.saturating_add(line.len());
@@ -739,21 +740,28 @@ async fn llm_memories(
     client: &dyn ApiClient,
     heuristic_candidates: Option<&[ExtractedMemory]>,
 ) -> Result<Vec<ExtractedMemory>, LoopError> {
+    const PREAMBLE: &str = "\nCandidate lessons already mined from this trajectory follow; \
+refine, merge, generalize, and drop the weak ones:\n";
     let mut system = String::from(
         "You are a memory extractor. Read the agent trajectory and emit JSON: an array of \
          {\"category\",\"content\",\"tags\",\"quality\"} objects. category is one of \
          \"strategy\", \"error_pattern\", \"insight\", or \"optimization\". Only emit \
          genuinely reusable lessons, phrased as advice.",
     );
+    let preamble_len = if heuristic_candidates.is_some() {
+        PREAMBLE.len()
+    } else {
+        0
+    };
+    let summary_budget = config
+        .llm_context_budget
+        .saturating_sub(system.len().saturating_add(preamble_len));
     if let Some(candidates) = heuristic_candidates {
-        system.push_str(
-            "\nCandidate lessons already mined from this trajectory follow; \
-                         refine, merge, generalize, and drop the weak ones:\n",
-        );
+        system.push_str(PREAMBLE);
         let mut candidate_budget = config
             .llm_context_budget
-            .saturating_sub(summarize_trajectory(record, config.llm_context_budget).len())
-            .min(config.llm_context_budget);
+            .saturating_sub(system.len())
+            .saturating_sub(summarize_trajectory(record, summary_budget).len());
         for candidate in candidates {
             let line = format!("- [{:?}] {}\n", candidate.category, candidate.content);
             if candidate_budget.saturating_sub(line.len()) == 0 {
@@ -764,10 +772,7 @@ async fn llm_memories(
         }
     }
     let request = StreamRequest {
-        messages: vec![Message::user(summarize_trajectory(
-            record,
-            config.llm_context_budget,
-        ))],
+        messages: vec![Message::user(summarize_trajectory(record, summary_budget))],
         system: Some(system),
         tools: None,
     };
@@ -897,6 +902,27 @@ mod tests {
     use crate::memory::LoopMemory;
     use crate::memory::builtin::InMemoryStore;
     use crate::memory::trajectory::{TokenSummary, TrajectoryToolCall, TrajectoryTurn};
+
+    #[test]
+    fn summary_boundary_budget_never_exceeds_the_cap() {
+        let mut boundary_turns: Vec<TrajectoryTurn> = Vec::new();
+        for index in 0..60 {
+            let mut entry_turn = turn(index, "filler", vec![call("Read", true)]);
+            entry_turn.query = format!("query {index}");
+            boundary_turns.push(entry_turn);
+        }
+        let boundary_record = record(TrajectoryOutcome::Success, boundary_turns);
+        for budget in (200..=1_500).step_by(7) {
+            let summary = summarize_trajectory(&boundary_record, budget);
+            assert!(
+                summary.len() <= budget,
+                "budget {budget}: summary is {} bytes — the marker must be reserved, \
+                never appended on top",
+                summary.len()
+            );
+        }
+    }
+
     #[cfg(feature = "testing")]
     use crate::testing::MockApiClient;
 
@@ -1364,9 +1390,9 @@ mod tests {
                 .map(|message| message.text_content().len())
                 .sum::<usize>();
         assert!(
-            total <= config.llm_context_budget + 400,
-            "summary plus candidates stay bounded by the configured budget \
-            (got {total} bytes)"
+            total <= config.llm_context_budget,
+            "system instruction, candidates, and summary together stay within the \
+            configured budget (got {total} bytes)"
         );
         let user_text = request.messages[0].text_content();
         assert!(

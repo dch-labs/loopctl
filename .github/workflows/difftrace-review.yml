@@ -1,8 +1,9 @@
 # Reference consumer workflow, maintained in the difftrace repo
 # (examples/difftrace-review.yml). Copy verbatim; on every difftrace
-# release bump the two version+checksum pins below. Local deviation: the
-# chat job's concurrency group is keyed by PR, not comment id — commands
-# on one PR mutate shared review state and must serialize.
+# release bump the two version+checksum pins below. Local deviations:
+# the chat job is intentionally memory-less (learnings accumulate from
+# the full reviews in the review job), and the memory cache keys off
+# the event context instead of resolving the head SHA in a step.
 name: difftrace review
 
 on:
@@ -30,8 +31,11 @@ jobs:
     name: Review the pull request
     runs-on: ubuntu-latest
     concurrency:
-      group: difftrace-review-${{ inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id }}
-      cancel-in-progress: true
+      # One lane per pull request, shared with the chat job: reviews and
+      # comment commands serialize instead of racing the registry,
+      # threads, and memory. Queued runs pick up the head at start time.
+      group: difftrace-${{ inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      cancel-in-progress: false
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -56,13 +60,13 @@ jobs:
           fork=$(gh api "repos/$REPO/pulls/$PR" --jq .head.repo.fork)
           case "$fork" in false) ;; *) echo "difftrace does not run on fork pull requests" >&2; exit 1;; esac
 
-      # The binary is pinned to the tagged v0.5.0 release; bump version and
+      # The binary is pinned to the tagged v0.6.0 release; bump version and
       # checksum together on every difftrace release.
-      - name: Install difftrace v0.5.0
+      - name: Install difftrace v0.6.0
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.5.0/difftrace-0.5.0-x86_64-unknown-linux-gnu.tar.gz
-          echo "5253f8daef15bba174ac890edcb386ad550610eb8d13c02bc4ae4d930902bac6  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.6.0/difftrace-0.6.0-x86_64-unknown-linux-gnu.tar.gz
+          echo "c166a4fd668ef4e1687fb9e5e02ea1b780d7f161b5344c4a6549e7da95dfd77e  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -85,9 +89,18 @@ jobs:
           permission-pull-requests: write
           permission-contents: write
 
+      - name: Restore the review memory
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.difftrace/memory
+          key: difftrace-mem-${{ github.repository }}-pr${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          restore-keys: |
+            difftrace-mem-${{ github.repository }}-pr${{ github.event.pull_request.number }}-
+            difftrace-mem-${{ github.repository }}-
+
       - name: Review the pull request
         run: |
-          difftrace review --repo "$REPO" --pr "$PR"
+          difftrace review --repo "$REPO" --pr "$PR" --memory "$HOME/.difftrace/memory/learnings.md"
         env:
           PR: ${{ steps.pr.outputs.pr }}
           REPO: ${{ github.repository }}
@@ -110,6 +123,8 @@ jobs:
   gate:
     name: Authorize a difftrace command
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     if: >-
       github.event_name == 'pull_request_review_comment' ||
       (github.event_name == 'issue_comment' &&
@@ -156,10 +171,14 @@ jobs:
 
   chat:
     name: Handle a difftrace command
+    # Intentionally memory-less: replies and plans answer the thread at
+    # hand; learnings accumulate from the full reviews in the review job.
     needs: gate
     runs-on: ubuntu-latest
     concurrency:
-      group: difftrace-chat-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      # Shared with the review job's lane: a re-review command waits for
+      # any in-flight review instead of racing it.
+      group: difftrace-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
       cancel-in-progress: false
     if: needs.gate.outputs.skip == ''
     steps:
@@ -172,13 +191,13 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      # The binary is pinned to the tagged v0.5.0 release; bump version and
+      # The binary is pinned to the tagged v0.6.0 release; bump version and
       # checksum together on every difftrace release.
-      - name: Install difftrace v0.5.0
+      - name: Install difftrace v0.6.0
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.5.0/difftrace-0.5.0-x86_64-unknown-linux-gnu.tar.gz
-          echo "5253f8daef15bba174ac890edcb386ad550610eb8d13c02bc4ae4d930902bac6  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.6.0/difftrace-0.6.0-x86_64-unknown-linux-gnu.tar.gz
+          echo "c166a4fd668ef4e1687fb9e5e02ea1b780d7f161b5344c4a6549e7da95dfd77e  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 

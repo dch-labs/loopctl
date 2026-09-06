@@ -253,6 +253,9 @@ pub struct ConsolidationConfig {
     /// unaccessed age, scaled by [`category_decay_weight`]. Fourteen days
     /// lets a store consolidated daily keep working memories for weeks while
     /// genuinely stale knowledge fades within a couple of months.
+    ///
+    /// Normalized per pass: a zero or sub-second half-life falls back to
+    /// the default instead of decaying everything to dust in a second.
     pub half_life: Duration,
 
     /// Run near-duplicate detection and corroboration merges.
@@ -386,9 +389,14 @@ impl ConsolidationConfig {
                 default
             }
         };
+        let half_life = if self.half_life < Duration::from_secs(1) {
+            Self::default().half_life
+        } else {
+            self.half_life
+        };
         Self {
             decay: self.decay,
-            half_life: self.half_life,
+            half_life,
             merge: self.merge,
             merge_threshold: normalize(self.merge_threshold, Self::default().merge_threshold),
             prune_floor: normalize(self.prune_floor, Self::default().prune_floor),
@@ -762,6 +770,25 @@ mod tests {
         );
         assert_eq!(entries.len(), 2, "NaN thresholds behave like the defaults");
     }
+
+    #[test]
+    fn a_zero_half_life_falls_back_to_the_default_instead_of_total_decay() {
+        let now = SystemTime::now();
+        let mut entry = entry(MemoryCategory::Trajectory, "fresh knowledge");
+        entry.relevance = 1.0;
+        entry.created_at = now - Duration::from_secs(5);
+        let mut entries = vec![entry];
+        let mut config = ConsolidationConfig::default();
+        config.half_life = Duration::ZERO;
+        consolidate_entries(&mut entries, &config, now);
+        assert!(
+            entries[0].relevance > 0.99,
+            "a zero half-life must fall back to the 14-day default, so an entry \
+            aged five seconds barely moves — not decay to ~zero: {}",
+            entries[0].relevance
+        );
+    }
+
     #[test]
     fn bytes_saved_is_nonzero_when_entries_are_removed() {
         let now = SystemTime::now();

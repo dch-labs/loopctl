@@ -61,7 +61,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub use builtin::InMemoryStore;
+pub use consolidate::{ConsolidationConfig, MemoryCluster};
 pub use entry::{ConsolidationStats, MemoryCategory, MemoryEntry};
+pub use extractor::{ExtractedMemory, ExtractionConfig, ExtractionObserver, ExtractionStrategy};
 pub use trajectory::{
     TokenSummary, TrajectoryObserver, TrajectoryOutcome, TrajectoryRecord, TrajectoryToolCall,
     TrajectoryTurn,
@@ -73,7 +75,9 @@ pub use vector::{
 };
 
 pub mod builtin;
+pub mod consolidate;
 pub mod entry;
+pub mod extractor;
 pub mod trajectory;
 #[cfg(feature = "vector_index")]
 pub mod vector;

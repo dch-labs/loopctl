@@ -6,6 +6,8 @@ A trait-based framework for building agent loops with pluggable LLM clients, too
 [![docs.rs](https://docs.rs/loopctl/badge.svg)](https://docs.rs/loopctl)
 [![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
+**Guide:** <https://loopctl.rs>
+
 ## Overview
 
 `loopctl` provides the core infrastructure for building LLM-based agent loops: a streaming

@@ -7,9 +7,11 @@
 //! # Provided Implementations
 //!
 //! - **[`InMemoryStore`]** — Stores [`MemoryEntry`] values in a `Vec` and
-//!   retrieves them via weighted keyword + tag scoring. Supports
-//!   [`consolidate`](LoopMemory::consolidate) by pruning entries whose
-//!   [`relevance`](MemoryEntry::relevance) drops below 0.05.
+//!   retrieves them via weighted keyword + tag scoring. Its
+//!   [`consolidate`](LoopMemory::consolidate) runs a full pass —
+//!   category-weighted decay, near-duplicate merging, and quality-floor
+//!   pruning — via the shared
+//!   [`consolidate`](crate::memory::consolidate) primitives.
 //!
 //! # When to Use
 //!
@@ -38,10 +40,14 @@
 //! ```
 
 use crate::error::LoopError;
+use crate::memory::consolidate::{ConsolidationConfig, consolidate_entries};
 use crate::memory::{ConsolidationStats, LoopMemory, MemoryEntry};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
+use std::time::SystemTime;
+use uuid::Uuid;
 
 /// A simple in-memory store for loop memory entries.
 ///
@@ -75,9 +81,12 @@ use std::sync::RwLock;
 /// # Thread Safety
 ///
 /// [`InMemoryStore`] is `Send + Sync`. Interior mutability is handled via
-/// an internal `RwLock`, so `store` and `consolidate` only require `&self`.
-/// This allows the store to be shared via `Arc<InMemoryStore>` or
-/// `Arc<InMemoryStore>` across tasks without external locking.
+/// an internal `RwLock` over the entries plus a `Mutex` over the small
+/// access log that `retrieve` writes and `consolidate` folds, so both
+/// methods only require `&self`. The log is a leaf lock — the entries
+/// guard is always acquired first, and the log never blocks a writer —
+/// which lets the store be shared via `Arc<InMemoryStore>` across tasks
+/// without external locking.
 ///
 /// # Construction
 ///
@@ -113,14 +122,37 @@ use std::sync::RwLock;
 /// # Unbounded Growth
 ///
 /// `InMemoryStore` accumulates entries in a `Vec` with no automatic
-/// eviction. The [`consolidate()`](InMemoryStore::consolidate) method
-/// prunes entries with `relevance < 0.05`, but it must be called
-/// explicitly. A long-running session that never calls `consolidate()`
-/// will accumulate memory indefinitely. For production use, consider
-/// calling `consolidate()` periodically or implementing a custom
-/// [`LoopMemory`] with bounded capacity.
+/// eviction between consolidation passes. The
+/// [`consolidate()`](InMemoryStore::consolidate) method now runs a full
+/// pass — category-weighted time decay, near-duplicate merging, and
+/// quality-floor pruning — so stale and duplicate knowledge ages out of a
+/// periodically consolidated store, but it must still be called
+/// explicitly. A session that never calls `consolidate()` still accumulates
+/// memory indefinitely; for hard bounds implement a custom [`LoopMemory`]
+/// with a capacity cap.
 pub struct InMemoryStore {
+    /// The stored entries; the single source of truth for store contents.
+    ///
+    /// Consolidation mutates the vec in place under the write guard.
+    /// Retrieval snapshots it under a read guard that is dropped before the
+    /// access log is touched, so the read path never holds a guard across a
+    /// writer's lock acquisition.
     entries: RwLock<Vec<MemoryEntry>>,
+
+    /// Access stamps recorded by `retrieve()`, keyed by entry id.
+    ///
+    /// A side log under its own lock, so the retrieve path never upgrades
+    /// its read guard; the next consolidation pass folds the stamps into
+    /// the entries and clears the log.
+    access_log: Mutex<HashMap<Uuid, SystemTime>>,
+
+    /// The configuration driving this store's consolidation pass.
+    ///
+    /// Defaults to the historical floor so stores that only ever pruned see
+    /// comparable results; set per store with
+    /// [`with_consolidation`](InMemoryStore::with_consolidation). The
+    /// config is read-only after construction.
+    consolidation: ConsolidationConfig,
 }
 
 impl InMemoryStore {
@@ -141,7 +173,34 @@ impl InMemoryStore {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(Vec::new()),
+            access_log: Mutex::new(HashMap::new()),
+            consolidation: ConsolidationConfig::default(),
         }
+    }
+
+    /// Build with a custom consolidation configuration.
+    ///
+    /// Controls the decay half-life, merge threshold, and prune floor the
+    /// store's [`consolidate`](LoopMemory::consolidate) pass uses; see
+    /// [`ConsolidationConfig`]. The default floor matches the historical
+    /// pruner, so stores that only ever pruned see comparable results.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::memory::builtin::InMemoryStore;
+    /// use loopctl::memory::consolidate::ConsolidationConfig;
+    /// use std::time::Duration;
+    ///
+    /// let store = InMemoryStore::new().with_consolidation(ConsolidationConfig {
+    ///     half_life: Duration::from_secs(60 * 60 * 24 * 7),
+    ///     ..ConsolidationConfig::default()
+    /// });
+    /// ```
+    #[must_use]
+    pub fn with_consolidation(mut self, config: ConsolidationConfig) -> Self {
+        self.consolidation = config;
+        self
     }
 
     /// Create a store pre-populated with the given entries.
@@ -269,22 +328,32 @@ impl LoopMemory for InMemoryStore {
 
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-            Ok(scored.into_iter().take(limit).map(|(_, e)| e).collect())
+            let selected: Vec<MemoryEntry> =
+                scored.into_iter().take(limit).map(|(_, e)| e).collect();
+            let now = SystemTime::now();
+            let mut access_log = crate::error::recover_guard(self.access_log.lock());
+            for entry in &selected {
+                access_log.insert(entry.id, now);
+            }
+            Ok(selected)
         })
     }
 
-    /// Consolidate memory by pruning low-relevance entries.
+    /// Consolidate memory: decay, merge near-duplicates, prune the stale.
     ///
     /// Called by the engine at the end of each successful run to keep the
-    /// memory store healthy. This implementation removes entries whose
-    /// [`relevance`](MemoryEntry::relevance) score has decayed below 0.05.
-    /// It does **not** perform merging — [`merged`](ConsolidationStats::merged)
-    /// and [`bytes_saved`](ConsolidationStats::bytes_saved) are always zero.
+    /// memory store healthy. The pass folds the access log recorded by
+    /// [`retrieve`](LoopMemory::retrieve) into the entries (stamping
+    /// [`last_accessed`](MemoryEntry::last_accessed) and bumping
+    /// [`access_count`](MemoryEntry::access_count)), then delegates to
+    /// [`consolidate_entries`]: category-weighted exponential decay,
+    /// near-duplicate clustering with corroboration merges, and pruning of
+    /// entries whose composite quality falls below the configured floor.
     ///
     /// # Returns
     ///
-    /// A [`ConsolidationStats`] describing the number of entries before and
-    /// after pruning, and how many were removed.
+    /// A [`ConsolidationStats`] describing entries removed, merged, and the
+    /// estimated text bytes reclaimed.
     ///
     /// # Example
     ///
@@ -302,17 +371,18 @@ impl LoopMemory for InMemoryStore {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
         Box::pin(async move {
+            let now = SystemTime::now();
             let mut entries = crate::error::recover_guard(self.entries.write());
-            let entries_before = entries.len();
-            entries.retain(|e| e.relevance >= 0.05);
-            let pruned = entries_before.saturating_sub(entries.len());
-            Ok(ConsolidationStats {
-                entries_before,
-                entries_after: entries.len(),
-                pruned,
-                merged: 0,
-                bytes_saved: 0,
-            })
+            let mut access_log = crate::error::recover_guard(self.access_log.lock());
+            for entry in entries.iter_mut() {
+                if let Some(stamp) = access_log.get(&entry.id) {
+                    entry.last_accessed = Some(*stamp);
+                    entry.access_count = entry.access_count.saturating_add(1);
+                }
+            }
+            access_log.clear();
+            let stats = consolidate_entries(&mut entries, &self.consolidation, now);
+            Ok(stats)
         })
     }
 

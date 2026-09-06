@@ -14,6 +14,7 @@
 //! [`Hybrid`](ExtractionStrategy::Hybrid) strategies take a
 //! caller-supplied [`ApiClient`], so this module adds no dependencies.
 
+use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -300,7 +301,9 @@ fn entry_for(memory: &ExtractedMemory) -> MemoryEntry {
 /// # Errors
 ///
 /// Propagates [`extract`]'s errors plus any store failure as
-/// [`LoopError::Memory`].
+/// [`LoopError::Memory`]; a store failure mid-loop reports how many
+/// memories were already written, so callers can tell a partial pass from
+/// an empty one.
 pub async fn extract_into(
     trajectory_path: &Path,
     config: &ExtractionConfig,
@@ -310,7 +313,9 @@ pub async fn extract_into(
     let candidates = extract(trajectory_path, config, client).await?;
     let mut written = 0usize;
     for candidate in &candidates {
-        store.store(entry_for(candidate)).await?;
+        store.store(entry_for(candidate)).await.map_err(|err| {
+            LoopError::Memory(format!("store failed after {written} memories: {err}"))
+        })?;
         written = written.saturating_add(1);
     }
     Ok((written, candidates))
@@ -472,10 +477,12 @@ async fn extract_from_record_owned(
 
 /// Read the last complete JSONL line of a trajectory ledger.
 ///
-/// Walks backwards past a torn trailing line (the writer's queue not yet
-/// flushed, or a crash mid-append) and returns the newest line that
-/// parses. [`None`] means nothing in the ledger parses — an empty or
-/// all-torn file — so a best-effort observer can simply skip.
+/// Streams the file forward line by line, keeping only the newest line
+/// that parses, so memory stays flat no matter how long a session's
+/// ledger grows. A torn trailing line (the writer's queue not yet
+/// flushed, or a crash mid-append) fails to parse and is simply skipped.
+/// [`None`] means nothing in the ledger parses — an empty or all-torn
+/// file — so a best-effort observer can simply skip.
 ///
 /// The file read runs on the blocking thread pool, so a large ledger
 /// never stalls a tokio worker.
@@ -485,18 +492,21 @@ async fn extract_from_record_owned(
 /// [`LoopError::Memory`] when the ledger cannot be read at all.
 async fn last_complete_record(path: &Path) -> Result<Option<TrajectoryRecord>, LoopError> {
     let path = path.to_path_buf();
-    let text = tokio::task::spawn_blocking(move || {
-        std::fs::read_to_string(&path)
-            .map_err(|err| LoopError::Memory(format!("cannot read trajectory ledger: {err}")))
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path)
+            .map_err(|err| LoopError::Memory(format!("cannot read trajectory ledger: {err}")))?;
+        let mut last = None;
+        for line in std::io::BufReader::new(file).lines() {
+            let line =
+                line.map_err(|err| LoopError::Memory(format!("cannot read ledger line: {err}")))?;
+            if let Ok(record) = serde_json::from_str::<TrajectoryRecord>(&line) {
+                last = Some(record);
+            }
+        }
+        Ok(last)
     })
     .await
-    .map_err(|err| LoopError::Memory(format!("trajectory reader task failed: {err}")))??;
-    let parsed = text
-        .lines()
-        .rev()
-        .filter(|line| !line.trim().is_empty())
-        .find_map(|line| serde_json::from_str(line).ok());
-    Ok(parsed)
+    .map_err(|err| LoopError::Memory(format!("trajectory reader task failed: {err}")))?
 }
 
 /// Run all three heuristic miners over one record.

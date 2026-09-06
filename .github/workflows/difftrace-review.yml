@@ -2,9 +2,9 @@
 # (examples/difftrace-review.yml). Copy verbatim; on every difftrace
 # release bump the two version+checksum pins below. Local deviations:
 # the chat job is intentionally memory-less (learnings accumulate from
-# the full reviews in the review job), and the memory cache takes its
-# SHA segment from github.sha instead of resolving the pull request's
-# head SHA in a step.
+# the full reviews in the review job), and the review job caches
+# difftrace memory across runs under a key built from the resolved
+# pull request number and the head SHA it resolves in a step.
 name: difftrace review
 
 on:
@@ -46,10 +46,14 @@ jobs:
       - name: Resolve the pull request number
         id: pr
         env:
+          GH_TOKEN: ${{ github.token }}
           PR: ${{ inputs.pr || github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
+          sha=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Reject fork pull requests
         if: github.event_name == 'workflow_dispatch'
@@ -61,13 +65,13 @@ jobs:
           fork=$(gh api "repos/$REPO/pulls/$PR" --jq .head.repo.fork)
           case "$fork" in false) ;; *) echo "difftrace does not run on fork pull requests" >&2; exit 1;; esac
 
-      # The binary is pinned to the tagged v0.7.0 release; bump version and
+      # The binary is pinned to the tagged v0.8.0 release; bump version and
       # checksum together on every difftrace release.
-      - name: Install difftrace v0.7.0
+      - name: Install difftrace v0.8.0
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.7.0/difftrace-0.7.0-x86_64-unknown-linux-gnu.tar.gz
-          echo "2b4d3228ad75b19f8ede66fa4d8ac8e39af05860a55b193f938ed951a4e93a18  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.8.0/difftrace-0.8.0-x86_64-unknown-linux-gnu.tar.gz
+          echo "fd6c0029258dfc0d289d6cb1c8b2189efd33dc758b21552f029e81a6c2f2e8dd  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -94,7 +98,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.difftrace/memory
-          key: difftrace-mem-${{ github.repository }}-pr${{ steps.pr.outputs.pr }}-${{ github.sha }}
+          key: difftrace-mem-${{ github.repository }}-pr${{ steps.pr.outputs.pr }}-${{ steps.pr.outputs.sha }}
           restore-keys: |
             difftrace-mem-${{ github.repository }}-pr${{ steps.pr.outputs.pr }}-
             difftrace-mem-${{ github.repository }}-
@@ -109,6 +113,7 @@ jobs:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           DIFFTRACE_PROFILE: zai
           DIFFTRACE_MAX_TOKENS: '32768'
+          DIFFTRACE_STREAM_TIMEOUT_SECS: '900'
           DIFFTRACE_MODEL: ${{ inputs.model || vars.DIFFTRACE_MODEL || 'glm-4.7' }}
           RUST_LOG: info
 
@@ -193,13 +198,13 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      # The binary is pinned to the tagged v0.7.0 release; bump version and
+      # The binary is pinned to the tagged v0.8.0 release; bump version and
       # checksum together on every difftrace release.
-      - name: Install difftrace v0.7.0
+      - name: Install difftrace v0.8.0
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.7.0/difftrace-0.7.0-x86_64-unknown-linux-gnu.tar.gz
-          echo "2b4d3228ad75b19f8ede66fa4d8ac8e39af05860a55b193f938ed951a4e93a18  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.8.0/difftrace-0.8.0-x86_64-unknown-linux-gnu.tar.gz
+          echo "fd6c0029258dfc0d289d6cb1c8b2189efd33dc758b21552f029e81a6c2f2e8dd  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -243,6 +248,7 @@ jobs:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           DIFFTRACE_PROFILE: zai
           DIFFTRACE_MAX_TOKENS: '32768'
+          DIFFTRACE_STREAM_TIMEOUT_SECS: '900'
           DIFFTRACE_MODEL: ${{ inputs.model || vars.DIFFTRACE_MODEL || 'glm-4.7' }}
           RUST_LOG: info
 

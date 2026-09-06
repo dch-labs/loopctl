@@ -115,20 +115,26 @@ pub fn category_decay_weight(category: MemoryCategory) -> f32 {
 /// hourly, daily, or once produces the same relevance as a single pass
 /// over the same total age. Retrieval between passes pauses decay — the
 /// stamp jumps to the access time, which shields the interval before it.
+/// The stamp never moves backwards: a pass whose clock sits before an
+/// earlier pass — an NTP step, a resumed VM — leaves the stamp alone, so
+/// time that has already been decayed is never decayed a second time.
 pub fn decay_relevance(entry: &mut MemoryEntry, now: SystemTime, half_life: Duration) {
     let effective_stamp = entry
         .last_decayed
         .unwrap_or(entry.created_at)
         .max(entry.last_accessed.unwrap_or(entry.created_at));
+    let advance = |entry: &mut MemoryEntry| {
+        entry.last_decayed = Some(entry.last_decayed.map_or(now, |prev| prev.max(now)));
+    };
     let Some(age) = now.duration_since(effective_stamp).ok() else {
-        entry.last_decayed = Some(now);
+        advance(entry);
         return;
     };
     let half_lives = age.as_secs_f32() / half_life.as_secs_f32().max(1.0)
         * category_decay_weight(entry.category);
     let factor = 0.5_f32.powf(half_lives.max(0.0));
     entry.relevance = (entry.relevance * factor).clamp(0.0, 1.0);
-    entry.last_decayed = Some(now);
+    advance(entry);
 }
 
 /// A group of entries deemed near-duplicates of one another.
@@ -308,6 +314,11 @@ impl Default for ConsolidationConfig {
 /// estimates the reclaimed text as the summed `memory` length of every
 /// pruned and merged-away entry. This is the pass a store runs under its
 /// write lock; it takes no locks of its own.
+///
+/// An entry whose relevance is not finite — reachable only through
+/// hand-constructed values, since every internal path clamps — is degraded
+/// to zero before the pass runs, so it prunes instead of poisoning decay,
+/// clustering, and merges with NaN arithmetic.
 pub fn consolidate_entries(
     entries: &mut Vec<MemoryEntry>,
     config: &ConsolidationConfig,
@@ -315,6 +326,11 @@ pub fn consolidate_entries(
 ) -> ConsolidationStats {
     let config = config.normalized();
     let entries_before = entries.len();
+    for entry in entries.iter_mut() {
+        if !entry.relevance.is_finite() {
+            entry.relevance = 0.0;
+        }
+    }
     if config.decay {
         for entry in entries.iter_mut() {
             decay_relevance(entry, now, config.half_life);
@@ -563,6 +579,31 @@ mod tests {
     }
 
     #[test]
+    fn decay_relevance_never_redecays_time_across_a_backwards_clock() {
+        let start = SystemTime::now();
+        let half_life = Duration::from_secs(3600);
+        let mut stepped = entry(MemoryCategory::Trajectory, "passed across a clock step");
+        stepped.relevance = 1.0;
+        stepped.created_at = start;
+        decay_relevance(&mut stepped, start + Duration::from_secs(3600), half_life);
+        let after_first_pass = stepped.relevance;
+        decay_relevance(&mut stepped, start + Duration::from_secs(3599), half_life);
+        decay_relevance(&mut stepped, start + Duration::from_secs(3600), half_life);
+        assert!(
+            (stepped.relevance - after_first_pass).abs() < 1e-6,
+            "a pass behind the stamp must neither decay nor rewind it — otherwise the \
+            next pass re-decays already-decayed time: {} vs {}",
+            stepped.relevance,
+            after_first_pass
+        );
+        assert_eq!(
+            stepped.last_decayed,
+            Some(start + Duration::from_secs(3600)),
+            "the stamp stays at the latest pass, never steps back"
+        );
+    }
+
+    #[test]
     fn decay_resists_for_recently_accessed_entries() {
         let now = SystemTime::now();
         let half_life = Duration::from_secs(3600);
@@ -769,6 +810,33 @@ mod tests {
             the default floor"
         );
         assert_eq!(entries.len(), 2, "NaN thresholds behave like the defaults");
+    }
+
+    #[test]
+    fn a_non_finite_relevance_prunes_instead_of_poisoning_the_pass() {
+        let now = SystemTime::now();
+        let mut healthy = entry(
+            MemoryCategory::Strategy,
+            "commit only after the build passes",
+        );
+        healthy.relevance = 0.9;
+        let mut nan = entry(MemoryCategory::Strategy, "poisoned by a NaN relevance");
+        nan.relevance = f32::NAN;
+        let mut infinite = entry(MemoryCategory::Strategy, "poisoned by an infinite one");
+        infinite.relevance = f32::INFINITY;
+
+        let mut entries = vec![healthy, nan, infinite];
+        let stats = consolidate_entries(&mut entries, &ConsolidationConfig::default(), now);
+        assert_eq!(
+            stats.pruned, 2,
+            "a hand-constructed non-finite relevance degrades to zero and prunes, \
+            instead of failing every comparison and surviving"
+        );
+        assert_eq!(entries.len(), 1, "only the healthy entry remains");
+        assert!(
+            (entries[0].relevance - 0.9).abs() < 1e-6,
+            "the healthy entry's relevance is untouched by its neighbours' sanitization"
+        );
     }
 
     #[test]

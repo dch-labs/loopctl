@@ -1,12 +1,10 @@
 # Reference consumer workflow, maintained in the difftrace repo
-# (examples/difftrace-review.yml). Copy verbatim, then bump the
-# DIFFTRACE_VERSION and DIFFTRACE_SHA256 env values together on every
-# difftrace release. Local deviations: the pin lives in workflow env
-# values (one copy), the token-mint steps note why contents:write is
-# required, the chat concurrency group is keyed by PR so re-reviews
-# serialize, the chat model env drops the dispatch-only inputs.model
-# term, the gate job narrows its token to contents:read, and trajectory
-# uploads wait for a successful token mint.
+# (examples/difftrace-review.yml). Copy verbatim; on every difftrace
+# release bump the two version+checksum pins below. Local deviations:
+# the chat job is intentionally memory-less (learnings accumulate from
+# the full reviews in the review job), and the review job caches
+# difftrace memory across runs under a key built from the resolved
+# pull request number and the head SHA it resolves in a step.
 name: difftrace review
 
 on:
@@ -29,17 +27,16 @@ permissions:
   pull-requests: write
   contents: read
 
-env:
-  DIFFTRACE_VERSION: 0.4.1
-  DIFFTRACE_SHA256: a92adaa9e816de63dbd0c31fef87027f2485ab5c11411c8d93ae4117125b95c9
-
 jobs:
   review:
     name: Review the pull request
     runs-on: ubuntu-latest
     concurrency:
-      group: difftrace-review-${{ inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id }}
-      cancel-in-progress: true
+      # One lane per pull request, shared with the chat job: reviews and
+      # comment commands serialize instead of racing the registry,
+      # threads, and memory. Queued runs pick up the head at start time.
+      group: difftrace-${{ inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      cancel-in-progress: false
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -49,14 +46,15 @@ jobs:
       - name: Resolve the pull request number
         id: pr
         env:
+          GH_TOKEN: ${{ github.token }}
           PR: ${{ inputs.pr || github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
+          sha=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
-      # pull_request events are fork-gated by the job-level `if`; this step
-      # covers workflow_dispatch, whose payload carries no fork flag — any
-      # new trigger type needs its own gate.
       - name: Reject fork pull requests
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -67,14 +65,13 @@ jobs:
           fork=$(gh api "repos/$REPO/pulls/$PR" --jq .head.repo.fork)
           case "$fork" in false) ;; *) echo "difftrace does not run on fork pull requests" >&2; exit 1;; esac
 
-      # The binary is pinned by the DIFFTRACE_VERSION and DIFFTRACE_SHA256
-      # env values at the top of this file; bump both together on every
-      # difftrace release.
-      - name: Install difftrace
+      # The binary is pinned to the tagged v0.8.0 release; bump version and
+      # checksum together on every difftrace release.
+      - name: Install difftrace v0.8.0
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            "https://github.com/dch-labs/difftrace/releases/download/v${DIFFTRACE_VERSION}/difftrace-${DIFFTRACE_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-          echo "${DIFFTRACE_SHA256}  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.8.0/difftrace-0.8.0-x86_64-unknown-linux-gnu.tar.gz
+          echo "fd6c0029258dfc0d289d6cb1c8b2189efd33dc758b21552f029e81a6c2f2e8dd  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -95,24 +92,33 @@ jobs:
           app-id: ${{ secrets.DIFFTRACE_APP_ID }}
           private-key: ${{ secrets.DIFFTRACE_APP_PRIVATE_KEY }}
           permission-pull-requests: write
-          # contents:write is required: the resolveReviewThread mutation
-          # rejects read-scoped installation tokens.
           permission-contents: write
+
+      - name: Restore the review memory
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.difftrace/memory
+          key: difftrace-mem-${{ github.repository }}-pr${{ steps.pr.outputs.pr }}-${{ steps.pr.outputs.sha }}
+          restore-keys: |
+            difftrace-mem-${{ github.repository }}-pr${{ steps.pr.outputs.pr }}-
+            difftrace-mem-${{ github.repository }}-
 
       - name: Review the pull request
         run: |
-          difftrace review --repo "$REPO" --pr "$PR"
+          difftrace review --repo "$REPO" --pr "$PR" --memory "$HOME/.difftrace/memory/learnings.md"
         env:
           PR: ${{ steps.pr.outputs.pr }}
           REPO: ${{ github.repository }}
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           DIFFTRACE_PROFILE: zai
+          DIFFTRACE_MAX_TOKENS: '32768'
+          DIFFTRACE_STREAM_TIMEOUT_SECS: '900'
           DIFFTRACE_MODEL: ${{ inputs.model || vars.DIFFTRACE_MODEL || 'glm-4.7' }}
           RUST_LOG: info
 
       - name: Upload trajectory
-        if: ${{ !cancelled() && steps.app-token.conclusion == 'success' }}
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: difftrace-trajectory-pr${{ steps.pr.outputs.pr }}
@@ -149,6 +155,8 @@ jobs:
           echo "skip=" >> "$GITHUB_OUTPUT"
           if printf '%s' "$BODY" | head -n 1 | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]+review([[:space:]]|$)'; then
             echo "verb=review" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$BODY" | head -n 1 | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]+plan([[:space:]]|$)'; then
+            echo "verb=plan" >> "$GITHUB_OUTPUT"
           else
             echo "verb=reply" >> "$GITHUB_OUTPUT"
           fi
@@ -170,10 +178,14 @@ jobs:
 
   chat:
     name: Handle a difftrace command
+    # Intentionally memory-less: replies and plans answer the thread at
+    # hand; learnings accumulate from the full reviews in the review job.
     needs: gate
     runs-on: ubuntu-latest
     concurrency:
-      group: difftrace-chat-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      # Shared with the review job's lane: a re-review command waits for
+      # any in-flight review instead of racing it.
+      group: difftrace-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
       cancel-in-progress: false
     if: needs.gate.outputs.skip == ''
     steps:
@@ -186,14 +198,13 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      # The binary is pinned by the DIFFTRACE_VERSION and DIFFTRACE_SHA256
-      # env values at the top of this file; bump both together on every
-      # difftrace release.
-      - name: Install difftrace
+      # The binary is pinned to the tagged v0.8.0 release; bump version and
+      # checksum together on every difftrace release.
+      - name: Install difftrace v0.8.0
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            "https://github.com/dch-labs/difftrace/releases/download/v${DIFFTRACE_VERSION}/difftrace-${DIFFTRACE_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-          echo "${DIFFTRACE_SHA256}  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.8.0/difftrace-0.8.0-x86_64-unknown-linux-gnu.tar.gz
+          echo "fd6c0029258dfc0d289d6cb1c8b2189efd33dc758b21552f029e81a6c2f2e8dd  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -214,14 +225,14 @@ jobs:
           app-id: ${{ secrets.DIFFTRACE_APP_ID }}
           private-key: ${{ secrets.DIFFTRACE_APP_PRIVATE_KEY }}
           permission-pull-requests: write
-          # contents:write is required: the resolveReviewThread mutation
-          # rejects read-scoped installation tokens.
           permission-contents: write
 
       - name: Run the command
         run: |
           if [ "$VERB" = "review" ]; then
             difftrace review --repo "$REPO" --pr "$PR"
+          elif [ "$VERB" = "plan" ] && [ "$COMMENT_KIND" = "review" ]; then
+            difftrace plan --repo "$REPO" --pr "$PR" --review-comment "$COMMENT_ID"
           elif [ "$COMMENT_KIND" = "issue" ]; then
             difftrace reply --repo "$REPO" --pr "$PR" --issue-comment "$COMMENT_ID"
           else
@@ -236,11 +247,13 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           DIFFTRACE_PROFILE: zai
-          DIFFTRACE_MODEL: ${{ vars.DIFFTRACE_MODEL || 'glm-4.7' }}
+          DIFFTRACE_MAX_TOKENS: '32768'
+          DIFFTRACE_STREAM_TIMEOUT_SECS: '900'
+          DIFFTRACE_MODEL: ${{ inputs.model || vars.DIFFTRACE_MODEL || 'glm-4.7' }}
           RUST_LOG: info
 
       - name: Upload trajectory
-        if: ${{ !cancelled() && steps.app-token.conclusion == 'success' }}
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: difftrace-trajectory-pr${{ steps.pr.outputs.pr }}-chat

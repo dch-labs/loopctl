@@ -67,11 +67,14 @@ pub struct MemoryEntry {
     /// time or boost it on repeated access.
     pub relevance: f32,
 
-    /// Number of times this entry has been retrieved.
+    /// Number of consolidation passes in which this entry was retrieved.
     ///
-    /// Popularity counter incremented each time the entry is surfaced,
-    /// feeding into ranking (frequently retrieved entries are deemed more
-    /// useful) and protecting high-traffic entries from pruning.
+    /// Popularity counter fed by the store's access log: `retrieve()`
+    /// records each surfacing, and the next `consolidate()` pass folds the
+    /// log in — incrementing the count once per pass in which the entry
+    /// was retrieved, not once per retrieval. Feeds into ranking
+    /// (frequently retrieved entries are deemed more useful) and protects
+    /// high-traffic entries from pruning.
     pub access_count: usize,
 
     /// Whether this entry has been validated. Consolidation prefers keeping validated entries.
@@ -80,6 +83,28 @@ pub struct MemoryEntry {
     /// builder. Consolidation treats validated entries as higher-trust and is
     /// less likely to prune them during a cleanup pass.
     pub validated: bool,
+
+    /// When this entry was last returned by `retrieve()`.
+    ///
+    /// `None` until first retrieved. Drives the recency factor in
+    /// [`quality_score`](crate::memory::consolidate::quality_score) and the
+    /// decay baseline: an entry retrieved recently resists decay even when
+    /// its [`created_at`](Self::created_at) is old. Stores that track access
+    /// stamp it; entries serialized before the field existed deserialize
+    /// with `None`.
+    #[serde(default)]
+    pub last_accessed: Option<SystemTime>,
+
+    /// When decay was last applied to this entry's relevance.
+    ///
+    /// `None` until the first consolidation pass. Decay advances from this
+    /// stamp (or the access/creation baseline when unset), so repeated
+    /// passes apply the elapsed time exactly once — the multi-pass total
+    /// equals a single pass over the same age. Entries serialized before
+    /// the field existed deserialize with `None` and decay from their
+    /// baseline on the next pass.
+    #[serde(default)]
+    pub last_decayed: Option<SystemTime>,
 }
 
 impl Default for MemoryEntry {
@@ -93,6 +118,8 @@ impl Default for MemoryEntry {
             relevance: 0.5,
             access_count: 0,
             validated: false,
+            last_accessed: None,
+            last_decayed: None,
         }
     }
 }
@@ -128,6 +155,8 @@ impl MemoryEntry {
             relevance: 1.0,
             access_count: 0,
             validated: false,
+            last_accessed: None,
+            last_decayed: None,
         }
     }
 

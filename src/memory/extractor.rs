@@ -266,9 +266,10 @@ pub async fn extract_from_record(
 /// not twelve); deduplicating before the `max_memories` truncation keeps
 /// the cap from being spent on repeats that crowd out other candidates.
 fn dedupe_candidates(memories: &mut Vec<ExtractedMemory>) {
-    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(&'static str, String)> =
+        std::collections::HashSet::new();
     memories
-        .retain(|memory| seen.insert((format!("{:?}", memory.category), memory.content.clone())));
+        .retain(|memory| seen.insert((category_label(memory.category), memory.content.clone())));
 }
 
 /// Build the store-ready [`MemoryEntry`] for one mined memory.
@@ -756,12 +757,13 @@ refine, merge, generalize, and drop the weak ones:\n";
     let summary_budget = config
         .llm_context_budget
         .saturating_sub(system.len().saturating_add(preamble_len));
+    let summary = summarize_trajectory(record, summary_budget);
     if let Some(candidates) = heuristic_candidates {
         system.push_str(PREAMBLE);
         let mut candidate_budget = config
             .llm_context_budget
             .saturating_sub(system.len())
-            .saturating_sub(summarize_trajectory(record, summary_budget).len());
+            .saturating_sub(summary.len());
         for candidate in candidates {
             let line = format!("- [{:?}] {}\n", candidate.category, candidate.content);
             if candidate_budget.saturating_sub(line.len()) == 0 {
@@ -772,7 +774,7 @@ refine, merge, generalize, and drop the weak ones:\n";
         }
     }
     let request = StreamRequest {
-        messages: vec![Message::user(summarize_trajectory(record, summary_budget))],
+        messages: vec![Message::user(summary)],
         system: Some(system),
         tools: None,
     };

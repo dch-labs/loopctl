@@ -366,11 +366,6 @@ pub fn consolidate_entries(
     }
 }
 
-/// Swap the cluster's highest-quality member into the canonical slot.
-///
-/// Clustering seeds each cluster with the first entry seen; the canonical
-/// member is defined as the best-scoring one, so merging keeps the
-/// strongest entry's identity and text.
 impl ConsolidationConfig {
     /// Return a pass-safe copy: thresholds outside `0.0..=1.0` — or
     /// non-finite — are replaced by the documented defaults.
@@ -404,6 +399,11 @@ impl ConsolidationConfig {
     }
 }
 
+/// Swap the cluster's highest-quality member into the canonical slot.
+///
+/// Clustering seeds each cluster with the first entry seen; the canonical
+/// member is defined as the best-scoring one, so merging keeps the
+/// strongest entry's identity and text.
 fn promote_highest_quality(cluster: &mut MemoryCluster, now: SystemTime) {
     let mut best_index = None;
     let mut best_score = quality_score(&cluster.canonical, now);

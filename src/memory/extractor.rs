@@ -115,12 +115,14 @@ pub struct ExtractionConfig {
     /// the most instructive recovery pairs, so opt in to learn from them.
     pub include_failures: bool,
 
-    /// Cap on the bytes of trajectory summary fed to the LLM strategies.
+    /// Cap on the bytes of trajectory context fed to the LLM strategies.
     ///
-    /// The summary is built per turn and stops growing at this budget, so
-    /// the provider call stays bounded whatever the run's size. Oversized
-    /// runs lose their oldest turns first — recent work, the most
-    /// instructive part, survives.
+    /// Bounds the combined prompt: the trajectory summary (newest turns
+    /// first, so truncation drops the run's beginning and keeps its
+    /// outcome) plus, for the `Hybrid` strategy, the heuristic candidate
+    /// lines share this budget. The provider call therefore stays bounded
+    /// whatever the run's size; oversized runs lose their oldest turns
+    /// first — recent work, the most instructive part, survives.
     pub llm_context_budget: usize,
 }
 
@@ -170,10 +172,15 @@ pub async fn extract(
     config: &ExtractionConfig,
     client: Option<&dyn ApiClient>,
 ) -> Result<Vec<ExtractedMemory>, LoopError> {
-    let text = std::fs::read_to_string(trajectory_path)
-        .map_err(|err| LoopError::Memory(format!("cannot read trajectory: {err}")))?;
-    let record: TrajectoryRecord = serde_json::from_str(text.trim())
-        .map_err(|err| LoopError::Memory(format!("cannot parse trajectory: {err}")))?;
+    let path = trajectory_path.to_path_buf();
+    let record: TrajectoryRecord = tokio::task::spawn_blocking(move || {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|err| LoopError::Memory(format!("cannot read trajectory: {err}")))?;
+        serde_json::from_str(text.trim())
+            .map_err(|err| LoopError::Memory(format!("cannot parse trajectory: {err}")))
+    })
+    .await
+    .map_err(|err| LoopError::Memory(format!("trajectory reader task failed: {err}")))??;
     extract_from_record(&record, config, client).await
 }
 
@@ -318,8 +325,13 @@ pub async fn extract_into(
 /// spawned task — session teardown never waits on extraction. Because the
 /// trajectory writer queues records asynchronously, the just-finished
 /// record may not be flushed yet when this observer fires; the pass is
-/// best-effort and simply warns in that case. Register this observer
-/// after the trajectory observer to minimize the window.
+/// best-effort, may then mine the previous run's record (consolidation
+/// folds any duplicate lesson away), and simply warns in that case.
+/// Register this observer after the trajectory observer to minimize the
+/// window. The same best-effort contract covers runtime shutdown: an
+/// extraction task still queued when the host drops the tokio runtime is
+/// lost with a log — hosts that require every run's extraction should
+/// call [`extract_into`] directly instead of relying on the observer.
 pub struct ExtractionObserver {
     /// The extraction configuration applied to each mined record.
     ///
@@ -409,7 +421,7 @@ impl LoopObserver for ExtractionObserver {
         let client = self.client.clone();
         let store = Arc::clone(&self.store);
         let spawned = handle.spawn(async move {
-            match last_complete_record(&path) {
+            match last_complete_record(&path).await {
                 Ok(Some(record)) => {
                     if let Err(err) =
                         extract_from_record_owned(record, &config, client.as_deref(), &*store).await
@@ -464,12 +476,20 @@ async fn extract_from_record_owned(
 /// parses. [`None`] means nothing in the ledger parses — an empty or
 /// all-torn file — so a best-effort observer can simply skip.
 ///
+/// The file read runs on the blocking thread pool, so a large ledger
+/// never stalls a tokio worker.
+///
 /// # Errors
 ///
 /// [`LoopError::Memory`] when the ledger cannot be read at all.
-fn last_complete_record(path: &Path) -> Result<Option<TrajectoryRecord>, LoopError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|err| LoopError::Memory(format!("cannot read trajectory ledger: {err}")))?;
+async fn last_complete_record(path: &Path) -> Result<Option<TrajectoryRecord>, LoopError> {
+    let path = path.to_path_buf();
+    let text = tokio::task::spawn_blocking(move || {
+        std::fs::read_to_string(&path)
+            .map_err(|err| LoopError::Memory(format!("cannot read trajectory ledger: {err}")))
+    })
+    .await
+    .map_err(|err| LoopError::Memory(format!("trajectory reader task failed: {err}")))??;
     let parsed = text
         .lines()
         .rev()
@@ -640,16 +660,22 @@ struct LlmMemoryWire {
 
 /// Render a compact, budget-capped transcript for the LLM strategies.
 ///
-/// Keeps what generalizes — outcome, per-turn tool names with ok/error
-/// flags, and trimmed query/response text — and stops appending once the
-/// byte budget is reached, so the provider call stays bounded whatever the
-/// run's size.
+/// Turns are rendered newest-first — when a long run must be truncated,
+/// the dropped part is the old beginning and the surviving summary ends
+/// where the run ended, which is where the outcome lives. Apart from the
+/// fixed outcome header — which always rides along, however small the
+/// budget — the returned summary never exceeds `budget` bytes: the
+/// truncation marker is reserved before any turn line is appended. Keeps
+/// what generalizes — outcome, turn index, per-turn tool names with
+/// ok/error flags, and trimmed query and response text.
 fn summarize_trajectory(record: &TrajectoryRecord, budget: usize) -> String {
-    let mut summary = format!(
+    let header = format!(
         "outcome: {:?}\ntotal turns: {}\n",
         record.outcome, record.total_turns
     );
-    for turn in &record.turns {
+    let mut lines: Vec<String> = Vec::new();
+    let mut used = header.len();
+    for turn in record.turns.iter().rev() {
         let tools = turn
             .tool_calls
             .iter()
@@ -663,15 +689,21 @@ fn summarize_trajectory(record: &TrajectoryRecord, budget: usize) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         let line = format!(
-            "turn: {} | tools: {} | query: {}\n",
-            truncate(&turn.response_text, 160),
+            "turn: {} | tools: {} | query: {} | response: {}\n",
+            turn.turn,
             tools,
-            truncate(&turn.query, 200)
+            truncate(&turn.query, 200),
+            truncate(&turn.response_text, 160),
         );
-        if summary.len().saturating_add(line.len()) > budget {
-            summary.push_str("…\n");
+        if used.saturating_add(line.len()) > budget.saturating_sub(2) {
+            lines.push("…\n".to_string());
             break;
         }
+        used = used.saturating_add(line.len());
+        lines.push(line);
+    }
+    let mut summary = header;
+    for line in lines {
         summary.push_str(&line);
     }
     summary
@@ -718,8 +750,16 @@ async fn llm_memories(
             "\nCandidate lessons already mined from this trajectory follow; \
                          refine, merge, generalize, and drop the weak ones:\n",
         );
+        let mut candidate_budget = config
+            .llm_context_budget
+            .saturating_sub(summarize_trajectory(record, config.llm_context_budget).len())
+            .min(config.llm_context_budget);
         for candidate in candidates {
             let line = format!("- [{:?}] {}\n", candidate.category, candidate.content);
+            if candidate_budget.saturating_sub(line.len()) == 0 {
+                break;
+            }
+            candidate_budget = candidate_budget.saturating_sub(line.len());
             system.push_str(&line);
         }
     }
@@ -1224,6 +1264,7 @@ mod tests {
         std::fs::write(&path, format!("{json}\n{{\"session_id\":\"x\",\"run_i"))
             .expect("ledger writes");
         let found = last_complete_record(&path)
+            .await
             .expect("a torn tail is not an error")
             .expect("the complete line is found");
         std::fs::remove_file(&path).ok();
@@ -1244,5 +1285,93 @@ mod tests {
             duration_ms: 100,
         });
         tokio::task::yield_now().await;
+    }
+
+    #[test]
+    fn summary_labels_turns_and_responses_newest_first_within_budget() {
+        let turns = vec![
+            turn(0, "first query alpha", vec![call("Read", true)]),
+            turn(1, "second query beta", vec![call("Edit", true)]),
+            turn(2, "third query gamma", vec![call("Bash", true)]),
+        ];
+        let mut record = record(TrajectoryOutcome::Success, turns);
+        record.turns[0].response_text = "first response".to_string();
+        record.turns[2].response_text = "third response".to_string();
+        let summary = summarize_trajectory(&record, 8_000);
+        assert!(
+            summary.contains("turn: 0")
+                && summary.contains("turn: 1")
+                && summary.contains("turn: 2"),
+            "every turn line carries its index"
+        );
+        let third = summary.find("turn: 2").expect("turn 2 present");
+        let first = summary.find("turn: 0").expect("turn 0 present");
+        assert!(
+            third < first,
+            "newest turns render first so truncation drops the run's beginning"
+        );
+        let line_end = third + summary[third..].find('\n').unwrap_or(0);
+        let line = &summary[third..line_end];
+        let response_at = line.find("response:").expect("response field labeled");
+        let value_at = line.find("third response").expect("response text present");
+        assert!(
+            value_at > response_at,
+            "the response text lands after the response label, not after turn:"
+        );
+        let tiny = summarize_trajectory(&record, 120);
+        assert!(
+            tiny.len() <= 120 + "outcome: Success\n".len() + "total turns: 3\n".len(),
+            "apart from the fixed header, the marker is reserved and the cap holds: \
+            {} bytes",
+            tiny.len()
+        );
+        assert!(tiny.ends_with("…\n"), "a truncated summary is marked");
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn hybrid_candidates_share_the_context_budget() {
+        let turns: Vec<TrajectoryTurn> = (0..40)
+            .map(|index| {
+                turn(
+                    index,
+                    &format!("query number {index} with padding to fill the summary"),
+                    vec![call("Read", true)],
+                )
+            })
+            .collect();
+        let trajectory = record(TrajectoryOutcome::Success, turns);
+        let candidates: Vec<ExtractedMemory> = (0..200)
+            .map(|index| ExtractedMemory {
+                category: MemoryCategory::Strategy,
+                content: format!("lesson number {index} with several words to fill the budget"),
+                tags: Vec::new(),
+                quality: 0.6,
+            })
+            .collect();
+        let mut config = ExtractionConfig::default();
+        config.strategy = ExtractionStrategy::Llm;
+        config.llm_context_budget = 900;
+        let client = MockApiClient::new("test-model").with_text_response("[]");
+        llm_memories(&trajectory, &config, &client, Some(&candidates))
+            .await
+            .expect("an empty array is a valid answer");
+        let request = &client.captured_requests()[0];
+        let total = request.system.as_ref().map_or(0, String::len)
+            + request
+                .messages
+                .iter()
+                .map(|message| message.text_content().len())
+                .sum::<usize>();
+        assert!(
+            total <= config.llm_context_budget + 400,
+            "summary plus candidates stay bounded by the configured budget \
+            (got {total} bytes)"
+        );
+        let user_text = request.messages[0].text_content();
+        assert!(
+            user_text.contains("turn: 39") && !user_text.contains("turn: 0 "),
+            "truncation keeps the newest turns and drops the run's beginning"
+        );
     }
 }

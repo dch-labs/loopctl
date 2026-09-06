@@ -1,6 +1,8 @@
 # Reference consumer workflow, maintained in the difftrace repo
 # (examples/difftrace-review.yml). Copy verbatim; on every difftrace
-# release bump the two version+checksum pins below.
+# release bump the two version+checksum pins below. Local deviation: the
+# chat job's concurrency group is keyed by PR, not comment id — commands
+# on one PR mutate shared review state and must serialize.
 name: difftrace review
 
 on:
@@ -157,7 +159,7 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     concurrency:
-      group: difftrace-chat-${{ github.event.comment.id || github.run_id }}
+      group: difftrace-chat-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
       cancel-in-progress: false
     if: needs.gate.outputs.skip == ''
     steps:

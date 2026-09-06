@@ -170,16 +170,14 @@ pub fn cluster_duplicates(
     similarity_threshold: f32,
 ) -> Vec<MemoryCluster> {
     let mut clusters: Vec<MemoryCluster> = Vec::new();
+    let mut cluster_tokens: Vec<HashSet<String>> = Vec::new();
     for entry in entries {
         let tokens = normalized_tokens(&entry.memory);
         let mut placed = false;
-        for cluster in &mut clusters {
+        for (cluster, canonical_tokens) in clusters.iter_mut().zip(cluster_tokens.iter()) {
             let same_category = std::mem::discriminant(&cluster.canonical.category)
                 == std::mem::discriminant(&entry.category);
-            if same_category
-                && jaccard(&tokens, &normalized_tokens(&cluster.canonical.memory))
-                    >= similarity_threshold
-            {
+            if same_category && jaccard(&tokens, canonical_tokens) >= similarity_threshold {
                 cluster.duplicates.push(entry.clone());
                 placed = true;
                 break;
@@ -190,6 +188,7 @@ pub fn cluster_duplicates(
                 canonical: entry.clone(),
                 duplicates: Vec::new(),
             });
+            cluster_tokens.push(tokens);
         }
     }
     clusters
@@ -231,6 +230,13 @@ pub fn merge_cluster(cluster: MemoryCluster) -> MemoryEntry {
 
 /// Which consolidation behaviours to run, and with which parameters.
 ///
+/// The struct is publicly constructible and `Clone`, so
+/// [`consolidate_entries`] never trusts it: thresholds are normalized once
+/// per pass — values outside `0.0..=1.0` or non-finite fall back to the
+/// documented defaults — so a misconfigured store degrades to
+/// conservative behaviour instead of merging every same-category pair or
+/// pruning everything.
+///
 /// The default runs the full pass — decay with a 14-day half-life, merge at
 /// a 0.6 similarity threshold, and a 0.05 quality floor matching the
 /// store's historical relevance floor — so out-of-the-box behaviour is
@@ -263,6 +269,9 @@ pub struct ConsolidationConfig {
     /// token sets reaches this value within one category. Lower values merge
     /// more aggressively; 0.6 folds re-worded repeats while keeping genuine
     /// paraphrases — which carry real information differences — separate.
+    ///
+    /// Normalized per pass: values outside `0.0..=1.0`, or non-finite,
+    /// fall back to the default.
     pub merge_threshold: f32,
 
     /// Prune entries whose post-decay relevance **or** composite
@@ -271,7 +280,9 @@ pub struct ConsolidationConfig {
     /// The relevance half preserves the historical pruning contract — an
     /// entry stored below the floor is dropped on the first pass however
     /// fresh it is — while the quality half ages out stale, never-accessed
-    /// knowledge that decay has hollowed out.
+    /// knowledge that decay has hollowed out. Normalized per pass:
+    /// values outside `0.0..=1.0`, or non-finite, fall back to the
+    /// default.
     pub prune_floor: f32,
 }
 
@@ -299,6 +310,7 @@ pub fn consolidate_entries(
     config: &ConsolidationConfig,
     now: SystemTime,
 ) -> ConsolidationStats {
+    let config = config.normalized();
     let entries_before = entries.len();
     if config.decay {
         for entry in entries.iter_mut() {
@@ -356,6 +368,34 @@ pub fn consolidate_entries(
 /// Clustering seeds each cluster with the first entry seen; the canonical
 /// member is defined as the best-scoring one, so merging keeps the
 /// strongest entry's identity and text.
+impl ConsolidationConfig {
+    /// Return a pass-safe copy: thresholds outside `0.0..=1.0` — or
+    /// non-finite — are replaced by the documented defaults.
+    ///
+    /// The config is `Clone` and publicly constructible, so validation at
+    /// construction cannot hold. Falling back to the defaults (rather than
+    /// clamping) is deliberate: a clamped-to-zero merge threshold would
+    /// merge every same-category entry, and a clamped-to-one prune floor
+    /// would prune every entry — the exact destruction the normalization
+    /// exists to prevent. The default fallback can only narrow behaviour.
+    fn normalized(&self) -> Self {
+        let normalize = |value: f32, default: f32| {
+            if value.is_finite() && (0.0..=1.0).contains(&value) {
+                value
+            } else {
+                default
+            }
+        };
+        Self {
+            decay: self.decay,
+            half_life: self.half_life,
+            merge: self.merge,
+            merge_threshold: normalize(self.merge_threshold, Self::default().merge_threshold),
+            prune_floor: normalize(self.prune_floor, Self::default().prune_floor),
+        }
+    }
+}
+
 fn promote_highest_quality(cluster: &mut MemoryCluster, now: SystemTime) {
     let mut best_index = None;
     let mut best_score = quality_score(&cluster.canonical, now);
@@ -664,6 +704,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn garbage_thresholds_degrade_to_conservative_behaviour() {
+        let now = SystemTime::now();
+        let mut alpha = entry(MemoryCategory::Strategy, "run the build before committing");
+        alpha.relevance = 0.9;
+        let mut beta = entry(
+            MemoryCategory::Strategy,
+            "totally different advice about tests",
+        );
+        beta.relevance = 0.9;
+        let mut keeper = entry(MemoryCategory::Fact, "durable and validated");
+        keeper.relevance = 0.9;
+        keeper.validated = true;
+
+        let mut entries = vec![alpha.clone(), beta.clone(), keeper.clone()];
+        let mut config = ConsolidationConfig::default();
+        config.merge_threshold = -1.0;
+        let stats = consolidate_entries(&mut entries, &config, now);
+        assert_eq!(
+            stats.merged, 0,
+            "a negative threshold falls back to the default, so distinct same-category \
+            texts stay separate"
+        );
+        assert_eq!(entries.len(), 3, "nothing merged, nothing pruned");
+
+        let mut entries = vec![alpha.clone(), beta, keeper.clone()];
+        let mut config = ConsolidationConfig::default();
+        config.prune_floor = 2.0;
+        let stats = consolidate_entries(&mut entries, &config, now);
+        assert_eq!(
+            stats.entries_after,
+            entries.len(),
+            "stats describe the same store the mutation produced"
+        );
+        assert_eq!(
+            entries.len(),
+            3,
+            "a floor above 1.0 falls back to the default and must not prune anything"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.memory == "durable and validated"),
+            "the validated high-relevance entry survives the clamped floor"
+        );
+
+        let mut entries = vec![alpha, keeper];
+        let mut config = ConsolidationConfig::default();
+        config.merge_threshold = f32::NAN;
+        config.prune_floor = f32::NAN;
+        let stats = consolidate_entries(&mut entries, &config, now);
+        assert_eq!(
+            stats.pruned, 0,
+            "NaN thresholds fall back to the defaults, and healthy entries are above \
+            the default floor"
+        );
+        assert_eq!(entries.len(), 2, "NaN thresholds behave like the defaults");
+    }
     #[test]
     fn bytes_saved_is_nonzero_when_entries_are_removed() {
         let now = SystemTime::now();

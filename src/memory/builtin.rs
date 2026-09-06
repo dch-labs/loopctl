@@ -266,6 +266,14 @@ impl LoopMemory for InMemoryStore {
     /// The query is matched case-insensitively against both the entry
     /// [`memory`](MemoryEntry::memory) and [`tags`](MemoryEntry::tags).
     ///
+    /// Only entries whose score reflects an actual query match — a word
+    /// overlap or a tag hit, not the always-present baseline — are recorded
+    /// in the access log. Baseline-only returns (possible when the store is
+    /// sparser than `limit`) are delivered but never stamped, so repeated
+    /// irrelevant queries cannot inflate [`access_count`](MemoryEntry::access_count)
+    /// or [`last_accessed`](MemoryEntry::last_accessed) and shield entries
+    /// from decay.
+    ///
     /// # Returns
     ///
     /// A `Vec<MemoryEntry>` of at most `limit` entries, sorted by descending
@@ -299,7 +307,7 @@ impl LoopMemory for InMemoryStore {
             let entries = crate::error::recover_guard(self.entries.read());
             let snapshot: Vec<MemoryEntry> = entries.iter().cloned().collect();
             drop(entries);
-            let mut scored: Vec<(f32, MemoryEntry)> = snapshot
+            let mut scored: Vec<(f32, bool, MemoryEntry)> = snapshot
                 .into_iter()
                 .map(|entry| {
                     let memory_lower = entry.memory.to_lowercase();
@@ -319,8 +327,10 @@ impl LoopMemory for InMemoryStore {
                         0.0
                     };
                     let tag_bonus = if tag_match { 0.3 } else { 0.0 };
+                    let matched = word_matches > 0 || tag_match;
                     (
                         base_score * 0.5 + query_bonus * 0.4 + tag_bonus + 0.1,
+                        matched,
                         entry,
                     )
                 })
@@ -328,14 +338,22 @@ impl LoopMemory for InMemoryStore {
 
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-            let selected: Vec<MemoryEntry> =
-                scored.into_iter().take(limit).map(|(_, e)| e).collect();
+            let selected: Vec<(bool, MemoryEntry)> = scored
+                .into_iter()
+                .take(limit)
+                .map(|(_, matched, e)| (matched, e))
+                .collect();
             let now = SystemTime::now();
             let mut access_log = crate::error::recover_guard(self.access_log.lock());
-            for entry in &selected {
-                access_log.insert(entry.id, now);
+            for (matched, entry) in &selected {
+                if !matched {
+                    continue;
+                }
+                let stamp = access_log.get(&entry.id).copied();
+                let newest = stamp.map_or(Some(now), |existing| Some(existing.max(now)));
+                access_log.insert(entry.id, newest.unwrap_or(now));
             }
-            Ok(selected)
+            Ok(selected.into_iter().map(|(_, e)| e).collect())
         })
     }
 
@@ -456,6 +474,54 @@ mod tests {
         let store = InMemoryStore::new();
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn baseline_only_retrievals_are_never_stamped() {
+        let store = InMemoryStore::new();
+
+        let mut matching = MemoryEntry::new(MemoryCategory::Insight, "deploy checklist nightly");
+        matching.relevance = 0.4;
+        store.store(matching).await.unwrap();
+
+        for index in 0..4 {
+            let mut filler = MemoryEntry::new(
+                MemoryCategory::Fact,
+                format!("unrelated fact number {index} about rust compilers"),
+            );
+            filler.relevance = 1.0;
+            store.store(filler).await.unwrap();
+        }
+
+        let hits = store.retrieve("deploy checklist", 3).await.unwrap();
+        assert_eq!(hits.len(), 3, "top-limit entries are returned as before");
+        assert!(
+            hits.iter().any(|entry| entry.memory.contains("deploy")),
+            "the matching entry is among the returned entries"
+        );
+
+        let stats = store.consolidate().await.unwrap();
+        assert_eq!(stats.entries_before, 5, "the pass saw every entry");
+        let entries = crate::error::recover_guard(store.entries.read()).clone();
+        let deployed = entries
+            .iter()
+            .find(|entry| entry.memory.contains("deploy"))
+            .expect("the matching entry survived");
+        assert_eq!(
+            deployed.access_count, 1,
+            "the query-matching entry was stamped exactly once"
+        );
+        assert!(deployed.last_accessed.is_some());
+        for entry in entries
+            .iter()
+            .filter(|entry| !entry.memory.contains("deploy"))
+        {
+            assert!(
+                entry.last_accessed.is_none() && entry.access_count == 0,
+                "baseline-only returns must not inflate access: {}",
+                entry.memory
+            );
+        }
     }
 
     #[tokio::test]

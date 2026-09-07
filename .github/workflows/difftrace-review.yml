@@ -3,6 +3,12 @@
 # every difftrace release, bump the ref in the uses: line below —
 # release.sh pins in the difftrace repo prints the exact line: a fixed
 # commit carrying the release's binary version+checksum pins.
+#
+# What the pinned callee enforces on its side — the jobs are not in this
+# file: fork and dependabot pull requests are rejected; command authors
+# must be collaborators with write; required secrets fail fast with
+# named messages; the binary is checksum-pinned; all writes go through
+# a least-privilege app token.
 name: difftrace review
 
 on:
@@ -27,7 +33,7 @@ permissions:
 
 jobs:
   review:
-    uses: dch-labs/difftrace/.github/workflows/review.yml@704613b81fbb484964052c57e4bd2891cc5ebd16 # v0.9.0
+    uses: dch-labs/difftrace/.github/workflows/review.yml@d73e50dc2f6511b4a0012847992e222846423107 # v0.10.0
     with:
       pr: ${{ inputs.pr }}
       model: ${{ inputs.model }}

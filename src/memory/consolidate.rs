@@ -279,8 +279,9 @@ pub struct ConsolidationConfig {
     /// more aggressively; 0.6 folds re-worded repeats while keeping genuine
     /// paraphrases — which carry real information differences — separate.
     ///
-    /// Normalized per pass: values outside `0.0..=1.0`, or non-finite,
-    /// fall back to the default.
+    /// Normalized per pass: values outside `(0.0..=1.0]` — including zero,
+    /// since disjoint sets score exactly `0.0` and would then merge every
+    /// same-category entry — or non-finite, fall back to the default.
     pub merge_threshold: f32,
 
     /// Prune entries whose post-decay relevance **or** composite
@@ -383,7 +384,7 @@ pub fn consolidate_entries(
 }
 
 impl ConsolidationConfig {
-    /// Return a pass-safe copy: thresholds outside `0.0..=1.0` — or
+    /// Return a pass-safe copy: thresholds outside their valid range — or
     /// non-finite — are replaced by the documented defaults.
     ///
     /// The config is `Clone` and publicly constructible, so validation at
@@ -392,13 +393,22 @@ impl ConsolidationConfig {
     /// merge every same-category entry, and a clamped-to-one prune floor
     /// would prune every entry — the exact destruction the normalization
     /// exists to prevent. The default fallback can only narrow behaviour.
+    ///
+    /// `merge_threshold` is additionally valid only *above* zero: disjoint
+    /// token sets have Jaccard exactly `0.0`, so a threshold of `0.0`
+    /// satisfies `jaccard >= threshold` for every same-category pair and
+    /// collapses the whole category into one entry — in range and finite,
+    /// but destructive all the same. `prune_floor` keeps `0.0` (nothing
+    /// sits below a zero floor).
     fn normalized(&self) -> Self {
-        let normalize = |value: f32, default: f32| {
-            if value.is_finite() && (0.0..=1.0).contains(&value) {
-                value
-            } else {
-                default
-            }
+        let normalize = |value: f32, default: f32, exclusive_zero: bool| {
+            let in_range = value.is_finite()
+                && if exclusive_zero {
+                    (0.0..=1.0).contains(&value) && value > 0.0
+                } else {
+                    (0.0..=1.0).contains(&value)
+                };
+            if in_range { value } else { default }
         };
         let half_life = if self.half_life < Duration::from_secs(1) {
             Self::default().half_life
@@ -409,8 +419,8 @@ impl ConsolidationConfig {
             decay: self.decay,
             half_life,
             merge: self.merge,
-            merge_threshold: normalize(self.merge_threshold, Self::default().merge_threshold),
-            prune_floor: normalize(self.prune_floor, Self::default().prune_floor),
+            merge_threshold: normalize(self.merge_threshold, Self::default().merge_threshold, true),
+            prune_floor: normalize(self.prune_floor, Self::default().prune_floor, false),
         }
     }
 }
@@ -777,6 +787,27 @@ mod tests {
             texts stay separate"
         );
         assert_eq!(entries.len(), 3, "nothing merged, nothing pruned");
+
+        let mut entries = vec![alpha.clone(), beta.clone(), keeper.clone()];
+        let mut config = ConsolidationConfig::default();
+        config.merge_threshold = 0.0;
+        let stats = consolidate_entries(&mut entries, &config, now);
+        assert_eq!(
+            stats.merged, 0,
+            "a zero threshold also falls back: disjoint sets score Jaccard 0.0, so \
+            keeping it would collapse every same-category entry into one"
+        );
+        assert_eq!(entries.len(), 3, "nothing merged, nothing pruned");
+
+        let mut entries = vec![alpha.clone(), beta.clone(), keeper.clone()];
+        let mut config = ConsolidationConfig::default();
+        config.prune_floor = 0.0;
+        let stats = consolidate_entries(&mut entries, &config, now);
+        assert_eq!(
+            stats.pruned, 0,
+            "a zero prune floor is valid, not garbage — nothing sits below it"
+        );
+        assert_eq!(entries.len(), 3, "a zero floor prunes nothing");
 
         let mut entries = vec![alpha.clone(), beta, keeper.clone()];
         let mut config = ConsolidationConfig::default();

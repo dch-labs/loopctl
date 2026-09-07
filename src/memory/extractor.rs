@@ -196,12 +196,12 @@ pub async fn extract(
 /// - [`LoopError::Api`] when the `Llm` strategy's provider
 ///   call fails or returns unparseable output (the `Hybrid` strategy falls
 ///   back to its heuristic result instead of erroring).
+#[tracing::instrument(name = "memory.extract", skip_all, level = "debug")]
 pub async fn extract_from_record(
     record: &TrajectoryRecord,
     config: &ExtractionConfig,
     client: Option<&dyn ApiClient>,
 ) -> Result<Vec<ExtractedMemory>, LoopError> {
-    let span = tracing::debug_span!("memory.extract");
     if record.turns.len() < config.min_turns {
         return Ok(Vec::new());
     }
@@ -229,7 +229,10 @@ pub async fn extract_from_record(
         ExtractionStrategy::Hybrid => {
             let candidates = heuristic_memories(record);
             match client {
-                None => candidates,
+                None => {
+                    fallback_outcome = Some(NO_CLIENT);
+                    candidates
+                }
                 Some(client) => {
                     match llm_memories(record, config, client, Some(&candidates)).await {
                         Ok(refined) => refined,
@@ -255,10 +258,7 @@ pub async fn extract_from_record(
     dedupe_candidates(&mut memories);
     memories.truncate(config.max_memories);
     let outcome = settle_outcome(fallback_outcome);
-    {
-        let _entered = span.enter();
-        emit_extraction_metrics(&memories, outcome);
-    }
+    emit_extraction_metrics(&memories, outcome);
     Ok(memories)
 }
 
@@ -341,13 +341,15 @@ pub async fn extract_into(
 /// spawned task — session teardown never waits on extraction. Because the
 /// trajectory writer queues records asynchronously, the just-finished
 /// record may not be flushed yet when this observer fires; the pass is
-/// best-effort, may then mine the previous run's record (consolidation
-/// folds any duplicate lesson away), and simply warns in that case.
-/// Register this observer after the trajectory observer to minimize the
-/// window. The same best-effort contract covers runtime shutdown: an
-/// extraction task still queued when the host drops the tokio runtime is
-/// lost with a log — hosts that require every run's extraction should
-/// call [`extract_into`] directly instead of relying on the observer.
+/// best-effort and may then silently mine the previous run's record
+/// (consolidation folds any duplicate lesson away) — nothing in the logs
+/// distinguishes that case, since the observer has no run id to compare
+/// against. Register this observer after the trajectory observer to
+/// minimize the window. The same best-effort contract covers runtime
+/// shutdown: an extraction task still queued when the host drops the
+/// tokio runtime is lost without executing and without a log — hosts
+/// that require every run's extraction should call [`extract_into`]
+/// directly instead of relying on the observer.
 pub struct ExtractionObserver {
     /// The extraction configuration applied to each mined record.
     ///
@@ -469,9 +471,8 @@ impl LoopObserver for ExtractionObserver {
 ///
 /// # Errors
 ///
-/// Propagates extraction failures and any store failure as
-/// [`LoopError::Memory`]; the observer logs and drops
-/// whatever this returns.
+/// Propagates extraction and store failures unchanged — the observer
+/// logs and drops whatever this returns.
 async fn extract_from_record_owned(
     record: TrajectoryRecord,
     config: &ExtractionConfig,
@@ -914,14 +915,25 @@ fn err_outcome(err: &LoopError) -> &'static str {
     }
 }
 
+/// The attempt outcome for a pass that never reached its provider: the
+/// `Hybrid` strategy is configured but no client was supplied, so the pass
+/// settled on its heuristic half.
+///
+/// Counted distinctly from `ok` so a host that configured `Hybrid` without
+/// wiring a client sees the misconfiguration in telemetry instead of a
+/// forever-`ok` counter.
+const NO_CLIENT: &str = "no_client";
+
 /// The attempt outcome a finished pass reports: the fallback reason when a
-/// hybrid pass settled for its heuristic candidates, `ok` otherwise.
+/// hybrid pass settled for its heuristic candidates — the LLM failure
+/// outcome, or [`NO_CLIENT`] when no client was supplied at all — and
+/// `ok` otherwise.
 ///
 /// Exactly one attempt event is emitted per extraction pass, so a hybrid
-/// fallback reports the LLM failure outcome here instead of pairing an
-/// early failure event with a spurious `ok` at the settle point — the
-/// counter keeps answering "is the model good enough at extraction"
-/// without double-counting the pass.
+/// fallback reports its settle reason here instead of pairing an early
+/// failure event with a spurious `ok` at the settle point — the counter
+/// keeps answering "is the model good enough at extraction" without
+/// double-counting the pass.
 fn settle_outcome(fallback: Option<&'static str>) -> &'static str {
     fallback.unwrap_or("ok")
 }
@@ -1543,6 +1555,32 @@ mod tests {
             "the fallback pass reports the LLM failure, not a second ok"
         );
         assert_eq!(settle_outcome(Some("parse_error")), "parse_error");
+        assert_eq!(
+            settle_outcome(Some(NO_CLIENT)),
+            NO_CLIENT,
+            "a configured-for-hybrid pass with no client reports no_client, not ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clientless_hybrid_pass_mines_heuristically_and_settles_on_no_client() {
+        let trajectory = record(
+            TrajectoryOutcome::Success,
+            vec![
+                turn(0, "read", vec![call("Read", true)]),
+                turn(1, "fail", vec![call("Bash", false)]),
+                turn(2, "recover", vec![call("Bash", true)]),
+            ],
+        );
+        let mut config = ExtractionConfig::default();
+        config.strategy = ExtractionStrategy::Hybrid;
+        let mined = extract_from_record(&trajectory, &config, None)
+            .await
+            .expect("hybrid stays heuristic without a client");
+        assert!(
+            !mined.is_empty(),
+            "the heuristic half still mines without a provider"
+        );
     }
 
     #[tokio::test]

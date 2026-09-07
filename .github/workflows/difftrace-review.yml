@@ -10,8 +10,8 @@
 # must be collaborators with write; required secrets fail fast with
 # named messages; the binary is checksum-pinned; all writes go through
 # a least-privilege app token; concurrency lanes are callee-side too
-# — pushes supersede in-flight reviews and commands queue without
-# dropping.
+# — pushes supersede in-flight reviews and commands queue FIFO without
+# dropping (up to 100 pending; beyond that, arrivals are canceled).
 name: difftrace review
 
 on:
@@ -37,7 +37,7 @@ permissions:
 jobs:
   review:
     if: github.event_name != 'issue_comment' || github.event.issue.pull_request != null
-    uses: dch-labs/difftrace/.github/workflows/review.yml@ea6c910f22707185e025b6c7bb2cc1c25a07ade6 # v0.11.2
+    uses: dch-labs/difftrace/.github/workflows/review.yml@a272e47e1826be342d360227c60ba598b1d4f201 # v0.11.3
     with:
       pr: ${{ github.event.pull_request.number || (github.event.issue.pull_request != null && github.event.issue.number) || inputs.pr }}
       model: ${{ inputs.model }}

@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   review:
-    uses: dch-labs/difftrace/.github/workflows/review.yml@d73e50dc2f6511b4a0012847992e222846423107 # v0.10.0
+    uses: dch-labs/difftrace/.github/workflows/review.yml@ed800d58b310ea3041f57521c15ce989b0bc932d # v0.11.0
     with:
       pr: ${{ inputs.pr }}
       model: ${{ inputs.model }}

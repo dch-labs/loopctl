@@ -464,8 +464,9 @@ fn normalized_tokens(text: &str) -> HashSet<String> {
 /// Jaccard similarity of two token sets: shared tokens over the union.
 ///
 /// Two empty sets are identical (1.0); a non-empty set against an empty
-/// one shares nothing (0.0 via the zero-denominator rule in
-/// [`unit_ratio`](crate::numeric::unit_ratio)).
+/// one shares nothing — a zero intersection over a non-empty union,
+/// which divides to `0.0` through the ordinary
+/// [`unit_ratio`](crate::numeric::unit_ratio) path.
 fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
     if a.is_empty() && b.is_empty() {
         return 1.0;

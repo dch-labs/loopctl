@@ -70,11 +70,12 @@ pub struct MemoryEntry {
     /// Number of consolidation passes in which this entry was retrieved.
     ///
     /// Popularity counter fed by the store's access log: `retrieve()`
-    /// records each surfacing, and the next `consolidate()` pass folds the
-    /// log in — incrementing the count once per pass in which the entry
-    /// was retrieved, not once per retrieval. Feeds into ranking
-    /// (frequently retrieved entries are deemed more useful) and protects
-    /// high-traffic entries from pruning.
+    /// records each matched surfacing — baseline-only returns are
+    /// delivered but never stamped — and the next `consolidate()` pass
+    /// folds the log in, incrementing the count once per pass in which
+    /// the entry was retrieved, not once per retrieval. Feeds into
+    /// ranking (frequently retrieved entries are deemed more useful) and
+    /// protects high-traffic entries from pruning.
     pub access_count: usize,
 
     /// Whether this entry has been validated. Consolidation prefers keeping validated entries.

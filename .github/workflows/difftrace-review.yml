@@ -1,14 +1,17 @@
 # Caller template for the difftrace review workflow
 # (dch-labs/difftrace/.github/workflows/review.yml). Copy verbatim; on
-# every difftrace release, bump the ref in the uses: line below —
-# release.sh pins in the difftrace repo prints the exact line: a fixed
-# commit carrying the release's binary version+checksum pins.
+# every difftrace release, bump the ref in the uses: line below — the
+# `release.sh pins` command in the difftrace repo prints the exact
+# line to copy, a fixed commit carrying the release's binary
+# version+checksum pins.
 #
 # What the pinned callee enforces on its side — the jobs are not in this
 # file: fork and dependabot pull requests are rejected; command authors
 # must be collaborators with write; required secrets fail fast with
 # named messages; the binary is checksum-pinned; all writes go through
-# a least-privilege app token.
+# a least-privilege app token; concurrency lanes are callee-side too
+# — pushes supersede in-flight reviews and commands queue without
+# dropping.
 name: difftrace review
 
 on:
@@ -33,9 +36,10 @@ permissions:
 
 jobs:
   review:
-    uses: dch-labs/difftrace/.github/workflows/review.yml@1a830b666aaa3ce47359d12944260ad1730c38b3 # v0.11.1
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request != null
+    uses: dch-labs/difftrace/.github/workflows/review.yml@ea6c910f22707185e025b6c7bb2cc1c25a07ade6 # v0.11.2
     with:
-      pr: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+      pr: ${{ github.event.pull_request.number || (github.event.issue.pull_request != null && github.event.issue.number) || inputs.pr }}
       model: ${{ inputs.model }}
     secrets:
       ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}

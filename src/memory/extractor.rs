@@ -864,6 +864,9 @@ fn wire_to_extracted(wire: LlmMemoryWire) -> Option<ExtractedMemory> {
         "insight" | "optimization" => MemoryCategory::Insight,
         _ => return None,
     };
+    if wire.content.trim().is_empty() {
+        return None;
+    }
     let mut tags = wire.tags.unwrap_or_default();
     if wire.category.to_lowercase() == "optimization" && !tags.iter().any(|t| t == "optimization") {
         tags.push("optimization".into());
@@ -872,7 +875,11 @@ fn wire_to_extracted(wire: LlmMemoryWire) -> Option<ExtractedMemory> {
         category,
         content: wire.content,
         tags,
-        quality: wire.quality.unwrap_or(0.5).clamp(0.0, 1.0),
+        quality: wire
+            .quality
+            .filter(|q| q.is_finite())
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0),
     })
 }
 
@@ -1347,6 +1354,42 @@ mod tests {
             "api_error",
             "a transport failure keeps the api_error label"
         );
+    }
+
+    #[test]
+    fn provider_slips_are_dropped_or_sanitized_during_wire_mapping() {
+        let empty = LlmMemoryWire {
+            category: "insight".into(),
+            content: "   ".into(),
+            tags: None,
+            quality: Some(0.9),
+        };
+        assert!(
+            wire_to_extracted(empty).is_none(),
+            "an empty or whitespace-only lesson is not a memory — it must drop like an \
+            unknown category, not store as validated text"
+        );
+
+        for poisoned in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let wire = LlmMemoryWire {
+                category: "insight".into(),
+                content: "a real lesson".into(),
+                tags: None,
+                quality: Some(poisoned),
+            };
+            let mined =
+                wire_to_extracted(wire).expect("a real lesson with a poisoned quality still mines");
+            assert!(
+                mined.quality.is_finite(),
+                "a non-finite quality must never reach the store's relevance"
+            );
+            assert!(
+                (mined.quality - 0.5).abs() < f32::EPSILON,
+                "a non-finite quality falls back to the mid-scale default, not a clamp \
+                that passes NaN through: {}",
+                mined.quality
+            );
+        }
     }
 
     #[cfg(feature = "testing")]

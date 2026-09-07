@@ -264,11 +264,13 @@ impl LoopMemory for InMemoryStore {
     /// - **Baseline** (10%) — ensures every entry has a non-zero score.
     ///
     /// The query is matched case-insensitively against both the entry
-    /// [`memory`](MemoryEntry::memory) and [`tags`](MemoryEntry::tags).
-    /// An empty — or whitespace-only — query matches nothing: every
-    /// `str::contains("")` is vacuously true, so without this rule an
-    /// empty query would count as a tag hit on every tagged entry,
-    /// boosting their scores and stamping them as accessed.
+    /// [`memory`](MemoryEntry::memory) and [`tags`](MemoryEntry::tags);
+    /// tag matching compares against the trimmed query, so padding never
+    /// silently drops the tag bonus. An empty — or whitespace-only —
+    /// query matches nothing: every `str::contains("")` is vacuously
+    /// true, so without this rule an empty query would count as a tag
+    /// hit on every tagged entry, boosting their scores and stamping
+    /// them as accessed.
     ///
     /// Only entries whose score reflects an actual query match — a word
     /// overlap or a tag hit, not the always-present baseline — are recorded
@@ -307,6 +309,7 @@ impl LoopMemory for InMemoryStore {
         let query = query.to_string();
         Box::pin(async move {
             let query_lower = query.to_lowercase();
+            let query_trimmed = query_lower.trim();
             let query_words: Vec<&str> = query_lower.split_whitespace().collect();
             let entries = crate::error::recover_guard(self.entries.read());
             let snapshot: Vec<MemoryEntry> = entries.iter().cloned().collect();
@@ -315,11 +318,11 @@ impl LoopMemory for InMemoryStore {
                 .into_iter()
                 .map(|entry| {
                     let memory_lower = entry.memory.to_lowercase();
-                    let tag_match = !query_lower.trim().is_empty()
+                    let tag_match = !query_trimmed.is_empty()
                         && entry
                             .tags
                             .iter()
-                            .any(|t| t.to_lowercase().contains(&query_lower));
+                            .any(|t| t.to_lowercase().contains(query_trimmed));
                     let word_matches = query_words
                         .iter()
                         .filter(|w| memory_lower.contains(*w))
@@ -400,7 +403,7 @@ impl LoopMemory for InMemoryStore {
             let mut access_log = crate::error::recover_guard(self.access_log.lock());
             for entry in entries.iter_mut() {
                 if let Some(stamp) = access_log.get(&entry.id) {
-                    entry.last_accessed = Some(*stamp);
+                    entry.last_accessed = entry.last_accessed.max(Some(*stamp));
                     entry.access_count = entry.access_count.saturating_add(1);
                 }
             }
@@ -424,6 +427,7 @@ mod tests {
     use super::*;
     use crate::memory::MemoryCategory;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn test_store_and_retrieve() {
@@ -563,6 +567,47 @@ mod tests {
                 entry.memory
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_padded_query_keeps_the_tag_match() {
+        let store = InMemoryStore::new();
+        let mut tagged = MemoryEntry::new(MemoryCategory::Fact, "note about releases");
+        tagged.relevance = 0.5;
+        tagged.tags.push("rust".to_string());
+        store.store(tagged).await.unwrap();
+
+        let hits = store.retrieve(" rust ", 3).await.unwrap();
+        assert_eq!(hits.len(), 1, "the padded query still returns the entry");
+        store.consolidate().await.unwrap();
+        let entries = crate::error::recover_guard(store.entries.read()).clone();
+        assert_eq!(
+            entries[0].access_count, 1,
+            "a padded query must not lose the tag match — the word-overlap path splits \
+            on whitespace and matches it fine"
+        );
+        assert!(entries[0].last_accessed.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_access_fold_never_rewinds_a_fresher_last_accessed_stamp() {
+        let store = InMemoryStore::new();
+        let now = SystemTime::now();
+        let mut seeded = MemoryEntry::new(MemoryCategory::Fact, "seeded with a fresher stamp");
+        seeded.relevance = 0.9;
+        seeded.last_accessed = Some(now + Duration::from_hours(24));
+        store.store(seeded).await.unwrap();
+
+        let hits = store.retrieve("seeded", 3).await.unwrap();
+        assert_eq!(hits.len(), 1, "the query matches");
+        store.consolidate().await.unwrap();
+        let entries = crate::error::recover_guard(store.entries.read()).clone();
+        assert_eq!(
+            entries[0].last_accessed,
+            Some(now + Duration::from_hours(24)),
+            "the fold takes the max of the log stamp and the entry's stamp — an older \
+            log entry (a backwards clock, a fresher seed) must not rewind it"
+        );
     }
 
     #[tokio::test]

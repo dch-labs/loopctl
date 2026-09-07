@@ -209,6 +209,7 @@ pub async fn extract_from_record(
     if !successful && !config.include_failures {
         return Ok(Vec::new());
     }
+    let mut fallback_outcome: Option<&'static str> = None;
     let mut memories = match config.strategy {
         ExtractionStrategy::Heuristic => heuristic_memories(record),
         ExtractionStrategy::Llm => {
@@ -233,7 +234,7 @@ pub async fn extract_from_record(
                     match llm_memories(record, config, client, Some(&candidates)).await {
                         Ok(refined) => refined,
                         Err(err) => {
-                            emit_attempt_metric(err_outcome(&err));
+                            fallback_outcome = Some(err_outcome(&err));
                             tracing::warn!(
                                 target: "loopctl::memory",
                                 error = %err,
@@ -253,9 +254,10 @@ pub async fn extract_from_record(
     });
     dedupe_candidates(&mut memories);
     memories.truncate(config.max_memories);
+    let outcome = settle_outcome(fallback_outcome);
     {
         let _entered = span.enter();
-        emit_extraction_metrics(&memories, "ok");
+        emit_extraction_metrics(&memories, outcome);
     }
     Ok(memories)
 }
@@ -487,10 +489,12 @@ async fn extract_from_record_owned(
 ///
 /// Streams the file forward line by line, keeping only the newest line
 /// that parses, so memory stays flat no matter how long a session's
-/// ledger grows. A torn trailing line (the writer's queue not yet
-/// flushed, or a crash mid-append) fails to parse and is simply skipped.
-/// [`None`] means nothing in the ledger parses — an empty or all-torn
-/// file — so a best-effort observer can simply skip.
+/// ledger grows. Lines are read as bytes and decoded per line, so a torn
+/// or corrupt line — invalid UTF-8 from a split multibyte write, or
+/// truncated JSON — fails to parse and is simply skipped, wherever it
+/// sits; only genuine I/O errors abort the scan. [`None`] means nothing
+/// in the ledger parses — an empty or all-torn file — so a best-effort
+/// observer can simply skip.
 ///
 /// The file read runs on the blocking thread pool, so a large ledger
 /// never stalls a tokio worker.
@@ -503,11 +507,18 @@ async fn last_complete_record(path: &Path) -> Result<Option<TrajectoryRecord>, L
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)
             .map_err(|err| LoopError::Memory(format!("cannot read trajectory ledger: {err}")))?;
+        let mut reader = std::io::BufReader::new(file);
         let mut last = None;
-        for line in std::io::BufReader::new(file).lines() {
-            let line =
-                line.map_err(|err| LoopError::Memory(format!("cannot read ledger line: {err}")))?;
-            if let Ok(record) = serde_json::from_str::<TrajectoryRecord>(&line) {
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|err| LoopError::Memory(format!("cannot read ledger line: {err}")))?;
+            if read == 0 {
+                break;
+            }
+            if let Ok(record) = serde_json::from_slice::<TrajectoryRecord>(&line) {
                 last = Some(record);
             }
         }
@@ -783,7 +794,11 @@ refine, merge, generalize, and drop the weak ones:\n";
             .saturating_sub(system.len())
             .saturating_sub(summary.len());
         for candidate in candidates {
-            let line = format!("- [{:?}] {}\n", candidate.category, candidate.content);
+            let line = format!(
+                "- [{}] {}\n",
+                category_label(candidate.category),
+                candidate.content
+            );
             if candidate_budget.saturating_sub(line.len()) == 0 {
                 break;
             }
@@ -897,6 +912,18 @@ fn err_outcome(err: &LoopError) -> &'static str {
         LoopError::Api(message) if message.contains("[parse]") => "parse_error",
         _ => "api_error",
     }
+}
+
+/// The attempt outcome a finished pass reports: the fallback reason when a
+/// hybrid pass settled for its heuristic candidates, `ok` otherwise.
+///
+/// Exactly one attempt event is emitted per extraction pass, so a hybrid
+/// fallback reports the LLM failure outcome here instead of pairing an
+/// early failure event with a spurious `ok` at the settle point — the
+/// counter keeps answering "is the model good enough at extraction"
+/// without double-counting the pass.
+fn settle_outcome(fallback: Option<&'static str>) -> &'static str {
+    fallback.unwrap_or("ok")
 }
 
 /// The stable `snake_case` telemetry label for a memory category.
@@ -1333,6 +1360,45 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn hybrid_candidate_lines_label_categories_in_the_wire_vocabulary() {
+        let trajectory = record(
+            TrajectoryOutcome::Success,
+            vec![
+                turn(0, "read", vec![call("Read", true)]),
+                turn(1, "fail", vec![call("Bash", false)]),
+                turn(2, "recover", vec![call("Bash", true)]),
+            ],
+        );
+        let mock = MockApiClient::new("test-model").with_text_response(
+            r#"[{"category":"strategy","content":"refined lesson","tags":[],"quality":0.8}]"#,
+        );
+        let mut config = ExtractionConfig::default();
+        config.strategy = ExtractionStrategy::Hybrid;
+        let mined = extract_from_record(&trajectory, &config, Some(&mock))
+            .await
+            .expect("the mock returns a parseable array");
+        let requests = mock.captured_requests();
+        assert_eq!(requests.len(), 1, "one provider call was made");
+        let system = requests[0].system.as_deref().unwrap_or_default();
+        assert!(
+            system.contains("[error_pattern]"),
+            "candidate labels must use the snake_case names the parser accepts: {system}"
+        );
+        assert!(
+            !system.contains("[Strategy]") && !system.contains("[ErrorPattern]"),
+            "Debug names a model might echo back are silently dropped by the parser: \
+            {system}"
+        );
+        assert!(
+            mined
+                .iter()
+                .any(|memory| memory.content == "refined lesson"),
+            "the refined candidate survives parsing"
+        );
+    }
+
     #[tokio::test]
     async fn extract_into_writes_mined_memories_to_the_store() {
         let trajectory = record(
@@ -1429,6 +1495,54 @@ mod tests {
             found.run_id, "run",
             "the complete record is extracted despite the torn trailing line"
         );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_line_does_not_abort_the_ledger_scan() {
+        let path = std::env::temp_dir().join(format!(
+            "loopctl-extractor-corrupt-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let mut bytes = serde_json::to_vec(&record(
+            TrajectoryOutcome::Success,
+            vec![turn(0, "read", vec![call("Read", true)])],
+        ))
+        .expect("record serializes");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"\xff\xfe not utf-8 at all\n");
+        bytes.extend_from_slice(
+            &serde_json::to_vec(&record(
+                TrajectoryOutcome::Success,
+                vec![
+                    turn(0, "check", vec![call("Bash", true)]),
+                    turn(1, "fix", vec![call("Edit", true)]),
+                    turn(2, "done", vec![call("Bash", true)]),
+                ],
+            ))
+            .expect("record serializes"),
+        );
+        std::fs::write(&path, &bytes).expect("ledger writes");
+
+        let found = last_complete_record(&path)
+            .await
+            .expect("a corrupt line is skipped, not fatal");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            found.expect("the newest valid record is found").total_turns,
+            3,
+            "the scan continues past the corrupt line to the newest valid record"
+        );
+    }
+
+    #[test]
+    fn a_hybrid_fallback_settles_on_the_failure_outcome() {
+        assert_eq!(settle_outcome(None), "ok");
+        assert_eq!(
+            settle_outcome(Some("api_error")),
+            "api_error",
+            "the fallback pass reports the LLM failure, not a second ok"
+        );
+        assert_eq!(settle_outcome(Some("parse_error")), "parse_error");
     }
 
     #[tokio::test]

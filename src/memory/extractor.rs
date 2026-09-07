@@ -300,10 +300,12 @@ fn entry_for(memory: &ExtractedMemory) -> MemoryEntry {
 ///
 /// # Errors
 ///
-/// Propagates [`extract`]'s errors plus any store failure as
-/// [`LoopError::Memory`]; a store failure mid-loop reports how many
-/// memories were already written, so callers can tell a partial pass from
-/// an empty one.
+/// Propagates [`extract`]'s errors plus any store failure. A mid-loop
+/// failure that already carries [`LoopError::Memory`] is annotated with
+/// the number of memories written so far, so callers can tell a partial
+/// pass from an empty one; every other variant passes through untouched —
+/// flattening a recoverable variant such as [`LoopError::Api`] into
+/// `Memory` would make a retryable store failure terminal to callers.
 pub async fn extract_into(
     trajectory_path: &Path,
     config: &ExtractionConfig,
@@ -313,9 +315,15 @@ pub async fn extract_into(
     let candidates = extract(trajectory_path, config, client).await?;
     let mut written = 0usize;
     for candidate in &candidates {
-        store.store(entry_for(candidate)).await.map_err(|err| {
-            LoopError::Memory(format!("store failed after {written} memories: {err}"))
-        })?;
+        store
+            .store(entry_for(candidate))
+            .await
+            .map_err(|err| match err {
+                LoopError::Memory(message) => {
+                    LoopError::Memory(format!("{message} (after {written} memories written)"))
+                }
+                other => other,
+            })?;
         written = written.saturating_add(1);
     }
     Ok((written, candidates))
@@ -938,6 +946,81 @@ mod tests {
     #[cfg(feature = "testing")]
     use crate::testing::MockApiClient;
 
+    use std::future::Future;
+    use std::pin::Pin;
+
+    /// Store double whose `store` fails after a chosen number of writes
+    /// with a chosen error shape, so `extract_into`'s error mapping can be
+    /// exercised without a real backend.
+    struct FailingStore {
+        fail_after: usize,
+        memory_variant: bool,
+        writes: std::sync::Mutex<usize>,
+    }
+
+    impl FailingStore {
+        fn failing_on_write(fail_after: usize, memory_variant: bool) -> Self {
+            Self {
+                fail_after,
+                memory_variant,
+                writes: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    impl LoopMemory for FailingStore {
+        fn store(
+            &self,
+            _entry: MemoryEntry,
+        ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>> {
+            Box::pin(async move {
+                let mut writes = crate::error::recover_guard(self.writes.lock());
+                *writes = writes.saturating_add(1);
+                if *writes > self.fail_after {
+                    return if self.memory_variant {
+                        Err(LoopError::Memory("disk full".into()))
+                    } else {
+                        Err(LoopError::Api("provider unreachable".into()))
+                    };
+                }
+                Ok(())
+            })
+        }
+
+        fn retrieve<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn consolidate(
+            &self,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::memory::ConsolidationStats, LoopError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::memory::ConsolidationStats {
+                    entries_before: 0,
+                    entries_after: 0,
+                    pruned: 0,
+                    merged: 0,
+                    bytes_saved: 0,
+                })
+            })
+        }
+
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
     fn call(tool: &str, ok: bool) -> TrajectoryToolCall {
         TrajectoryToolCall {
             tool_call_id: format!("{tool}-{}", if ok { "ok" } else { "err" }),
@@ -1282,6 +1365,42 @@ mod tests {
                 .any(|memory| memory.category == MemoryCategory::ErrorPattern),
             "the recovery pair was mined from disk"
         );
+    }
+
+    #[tokio::test]
+    async fn extract_into_annotates_memory_errors_and_passes_other_variants_through() {
+        let trajectory = record(
+            TrajectoryOutcome::Success,
+            vec![
+                turn(0, "read", vec![call("Read", true)]),
+                turn(1, "fail", vec![call("Bash", false)]),
+                turn(2, "recover", vec![call("Edit", true), call("Bash", true)]),
+            ],
+        );
+        let path = write_record(&trajectory);
+
+        let recoverable = FailingStore::failing_on_write(1, false);
+        let err = extract_into(&path, &ExtractionConfig::default(), None, &recoverable)
+            .await
+            .expect_err("the second store call fails");
+        assert!(
+            matches!(err, LoopError::Api(_)),
+            "a recoverable store error must round-trip as its own variant, not flatten \
+            to the terminal Memory variant: {err}"
+        );
+
+        let annotated = FailingStore::failing_on_write(1, true);
+        let err = extract_into(&path, &ExtractionConfig::default(), None, &annotated)
+            .await
+            .expect_err("the second store call fails");
+        match err {
+            LoopError::Memory(message) => assert!(
+                message.contains("after 1 memories written"),
+                "the Memory variant carries the partial-written count: {message}"
+            ),
+            other => panic!("expected the Memory variant, got: {other}"),
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]

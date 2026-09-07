@@ -265,6 +265,10 @@ impl LoopMemory for InMemoryStore {
     ///
     /// The query is matched case-insensitively against both the entry
     /// [`memory`](MemoryEntry::memory) and [`tags`](MemoryEntry::tags).
+    /// An empty — or whitespace-only — query matches nothing: every
+    /// `str::contains("")` is vacuously true, so without this rule an
+    /// empty query would count as a tag hit on every tagged entry,
+    /// boosting their scores and stamping them as accessed.
     ///
     /// Only entries whose score reflects an actual query match — a word
     /// overlap or a tag hit, not the always-present baseline — are recorded
@@ -311,10 +315,11 @@ impl LoopMemory for InMemoryStore {
                 .into_iter()
                 .map(|entry| {
                     let memory_lower = entry.memory.to_lowercase();
-                    let tag_match = entry
-                        .tags
-                        .iter()
-                        .any(|t| t.to_lowercase().contains(&query_lower));
+                    let tag_match = !query_lower.trim().is_empty()
+                        && entry
+                            .tags
+                            .iter()
+                            .any(|t| t.to_lowercase().contains(&query_lower));
                     let word_matches = query_words
                         .iter()
                         .filter(|w| memory_lower.contains(*w))
@@ -366,7 +371,8 @@ impl LoopMemory for InMemoryStore {
     /// [`access_count`](MemoryEntry::access_count)), then delegates to
     /// [`consolidate_entries`]: category-weighted exponential decay,
     /// near-duplicate clustering with corroboration merges, and pruning of
-    /// entries whose composite quality falls below the configured floor.
+    /// entries whose post-decay relevance *or* composite quality falls
+    /// below the configured floor.
     ///
     /// # Returns
     ///
@@ -519,6 +525,41 @@ mod tests {
             assert!(
                 entry.last_accessed.is_none() && entry.access_count == 0,
                 "baseline-only returns must not inflate access: {}",
+                entry.memory
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_query_returns_the_baseline_without_stamping_tagged_entries() {
+        let store = InMemoryStore::new();
+        for tag in ["rust", "release", "docs"] {
+            let mut entry = MemoryEntry::new(MemoryCategory::Fact, format!("note about {tag}"));
+            entry.relevance = 0.5;
+            entry.tags.push(tag.to_string());
+            store.store(entry).await.unwrap();
+        }
+
+        let hits = store.retrieve("", 2).await.unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "the baseline ranking is still delivered for an empty query"
+        );
+        let whitespace_hits = store.retrieve("   ", 2).await.unwrap();
+        assert_eq!(
+            whitespace_hits.len(),
+            2,
+            "whitespace matches nothing either"
+        );
+
+        store.consolidate().await.unwrap();
+        let entries = crate::error::recover_guard(store.entries.read()).clone();
+        for entry in &entries {
+            assert!(
+                entry.access_count == 0 && entry.last_accessed.is_none(),
+                "an empty query must not count as a tag hit — `contains(\"\")` is \
+                vacuously true, which would stamp every tagged entry: {}",
                 entry.memory
             );
         }

@@ -597,8 +597,13 @@ const DEFAULT_WARN_THRESHOLD: f32 = 0.4;
 
 /// Default block threshold: an aggregate score at or above this produces a block.
 ///
-/// High enough that routine commands never trip it, low enough to
-/// stop clearly destructive pipelines.
+/// Inputs scoring below both it and the hardcoded `0.9` Critical
+/// cutoff never block; note the curated patterns for `rm -f` (Bash),
+/// `/etc/` writes (Write), and `.ssh/` edits (Edit) sit exactly on
+/// this boundary — an Edit of `/etc/` scores 0.5 and does not — so
+/// those block outright under the defaults; tune the threshold to
+/// move them to warn-first. Tuning above `0.9` does not release the
+/// patterns that sit there: Critical always blocks.
 const DEFAULT_BLOCK_THRESHOLD: f32 = 0.7;
 
 impl UnixShield {

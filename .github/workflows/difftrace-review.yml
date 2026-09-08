@@ -43,7 +43,14 @@ permissions:
 
 jobs:
   review:
-    if: github.event_name != 'issue_comment' || github.event.issue.pull_request != null
+    # Fork and dependabot pull requests skip (neutral) rather than
+    # reaching the callee's fail-loud rejection — the callee's gates
+    # stay as defense in depth for the comment and dispatch paths.
+    if: >-
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request != null) &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.user.login != 'dependabot[bot]' &&
+        github.event.pull_request.head.repo.fork != true))
     uses: dch-labs/difftrace/.github/workflows/review.yml@a272e47e1826be342d360227c60ba598b1d4f201 # v0.11.3
     with:
       pr: ${{ github.event.pull_request.number || (github.event.issue.pull_request != null && github.event.issue.number) || inputs.pr }}

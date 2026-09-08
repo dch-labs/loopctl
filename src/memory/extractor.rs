@@ -515,6 +515,16 @@ async fn extract_from_record_owned(
     Ok(memories)
 }
 
+/// Ceiling on one provider answer's bytes before bracket-span parsing.
+///
+/// The lenient parser tries every `]` after every `[`, which is
+/// quadratic on bracket-dense input; the cap bounds that worst case to
+/// a size no legitimate memory array approaches (a memory is itself
+/// capped at [`MAX_WIRE_CONTENT_CHARS`], so hundreds fit well below
+/// this), and the parse runs on the blocking pool so even the bounded
+/// worst case cannot stall a tokio worker.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// Ceiling on one ledger line's buffered bytes.
 ///
 /// Bounds the reader's memory even when a region of the file has no
@@ -631,26 +641,25 @@ fn heuristic_memories(record: &TrajectoryRecord) -> Vec<ExtractedMemory> {
 
 /// Mine error-then-recovery pairs as `ErrorPattern` memories.
 ///
-/// A failed call whose tool succeeds in a later turn means the model found
-/// the fix; the memory pairs the failing tool with the retry advice so the
-/// next run starts from the fix instead of the failure.
+/// A failed call whose tool succeeds in a later call — the same turn
+/// or a later turn — means the model found the fix; the memory pairs
+/// the failing tool with the retry advice so the next run starts from
+/// the fix instead of the failure. Turns are walked once, newest
+/// first, and each turn's calls with them, accumulating the tools
+/// already recovered further down — one linear pass instead of a
+/// rescan per failed call.
 fn mine_recoveries(record: &TrajectoryRecord) -> Vec<ExtractedMemory> {
     let mut memories = Vec::new();
-    for (turn_index, turn) in record.turns.iter().enumerate() {
-        for call in &turn.tool_calls {
+    let mut recovered_tools: Vec<&str> = Vec::new();
+    for turn in record.turns.iter().rev() {
+        for call in turn.tool_calls.iter().rev() {
             if call.ok {
+                if !recovered_tools.contains(&call.tool.as_str()) {
+                    recovered_tools.push(call.tool.as_str());
+                }
                 continue;
             }
-            let recovered = record
-                .turns
-                .iter()
-                .skip(turn_index.saturating_add(1))
-                .any(|later| {
-                    later
-                        .tool_calls
-                        .iter()
-                        .any(|later_call| later_call.ok && later_call.tool == call.tool)
-                });
+            let recovered = recovered_tools.contains(&call.tool.as_str());
             if recovered {
                 memories.push(ExtractedMemory {
                     category: MemoryCategory::ErrorPattern,
@@ -667,6 +676,27 @@ fn mine_recoveries(record: &TrajectoryRecord) -> Vec<ExtractedMemory> {
     }
     memories
 }
+
+/// Ceiling on one provider-supplied lesson's content, in bytes.
+///
+/// A degenerate or runaway answer must not persist megabyte-scale
+/// lessons into the store — a stored memory is re-paid on every future
+/// retrieval, so one oversized lesson is a recurring cost with no knob
+/// to unwind it. Oversized items drop like unknown categories do.
+const MAX_WIRE_CONTENT_CHARS: usize = 2_000;
+
+/// Ceiling on one provider-supplied tag's length.
+///
+/// Tags are short filter labels; a longer one is model noise trimmed
+/// before it can bloat the stored entry.
+const MAX_WIRE_TAG_CHARS: usize = 64;
+
+/// Ceiling on the tag count one provider-supplied lesson may carry.
+///
+/// A lesson needs a handful of labels to be selectable by kind and
+/// topic; beyond that the list is padding that grows every retrieved
+/// copy of the memory for no filtering value.
+const MAX_WIRE_TAGS: usize = 8;
 
 /// How many leading tool names a strategy memory lists before collapsing
 /// the rest into a count.
@@ -793,9 +823,12 @@ struct LlmMemoryWire {
 
     /// The model's self-reported confidence; absent defaults to 0.5.
     ///
-    /// Clamped into `0.0..=1.0` and used as the mined memory's relevance.
-    /// The mid-scale default means un-self-assessed memories neither dominate
-    /// the store nor vanish at the prune floor.
+    /// Clamped into `0.0..=1.0`, then capped just below the 0.9
+    /// auto-validate threshold — self-assessed confidence reaches the
+    /// relevance scale but never the validated flag, mirroring the
+    /// heuristic miners' rule that a mining pass is not confirmation.
+    /// The mid-scale default means un-self-assessed memories neither
+    /// dominate the store nor vanish at the prune floor.
     quality: Option<f32>,
 }
 
@@ -922,7 +955,14 @@ refine, merge, generalize, and drop the weak ones:\n";
         .create_message(&request)
         .await
         .map_err(|err| LoopError::Api(format!("extraction provider call failed: {err}")))?;
-    parse_llm_memories(&response.message.text_content())
+    let text = response.message.text_content();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle
+            .spawn_blocking(move || parse_llm_memories(&text))
+            .await
+            .map_err(|err| LoopError::Api(format!("extraction parser task failed: {err}")))?,
+        Err(_) => parse_llm_memories(&text),
+    }
 }
 
 /// Append the hybrid candidate lines to `system`, bounded by `budget`.
@@ -949,30 +989,37 @@ fn append_candidate_lines(system: &mut String, candidates: &[ExtractedMemory], b
 /// Parse the provider's answer: the outermost JSON array in the text,
 /// mapped to [`ExtractedMemory`] values with unknown categories dropped.
 ///
-/// Each `[` in the text is tried as the array's start until one slice
-/// deserializes, so prose containing an earlier bracket pair ("[3
-/// total]") does not reject a response whose array parses fine.
+/// Each `[` in the text is tried as the array's start, and for each
+/// start every later `]` as its end, until one slice deserializes — so
+/// prose containing an earlier bracket pair ("[3 total]") or trailing
+/// commentary with a bracket ("(done [2 items])") does not reject a
+/// response whose array parses fine. Text above [`MAX_RESPONSE_BYTES`]
+/// is rejected outright before any scanning.
 ///
 /// # Errors
 ///
 /// [`LoopError::Api`] when no array is present or no
 /// candidate slice deserializes.
 fn parse_llm_memories(text: &str) -> Result<Vec<ExtractedMemory>, LoopError> {
-    let Some(end) = text.rfind(']') else {
+    if text.len() > MAX_RESPONSE_BYTES {
         return Err(unparseable_response());
-    };
-    for (start, byte) in text.char_indices() {
-        if byte != '[' {
+    }
+    let ends: Vec<usize> = text
+        .char_indices()
+        .filter(|&(_, ch)| ch == ']')
+        .map(|(index, _)| index)
+        .collect();
+    for (start, ch) in text.char_indices() {
+        if ch != '[' {
             continue;
         }
-        if start >= end {
-            break;
-        }
-        let Some(slice) = text.get(start..=end) else {
-            continue;
-        };
-        if let Ok(wire) = serde_json::from_str::<Vec<LlmMemoryWire>>(slice) {
-            return Ok(wire.into_iter().filter_map(wire_to_extracted).collect());
+        for &end in ends.iter().filter(|&&end| end > start) {
+            let Some(slice) = text.get(start..=end) else {
+                continue;
+            };
+            if let Ok(wire) = serde_json::from_str::<Vec<LlmMemoryWire>>(slice) {
+                return Ok(wire.into_iter().filter_map(wire_to_extracted).collect());
+            }
         }
     }
     Err(unparseable_response())
@@ -996,17 +1043,23 @@ fn unparseable_response() -> LoopError {
 /// `recovery` — each kind backfills the selecting tag a host filters by,
 /// keeping filter-by-kind parity with the heuristic miners.
 fn wire_to_extracted(wire: LlmMemoryWire) -> Option<ExtractedMemory> {
-    let category = match wire.category.to_lowercase().as_str() {
+    let name = wire.category.to_lowercase();
+    let category = match name.as_str() {
         "strategy" => MemoryCategory::Strategy,
         "error_pattern" => MemoryCategory::ErrorPattern,
         "insight" | "optimization" => MemoryCategory::Insight,
         _ => return None,
     };
-    if wire.content.trim().is_empty() {
+    if wire.content.trim().is_empty() || wire.content.len() > MAX_WIRE_CONTENT_CHARS {
         return None;
     }
-    let name = wire.category.to_lowercase();
-    let mut tags = wire.tags.unwrap_or_default();
+    let mut tags: Vec<String> = wire
+        .tags
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|tag| tag.len() <= MAX_WIRE_TAG_CHARS)
+        .take(MAX_WIRE_TAGS)
+        .collect();
     if name == "optimization" && !tags.iter().any(|t| t == "optimization") {
         tags.push("optimization".into());
     }
@@ -1021,7 +1074,8 @@ fn wire_to_extracted(wire: LlmMemoryWire) -> Option<ExtractedMemory> {
             .quality
             .filter(|q| q.is_finite())
             .unwrap_or(0.5)
-            .clamp(0.0, 1.0),
+            .clamp(0.0, 1.0)
+            .min(0.85),
     })
 }
 
@@ -1325,6 +1379,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_same_turn_success_before_the_failure_is_not_a_recovery() {
+        let backwards = record(
+            TrajectoryOutcome::Success,
+            vec![
+                turn(
+                    0,
+                    "succeed then break",
+                    vec![call("Bash", true), call("Bash", false)],
+                ),
+                turn(1, "carry on", vec![call("Edit", true)]),
+                turn(2, "finish", vec![call("Read", true)]),
+            ],
+        );
+        let mined = extract_from_record(&backwards, &ExtractionConfig::default(), None)
+            .await
+            .expect("heuristic extraction never needs a provider");
+        assert!(
+            !mined
+                .iter()
+                .any(|memory| memory.category == MemoryCategory::ErrorPattern),
+            "a success that preceded the failure did not recover from it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_same_turn_retry_after_the_failure_is_a_recovery() {
+        let retried = record(
+            TrajectoryOutcome::Success,
+            vec![
+                turn(
+                    0,
+                    "fail then adjust",
+                    vec![call("Bash", false), call("Bash", true)],
+                ),
+                turn(1, "carry on", vec![call("Edit", true)]),
+                turn(2, "finish", vec![call("Read", true)]),
+            ],
+        );
+        let mined = extract_from_record(&retried, &ExtractionConfig::default(), None)
+            .await
+            .expect("heuristic extraction never needs a provider");
+        assert!(
+            mined
+                .iter()
+                .any(|memory| memory.category == MemoryCategory::ErrorPattern),
+            "a retry that succeeded after the failure is a recovery"
+        );
+    }
+
+    #[tokio::test]
     async fn repeated_recovery_pairs_dedupe_to_one_memory() {
         let flaky = record(
             TrajectoryOutcome::Success,
@@ -1534,6 +1638,74 @@ mod tests {
             .expect("the final line parses even without its newline");
         std::fs::remove_file(&path).ok();
         assert_eq!(found.run_id, "run");
+    }
+
+    #[test]
+    fn oversized_provider_content_drops_and_runaway_tags_trim() {
+        let oversized = LlmMemoryWire {
+            category: "insight".into(),
+            content: "x".repeat(MAX_WIRE_CONTENT_CHARS + 1),
+            tags: None,
+            quality: Some(0.5),
+        };
+        assert!(
+            wire_to_extracted(oversized).is_none(),
+            "a runaway lesson must not persist into the store"
+        );
+        let tagged = LlmMemoryWire {
+            category: "insight".into(),
+            content: "a real lesson".into(),
+            tags: Some((0..20).map(|i| format!("tag-{i}")).collect()),
+            quality: Some(0.5),
+        };
+        let mined = wire_to_extracted(tagged).expect("parses");
+        assert_eq!(
+            mined.tags.len(),
+            MAX_WIRE_TAGS,
+            "the tag list trims to the cap: {:?}",
+            mined.tags
+        );
+    }
+
+    #[test]
+    fn an_oversized_provider_answer_is_a_parse_error_before_scanning() {
+        let huge = format!("[{}]{}", "x".repeat(MAX_RESPONSE_BYTES), "]");
+        let err = parse_llm_memories(&huge).expect_err("oversized answers reject outright");
+        assert_eq!(
+            err_outcome(&err),
+            "parse_error",
+            "the cap rejects before the quadratic scan, as a parse failure"
+        );
+    }
+
+    #[test]
+    fn a_self_assessed_quality_never_reaches_the_validated_tier() {
+        let confident = LlmMemoryWire {
+            category: "insight".into(),
+            content: "a lesson the model graded itself highly".into(),
+            tags: None,
+            quality: Some(0.99),
+        };
+        let mined = wire_to_extracted(confident).expect("parses");
+        assert!(
+            mined.quality <= 0.85,
+            "self-assessed confidence reaches the relevance scale but never \
+            the 0.9 auto-validate threshold — mining is not confirmation: {}",
+            mined.quality
+        );
+        let entry = entry_for(&mined);
+        assert!(
+            !entry.validated,
+            "a wire-derived memory must not store pre-validated"
+        );
+    }
+
+    #[test]
+    fn trailing_prose_with_a_bracket_does_not_reject_the_array() {
+        let text = "[{\"category\":\"insight\",\"content\":\"a real lesson\",\"quality\":0.5}]\n(done [2 items])";
+        let mined = parse_llm_memories(text).expect("the array behind the trailing prose parses");
+        assert_eq!(mined.len(), 1);
+        assert_eq!(mined[0].content, "a real lesson");
     }
 
     #[test]

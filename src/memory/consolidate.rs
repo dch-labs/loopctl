@@ -78,10 +78,9 @@ pub fn quality_score(entry: &MemoryEntry, now: SystemTime) -> f32 {
     let access_count = f32::from(u16::try_from(entry.access_count).unwrap_or(u16::MAX));
     let access_factor =
         ((1.0 + access_count).ln() / (1.0 + ACCESS_SATURATION).ln()).clamp(0.0, 1.0);
-    let recency_factor = entry
-        .last_accessed
-        .or(Some(entry.created_at))
-        .and_then(|stamp| now.duration_since(stamp).ok())
+    let recency_factor = now
+        .duration_since(entry.last_accessed.unwrap_or(entry.created_at))
+        .ok()
         .map_or(1.0, |age| (-age.as_secs_f32() / RECENCY_SCALE_SECS).exp());
     let validated_bonus = if entry.validated { 1.0 } else { 0.0 };
     entry.relevance.clamp(0.0, 1.0) * RELEVANCE_WEIGHT
@@ -360,9 +359,16 @@ impl Default for ConsolidationConfig {
 ///
 /// An entry whose relevance is not finite or sits outside `0.0..=1.0` —
 /// reachable only through hand-constructed values, since every internal
-/// path clamps — is degraded to zero before the pass runs, so it prunes
-/// instead of poisoning decay, clustering, and merges with NaN arithmetic
-/// or falsifying the composite score's documented range.
+/// path clamps — is degraded to zero and **excluded from clustering**,
+/// so it cannot corroborate a survivor into unprunable relevance or
+/// donate a garbage `validated`/`access_count`; with any prune floor
+/// above zero (the default is 0.05) it then prunes instead of poisoning
+/// decay, clustering, and merges. The exclusion is a property of the
+/// pass that sees the garbage: a zero prune floor — valid, since nothing
+/// sits below it — retains the degraded entry at relevance `0.0`, where
+/// the next pass is entitled to treat it like any legitimately decayed
+/// entry. Hosts that must expel poisoned input unconditionally should
+/// keep the floor above zero.
 pub fn consolidate_entries(
     entries: &mut Vec<MemoryEntry>,
     config: &ConsolidationConfig,
@@ -370,20 +376,27 @@ pub fn consolidate_entries(
 ) -> ConsolidationStats {
     let config = config.normalized();
     let entries_before = entries.len();
-    for entry in entries.iter_mut() {
-        if !(0.0..=1.0).contains(&entry.relevance) {
-            entry.relevance = 0.0;
+    let mut degraded = Vec::new();
+    let mut healthy = Vec::new();
+    for entry in std::mem::take(entries) {
+        if (0.0..=1.0).contains(&entry.relevance) {
+            healthy.push(entry);
+        } else {
+            degraded.push(entry);
         }
     }
+    for entry in &mut degraded {
+        entry.relevance = 0.0;
+    }
     if config.decay {
-        for entry in entries.iter_mut() {
+        for entry in &mut healthy {
             decay_relevance(entry, now, config.half_life);
         }
     }
     let mut merged = 0usize;
     let mut merged_away_text = 0usize;
     if config.merge {
-        let clusters = cluster_duplicates(entries, config.merge_threshold);
+        let clusters = cluster_duplicates(&healthy, config.merge_threshold);
         let mut consolidated = Vec::with_capacity(clusters.len());
         for mut cluster in clusters {
             promote_highest_quality(&mut cluster, now);
@@ -397,8 +410,10 @@ pub fn consolidate_entries(
             merged = merged.saturating_add(cluster.duplicates.len());
             consolidated.push(merge_cluster(cluster));
         }
-        *entries = consolidated;
+        healthy = consolidated;
     }
+    healthy.append(&mut degraded);
+    *entries = healthy;
     let before_prune = entries.len();
     let prunable = |entry: &MemoryEntry| {
         entry.relevance < config.prune_floor || quality_score(entry, now) < config.prune_floor
@@ -1010,6 +1025,100 @@ mod tests {
             "degenerate entries prune on their own weak relevance"
         );
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn degraded_entries_never_corroborate_a_survivor() {
+        let now = SystemTime::now();
+        let mut healthy_entry = entry(MemoryCategory::Insight, "run the build before committing");
+        healthy_entry.relevance = 0.9;
+        let mut corrupted = entry(MemoryCategory::Insight, "run the build before committing");
+        corrupted.relevance = f32::NAN;
+        corrupted.validated = true;
+        corrupted.access_count = 900_000;
+        let mut entries = vec![healthy_entry, corrupted];
+        let stats = consolidate_entries(&mut entries, &ConsolidationConfig::default(), now);
+        assert_eq!(
+            stats.merged, 0,
+            "a degraded entry must not corroborate the healthy one — no cluster forms"
+        );
+        assert_eq!(entries.len(), 1, "the corrupted entry prunes");
+        assert!(
+            !entries[0].validated && entries[0].access_count == 0,
+            "the garbage validated flag and access count die with it"
+        );
+    }
+
+    #[test]
+    fn degraded_entries_do_not_cluster_into_an_unprunable_survivor() {
+        let now = SystemTime::now();
+        let mut first = entry(MemoryCategory::Fact, "identical corrupted text");
+        first.relevance = f32::INFINITY;
+        let mut second = entry(MemoryCategory::Fact, "identical corrupted text");
+        second.relevance = -2.0;
+        let mut entries = vec![first, second];
+        consolidate_entries(&mut entries, &ConsolidationConfig::default(), now);
+        assert!(
+            entries.is_empty(),
+            "two degraded near-duplicates must not merge into a corroborated \
+            survivor that clears the prune floor"
+        );
+    }
+
+    #[test]
+    fn a_zero_prune_floor_retains_a_degraded_entry_at_zero_relevance() {
+        let now = SystemTime::now();
+        let mut healthy_entry = entry(MemoryCategory::Insight, "cache the build outputs");
+        healthy_entry.relevance = 0.9;
+        let mut corrupted = entry(MemoryCategory::Insight, "cache the build outputs");
+        corrupted.relevance = f32::NAN;
+        let mut entries = vec![healthy_entry, corrupted];
+        let mut config = ConsolidationConfig::default();
+        config.prune_floor = 0.0;
+        let stats = consolidate_entries(&mut entries, &config, now);
+        assert_eq!(
+            stats.merged, 0,
+            "the degraded entry stays out of clustering on the pass that sees it"
+        );
+        let corrupted = entries
+            .iter()
+            .find(|entry| entry.relevance == 0.0)
+            .expect("the zero floor retains the degraded entry");
+        assert_eq!(
+            corrupted.memory, "cache the build outputs",
+            "retained at degraded relevance, exactly as the floor-0.0 doc promises"
+        );
+        assert_eq!(entries.len(), 2, "nothing prunes under a zero floor");
+    }
+
+    #[test]
+    fn consolidate_entries_promotes_the_strongest_member_into_canonical() {
+        let now = SystemTime::now();
+        let mut weak = entry(MemoryCategory::Insight, "run the build before committing");
+        weak.relevance = 0.3;
+        weak.created_at = now - Duration::from_hours(24 * 30);
+        let mut strong = entry(MemoryCategory::Insight, "run the build before committing");
+        strong.relevance = 0.9;
+        strong.validated = true;
+        strong.access_count = 20;
+        strong.last_accessed = Some(now);
+        let strong_id = strong.id;
+        let mut entries = vec![weak, strong];
+        let stats = consolidate_entries(&mut entries, &ConsolidationConfig::default(), now);
+        assert_eq!(
+            stats.merged, 1,
+            "the weak canonical counts as the one merged-away duplicate"
+        );
+        assert_eq!(entries.len(), 1, "the cluster folds into one survivor");
+        assert_eq!(
+            entries[0].id, strong_id,
+            "promotion swaps the strongest member into the canonical slot — \
+            the survivor carries its identity, not the first-seen canonical's"
+        );
+        assert!(
+            entries[0].validated,
+            "the promoted member's validated flag survives the merge"
+        );
     }
 
     #[test]

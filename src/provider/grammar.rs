@@ -24,8 +24,9 @@ use crate::tool::ToolSchema;
 pub trait ToolGrammarProvider: Send + Sync + std::fmt::Debug {
     /// The compiled grammar string.
     ///
-    /// Returned per call and expected to be cheap to recompute or
-    /// cached by the implementation.
+    /// Callers may invoke this per request; implementations precompute
+    /// the grammar (or lazily cache it in `self`, as the borrowed return
+    /// requires) so the call stays cheap.
     fn grammar(&self) -> &str;
 }
 

@@ -171,7 +171,8 @@ pub enum Interactivity {
 
     /// Human is available — `Ask` passes through unchanged.
     ///
-    /// The interactive UI receives the question and decides.
+    /// `Ask` is returned to the caller, which is responsible for
+    /// presenting it to a human and deciding.
     Interactive,
 }
 

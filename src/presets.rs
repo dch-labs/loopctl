@@ -61,8 +61,9 @@ const GOAL_REMINDER_EVERY_N_TURNS: usize = 5;
 
 /// Default write-class tool names the preset wires into its middleware. Advisory.
 ///
-/// Hosts with differently-named write tools override the list; the
-/// names here cover the common coding-agent set.
+/// The names cover the common coding-agent set; hosts with
+/// differently-named write tools build the middleware stack directly
+/// rather than through the preset.
 const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit"];
 
 /// Default memoized tool names the preset wires into its middleware. Advisory.

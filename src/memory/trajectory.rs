@@ -877,9 +877,10 @@ impl LoopObserver for TrajectoryObserver {
 
     /// Close a tool-call slot with its outcome and duration.
     ///
-    /// The call attaches to its dispatch turn's slot — open or already
-    /// closed — so a result arriving after turn-end still lands in the
-    /// right place.
+    /// The call attaches to the result event's own turn slot — open or
+    /// already closed — so a result arriving after turn-end still lands;
+    /// the dispatch turn recorded at `on_tool_pre` is used only when a
+    /// call is abandoned at run end.
     fn on_tool_post(&self, ctx: &ToolPostContext) {
         let mut guard = recover_guard(self.inner.lock());
         let Some(builder) = guard.as_mut() else {

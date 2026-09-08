@@ -287,9 +287,11 @@ impl LoopMemory for InMemoryStore {
     /// or [`last_accessed`](MemoryEntry::last_accessed) and shield entries
     /// from decay. An entry whose [`relevance`](MemoryEntry::relevance) is
     /// not finite — reachable only through a hand-constructed value — scores
-    /// as zero, mirroring the guard the consolidation pass applies to the
-    /// same input class, so a poisoned entry cannot disorder the ranking it
-    /// is then stamped into.
+    /// as zero — the same `0.0..=1.0` sanitization the consolidation pass
+    /// applies to the same input class (non-finite included, since `NaN`
+    /// fails the range test) — so a poisoned entry cannot disorder the
+    /// ranking it is then stamped into, for the whole window before the
+    /// next pass sanitizes the store.
     ///
     /// # Returns
     ///
@@ -340,7 +342,7 @@ impl LoopMemory for InMemoryStore {
                         .iter()
                         .filter(|w| memory_lower.contains(*w))
                         .count();
-                    let base_score = if entry.relevance.is_finite() {
+                    let base_score = if (0.0..=1.0).contains(&entry.relevance) {
                         entry.relevance
                     } else {
                         0.0
@@ -698,10 +700,14 @@ mod tests {
                 .unwrap();
         }
 
-        // The writer runs on a real OS thread so its write-guard
-        // acquisitions interleave with the in-flight retrieve — a lock
-        // cycle between the entries guard and the access log deadlocks
-        // the join instead of passing.
+        // The writer and the retrieve each run on a real OS thread so
+        // the writer's write-guard acquisitions interleave with the
+        // in-flight retrieve — and because retrieve's polls take the
+        // std locks directly, a lock regression would pin the single
+        // runtime thread inside the poll where no timer can fire. The
+        // test thread owns the deadline instead: a lock regression
+        // fails the recv timeout below instead of hanging the whole
+        // test run.
         let writer = std::thread::spawn({
             let store = Arc::clone(&store);
             move || {
@@ -715,7 +721,22 @@ mod tests {
             }
         });
 
-        let retrieved = store.retrieve("concurrency", 5).await.unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                tx.send(futures::executor::block_on(
+                    store.retrieve("concurrency", 5),
+                ))
+            }
+        });
+        let retrieved = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect(
+                "retrieve completes — a lock regression fails the deadline \
+                 instead of hanging the run",
+            )
+            .unwrap();
         writer
             .join()
             .expect("the writer interleaves without deadlock");
@@ -725,26 +746,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_non_finite_relevance_does_not_poison_the_ranking() {
+    async fn an_out_of_range_relevance_does_not_poison_the_ranking() {
         let store = InMemoryStore::new();
         let mut poisoned =
             MemoryEntry::new(MemoryCategory::Fact, "rust fact with a poisoned relevance");
         poisoned.relevance = f32::NAN;
+        let mut inflated = MemoryEntry::new(
+            MemoryCategory::Fact,
+            "rust fact with an out-of-range relevance",
+        );
+        inflated.relevance = 42.0;
         let mut healthy =
             MemoryEntry::new(MemoryCategory::Fact, "rust fact with a healthy relevance");
         healthy.relevance = 0.9;
         store.store(poisoned).await.unwrap();
+        store.store(inflated).await.unwrap();
         store.store(healthy).await.unwrap();
 
-        let hits = store.retrieve("rust", 2).await.unwrap();
+        let hits = store.retrieve("rust", 3).await.unwrap();
         assert_eq!(
             hits.len(),
-            2,
-            "both entries are delivered — no panic, no lost entries"
+            3,
+            "every entry is delivered — no panic, no lost entries"
         );
         assert!(
-            hits[0].relevance.is_finite(),
-            "the poisoned entry scores as zero, so the healthy one outranks it"
+            hits[0].relevance <= 1.0,
+            "the poisoned and out-of-range entries score as zero, so the \
+            healthy one outranks them: {:?}",
+            hits.iter().map(|hit| hit.relevance).collect::<Vec<_>>()
         );
     }
 

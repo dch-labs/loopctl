@@ -80,6 +80,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         .unwrap_or_else(|| to_snake_case(&ident.to_string()));
 
     let rename_all = attr::serde_rename_all(&input.attrs);
+    let container_default = attr::has_serde_default(&input.attrs);
     let mut properties = Vec::<TokenStream2>::new();
     let mut required = Vec::<String>::new();
     for field in fields {
@@ -88,7 +89,7 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         };
         let field_attrs = attr::parse_field(&field.attrs)?;
         if field_attrs.skip {
-            check_skip_validity(field_ident, &field.ty, &field.attrs)?;
+            check_skip_validity(field_ident, &field.ty, &field.attrs, container_default)?;
             continue;
         }
         let json_name = resolve_json_name(field_ident, &field_attrs, &field.attrs, rename_all)?;
@@ -104,8 +105,15 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         properties.push(quote! {
             #json_name: { #schema_value #description_part }
         });
-        check_default_agreement(field_ident, &field_attrs, &field.attrs, optional)?;
-        if !optional && !field_attrs.default && !attr::has_serde_default(&field.attrs) {
+        check_default_agreement(
+            field_ident,
+            &field_attrs,
+            &field.attrs,
+            optional,
+            container_default,
+        )?;
+        let serde_fills = attr::has_serde_default(&field.attrs) || container_default;
+        if !optional && !field_attrs.default && !serde_fills {
             required.push(json_name);
         }
     }
@@ -259,8 +267,9 @@ fn resolve_json_name(
     }
 }
 
-/// Enforce that `#[tool(default)]` on a non-`Option` field also has
-/// `#[serde(default)]` — without it the schema says optional but
+/// Enforce that `#[tool(default)]` on a non-`Option` field is also
+/// fillable by serde — field-level `#[serde(default)]` or a
+/// struct-level one — without either the schema says optional but
 /// deserialization fails when the model omits the field.
 ///
 /// # Errors
@@ -271,8 +280,9 @@ fn check_default_agreement(
     field_attrs: &crate::attr::FieldAttrs,
     field: &[syn::Attribute],
     optional: bool,
+    container_default: bool,
 ) -> syn::Result<()> {
-    if field_attrs.default && !optional && !attr::has_serde_default(field) {
+    if field_attrs.default && !optional && !attr::has_serde_default(field) && !container_default {
         return Err(syn::Error::new(
             field_ident.span(),
             "`#[tool(default)]` on a non-`Option` field also needs \
@@ -286,17 +296,19 @@ fn check_default_agreement(
 /// Enforce the deserialization precondition of `#[tool(skip)]`.
 ///
 /// A skipped field never reaches the model, so serde must be able to
-/// produce it without input — `Option<T>` or `#[serde(default)]`.
+/// produce it without input — `Option<T>`, `#[serde(default)]`, or a
+/// struct-level `#[serde(default)]`.
 ///
 /// # Errors
 ///
-/// Returns a spanned error naming the precondition when neither holds.
+/// Returns a spanned error naming the precondition when none holds.
 fn check_skip_validity(
     field_ident: &Ident,
     ty: &Type,
     attrs: &[syn::Attribute],
+    container_default: bool,
 ) -> syn::Result<()> {
-    if is_option(ty).is_some() || attr::has_serde_default(attrs) {
+    if is_option(ty).is_some() || attr::has_serde_default(attrs) || container_default {
         return Ok(());
     }
     Err(syn::Error::new(

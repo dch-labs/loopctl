@@ -65,9 +65,10 @@ const TEXT_PART_INDEX: usize = 0;
 
 /// Delta slot carrying reasoning text when the model emits it.
 ///
-/// A distinct index from the text lane, so a reasoning lane cannot
-/// share its part index with a tool call; an absent field simply yields
-/// no thinking deltas, and the lanes interleave in any order.
+/// A distinct index from the text lane; wire tool-call indices can
+/// still collide with it, so an open lane is closed with an addressed
+/// stop before any tool part opens. An absent field simply yields no
+/// thinking deltas, and the lanes interleave in any order.
 const THINKING_PART_INDEX: usize = 1;
 
 /// An OpenAI-compatible chat completions client with streaming support.

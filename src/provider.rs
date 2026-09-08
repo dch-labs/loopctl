@@ -628,13 +628,12 @@ const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 #[cfg(feature = "moonshot")]
 const MOONSHOT_DEFAULT_MODEL: &str = "kimi-k3";
 
-/// Read an environment variable, falling back to a second name, then a
-/// default value.
-///
-/// Reduces boilerplate in the convenience constructors below where a
-/// provider supports multiple env-var aliases (e.g. `XAI_API_KEY` /
-/// `GROK_API_KEY`).
 /// Read an environment variable or return a default.
+///
+/// Profile constructors use this for endpoints, models, and placeholder
+/// credentials a host may override by environment without touching
+/// code — required credentials without a placeholder belong to
+/// [`env_key`] instead.
 #[cfg(any(
     feature = "ollama",
     feature = "deepseek",

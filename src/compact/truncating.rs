@@ -327,13 +327,15 @@ impl ContextCompactor for TruncatingCompactor {
         Box::pin(async move {
             let total = messages.len();
             if total <= self.min_messages {
-                return Self::unchanged(messages, &context);
+                let pairing = ToolPairing::scan(&messages);
+                return Self::unchanged(messages, &pairing, &context);
             }
 
+            let pairing = ToolPairing::scan(&messages);
             let initial_split = total.saturating_sub(self.preserve_recent);
             let mut split = initial_split;
             loop {
-                let adjusted = Self::adjust_for_tool_pairs(&messages, split);
+                let adjusted = Self::adjust_for_tool_pairs(&pairing, split);
                 if adjusted == split {
                     break;
                 }
@@ -341,7 +343,7 @@ impl ContextCompactor for TruncatingCompactor {
             }
 
             if split == 0 {
-                return Self::unchanged(messages, &context);
+                return Self::unchanged(messages, &pairing, &context);
             }
 
             let recent: Vec<Message> = messages.get(split..).unwrap_or_default().to_vec();
@@ -351,10 +353,10 @@ impl ContextCompactor for TruncatingCompactor {
                 preserved.push(first.clone());
             }
             preserved.extend(recent);
-            let preserved = Self::reattach_dropped_results(&messages, split, preserved);
+            let preserved = Self::reattach_dropped_results(&messages, &pairing, split, preserved);
 
             if preserved.is_empty() {
-                return Self::unchanged(messages, &context);
+                return Self::unchanged(messages, &pairing, &context);
             }
 
             let tokens_after = context.counter.count(&preserved);
@@ -379,11 +381,15 @@ impl TruncatingCompactor {
     /// message containing that call. Pairing is per occurrence (see
     /// [`ToolPairing`]): a call id reused in a later turn is a
     /// different pair and never substitutes for the stranded one.
-    fn adjust_for_tool_pairs(messages: &[Message], split: usize) -> usize {
+    ///
+    /// Returns `split` unchanged or a strictly smaller index, so the
+    /// caller's re-apply loop converges — the adjustment is
+    /// non-increasing and bottoms out at zero.
+    fn adjust_for_tool_pairs(pairing: &ToolPairing, split: usize) -> usize {
         if split == 0 {
             return 0;
         }
-        ToolPairing::scan(messages).adjusted_split(split)
+        pairing.adjusted_split(split)
     }
 
     /// Pull dropped [`MessagePart::ToolResult`]s back into the kept slice
@@ -414,10 +420,10 @@ impl TruncatingCompactor {
     /// call nor gets pulled in its place.
     fn reattach_dropped_results(
         messages: &[Message],
+        pairing: &ToolPairing,
         split: usize,
         kept: Vec<Message>,
     ) -> Vec<Message> {
-        let pairing = ToolPairing::scan(messages);
         let pull_indices = pairing.first_message_dropped_result_indices(split);
 
         let pulled: Vec<Message> = pull_indices
@@ -438,7 +444,7 @@ impl TruncatingCompactor {
         origins.extend(pull_indices.iter().copied());
         origins.extend(split..messages.len());
         out.extend(kept_iter);
-        Self::sanitize_tool_parts(&mut out, &origins, &pairing, pulled_len);
+        Self::sanitize_tool_parts(&mut out, &origins, pairing, pulled_len);
         out
     }
 
@@ -456,9 +462,14 @@ impl TruncatingCompactor {
     /// path; when nothing was filtered, the plain no-change outcome
     /// (zero savings) is returned. A conversation consisting solely of
     /// orphaned results is returned as received — filtering it would
-    /// produce an empty history, which is never an outcome.
-    fn unchanged(messages: Vec<Message>, context: &CompactionContext) -> CompactionOutcome {
-        let pairing = ToolPairing::scan(&messages);
+    /// produce an empty history, which is never an outcome. The caller
+    /// supplies the conversation's pairing — every path into here has
+    /// either scanned one already or scans it fresh at the call site.
+    fn unchanged(
+        messages: Vec<Message>,
+        pairing: &ToolPairing,
+        context: &CompactionContext,
+    ) -> CompactionOutcome {
         if pairing.all_parts_lone_results() {
             return CompactionOutcome::no_change(messages);
         }
@@ -469,7 +480,7 @@ impl TruncatingCompactor {
             .fold(0usize, usize::saturating_add);
         let origins: Vec<usize> = (0..input_len).collect();
         let mut out = messages;
-        Self::sanitize_tool_parts(&mut out, &origins, &pairing, 0);
+        Self::sanitize_tool_parts(&mut out, &origins, pairing, 0);
         let filtered_parts = out
             .iter()
             .map(|msg| msg.parts.len())
@@ -1015,7 +1026,8 @@ mod tests {
     #[test]
     fn adjust_for_tool_pairs_returns_zero_when_split_is_zero() {
         let messages = convo_with_straddling_tool_pair();
-        assert_eq!(TruncatingCompactor::adjust_for_tool_pairs(&messages, 0), 0);
+        let pairing = ToolPairing::scan(&messages);
+        assert_eq!(TruncatingCompactor::adjust_for_tool_pairs(&pairing, 0), 0);
     }
 
     #[test]
@@ -1029,7 +1041,10 @@ mod tests {
             Message::user("e"),
             Message::assistant("f"),
         ];
-        assert_eq!(TruncatingCompactor::adjust_for_tool_pairs(&messages, 4), 4);
+        assert_eq!(
+            TruncatingCompactor::adjust_for_tool_pairs(&ToolPairing::scan(&messages), 4),
+            4
+        );
     }
 
     #[test]
@@ -1037,7 +1052,10 @@ mod tests {
         let messages = convo_with_straddling_tool_pair();
         // Naive split at index 6 would keep result (idx 6) but drop call (idx 5).
         // Should adjust back to 5.
-        assert_eq!(TruncatingCompactor::adjust_for_tool_pairs(&messages, 6), 5);
+        assert_eq!(
+            TruncatingCompactor::adjust_for_tool_pairs(&ToolPairing::scan(&messages), 6),
+            5
+        );
     }
 
     #[tokio::test]

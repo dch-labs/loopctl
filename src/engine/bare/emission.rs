@@ -401,8 +401,9 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Fire the `on_run_start` hook when a hook executor is configured.
     ///
-    /// A missing executor is a no-op, so runs without the `hooks`
-    /// feature pay nothing.
+    /// A missing executor is a no-op for feature-enabled builds without
+    /// one; builds without the `hooks` feature do not compile this call
+    /// at all.
     #[cfg(feature = "hooks")]
     fn notify_run_start_hook(&self) {
         let Some(executor) = self.managers.hook_executor() else {

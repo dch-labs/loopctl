@@ -133,10 +133,13 @@ pub(crate) fn parse_container(attrs: &[Attribute]) -> syn::Result<ContainerAttrs
             } else if meta.path.is_ident("handler") {
                 out.handler = Some(string_value(&meta)?);
             } else if meta.path.is_ident("read_only") {
+                flag_without_value(&meta, "read_only")?;
                 out.read_only = true;
             } else if meta.path.is_ident("concurrency_safe") {
+                flag_without_value(&meta, "concurrency_safe")?;
                 out.concurrency_safe = true;
             } else if meta.path.is_ident("allow_extra") {
+                flag_without_value(&meta, "allow_extra")?;
                 out.allow_extra = true;
             } else {
                 return Err(meta.error(format!(
@@ -167,8 +170,10 @@ pub(crate) fn parse_field(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
             } else if meta.path.is_ident("description") {
                 out.description = Some(string_value(&meta)?);
             } else if meta.path.is_ident("skip") {
+                flag_without_value(&meta, "skip")?;
                 out.skip = true;
             } else if meta.path.is_ident("default") {
+                flag_without_value(&meta, "default")?;
                 out.default = true;
             } else {
                 return Err(meta.error(format!(
@@ -195,6 +200,24 @@ fn string_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<String> {
     Ok(lit.value())
 }
 
+/// Reject a value on a flag-shaped `#[tool(...)]` key.
+///
+/// `read_only`, `concurrency_safe`, `allow_extra`, `skip`, and
+/// `default` are presence flags; a stray `= value` would otherwise
+/// surface as a bare syntax error (or, worse, silently invert the
+/// flag's meaning), so misuse fails with the key's own span and name.
+///
+/// # Errors
+///
+/// Returns a spanned error when the key carries a value.
+fn flag_without_value(meta: &syn::meta::ParseNestedMeta<'_>, key: &str) -> syn::Result<()> {
+    if meta.value().is_ok() {
+        Err(meta.error(format!("`{key}` takes no value")))
+    } else {
+        Ok(())
+    }
+}
+
 /// The `///` doc comment text of an item, joined across lines, if any.
 ///
 /// Each line is trimmed and the lines are joined with single spaces,
@@ -217,23 +240,38 @@ pub(crate) fn doc_string(attrs: &[Attribute]) -> Option<String> {
     }
 }
 
-/// Whether the field carries a `#[serde(default)]`-shaped attribute.
+/// The `Meta` items inside every `#[serde(…)]` attribute, in order.
+///
+/// A malformed serde attribute is skipped wholesale, so every serde-key
+/// check built on this walks the same arguments under the same policy —
+/// an unparseable key a host carries never aborts the walk for the
+/// well-formed ones.
+pub(crate) fn serde_metas(attrs: &[Attribute]) -> Vec<Meta> {
+    let mut metas = Vec::new();
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
+        if let Ok(list) = attr
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        {
+            metas.extend(list);
+        }
+    }
+    metas
+}
+
+/// Whether the attrs carry a `#[serde(default)]`-shaped attribute.
 ///
 /// The schema-side condition for `#[tool(skip)]` validity and for
 /// omitting a field from `required`: a field the runtime accepts
-/// without is not truly required. Matches the `default` key whether
-/// it is a bare flag or `default = "path"`.
+/// without is not truly required. Works on a field's attrs and on the
+/// container's — a struct-level `#[serde(default)]` fills every missing
+/// field the same way. Matches the `default` key whether it is a bare
+/// flag or `default = "path"`.
 pub(crate) fn has_serde_default(attrs: &[Attribute]) -> bool {
-    let mut found = false;
-    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("default") {
-                found = true;
-            }
-            Ok(())
-        });
-    }
-    found
+    serde_metas(attrs).iter().any(|meta| match meta {
+        Meta::Path(path) => path.is_ident("default"),
+        Meta::NameValue(nv) => nv.path.is_ident("default"),
+        Meta::List(_) => false,
+    })
 }
 
 /// The `#[serde(rename = "…")]` value on a field, if any.
@@ -245,40 +283,33 @@ pub(crate) fn has_serde_default(attrs: &[Attribute]) -> bool {
 pub(crate) fn serde_rename(attrs: &[Attribute]) -> Option<String> {
     let mut plain = None;
     let mut deserialize = None;
-    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
-        let Ok(list) = attr
-            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
-        else {
-            continue;
-        };
-        for meta in &list {
-            match meta {
-                Meta::NameValue(nv) if nv.path.is_ident("rename") => {
-                    if let Expr::Lit(expr) = &nv.value
+    for meta in serde_metas(attrs) {
+        match &meta {
+            Meta::NameValue(nv) if nv.path.is_ident("rename") => {
+                if let Expr::Lit(expr) = &nv.value
+                    && let Lit::Str(lit) = &expr.lit
+                {
+                    plain = Some(lit.value());
+                }
+            }
+            Meta::List(ml) if ml.path.is_ident("rename") => {
+                let Ok(inner) = syn::parse::Parser::parse2(
+                    &syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+                    ml.tokens.clone(),
+                ) else {
+                    continue;
+                };
+                for meta in &inner {
+                    if let Meta::NameValue(nv) = meta
+                        && nv.path.is_ident("deserialize")
+                        && let Expr::Lit(expr) = &nv.value
                         && let Lit::Str(lit) = &expr.lit
                     {
-                        plain = Some(lit.value());
+                        deserialize = Some(lit.value());
                     }
                 }
-                Meta::List(ml) if ml.path.is_ident("rename") => {
-                    let Ok(inner) = syn::parse::Parser::parse2(
-                        &syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
-                        ml.tokens.clone(),
-                    ) else {
-                        continue;
-                    };
-                    for meta in &inner {
-                        if let Meta::NameValue(nv) = meta
-                            && nv.path.is_ident("deserialize")
-                            && let Expr::Lit(expr) = &nv.value
-                            && let Lit::Str(lit) = &expr.lit
-                        {
-                            deserialize = Some(lit.value());
-                        }
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         }
     }
     deserialize.or(plain)
@@ -309,14 +340,14 @@ pub(crate) fn serde_rename_all(attrs: &[Attribute]) -> Option<RenameAll> {
 /// `Deserialize` input struct already declares.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RenameAll {
-    /// The `lowercase` strategy — field names as-is but all lowercase.
+    /// The `lowercase` strategy — field names lowercased, ASCII-only.
     ///
-    ///
-    /// No separators are inserted or removed.
+    /// Like serde's field arm, only ASCII case changes: no separators
+    /// are inserted or removed, and non-ASCII characters keep their
+    /// shape.
     Lower,
 
     /// The `UPPERCASE` strategy — field names uppercased.
-    ///
     ///
     /// Words keep their positions; only case changes.
     Upper,
@@ -372,83 +403,61 @@ impl RenameAll {
             "snake_case" => Some(Self::Snake),
             "SCREAMING_SNAKE_CASE" => Some(Self::ScreamingSnake),
             "kebab-case" => Some(Self::Kebab),
-            "SCREAMING_KEBAB_CASE" => Some(Self::ScreamingKebab),
+            "SCREAMING-KEBAB-CASE" => Some(Self::ScreamingKebab),
             _ => None,
         }
     }
 
-    /// Apply the strategy to a field name.
+    /// Apply the strategy to a field name, exactly as serde's
+    /// `rename_all` does for struct fields.
     ///
     /// The input is the Rust field identifier; the output is the JSON
-    /// property name serde will look for during deserialization.
+    /// property name serde will look for during deserialization. The
+    /// separator-inserting rules apply to *variants* in serde — for
+    /// fields, `snake_case` is the identity and `lowercase` lowercases
+    /// ASCII-only, `PascalCase` capitalizes after each underscore, and
+    /// the screaming/kebab rules are plain case and separator
+    /// conversions; mirroring those exactly is what keeps the schema
+    /// from lying about the wire name.
     pub(crate) fn apply(self, name: &str) -> String {
         match self {
-            Self::Lower => name.to_lowercase(),
-            Self::Upper => name.to_uppercase(),
+            Self::Lower => name.to_ascii_lowercase(),
+            Self::Snake => name.to_owned(),
+            Self::Upper | Self::ScreamingSnake => name.to_ascii_uppercase(),
             Self::Pascal => to_pascal_case(name),
             Self::Camel => {
                 let pascal = to_pascal_case(name);
                 let mut chars = pascal.chars();
                 match chars.next() {
-                    Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
+                    Some(first) => String::from(first.to_ascii_lowercase()) + chars.as_str(),
                     None => String::new(),
                 }
             }
-            Self::Snake => serde_snake_case(name),
-            Self::ScreamingSnake => serde_snake_case(name).to_uppercase(),
-            Self::Kebab => serde_snake_case(name).replace('_', "-"),
-            Self::ScreamingKebab => serde_snake_case(name).replace('_', "-").to_uppercase(),
+            Self::Kebab => name.replace('_', "-"),
+            Self::ScreamingKebab => name.to_ascii_uppercase().replace('_', "-"),
         }
     }
 }
 
-/// `PascalCase` from a `snake_case` or `camelCase` input.
+/// `PascalCase` the way serde's field rule builds it.
 ///
-/// Splits on underscores, capitalizes each word's first letter, and
-/// joins without separators. Empty segments (from leading/trailing
-/// underscores) are dropped.
+/// Underscores disappear and the character after each one is
+/// capitalized; everything else passes through unchanged, matching
+/// serde's own loop character for character.
 fn to_pascal_case(name: &str) -> String {
-    name.split('_')
-        .filter(|s| !s.is_empty())
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect()
-}
-
-/// `snake_case` matching serde's field-rename behavior.
-///
-/// An underscore is inserted before an uppercase character only when
-/// the previous character is lowercase or a digit — consecutive
-/// uppercase (an acronym like `ID` in `userID`) stays together:
-/// `userID` becomes `user_id`, not `user_i_d`.
-fn serde_snake_case(name: &str) -> String {
-    let chars: Vec<char> = name.chars().collect();
-    let mut out = String::new();
-    for (i, &ch) in chars.iter().enumerate() {
-        if ch.is_uppercase() {
-            let prev_lower = i > 0
-                && chars
-                    .get(i.wrapping_sub(1))
-                    .is_some_and(|c| c.is_lowercase() || c.is_numeric());
-            let next_lower = chars
-                .get(i.wrapping_add(1))
-                .is_some_and(|c| c.is_lowercase());
-            // Insert before an uppercase that starts a word —
-            // after lowercase/digit, or at an acronym-to-word boundary.
-            if prev_lower || (i > 0 && next_lower) {
-                out.push('_');
-            }
-            out.extend(ch.to_lowercase());
+    let mut pascal = String::new();
+    let mut capitalize = true;
+    for ch in name.chars() {
+        if ch == '_' {
+            capitalize = true;
+        } else if capitalize {
+            pascal.extend(ch.to_uppercase());
+            capitalize = false;
         } else {
-            out.push(ch);
+            pascal.push(ch);
         }
     }
-    out
+    pascal
 }
 
 #[cfg(test)]
@@ -462,10 +471,10 @@ mod tests {
             ("UPPERCASE", "FileName", "FILENAME"),
             ("PascalCase", "file_name", "FileName"),
             ("camelCase", "file_name", "fileName"),
-            ("snake_case", "FileName", "file_name"),
-            ("SCREAMING_SNAKE_CASE", "FileName", "FILE_NAME"),
+            ("snake_case", "FileName", "FileName"),
+            ("SCREAMING_SNAKE_CASE", "FileName", "FILENAME"),
             ("kebab-case", "file_name", "file-name"),
-            ("SCREAMING_KEBAB_CASE", "file_name", "FILE-NAME"),
+            ("SCREAMING-KEBAB-CASE", "file_name", "FILE-NAME"),
         ];
         for (name, input, expected) in cases {
             let strategy =
@@ -479,20 +488,84 @@ mod tests {
     }
 
     #[test]
-    fn snake_case_preserves_consecutive_uppercase() {
+    fn separator_rules_are_identities_on_fields_matching_serde() {
         assert_eq!(
             RenameAll::from_str("snake_case").unwrap().apply("userID"),
-            "user_id"
+            "userID",
+            "serde's field arm for snake_case is the identity — the \
+            separator-inserting logic applies to variants, not fields"
         );
         assert_eq!(
-            RenameAll::from_str("snake_case")
-                .unwrap()
-                .apply("parseHTTPResponse"),
-            "parse_http_response"
+            RenameAll::from_str("lowercase").unwrap().apply("FileName"),
+            "filename",
+            "serde's field arm for lowercase lowercases — only snake_case \
+            is the identity on fields, so the schema must advertise the \
+            lowercased key serde will actually look for"
         );
         assert_eq!(
-            RenameAll::from_str("snake_case").unwrap().apply("htmlID"),
-            "html_id"
+            RenameAll::from_str("camelCase").unwrap().apply("user_ID"),
+            "userID",
+            "camelCase is pascal-case-after-underscore with the first \
+            character lowered, character for character like serde"
+        );
+    }
+
+    #[test]
+    fn screaming_kebab_accepts_only_serdes_hyphenated_name() {
+        assert!(RenameAll::from_str("SCREAMING-KEBAB-CASE").is_some());
+        assert!(
+            RenameAll::from_str("SCREAMING_KEBAB_CASE").is_none(),
+            "serde rejects the underscore spelling; the derive must not \
+            accept a name serde itself would refuse"
+        );
+    }
+
+    #[test]
+    fn has_serde_default_survives_value_bearing_keys_before_it() {
+        use syn::parse_quote;
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(with = "humantime_serde", default)]
+        };
+        assert!(
+            has_serde_default(&attrs),
+            "a value-bearing key before `default` must not abort the walk"
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(skip_serializing_if = "Option::is_none", default)]
+        };
+        assert!(has_serde_default(&attrs));
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(default = "default_path")]
+        };
+        assert!(has_serde_default(&attrs));
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(rename = "other")]
+        };
+        assert!(!has_serde_default(&attrs));
+    }
+
+    #[test]
+    fn flag_keys_reject_values_with_a_named_error() {
+        use syn::parse_quote;
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[tool(read_only = false)]
+        };
+        let err = parse_container(&attrs)
+            .err()
+            .expect("a flag with a value must fail");
+        assert!(
+            err.to_string().contains("`read_only` takes no value"),
+            "the error names the key: {err}"
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[tool(skip = false)]
+        };
+        let err = parse_field(&attrs)
+            .err()
+            .expect("a flag with a value must fail");
+        assert!(
+            err.to_string().contains("`skip` takes no value"),
+            "the error names the key: {err}"
         );
     }
 

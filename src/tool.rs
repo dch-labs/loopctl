@@ -212,8 +212,9 @@ pub enum DisplayHint {
     Code {
         /// The source language identifier (lowercase convention, e.g. `"rust"`).
         ///
-        /// Follows the highlighter-identifier convention so consumers can
-        /// pick a grammar without a mapping table.
+        /// Conventionally a highlighter identifier, so consumers can
+        /// often resolve a grammar directly — the value is a free-form
+        /// hint, and identifiers vary between highlighters.
         language: String,
     },
 

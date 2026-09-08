@@ -441,7 +441,9 @@ impl VectorIndex for LinearVectorIndex {
     /// Score every row against `query` and return the top `k`.
     ///
     /// A brute-force cosine scan sorted descending with a stable id
-    /// tiebreak; emits one `vector.index.search` metric event per call.
+    /// tiebreak; emits one `vector.index.search` metric event per
+    /// successful call — a dimension-mismatch rejection returns before
+    /// the event fires.
     fn search(
         &self,
         query: &Embedding,

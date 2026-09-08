@@ -166,8 +166,19 @@ impl ToolMiddleware for PermissionMiddleware {
                     let resolver = Arc::clone(resolver);
                     Box::pin(async move {
                         let tool_name = ctx.tool_name.clone();
+                        let cancel = Arc::clone(&ctx.cancel);
                         let approved = resolver(&prompt, &tool_name);
-                        if approved.await {
+                        let approved = tokio::select! {
+                            approved = approved => approved,
+                            () = cancel.notified() => {
+                                return Self::deny(
+                                    ctx,
+                                    "cancelled while awaiting approval",
+                                )
+                                .await;
+                            }
+                        };
+                        if approved {
                             next.dispatch(ctx).await
                         } else {
                             Self::deny(ctx, "denied by user").await
@@ -190,8 +201,9 @@ impl PermissionMiddleware {
     /// Build a denied result with tracing.
     ///
     /// One shape for every denial site — an explicit `Deny`, an
-    /// unanswered `Ask`, and a user refusal — so logs and results stay
-    /// in sync wherever the verdict originated.
+    /// unanswered `Ask`, a user refusal, and a pipeline cancelled
+    /// mid-prompt — so logs and results stay in sync wherever the
+    /// verdict originated.
     fn deny<'a>(
         ctx: &'a mut ToolDispatchContext,
         reason: &str,
@@ -208,5 +220,64 @@ impl PermissionMiddleware {
             format!("Permission {reason} for tool '{tool_name}'"),
             Duration::ZERO,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cancel::CancelSignal;
+    use crate::middleware::ToolPipeline;
+    use crate::tool::{PermissionCheck, ToolContext, ToolRegistry};
+
+    #[tokio::test]
+    async fn a_cancelled_pipeline_aborts_a_pending_approval_prompt() {
+        let resolver: AskResolverFn = Arc::new(|_prompt: &str, _tool: &str| {
+            Box::pin(std::future::pending::<bool>()) as Pin<Box<dyn Future<Output = bool> + Send>>
+        });
+        let permission = PermissionMiddleware::from_context()
+            .with_check(|_| PermissionCheck::Ask {
+                prompt: "approve the deploy?".into(),
+            })
+            .with_ask_resolver(resolver);
+        let pipeline = Arc::new(
+            ToolPipeline::builder()
+                .with_core(Arc::new(ToolRegistry::new()))
+                .with_middleware(permission)
+                .build()
+                .expect("a core plus one middleware assembles"),
+        );
+        let cancel = Arc::new(CancelSignal::new());
+        let ctx = ToolDispatchContext {
+            tool_name: "deploy".into(),
+            input: serde_json::Value::Null,
+            call_id: "call_1".into(),
+            turn_number: 0,
+            cancel: Arc::clone(&cancel),
+            permission: PermissionCheck::allow(),
+            tool_context: ToolContext::default(),
+        };
+
+        let invoked = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            async move { pipeline.invoke(ctx).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The resolver never answers; only cancellation can end the prompt.
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), invoked)
+            .await
+            .expect("cancellation ends the prompt well inside the timeout")
+            .expect("the spawned invoke survives to completion");
+        assert!(result.is_error, "a cancelled prompt denies the call");
+        match &result.output {
+            crate::message::ToolContent::Text(text) => assert!(
+                text.contains("cancelled while awaiting approval"),
+                "the denial names the cancelled prompt: {text}"
+            ),
+            crate::message::ToolContent::Multipart(parts) => {
+                panic!("expected a text denial, got {} parts", parts.len())
+            }
+        }
     }
 }

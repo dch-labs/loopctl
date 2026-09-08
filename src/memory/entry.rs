@@ -73,7 +73,7 @@ pub struct MemoryEntry {
     /// How often this entry has been retrieved; the reference store
     /// counts consolidation passes, not individual retrievals.
     ///
-    /// A popularity counter stores feed from their access tracking —
+    /// A popularity counter is fed from the store's access tracking —
     /// [`InMemoryStore`](crate::memory::builtin::InMemoryStore) records
     /// each matched surfacing in a side log (baseline-only returns are
     /// delivered but never stamped) and folds it at the next

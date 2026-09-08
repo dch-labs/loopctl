@@ -145,7 +145,8 @@ let mut agent = BareLoop::new(
     registry,
     test_config(),
 );
-// let result = agent.run("test input", &RunConfig::default()).await?;
+// let result = agent.run("test input", &RunConfig::default()).await;
+// assert!(result.is_ok());
 ```
 
 ### Structured Output

@@ -32,13 +32,20 @@ use crate::hooks::context::PreToolUseContext;
 /// ```
 pub struct BlocklistHook {
     /// Tool names to block (denylist). Takes precedence over allowlist.
+    ///
+    /// Exact-match on the requested tool name.
     blocked: Vec<String>,
     /// If non-empty, only these tools are allowed (allowlist).
+    ///
+    /// An empty vector allows everything not on the denylist.
     allowed: Vec<String>,
 }
 
 impl BlocklistHook {
     /// Create a denylist hook — blocks the named tools.
+    ///
+    /// Everything else passes; equivalent to `BlocklistHook` with an
+    /// empty allowlist.
     #[must_use]
     pub fn deny(blocked: Vec<String>) -> Self {
         Self {
@@ -48,6 +55,9 @@ impl BlocklistHook {
     }
 
     /// Create an allowlist hook — only the named tools are permitted.
+    ///
+    /// Requests for anything else are denied with a message naming the
+    /// requested tool.
     #[must_use]
     pub fn allow_only(allowed: Vec<String>) -> Self {
         Self {
@@ -63,14 +73,12 @@ impl Hook for BlocklistHook {
     }
 
     fn on_pre_tool_use(&self, ctx: &PreToolUseContext) -> Option<HookAction> {
-        // Denylist takes precedence
         if self.blocked.iter().any(|b| b == &ctx.tool_name) {
             return Some(HookAction::block(format!(
                 "Tool '{}' is blocked by policy",
                 ctx.tool_name
             )));
         }
-        // Allowlist: if non-empty, only listed tools are permitted
         if !self.allowed.is_empty() && !self.allowed.iter().any(|a| a == &ctx.tool_name) {
             return Some(HookAction::block(format!(
                 "Tool '{}' is not in the allowlist",
@@ -143,6 +151,21 @@ mod tests {
         match hook.on_pre_tool_use(&make_ctx("dangerous")) {
             Some(HookAction::Block { reason }) => {
                 assert!(reason.contains("dangerous"));
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_rejection_names_the_requested_tool() {
+        let hook = BlocklistHook::allow_only(vec!["safe".to_string()]);
+        match hook.on_pre_tool_use(&make_ctx("unlisted")) {
+            Some(HookAction::Block { reason }) => {
+                assert!(
+                    reason.contains("unlisted") && reason.contains("allowlist"),
+                    "the allowlist rejection names the requested tool and the \
+                    list that refused it: {reason}"
+                );
             }
             other => panic!("expected Block, got {other:?}"),
         }

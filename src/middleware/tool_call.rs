@@ -28,6 +28,10 @@ impl ToolCallMiddleware {
     pub(super) const NAME: &str = "tool_call";
 
     /// Create a new core dispatch wrapping the given registry.
+    ///
+    /// The registry is shared behind an `Arc` and immutable from here
+    /// on; dispatch still looks the tool up by name on every call
+    /// rather than caching the resolution at construction time.
     #[must_use]
     pub fn new(registry: Arc<ToolRegistry>) -> Self {
         Self { registry }
@@ -78,7 +82,6 @@ impl ToolCallMiddleware {
 
             let duration = start.elapsed();
 
-            // Convert a panic payload into a tool-error result.
             let call_result = match call_result {
                 Ok(inner) => inner,
                 Err(panic_payload) => {

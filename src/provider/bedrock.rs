@@ -23,6 +23,10 @@ use crate::api::{ApiClient, NonStreamingResponse, StreamRequest};
 use crate::stream::StreamStopReason as Stop;
 use crate::stream::{StreamEvent, StreamStopReason};
 
+/// The `SigV4` signing hash — HMAC over SHA-256.
+///
+/// Bedrock credentials sign every invoke URL and body with this
+/// construction; the alias keeps the signing sites readable.
 type HmacSha256 = Hmac<Sha256>;
 
 /// Which Bedrock invoke path to use for the configured model.

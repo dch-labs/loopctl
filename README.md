@@ -21,10 +21,11 @@ and tool implementations; the framework handles the rest.
 |--------|-------------|
 | [`api`](https://docs.rs/loopctl/latest/loopctl/api/index.html) | `ApiClient` trait for LLM provider communication (streaming + non-streaming) |
 | [`api::error`](https://docs.rs/loopctl/latest/loopctl/api/error/index.html) | API error types with retry classification |
-| [`cancel`](https://docs.rs/loopctl/latest/loopctl/cancel/index.html) | Cooperative cancellation via `CancelSignal` (AtomicBool + tokio::Notify) |
+| [`cancel`](https://docs.rs/loopctl/latest/loopctl/cancel/index.html) | Cooperative cancellation via `CancelSignal` — a one-shot `tokio_util::sync::CancellationToken` wrapper (re-armed with `reset()`; avoids the `AtomicBool` + `Notify` TOCTOU race) |
 | [`capabilities`](https://docs.rs/loopctl/latest/loopctl/capabilities/index.html) | Capability traits (`Observable`, `Detectable`, `Compactable`, etc.) |
 | [`compact`](https://docs.rs/loopctl/latest/loopctl/compact/index.html) | Context compaction: `ContextCompactor` trait, `TruncatingCompactor`, `TokenSplitter` |
 | [`config`](https://docs.rs/loopctl/latest/loopctl/config/index.html) | Session configuration (`LoopConfig`) |
+| [`contributor`](https://docs.rs/loopctl/latest/loopctl/contributor/index.html) | `ContextContributor` — turn-boundary context injection (re-emit goals and plans so small models don't drift) |
 | [`detection`](https://docs.rs/loopctl/latest/loopctl/detection/index.html) | Loop detection, convergence detection, `DetectionManager` |
 | [`engine`](https://docs.rs/loopctl/latest/loopctl/engine/index.html) | `BareLoop<C>` — the default agent loop engine (stream → accumulate → dispatch tools → repeat) |
 | [`error`](https://docs.rs/loopctl/latest/loopctl/error/index.html) | Central `LoopError` enum for all framework operations |
@@ -33,9 +34,11 @@ and tool implementations; the framework handles the rest.
 | [`message`](https://docs.rs/loopctl/latest/loopctl/message/index.html) | Conversation types: `Message`, `MessagePart`, `ToolContent`, roles |
 | [`middleware`](https://docs.rs/loopctl/latest/loopctl/middleware/index.html) | Tool dispatch pipeline: timeouts, permissions, output limits, unknown-tool handling |
 | [`observer`](https://docs.rs/loopctl/latest/loopctl/observer/index.html) | `LoopObserver` trait and `ObserverHost` for lifecycle event observation |
+| [`presets`](https://docs.rs/loopctl/latest/loopctl/presets/index.html) | Small-model runtime profiles: `ConstrainedProfile`, `FrontierProfile`, `GoalReminder` |
 | [`reflection`](https://docs.rs/loopctl/latest/loopctl/reflection/index.html) | Failure reflection and recovery strategies (`Reflector`, `RecoveryStrategy`) |
 | [`managers`](https://docs.rs/loopctl/latest/loopctl/managers/index.html) | `LoopManagers` — the default infrastructure bundle |
 | [`stream`](https://docs.rs/loopctl/latest/loopctl/stream/index.html) | Streaming event types, accumulator, stop reasons, usage tracking |
+| [`structured`](https://docs.rs/loopctl/latest/loopctl/structured/index.html) | Structured output: `request_structured` (native `response_format`), `request_structured_prompted` (schema-in-prompt fallback), `StructuredOutput` trait, `ToolConstraint` |
 | [`tool`](https://docs.rs/loopctl/latest/loopctl/tool/index.html) | `Tool` trait, `ToolRegistry`, `ToolSchema`, `ToolOutput`, `FnTool` adapter |
 | [`hooks`](https://docs.rs/loopctl/latest/loopctl/hooks/index.html) | Bidirectional lifecycle control (allow/block/ask before tool use). *Requires `hooks` feature.* |
 | [`testing`](https://docs.rs/loopctl/latest/loopctl/testing/index.html) | Mock API client, mock tools, and test fixture factories. *Requires `testing` feature.* |
@@ -92,8 +95,12 @@ use std::sync::Arc;
 # use loopctl::api::ApiClient;
 # impl ApiClient for MyClient {
 #     fn model(&self) -> String { "llm-70b".to_string() }
+#     fn create_message(&self, _req: &loopctl::api::StreamRequest)
+#         -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<loopctl::api::NonStreamingResponse, loopctl::api::error::ApiError>> + Send + '_>> {
+#         unimplemented!()
+#     }
 #     fn stream_messages(&self, _req: &loopctl::api::StreamRequest)
-#         -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<loopctl::stream::StreamEvent, loopctl::api::error::ApiError>> + Send>> {
+#         -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<loopctl::stream::StreamEvent, loopctl::api::error::ApiError>> + Send + 'static>> {
 #         unimplemented!()
 #     }
 # }
@@ -122,6 +129,7 @@ loopctl = { version = "0.3", features = ["testing"] }
 ```rust,no_run
 use loopctl::testing::{MockApiClient, MockTool, test_config};
 use loopctl::engine::BareLoop;
+use loopctl::engine::RunConfig;
 use loopctl::engine::core::Loop;
 use loopctl::tool::ToolRegistry;
 use std::sync::Arc;
@@ -132,12 +140,12 @@ client = client.with_text_response("Hello from the mock");
 let mut registry = ToolRegistry::new();
 registry.register(MockTool::new("demo", "A demo tool"));
 
-let agent = BareLoop::new(
+let mut agent = BareLoop::new(
     Arc::new(client),
     registry,
     test_config(),
 );
-// let result = agent.run("test input").await?;
+// let result = agent.run("test input", &RunConfig::default()).await?;
 ```
 
 ### Structured Output
@@ -256,7 +264,7 @@ Two cross-cutting concerns run alongside the main loop:
 ## Development
 
 ```bash
-make ci        # fmt + check + clippy + tests + docs + examples + redaction minimal-feature gate
+make ci        # fmt + check + clippy (all-features and default) + tests + docs + examples + redaction minimal-feature gate
                # (the gate builds an isolated probe crate — a separate dependency build, cached under `target/redaction-minimal`)
 make test      # run all tests
 make lint      # auto-format

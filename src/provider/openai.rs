@@ -39,10 +39,35 @@ use crate::structured::ToolConstraint;
 use crate::structured::tighten_json_schema;
 use crate::tool::ToolSchema;
 
+/// Default OpenAI chat-completions endpoint used when a builder sets none.
+///
+/// Compatible servers (`Ollama`, `vLLM`, `DeepSeek`, …) override it with
+/// [`with_base_url`](OpenAiClientBuilder::with_base_url).
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Model served when a builder or environment names none.
+///
+/// Override with [`with_model`](OpenAiClientBuilder::with_model) or the
+/// provider profile constructors that seed their own default.
 const DEFAULT_MODEL: &str = "gpt-4o";
+
+/// Sentinel terminating an OpenAI server-sent-event stream.
+///
+/// The stream ends on this data line rather than a close frame; the
+/// reader treats it as end-of-stream.
 const SSE_DONE: &str = "[DONE]";
+
+/// Delta slot carrying answer text.
+///
+/// OpenAI streams choices positionally; answer text rides the first
+/// choice's delta.
 const TEXT_PART_INDEX: usize = 0;
+
+/// Delta slot carrying reasoning text when the model emits it.
+///
+/// A distinct index from the text lane, so a reasoning lane cannot
+/// share its part index with a tool call; an absent field simply yields
+/// no thinking deltas, and the lanes interleave in any order.
 const THINKING_PART_INDEX: usize = 1;
 
 /// An OpenAI-compatible chat completions client with streaming support.

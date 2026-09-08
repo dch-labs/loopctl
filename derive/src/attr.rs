@@ -100,8 +100,15 @@ pub(crate) struct FieldAttrs {
     pub default: bool,
 }
 
+/// Accepted keys on the container-level `#[tool(...)]` attribute.
+///
+/// Unknown keys are rejected with this list in the error so a typo
+/// fails at compile time, not as a silently ignored attribute.
 const CONTAINER_KEYS: &str =
     "name, description, read_only, concurrency_safe, system_prompt, handler, allow_extra";
+/// Accepted keys on a field-level `#[tool(...)]` attribute.
+///
+/// Unknown keys are rejected with this list in the error.
 const FIELD_KEYS: &str = "name, description, skip, default";
 
 /// Parse the container-level `#[tool(...)]` attributes.
@@ -297,23 +304,57 @@ pub(crate) fn serde_rename_all(attrs: &[Attribute]) -> Option<RenameAll> {
 }
 
 /// The `#[serde(rename_all = "…")]` casing strategies.
+///
+/// Mirrored from serde so the derive honours the same casing names a
+/// `Deserialize` input struct already declares.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RenameAll {
     /// The `lowercase` strategy — field names as-is but all lowercase.
+    ///
+    ///
+    /// No separators are inserted or removed.
     Lower,
+
     /// The `UPPERCASE` strategy — field names uppercased.
+    ///
+    ///
+    /// Words keep their positions; only case changes.
     Upper,
+
     /// The `PascalCase` strategy — each word capitalized, no separators.
+    ///
+    ///
+    /// Word boundaries come from the field name's existing separators.
     Pascal,
+
     /// The `camelCase` strategy — first word lowercase, rest capitalized.
+    ///
+    ///
+    /// The conventional local-variable and JSON-field shape.
     Camel,
+
     /// The `snake_case` strategy — underscore-separated lowercase words.
+    ///
+    ///
+    /// The conventional Rust field shape, and the derive's default.
     Snake,
+
     /// The `SCREAMING_SNAKE_CASE` strategy — underscore-separated uppercase.
+    ///
+    ///
+    /// The conventional Rust constant shape.
     ScreamingSnake,
+
     /// The `kebab-case` strategy — hyphen-separated lowercase words.
+    ///
+    ///
+    /// The conventional CLI-flag and HTML-attribute shape.
     Kebab,
+
     /// The `SCREAMING-KEBAB-CASE` strategy — hyphen-separated uppercase.
+    ///
+    ///
+    /// Rare in practice; accepted for serde parity.
     ScreamingKebab,
 }
 

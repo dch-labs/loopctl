@@ -691,6 +691,9 @@ impl Session {
 }
 
 /// The result of a `run()` call — either the completed [`Run`] or a [`LoopError`].
+///
+/// Aliased so signatures and match arms read as one concept
+/// throughout the engine.
 pub type RunResult = Result<Run, LoopError>;
 
 /// The core agent lifecycle trait.

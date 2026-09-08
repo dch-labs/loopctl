@@ -49,9 +49,11 @@ const VALIDATED_WEIGHT: f32 = 0.10;
 
 /// Access count at which the log-scaled access factor saturates at 1.0.
 ///
-/// The point sits far above realistic retrieval counts for any single
-/// entry, so the log scale effectively never tops out in practice.
-/// Raising it flattens the access curve further; lowering it makes
+/// The point sits far above realistic per-retrieval counts for a single
+/// entry. Merges sum whole clusters' access counts, so a merged hot
+/// entry can pass the saturation point — the clamp then pins its access
+/// factor at the ceiling rather than distorting the score. Raising the
+/// constant flattens the access curve further; lowering it makes
 /// popularity matter sooner.
 const ACCESS_SATURATION: f32 = 50.0;
 
@@ -66,7 +68,11 @@ const RECENCY_SCALE_SECS: f32 = 60.0 * 60.0 * 24.0 * 30.0;
 /// mid-relevance memory that is retrieved often. Composed as
 /// `relevance × 0.45 + access × 0.30 + recency × 0.15 + validated × 0.10`,
 /// with every component normalized to `0.0..=1.0` so the result stays in
-/// range.
+/// range — relevance is clamped into the range, so a finite
+/// hand-constructed or deserialized out-of-range value cannot push the
+/// composite past `1.0` (a NaN input propagates, staying visibly broken
+/// for the sanitizing pass — the same policy `merge_cluster`'s cap
+/// follows).
 #[must_use]
 pub fn quality_score(entry: &MemoryEntry, now: SystemTime) -> f32 {
     let access_count = f32::from(u16::try_from(entry.access_count).unwrap_or(u16::MAX));
@@ -78,7 +84,7 @@ pub fn quality_score(entry: &MemoryEntry, now: SystemTime) -> f32 {
         .and_then(|stamp| now.duration_since(stamp).ok())
         .map_or(1.0, |age| (-age.as_secs_f32() / RECENCY_SCALE_SECS).exp());
     let validated_bonus = if entry.validated { 1.0 } else { 0.0 };
-    entry.relevance * RELEVANCE_WEIGHT
+    entry.relevance.clamp(0.0, 1.0) * RELEVANCE_WEIGHT
         + access_factor * ACCESS_WEIGHT
         + recency_factor * RECENCY_WEIGHT
         + validated_bonus * VALIDATED_WEIGHT
@@ -166,55 +172,85 @@ pub struct MemoryCluster {
 ///
 /// Two entries cluster when they share a [`MemoryCategory`] and the Jaccard
 /// similarity of their normalized token sets reaches `similarity_threshold`
-/// against the cluster's canonical member. Greedy and `O(n²)` in the worst
-/// case — acceptable because consolidation is periodic, not per-turn.
-/// Every input entry lands in exactly one cluster; singletons come back
-/// with an empty `duplicates` vector so callers treat both shapes alike.
+/// against the cluster's canonical member. The threshold defends itself
+/// like the pass does: a value that is non-finite or outside
+/// `(0.0..=1.0]` falls back to the default 0.6 — a threshold of exactly
+/// zero would satisfy `jaccard >= threshold` for every same-category
+/// pair, disjoint sets included, and collapse the category into one
+/// entry. An entry whose normalized token set is empty — empty,
+/// punctuation-only, or emoji-only text — never clusters: corroboration
+/// requires shared tokens, so degenerate entries prune on their own
+/// relevance instead of promoting each other. Greedy
+/// and `O(n²)` in the worst case — acceptable because consolidation is
+/// periodic, not per-turn. Every input entry lands in exactly one
+/// cluster; singletons come back with an empty `duplicates` vector so
+/// callers treat both shapes alike.
 #[must_use]
 pub fn cluster_duplicates(
     entries: &[MemoryEntry],
     similarity_threshold: f32,
 ) -> Vec<MemoryCluster> {
-    let mut clusters: Vec<MemoryCluster> = Vec::new();
-    let mut cluster_tokens: Vec<HashSet<String>> = Vec::new();
+    let similarity_threshold = if similarity_threshold.is_finite()
+        && (0.0..=1.0).contains(&similarity_threshold)
+        && similarity_threshold > 0.0
+    {
+        similarity_threshold
+    } else {
+        ConsolidationConfig::default().merge_threshold
+    };
+    let mut clusters: Vec<(MemoryCluster, HashSet<String>)> = Vec::new();
     for entry in entries {
         let tokens = normalized_tokens(&entry.memory);
         let mut placed = false;
-        for (cluster, canonical_tokens) in clusters.iter_mut().zip(cluster_tokens.iter()) {
-            let same_category = std::mem::discriminant(&cluster.canonical.category)
-                == std::mem::discriminant(&entry.category);
-            if same_category && jaccard(&tokens, canonical_tokens) >= similarity_threshold {
-                cluster.duplicates.push(entry.clone());
-                placed = true;
-                break;
+        if !tokens.is_empty() {
+            for (cluster, canonical_tokens) in &mut clusters {
+                let same_category = std::mem::discriminant(&cluster.canonical.category)
+                    == std::mem::discriminant(&entry.category);
+                if same_category && jaccard(&tokens, canonical_tokens) >= similarity_threshold {
+                    cluster.duplicates.push(entry.clone());
+                    placed = true;
+                    break;
+                }
             }
         }
         if !placed {
-            clusters.push(MemoryCluster {
-                canonical: entry.clone(),
-                duplicates: Vec::new(),
-            });
-            cluster_tokens.push(tokens);
+            clusters.push((
+                MemoryCluster {
+                    canonical: entry.clone(),
+                    duplicates: Vec::new(),
+                },
+                tokens,
+            ));
         }
     }
-    clusters
+    clusters.into_iter().map(|(cluster, _)| cluster).collect()
 }
 
 /// Merge a cluster into one [`MemoryEntry`].
 ///
 /// Keeps the canonical entry's `id` and memory text; unions `tags`
 /// (deduplicated); raises `relevance` by `0.1` per duplicate as
-/// corroboration, capped at 1.0; sums `access_count`; sets `validated`
-/// when any member was validated; keeps the earliest `created_at` (the
-/// cluster's provenance) and the freshest `last_accessed`.
+/// corroboration, clamped into `0.0..=1.0` (a NaN stays NaN — visibly
+/// broken for the next sanitizing pass — instead of `f32::min`'s
+/// ignore-NaN turning it into exactly `1.0`); sums `access_count`; sets
+/// `validated` when any member was validated; keeps the earliest
+/// `created_at` (the cluster's provenance) and the freshest
+/// `last_accessed`. Adopting the earlier provenance stamps
+/// `last_decayed` with the canonical's pre-merge decay baseline (its
+/// own `last_decayed`, else its original `created_at`), so the first
+/// post-merge pass decays only the window the canonical's relevance
+/// actually lived through — the rewind cannot charge it the duplicate's
+/// age.
 #[must_use]
 pub fn merge_cluster(cluster: MemoryCluster) -> MemoryEntry {
     let mut merged = cluster.canonical;
+    let canonical_created_at = merged.created_at;
     let earliest = cluster
         .duplicates
         .iter()
         .fold(merged.created_at, |acc, dup| acc.min(dup.created_at));
     merged.created_at = earliest;
+    merged.last_decayed = Some(merged.last_decayed.unwrap_or(canonical_created_at));
     let latest = cluster
         .duplicates
         .iter()
@@ -222,7 +258,7 @@ pub fn merge_cluster(cluster: MemoryCluster) -> MemoryEntry {
         .fold(merged.last_accessed, |acc, stamp| acc.max(Some(stamp)));
     merged.last_accessed = latest;
     for dup in &cluster.duplicates {
-        merged.relevance = (merged.relevance + 0.1).min(1.0);
+        merged.relevance = (merged.relevance + 0.1).clamp(0.0, 1.0);
         merged.access_count = merged.access_count.saturating_add(dup.access_count);
         merged.validated = merged.validated || dup.validated;
         for tag in &dup.tags {
@@ -297,6 +333,12 @@ pub struct ConsolidationConfig {
 }
 
 impl Default for ConsolidationConfig {
+    /// Returns the full-pass defaults: decay on a 14-day half-life,
+    /// merge at a 0.6 similarity threshold, prune at a 0.05 floor.
+    ///
+    /// These match what the in-memory store's historical plain pruner
+    /// produced, so adopting the full pass changes nothing for a store
+    /// that never tuned it.
     fn default() -> Self {
         Self {
             decay: true,
@@ -316,10 +358,11 @@ impl Default for ConsolidationConfig {
 /// pruned and merged-away entry. This is the pass a store runs under its
 /// write lock; it takes no locks of its own.
 ///
-/// An entry whose relevance is not finite — reachable only through
-/// hand-constructed values, since every internal path clamps — is degraded
-/// to zero before the pass runs, so it prunes instead of poisoning decay,
-/// clustering, and merges with NaN arithmetic.
+/// An entry whose relevance is not finite or sits outside `0.0..=1.0` —
+/// reachable only through hand-constructed values, since every internal
+/// path clamps — is degraded to zero before the pass runs, so it prunes
+/// instead of poisoning decay, clustering, and merges with NaN arithmetic
+/// or falsifying the composite score's documented range.
 pub fn consolidate_entries(
     entries: &mut Vec<MemoryEntry>,
     config: &ConsolidationConfig,
@@ -328,7 +371,7 @@ pub fn consolidate_entries(
     let config = config.normalized();
     let entries_before = entries.len();
     for entry in entries.iter_mut() {
-        if !entry.relevance.is_finite() {
+        if !(0.0..=1.0).contains(&entry.relevance) {
             entry.relevance = 0.0;
         }
     }
@@ -360,13 +403,17 @@ pub fn consolidate_entries(
     let prunable = |entry: &MemoryEntry| {
         entry.relevance < config.prune_floor || quality_score(entry, now) < config.prune_floor
     };
-    let pruned_text: usize = entries
-        .iter()
-        .filter(|entry| prunable(entry))
-        .map(|entry| entry.memory.len())
-        .sum();
-    entries.retain(|entry| !prunable(entry));
-    let pruned = before_prune.saturating_sub(entries.len());
+    let mut kept: Vec<MemoryEntry> = Vec::with_capacity(entries.len());
+    let mut pruned_text = 0usize;
+    for entry in std::mem::take(entries) {
+        if prunable(&entry) {
+            pruned_text = pruned_text.saturating_add(entry.memory.len());
+        } else {
+            kept.push(entry);
+        }
+    }
+    let pruned = before_prune.saturating_sub(kept.len());
+    *entries = kept;
     tracing::debug!(
         target: "loopctl::metrics",
         metric = "loopctl.memory.consolidated",
@@ -500,6 +547,13 @@ mod tests {
         );
         let mut plain = entry(MemoryCategory::Insight, "baseline");
         plain.relevance = 0.5;
+        let mut out_of_range = entry(MemoryCategory::Insight, "deserialized above the range");
+        out_of_range.relevance = 1.5;
+        assert!(
+            quality_score(&out_of_range, now) <= 1.0,
+            "the relevance term is clamped, so an out-of-range value cannot push the \
+            composite past its documented ceiling"
+        );
         let mut validated = plain.clone();
         validated.validated = true;
         assert!(
@@ -886,6 +940,119 @@ mod tests {
             "a zero half-life must fall back to the 14-day default, so an entry \
             aged five seconds barely moves — not decay to ~zero: {}",
             entries[0].relevance
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_relevance_degrades_like_a_non_finite_one() {
+        let now = SystemTime::now();
+        let mut healthy = entry(MemoryCategory::Fact, "in range and durable");
+        healthy.relevance = 0.9;
+        healthy.validated = true;
+        let mut above = entry(
+            MemoryCategory::Strategy,
+            "relevance above the documented range",
+        );
+        above.relevance = 3.0;
+        let mut below = entry(
+            MemoryCategory::Working,
+            "relevance below the documented range",
+        );
+        below.relevance = -0.5;
+
+        let mut entries = vec![healthy, above, below];
+        let stats = consolidate_entries(&mut entries, &ConsolidationConfig::default(), now);
+        assert_eq!(
+            stats.pruned, 2,
+            "a finite but out-of-range relevance degrades to zero and prunes, keeping \
+            quality_score inside its documented 0.0..=1.0 composite range"
+        );
+        assert_eq!(entries.len(), 1, "only the healthy entry remains");
+        assert!(
+            (entries[0].relevance - 0.9).abs() < 1e-6,
+            "the healthy entry's relevance is untouched"
+        );
+    }
+
+    #[test]
+    fn a_zero_threshold_falls_back_instead_of_collapsing_categories() {
+        let first = entry(MemoryCategory::Strategy, "run the build before committing");
+        let second = entry(
+            MemoryCategory::Strategy,
+            "totally different advice about tests",
+        );
+        let clusters = cluster_duplicates(&[first, second], 0.0);
+        assert_eq!(
+            clusters.len(),
+            2,
+            "a zero threshold falls back to the default — disjoint same-category \
+            entries must stay separate even when a caller bypasses the config path"
+        );
+    }
+
+    #[test]
+    fn tokenless_entries_never_corroborate_each_other() {
+        let now = SystemTime::now();
+        let mut empty_text = entry(MemoryCategory::Insight, "");
+        empty_text.relevance = 0.04;
+        let mut emoji_only = entry(MemoryCategory::Insight, "😅 … !");
+        emoji_only.relevance = 0.04;
+
+        let mut entries = vec![empty_text, emoji_only];
+        let stats = consolidate_entries(&mut entries, &ConsolidationConfig::default(), now);
+        assert_eq!(
+            stats.merged, 0,
+            "entries sharing zero tokens must not cluster — corroboration manufactured \
+            from nothing would lift them over the prune floor"
+        );
+        assert_eq!(
+            stats.pruned, 2,
+            "degenerate entries prune on their own weak relevance"
+        );
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn a_merged_survivor_decays_only_the_canonicals_window() {
+        let now = SystemTime::now();
+        let mut canonical = entry(MemoryCategory::Trajectory, "fresh canonical");
+        canonical.relevance = 0.9;
+        canonical.created_at = now - Duration::from_hours(24);
+        let mut stale = entry(MemoryCategory::Trajectory, "fresh canonical");
+        stale.relevance = 0.1;
+        stale.created_at = now - Duration::from_hours(24 * 60);
+        stale.last_decayed = Some(now - Duration::from_hours(24 * 29));
+        let mut merged = merge_cluster(MemoryCluster {
+            canonical,
+            duplicates: vec![stale],
+        });
+        assert_eq!(
+            merged.created_at,
+            now - Duration::from_hours(24 * 60),
+            "provenance still adopts the cluster's earliest creation"
+        );
+        decay_relevance(&mut merged, now, Duration::from_hours(336));
+        assert!(
+            merged.relevance > 0.9 && merged.relevance < 1.0,
+            "the first post-merge pass decays one day — the canonical's unaccounted \
+            window — not the adopted 60-day provenance: {}",
+            merged.relevance
+        );
+    }
+
+    #[test]
+    fn a_nan_relevance_survives_a_merge_visibly_broken() {
+        let mut canonical = entry(MemoryCategory::Insight, "poisoned canonical");
+        canonical.relevance = f32::NAN;
+        let duplicate = entry(MemoryCategory::Insight, "poisoned canonical");
+        let merged = merge_cluster(MemoryCluster {
+            canonical,
+            duplicates: vec![duplicate],
+        });
+        assert!(
+            merged.relevance.is_nan(),
+            "the clamp propagates NaN instead of f32::min's ignore-NaN cementing it \
+            at exactly 1.0 — the next sanitizing pass prunes it"
         );
     }
 

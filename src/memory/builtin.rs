@@ -83,8 +83,8 @@ use uuid::Uuid;
 /// [`InMemoryStore`] is `Send + Sync`. Interior mutability is handled via
 /// an internal `RwLock` over the entries plus a `Mutex` over the small
 /// access log that `retrieve` writes and `consolidate` folds, so both
-/// methods only require `&self`. The log is a leaf lock — the entries
-/// guard is always acquired first, and the log never blocks a writer —
+/// methods only require `&self`. The log is a leaf lock — always
+/// acquired last, so holding it never blocks another lock acquisition —
 /// which lets the store be shared via `Arc<InMemoryStore>` across tasks
 /// without external locking.
 ///
@@ -123,7 +123,7 @@ use uuid::Uuid;
 ///
 /// `InMemoryStore` accumulates entries in a `Vec` with no automatic
 /// eviction between consolidation passes. The
-/// [`consolidate()`](InMemoryStore::consolidate) method now runs a full
+/// [`consolidate()`](InMemoryStore::consolidate) method runs a full
 /// pass — category-weighted time decay, near-duplicate merging, and
 /// quality-floor pruning — so stale and duplicate knowledge ages out of a
 /// periodically consolidated store, but it must still be called
@@ -228,6 +228,11 @@ impl InMemoryStore {
 }
 
 impl Default for InMemoryStore {
+    /// Returns an empty store, identical to [`new`](InMemoryStore::new).
+    ///
+    /// The default carries the default consolidation configuration; use
+    /// [`with_consolidation`](InMemoryStore::with_consolidation) for a
+    /// tuned pass.
     fn default() -> Self {
         Self::new()
     }
@@ -274,16 +279,24 @@ impl LoopMemory for InMemoryStore {
     ///
     /// Only entries whose score reflects an actual query match — a word
     /// overlap or a tag hit, not the always-present baseline — are recorded
-    /// in the access log. Baseline-only returns (possible when the store is
-    /// sparser than `limit`) are delivered but never stamped, so repeated
-    /// irrelevant queries cannot inflate [`access_count`](MemoryEntry::access_count)
+    /// in the access log, and only the delivered ones: a match ranked
+    /// below `limit` is neither returned nor stamped. Baseline-only
+    /// returns (possible when the store is sparser than `limit`) are
+    /// delivered but never stamped, so repeated irrelevant queries cannot
+    /// inflate [`access_count`](MemoryEntry::access_count)
     /// or [`last_accessed`](MemoryEntry::last_accessed) and shield entries
-    /// from decay.
+    /// from decay. An entry whose [`relevance`](MemoryEntry::relevance) is
+    /// not finite — reachable only through a hand-constructed value — scores
+    /// as zero, mirroring the guard the consolidation pass applies to the
+    /// same input class, so a poisoned entry cannot disorder the ranking it
+    /// is then stamped into.
     ///
     /// # Returns
     ///
     /// A `Vec<MemoryEntry>` of at most `limit` entries, sorted by descending
-    /// composite score. May be empty if no entries match or the store is empty.
+    /// composite score. May be empty if the store is empty or `limit` is 0;
+    /// entries with no query match are still delivered via the baseline term
+    /// (but never stamped).
     ///
     /// # Example
     ///
@@ -327,7 +340,11 @@ impl LoopMemory for InMemoryStore {
                         .iter()
                         .filter(|w| memory_lower.contains(*w))
                         .count();
-                    let base_score = entry.relevance;
+                    let base_score = if entry.relevance.is_finite() {
+                        entry.relevance
+                    } else {
+                        0.0
+                    };
                     let denom = query_words.len().max(1);
                     let query_bonus = if word_matches > 0 {
                         crate::numeric::unit_ratio(word_matches, denom)
@@ -358,8 +375,7 @@ impl LoopMemory for InMemoryStore {
                     continue;
                 }
                 let stamp = access_log.get(&entry.id).copied();
-                let newest = stamp.map_or(Some(now), |existing| Some(existing.max(now)));
-                access_log.insert(entry.id, newest.unwrap_or(now));
+                access_log.insert(entry.id, stamp.map_or(now, |existing| existing.max(now)));
             }
             Ok(selected.into_iter().map(|(_, e)| e).collect())
         })
@@ -669,9 +685,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_retrieve_does_not_block_writers() {
+    async fn retrieve_and_concurrent_writers_both_complete() {
         // Populate enough entries to make scoring non-trivial.
-        let store = InMemoryStore::new();
+        let store = Arc::new(InMemoryStore::new());
         for i in 0..200 {
             store
                 .store(MemoryEntry::new(
@@ -682,24 +698,54 @@ mod tests {
                 .unwrap();
         }
 
-        // Start a retrieve future (it will be polled once we await below).
-        let retrieve_fut = store.retrieve("concurrency", 5);
+        // The writer runs on a real OS thread so its write-guard
+        // acquisitions interleave with the in-flight retrieve — a lock
+        // cycle between the entries guard and the access log deadlocks
+        // the join instead of passing.
+        let writer = std::thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                for i in 0..50 {
+                    futures::executor::block_on(store.store(MemoryEntry::new(
+                        MemoryCategory::Insight,
+                        format!("writer note {i}"),
+                    )))
+                    .unwrap();
+                }
+            }
+        });
 
-        // While retrieve is pending, a store should succeed without timing
-        // out — if the read lock were still held during scoring this would
-        // deadlock or at least block until retrieve completes.
-        let store_fut = store.store(MemoryEntry::new(
-            MemoryCategory::Insight,
-            "writer proceeds concurrently",
-        ));
-
-        // Drive both to completion.
-        let (retrieved, store_res) = tokio::join!(retrieve_fut, store_fut);
-        let retrieved = retrieved.unwrap();
-        store_res.unwrap();
+        let retrieved = store.retrieve("concurrency", 5).await.unwrap();
+        writer
+            .join()
+            .expect("the writer interleaves without deadlock");
 
         assert!(retrieved.len() <= 5);
-        assert_eq!(store.len(), 201); // 200 originals + 1 concurrent store
+        assert_eq!(store.len(), 250);
+    }
+
+    #[tokio::test]
+    async fn a_non_finite_relevance_does_not_poison_the_ranking() {
+        let store = InMemoryStore::new();
+        let mut poisoned =
+            MemoryEntry::new(MemoryCategory::Fact, "rust fact with a poisoned relevance");
+        poisoned.relevance = f32::NAN;
+        let mut healthy =
+            MemoryEntry::new(MemoryCategory::Fact, "rust fact with a healthy relevance");
+        healthy.relevance = 0.9;
+        store.store(poisoned).await.unwrap();
+        store.store(healthy).await.unwrap();
+
+        let hits = store.retrieve("rust", 2).await.unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "both entries are delivered — no panic, no lost entries"
+        );
+        assert!(
+            hits[0].relevance.is_finite(),
+            "the poisoned entry scores as zero, so the healthy one outranks it"
+        );
     }
 
     #[tokio::test]

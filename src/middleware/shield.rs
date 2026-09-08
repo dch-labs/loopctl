@@ -102,6 +102,9 @@ impl SafetyShieldMiddleware {
     }
 
     /// Build the per-call [`ShieldContext`] from a dispatch context.
+    ///
+    /// Copies the fields the shield evaluates, isolating it from the
+    /// wider dispatch type.
     fn shield_ctx(&self, ctx: &ToolDispatchContext) -> ShieldContext {
         ShieldContext {
             tool_name: ctx.tool_name.clone(),

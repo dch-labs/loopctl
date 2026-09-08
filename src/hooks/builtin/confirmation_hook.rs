@@ -16,6 +16,9 @@ use crate::hooks::context::PreToolUseContext;
 /// (which tools to confirm).
 pub trait ConfirmationHandler: Send + Sync {
     /// Ask the user whether to proceed. Returns `true` to allow.
+    ///
+    /// Called synchronously on the hook path; implementations own
+    /// whatever UI or prompting that entails.
     fn confirm(&self, message: &str) -> bool;
 }
 
@@ -43,13 +46,21 @@ pub trait ConfirmationHandler: Send + Sync {
 /// ```
 pub struct ConfirmationHook {
     /// Tool names that require confirmation.
+    ///
+    /// Exact-match on the requested tool name; unlisted tools pass
+    /// without prompting.
     tools: Vec<String>,
     /// The confirmation UI (provided by the agent).
+    ///
+    /// Shared behind an `Arc` so the hook and host keep one
+    /// confirmation surface.
     handler: Arc<dyn ConfirmationHandler>,
 }
 
 impl ConfirmationHook {
     /// Create a new confirmation hook for the specified tools.
+    ///
+    /// `handler` answers every confirmation prompt the hook raises.
     pub fn new(tools: Vec<String>, handler: Arc<dyn ConfirmationHandler>) -> Self {
         Self { tools, handler }
     }

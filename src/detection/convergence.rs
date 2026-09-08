@@ -827,7 +827,6 @@ impl ConvergenceDetector {
         let a_norm = Self::normalize_text(a);
         let b_norm = Self::normalize_text(b);
 
-        // Use Jaccard similarity on words
         let a_words: HashSet<&str> = a_norm.split_whitespace().collect();
         let b_words: HashSet<&str> = b_norm.split_whitespace().collect();
 
@@ -841,6 +840,10 @@ impl ConvergenceDetector {
         crate::numeric::unit_ratio(intersection, union)
     }
 
+    /// Lowercase a text and collapse every non-alphanumeric span to spaces.
+    ///
+    /// Punctuation and formatting differences must not count as
+    /// divergence when comparing repeated responses.
     fn normalize_text(text: &str) -> String {
         text.to_lowercase()
             .chars()

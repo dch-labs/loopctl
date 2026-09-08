@@ -368,6 +368,10 @@ impl RequestOptions {
 }
 
 /// Errors raised by the structured-output machinery.
+///
+/// Covers the full extract-and-validate pipeline: transport failures
+/// surface as the underlying API error, everything else as a typed
+/// variant naming the failed stage.
 #[derive(Debug, thiserror::Error)]
 pub enum StructuredError {
     /// The model's output did not deserialize into the target type.

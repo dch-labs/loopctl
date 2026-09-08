@@ -1501,8 +1501,11 @@ impl StreamHandler {
     /// can return `&Self` (never `Option<&Self>`).
     #[must_use]
     pub fn passthrough() -> Self {
-        // Duration::MAX overflows Instant::now() + it; stream_turn maps that
-        // overflow to None (no deadline), so this never fires spuriously.
+        /// A timeout that can never fire.
+        ///
+        /// `Duration::MAX` overflows the deadline arithmetic
+        /// (`Instant::now() + it`), and the deadline computations map
+        /// that overflow to no deadline, so this never trips spuriously.
         const NEVER_TIME_OUT: Duration = Duration::MAX;
         Self {
             timeout_config: StreamTimeoutConfig {
@@ -1536,6 +1539,10 @@ impl StreamHandler {
     /// to always return `&Self` regardless of configuration.
     #[must_use]
     pub fn passthrough_default() -> &'static Self {
+        /// The shared no-op handler, built once per process.
+        ///
+        /// Callers that only need a default share this instance instead
+        /// of reconstructing an identical one.
         static PASSTHROUGH: std::sync::OnceLock<StreamHandler> = std::sync::OnceLock::new();
         PASSTHROUGH.get_or_init(Self::passthrough)
     }

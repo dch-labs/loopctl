@@ -35,8 +35,16 @@ use std::time::{Duration, Instant};
 #[non_exhaustive]
 pub enum RateLimitError {
     /// The caller must wait this long before retrying.
+    ///
+    /// Derived from the bucket's refill rate; retrying sooner is
+    /// guaranteed to fail the same check.
     Wait(Duration),
+
     /// The bucket's mutex was poisoned; the token count is not trustworthy.
+    ///
+    /// A panicking caller compromised the bucket; surfacing this as an
+    /// error instead of unwrapping the poisoned lock keeps the stream
+    /// path panic-free.
     Poisoned,
 }
 
@@ -73,6 +81,12 @@ pub struct TokenBucket {
     state: Mutex<BucketState>,
 }
 
+/// One bucket's mutable token state, under the bucket's own
+/// short-lived `state` mutex.
+///
+/// The float-valued level refills continuously; poison recovery on the
+/// map lock is safe because each map operation is single-shot, unlike
+/// the bucket state whose invariants span operations.
 #[derive(Debug, Clone, Copy)]
 struct BucketState {
     /// Current token count.

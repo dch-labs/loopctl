@@ -8,6 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Permission check function type.
+///
+/// Shared behind an `Arc` so several middleware instances carry one
+/// policy closure without copying it; changing the policy means
+/// building a new middleware, not mutating a shared one.
 pub type PermissionCheckFn = Arc<dyn Fn(&ToolDispatchContext) -> PermissionCheck + Send + Sync>;
 
 /// Async resolver for [`PermissionCheck::Ask`].
@@ -46,8 +50,14 @@ pub type AskResolverFn =
 /// ```
 pub struct PermissionMiddleware {
     /// When `Some`, overrides [`ToolDispatchContext::permission`].
+    ///
+    /// Lets one pipeline impose a uniform policy regardless of what
+    /// each dispatch claims.
     check_fn: Option<PermissionCheckFn>,
     /// When `Some`, called to resolve [`PermissionCheck::Ask`] interactively.
+    ///
+    /// Absent, an `Ask` degrades to a denial naming the prompt, so a
+    /// headless run never blocks on an unanswered question.
     ask_resolver: Option<AskResolverFn>,
 }
 
@@ -119,6 +129,12 @@ impl PermissionMiddleware {
         self
     }
 
+    /// Decide the permission for one dispatch: the middleware's own
+    /// check function when configured, otherwise the context's
+    /// per-call verdict.
+    ///
+    /// Centralizing the fallback keeps the configured and default
+    /// paths on one resolution rule.
     fn resolve_permission(&self, ctx: &ToolDispatchContext) -> PermissionCheck {
         match &self.check_fn {
             Some(f) => f(ctx),
@@ -154,11 +170,7 @@ impl ToolMiddleware for PermissionMiddleware {
                         if approved.await {
                             next.dispatch(ctx).await
                         } else {
-                            ToolDispatchResult::err(
-                                &tool_name,
-                                format!("Permission denied by user for tool '{tool_name}'"),
-                                Duration::ZERO,
-                            )
+                            Self::deny(ctx, "denied by user").await
                         }
                     })
                 } else {
@@ -176,6 +188,10 @@ impl ToolMiddleware for PermissionMiddleware {
 
 impl PermissionMiddleware {
     /// Build a denied result with tracing.
+    ///
+    /// One shape for every denial site — an explicit `Deny`, an
+    /// unanswered `Ask`, and a user refusal — so logs and results stay
+    /// in sync wherever the verdict originated.
     fn deny<'a>(
         ctx: &'a mut ToolDispatchContext,
         reason: &str,

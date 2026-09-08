@@ -403,10 +403,19 @@ impl LinearVectorIndex {
 }
 
 impl VectorIndex for LinearVectorIndex {
+    /// Returns the fixed dimension every vector in this index carries.
+    ///
+    /// Set at construction; a vector of any other dimension is rejected
+    /// by [`add`](VectorIndex::add) rather than truncated or padded.
     fn dim(&self) -> usize {
         self.dim
     }
 
+    /// Insert or replace one vector under `id`.
+    ///
+    /// An existing row with the same id is overwritten in place — the
+    /// upsert contract — so re-embedding a memory never duplicates its
+    /// row.
     fn add(
         &self,
         id: Uuid,
@@ -429,6 +438,10 @@ impl VectorIndex for LinearVectorIndex {
         })
     }
 
+    /// Score every row against `query` and return the top `k`.
+    ///
+    /// A brute-force cosine scan sorted descending with a stable id
+    /// tiebreak; emits one `vector.index.search` metric event per call.
     fn search(
         &self,
         query: &Embedding,
@@ -474,6 +487,10 @@ impl VectorIndex for LinearVectorIndex {
         })
     }
 
+    /// Drop the row stored under `id`, if any.
+    ///
+    /// Removing an absent id is a no-op, so teardown never needs to know
+    /// what was indexed.
     fn remove(&self, id: Uuid) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>> {
         Box::pin(async move {
             let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
@@ -482,6 +499,10 @@ impl VectorIndex for LinearVectorIndex {
         })
     }
 
+    /// Returns the number of stored rows, under a read guard.
+    ///
+    /// Counts upserted ids regardless of later modification; paired
+    /// with [`is_empty`](VectorIndex::is_empty)'s default.
     fn len(&self) -> usize {
         self.rows
             .read()
@@ -576,10 +597,19 @@ impl HashingEmbedder {
 }
 
 impl EmbeddingProvider for HashingEmbedder {
+    /// Returns the hashing embedder's fixed output dimension.
+    ///
+    /// Set at construction; every embedding it produces has exactly this
+    /// many components.
     fn dim(&self) -> usize {
         self.dim
     }
 
+    /// Embed one text deterministically.
+    ///
+    /// Delegates to the synchronous hashing pass and wraps it in the
+    /// boxed-future shape the trait requires, emitting a
+    /// `vector.embed` metric event per call.
     fn embed<'a>(
         &'a self,
         text: &'a str,

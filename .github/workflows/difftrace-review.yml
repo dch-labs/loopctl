@@ -9,9 +9,16 @@
 # file: fork and dependabot pull requests are rejected; command authors
 # must be collaborators with write; required secrets fail fast with
 # named messages; the binary is checksum-pinned; all writes go through
-# a least-privilege app token; concurrency lanes are callee-side too
-# — pushes supersede in-flight reviews and commands queue FIFO without
-# dropping (up to 100 pending; beyond that, arrivals are canceled).
+# a least-privilege app token; PR trajectory artifacts upload
+# callee-side on every path (`if: always()`); concurrency lanes are
+# callee-side too — pushes supersede in-flight reviews and commands
+# queue FIFO without dropping (up to 100 pending; beyond that, the
+# longest-pending runs are canceled).
+#
+# Local deviation from the upstream template: the GITHUB_TOKEN grant is
+# narrowed to `pull-requests: read` — every callee use of `github.token`
+# is a read-only `gh api` query (writes ride the app token), so the
+# standing write grant served nothing.
 name: difftrace review
 
 on:
@@ -31,7 +38,7 @@ on:
         required: false
 
 permissions:
-  pull-requests: write
+  pull-requests: read
   contents: read
 
 jobs:

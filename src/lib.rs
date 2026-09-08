@@ -13,7 +13,9 @@
 //! ## Subsystems
 //!
 //! - **[`observer`]** — Lifecycle event observation ([`LoopObserver`](observer::LoopObserver), [`ObserverHost`](observer::ObserverHost)).
-//! - **[`memory`]** — Agent memory trait ([`LoopMemory`](memory::LoopMemory)) and entry types.
+//! - **[`memory`]** — Agent memory trait ([`LoopMemory`](memory::LoopMemory)), entry types,
+//!   trajectory capture, and learned-memory extraction
+//!   ([`extractor`](memory::extractor)).
 //! - **`memory::vector`** — Vector primitives for semantic retrieval ([`EmbeddingProvider`](memory::vector::EmbeddingProvider), [`VectorIndex`](memory::vector::VectorIndex)). *Requires `vector_index` feature.*
 //! - **[`reflection`]** — Failure reflection and recovery strategies.
 //! - **[`detection`]** — Loop and convergence detection ([`DetectionManager`](detection::DetectionManager)).
@@ -41,6 +43,12 @@
 //! ## Support
 //!
 //! - **[`memory::builtin`]** — Reference [`InMemoryStore`](memory::builtin::InMemoryStore) implementation.
+//! - **[`memory::consolidate`]** — Store-agnostic consolidation pass a backend runs under its own write lock
+//!   ([`consolidate_entries`](memory::consolidate::consolidate_entries)).
+//! - **[`memory::trajectory`]** — [`TrajectoryObserver`](memory::trajectory::TrajectoryObserver): captures each run as a serializable record.
+//! - **[`memory::extractor`]** — Turns recorded trajectories into learned memories
+//!   ([`extract_into`](memory::extractor::extract_into) for the reliable path,
+//!   [`ExtractionObserver`](memory::extractor::ExtractionObserver) for automated best-effort at run end).
 //! - **hooks** — Bidirectional lifecycle control (allow/block/ask before tool use, compaction). *Requires `hooks` feature.*
 //! - **testing** — Test utilities and fixtures. *Requires `testing` feature.*
 

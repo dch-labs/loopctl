@@ -98,6 +98,9 @@ pub(super) struct TurnEnd<'a> {
 
 impl<C: ApiClient> BareLoop<C> {
     /// Notify all observers and hooks that a run has started.
+    ///
+    /// Observers always fire; the hook half is feature-gated and
+    /// skipped when no executor is configured.
     pub(super) fn notify_run_start(&self) {
         self.managers.observers().on_run_start(&RunStartContext {
             session_id: self.session.id,
@@ -107,6 +110,9 @@ impl<C: ApiClient> BareLoop<C> {
     }
 
     /// Notify hooks and observers that a run has ended.
+    ///
+    /// Carries the finished run, its duration, and the terminal error
+    /// when the run failed.
     pub(super) fn notify_run_end(
         &self,
         result: &Run,
@@ -394,6 +400,9 @@ impl<C: ApiClient> BareLoop<C> {
     }
 
     /// Fire the `on_run_start` hook when a hook executor is configured.
+    ///
+    /// A missing executor is a no-op, so runs without the `hooks`
+    /// feature pay nothing.
     #[cfg(feature = "hooks")]
     fn notify_run_start_hook(&self) {
         let Some(executor) = self.managers.hook_executor() else {
@@ -410,6 +419,9 @@ impl<C: ApiClient> BareLoop<C> {
     }
 
     /// Fire the `on_run_end` hook when a hook executor is configured.
+    ///
+    /// The context carries the end reason derived from the run's
+    /// outcome and error.
     #[cfg(feature = "hooks")]
     fn notify_run_end_hook(&self, result: &Run, error: Option<&LoopError>, duration: Duration) {
         let Some(executor) = self.managers.hook_executor() else {

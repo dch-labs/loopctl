@@ -36,9 +36,24 @@ use crate::structured::ToolConstraint;
 use crate::structured::tighten_json_schema;
 use crate::tool::ToolSchema;
 
+/// Default Messages API endpoint used when a builder sets none.
+///
+/// The plain HTTPS endpoint; Bedrock's Anthropic-native path uses its
+/// own invoke URL instead of this constant.
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+
+/// Model served when a builder or environment names none.
+///
+/// A dated snapshot so behavior is reproducible across Anthropic
+/// alias updates; override with [`with_model`](AnthropicClientBuilder::with_model).
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+
+/// Wire protocol version sent as the `anthropic-version` header.
+///
+/// The Messages API date-versioned protocol this client's request and
+/// event shapes are written against.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
 /// The output-token budget used when a request carries none.
 ///
 /// Shared by the direct Anthropic path and the Bedrock Anthropic-native
@@ -829,7 +844,6 @@ pub(super) fn convert_message(m: &Message) -> Value {
         Role::Assistant => "assistant",
     };
 
-    // Bucket parts by Anthropic category.
     let mut text_parts: Vec<&str> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();

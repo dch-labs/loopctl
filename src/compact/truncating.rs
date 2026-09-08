@@ -330,17 +330,7 @@ impl ContextCompactor for TruncatingCompactor {
                 return Self::unchanged(messages, &context);
             }
 
-            // Determine split point: keep `preserve_recent` from the end.
             let initial_split = total.saturating_sub(self.preserve_recent);
-
-            // Adjust split to avoid orphaning tool-call/result pairs.
-            // If the "recent" portion contains a ToolResult whose matching
-            // ToolCall would be dropped, move the split back to include the
-            // message containing that ToolCall. Each backward move admits
-            // previously dropped messages that can themselves carry results
-            // whose calls stay dropped, so re-adjust until the split stops
-            // moving: the adjustment is non-increasing and bottoms out at
-            // 0, so the loop always terminates.
             let mut split = initial_split;
             loop {
                 let adjusted = Self::adjust_for_tool_pairs(&messages, split);
@@ -350,19 +340,12 @@ impl ContextCompactor for TruncatingCompactor {
                 split = adjusted;
             }
 
-            // A split of 0 means the adjustment pulled the whole
-            // conversation into the recent slice — nothing is dropped, so
-            // report no change instead of a compaction that reduced
-            // nothing.
             if split == 0 {
                 return Self::unchanged(messages, &context);
             }
 
             let recent: Vec<Message> = messages.get(split..).unwrap_or_default().to_vec();
 
-            // Always preserve the first message (typically the system
-            // prompt); split > 0 guarantees it is not already part of the
-            // recent slice.
             let mut preserved: Vec<Message> = Vec::with_capacity(recent.len().saturating_add(1));
             if let Some(first) = messages.first() {
                 preserved.push(first.clone());
@@ -370,10 +353,6 @@ impl ContextCompactor for TruncatingCompactor {
             preserved.extend(recent);
             let preserved = Self::reattach_dropped_results(&messages, split, preserved);
 
-            // Garbage filtering can empty every kept message (a first
-            // message and recent slice made solely of orphaned results);
-            // an empty history must never replace a non-empty one, so
-            // decline to reduce instead.
             if preserved.is_empty() {
                 return Self::unchanged(messages, &context);
             }
@@ -617,6 +596,9 @@ pub struct TokenSplitter {
 }
 
 /// Result of splitting a conversation into old and recent portions.
+///
+/// The old portion is what a compactor summarizes or drops; the
+/// recent portion passes through untouched.
 #[derive(Debug, Clone)]
 pub struct SplitResult {
     /// Messages to compact or summarize (the old portion).
@@ -710,9 +692,6 @@ impl TokenSplitter {
             };
         }
 
-        // Find a split point: we want `preserve_recent` messages at the end.
-        // Look for a turn boundary (assistant→user transition) near the
-        // target split point.
         let target_split = messages.len().saturating_sub(self.preserve_recent);
         let split_index = Self::find_turn_boundary(messages, target_split);
         let (to_compact, preserved) = messages.split_at(split_index);

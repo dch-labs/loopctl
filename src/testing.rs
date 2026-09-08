@@ -382,11 +382,6 @@ impl MockApiClient {
     /// ```
     #[must_use]
     pub fn new(model: &str) -> Self {
-        // Build the default single-response queue.
-        //
-        // This response is intentionally minimal — just text `"Hello!"`
-        // with `"end_turn"` — so that tests that don't care about the
-        // response content can use the mock without any configuration.
         let default_response = MockResponse {
             text: "Hello!".to_string(),
             tool_call: None,

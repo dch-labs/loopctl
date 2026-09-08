@@ -43,14 +43,32 @@ use crate::middleware::{
 use crate::structured::{RequestOptions, ToolConstraint};
 
 /// Default per-tool-output cap (characters) applied by `OutputLimitMiddleware`.
+///
+/// Keeps one chatty tool from flooding a small model's context.
 const OUTPUT_CAP_CHARS: usize = 16_384;
+
 /// Default cache TTL (turns) for the preset's `MemoizingMiddleware`.
+///
+/// Long enough to save repeats within a task, short enough to track
+/// edits within a session.
 const MEMOIZE_TTL_TURNS: u32 = 5;
+
 /// Default reminder cadence (turns) for [`GoalReminder`].
+///
+/// Re-injects the goal often enough to arrest drift without spending
+/// a turn's budget on repetition.
 const GOAL_REMINDER_EVERY_N_TURNS: usize = 5;
+
 /// Default write-class tool names the preset wires into its middleware. Advisory.
+///
+/// Hosts with differently-named write tools override the list; the
+/// names here cover the common coding-agent set.
 const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit"];
+
 /// Default memoized tool names the preset wires into its middleware. Advisory.
+///
+/// Read-class, side-effect-free calls — the shapes whose repeats are
+/// pure waste.
 const MEMOIZED_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
 
 /// The small-model-tuned runtime profile.

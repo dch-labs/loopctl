@@ -591,9 +591,14 @@ pub struct UnixShield {
 }
 
 /// Default warn threshold: an aggregate score at or above this produces a warn.
+///
+/// Sits below the block threshold so borderline inputs warn first.
 const DEFAULT_WARN_THRESHOLD: f32 = 0.4;
 
 /// Default block threshold: an aggregate score at or above this produces a block.
+///
+/// High enough that routine commands never trip it, low enough to
+/// stop clearly destructive pipelines.
 const DEFAULT_BLOCK_THRESHOLD: f32 = 0.7;
 
 impl UnixShield {

@@ -16,6 +16,9 @@ use std::thread::JoinHandle;
 use crate::error::recover_guard;
 
 /// File name of the JSON Lines ledger inside the sink directory.
+///
+/// Fixed by the documented interchange contract; hosts locate a
+/// session's ledger by joining the directory with this name.
 const LEDGER_FILE: &str = "trajectory.jsonl";
 
 /// Default bound on records waiting to be written.

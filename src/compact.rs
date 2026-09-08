@@ -74,6 +74,19 @@ pub use types::{
     EnsureContextResult, PostCompactStats, PreCompactStats,
 };
 
+/// Heuristic characters-per-token divisor for the estimate.
+///
+/// Four is the long-standing cross-tokenizer average; hosts
+/// needing accuracy install a preset [`RatioTokenCounter`] or
+/// their own counter instead.
+const CHARS_PER_TOKEN: u64 = 4;
+
+/// Per-message framing characters added to each rendered message.
+///
+/// Approximates role tags and separators the tokenizer counts
+/// but plain text rendering omits.
+const MESSAGE_OVERHEAD_CHARS: u64 = 20;
+
 /// Strategy for estimating the token cost of a message slice.
 ///
 /// The engine uses a token counter in two places: the driver estimates the
@@ -142,8 +155,6 @@ pub struct HeuristicTokenCounter;
 
 impl TokenCounter for HeuristicTokenCounter {
     fn count(&self, messages: &[Message]) -> u64 {
-        const CHARS_PER_TOKEN: u64 = 4;
-        const MESSAGE_OVERHEAD_CHARS: u64 = 20;
         let total_chars: u64 = messages
             .iter()
             .map(|m| rendered_message_chars(m).saturating_add(MESSAGE_OVERHEAD_CHARS))
@@ -471,7 +482,8 @@ pub trait ContextCompactor: Send + Sync {
     ///   [`ContextManager::compact_with_reason`](ContextManager::compact_with_reason)),
     ///   so fitting the target leaves room for it.
     /// * `context` — Metadata about the compaction trigger.
-    // The return-type boxing is required for object safety.
+    ///
+    /// The return-type boxing is required for object safety.
     fn compact(
         &self,
         messages: Vec<Message>,

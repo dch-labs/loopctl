@@ -1103,12 +1103,16 @@ impl ToolSafetyShield for UnixShield {
 /// ```
 pub struct UnixShieldBuilder {
     /// Aggregate score at or above which the built shield will return
-    /// [`SafetyAction::Warn`]. Defaults to `0.4`; override via
+    /// [`SafetyAction::Warn`].
+    ///
+    /// Defaults to `0.4`; override via
     /// [`with_warn_threshold`](Self::with_warn_threshold).
     warn_threshold: f32,
 
     /// Aggregate score at or above which the built shield will return
-    /// [`SafetyAction::Block`]. Defaults to `0.7`; override via
+    /// [`SafetyAction::Block`].
+    ///
+    /// Defaults to `0.7`; override via
     /// [`with_block_threshold`](Self::with_block_threshold).
     block_threshold: f32,
 

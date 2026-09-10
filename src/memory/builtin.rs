@@ -700,14 +700,10 @@ mod tests {
                 .unwrap();
         }
 
-        // The writer and the retrieve each run on a real OS thread so
-        // the writer's write-guard acquisitions interleave with the
-        // in-flight retrieve — and because retrieve's polls take the
-        // std locks directly, a lock regression would pin the single
-        // runtime thread inside the poll where no timer can fire. The
-        // test thread owns the deadline instead: a lock regression
-        // fails the recv timeout below instead of hanging the whole
-        // test run.
+        // retrieve's polls take the std locks directly, so a lock
+        // regression would pin the single runtime thread inside the
+        // poll where no tokio timer can fire — the deadline must live
+        // on the test thread, hence the threads and the recv_timeout.
         let writer = std::thread::spawn({
             let store = Arc::clone(&store);
             move || {

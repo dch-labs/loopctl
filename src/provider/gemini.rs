@@ -759,9 +759,10 @@ fn grammar_unsupported_error() -> ApiError {
     )
 }
 
-/// The Gemini API's `responseJsonSchema` has no strict-mode switch — a
-/// `strict` response format would be silently served non-strict, so it
-/// is rejected loudly instead.
+/// The error for a `strict` request the Gemini API cannot express.
+///
+/// Its `responseJsonSchema` has no strict-mode switch, so the request
+/// would be silently served non-strict — rejected loudly instead.
 fn strict_unsupported_error(provider: &str) -> ApiError {
     ApiError::config_validation(format!(
         "the {provider} API cannot express response_format.strict; the \

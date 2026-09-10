@@ -301,8 +301,10 @@ pub struct RequestOptions {
     pub response_format: Option<ResponseFormat>,
 
     /// How strictly the model's tool-call output must follow the
-    /// registered tool schemas. Default [`ToolConstraint::None`] is a
-    /// no-op. See [`ToolConstraint`] for the modes.
+    /// registered tool schemas.
+    ///
+    /// Default [`ToolConstraint::None`] is a no-op; see
+    /// [`ToolConstraint`] for the modes.
     pub tool_constraint: ToolConstraint,
 
     /// Serve the request with the named model, overriding the client's

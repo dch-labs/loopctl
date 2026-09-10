@@ -373,8 +373,10 @@ pub trait VectorIndex: Send + Sync {
 /// });
 /// ```
 pub struct LinearVectorIndex {
-    /// Dimensionality every stored vector must have; fixed at
-    /// construction and checked on `add` and `search`.
+    /// Dimensionality every stored vector must have.
+    ///
+    /// Fixed at construction and checked on `add` and `search`, so a
+    /// mismatched vector is rejected before it can corrupt the index.
     dim: usize,
 
     /// The stored vectors under their ids, in insertion order.
@@ -542,9 +544,10 @@ impl VectorIndex for LinearVectorIndex {
 /// assert_eq!(embedding.dim(), 64);
 /// ```
 pub struct HashingEmbedder {
-    /// The dimensionality of every vector produced; each token hashes
-    /// into one of `dim` buckets, so small values fold many tokens onto
-    /// the same component.
+    /// The dimensionality of every vector produced.
+    ///
+    /// Each token hashes into one of `dim` buckets, so small values
+    /// fold many tokens onto the same component.
     dim: usize,
 }
 

@@ -749,9 +749,11 @@ fn grammar_unsupported_error() -> ApiError {
     )
 }
 
-/// The Anthropic Messages API has no strict-mode switch for its forced
-/// tool — a `strict` response format would be silently served
-/// non-strict, so it is rejected loudly instead.
+/// The error for a `strict` request the Anthropic Messages API cannot
+/// express.
+///
+/// It has no strict-mode switch for its forced tool, so the request
+/// would be silently served non-strict — rejected loudly instead.
 fn strict_unsupported_error(provider: &str) -> ApiError {
     ApiError::config_validation(format!(
         "the {provider} API cannot express response_format.strict; the \

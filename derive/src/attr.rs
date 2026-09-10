@@ -200,18 +200,21 @@ fn string_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<String> {
     Ok(lit.value())
 }
 
-/// Reject a value on a flag-shaped `#[tool(...)]` key.
+/// Reject anything trailing a flag-shaped `#[tool(...)]` key.
 ///
 /// `read_only`, `concurrency_safe`, `allow_extra`, `skip`, and
-/// `default` are presence flags; a stray `= value` would otherwise
-/// surface as a bare syntax error (or, worse, silently invert the
-/// flag's meaning), so misuse fails with the key's own span and name.
+/// `default` are presence flags; a stray `= value` or the
+/// parenthesized `flag(false)` form would otherwise surface as a bare
+/// syntax error (or, worse, silently set the flag the user was trying
+/// to negate), so misuse fails with the key's own span and name.
 ///
 /// # Errors
 ///
-/// Returns a spanned error when the key carries a value.
+/// Returns a spanned error when the key carries a value or a
+/// parenthesized argument list.
 fn flag_without_value(meta: &syn::meta::ParseNestedMeta<'_>, key: &str) -> syn::Result<()> {
-    if meta.value().is_ok() {
+    let takes_value = meta.value().is_ok() || meta.input.peek(syn::token::Paren);
+    if takes_value {
         Err(meta.error(format!("`{key}` takes no value")))
     } else {
         Ok(())
@@ -315,45 +318,171 @@ pub(crate) fn serde_rename(attrs: &[Attribute]) -> Option<String> {
     deserialize.or(plain)
 }
 
+/// Reject serde attributes that change what serde reads on the wire in
+/// ways the generated schema cannot mirror.
+///
+/// The derive's contract is that the schema never disagrees with serde
+/// on the wire. `rename`, `rename_all`, and `default` are mirrored;
+/// these keys are not, and a schema generated alongside them would
+/// advertise keys serde never looks for (or omit ones it requires) —
+/// so they fail at derive time with the manual-impl escape hatch
+/// instead of silently lying to the model.
+///
+/// Field-level read-side skip keys (`skip`, `skip_deserializing`) are
+/// allowed when `#[tool(skip)]` also removes the field from the schema
+/// — that combination is consistent; alone they advertise a field
+/// serde ignores. Write-side keys (`skip_serializing`,
+/// `skip_serializing_if`, `serialize_with`) change only what serde
+/// emits, so a schema advertising the field stays truthful and they
+/// pass. `with` and `deserialize_with` rewrite the wire format itself
+/// and are rejected on the field side.
+///
+/// # Errors
+///
+/// Returns a spanned error naming the unsupported key.
+pub(crate) fn check_unmirrorable_serde(
+    attrs: &[Attribute],
+    container: bool,
+    tool_skip: bool,
+) -> syn::Result<()> {
+    const CONTAINER_KEYS: &[&str] = &[
+        "from",
+        "into",
+        "try_from",
+        "try_into",
+        "remote",
+        "transparent",
+        "rename_all_fields",
+    ];
+    const SKIP_KEYS: &[&str] = &["skip", "skip_deserializing"];
+    const WITH_KEYS: &[&str] = &["with", "deserialize_with"];
+    for meta in serde_metas(attrs) {
+        let name = match &meta {
+            Meta::Path(path) => path.get_ident().map(std::string::ToString::to_string),
+            Meta::NameValue(nv) => nv.path.get_ident().map(std::string::ToString::to_string),
+            Meta::List(ml) => ml.path.get_ident().map(std::string::ToString::to_string),
+        };
+        let Some(name) = name else {
+            continue;
+        };
+        let unmirrorable = if container {
+            CONTAINER_KEYS.contains(&name.as_str())
+        } else {
+            name == "flatten"
+                || (SKIP_KEYS.contains(&name.as_str()) && !tool_skip)
+                || WITH_KEYS.contains(&name.as_str())
+        };
+        if unmirrorable {
+            if !container && SKIP_KEYS.contains(&name.as_str()) {
+                return Err(syn::Error::new_spanned(
+                    &meta,
+                    format!(
+                        "`#[serde({name})]` leaves the schema advertising a field serde \
+                         ignores — add `#[tool(skip)]` to remove it from the schema, or \
+                         write a manual `Tool` impl"
+                    ),
+                ));
+            }
+            return Err(syn::Error::new_spanned(
+                &meta,
+                format!(
+                    "`#[serde({name})]` changes what serde reads on the wire in ways \
+                     `#[derive(Tool)]` cannot mirror — write a manual `Tool` impl for \
+                     this input"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the attrs carry a read-side `#[serde(skip)]`-shaped key.
+///
+/// `skip` and `skip_deserializing` fill the field from
+/// `Default::default()` without reading the wire, so they satisfy the
+/// same fillability precondition as `#[serde(default)]` — the validity
+/// check for `#[tool(skip)]` credits them here. Write-side
+/// `skip_serializing` does not fill anything and is deliberately not
+/// matched.
+pub(crate) fn has_serde_skip(attrs: &[Attribute]) -> bool {
+    serde_metas(attrs).iter().any(|meta| match meta {
+        Meta::Path(path) => path.is_ident("skip") || path.is_ident("skip_deserializing"),
+        Meta::NameValue(nv) => nv.path.is_ident("skip") || nv.path.is_ident("skip_deserializing"),
+        Meta::List(ml) => ml.path.is_ident("skip") || ml.path.is_ident("skip_deserializing"),
+    })
+}
+
+/// Whether the attrs carry `#[serde(deny_unknown_fields)]`.
+///
+/// Alone it matches the schema's default closed world
+/// (`additionalProperties: false`), so it is not an unmirrorable key;
+/// the caller rejects only its contradiction with
+/// `#[tool(allow_extra)]`.
+pub(crate) fn has_serde_deny_unknown(attrs: &[Attribute]) -> bool {
+    serde_metas(attrs).iter().any(|meta| match meta {
+        Meta::Path(path) => path.is_ident("deny_unknown_fields"),
+        Meta::NameValue(nv) => nv.path.is_ident("deny_unknown_fields"),
+        Meta::List(ml) => ml.path.is_ident("deny_unknown_fields"),
+    })
+}
+
 /// The `#[serde(rename_all = "…")]` strategy on the struct, if any.
 ///
 /// Applied to each field's Rust name to derive its JSON property name,
-/// exactly as serde deserializes it.
-pub(crate) fn serde_rename_all(attrs: &[Attribute]) -> Option<RenameAll> {
+/// exactly as serde deserializes it. A strategy serde itself would
+/// reject fails here too — falling back to raw field names would
+/// advertise keys serde never looks for.
+///
+/// # Errors
+///
+/// Returns a spanned error when `rename_all` is present with a
+/// strategy name the serde rule set does not contain.
+pub(crate) fn serde_rename_all(attrs: &[Attribute]) -> syn::Result<Option<RenameAll>> {
     let mut out = None;
-    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("rename_all")
-                && let Ok(lit) = meta.value()?.parse::<LitStr>()
-            {
-                out = RenameAll::from_str(&lit.value());
+    for meta in serde_metas(attrs) {
+        if let Meta::NameValue(nv) = &meta
+            && nv.path.is_ident("rename_all")
+            && let Expr::Lit(expr) = &nv.value
+            && let Lit::Str(lit) = &expr.lit
+        {
+            match RenameAll::from_str(&lit.value()) {
+                Some(strategy) => out = Some(strategy),
+                None => {
+                    return Err(syn::Error::new_spanned(
+                        nv,
+                        format!(
+                            "unknown serde `rename_all` strategy `{}` — serde rejects this \
+                             spelling, and the derive will not fall back to raw field names",
+                            lit.value()
+                        ),
+                    ));
+                }
             }
-            Ok(())
-        });
+        }
     }
-    out
+    Ok(out)
 }
 
 /// The `#[serde(rename_all = "…")]` casing strategies.
 ///
 /// Mirrored from serde so the derive honours the same casing names a
 /// `Deserialize` input struct already declares.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RenameAll {
-    /// The `lowercase` strategy — field names lowercased, ASCII-only.
+    /// The `lowercase` strategy — the identity on fields, like serde's.
     ///
-    /// Like serde's field arm, only ASCII case changes: no separators
-    /// are inserted or removed, and non-ASCII characters keep their
-    /// shape.
+    /// Serde's field arm treats `lowercase` and `snake_case` the same:
+    /// the name passes through unchanged, because separator handling
+    /// belongs to variant renaming.
     Lower,
 
-    /// The `UPPERCASE` strategy — field names uppercased.
+    /// The `UPPERCASE` strategy — field names uppercased, ASCII-only.
     ///
-    /// Words keep their positions; only case changes.
+    /// Words keep their positions; non-ASCII characters pass through
+    /// untouched, exactly as in serde's field arm.
     Upper,
 
     /// The `PascalCase` strategy — each word capitalized, no separators.
-    ///
     ///
     /// Word boundaries come from the field name's existing separators.
     Pascal,
@@ -412,17 +541,16 @@ impl RenameAll {
     /// `rename_all` does for struct fields.
     ///
     /// The input is the Rust field identifier; the output is the JSON
-    /// property name serde will look for during deserialization. The
-    /// separator-inserting rules apply to *variants* in serde — for
-    /// fields, `snake_case` is the identity and `lowercase` lowercases
-    /// ASCII-only, `PascalCase` capitalizes after each underscore, and
-    /// the screaming/kebab rules are plain case and separator
-    /// conversions; mirroring those exactly is what keeps the schema
-    /// from lying about the wire name.
+    /// property name serde will look for during deserialization.
+    /// Serde's field arm is deliberately narrow: `lowercase` and
+    /// `snake_case` are identities (separator handling belongs to
+    /// variant renaming), the case-changing rules convert ASCII only,
+    /// and the separator rules are plain `_` replacements — mirroring
+    /// those exactly is what keeps the schema from lying about the
+    /// wire name.
     pub(crate) fn apply(self, name: &str) -> String {
         match self {
-            Self::Lower => name.to_ascii_lowercase(),
-            Self::Snake => name.to_owned(),
+            Self::Lower | Self::Snake => name.to_owned(),
             Self::Upper | Self::ScreamingSnake => name.to_ascii_uppercase(),
             Self::Pascal => to_pascal_case(name),
             Self::Camel => {
@@ -451,7 +579,7 @@ fn to_pascal_case(name: &str) -> String {
         if ch == '_' {
             capitalize = true;
         } else if capitalize {
-            pascal.extend(ch.to_uppercase());
+            pascal.push(ch.to_ascii_uppercase());
             capitalize = false;
         } else {
             pascal.push(ch);
@@ -467,7 +595,7 @@ mod tests {
     #[test]
     fn rename_all_covers_the_full_serde_strategy_set() {
         let cases: Vec<(&str, &str, &str)> = vec![
-            ("lowercase", "FileName", "filename"),
+            ("lowercase", "FileName", "FileName"),
             ("UPPERCASE", "FileName", "FILENAME"),
             ("PascalCase", "file_name", "FileName"),
             ("camelCase", "file_name", "fileName"),
@@ -488,6 +616,26 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_identifiers_follow_serdes_ascii_only_field_arms() {
+        let cases: Vec<(&str, &str, &str)> = vec![
+            ("lowercase", "straße_x", "straße_x"),
+            ("UPPERCASE", "straße_x", "STRAßE_X"),
+            ("PascalCase", "straße_x", "StraßeX"),
+            ("camelCase", "straße_x", "straßeX"),
+            ("SCREAMING_SNAKE_CASE", "straße_x", "STRAßE_X"),
+        ];
+        for (name, input, expected) in cases {
+            let strategy =
+                RenameAll::from_str(name).unwrap_or_else(|| panic!("unknown strategy: {name}"));
+            assert_eq!(
+                strategy.apply(input),
+                expected,
+                "strategy {name:?} on {input:?} must match serde's ASCII-only field arm"
+            );
+        }
+    }
+
+    #[test]
     fn separator_rules_are_identities_on_fields_matching_serde() {
         assert_eq!(
             RenameAll::from_str("snake_case").unwrap().apply("userID"),
@@ -497,10 +645,10 @@ mod tests {
         );
         assert_eq!(
             RenameAll::from_str("lowercase").unwrap().apply("FileName"),
-            "filename",
-            "serde's field arm for lowercase lowercases — only snake_case \
-            is the identity on fields, so the schema must advertise the \
-            lowercased key serde will actually look for"
+            "FileName",
+            "serde's field arm groups lowercase with snake_case as the \
+            identity — mirroring that is what keeps the advertised key \
+            the one serde actually looks for"
         );
         assert_eq!(
             RenameAll::from_str("camelCase").unwrap().apply("user_ID"),
@@ -545,6 +693,96 @@ mod tests {
     }
 
     #[test]
+    fn serde_rename_all_survives_value_bearing_keys_beside_it() {
+        use syn::parse_quote;
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(bound = "T: Clone", crate = "serde", rename_all = "kebab-case")]
+        };
+        assert_eq!(
+            serde_rename_all(&attrs).expect("other keys are tolerated"),
+            Some(RenameAll::Kebab),
+            "a value-bearing serde key that is not rename_all must not abort the walk"
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(rename = "container")]
+        };
+        assert_eq!(
+            serde_rename_all(&attrs).expect("container rename is tolerated"),
+            None
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(rename_all = "screaming")]
+        };
+        assert!(
+            serde_rename_all(&attrs).is_err(),
+            "an unknown strategy still fails instead of falling back to raw names"
+        );
+    }
+
+    #[test]
+    fn read_side_skip_keys_are_the_only_skip_shaped_rejections() {
+        use syn::parse_quote;
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(skip_serializing)]
+        };
+        assert!(
+            check_unmirrorable_serde(&attrs, false, false).is_ok(),
+            "skip_serializing changes only what serde emits — advertising the field \
+            stays truthful"
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(skip)]
+        };
+        assert!(check_unmirrorable_serde(&attrs, false, false).is_err());
+        assert!(
+            check_unmirrorable_serde(&attrs, false, true).is_ok(),
+            "the tool(skip) combination is the consistent escape"
+        );
+        assert!(has_serde_skip(&attrs));
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(skip_deserializing)]
+        };
+        assert!(has_serde_skip(&attrs));
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(skip_serializing)]
+        };
+        assert!(
+            !has_serde_skip(&attrs),
+            "the write-side key fills nothing and must not count as fillable"
+        );
+    }
+
+    #[test]
+    fn wire_format_rewriters_and_transparent_are_rejected() {
+        use syn::parse_quote;
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(with = "base64_bytes")]
+        };
+        assert!(
+            check_unmirrorable_serde(&attrs, false, false).is_err(),
+            "`with` rewrites the wire format the schema describes"
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(deserialize_with = "parse_duration")]
+        };
+        assert!(check_unmirrorable_serde(&attrs, false, false).is_err());
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(serialize_with = "emit_compact")]
+        };
+        assert!(
+            check_unmirrorable_serde(&attrs, false, false).is_ok(),
+            "serialize_with is write-side only, like skip_serializing"
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(transparent)]
+        };
+        assert!(
+            check_unmirrorable_serde(&attrs, true, false).is_err(),
+            "transparent makes the wire the inner value, not the advertised object"
+        );
+    }
+
+    #[test]
     fn flag_keys_reject_values_with_a_named_error() {
         use syn::parse_quote;
         let attrs: Vec<Attribute> = parse_quote! {
@@ -565,6 +803,26 @@ mod tests {
             .expect("a flag with a value must fail");
         assert!(
             err.to_string().contains("`skip` takes no value"),
+            "the error names the key: {err}"
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[tool(allow_extra(false))]
+        };
+        let err = parse_container(&attrs)
+            .err()
+            .expect("the parenthesized form must not slip past the check and set the flag");
+        assert!(
+            err.to_string().contains("`allow_extra` takes no value"),
+            "the error names the key: {err}"
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[tool(default(false))]
+        };
+        let err = parse_field(&attrs)
+            .err()
+            .expect("the parenthesized form must not slip past the check and set the flag");
+        assert!(
+            err.to_string().contains("`default` takes no value"),
             "the error names the key: {err}"
         );
     }

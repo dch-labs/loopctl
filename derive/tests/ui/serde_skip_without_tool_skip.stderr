@@ -1,0 +1,5 @@
+error: `#[serde(skip)]` leaves the schema advertising a field serde ignores — add `#[tool(skip)]` to remove it from the schema, or write a manual `Tool` impl
+  --> tests/ui/serde_skip_without_tool_skip.rs:13:13
+   |
+13 |     #[serde(skip)]
+   |             ^^^^

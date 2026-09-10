@@ -59,8 +59,11 @@ pub struct ExtractedMemory {
     /// inject only recovery knowledge.
     pub tags: Vec<String>,
 
-    /// Confidence the memory is worth keeping (`0.0..=1.0`); becomes the
-    /// initial `MemoryEntry::relevance`.
+    /// Confidence the memory is worth keeping (`0.0..=1.0`).
+    ///
+    /// Becomes the initial `MemoryEntry::relevance` when the memory is
+    /// stored; the miners cap their self-assessment below the
+    /// auto-validate threshold.
     pub quality: f32,
 }
 
@@ -71,21 +74,27 @@ pub struct ExtractedMemory {
 /// field.
 #[derive(Debug, Clone, Default)]
 pub enum ExtractionStrategy {
-    /// Pattern-match the trajectory for known shapes (error→recovery
-    /// adjacency, successful tool chains, repeated calls) and synthesize
-    /// memories from rule-based templates. Zero LLM cost, deterministic,
-    /// offline.
+    /// Pattern-match the trajectory for known shapes and synthesize
+    /// memories from rule-based templates.
+    ///
+    /// The shapes are error→recovery adjacency, successful tool chains,
+    /// and repeated same-turn calls. Zero LLM cost, deterministic, and
+    /// fully offline.
     #[default]
     Heuristic,
 
     /// Ask an [`ApiClient`] to read a summarized trajectory and emit a
-    /// JSON array of memories. Higher quality; costs tokens and needs a
-    /// provider.
+    /// JSON array of memories.
+    ///
+    /// Higher-quality lessons than the templates produce, at the cost of
+    /// tokens and a configured provider.
     Llm,
 
-    /// Heuristic first (cheap, always runs), then an optional LLM pass to
-    /// refine, merge, and generalize the candidates. Degrades to the
-    /// heuristic result when the provider call fails.
+    /// Heuristic first, then an optional LLM pass over the candidates.
+    ///
+    /// The cheap templates always run; the provider refines, merges, and
+    /// generalizes their output, and a provider failure degrades to the
+    /// heuristic result.
     Hybrid,
 }
 
@@ -103,18 +112,23 @@ pub struct ExtractionConfig {
     /// generality; see [`ExtractionStrategy`] for the trade-offs.
     pub strategy: ExtractionStrategy,
 
-    /// Don't extract more than this many memories per trajectory — caps LLM
-    /// cost and keeps one run from flooding the store.
+    /// Ceiling on memories one trajectory may yield.
+    ///
+    /// Caps LLM cost and keeps a single run from flooding the store;
+    /// candidates beyond the cap are dropped after sorting by quality.
     pub max_memories: usize,
 
-    /// Skip extraction entirely for trajectories with fewer turns — a
-    /// one-shot has nothing to generalize from.
+    /// Skip extraction entirely below this many turns.
+    ///
+    /// A one-shot trajectory has nothing to generalize from, so short
+    /// runs produce no memories rather than noise.
     pub min_turns: usize,
 
-    /// Mine from non-failed runs by default; a `Partial` run's successful
-    /// tool work is exactly what its grade certifies, so it counts.
-    /// Outright failures often contain the most instructive recovery
-    /// pairs, so opt in to learn from them.
+    /// Mine from non-failed runs by default.
+    ///
+    /// A `Partial` run's successful tool work is exactly what its grade
+    /// certifies, so it counts; outright failures often contain the most
+    /// instructive recovery pairs, so opt in to learn from them.
     pub include_failures: bool,
 
     /// Cap on the bytes of trajectory context fed to the LLM strategies.
@@ -695,7 +709,9 @@ const MAX_WIRE_TAG_CHARS: usize = 64;
 ///
 /// A lesson needs a handful of labels to be selectable by kind and
 /// topic; beyond that the list is padding that grows every retrieved
-/// copy of the memory for no filtering value.
+/// copy of the memory for no filtering value. One slot is reserved for
+/// the `provider-derived` provenance tag every LLM-mined memory
+/// carries, so model-supplied tags alone can never fill the cap.
 const MAX_WIRE_TAGS: usize = 8;
 
 /// How many leading tool names a strategy memory lists before collapsing
@@ -803,8 +819,11 @@ fn mine_repetition(record: &TrajectoryRecord) -> Vec<ExtractedMemory> {
 /// self-assessed quality.
 #[derive(Debug, Deserialize)]
 struct LlmMemoryWire {
-    /// Category name as the prompt defines them: `strategy`,
-    /// `error_pattern`, `insight`, or `optimization`.
+    /// Category name as the prompt defines them.
+    ///
+    /// Exactly `strategy`, `error_pattern`, `insight`, or
+    /// `optimization`; any other string drops the whole element during
+    /// mapping.
     category: String,
 
     /// The learned lesson, phrased as reusable advice.
@@ -885,8 +904,10 @@ fn summarize_trajectory(record: &TrajectoryRecord, budget: usize) -> String {
     summary
 }
 
-/// Cut `text` to at most `limit` bytes on a char boundary, marking the
-/// cut with an ellipsis so summaries stay honest about what they dropped.
+/// Cut `text` to at most `limit` bytes on a char boundary.
+///
+/// The cut is marked with an ellipsis so summaries stay honest about
+/// what they dropped.
 fn truncate(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
@@ -989,46 +1010,63 @@ fn append_candidate_lines(system: &mut String, candidates: &[ExtractedMemory], b
 /// Parse the provider's answer: the outermost JSON array in the text,
 /// mapped to [`ExtractedMemory`] values with unknown categories dropped.
 ///
-/// Each `[` in the text is tried as the array's start, and for each
-/// start every later `]` as its end, until one slice deserializes — so
-/// prose containing an earlier bracket pair ("[3 total]") or trailing
-/// commentary with a bracket ("(done [2 items])") does not reject a
-/// response whose array parses fine. Text above [`MAX_RESPONSE_BYTES`]
-/// is rejected outright before any scanning.
+/// Bracket pairs are matched once with a single stack pass — brackets
+/// inside JSON strings do not count — and each `[` is tried only
+/// against its own matching `]`, earliest start first, until one span
+/// deserializes. Prose containing an earlier bracket pair ("[3
+/// total]") or trailing commentary with a bracket ("(done [2 items])")
+/// still does not reject a response whose array parses fine, while the
+/// scan stays linear in the input instead of trying every start
+/// against every later `]` — a bracket-heavy answer under the size cap
+/// cannot make the pass stall. Text above [`MAX_RESPONSE_BYTES`] is
+/// rejected outright before any scanning.
 ///
 /// # Errors
 ///
 /// [`LoopError::Api`] when no array is present or no
-/// candidate slice deserializes.
+/// candidate span deserializes.
 fn parse_llm_memories(text: &str) -> Result<Vec<ExtractedMemory>, LoopError> {
     if text.len() > MAX_RESPONSE_BYTES {
         return Err(unparseable_response());
     }
-    let ends: Vec<usize> = text
-        .char_indices()
-        .filter(|&(_, ch)| ch == ']')
-        .map(|(index, _)| index)
-        .collect();
-    for (start, ch) in text.char_indices() {
-        if ch != '[' {
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
             continue;
         }
-        for &end in ends.iter().filter(|&&end| end > start) {
-            let Some(slice) = text.get(start..=end) else {
-                continue;
-            };
-            if let Ok(wire) = serde_json::from_str::<Vec<LlmMemoryWire>>(slice) {
-                return Ok(wire.into_iter().filter_map(wire_to_extracted).collect());
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '[' if !in_string => open.push(index),
+            ']' if !in_string => {
+                if let Some(start) = open.pop() {
+                    pairs.push((start, index));
+                }
             }
+            _ => {}
+        }
+    }
+    pairs.sort_unstable_by_key(|&(start, _)| start);
+    for (start, end) in pairs {
+        let Some(span) = text.get(start..=end) else {
+            continue;
+        };
+        if let Ok(wire) = serde_json::from_str::<Vec<LlmMemoryWire>>(span) {
+            return Ok(wire.into_iter().filter_map(wire_to_extracted).collect());
         }
     }
     Err(unparseable_response())
 }
 
-/// The error for a provider answer that is transport-fine but not a
-/// parseable memory array — labelled `[parse]` so telemetry can
-/// distinguish "the model cannot do this job" from "the transport
-/// failed".
+/// The error for a provider answer that transports fine but carries no
+/// parseable memory array.
+///
+/// Labelled `[parse]` so telemetry can distinguish "the model cannot
+/// do this job" from "the transport failed".
 fn unparseable_response() -> LoopError {
     LoopError::Api("extraction response contained no parseable JSON array [parse]".into())
 }
@@ -1041,7 +1079,11 @@ fn unparseable_response() -> LoopError {
 /// requests. The `optimization` name maps to `Insight` and gains the
 /// `optimization` tag it is selected by; `error_pattern` likewise gains
 /// `recovery` — each kind backfills the selecting tag a host filters by,
-/// keeping filter-by-kind parity with the heuristic miners.
+/// keeping filter-by-kind parity with the heuristic miners. Every
+/// mapped memory also gains the `provider-derived` tag: provider text
+/// is untrusted — trajectory content an attacker shaped can steer the
+/// answer, and the answer persists verbatim — so the tag lets hosts
+/// filter, frame, or strip provider-sourced lessons at retrieval.
 fn wire_to_extracted(wire: LlmMemoryWire) -> Option<ExtractedMemory> {
     let name = wire.category.to_lowercase();
     let category = match name.as_str() {
@@ -1053,19 +1095,26 @@ fn wire_to_extracted(wire: LlmMemoryWire) -> Option<ExtractedMemory> {
     if wire.content.trim().is_empty() || wire.content.len() > MAX_WIRE_CONTENT_CHARS {
         return None;
     }
+    let selecting_tag = match name.as_str() {
+        "optimization" => Some("optimization"),
+        "error_pattern" => Some("recovery"),
+        _ => None,
+    };
+    let tag_budget =
+        MAX_WIRE_TAGS.saturating_sub(usize::from(selecting_tag.is_some()).saturating_add(1));
     let mut tags: Vec<String> = wire
         .tags
         .unwrap_or_default()
         .into_iter()
         .filter(|tag| tag.len() <= MAX_WIRE_TAG_CHARS)
-        .take(MAX_WIRE_TAGS)
+        .take(tag_budget)
         .collect();
-    if name == "optimization" && !tags.iter().any(|t| t == "optimization") {
-        tags.push("optimization".into());
+    if let Some(selecting) = selecting_tag
+        && !tags.iter().any(|t| t == selecting)
+    {
+        tags.push(selecting.into());
     }
-    if name == "error_pattern" && !tags.iter().any(|t| t == "recovery") {
-        tags.push("recovery".into());
-    }
+    tags.push("provider-derived".into());
     Some(ExtractedMemory {
         category,
         content: wire.content,
@@ -1097,7 +1146,10 @@ fn emit_extraction_metrics(memories: &[ExtractedMemory], outcome: &'static str) 
 }
 
 /// Emit the `loopctl.memory.extract.attempts` counter for one settled
-/// pass, labelled by how it settled.
+/// pass.
+///
+/// The outcome label carries how the pass settled, so a dashboard can
+/// split provider quality from configuration mistakes.
 fn emit_attempt_metric(outcome: &'static str) {
     tracing::debug!(
         target: "loopctl::metrics",
@@ -1106,11 +1158,12 @@ fn emit_attempt_metric(outcome: &'static str) {
     );
 }
 
-/// Map an extraction error to its telemetry outcome label — a parse
-/// failure answers "is the model good enough at this" differently than a
-/// transport failure. Parse failures carry the `[parse]` marker set by
-/// [`unparseable_response`]; everything else is a transport-level
-/// `api_error`.
+/// Map an extraction error to its telemetry outcome label.
+///
+/// A parse failure answers "is the model good enough at this"
+/// differently than a transport failure: parse failures carry the
+/// `[parse]` marker set by [`unparseable_response`], and everything
+/// else is a transport-level `api_error`.
 fn err_outcome(err: &LoopError) -> &'static str {
     match err {
         LoopError::Api(message) if message.contains("[parse]") => "parse_error",
@@ -1722,6 +1775,28 @@ mod tests {
     }
 
     #[test]
+    fn a_bracket_flood_under_the_cap_parses_the_real_array() {
+        let flood = format!(
+            "{}{}",
+            "[0]".repeat(10_000),
+            "[{\"category\":\"insight\",\"content\":\"the survivor\",\"quality\":0.5}]",
+        );
+        assert!(flood.len() < MAX_RESPONSE_BYTES);
+        let mined = parse_llm_memories(&flood)
+            .expect("the flood degrades to fast parse failures; the real array parses");
+        assert_eq!(mined.len(), 1);
+        assert_eq!(mined[0].content, "the survivor");
+    }
+
+    #[test]
+    fn nested_arrays_fall_through_to_the_inner_memory_array() {
+        let text = "[[{\"category\":\"insight\",\"content\":\"nested lesson\",\"quality\":0.5}]]";
+        let mined = parse_llm_memories(text).expect("the inner array carries the memories");
+        assert_eq!(mined.len(), 1);
+        assert_eq!(mined[0].content, "nested lesson");
+    }
+
+    #[test]
     fn candidate_lines_keep_an_exact_fit_and_stop_at_the_cap() {
         let candidates: Vec<ExtractedMemory> = (0..3)
             .map(|_| ExtractedMemory {
@@ -1879,6 +1954,45 @@ mod tests {
 
     #[test]
     fn provider_slips_are_dropped_or_sanitized_during_wire_mapping() {
+        let tagged = LlmMemoryWire {
+            category: "insight".into(),
+            content: "a real lesson".into(),
+            tags: Some((0..20).map(|i| format!("tag-{i}")).collect()),
+            quality: Some(0.5),
+        };
+        let mined = wire_to_extracted(tagged).expect("parses");
+        assert!(
+            mined.tags.iter().any(|tag| tag == "provider-derived"),
+            "every LLM-mined memory carries the provenance tag even when \
+            the model filled the tag budget: {:?}",
+            mined.tags
+        );
+        assert_eq!(
+            mined.tags.len(),
+            MAX_WIRE_TAGS,
+            "the provenance slot keeps the total at the cap"
+        );
+
+        let backfilled = LlmMemoryWire {
+            category: "error_pattern".into(),
+            content: "retry after adjusting the input".into(),
+            tags: Some((0..20).map(|i| format!("tag-{i}")).collect()),
+            quality: Some(0.5),
+        };
+        let mined = wire_to_extracted(backfilled).expect("parses");
+        assert_eq!(
+            mined.tags.len(),
+            MAX_WIRE_TAGS,
+            "a backfilled selecting tag and the provenance tag both fit within the \
+            cap: {:?}",
+            mined.tags
+        );
+        assert!(
+            mined.tags.iter().any(|tag| tag == "recovery")
+                && mined.tags.iter().any(|tag| tag == "provider-derived"),
+            "the selecting tag is backfilled and the provenance tag survives the squeeze"
+        );
+
         let empty = LlmMemoryWire {
             category: "insight".into(),
             content: "   ".into(),

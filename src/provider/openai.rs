@@ -766,22 +766,26 @@ struct RequestBody {
     /// [`Message`] list via [`convert_message`].
     messages: Vec<Value>,
 
-    /// The registered tools in OpenAI function-calling format, or `None`
-    /// when no tools are registered or when `response_format` is set
-    /// (mutual exclusion).
+    /// The registered tools in OpenAI function-calling format.
+    ///
+    /// `None` when no tools are registered or when `response_format`
+    /// is set — the two are mutually exclusive on the wire.
     tools: Option<Vec<Value>>,
 
-    /// The structured-output `response_format` JSON object, or `None`
-    /// when structured output is not requested. When `Some`, the field is
-    /// emitted as `response_format: { type: "json_schema", ... }` and
-    /// `tools` is suppressed.
+    /// The structured-output `response_format` JSON object.
+    ///
+    /// `None` when structured output is not requested; when `Some`, the
+    /// field is emitted as `response_format: { type: "json_schema", ... }`
+    /// and `tools` is suppressed.
     response_format: Option<Value>,
 
-    /// Grammar to pass through as `guided_json` for vLLM-style grammar-aware
-    /// samplers. `None` unless the caller set
+    /// Grammar to pass through as `guided_json` for vLLM-style
+    /// grammar-aware samplers.
+    ///
+    /// `None` unless the caller set
     /// [`ToolConstraint::Grammar`](crate::structured::ToolConstraint::Grammar)
-    /// and no `response_format` was set. Stored as a string so the body is
-    /// serializable without re-borrowing the trait object.
+    /// and no `response_format` was set. Stored as a string so the body
+    /// is serializable without re-borrowing the trait object.
     guided_json: Option<String>,
 
     /// Whether to request `stream_options.include_usage` when streaming.
@@ -1264,8 +1268,10 @@ impl OpenAiStreamError {
 /// `finish_reason`).
 #[derive(Deserialize)]
 struct OpenAiChoice {
-    /// Incremental content for this chunk, or `None` on the terminal
-    /// chunk that carries only a `finish_reason`.
+    /// Incremental content for this chunk.
+    ///
+    /// `None` on the terminal chunk, which carries only a
+    /// `finish_reason`.
     delta: Option<OpenAiDelta>,
 
     /// Why the model stopped generating, present only on the last chunk.

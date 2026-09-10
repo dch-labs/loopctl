@@ -370,8 +370,10 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Convert a [`Duration`] to milliseconds as a `u64`, saturating at
-    /// `u64::MAX` on overflow.
+    /// Convert a [`Duration`] to milliseconds as a `u64`.
+    ///
+    /// Saturates at `u64::MAX` on overflow rather than truncating or
+    /// panicking.
     pub(super) fn millis_u64(duration: Duration) -> u64 {
         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
     }

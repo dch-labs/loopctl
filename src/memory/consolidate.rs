@@ -57,8 +57,10 @@ const VALIDATED_WEIGHT: f32 = 0.10;
 /// popularity matter sooner.
 const ACCESS_SATURATION: f32 = 50.0;
 
-/// Recency time scale: an entry accessed now scores 1.0, one untouched for
-/// a month approaches zero.
+/// Recency time scale for the composite score, in seconds.
+///
+/// An entry accessed now scores 1.0 on the recency factor; one left
+/// untouched for a month approaches zero.
 const RECENCY_SCALE_SECS: f32 = 60.0 * 60.0 * 24.0 * 30.0;
 
 /// The composite quality of a memory entry, independent of any query.
@@ -284,8 +286,10 @@ pub fn merge_cluster(cluster: MemoryCluster) -> MemoryEntry {
 /// comparable to the plain pruner it replaces, only smarter.
 #[derive(Debug, Clone)]
 pub struct ConsolidationConfig {
-    /// Run time-based decay first, so dedup and pruning see post-decay
-    /// relevance.
+    /// Run time-based decay first.
+    ///
+    /// Dedup and pruning then see post-decay relevance, so a pass
+    /// judges entries by the value they have now.
     pub decay: bool,
 
     /// Half-life for decay. Default: 14 days.
@@ -509,8 +513,10 @@ fn promote_highest_quality(cluster: &mut MemoryCluster, now: SystemTime) {
     }
 }
 
-/// Lowercased, punctuation-trimmed whitespace tokens of a text — the
-/// comparison unit for Jaccard similarity.
+/// Lowercased, punctuation-trimmed whitespace tokens of a text.
+///
+/// The comparison unit for Jaccard similarity: punctuation edges do
+/// not distinguish lessons, so they are stripped before tokenizing.
 fn normalized_tokens(text: &str) -> HashSet<String> {
     text.to_lowercase()
         .split_whitespace()

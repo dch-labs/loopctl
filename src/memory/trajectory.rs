@@ -196,8 +196,11 @@ pub enum TrajectoryOutcome {
     /// in flight.
     Failure,
 
-    /// Real progress, imperfect ending: the run reported failure while at
-    /// least one of its tool calls succeeded.
+    /// Real progress with an imperfect ending.
+    ///
+    /// The run reported failure while at least one of its tool calls
+    /// succeeded, so its trajectory still certifies the work that went
+    /// right.
     Partial,
 }
 

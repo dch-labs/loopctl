@@ -281,8 +281,10 @@ impl FrontierProfile {
 /// Construct with [`GoalReminder::new`], or get a default-cadence one via
 /// [`ConstrainedProfile::apply`].
 pub struct GoalReminder {
-    /// Reminder cadence in turns. The reminder fires when
-    /// `turn > 0 && turn % every_n_turns == 0`.
+    /// Reminder cadence in turns.
+    ///
+    /// The reminder fires when `turn > 0 && turn % every_n_turns == 0`,
+    /// so the first turn of a run stays clean.
     every_n_turns: usize,
 }
 

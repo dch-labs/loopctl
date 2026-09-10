@@ -293,31 +293,39 @@ impl RatioTokenCounter {
         Self::validated(ratio, per_message, "custom")
     }
 
-    /// The OpenAI-calibrated preset: 4.30 chars per token, 4 tokens of
-    /// per-message overhead.
+    /// The OpenAI-calibrated preset.
+    ///
+    /// Assumes 4.30 chars per token and 4 tokens of per-message
+    /// overhead, matching OpenAI tokenizer measurements.
     #[must_use]
     pub fn openai() -> Self {
         Self::validated(4.3, 4, "openai")
     }
 
-    /// The Anthropic-calibrated preset: 3.60 chars per token, 5 tokens
-    /// of per-message overhead.
+    /// The Anthropic-calibrated preset.
+    ///
+    /// Assumes 3.60 chars per token and 5 tokens of per-message
+    /// overhead, matching Anthropic tokenizer measurements.
     #[must_use]
     pub fn anthropic() -> Self {
         Self::validated(3.6, 5, "anthropic")
     }
 
-    /// The Gemini-calibrated preset: 4.05 chars per token, 4 tokens of
-    /// per-message overhead.
+    /// The Gemini-calibrated preset.
+    ///
+    /// Assumes 4.05 chars per token and 4 tokens of per-message
+    /// overhead, matching Gemini tokenizer measurements.
     #[must_use]
     pub fn gemini() -> Self {
         Self::validated(4.05, 4, "gemini")
     }
 
-    /// A conservative starting point for local models: 3.80 chars per
-    /// token, 4 tokens of per-message overhead. Under-promises the
-    /// window on purpose; tune per tokenizer with [`new`](Self::new)
-    /// using the calibration recipe in the type docs.
+    /// A conservative starting point for local models.
+    ///
+    /// Assumes 3.80 chars per token and 4 tokens of per-message
+    /// overhead, under-promising the window on purpose; tune per
+    /// tokenizer with [`new`](Self::new) using the calibration recipe
+    /// in the type docs.
     #[must_use]
     pub fn local_default() -> Self {
         Self::validated(3.8, 4, "local")

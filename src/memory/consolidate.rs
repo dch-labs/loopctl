@@ -120,7 +120,9 @@ pub fn category_decay_weight(category: MemoryCategory) -> f32 {
 /// since the previous call and then advances the entry's
 /// [`last_decayed`](MemoryEntry::last_decayed) stamp, so consolidating
 /// hourly, daily, or once produces the same relevance as a single pass
-/// over the same total age. Retrieval between passes pauses decay — the
+/// over the same total age. The divisor floors the half-life at one
+/// second: a direct call with a sub-second or zero `half_life` decays
+/// per second rather than erroring — the [`ConsolidationConfig`] path substitutes its documented default instead. Retrieval between passes pauses decay — the
 /// stamp jumps to the access time, which shields the interval before it.
 /// The stamp never moves backwards: a pass whose clock sits before an
 /// earlier pass — an NTP step, a resumed VM — leaves the stamp alone, so

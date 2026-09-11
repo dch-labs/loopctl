@@ -17,8 +17,16 @@ use crate::hooks::context::PreToolUseContext;
 pub trait ConfirmationHandler: Send + Sync {
     /// Ask the user whether to proceed. Returns `true` to allow.
     ///
-    /// Called synchronously on the hook path; implementations own
-    /// whatever UI or prompting that entails.
+    /// Called synchronously on the hook path, so an implementation
+    /// must resolve without blocking indefinitely: a headless run has
+    /// no one to ask, and a stalled prompt stalls the hook — and the
+    /// async polling worker when the check runs inline. A waiting
+    /// confirmation belongs on the framework's own path instead:
+    /// return [`HookAction::ask`](crate::hooks::HookAction::ask)
+    /// through an executor running
+    /// [`Interactivity::Interactive`](crate::hooks::Interactivity),
+    /// where an unanswered question is downgraded to a block rather
+    /// than hanging the loop.
     fn confirm(&self, message: &str) -> bool;
 }
 

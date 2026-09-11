@@ -335,7 +335,10 @@ pub(crate) fn serde_rename(attrs: &[Attribute]) -> Option<String> {
 /// `skip_serializing_if`, `serialize_with`) change only what serde
 /// emits, so a schema advertising the field stays truthful and they
 /// pass. `with` and `deserialize_with` rewrite the wire format itself
-/// and are rejected on the field side.
+/// and are rejected on the field side. The same split governs the
+/// container: `into`/`try_into` convert only what serde emits and
+/// pass, while `from`/`try_from` convert the deserialization input
+/// and are rejected.
 ///
 /// # Errors
 ///
@@ -347,9 +350,7 @@ pub(crate) fn check_unmirrorable_serde(
 ) -> syn::Result<()> {
     const CONTAINER_KEYS: &[&str] = &[
         "from",
-        "into",
         "try_from",
-        "try_into",
         "remote",
         "transparent",
         "rename_all_fields",
@@ -780,6 +781,127 @@ mod tests {
             check_unmirrorable_serde(&attrs, true, false).is_err(),
             "transparent makes the wire the inner value, not the advertised object"
         );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(into = "String")]
+        };
+        assert!(
+            check_unmirrorable_serde(&attrs, true, false).is_ok(),
+            "into converts only what serde emits — the read side the schema describes is untouched"
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(try_into = "Vec<u8>")]
+        };
+        assert!(
+            check_unmirrorable_serde(&attrs, true, false).is_ok(),
+            "try_into is write-side like into"
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(from = "Raw")]
+        };
+        assert!(
+            check_unmirrorable_serde(&attrs, true, false).is_err(),
+            "from converts the deserialization input itself"
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(try_from = "Raw")]
+        };
+        assert!(
+            check_unmirrorable_serde(&attrs, true, false).is_err(),
+            "try_from is read-side like from"
+        );
+    }
+
+    #[test]
+    fn rename_all_matches_serdes_serialized_wire_names() {
+        use serde::Serialize;
+
+        macro_rules! renamed {
+            ($name:ident, $strategy:literal) => {
+                #[derive(Serialize)]
+                #[serde(rename_all = $strategy)]
+                #[allow(non_snake_case)]
+                struct $name {
+                    fileName: &'static str,
+                    straße_x: &'static str,
+                }
+            };
+        }
+        renamed!(RenamedLower, "lowercase");
+        renamed!(RenamedUpper, "UPPERCASE");
+        renamed!(RenamedPascal, "PascalCase");
+        renamed!(RenamedCamel, "camelCase");
+        renamed!(RenamedSnake, "snake_case");
+        renamed!(RenamedScreamingSnake, "SCREAMING_SNAKE_CASE");
+        renamed!(RenamedKebab, "kebab-case");
+        renamed!(RenamedScreamingKebab, "SCREAMING-KEBAB-CASE");
+
+        let lower = serde_json::to_value(RenamedLower {
+            fileName: "",
+            straße_x: "",
+        })
+        .expect("serializes");
+        let upper = serde_json::to_value(RenamedUpper {
+            fileName: "",
+            straße_x: "",
+        })
+        .expect("serializes");
+        let pascal = serde_json::to_value(RenamedPascal {
+            fileName: "",
+            straße_x: "",
+        })
+        .expect("serializes");
+        let camel = serde_json::to_value(RenamedCamel {
+            fileName: "",
+            straße_x: "",
+        })
+        .expect("serializes");
+        let snake = serde_json::to_value(RenamedSnake {
+            fileName: "",
+            straße_x: "",
+        })
+        .expect("serializes");
+        let screaming_snake = serde_json::to_value(RenamedScreamingSnake {
+            fileName: "",
+            straße_x: "",
+        })
+        .expect("serializes");
+        let kebab = serde_json::to_value(RenamedKebab {
+            fileName: "",
+            straße_x: "",
+        })
+        .expect("serializes");
+        let screaming_kebab = serde_json::to_value(RenamedScreamingKebab {
+            fileName: "",
+            straße_x: "",
+        })
+        .expect("serializes");
+
+        let cases: [(&str, serde_json::Value); 8] = [
+            ("lowercase", lower),
+            ("UPPERCASE", upper),
+            ("PascalCase", pascal),
+            ("camelCase", camel),
+            ("snake_case", snake),
+            ("SCREAMING_SNAKE_CASE", screaming_snake),
+            ("kebab-case", kebab),
+            ("SCREAMING-KEBAB-CASE", screaming_kebab),
+        ];
+        for (strategy, serialized) in cases {
+            let keys = serialized
+                .as_object()
+                .expect("the renamed struct serializes as an object")
+                .keys()
+                .cloned()
+                .collect::<Vec<String>>();
+            let rule = RenameAll::from_str(strategy)
+                .unwrap_or_else(|| panic!("unknown strategy: {strategy}"));
+            assert_eq!(
+                keys,
+                vec![rule.apply("fileName"), rule.apply("straße_x")],
+                "serde's own serialized keys for {strategy} are the oracle — the \
+                derive must advertise exactly them"
+            );
+        }
     }
 
     #[test]

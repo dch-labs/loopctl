@@ -253,9 +253,9 @@ pub async fn extract_from_record(
             };
             match llm_memories(record, config, client, None).await {
                 Ok(mined) => mined,
-                Err(err) => {
-                    emit_attempt_metric(err_outcome(&err));
-                    return Err(err);
+                Err(failure) => {
+                    emit_attempt_metric(failure.outcome);
+                    return Err(failure.error);
                 }
             }
         }
@@ -269,11 +269,11 @@ pub async fn extract_from_record(
                 Some(client) => {
                     match llm_memories(record, config, client, Some(&candidates)).await {
                         Ok(refined) => refined,
-                        Err(err) => {
-                            fallback_outcome = Some(err_outcome(&err));
+                        Err(failure) => {
+                            fallback_outcome = Some(failure.outcome);
                             tracing::warn!(
                                 target: "loopctl::memory",
-                                error = %err,
+                                error = %failure.error,
                                 "hybrid extraction fell back to heuristic candidates"
                             );
                             candidates
@@ -534,7 +534,7 @@ async fn extract_from_record_owned(
 /// The lenient parser tries every `]` after every `[`, which is
 /// quadratic on bracket-dense input; the cap bounds that worst case to
 /// a size no legitimate memory array approaches (a memory is itself
-/// capped at [`MAX_WIRE_CONTENT_CHARS`], so hundreds fit well below
+/// capped at [`MAX_WIRE_CONTENT_BYTES`], so hundreds fit well below
 /// this), and the parse runs on the blocking pool so even the bounded
 /// worst case cannot stall a tokio worker.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -697,12 +697,13 @@ fn mine_recoveries(record: &TrajectoryRecord) -> Vec<ExtractedMemory> {
 /// lessons into the store — a stored memory is re-paid on every future
 /// retrieval, so one oversized lesson is a recurring cost with no knob
 /// to unwind it. Oversized items drop like unknown categories do.
-const MAX_WIRE_CONTENT_CHARS: usize = 2_000;
+const MAX_WIRE_CONTENT_BYTES: usize = 2_000;
 
 /// Ceiling on one provider-supplied tag's length.
 ///
-/// Tags are short filter labels; a longer one is model noise trimmed
-/// before it can bloat the stored entry.
+/// Tags are short filter labels; a longer one is model noise dropped
+/// whole before it can bloat the stored entry — a cut label would
+/// filter differently than the model intended.
 const MAX_WIRE_TAG_CHARS: usize = 64;
 
 /// Ceiling on the tag count one provider-supplied lesson may carry.
@@ -713,6 +714,15 @@ const MAX_WIRE_TAG_CHARS: usize = 64;
 /// the `provider-derived` provenance tag every LLM-mined memory
 /// carries, so model-supplied tags alone can never fill the cap.
 const MAX_WIRE_TAGS: usize = 8;
+
+/// Cap on a tool name interpolated into heuristic mined content.
+///
+/// Tool names on the wire come from the model's tool calls, so a
+/// hallucinated or attacker-steered name can be arbitrarily long; the
+/// repetition miner is the one heuristic sink where such a name is
+/// stored without first matching a successful dispatch. The cap keeps
+/// the persisted lesson bounded whatever the ledger carried.
+const MAX_MINED_TOOL_NAME_CHARS: usize = 64;
 
 /// How many leading tool names a strategy memory lists before collapsing
 /// the rest into a count.
@@ -795,6 +805,7 @@ fn mine_repetition(record: &TrajectoryRecord) -> Vec<ExtractedMemory> {
         }
         for (tool, count) in counted {
             if count >= 3 {
+                let tool = truncate(&tool, MAX_MINED_TOOL_NAME_CHARS);
                 memories.push(ExtractedMemory {
                     category: MemoryCategory::Insight,
                     content: format!(
@@ -858,7 +869,10 @@ struct LlmMemoryWire {
 /// where the run ended, which is where the outcome lives. Apart from the
 /// fixed outcome header — which always rides along, however small the
 /// budget — the returned summary never exceeds `budget` bytes: the
-/// truncation marker is reserved before any turn line is appended. Keeps
+/// truncation marker is reserved before any turn line is appended. A
+/// budget smaller than the marker itself is pathological configuration;
+/// there the marker still rides on top of the header, since an
+/// unmarked silent truncation would lie worse. Keeps
 /// what generalizes — outcome, turn index, per-turn tool names with
 /// ok/error flags, and trimmed query and response text.
 fn summarize_trajectory(record: &TrajectoryRecord, budget: usize) -> String {
@@ -935,7 +949,7 @@ async fn llm_memories(
     config: &ExtractionConfig,
     client: &dyn ApiClient,
     heuristic_candidates: Option<&[ExtractedMemory]>,
-) -> Result<Vec<ExtractedMemory>, LoopError> {
+) -> Result<Vec<ExtractedMemory>, LlmFailure> {
     /// The hybrid prompt's candidate preamble.
     ///
     /// Appended to the system instruction only when heuristic candidates
@@ -975,15 +989,48 @@ refine, merge, generalize, and drop the weak ones:\n";
     let response = client
         .create_message(&request)
         .await
-        .map_err(|err| LoopError::Api(format!("extraction provider call failed: {err}")))?;
+        .map_err(|err| LlmFailure {
+            error: LoopError::Api(format!("extraction provider call failed: {err}")),
+            outcome: "api_error",
+        })?;
     let text = response.message.text_content();
-    match tokio::runtime::Handle::try_current() {
+    let parsed = match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle
             .spawn_blocking(move || parse_llm_memories(&text))
             .await
-            .map_err(|err| LoopError::Api(format!("extraction parser task failed: {err}")))?,
-        Err(_) => parse_llm_memories(&text),
-    }
+            .map_err(|err| LlmFailure {
+                error: LoopError::Api(format!("extraction parser task failed: {err}")),
+                outcome: "api_error",
+            }),
+        Err(_) => Ok(parse_llm_memories(&text)),
+    }?;
+    parsed.map_err(|error| LlmFailure {
+        error,
+        outcome: "parse_error",
+    })
+}
+
+/// A failed provider pass carrying the telemetry outcome label.
+///
+/// The label is chosen at the failure site — `api_error` on the
+/// transport legs, `parse_error` when the answer arrived but carried no
+/// parseable array — so the `loopctl.memory.extract.attempts` split of
+/// model quality from transport health is carried in the error's shape
+/// rather than recovered by matching rendered message text a provider
+/// body could forge.
+#[derive(Debug)]
+struct LlmFailure {
+    /// The error the caller propagates.
+    ///
+    /// Always a [`LoopError::Api`] today; kept untyped so callers
+    /// propagate it unchanged wherever the pass fails.
+    error: LoopError,
+
+    /// The attempt-metric outcome for the failed pass.
+    ///
+    /// One of `api_error` or `parse_error`, fixed at the site that
+    /// produced the error.
+    outcome: &'static str,
 }
 
 /// Append the hybrid candidate lines to `system`, bounded by `budget`.
@@ -1065,10 +1112,10 @@ fn parse_llm_memories(text: &str) -> Result<Vec<ExtractedMemory>, LoopError> {
 /// The error for a provider answer that transports fine but carries no
 /// parseable memory array.
 ///
-/// Labelled `[parse]` so telemetry can distinguish "the model cannot
-/// do this job" from "the transport failed".
+/// The failure site labels its telemetry outcome `parse_error`
+/// directly, so the message states the cause and carries no marker.
 fn unparseable_response() -> LoopError {
-    LoopError::Api("extraction response contained no parseable JSON array [parse]".into())
+    LoopError::Api("extraction response contained no parseable JSON array".into())
 }
 
 /// Map one provider-reported memory onto [`ExtractedMemory`].
@@ -1092,7 +1139,7 @@ fn wire_to_extracted(wire: LlmMemoryWire) -> Option<ExtractedMemory> {
         "insight" | "optimization" => MemoryCategory::Insight,
         _ => return None,
     };
-    if wire.content.trim().is_empty() || wire.content.len() > MAX_WIRE_CONTENT_CHARS {
+    if wire.content.trim().is_empty() || wire.content.len() > MAX_WIRE_CONTENT_BYTES {
         return None;
     }
     let selecting_tag = match name.as_str() {
@@ -1156,19 +1203,6 @@ fn emit_attempt_metric(outcome: &'static str) {
         metric = "loopctl.memory.extract.attempts",
         outcome
     );
-}
-
-/// Map an extraction error to its telemetry outcome label.
-///
-/// A parse failure answers "is the model good enough at this"
-/// differently than a transport failure: parse failures carry the
-/// `[parse]` marker set by [`unparseable_response`], and everything
-/// else is a transport-level `api_error`.
-fn err_outcome(err: &LoopError) -> &'static str {
-    match err {
-        LoopError::Api(message) if message.contains("[parse]") => "parse_error",
-        _ => "api_error",
-    }
 }
 
 /// The attempt outcome for a pass that never reached its provider: the
@@ -1694,10 +1728,10 @@ mod tests {
     }
 
     #[test]
-    fn oversized_provider_content_drops_and_runaway_tags_trim() {
+    fn oversized_provider_content_drops_and_runaway_tags_drop() {
         let oversized = LlmMemoryWire {
             category: "insight".into(),
-            content: "x".repeat(MAX_WIRE_CONTENT_CHARS + 1),
+            content: "x".repeat(MAX_WIRE_CONTENT_BYTES + 1),
             tags: None,
             quality: Some(0.5),
         };
@@ -1722,12 +1756,12 @@ mod tests {
 
     #[test]
     fn an_oversized_provider_answer_is_a_parse_error_before_scanning() {
-        let huge = format!("[{}]{}", "x".repeat(MAX_RESPONSE_BYTES), "]");
+        let valid = r#"[{"category":"insight","content":"the lesson","quality":0.5}]"#;
+        let huge = format!("{}{}", "[0]".repeat(MAX_RESPONSE_BYTES / 3 + 1), valid);
         let err = parse_llm_memories(&huge).expect_err("oversized answers reject outright");
-        assert_eq!(
-            err_outcome(&err),
-            "parse_error",
-            "the cap rejects before the quadratic scan, as a parse failure"
+        assert!(
+            err.to_string().contains("no parseable JSON array"),
+            "the rejection is the parse failure: {err}"
         );
     }
 
@@ -1873,6 +1907,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_runaway_tool_name_is_bounded_in_the_mined_repetition_lesson() {
+        let long_name = "x".repeat(500);
+        let runaway = record(
+            TrajectoryOutcome::Success,
+            vec![
+                turn(0, "look", vec![call("Read", true)]),
+                turn(1, "think", vec![call("Read", true)]),
+                turn(
+                    2,
+                    "flail",
+                    vec![
+                        call(&long_name, false),
+                        call(&long_name, false),
+                        call(&long_name, false),
+                    ],
+                ),
+            ],
+        );
+        let mined = extract_from_record(&runaway, &ExtractionConfig::default(), None)
+            .await
+            .expect("ok");
+        let insight = mined
+            .iter()
+            .find(|memory| memory.tags.iter().any(|tag| tag == "optimization"))
+            .expect("three repeats of one name still mine the lesson");
+        assert!(
+            insight.content.len() < 300,
+            "a hallucinated half-kilobyte tool name must not persist into the \
+            store unbounded: {} bytes",
+            insight.content.len()
+        );
+        assert!(
+            insight.content.contains('…'),
+            "the cut name is marked rather than silently shortened"
+        );
+    }
+
+    #[tokio::test]
     async fn max_memories_caps_the_candidate_list() {
         let busy = record(
             TrajectoryOutcome::Success,
@@ -1935,20 +2007,18 @@ mod tests {
             matches!(err, LoopError::Api(_)),
             "malformed provider output surfaces as LoopError::Api"
         );
-        assert_eq!(
-            err_outcome(&err),
-            "parse_error",
-            "a response that transports fine but carries no array is a parse \
-            failure, not a transport failure"
+        assert!(
+            err.to_string().contains("no parseable JSON array"),
+            "a response that transports fine but carries no array fails as a \
+            parse failure: {err}"
         );
         let transport = MockApiClient::new("test-model").with_errors(vec![Some("boom".into())]);
         let err = extract_from_record(&trajectory, &config, Some(&transport))
             .await
             .expect_err("a provider transport failure is an error");
-        assert_eq!(
-            err_outcome(&err),
-            "api_error",
-            "a transport failure keeps the api_error label"
+        assert!(
+            err.to_string().contains("provider call failed"),
+            "a transport failure carries the transport message: {err}"
         );
     }
 

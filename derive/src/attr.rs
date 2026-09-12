@@ -463,19 +463,17 @@ pub(crate) fn serde_rename_all(attrs: &[Attribute]) -> syn::Result<Option<Rename
         if let Meta::List(list) = &meta
             && list.path.is_ident("rename_all")
         {
-            let mut serialize_rule = None;
             let mut deserialize_rule = None;
             list.parse_args_with(syn::meta::parser(|nested| {
-                let reads = nested.path.is_ident("deserialize");
-                if (reads || nested.path.is_ident("serialize"))
+                if nested.path.is_ident("serialize") {
+                    let _write_side: LitStr = nested.value()?.parse()?;
+                    return Ok(());
+                }
+                if nested.path.is_ident("deserialize")
                     && let Ok(lit) = nested.value()?.parse::<LitStr>()
                 {
                     if let Some(strategy) = RenameAll::from_str(&lit.value()) {
-                        if reads {
-                            deserialize_rule = Some(strategy);
-                        } else {
-                            serialize_rule = Some(strategy);
-                        }
+                        deserialize_rule = Some(strategy);
                     } else {
                         let value = lit.value();
                         return Err(syn::Error::new_spanned(
@@ -490,7 +488,7 @@ pub(crate) fn serde_rename_all(attrs: &[Attribute]) -> syn::Result<Option<Rename
                 }
                 Ok(())
             }))?;
-            if let Some(strategy) = deserialize_rule.or(serialize_rule) {
+            if let Some(strategy) = deserialize_rule {
                 out = Some(strategy);
             }
         }
@@ -1017,8 +1015,9 @@ mod tests {
         };
         assert_eq!(
             serde_rename_all(&attrs).expect("a serialize-only list form parses"),
-            Some(RenameAll::Camel),
-            "without a deserialization rule the serialize rule is the only signal"
+            None,
+            "the serialize rule never reaches the read side — serde keeps \
+            deserialization on the raw field names, and so must the schema"
         );
     }
 

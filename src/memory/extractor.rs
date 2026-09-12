@@ -595,13 +595,14 @@ async fn last_complete_record(path: &Path) -> Result<Option<TrajectoryRecord>, L
 
 /// Read one line into `buf`, never buffering past `cap`.
 ///
-/// Returns `true` at end of input. A line longer than the cap completes
-/// as a truncated buffer — the excess is consumed and discarded — so the
-/// caller's parse simply fails and the line is skipped, while the
-/// reader's memory stays bounded however long the newline-less region
-/// grows. `buf` always ends at the line's newline when one terminated
-/// it, matching plain [`read_until`](std::io::BufRead::read_until)
-/// output for in-cap lines.
+/// A line longer than the cap is discarded whole — the excess is
+/// consumed without buffering and `buf` comes back empty — so the
+/// caller's parse fails and the line is skipped even when the buffered
+/// prefix would itself be valid JSON (a record padded past the cap with
+/// trailing whitespace, say), while the reader's memory stays bounded
+/// however long the newline-less region grows. `buf` always ends at the
+/// line's newline when one terminated it, matching plain
+/// [`read_until`](std::io::BufRead::read_until) output for in-cap lines.
 ///
 /// # Errors
 ///
@@ -616,6 +617,9 @@ fn read_capped_line(
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
+            if over_cap {
+                buf.clear();
+            }
             return Ok(buf.is_empty());
         }
         if let Some(index) = available.iter().position(|&byte| byte == b'\n') {
@@ -627,6 +631,9 @@ fn read_capped_line(
                 buf.extend_from_slice(through_newline);
             }
             reader.consume(terminator);
+            if over_cap {
+                buf.clear();
+            }
             return Ok(false);
         }
         let len = available.len();
@@ -1674,6 +1681,32 @@ mod tests {
                 .any(|memory| memory.category == MemoryCategory::ErrorPattern),
             "the newest record is mined — the reliable path must read the same \
             lenient ledger the observer does, not fail on trailing characters"
+        );
+    }
+
+    #[test]
+    fn a_padded_valid_record_past_the_cap_is_discarded_not_parsed() {
+        let padded = format!("{{\"category\":\"insight\"}}{}", " ".repeat(200));
+        let mut stream = padded.into_bytes();
+        stream.push(b'\n');
+        stream.extend_from_slice(b"x\n{\"category\":\"insight\"}\n");
+        let mut reader = std::io::Cursor::new(stream);
+        let mut line = Vec::new();
+        read_capped_line(&mut reader, &mut line, 64).expect("read");
+        assert!(
+            line.is_empty(),
+            "an over-cap line is discarded whole — its whitespace-padded valid-JSON \
+            prefix must not parse: {line:?}"
+        );
+        read_capped_line(&mut reader, &mut line, 64).expect("read");
+        assert_eq!(
+            line, b"x\n",
+            "the reader resynchronizes on the next newline"
+        );
+        read_capped_line(&mut reader, &mut line, 64).expect("read");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&line).is_ok(),
+            "the following in-cap line still parses"
         );
     }
 

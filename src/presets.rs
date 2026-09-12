@@ -43,14 +43,33 @@ use crate::middleware::{
 use crate::structured::{RequestOptions, ToolConstraint};
 
 /// Default per-tool-output cap (characters) applied by `OutputLimitMiddleware`.
+///
+/// Keeps one chatty tool from flooding a small model's context.
 const OUTPUT_CAP_CHARS: usize = 16_384;
+
 /// Default cache TTL (turns) for the preset's `MemoizingMiddleware`.
+///
+/// Long enough to save repeats within a task, short enough to track
+/// edits within a session.
 const MEMOIZE_TTL_TURNS: u32 = 5;
+
 /// Default reminder cadence (turns) for [`GoalReminder`].
+///
+/// Re-injects the goal often enough to arrest drift without spending
+/// a turn's budget on repetition.
 const GOAL_REMINDER_EVERY_N_TURNS: usize = 5;
+
 /// Default write-class tool names the preset wires into its middleware. Advisory.
+///
+/// The names cover the common coding-agent set; hosts with
+/// differently-named write tools build the middleware stack directly
+/// rather than through the preset.
 const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit"];
+
 /// Default memoized tool names the preset wires into its middleware. Advisory.
+///
+/// Read-class, side-effect-free calls — the shapes whose repeats are
+/// pure waste.
 const MEMOIZED_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
 
 /// The small-model-tuned runtime profile.
@@ -262,8 +281,10 @@ impl FrontierProfile {
 /// Construct with [`GoalReminder::new`], or get a default-cadence one via
 /// [`ConstrainedProfile::apply`].
 pub struct GoalReminder {
-    /// Reminder cadence in turns. The reminder fires when
-    /// `turn > 0 && turn % every_n_turns == 0`.
+    /// Reminder cadence in turns.
+    ///
+    /// The reminder fires when `turn > 0 && turn % every_n_turns == 0`,
+    /// so the first turn of a run stays clean.
     every_n_turns: usize,
 }
 

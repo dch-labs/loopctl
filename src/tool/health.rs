@@ -373,6 +373,9 @@ fn update_ewma(prev: u64, is_success: bool) -> u64 {
 }
 
 /// Add `value` to `cell`, saturating at `u64::MAX` instead of wrapping.
+///
+/// Atomic fetch-add wraps on overflow; the compare-exchange loop
+/// keeps monotone counters monotone at the type's ceiling.
 fn saturating_add(cell: &AtomicU64, value: u64) {
     cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
         prev.checked_add(value).or(Some(u64::MAX))

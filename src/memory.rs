@@ -5,6 +5,34 @@
 //! [`LoopMemory`] trait that all memory backends implement, along with
 //! the [`MemoryEntry`] value type and supporting enumerations.
 //!
+//! Beyond the trait, this facade fronts four core subsystems a backend
+//! or host composes (plus the feature-gated [`vector`] module for
+//! semantic retrieval under `vector_index`):
+//!
+//! - **[`builtin`]** — [`InMemoryStore`], the zero-dependency reference
+//!   backend: weighted keyword + tag retrieval, access-log stamping, and
+//!   a full consolidation pass.
+//! - **[`consolidate`]** — the store-agnostic pass every backend can
+//!   reuse: [`quality_score`](consolidate::quality_score),
+//!   category-weighted [`decay_relevance`](consolidate::decay_relevance),
+//!   Jaccard [`cluster_duplicates`](consolidate::cluster_duplicates) with
+//!   [`merge_cluster`](consolidate::merge_cluster), and the one-call
+//!   [`consolidate_entries`](consolidate::consolidate_entries) pass —
+//!   its relevance sanitization is documented on that function and its
+//!   threshold normalization on `ConsolidationConfig`.
+//! - **[`trajectory`]** — [`TrajectoryObserver`] captures each run as a
+//!   serializable [`TrajectoryRecord`] (in memory or as a JSONL ledger),
+//!   the raw material for learning.
+//! - **[`vector`]** — semantic-retrieval primitives (feature
+//!   `vector_index`): [`EmbeddingProvider`] and [`VectorIndex`] traits
+//!   with dependency-free reference implementations.
+//! - **[`extractor`]** — mines those records into reusable memories:
+//!   [`extract`](extractor::extract) / [`extract_into`](extractor::extract_into)
+//!   read a ledger's newest complete record, and
+//!   [`ExtractionObserver`] automates the
+//!   pass at run end on a best-effort spawned task (see its docs for the
+//!   flush race and shutdown caveats).
+//!
 //! # Provided Implementations
 //!
 //! - **[`InMemoryStore`]** — Records tool-execution trajectories and
@@ -61,7 +89,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub use builtin::InMemoryStore;
+pub use consolidate::{ConsolidationConfig, MemoryCluster};
 pub use entry::{ConsolidationStats, MemoryCategory, MemoryEntry};
+pub use extractor::{ExtractedMemory, ExtractionConfig, ExtractionObserver, ExtractionStrategy};
 pub use trajectory::{
     TokenSummary, TrajectoryObserver, TrajectoryOutcome, TrajectoryRecord, TrajectoryToolCall,
     TrajectoryTurn,
@@ -73,7 +103,9 @@ pub use vector::{
 };
 
 pub mod builtin;
+pub mod consolidate;
 pub mod entry;
+pub mod extractor;
 pub mod trajectory;
 #[cfg(feature = "vector_index")]
 pub mod vector;

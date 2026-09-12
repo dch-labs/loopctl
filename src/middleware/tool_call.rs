@@ -28,6 +28,10 @@ impl ToolCallMiddleware {
     pub(super) const NAME: &str = "tool_call";
 
     /// Create a new core dispatch wrapping the given registry.
+    ///
+    /// The registry is shared behind an `Arc` and immutable from here
+    /// on; dispatch still looks the tool up by name on every call
+    /// rather than caching the resolution at construction time.
     #[must_use]
     pub fn new(registry: Arc<ToolRegistry>) -> Self {
         Self { registry }
@@ -59,11 +63,15 @@ impl ToolCallMiddleware {
                     .with_call_id(&call_id);
             };
 
-            // Wrap the tool call in `catch_unwind` so a panicking tool
-            // implementation produces an error result instead of unwinding
-            // through and aborting the entire agent loop.  Tools are
-            // user-supplied `dyn Tool` implementations and the framework
-            // cannot trust them to be panic-free.
+            if cancel.is_cancelled() {
+                return ToolDispatchResult::err(
+                    &tool_name,
+                    format!("Tool '{tool_name}' cancelled"),
+                    start.elapsed(),
+                )
+                .with_call_id(&call_id);
+            }
+
             let call_result = tokio::select! {
                 r = AssertUnwindSafe(tool.call(input, &tool_ctx)).catch_unwind() => r,
                 () = cancel.notified() => {
@@ -78,7 +86,6 @@ impl ToolCallMiddleware {
 
             let duration = start.elapsed();
 
-            // Convert a panic payload into a tool-error result.
             let call_result = match call_result {
                 Ok(inner) => inner,
                 Err(panic_payload) => {
@@ -164,6 +171,63 @@ mod tests {
             permission: PermissionCheck::allow(),
             tool_context: ToolContext::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_precancelled_run_never_starts_the_tool() {
+        struct SideEffectProbe(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Tool for SideEffectProbe {
+            fn name(&self) -> &'static str {
+                "side_effect_probe"
+            }
+            fn description(&self) -> &'static str {
+                "A tool that records being polled"
+            }
+            fn schema(&self) -> ToolSchema {
+                ToolSchema {
+                    tool: self.name().into(),
+                    description: self.description().into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                }
+            }
+            fn call(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &ToolContext,
+            ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>>
+            {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async { Ok(ToolOutput::text("started")) })
+            }
+        }
+
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = ToolRegistry::new();
+        registry.register(SideEffectProbe(Arc::clone(&polled)));
+
+        let middleware = ToolCallMiddleware::new(Arc::new(registry));
+        let cancel = Arc::new(CancelSignal::new());
+        cancel.cancel();
+        let mut ctx = make_ctx("side_effect_probe", cancel);
+
+        let result = middleware.dispatch(&mut ctx).await;
+
+        assert!(
+            result.is_error,
+            "a pre-cancelled dispatch reports cancellation, not a tool result"
+        );
+        if let ToolContent::Text(text) = &result.output {
+            assert!(
+                text.contains("cancelled"),
+                "the error names cancellation: {text}"
+            );
+        }
+        assert!(
+            !polled.load(std::sync::atomic::Ordering::SeqCst),
+            "the tool's call future was never polled — a cancelled run must not \
+            start side-effecting tools"
+        );
     }
 
     #[tokio::test]

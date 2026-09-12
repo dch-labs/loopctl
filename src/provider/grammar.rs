@@ -23,6 +23,10 @@ use crate::tool::ToolSchema;
 /// a non-JSON grammar (e.g. GBNF for llama.cpp).
 pub trait ToolGrammarProvider: Send + Sync + std::fmt::Debug {
     /// The compiled grammar string.
+    ///
+    /// Callers may invoke this per request; implementations precompute
+    /// the grammar (or lazily cache it in `self`, as the borrowed return
+    /// requires) so the call stays cheap.
     fn grammar(&self) -> &str;
 }
 

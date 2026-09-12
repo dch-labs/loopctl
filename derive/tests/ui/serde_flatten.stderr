@@ -1,0 +1,5 @@
+error: `#[serde(flatten)]` changes what serde reads on the wire in ways `#[derive(Tool)]` cannot mirror — write a manual `Tool` impl for this input
+  --> tests/ui/serde_flatten.rs:14:13
+   |
+14 |     #[serde(flatten)]
+   |             ^^^^^^^

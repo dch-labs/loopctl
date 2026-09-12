@@ -37,9 +37,31 @@ use crate::structured::ToolConstraint;
 use crate::structured::tighten_json_schema;
 use crate::tool::ToolSchema;
 
+/// Default Generative Language API endpoint used when a builder sets none.
+///
+/// Points at the stable `v1beta` surface; `streamGenerateContent` and
+/// `generateContent` are appended per request.
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+/// Model served when a builder or environment names none.
+///
+/// A fast general-purpose default; override with
+/// [`with_model`](GeminiClientBuilder::with_model).
 const DEFAULT_MODEL: &str = "gemini-2.0-flash";
+
+/// Framework-side part index assigned to the text lane in stream
+/// events.
+///
+/// Text fragments from any Gemini part position land here — the
+/// extractor walks every part of a candidate rather than expecting the
+/// answer in the first.
 const TEXT_PART_INDEX: usize = 0;
+
+/// Framework-side part index assigned to the thinking lane in stream
+/// events.
+///
+/// Thinking fragments from any part position land here; a model that
+/// emits none simply yields no thinking deltas.
 const THINKING_PART_INDEX: usize = 1;
 
 /// A Google Gemini API client with streaming support.
@@ -737,9 +759,10 @@ fn grammar_unsupported_error() -> ApiError {
     )
 }
 
-/// The Gemini API's `responseJsonSchema` has no strict-mode switch — a
-/// `strict` response format would be silently served non-strict, so it
-/// is rejected loudly instead.
+/// The error for a `strict` request the Gemini API cannot express.
+///
+/// Its `responseJsonSchema` has no strict-mode switch, so the request
+/// would be silently served non-strict — rejected loudly instead.
 fn strict_unsupported_error(provider: &str) -> ApiError {
     ApiError::config_validation(format!(
         "the {provider} API cannot express response_format.strict; the \

@@ -36,6 +36,10 @@ use serde_json::Value;
 use serde_json::json;
 
 /// Buffer size matching the adapter's own duplex.
+///
+/// The in-memory pair behaves like the transport the adapter sees in
+/// production only when neither side truncates, so the test buffer
+/// mirrors the adapter's real frame budget.
 const DUPLEX_BUFFER: usize = 4096;
 
 /// Connect a pure client to `server` over an in-memory duplex, returning the
@@ -169,6 +173,10 @@ async fn is_read_only_defaults_false_and_never_concurrency_safe() {
 }
 
 /// A server whose tool returns a soft error (`isError = true`) with text.
+///
+/// Exercises the adapter's mapping of a protocol-level success whose
+/// payload declares failure: the text must reach the tool output as an
+/// error result, not a success carrying error prose.
 #[derive(Clone)]
 struct SoftErrorServer {
     router: ToolRouter<Self>,
@@ -209,6 +217,10 @@ async fn soft_error_returns_ok_with_is_error_set() {
 }
 
 /// A server whose tool returns an empty error (`isError = true`, no content).
+///
+/// The degenerate sibling of the soft-error server: with nothing in
+/// the payload to surface, the adapter must still produce a well-formed
+/// error output rather than an empty success.
 #[derive(Clone)]
 struct EmptyErrorServer {
     router: ToolRouter<Self>,
@@ -312,6 +324,10 @@ async fn protocol_error_rejection_becomes_hard_toolerror() {
 }
 
 /// A server with multipart-returning tools.
+///
+/// Tool results arrive as several content parts of mixed kinds, so the
+/// adapter's part-by-part mapping — and its ordering — can be asserted
+/// rather than trusted.
 #[derive(Clone)]
 struct MultipartServer {
     router: ToolRouter<Self>,
@@ -465,6 +481,10 @@ async fn refresh_replaces_snapshot_in_place() {
 }
 
 /// A server with two tools whose server-side names collide after prefixing.
+///
+/// Both tool names map to the same prefixed wire name; the fixture pins
+/// how the adapter disambiguates (or refuses) instead of silently
+/// dropping one of the pair.
 #[derive(Clone)]
 struct CollisionServer {
     router: ToolRouter<Self>,
@@ -639,7 +659,7 @@ struct AnnotatedServer {
     router: ToolRouter<Self>,
 }
 
-#[tool_router]
+#[tool_router(allow_empty)]
 impl AnnotatedServer {
     fn new() -> Self {
         Self {

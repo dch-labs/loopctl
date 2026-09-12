@@ -12,6 +12,7 @@ test:
 	cargo test
 	cargo test --all-features
 	cargo test --doc --all-features
+	cargo test -p loopctl-derive
 
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings

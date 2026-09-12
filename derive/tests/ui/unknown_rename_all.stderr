@@ -1,0 +1,11 @@
+error: unknown serde `rename_all` strategy `screaming` — serde rejects this spelling, and the derive will not fall back to raw field names
+ --> tests/ui/unknown_rename_all.rs:9:9
+  |
+9 | #[serde(rename_all = "screaming")]
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: unknown rename rule `rename_all = "screaming"`, expected one of "lowercase", "UPPERCASE", "PascalCase", "camelCase", "snake_case", "SCREAMING_SNAKE_CASE", "kebab-case", "SCREAMING-KEBAB-CASE"
+ --> tests/ui/unknown_rename_all.rs:9:22
+  |
+9 | #[serde(rename_all = "screaming")]
+  |                      ^^^^^^^^^^^

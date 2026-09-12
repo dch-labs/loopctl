@@ -34,8 +34,14 @@ use std::sync::Arc;
 /// ```
 pub struct UnknownToolMiddleware {
     /// Tool registry used to enumerate available tool names.
+    ///
+    /// Suggestions come from the registry's live contents, not a
+    /// snapshot taken at construction.
     registry: Arc<ToolRegistry>,
     /// Defaults to `0.4`.
+    ///
+    /// Names at or above this similarity to the requested one are
+    /// suggested; lower it to surface looser near-misses.
     suggestion_threshold: f64,
 }
 
@@ -99,7 +105,6 @@ impl UnknownToolMiddleware {
         let max_len = u32::try_from(a_chars.len().max(b_chars.len())).unwrap_or(u32::MAX);
         let lcs_u32 = u32::try_from(lcs_len).unwrap_or(u32::MAX);
 
-        // Check for prefix match bonus
         let prefix_len = a_chars
             .iter()
             .zip(b_chars.iter())
@@ -231,7 +236,6 @@ impl ToolMiddleware for UnknownToolMiddleware {
                         score = %score,
                         "suggesting alternative tool"
                     );
-                    // Append suggestion to the error message
                     if let ToolContent::Text(ref mut msg) = result.output {
                         *msg = format!("{msg}. Did you mean '{suggestion}'?");
                     }

@@ -490,8 +490,20 @@ impl HttpClientConfig {
 /// Used internally by [`HttpClientConfig::build`].
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 trait ClientBuilderExt: Sized {
+    /// Apply the pool-size knob when the caller set one.
+    ///
+    /// A `None` leaves the builder's current value untouched, so the
+    /// shared default client is only reconfigured by hosts that asked.
     fn maybe_pool_max_idle_per_host(self, val: Option<usize>) -> Self;
+
+    /// Apply the idle-eviction knob when the caller set one.
+    ///
+    /// `None` preserves the builder's current timeout.
     fn maybe_pool_idle_timeout(self, val: Option<Duration>) -> Self;
+
+    /// Apply the TCP keepalive knob when the caller set one.
+    ///
+    /// `None` preserves the builder's current keepalive setting.
     fn maybe_tcp_keepalive(self, val: Option<Duration>) -> Self;
 }
 
@@ -547,18 +559,38 @@ pub use gemini::GeminiClient;
 #[cfg(feature = "grammar")]
 pub use grammar::{JsonSchemaGrammar, ToolGrammarProvider};
 
+/// Local Ollama server's OpenAI-compatible endpoint.
+///
+/// The profile constructors seed it; an `OLLAMA_BASE_URL` variable
+/// overrides it for remote hosts.
 #[cfg(feature = "ollama")]
 const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 
+/// `DeepSeek`'s OpenAI-compatible API endpoint.
+///
+/// Seeded by the `DeepSeek` profile constructors; the base URL is fixed
+/// by the provider.
 #[cfg(feature = "deepseek")]
 const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 
+/// Model served by the `DeepSeek` profile when none is configured.
+///
+/// The general-purpose chat model; a `DEEPSEEK_MODEL` variable or
+/// [`with_model`](OpenAiClientBuilder::with_model) overrides it.
 #[cfg(feature = "deepseek")]
 const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-chat";
 
+/// `xAI`'s OpenAI-compatible API endpoint.
+///
+/// Seeded by the `Grok` profile constructors; the base URL is fixed by
+/// the provider.
 #[cfg(feature = "grok")]
 const GROK_BASE_URL: &str = "https://api.x.ai/v1";
 
+/// Model served by the `Grok` profile when none is configured.
+///
+/// An `XAI_MODEL` (or `GROK_MODEL`) variable or
+/// [`with_model`](OpenAiClientBuilder::with_model) overrides it.
 #[cfg(feature = "grok")]
 const GROK_DEFAULT_MODEL: &str = "grok-beta";
 
@@ -568,25 +600,40 @@ pub mod bedrock;
 #[cfg(feature = "bedrock")]
 pub use bedrock::BedrockClient;
 
+/// `Z.AI`'s Anthropic-compatible API endpoint.
+///
+/// Seeded by the `Z.AI` profile constructors; the base URL is fixed by
+/// the provider.
 #[cfg(feature = "zai")]
 const ZAI_BASE_URL: &str = "https://api.z.ai/api/anthropic";
 
+/// Model served by the `Z.AI` profile when none is configured.
+///
+/// A `ZAI_MODEL` variable or [`with_model`](AnthropicClientBuilder::with_model)
+/// overrides it.
 #[cfg(feature = "zai")]
 const ZAI_DEFAULT_MODEL: &str = "glm-4.7";
 
+/// `Moonshot`'s OpenAI-compatible API endpoint.
+///
+/// Seeded by the `Moonshot` profile constructors; the base URL is fixed
+/// by the provider.
 #[cfg(feature = "moonshot")]
 const MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 
+/// Model served by the `Moonshot` profile when none is configured.
+///
+/// A `MOONSHOT_MODEL` variable or [`with_model`](OpenAiClientBuilder::with_model)
+/// overrides it.
 #[cfg(feature = "moonshot")]
 const MOONSHOT_DEFAULT_MODEL: &str = "kimi-k3";
 
-/// Read an environment variable, falling back to a second name, then a
-/// default value.
-///
-/// Reduces boilerplate in the convenience constructors below where a
-/// provider supports multiple env-var aliases (e.g. `XAI_API_KEY` /
-/// `GROK_API_KEY`).
 /// Read an environment variable or return a default.
+///
+/// Profile constructors use this for endpoints, models, and placeholder
+/// credentials a host may override by environment without touching
+/// code — required credentials without a placeholder belong to
+/// [`env_key`] instead.
 #[cfg(any(
     feature = "ollama",
     feature = "deepseek",

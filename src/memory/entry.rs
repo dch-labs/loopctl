@@ -28,9 +28,10 @@ use uuid::Uuid;
 pub struct MemoryEntry {
     /// UUID v4 for deduplication and stable reference during consolidation.
     ///
-    /// Generated at construction by [`MemoryEntry::new`] and never reused, so
-    /// two entries are distinct even if their text is identical. Used as the
-    /// stable key when merging or pruning the store.
+    /// Generated at construction — by [`MemoryEntry::new`] and by
+    /// [`Default`] alike — and never reused, so two entries are distinct
+    /// even if their text is identical. Used as the stable key when
+    /// merging or pruning the store.
     pub id: Uuid,
 
     /// Entry category, influencing ranking and consolidation rules.
@@ -60,18 +61,32 @@ pub struct MemoryEntry {
     /// favour fresher knowledge.
     pub created_at: SystemTime,
 
-    /// Relevance score (0.0–1.0). Starts at 1.0; implementations may decay over time.
+    /// Relevance score (0.0–1.0); implementations may decay it over time.
     ///
     /// Numeric prominence used to rank entries during retrieval and decide
-    /// which to prune. New entries begin at `1.0`; stores may decay it over
-    /// time or boost it on repeated access.
+    /// which to prune. [`MemoryEntry::new`] starts entries at `1.0`;
+    /// [`Default`] builds the mid-scale `0.5` instead — a neutral starting
+    /// point for hand-constructed entries. Stores may decay it over time or
+    /// boost it on repeated access.
     pub relevance: f32,
 
-    /// Number of times this entry has been retrieved.
+    /// How often this entry has been retrieved; the reference store
+    /// counts consolidation passes, not individual retrievals.
     ///
-    /// Popularity counter incremented each time the entry is surfaced,
-    /// feeding into ranking (frequently retrieved entries are deemed more
-    /// useful) and protecting high-traffic entries from pruning.
+    /// A popularity counter is fed from the store's access tracking —
+    /// [`InMemoryStore`](crate::memory::builtin::InMemoryStore) records
+    /// each matched surfacing in a side log (baseline-only returns are
+    /// delivered but never stamped) and folds it at the next
+    /// `consolidate()` pass, so its counts grow once per pass the entry
+    /// was retrieved in rather than once per retrieval; a custom
+    /// [`LoopMemory`](super::LoopMemory) may stamp per retrieval instead —
+    /// the trait leaves the tracking mechanism to implementations, and
+    /// only the "grows with use" meaning is part of the field.
+    /// Corroboration merges fold their duplicates' counts into the
+    /// survivor, so a merged entry's count also covers passes its
+    /// duplicates — now pruned — were retrieved in. Feeds into ranking
+    /// (frequently retrieved entries are deemed more useful) and
+    /// protects high-traffic entries from pruning.
     pub access_count: usize,
 
     /// Whether this entry has been validated. Consolidation prefers keeping validated entries.
@@ -80,9 +95,39 @@ pub struct MemoryEntry {
     /// builder. Consolidation treats validated entries as higher-trust and is
     /// less likely to prune them during a cleanup pass.
     pub validated: bool,
+
+    /// When this entry was last returned by `retrieve()`.
+    ///
+    /// `None` until first retrieved. Drives the recency factor in
+    /// [`quality_score`](crate::memory::consolidate::quality_score) and the
+    /// decay baseline: an entry retrieved recently resists decay even when
+    /// its [`created_at`](Self::created_at) is old. Stores that track access
+    /// stamp it; entries serialized before the field existed deserialize
+    /// with `None`.
+    #[serde(default)]
+    pub last_accessed: Option<SystemTime>,
+
+    /// When decay was last applied to this entry's relevance.
+    ///
+    /// `None` until the first consolidation pass. Decay advances from the
+    /// later of this stamp and any [`last_accessed`](Self::last_accessed)
+    /// — falling back to `created_at` when neither is set — so repeated
+    /// passes apply the elapsed time exactly once and a retrieval between
+    /// passes still shields the interval before it (the multi-pass total
+    /// equals a single pass over the same age). Entries serialized before
+    /// the field existed deserialize with `None` and decay from their
+    /// baseline on the next pass.
+    #[serde(default)]
+    pub last_decayed: Option<SystemTime>,
 }
 
 impl Default for MemoryEntry {
+    /// Returns a blank working-memory entry: fresh UUID, empty text, no
+    /// tags, mid-scale `0.5` relevance.
+    ///
+    /// Prefer [`MemoryEntry::new`], which starts relevance at `1.0` and
+    /// takes the category and text up front; `default` suits
+    /// deserialization-adjacent code and struct-update idioms.
     fn default() -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -93,6 +138,8 @@ impl Default for MemoryEntry {
             relevance: 0.5,
             access_count: 0,
             validated: false,
+            last_accessed: None,
+            last_decayed: None,
         }
     }
 }
@@ -128,6 +175,8 @@ impl MemoryEntry {
             relevance: 1.0,
             access_count: 0,
             validated: false,
+            last_accessed: None,
+            last_decayed: None,
         }
     }
 

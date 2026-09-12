@@ -1,0 +1,5 @@
+error: `#[serde(deserialize_with)]` changes what serde reads on the wire in ways `#[derive(Tool)]` cannot mirror — write a manual `Tool` impl for this input
+  --> tests/ui/serde_deserialize_with.rs:10:13
+   |
+10 |     #[serde(deserialize_with = "parse_duration")]
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

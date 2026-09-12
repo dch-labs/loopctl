@@ -28,6 +28,61 @@ pub(crate) fn expand_derive_tool(input: DeriveInput) -> TokenStream2 {
     }
 }
 
+/// Resolve the tool's description: the explicit attribute, else the
+/// struct's doc comment.
+///
+/// # Errors
+///
+/// Returns a spanned error naming both sources when neither is
+/// present — a tool without a description has nothing to advertise to
+/// the model.
+fn resolve_description(
+    ident: &Ident,
+    container: &crate::attr::ContainerAttrs,
+    attrs: &[syn::Attribute],
+) -> syn::Result<String> {
+    container
+        .description
+        .clone()
+        .or_else(|| attr::doc_string(attrs))
+        .ok_or_else(|| {
+            syn::Error::new(
+                ident.span(),
+                format!(
+                    "`{ident}` has no description: set \
+                     `#[tool(description = \"…\")]` or add a `///` doc comment"
+                ),
+            )
+        })
+}
+
+/// Reject the one container combination where openness is advertised
+/// but serde refuses it.
+///
+/// `#[tool(allow_extra)]` omits `additionalProperties: false`, which
+/// only tells the truth when serde tolerates unknown keys; paired with
+/// `#[serde(deny_unknown_fields)]` every extra key the schema invites
+/// would fail deserialization.
+///
+/// # Errors
+///
+/// Returns a spanned error naming the conflict when both are set.
+fn check_allow_extra_conflict(
+    ident: &Ident,
+    attrs: &[syn::Attribute],
+    allow_extra: bool,
+) -> syn::Result<()> {
+    if allow_extra && attr::has_serde_deny_unknown(attrs) {
+        return Err(syn::Error::new(
+            ident.span(),
+            "`#[tool(allow_extra)]` omits `additionalProperties: false` while \
+             `#[serde(deny_unknown_fields)]` rejects any unknown key — the schema \
+             would invite payloads serde refuses; drop one of the two",
+        ));
+    }
+    Ok(())
+}
+
 /// The codegen core.
 ///
 /// # Errors
@@ -61,25 +116,16 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         ));
     }
     let container = attr::parse_container(&input.attrs)?;
-    let description = container
-        .description
-        .clone()
-        .or_else(|| attr::doc_string(&input.attrs))
-        .ok_or_else(|| {
-            syn::Error::new(
-                ident.span(),
-                format!(
-                    "`{ident}` has no description: set \
-                     `#[tool(description = \"…\")]` or add a `///` doc comment"
-                ),
-            )
-        })?;
+    let description = resolve_description(ident, &container, &input.attrs)?;
     let tool_name = container
         .name
         .clone()
         .unwrap_or_else(|| to_snake_case(&ident.to_string()));
 
-    let rename_all = attr::serde_rename_all(&input.attrs);
+    let rename_all = attr::serde_rename_all(&input.attrs)?;
+    attr::check_unmirrorable_serde(&input.attrs, true, false)?;
+    check_allow_extra_conflict(ident, &input.attrs, container.allow_extra)?;
+    let container_default = attr::has_serde_default(&input.attrs);
     let mut properties = Vec::<TokenStream2>::new();
     let mut required = Vec::<String>::new();
     for field in fields {
@@ -87,8 +133,9 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             continue;
         };
         let field_attrs = attr::parse_field(&field.attrs)?;
+        attr::check_unmirrorable_serde(&field.attrs, false, field_attrs.skip)?;
         if field_attrs.skip {
-            check_skip_validity(field_ident, &field.ty, &field.attrs)?;
+            check_skip_validity(field_ident, &field.ty, &field.attrs, container_default)?;
             continue;
         }
         let json_name = resolve_json_name(field_ident, &field_attrs, &field.attrs, rename_all)?;
@@ -104,8 +151,15 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         properties.push(quote! {
             #json_name: { #schema_value #description_part }
         });
-        check_default_agreement(field_ident, &field_attrs, &field.attrs, optional)?;
-        if !optional && !field_attrs.default && !attr::has_serde_default(&field.attrs) {
+        check_default_agreement(
+            field_ident,
+            &field_attrs,
+            &field.attrs,
+            optional,
+            container_default,
+        )?;
+        let serde_fills = attr::has_serde_default(&field.attrs) || container_default;
+        if !optional && !field_attrs.default && !serde_fills {
             required.push(json_name);
         }
     }
@@ -259,8 +313,9 @@ fn resolve_json_name(
     }
 }
 
-/// Enforce that `#[tool(default)]` on a non-`Option` field also has
-/// `#[serde(default)]` — without it the schema says optional but
+/// Enforce that `#[tool(default)]` on a non-`Option` field is also
+/// fillable by serde — field-level `#[serde(default)]` or a
+/// struct-level one — without either the schema says optional but
 /// deserialization fails when the model omits the field.
 ///
 /// # Errors
@@ -271,8 +326,9 @@ fn check_default_agreement(
     field_attrs: &crate::attr::FieldAttrs,
     field: &[syn::Attribute],
     optional: bool,
+    container_default: bool,
 ) -> syn::Result<()> {
-    if field_attrs.default && !optional && !attr::has_serde_default(field) {
+    if field_attrs.default && !optional && !attr::has_serde_default(field) && !container_default {
         return Err(syn::Error::new(
             field_ident.span(),
             "`#[tool(default)]` on a non-`Option` field also needs \
@@ -286,17 +342,24 @@ fn check_default_agreement(
 /// Enforce the deserialization precondition of `#[tool(skip)]`.
 ///
 /// A skipped field never reaches the model, so serde must be able to
-/// produce it without input — `Option<T>` or `#[serde(default)]`.
+/// produce it without input — `Option<T>`, `#[serde(default)]`, a
+/// struct-level `#[serde(default)]`, or a read-side `#[serde(skip)]`
+/// (which fills from `Default::default()` without reading the wire).
 ///
 /// # Errors
 ///
-/// Returns a spanned error naming the precondition when neither holds.
+/// Returns a spanned error naming the precondition when none holds.
 fn check_skip_validity(
     field_ident: &Ident,
     ty: &Type,
     attrs: &[syn::Attribute],
+    container_default: bool,
 ) -> syn::Result<()> {
-    if is_option(ty).is_some() || attr::has_serde_default(attrs) {
+    if is_option(ty).is_some()
+        || attr::has_serde_default(attrs)
+        || attr::has_serde_skip(attrs)
+        || container_default
+    {
         return Ok(());
     }
     Err(syn::Error::new(
@@ -463,7 +526,10 @@ fn second_generic_arg(segment: &syn::PathSegment) -> syn::Result<&Type> {
 }
 
 /// The error for a generic type whose arguments are missing or not
-/// types (e.g. a bare `Vec` without a parameter).
+/// types.
+///
+/// A bare `Vec` without a parameter is the canonical case; the span
+/// points at the segment so the user sees which type failed.
 fn unmappable_of(segment: &syn::PathSegment) -> syn::Error {
     syn::Error::new(
         segment.ident.span(),

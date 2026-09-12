@@ -163,9 +163,16 @@ pub trait Hook: Send + Sync {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Interactivity {
     /// No human in the loop — `Ask` is downgraded to `Block`.
+    ///
+    /// The safe default for headless runs: an unanswered question must
+    /// not hang the loop.
     #[default]
     Headless,
+
     /// Human is available — `Ask` passes through unchanged.
+    ///
+    /// `Ask` is returned to the caller, which is responsible for
+    /// presenting it to a human and deciding.
     Interactive,
 }
 

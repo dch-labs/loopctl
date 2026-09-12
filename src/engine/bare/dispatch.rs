@@ -5,6 +5,10 @@
 //! support.
 
 /// Truncate a string to `max_len` chars, appending `…` when truncated.
+///
+/// Counts by `char`, never bytes, so a multi-byte character is kept
+/// whole rather than split; text at or under the limit passes through
+/// unchanged.
 fn truncate_to(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {
         return s.to_string();
@@ -999,6 +1003,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// tool name, input, and result, then stores it. Errors are logged and
     /// swallowed — a memory-store failure must never crash the turn.
     async fn record_tool_memory(&self, tc: &ToolCall, tool_result: &ToolDispatchResult) {
+        /// Cap applied to each trajectory-field string before storage.
+        ///
+        /// Keeps one verbose tool input or result from dominating the
+        /// stored trajectory entry of a successful call — failed calls
+        /// are never recorded.
         const MAX_FIELD_LEN: usize = 500;
         let Some(memory) = self.managers.memory() else {
             return;

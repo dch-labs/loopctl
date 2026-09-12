@@ -104,6 +104,10 @@ use sink::LedgerWriter;
 use std::sync::Arc as StdArc;
 
 /// Default bound on the response text captured per turn, in characters.
+///
+/// Keeps one verbose model answer from dominating the record's size;
+/// hosts that need full text raise the limit through the observer's
+/// capture configuration.
 const DEFAULT_CAPTURE_LIMIT: usize = 2_000;
 
 /// One run's full trajectory, captured by [`TrajectoryObserver`].
@@ -192,8 +196,11 @@ pub enum TrajectoryOutcome {
     /// in flight.
     Failure,
 
-    /// Real progress, imperfect ending: the run reported failure while at
-    /// least one of its tool calls succeeded.
+    /// Real progress with an imperfect ending.
+    ///
+    /// The run reported failure while at least one of its tool calls
+    /// succeeded, so its trajectory still certifies the work that went
+    /// right.
     Partial,
 }
 
@@ -331,6 +338,10 @@ pub struct TrajectoryToolCall {
 }
 
 /// The run currently being assembled.
+///
+/// Accumulates turn and tool-call slots as the observer streams events
+/// in; at run end the observer drains it into the immutable
+/// [`TrajectoryRecord`] handed to the sink and retention holders.
 #[derive(Debug)]
 struct RecordBuilder {
     /// Session correlation id, captured at run start.
@@ -620,6 +631,11 @@ pub struct TrajectoryObserver {
 }
 
 impl std::fmt::Debug for TrajectoryObserver {
+    /// Renders the observer's observable state, not its records.
+    ///
+    /// Prints finished-record and in-flight-run counts, the sink's
+    /// directory, the capture limit, and retention — enough to identify
+    /// an observer in a log line without dumping captured content.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let finished = recover_guard(self.finished.lock()).len();
         let in_flight = recover_guard(self.inner.lock()).is_some();
@@ -640,6 +656,11 @@ impl std::fmt::Debug for TrajectoryObserver {
 }
 
 impl Default for TrajectoryObserver {
+    /// Returns an in-memory observer, identical to
+    /// [`in_memory`](TrajectoryObserver::in_memory).
+    ///
+    /// Records accumulate only in memory; a durable ledger needs
+    /// [`writing_to`](TrajectoryObserver::writing_to).
     fn default() -> Self {
         Self::in_memory()
     }
@@ -745,10 +766,19 @@ impl TrajectoryObserver {
 }
 
 impl LoopObserver for TrajectoryObserver {
+    /// Returns `"trajectory"`, the label observers report to hosts.
+    ///
+    /// Constant per implementation, so hosts can key observer routing on
+    /// it.
     fn name(&self) -> &'static str {
         "trajectory"
     }
 
+    /// Begin a run's record, discarding any unfinished predecessor.
+    ///
+    /// A still-open builder at run start means the previous run never
+    /// ended — one observer watched two concurrent loops — and is
+    /// dropped with a warning naming the loss.
     fn on_run_start(&self, ctx: &RunStartContext) {
         let mut guard = recover_guard(self.inner.lock());
         if guard
@@ -768,27 +798,28 @@ impl LoopObserver for TrajectoryObserver {
         }
     }
 
+    /// Open (or reopen) the slot for one turn.
+    ///
+    /// A slot may already exist when this fires — an earlier event of the
+    /// same turn opened it lazily, and the start event then supplies the
+    /// authoritative query. A start for a turn that already closed
+    /// reopens it, merging whatever both phases captured into one slot
+    /// per index.
     fn on_turn_start(&self, ctx: &TurnStartContext) {
         let mut guard = recover_guard(self.inner.lock());
         let Some(builder) = guard.as_mut() else {
             return;
         };
-        if builder
+        if let Some(open) = builder
             .current
-            .as_ref()
-            .is_some_and(|open| open.turn == ctx.turn)
+            .as_mut()
+            .filter(|open| open.turn == ctx.turn)
         {
-            // The slot was opened lazily by an earlier event of this turn;
-            // the start event supplies the authoritative query.
-            if let Some(open) = builder.current.as_mut() {
-                open.query.clone_from(&ctx.query);
-            }
+            open.query.clone_from(&ctx.query);
             return;
         }
         builder.close_current();
         if let Some(pos) = builder.turns.iter().rposition(|done| done.turn == ctx.turn) {
-            // A start for a turn that already closed reopens it, merging
-            // whatever both phases captured into one slot per index.
             let done = builder.turns.remove(pos);
             builder.current = Some(TurnBuilder {
                 turn: done.turn,
@@ -804,6 +835,12 @@ impl LoopObserver for TrajectoryObserver {
         }
     }
 
+    /// Record one turn's response text, capture-limited.
+    ///
+    /// The text lands on the turn's slot whether it is still open or
+    /// already closed — a response may arrive after the turn-end event
+    /// patched it — and is truncated to the observer's capture limit so
+    /// one verbose answer cannot dominate the record.
     fn on_response(&self, ctx: &ResponseContext) {
         let mut guard = recover_guard(self.inner.lock());
         let Some(builder) = guard.as_mut() else {
@@ -821,6 +858,11 @@ impl LoopObserver for TrajectoryObserver {
         builder.turn_mut(ctx.turn).response_text = text;
     }
 
+    /// Open a tool-call slot, keyed by `tool_call_id`.
+    ///
+    /// The pre-event carries only the identity and start time; pairing
+    /// with the result happens at the post-event, which makes the
+    /// capture safe for parallel dispatch.
     fn on_tool_pre(&self, ctx: &ToolPreContext) {
         let mut guard = recover_guard(self.inner.lock());
         let Some(builder) = guard.as_mut() else {
@@ -836,6 +878,12 @@ impl LoopObserver for TrajectoryObserver {
         );
     }
 
+    /// Close a tool-call slot with its outcome and duration.
+    ///
+    /// The call attaches to the result event's own turn slot — open or
+    /// already closed — so a result arriving after turn-end still lands;
+    /// the dispatch turn recorded at `on_tool_pre` is used only when a
+    /// call is abandoned at run end.
     fn on_tool_post(&self, ctx: &ToolPostContext) {
         let mut guard = recover_guard(self.inner.lock());
         let Some(builder) = guard.as_mut() else {
@@ -855,6 +903,12 @@ impl LoopObserver for TrajectoryObserver {
         }
     }
 
+    /// Close a turn's slot, folding in the phase's duration and tokens.
+    ///
+    /// The engine emits turn-end per phase (model, then tools), so the
+    /// duration sums across both while the token figures stay
+    /// last-wins; a turn-end with no prior slot opens one lazily rather
+    /// than dropping the event.
     fn on_turn_end(&self, ctx: &TurnEndContext) {
         let mut guard = recover_guard(self.inner.lock());
         let Some(builder) = guard.as_mut() else {
@@ -891,6 +945,13 @@ impl LoopObserver for TrajectoryObserver {
         }
     }
 
+    /// Finish the run: classify, assemble, and hand off the record.
+    ///
+    /// Calls still in flight are abandoned into their dispatch turns
+    /// (`ok: false`, timed to run end), turns are ordered by index, the
+    /// three-way outcome is decided (`Partial` when a failed run still
+    /// completed successful tool work), and the finished record goes to
+    /// the sink and retention holders.
     fn on_run_end(&self, ctx: &RunEndContext) {
         let mut guard = recover_guard(self.inner.lock());
         let Some(mut builder) = guard.take() else {
@@ -1015,8 +1076,10 @@ fn emit_run_signals(record: &TrajectoryRecord) {
 ///
 /// The strings match the serde `snake_case` rendering of
 /// [`TrajectoryOutcome`], so the counter's label values and the
-/// serialized records agree without sharing code.
-fn outcome_label(outcome: &TrajectoryOutcome) -> &'static str {
+/// serialized records agree without sharing code. The extraction
+/// summary reuses the same labels for its header, keeping one outcome
+/// vocabulary across everything a provider may echo back.
+pub(crate) fn outcome_label(outcome: &TrajectoryOutcome) -> &'static str {
     match outcome {
         TrajectoryOutcome::Success => "success",
         TrajectoryOutcome::Failure => "failure",
@@ -1119,6 +1182,11 @@ mod tests {
     /// bounded-warning contract is pinned rather than trusted.
     struct WarnCapture {
         /// The `message` field of every emitted event, in order.
+        ///
+        /// The assertions count matches per message: a bounded-warning
+        /// contract is pinned by how many warnings each condition
+        /// produced, so the capture keeps every message rather than
+        /// tallying at emit time.
         messages: TestMutex<Vec<String>>,
     }
 

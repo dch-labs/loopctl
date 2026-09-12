@@ -8,6 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Permission check function type.
+///
+/// Shared behind an `Arc` so several middleware instances carry one
+/// policy closure without copying it; changing the policy means
+/// building a new middleware, not mutating a shared one.
 pub type PermissionCheckFn = Arc<dyn Fn(&ToolDispatchContext) -> PermissionCheck + Send + Sync>;
 
 /// Async resolver for [`PermissionCheck::Ask`].
@@ -15,6 +19,14 @@ pub type PermissionCheckFn = Arc<dyn Fn(&ToolDispatchContext) -> PermissionCheck
 /// Receives the prompt string and the tool name, returns `true` to allow
 /// the tool call or `false` to deny it. Called by [`PermissionMiddleware`]
 /// when the permission check resolves to [`PermissionCheck::Ask`].
+///
+/// The returned future may be dropped before it resolves: when the
+/// dispatch's [`CancelSignal`](crate::cancel::CancelSignal) fires while
+/// the answer is still pending, the middleware stops awaiting and denies
+/// with `cancelled while awaiting approval`, and no completion signal
+/// reaches the resolver side. Implementations should be
+/// cancellation-safe — detect a dropped answer channel and tear the
+/// prompt down — rather than assuming every prompt is answered.
 pub type AskResolverFn =
     Arc<dyn Fn(&str, &str) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
@@ -27,7 +39,11 @@ pub type AskResolverFn =
 /// - `Modify` — replaces `ctx.input` with the modified input, then proceeds.
 /// - `Ask` — if an [`AskResolverFn`] is configured, calls it to prompt the
 ///   user; the tool proceeds on `true` or is denied on `false`. Without a
-///   resolver, `Ask` is denied (headless mode).
+///   resolver, `Ask` is denied (headless mode). The prompt races the
+///   dispatch's [`CancelSignal`](crate::cancel::CancelSignal), and a
+///   cancellation that already fired when the answer lands wins
+///   deterministically — a cancelled run never executes the tool,
+///   however the approval resolves.
 ///
 /// # Example
 ///
@@ -46,8 +62,14 @@ pub type AskResolverFn =
 /// ```
 pub struct PermissionMiddleware {
     /// When `Some`, overrides [`ToolDispatchContext::permission`].
+    ///
+    /// Lets one pipeline impose a uniform policy regardless of what
+    /// each dispatch claims.
     check_fn: Option<PermissionCheckFn>,
     /// When `Some`, called to resolve [`PermissionCheck::Ask`] interactively.
+    ///
+    /// Absent, an `Ask` degrades to a denial naming the prompt, so a
+    /// headless run never blocks on an unanswered question.
     ask_resolver: Option<AskResolverFn>,
 }
 
@@ -119,6 +141,12 @@ impl PermissionMiddleware {
         self
     }
 
+    /// Decide the permission for one dispatch: the middleware's own
+    /// check function when configured, otherwise the context's
+    /// per-call verdict.
+    ///
+    /// Centralizing the fallback keeps the configured and default
+    /// paths on one resolution rule.
     fn resolve_permission(&self, ctx: &ToolDispatchContext) -> PermissionCheck {
         match &self.check_fn {
             Some(f) => f(ctx),
@@ -150,15 +178,24 @@ impl ToolMiddleware for PermissionMiddleware {
                     let resolver = Arc::clone(resolver);
                     Box::pin(async move {
                         let tool_name = ctx.tool_name.clone();
+                        let cancel = Arc::clone(&ctx.cancel);
                         let approved = resolver(&prompt, &tool_name);
-                        if approved.await {
+                        let approved = tokio::select! {
+                            approved = approved => approved,
+                            () = cancel.notified() => {
+                                return Self::deny(
+                                    ctx,
+                                    "cancelled while awaiting approval",
+                                )
+                                .await;
+                            }
+                        };
+                        if approved && !cancel.is_cancelled() {
                             next.dispatch(ctx).await
+                        } else if approved {
+                            Self::deny(ctx, "cancelled while awaiting approval").await
                         } else {
-                            ToolDispatchResult::err(
-                                &tool_name,
-                                format!("Permission denied by user for tool '{tool_name}'"),
-                                Duration::ZERO,
-                            )
+                            Self::deny(ctx, "denied by user").await
                         }
                     })
                 } else {
@@ -176,6 +213,11 @@ impl ToolMiddleware for PermissionMiddleware {
 
 impl PermissionMiddleware {
     /// Build a denied result with tracing.
+    ///
+    /// One shape for every denial site — an explicit `Deny`, an
+    /// unanswered `Ask`, a user refusal, and a pipeline cancelled
+    /// mid-prompt — so logs and results stay in sync wherever the
+    /// verdict originated.
     fn deny<'a>(
         ctx: &'a mut ToolDispatchContext,
         reason: &str,
@@ -192,5 +234,110 @@ impl PermissionMiddleware {
             format!("Permission {reason} for tool '{tool_name}'"),
             Duration::ZERO,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cancel::CancelSignal;
+    use crate::middleware::ToolPipeline;
+    use crate::tool::{PermissionCheck, ToolContext, ToolRegistry};
+
+    #[tokio::test]
+    async fn a_cancelled_pipeline_aborts_a_pending_approval_prompt() {
+        let resolver: AskResolverFn = Arc::new(|_prompt: &str, _tool: &str| {
+            Box::pin(std::future::pending::<bool>()) as Pin<Box<dyn Future<Output = bool> + Send>>
+        });
+        let permission = PermissionMiddleware::from_context()
+            .with_check(|_| PermissionCheck::Ask {
+                prompt: "approve the deploy?".into(),
+            })
+            .with_ask_resolver(resolver);
+        let pipeline = Arc::new(
+            ToolPipeline::builder()
+                .with_core(Arc::new(ToolRegistry::new()))
+                .with_middleware(permission)
+                .build()
+                .expect("a core plus one middleware assembles"),
+        );
+        let cancel = Arc::new(CancelSignal::new());
+        let ctx = ToolDispatchContext {
+            tool_name: "deploy".into(),
+            input: serde_json::Value::Null,
+            call_id: "call_1".into(),
+            turn_number: 0,
+            cancel: Arc::clone(&cancel),
+            permission: PermissionCheck::allow(),
+            tool_context: ToolContext::default(),
+        };
+
+        let invoked = tokio::spawn({
+            let pipeline = Arc::clone(&pipeline);
+            async move { pipeline.invoke(ctx).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), invoked)
+            .await
+            .expect("cancellation ends the prompt well inside the timeout")
+            .expect("the spawned invoke survives to completion");
+        assert!(result.is_error, "a cancelled prompt denies the call");
+        match &result.output {
+            crate::message::ToolContent::Text(text) => assert!(
+                text.contains("cancelled while awaiting approval"),
+                "the denial names the cancelled prompt: {text}"
+            ),
+            crate::message::ToolContent::Multipart(parts) => {
+                panic!("expected a text denial, got {} parts", parts.len())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approval_landing_after_cancellation_still_denies() {
+        let resolver: AskResolverFn = Arc::new(|_prompt: &str, _tool: &str| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                true
+            }) as Pin<Box<dyn Future<Output = bool> + Send>>
+        });
+        let permission = PermissionMiddleware::from_context()
+            .with_check(|_| PermissionCheck::Ask {
+                prompt: "approve the deploy?".into(),
+            })
+            .with_ask_resolver(resolver);
+        let pipeline = Arc::new(
+            ToolPipeline::builder()
+                .with_core(Arc::new(ToolRegistry::new()))
+                .with_middleware(permission)
+                .build()
+                .expect("a core plus one middleware assembles"),
+        );
+        let cancel = Arc::new(CancelSignal::new());
+        cancel.cancel();
+        let ctx = ToolDispatchContext {
+            tool_name: "deploy".into(),
+            input: serde_json::Value::Null,
+            call_id: "call_1".into(),
+            turn_number: 0,
+            cancel: Arc::clone(&cancel),
+            permission: PermissionCheck::allow(),
+            tool_context: ToolContext::default(),
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(1), pipeline.invoke(ctx))
+            .await
+            .expect("the already-cancelled signal resolves the select immediately");
+        assert!(result.is_error, "a cancelled run must not execute the tool");
+        match &result.output {
+            crate::message::ToolContent::Text(text) => assert!(
+                text.contains("cancelled while awaiting approval"),
+                "cancellation wins the both-ready race deterministically: {text}"
+            ),
+            crate::message::ToolContent::Multipart(parts) => {
+                panic!("expected a text denial, got {} parts", parts.len())
+            }
+        }
     }
 }

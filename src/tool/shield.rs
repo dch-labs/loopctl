@@ -591,9 +591,19 @@ pub struct UnixShield {
 }
 
 /// Default warn threshold: an aggregate score at or above this produces a warn.
+///
+/// Sits below the block threshold so borderline inputs warn first.
 const DEFAULT_WARN_THRESHOLD: f32 = 0.4;
 
 /// Default block threshold: an aggregate score at or above this produces a block.
+///
+/// Inputs scoring below both it and the hardcoded `0.9` Critical
+/// cutoff never block; note the curated patterns for `rm -f` (Bash),
+/// `/etc/` writes (Write), and `.ssh/` edits (Edit) sit exactly on
+/// this boundary — an Edit of `/etc/` scores 0.5 and does not — so
+/// those block outright under the defaults; tune the threshold to
+/// move them to warn-first. Tuning above `0.9` does not release the
+/// patterns that sit there: Critical always blocks.
 const DEFAULT_BLOCK_THRESHOLD: f32 = 0.7;
 
 impl UnixShield {
@@ -1093,12 +1103,16 @@ impl ToolSafetyShield for UnixShield {
 /// ```
 pub struct UnixShieldBuilder {
     /// Aggregate score at or above which the built shield will return
-    /// [`SafetyAction::Warn`]. Defaults to `0.4`; override via
+    /// [`SafetyAction::Warn`].
+    ///
+    /// Defaults to `0.4`; override via
     /// [`with_warn_threshold`](Self::with_warn_threshold).
     warn_threshold: f32,
 
     /// Aggregate score at or above which the built shield will return
-    /// [`SafetyAction::Block`]. Defaults to `0.7`; override via
+    /// [`SafetyAction::Block`].
+    ///
+    /// Defaults to `0.7`; override via
     /// [`with_block_threshold`](Self::with_block_threshold).
     block_threshold: f32,
 

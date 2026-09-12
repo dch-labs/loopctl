@@ -187,8 +187,24 @@ impl RatioInt for usize {
     }
 }
 
-/// Ratio of two counts as a float, computed without tripping
-/// `cast_precision_loss`.
+/// Divide `value` by `scale`, keeping any positive input strictly positive.
+///
+/// The integer division floors, so a small positive `value` divided by a large
+/// `scale` can drop to zero — collapsing a genuine operand of the ratio. This
+/// clamps such a floored result back up to one so that a positive numerator or
+/// denominator never vanishes (which would otherwise yield `0.0` or `inf`
+/// respectively). Used symmetrically on both operands of [`unit_ratio`].
+fn scale_operand<T: RatioInt>(value: T, scale: T) -> T {
+    let scaled = T::checked_div(value, scale).unwrap_or(value);
+    if value > T::ZERO && scaled == T::ZERO {
+        T::ONE
+    } else {
+        scaled
+    }
+}
+
+/// Compute `numerator / denominator` as the family's float, without
+/// tripping `cast_precision_loss`.
 ///
 /// Both counts are first scaled by a shared divisor and then each is narrowed
 /// through the family's [`Narrow`](RatioInt::Narrow) integer (the widest
@@ -208,31 +224,16 @@ impl RatioInt for usize {
 /// - **Zero denominator** returns `0.0` (rather than `NaN` or `inf`), matching
 ///   what every current caller wants for an empty set or window.
 /// - **Scaled operand that floors to `0`** is clamped up to `1` — applied
-///   symmetrically to numerator and denominator. For the numerator this keeps
+///   symmetrically to numerator and denominator, so either operand that
+///   floors to zero is raised back up to one. For the numerator this keeps
 ///   a small positive value over a large one (e.g. `1 / 70_000`) from
-///   collapsing to `0.0`; for the denominator it keeps a large numerator over a
-///   small one (e.g. `70_000 / 1`) from producing `inf`. Either way, a positive
-///   denominator guarantees a finite result.
+///   collapsing to `0.0`; for the denominator it keeps a large numerator
+///   over a small one (e.g. `70_000 / 1`) from producing `inf`. Either way,
+///   a positive denominator guarantees a finite result.
 ///
 /// The result is not clamped to `[0, 1]`: when the numerator exceeds the
 /// denominator it rises above `1.0` (e.g. context-window overflow reports a
 /// utilization greater than one).
-/// Divide `value` by `scale`, keeping any positive input strictly positive.
-///
-/// The integer division floors, so a small positive `value` divided by a large
-/// `scale` can drop to zero — collapsing a genuine operand of the ratio. This
-/// clamps such a floored result back up to one so that a positive numerator or
-/// denominator never vanishes (which would otherwise yield `0.0` or `inf`
-/// respectively). Used symmetrically on both operands of [`unit_ratio`].
-fn scale_operand<T: RatioInt>(value: T, scale: T) -> T {
-    let scaled = T::checked_div(value, scale).unwrap_or(value);
-    if value > T::ZERO && scaled == T::ZERO {
-        T::ONE
-    } else {
-        scaled
-    }
-}
-
 #[must_use]
 pub(crate) fn unit_ratio<T: RatioInt>(numerator: T, denominator: T) -> T::Float {
     if denominator == T::ZERO {

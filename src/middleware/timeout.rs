@@ -7,6 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Configuration for the [`TimeoutMiddleware`].
+///
+/// Built with defaults and tuned per field; set `timeout` to
+/// `Duration::MAX` (or build via [`TimeoutMiddleware::none`]) to
+/// disable the timeout entirely — a zero deadline fires the moment the
+/// wrapped future first yields.
 #[derive(Debug, Clone)]
 pub struct TimeoutConfig {
     /// Per-tool execution deadline.

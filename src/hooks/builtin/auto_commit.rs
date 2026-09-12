@@ -591,6 +591,11 @@ impl Default for AutoCommitConfig {
 /// [`AutoCommitConfig::default`] values.
 pub struct AutoCommitConfigBuilder {
     /// The in-progress configuration, mutated by each `with_*` call.
+    ///
+    /// `build` consumes the builder and returns this value unchanged;
+    /// the builder performs no validation at all — a misconfiguration
+    /// such as an empty `files` list surfaces at commit time, when
+    /// `GitExecutor::stage_files` refuses to stage nothing.
     config: AutoCommitConfig,
 }
 

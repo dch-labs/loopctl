@@ -1153,7 +1153,7 @@ fn wire_to_extracted(wire: LlmMemoryWire) -> Option<ExtractedMemory> {
         .tags
         .unwrap_or_default()
         .into_iter()
-        .filter(|tag| tag.len() <= MAX_WIRE_TAG_CHARS)
+        .filter(|tag| tag.chars().count() <= MAX_WIRE_TAG_CHARS)
         .take(tag_budget)
         .collect();
     if let Some(selecting) = selecting_tag

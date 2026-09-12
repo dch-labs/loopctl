@@ -460,6 +460,40 @@ pub(crate) fn serde_rename_all(attrs: &[Attribute]) -> syn::Result<Option<Rename
                 }
             }
         }
+        if let Meta::List(list) = &meta
+            && list.path.is_ident("rename_all")
+        {
+            let mut serialize_rule = None;
+            let mut deserialize_rule = None;
+            list.parse_args_with(syn::meta::parser(|nested| {
+                let reads = nested.path.is_ident("deserialize");
+                if (reads || nested.path.is_ident("serialize"))
+                    && let Ok(lit) = nested.value()?.parse::<LitStr>()
+                {
+                    if let Some(strategy) = RenameAll::from_str(&lit.value()) {
+                        if reads {
+                            deserialize_rule = Some(strategy);
+                        } else {
+                            serialize_rule = Some(strategy);
+                        }
+                    } else {
+                        let value = lit.value();
+                        return Err(syn::Error::new_spanned(
+                            lit,
+                            format!(
+                                "unknown serde `rename_all` strategy `{value}` — \
+                                 serde rejects this spelling, and the derive will not \
+                                 fall back to raw field names"
+                            ),
+                        ));
+                    }
+                }
+                Ok(())
+            }))?;
+            if let Some(strategy) = deserialize_rule.or(serialize_rule) {
+                out = Some(strategy);
+            }
+        }
     }
     Ok(out)
 }
@@ -964,6 +998,28 @@ mod tests {
             #[serde(rename = "simple")]
         };
         assert_eq!(serde_rename(&[attr]), Some("simple".to_string()));
+    }
+
+    #[test]
+    fn serde_rename_all_prefers_the_deserialize_rule_in_list_form() {
+        use syn::parse_quote;
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(rename_all(serialize = "camelCase", deserialize = "kebab-case"))]
+        };
+        assert_eq!(
+            serde_rename_all(&attrs).expect("the list form parses"),
+            Some(RenameAll::Kebab),
+            "the deserialization rule governs the schema — it describes what the \
+            model sends"
+        );
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[serde(rename_all(serialize = "camelCase"))]
+        };
+        assert_eq!(
+            serde_rename_all(&attrs).expect("a serialize-only list form parses"),
+            Some(RenameAll::Camel),
+            "without a deserialization rule the serialize rule is the only signal"
+        );
     }
 
     #[test]

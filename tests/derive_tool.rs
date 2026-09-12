@@ -23,7 +23,226 @@ fn call(tool: &impl Tool, input: serde_json::Value) -> Result<ToolOutput, ToolEr
     futures::executor::block_on(tool.call(input, &ToolContext::default()))
 }
 
+/// A known-good derived tool driven through its full surface.
+///
+/// Relocated from the UI pass fixture, where trybuild compiles but
+/// never runs it: the tool-level name and description overrides, the
+/// generated schema's required list, and the call dispatch into the
+/// run handler.
+#[derive(DeriveTool, Deserialize)]
+#[tool(name = "greet", description = "Greets")]
+struct GreetContractInput {
+    /// A plain required `String`, required under its serde name.
+    ///
+    /// No defaulting on either side, so the schema's required list is
+    /// the honest signal: this field must arrive on the wire.
+    who: String,
+}
+
+impl GreetContractInput {
+    async fn run(
+        &self,
+        _input: GreetContractInput,
+        _ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("hi"))
+    }
+}
+
+/// A struct-level `#[serde(default)]` makes every field optional.
+///
+/// Serde fills any missing field from the struct's `Default` impl, so
+/// no field is truly required and a skipped field needs no field-level
+/// default of its own. The skipped field also carries `#[serde(skip)]`
+/// — the one skip combination that agrees with the schema, since both
+/// sides omit it.
+#[derive(Default, DeriveTool, Deserialize)]
+#[serde(default)]
+#[tool(name = "container_default", description = "Struct-level default")]
+struct ContainerDefaultContractInput {
+    /// A count serde fills from the struct's default when absent.
+    ///
+    /// Present in the schema as an optional property; its absence at
+    /// deserialization is legal and yields `Default::default()`.
+    count: u32,
+
+    /// An internal field neither side of the wire ever sees.
+    ///
+    /// Both the tool schema and serde skip it, so nothing about it is
+    /// advertised and nothing is required to fill it.
+    #[tool(skip)]
+    #[serde(skip)]
+    internal: String,
+}
+
+impl ContainerDefaultContractInput {
+    async fn run(
+        &self,
+        _input: ContainerDefaultContractInput,
+        _ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("hi"))
+    }
+}
+
+/// A bare `#[tool(skip)]` + read-side `#[serde(skip)]` pair.
+///
+/// On a non-`Option` field serde fills the skipped value from
+/// `Default::default()` without reading the wire — exactly the
+/// fillability the skip validity check demands — so no struct-level or
+/// field-level `default` attribute is needed.
+#[derive(Default, DeriveTool, Deserialize)]
+#[tool(name = "skip_pair", description = "Bare skip pair")]
+struct SkipPairContractInput {
+    /// The one schema-visible property of the pair.
+    ///
+    /// Required under its serde name, so the generated schema lists it
+    /// alone.
+    label: String,
+
+    /// The skipped field the schema must not mention.
+    ///
+    /// Neither tool-side nor serde-side — the assertion pins that the
+    /// properties map carries `label` and nothing else.
+    #[tool(skip)]
+    #[serde(skip)]
+    secret: String,
+}
+
+impl SkipPairContractInput {
+    async fn run(
+        &self,
+        _input: SkipPairContractInput,
+        _ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("hi"))
+    }
+}
+
+/// Split rename rules: the schema must follow the deserialization side.
+///
+/// serde accepts `rename_all(serialize = \"…\", deserialize = \"…\")`;
+/// the schema mirrors the read side, because it describes what the
+/// model sends, while serde's own serialization keeps the write-side
+/// rule — the assertion checks both directions.
+#[derive(DeriveTool, Deserialize, serde::Serialize)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "kebab-case"))]
+#[tool(name = "split_rename", description = "Split rename rules")]
+struct SplitRenameInput {
+    /// Serializes as `maxDepth`, deserializes from `max-depth`.
+    ///
+    /// The numeric half of the split-rule contract: the schema must
+    /// advertise the kebab name, because that is what the model sends.
+    max_depth: u32,
+
+    /// Serializes as `labelText`, deserializes from `label-text`.
+    ///
+    /// The string half of the split-rule contract, so the assertion
+    /// covers both property kinds.
+    label_text: String,
+}
+
+impl SplitRenameInput {
+    async fn run(
+        &self,
+        _input: SplitRenameInput,
+        _ctx: &ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("hi"))
+    }
+}
+
+#[test]
+fn ui_pass_contract() {
+    let greet = GreetContractInput {
+        who: "world".into(),
+    };
+    assert_eq!(greet.name(), "greet", "the tool-level name override wins");
+    assert_eq!(greet.description(), "Greets");
+    let schema = greet.schema();
+    let required = schema
+        .input_schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .expect("the schema always carries a required list");
+    assert_eq!(
+        serde_json::to_string(required).expect("the required list serializes"),
+        r#"["who"]"#,
+        "a plain field is required under its serde name"
+    );
+    let output = call(&greet, serde_json::json!({"who": "world"}))
+        .expect("the generated dispatch reaches the run handler");
+    assert_eq!(output.text_content(), "hi");
+
+    let tool = ContainerDefaultContractInput::default();
+    let schema = tool.schema();
+    let required = schema
+        .input_schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .expect("the schema always carries a required list");
+    assert!(
+        required.is_empty(),
+        "a struct-level serde default makes every field optional in the schema"
+    );
+
+    let skip_pair = SkipPairContractInput {
+        label: "x".into(),
+        secret: String::new(),
+    };
+    let schema = skip_pair.schema();
+    let properties = schema
+        .input_schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .expect("the schema always carries properties");
+    assert!(
+        properties.len() == 1 && properties.contains_key("label"),
+        "the serde-skip pair stays out of the schema without any default attribute:         {properties:?}"
+    );
+}
+
+#[test]
+fn split_rename_rules_follow_the_deserialization_side() {
+    let tool = SplitRenameInput {
+        max_depth: 3,
+        label_text: "x".into(),
+    };
+    let schema = tool.schema();
+    let properties = schema
+        .input_schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .expect("the schema always carries properties");
+    assert!(
+        properties.contains_key("max-depth") && properties.contains_key("label-text"),
+        "the schema advertises the kebab-case names serde deserializes from:         {properties:?}"
+    );
+    assert!(
+        !properties.contains_key("maxDepth") && !properties.contains_key("labelText"),
+        "the serialization-side camelCase names must not leak into the read-side \
+        schema: {properties:?}"
+    );
+    let input: SplitRenameInput = serde_json::from_value(serde_json::json!({
+        "max-depth": 3,
+        "label-text": "x",
+    }))
+    .expect("serde deserializes from the kebab-case names the schema advertises");
+    assert_eq!(input.max_depth, 3);
+    let serialized = serde_json::to_value(&input).expect("serializes");
+    assert_eq!(
+        serialized
+            .get("maxDepth")
+            .and_then(serde_json::Value::as_u64),
+        Some(3),
+        "serde's own serialization follows the camelCase rule — the split is live"
+    );
+}
+
 /// Echo a message back to the caller.
+///
+/// The minimal derived tool: one plain required field, no attribute
+/// overrides — the baseline every richer fixture below diverges from.
 #[derive(DeriveTool, Deserialize)]
 #[tool(name = "echo", description = "Echo back the provided message")]
 struct EchoInput {
@@ -65,6 +284,10 @@ fn minimal_derived_tool_round_trips() {
 }
 
 /// A renamed field, an optional field, and a defaulted field.
+///
+/// One struct mixing the three field-level serde behaviours the
+/// schema has to mirror independently: a rename, an `Option`, and a
+/// `#[serde(default)]`.
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Renamed and defaulted fields")]
 struct SearchInput {
@@ -116,6 +339,10 @@ fn field_attributes_shape_the_schema() {
 }
 
 /// Every supported type mapping plus recursion.
+///
+/// Nested containers of scalars exercise the type map at depth, so a
+/// regression in any mapping or the recursion itself shows up here
+/// first.
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Type map fixture")]
 struct TypesInput {
@@ -161,6 +388,10 @@ fn type_mapping_matches_the_table() {
 }
 
 /// Provided-method overrides emit only when the attribute is present.
+///
+/// `read_only` and friends generate their trait method only for
+/// structs that opt in; this fixture opts in so the assertions can
+/// call the overrides and prove they fired.
 #[derive(DeriveTool, Deserialize)]
 #[tool(
     description = "Overrides fixture",
@@ -198,6 +429,10 @@ fn provided_method_overrides() {
 }
 
 /// Bad input surfaces as `InvalidInput` through the generated dispatch.
+///
+/// The generated `call` parses the JSON into the input struct before
+/// the run handler sees it, so a type mismatch must fail as a typed
+/// tool error, never as a panic.
 #[test]
 fn bad_input_maps_to_invalid_input() {
     let tool = EchoInput {
@@ -212,6 +447,10 @@ fn bad_input_maps_to_invalid_input() {
 }
 
 /// A skipped field leaves the schema and still deserializes.
+///
+/// The `#[tool(skip)]` + `#[serde(default)]` combination: the field is
+/// absent from the schema yet serde fills it, proving the skip did not
+/// break deserialization.
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Skip fixture")]
 struct SkipInput {
@@ -245,6 +484,10 @@ fn skipped_field_leaves_the_schema() {
 }
 
 /// A renamed handler via `#[tool(handler = "...")]`.
+///
+/// The dispatch calls the named associated function instead of the
+/// conventional `run`, so hosts can host several handlers on one
+/// struct.
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Handler fixture", handler = "execute")]
 struct HandlerInput {
@@ -377,6 +620,10 @@ fn explicit_tool_default_leaves_required_but_keeps_the_property() {
 }
 
 /// `#[serde(rename)]` on a field mirrors into the schema.
+///
+/// The schema must advertise the wire name serde reads under — a
+/// mismatch would make the schema lie about what the model should
+/// send.
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Serde rename fixture")]
 struct SerdeRenameInput {
@@ -485,6 +732,10 @@ fn tool_and_serde_names_agree_and_round_trip() {
 }
 
 /// The full integer range maps to `integer`.
+///
+/// Every width from `i8` to `u64` shares one JSON schema type; the
+/// assertion pins that none of them leaks a `number` or a width-specific
+/// name.
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Integer fixture")]
 struct IntegersInput {
@@ -551,6 +802,9 @@ fn serde_rename_all_pascal_case_applies() {
 }
 
 /// `rename_all` with `SCREAMING_SNAKE_CASE`.
+///
+/// One of the container-level casing strategies, checked against
+/// serde's own serialized keys as the oracle.
 #[derive(DeriveTool, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[tool(description = "Screaming fixture")]
@@ -582,6 +836,9 @@ fn serde_rename_all_screaming_snake_applies() {
 }
 
 /// `rename_all` with `kebab-case`.
+///
+/// The hyphenated counterpart of the screaming-kebab fixture — same
+/// oracle, opposite case policy.
 #[derive(DeriveTool, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[tool(description = "Kebab fixture")]
@@ -613,6 +870,9 @@ fn serde_rename_all_kebab_case_applies() {
 }
 
 /// `skip` on an `Option` field (not just `#[serde(default)]`).
+///
+/// An `Option` is fillable from `None` without any default attribute,
+/// so the skip-validity check accepts it on fillability alone.
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Skip-option fixture")]
 struct SkipOptionInput {
@@ -650,6 +910,9 @@ fn skip_on_option_field_leaves_the_schema() {
 #[tool(description = "Field description override fixture")]
 struct FieldDescInput {
     /// This doc comment would be the description.
+    ///
+    /// The attribute below outranks it, proving the precedence order
+    /// rather than just the presence of a description.
     #[tool(description = "The explicit override wins.")]
     target: String,
 }
@@ -677,6 +940,9 @@ fn field_description_override_wins_over_doc_comment() {
 }
 
 /// `Cow<'static, str>` maps to `string` — the type-map accepts it.
+///
+/// Borrowed and owned spellings of one wire type must not fork the
+/// schema; both map to the same `string` property.
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Cow fixture")]
 struct CowStrInput {
@@ -704,6 +970,9 @@ fn cow_str_maps_to_string() {
 }
 
 /// `Vec<i64>` exercises array recursion into a non-string scalar.
+///
+/// The `items` subschema comes from the same type map as the top-level
+/// fields, so recursion cannot special-case scalar kinds.
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Integer vec fixture")]
 struct IntVecInput {
@@ -739,6 +1008,9 @@ fn tool_int_vec() -> IntVecInput {
 }
 
 /// `Option<Vec<String>>` — an optional complex type.
+///
+/// Optionality wraps a container rather than a scalar: the property
+/// stays out of `required` while its `items` mapping still applies.
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Optional vec fixture")]
 struct OptionalVecInput {
@@ -785,6 +1057,10 @@ fn optional_vec_unwraps_for_schema_and_leaves_required() {
 }
 
 /// `allow_extra` omits the closed-world flag.
+///
+/// The schema drops `additionalProperties: false` so the model may
+/// send fields the struct ignores — the open-world counterpart of the
+/// default closed schema.
 #[derive(DeriveTool, Deserialize)]
 #[tool(description = "Open fixture", allow_extra)]
 struct OpenInput {

@@ -20,8 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ### Fixed
 
-- **`#[derive(Tool)]` matches serde's rename rules for fields** — `rename_all = "snake_case"` is an identity on fields (the previous conversion invented names serde rejects), `lowercase` lowercases ASCII-only like serde's field arm (only `snake_case` is the identity there), `"SCREAMING-KEBAB-CASE"` is accepted in serde's spelling, `#[serde(default)]` is found after value-bearing serde keys like `with = "…"`, and flag keys reject `= value` misuse with a named error.
-- **Review workflow skips fork and dependabot pull requests again** (neutral skip, not a failed check).
+- **`#[derive(Tool)]` matches serde's rename rules for fields** — including the split `rename_all(serialize = …, deserialize = …)` form, where the schema follows the deserialization rule (pinned by `split_rename_rules_follow_the_deserialization_side`); `rename_all = "snake_case"` and `"lowercase"` are identities on fields (serde's field arm treats them the same; the previous conversion invented names serde rejects), the case-changing strategies convert ASCII-only exactly as serde does, `"SCREAMING-KEBAB-CASE"` is accepted in serde's spelling, `#[serde(default)]` is found after value-bearing serde keys like `with = "…"`, and flag keys reject `= value` and parenthesized misuse with a named error.
 
 ## [0.3.1] - 2026-09-05
 

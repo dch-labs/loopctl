@@ -105,6 +105,27 @@ pub struct RunConfig {
     /// and appends them as a reference user message. Defaults to `3`. Set to
     /// `0` to disable memory retrieval entirely for the run.
     pub memory_top_k: usize,
+
+    /// Whether retrieved provider-derived memories join the turn context.
+    ///
+    /// Wire-mined memories carry the
+    /// [`PROVIDER_DERIVED_TAG`](crate::memory::entry::PROVIDER_DERIVED_TAG);
+    /// `true` (the default) renders them in their own section under a
+    /// stronger untrusted-text framing, and `false` excludes them from
+    /// injection while untagged entries the store returned still render —
+    /// the shape for hosts that review extracted memories before trusting
+    /// them. The knob filters what the store returned; it does not
+    /// re-query.
+    #[serde(default = "default_memory_include_provider_derived")]
+    pub memory_include_provider_derived: bool,
+}
+
+/// The serde default for [`RunConfig::memory_include_provider_derived`].
+///
+/// Absent fields deserialize to inclusion — a serialized config from
+/// before the field existed behaves exactly as it did.
+fn default_memory_include_provider_derived() -> bool {
+    true
 }
 
 impl Default for RunConfig {
@@ -114,6 +135,7 @@ impl Default for RunConfig {
             parallel_tool_dispatch: ParallelDispatchConfig::default(),
             reset_managers: false,
             memory_top_k: 3,
+            memory_include_provider_derived: true,
         }
     }
 }
@@ -161,6 +183,23 @@ impl RunConfig {
     #[must_use]
     pub fn with_max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = max_turns;
+        self
+    }
+
+    /// Set whether provider-derived memories join the turn context.
+    ///
+    /// Builder-style convenience for `#[non_exhaustive]` compliance; see
+    /// [`memory_include_provider_derived`](Self::memory_include_provider_derived).
+    ///
+    /// ```
+    /// use loopctl::engine::RunConfig;
+    ///
+    /// let config = RunConfig::default().with_memory_include_provider_derived(false);
+    /// assert!(!config.memory_include_provider_derived);
+    /// ```
+    #[must_use]
+    pub fn with_memory_include_provider_derived(mut self, include: bool) -> Self {
+        self.memory_include_provider_derived = include;
         self
     }
 }
@@ -797,5 +836,36 @@ pub trait Loop: Send + Sync {
     /// etc.). The default implementation returns `None` (normal completion).
     fn stop_reason(&self) -> Option<LoopError> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RunConfig;
+
+    #[test]
+    fn a_config_missing_the_knob_field_deserializes_to_inclusion() {
+        let mut value = serde_json::to_value(RunConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .expect("a RunConfig serializes to a JSON object")
+            .remove("memory_include_provider_derived");
+        let config: RunConfig = serde_json::from_value(value).unwrap();
+        assert!(
+            config.memory_include_provider_derived,
+            "a serialized config from before the field existed must deserialize \
+            with the inclusive default"
+        );
+    }
+
+    #[test]
+    fn a_config_built_with_exclusion_survives_a_serde_round_trip() {
+        let config = RunConfig::default().with_memory_include_provider_derived(false);
+        let round_tripped: RunConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert!(
+            !round_tripped.memory_include_provider_derived,
+            "an opted-out knob must survive serialization"
+        );
     }
 }

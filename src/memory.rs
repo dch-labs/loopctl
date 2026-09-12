@@ -119,7 +119,8 @@ pub mod vector;
 /// - **Stores** a [`MemoryEntry`] after every successful tool call,
 ///   recording what tool ran, with what input, and what it returned.
 /// - **Retrieves** up to a few relevant entries before each turn and
-///   injects them as a system message so the model sees prior experience.
+///   injects them as a user-role reference message — memory text framed
+///   as context, never instructions — so the model sees prior experience.
 /// - **Consolidates** the store at the end of each successful run,
 ///   pruning low-relevance entries.
 ///

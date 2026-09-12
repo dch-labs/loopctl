@@ -110,22 +110,24 @@ pub struct RunConfig {
     ///
     /// Wire-mined memories carry the
     /// [`PROVIDER_DERIVED_TAG`](crate::memory::entry::PROVIDER_DERIVED_TAG);
-    /// `true` (the default) renders them in their own section under a
-    /// stronger untrusted-text framing, and `false` excludes them from
-    /// injection while untagged entries the store returned still render —
-    /// the shape for hosts that review extracted memories before trusting
-    /// them. The knob filters what the store returned; it does not
-    /// re-query.
+    /// `false` (the default) excludes them from injection while untagged
+    /// entries the store returned still render — the trust boundary is
+    /// opt-in, so unreviewed provider text never reaches a prompt unless
+    /// a host asks for it. `true` renders tagged entries in their own
+    /// section under a stronger untrusted-text framing, for hosts that
+    /// want learned provider text replayed. The knob filters what the
+    /// store returned; it does not re-query.
     #[serde(default = "default_memory_include_provider_derived")]
     pub memory_include_provider_derived: bool,
 }
 
 /// The serde default for [`RunConfig::memory_include_provider_derived`].
 ///
-/// Absent fields deserialize to inclusion — a serialized config from
-/// before the field existed behaves exactly as it did.
+/// Absent fields deserialize to exclusion — the same behavior every
+/// released version had, since no release predating this field could
+/// hold a tagged entry.
 fn default_memory_include_provider_derived() -> bool {
-    true
+    false
 }
 
 impl Default for RunConfig {
@@ -135,7 +137,7 @@ impl Default for RunConfig {
             parallel_tool_dispatch: ParallelDispatchConfig::default(),
             reset_managers: false,
             memory_top_k: 3,
-            memory_include_provider_derived: true,
+            memory_include_provider_derived: false,
         }
     }
 }
@@ -194,8 +196,8 @@ impl RunConfig {
     /// ```
     /// use loopctl::engine::RunConfig;
     ///
-    /// let config = RunConfig::default().with_memory_include_provider_derived(false);
-    /// assert!(!config.memory_include_provider_derived);
+    /// let config = RunConfig::default().with_memory_include_provider_derived(true);
+    /// assert!(config.memory_include_provider_derived);
     /// ```
     #[must_use]
     pub fn with_memory_include_provider_derived(mut self, include: bool) -> Self {
@@ -844,7 +846,7 @@ mod tests {
     use super::RunConfig;
 
     #[test]
-    fn a_config_missing_the_knob_field_deserializes_to_inclusion() {
+    fn a_config_missing_the_knob_field_deserializes_to_exclusion() {
         let mut value = serde_json::to_value(RunConfig::default()).unwrap();
         value
             .as_object_mut()
@@ -852,20 +854,20 @@ mod tests {
             .remove("memory_include_provider_derived");
         let config: RunConfig = serde_json::from_value(value).unwrap();
         assert!(
-            config.memory_include_provider_derived,
+            !config.memory_include_provider_derived,
             "a serialized config from before the field existed must deserialize \
-            with the inclusive default"
+            to the exclusive default"
         );
     }
 
     #[test]
-    fn a_config_built_with_exclusion_survives_a_serde_round_trip() {
-        let config = RunConfig::default().with_memory_include_provider_derived(false);
+    fn a_config_built_with_inclusion_survives_a_serde_round_trip() {
+        let config = RunConfig::default().with_memory_include_provider_derived(true);
         let round_tripped: RunConfig =
             serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
         assert!(
-            !round_tripped.memory_include_provider_derived,
-            "an opted-out knob must survive serialization"
+            round_tripped.memory_include_provider_derived,
+            "an opted-in knob must survive serialization"
         );
     }
 }

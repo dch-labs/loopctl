@@ -1208,15 +1208,14 @@ impl<C: ApiClient> BareLoop<C> {
     /// deliberate: memory text is reference context for the model, not a
     /// directive, and saying so reduces the chance recalled facts are
     /// treated as instructions to act on. Tagged entries — content a
-    /// provider authored — render in their own trailing section under a
+    /// provider authored — are excluded by default; when
+    /// [`memory_include_provider_derived`](crate::engine::RunConfig::memory_include_provider_derived)
+    /// is `true` they render in their own trailing section under a
     /// stronger untrusted-text framing, because that text may have been
     /// steered by attacker-influenced trajectory content the extractor
-    /// read. When
-    /// [`memory_include_provider_derived`](crate::engine::RunConfig::memory_include_provider_derived)
-    /// is `false`, tagged entries are filtered out instead of framed; the
-    /// knob filters what the store returned, it does not re-query. A store
-    /// holding no tagged entries renders byte-identically to the single
-    /// prefix that predated the sections.
+    /// read. The knob filters what the store returned, it does not
+    /// re-query. A store holding no tagged entries renders
+    /// byte-identically to the single prefix that predated the sections.
     ///
     /// The message is appended to `messages`, so it
     /// travels into the outbound request alongside contributor output but is

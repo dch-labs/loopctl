@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 - **`#[derive(Tool)]` matches serde's rename rules for fields** — including the split `rename_all(serialize = …, deserialize = …)` form, where the schema follows the deserialization rule (pinned by `split_rename_rules_follow_the_deserialization_side`); `rename_all = "snake_case"` and `"lowercase"` are identities on fields (serde's field arm treats them the same; the previous conversion invented names serde rejects), the case-changing strategies convert ASCII-only exactly as serde does, `"SCREAMING-KEBAB-CASE"` is accepted in serde's spelling, `#[serde(default)]` is found after value-bearing serde keys like `with = "…"`, and flag keys reject `= value` and parenthesized misuse with a named error.
 
-- **A cancelled run no longer starts a tool after cancellation** — the core tool dispatch skips pre-cancelled calls deterministically instead of relying on `select!`'s random branch order, which could poll a side-effecting tool once before the cancel branch won.
+- **Pre-cancelled tool calls no longer start** — the core tool dispatch skips pre-cancelled calls deterministically instead of relying on `select!`'s random branch order, which could poll a side-effecting tool once before the cancel branch won.
 
 ## [0.3.1] - 2026-09-05
 

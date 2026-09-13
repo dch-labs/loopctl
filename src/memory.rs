@@ -32,11 +32,17 @@
 //!   [`ExtractionObserver`] automates the
 //!   pass at run end on a best-effort spawned task (see its docs for the
 //!   flush race and shutdown caveats).
+//! - **[`score`]** — the shared retrieval scorer
+//!   [`score_entry`](score::score_entry) every flat-list backend ranks
+//!   with, so results order identically across stores.
 //!
 //! # Provided Implementations
 //!
 //! - **[`InMemoryStore`]** — Records tool-execution trajectories and
 //!   retrieves relevant past experiences.
+//! - **[`FileMemoryStore`]** — The same store persisted to a JSONL file,
+//!   so learned memory survives a process restart (feature
+//!   `file_memory`).
 //!
 //! # Quick Start
 //!
@@ -106,9 +112,15 @@ pub mod builtin;
 pub mod consolidate;
 pub mod entry;
 pub mod extractor;
+#[cfg(feature = "file_memory")]
+pub mod file;
+pub mod score;
 pub mod trajectory;
 #[cfg(feature = "vector_index")]
 pub mod vector;
+
+#[cfg(feature = "file_memory")]
+pub use file::FileMemoryStore;
 
 /// A memory system for agent loops.
 ///

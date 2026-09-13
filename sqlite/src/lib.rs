@@ -1,0 +1,57 @@
+//! SQLite-backed [`LoopMemory`] for loopctl — durable, indexed,
+//! concurrent.
+//!
+//! [`SqliteMemoryStore`] implements loopctl's memory trait over a local
+//! SQLite database (`rusqlite` with the `bundled` feature, so no system
+//! SQLite is required): WAL journaling for concurrent readers with one
+//! writer, an FTS5 full-text index over the memory text with a `LIKE`
+//! fallback, and retrieval re-ranked in Rust with loopctl's shared
+//! scorer — matched candidates order by the same formula as the other
+//! backends, though recall is token-level (stemmed whole words; a
+//! substring-only hit surfaces through baseline fill-up, not as a
+//! match).
+//!
+//! Add this crate as a direct dependency; no feature on `loopctl`
+//! itself is required:
+//!
+//! ```toml
+//! [dependencies]
+//! loopctl = "0.3"
+//! loopctl-sqlite = "0.3"
+//! ```
+//!
+//! ```no_run
+//! use loopctl_sqlite::SqliteMemoryStore;
+//! # fn main() -> Result<(), loopctl_sqlite::SqliteMemoryError> {
+//! let store = SqliteMemoryStore::open("agent-memory.db")?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`LoopMemory`]: loopctl::memory::LoopMemory
+
+#![warn(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::missing_panics_doc,
+        clippy::missing_errors_doc,
+        clippy::unnecessary_wraps,
+        clippy::clone_on_ref_ptr,
+        clippy::doc_markdown,
+        clippy::field_reassign_with_default,
+        clippy::used_underscore_items,
+        clippy::wildcard_imports,
+    )
+)]
+
+mod error;
+mod schema;
+mod store;
+
+pub use error::SqliteMemoryError;
+pub use store::SqliteMemoryStore;

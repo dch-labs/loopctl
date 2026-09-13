@@ -332,34 +332,9 @@ impl LoopMemory for InMemoryStore {
             let mut scored: Vec<(f32, bool, MemoryEntry)> = snapshot
                 .into_iter()
                 .map(|entry| {
-                    let memory_lower = entry.memory.to_lowercase();
-                    let tag_match = !query_trimmed.is_empty()
-                        && entry
-                            .tags
-                            .iter()
-                            .any(|t| t.to_lowercase().contains(query_trimmed));
-                    let word_matches = query_words
-                        .iter()
-                        .filter(|w| memory_lower.contains(*w))
-                        .count();
-                    let base_score = if (0.0..=1.0).contains(&entry.relevance) {
-                        entry.relevance
-                    } else {
-                        0.0
-                    };
-                    let denom = query_words.len().max(1);
-                    let query_bonus = if word_matches > 0 {
-                        crate::numeric::unit_ratio(word_matches, denom)
-                    } else {
-                        0.0
-                    };
-                    let tag_bonus = if tag_match { 0.3 } else { 0.0 };
-                    let matched = word_matches > 0 || tag_match;
-                    (
-                        base_score * 0.5 + query_bonus * 0.4 + tag_bonus + 0.1,
-                        matched,
-                        entry,
-                    )
+                    let (score, matched) =
+                        super::score::score_entry(&entry, query_trimmed, &query_words);
+                    (score, matched, entry)
                 })
                 .collect();
 

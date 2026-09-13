@@ -7,8 +7,9 @@
 //! writer, and retrieval that loads every entry and ranks it in Rust
 //! with loopctl's shared scorer — the same entries match, in the same
 //! order with the same tie-breaking, as the in-memory and file
-//! backends. An FTS5 index is maintained on every write for a future
-//! indexed path.
+//! backends. An FTS5 index is maintained on every write; retrieval
+//! does not consult it — ranking every entry is what guarantees the
+//! parity contract.
 //!
 //! Add this crate as a direct dependency; no feature on `loopctl`
 //! itself is required:

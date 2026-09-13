@@ -213,6 +213,41 @@ async fn a_torn_final_line_is_dropped_on_open() {
 }
 
 #[tokio::test]
+async fn a_valid_line_without_its_newline_is_repaired_on_open() {
+    let dir = temp_dir("unterminated");
+    let path = dir.join("memory.jsonl");
+
+    let first = MemoryEntry::new(MemoryCategory::Fact, "survived the crash mid-newline");
+    let contents = serde_json::to_string(&first).unwrap();
+    std::fs::write(&path, contents).unwrap();
+
+    let store = FileMemoryStore::open(&path).unwrap();
+    assert_eq!(store.len(), 1, "the unterminated-but-valid line loads");
+    let second = MemoryEntry::new(MemoryCategory::Fact, "stored after the repair");
+    store.store(second.clone()).await.unwrap();
+    drop(store);
+
+    let reopened = FileMemoryStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.len(),
+        2,
+        "the repair appended the missing terminator, so the next append is \
+        its own line — neither entry is lost to a welded line"
+    );
+    assert_eq!(
+        reopened
+            .retrieve("survived the crash", 3)
+            .await
+            .unwrap()
+            .first()
+            .map(|e| e.id),
+        Some(first.id),
+        "the pre-crash entry survives"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn a_torn_tail_is_repaired_so_later_stores_survive() {
     let dir = temp_dir("torn-repair");
     let path = dir.join("memory.jsonl");

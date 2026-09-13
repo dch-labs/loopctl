@@ -42,11 +42,12 @@ use uuid::Uuid;
 /// single line; [`consolidate`](LoopMemory::consolidate) and
 /// [`flush`](Self::flush) rewrite the whole file atomically (write to a
 /// sibling temp file, then `rename`). A torn final line — a crash
-/// mid-append — is dropped with a warning and repaired (its tail
-/// rewritten away) on the next `open`, so a later append cannot weld
-/// itself onto the fragment; a malformed line anywhere earlier is
-/// surfaced as an error, since it indicates real corruption rather than
-/// an interrupted write.
+/// mid-append, or between the line and its newline — is repaired (its
+/// tail rewritten with the terminator) on the next `open`, so a later
+/// append cannot weld itself onto it; an undecodable fragment is
+/// additionally dropped with a warning, and a malformed complete line
+/// anywhere earlier is surfaced as an error, since it indicates real
+/// corruption rather than an interrupted write.
 ///
 /// # Concurrency
 ///
@@ -214,10 +215,13 @@ impl FileMemoryStore {
     /// droppable like any other torn write — a strict UTF-8 read of the
     /// whole file would reject valid complete lines over one broken
     /// tail byte. A missing file yields an empty store. Blank lines are
-    /// skipped. A malformed final fragment — invalid UTF-8 or
-    /// undecodable JSON — is a torn write: skipped with a warning and
-    /// reported in the returned flag so the caller repairs the file,
-    /// while a malformed complete line anywhere is surfaced as an error.
+    /// skipped. A trailing fragment — bytes after the last newline —
+    /// means the file lost its terminating newline, whatever those bytes
+    /// hold: an undecodable fragment is a torn write (dropped with a
+    /// warning) and a decodable one loads, but either way the returned
+    /// flag tells the caller to repair, since the next append would
+    /// weld onto an unterminated line. A malformed complete line
+    /// anywhere is surfaced as an error.
     ///
     /// # Errors
     ///
@@ -256,13 +260,13 @@ impl FileMemoryStore {
             }
         }
         if let Some(fragment) = trailing {
+            torn_tail = true;
             let decodable = std::str::from_utf8(fragment)
                 .ok()
                 .and_then(|text| serde_json::from_str(text).ok());
             if let Some(entry) = decodable {
                 entries.push(entry);
             } else {
-                torn_tail = true;
                 tracing::warn!("dropping a torn final memory line");
             }
         }

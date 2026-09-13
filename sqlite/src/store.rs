@@ -3,19 +3,18 @@
 //! [`SqliteMemoryStore`] persists each
 //! [`MemoryEntry`](loopctl::memory::MemoryEntry) as a row in a local
 //! SQLite database (WAL mode, `rusqlite` with the `bundled` feature so
-//! no system SQLite is required) and retrieves through an FTS5
-//! full-text index with a `LIKE` fallback, re-ranked in Rust with the
-//! shared [`score_entry`](loopctl::memory::score::score_entry) so
-//! matched candidates order by the same formula as the other backends
-//! (recall differs: FTS5 matches stemmed whole tokens, so a query that
-//! appears only as a substring surfaces through baseline fill-up rather
-//! than as a match).
+//! no system SQLite is required) and retrieves by loading every entry
+//! and ranking it in Rust with the shared
+//! [`score_entry`](loopctl::memory::score::score_entry) — the same
+//! entries match, in the same order with the same tie-breaking, as the
+//! other backends. An FTS5 index is maintained on every write; see
+//! [`schema`](crate::schema) for its role.
 //!
 //! Add `loopctl-sqlite` as a direct dependency; do not enable any
 //! feature on `loopctl` itself.
 
 use crate::error::SqliteMemoryError;
-use crate::schema::{CREATE_CORE_TABLE, CREATE_FTS_TABLE};
+use crate::schema::{CREATE_CORE_TABLE, CREATE_FTS_TABLE, CREATE_STAMPS_TABLE};
 use loopctl::error::{LoopError, recover_guard};
 use loopctl::memory::LoopMemory;
 use loopctl::memory::consolidate::{ConsolidationConfig, consolidate_entries};
@@ -45,8 +44,8 @@ use uuid::Uuid;
 /// results, ordering, and tie-breaking as the flat backends (loading in
 /// rowid order matches their insertion-order stable sort, so even
 /// baseline ties deliver identically). The FTS5 index is maintained on
-/// every write but not consulted by retrieval; it is reserved for a
-/// future indexed path that can preserve this exact ranking contract.
+/// every write but not consulted by retrieval: ranking every entry is
+/// what guarantees the cross-backend parity contract.
 ///
 /// # Example
 ///
@@ -66,22 +65,11 @@ use uuid::Uuid;
 pub struct SqliteMemoryStore {
     /// The single SQLite connection, WAL mode, behind a mutex.
     ///
-    /// `rusqlite::Connection` is `Send` but not `Sync`; the mutex is what
-    /// makes the store shareable. Lock order is always `conn` before
-    /// `access_log` — `retrieve` takes both, and nothing takes them in
-    /// the opposite order.
+    /// `rusqlite::Connection` is `Send` but not `Sync`; the mutex is
+    /// what makes the store shareable. It is the only lock the store
+    /// holds — access stamps live in the database itself, shared with
+    /// every other store on the same file.
     conn: Mutex<Connection>,
-
-    /// Access stamps recorded by `retrieve()`, keyed by entry id.
-    ///
-    /// In-memory only, following the reference store's side-log pattern:
-    /// matched entries that were actually delivered are stamped, and the
-    /// next consolidation pass folds the stamps into
-    /// [`last_accessed`](MemoryEntry::last_accessed) and
-    /// [`access_count`](MemoryEntry::access_count) before clearing the
-    /// log. Not persisted — a process that exits mid-pass loses at most
-    /// one pass of access accounting.
-    access_log: Mutex<HashMap<Uuid, SystemTime>>,
 
     /// The configuration driving this store's consolidation pass.
     ///
@@ -219,7 +207,6 @@ impl SqliteMemoryStore {
     fn from_connection(conn: Connection) -> Self {
         Self {
             conn: Mutex::new(conn),
-            access_log: Mutex::new(HashMap::new()),
             consolidation: ConsolidationConfig::default(),
         }
     }
@@ -246,6 +233,8 @@ impl SqliteMemoryStore {
             .map_err(SqliteMemoryError::from)?;
         conn.execute_batch(CREATE_FTS_TABLE)
             .map_err(SqliteMemoryError::from)?;
+        conn.execute_batch(CREATE_STAMPS_TABLE)
+            .map_err(SqliteMemoryError::from)?;
         Ok(())
     }
 
@@ -266,6 +255,68 @@ impl SqliteMemoryStore {
             .query_map([], read_entry_row)
             .map_err(SqliteMemoryError::from)?;
         collect_decoded(rows)
+    }
+
+    /// Record retrieval access stamps as pending rows in the database.
+    ///
+    /// One row per entry id, keeping the newest stamp — the same
+    /// max-rule the in-memory side log used. Because the rows live in
+    /// the database, stamps are visible to every `SqliteMemoryStore` on
+    /// the same file and survive a process restart.
+    ///
+    /// # Errors
+    ///
+    /// The upsert statement fails.
+    fn record_access_stamps(
+        conn: &Mutex<Connection>,
+        ids: &[Uuid],
+    ) -> Result<(), SqliteMemoryError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conn = recover_guard(conn.lock());
+        let mut statement = conn
+            .prepare(
+                "INSERT INTO access_stamps (id, stamped_at) VALUES (?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET stamped_at = max(stamped_at, excluded.stamped_at)",
+            )
+            .map_err(SqliteMemoryError::from)?;
+        let now = time_to_millis(SystemTime::now());
+        for id in ids {
+            statement
+                .execute(params![id.to_string(), now])
+                .map_err(SqliteMemoryError::from)?;
+        }
+        Ok(())
+    }
+
+    /// Load all pending access stamps within the consolidation transaction.
+    ///
+    /// The caller holds the transaction, so the load and the consume
+    /// delete see the same snapshot: a stamp committed before this pass
+    /// is folded and deleted, one committed after survives as a row for
+    /// the next pass — no stamp can be lost in between.
+    ///
+    /// # Errors
+    ///
+    /// The SELECT fails, or a stamp row holds an unreadable id.
+    fn load_access_stamps(tx: &Connection) -> Result<HashMap<Uuid, SystemTime>, SqliteMemoryError> {
+        let mut statement = tx
+            .prepare("SELECT id, stamped_at FROM access_stamps")
+            .map_err(SqliteMemoryError::from)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(SqliteMemoryError::from)?;
+        let mut stamps = HashMap::new();
+        for row in rows {
+            let (id, stamped_at) = row.map_err(SqliteMemoryError::from)?;
+            let id = Uuid::parse_str(&id)
+                .map_err(|e| SqliteMemoryError::InvalidEntry(format!("stamp id: {e}")))?;
+            stamps.insert(id, millis_to_time(stamped_at));
+        }
+        Ok(stamps)
     }
 
     /// Write one entry's core row and FTS row inside the given transaction.
@@ -498,14 +549,13 @@ impl LoopMemory for SqliteMemoryStore {
                 .take(limit)
                 .map(|(_, matched, entry)| (matched, entry))
                 .collect();
-            let now = SystemTime::now();
-            let mut access_log = recover_guard(self.access_log.lock());
-            for (matched, entry) in &selected {
-                if !matched {
-                    continue;
-                }
-                let stamp = access_log.get(&entry.id).copied();
-                access_log.insert(entry.id, stamp.map_or(now, |existing| existing.max(now)));
+            let stamped: Vec<Uuid> = selected
+                .iter()
+                .filter(|(matched, _)| *matched)
+                .map(|(_, entry)| entry.id)
+                .collect();
+            if let Err(error) = Self::record_access_stamps(&self.conn, &stamped) {
+                tracing::warn!(%error, "recording access stamps failed; best-effort");
             }
             Ok(selected.into_iter().map(|(_, entry)| entry).collect())
         })
@@ -513,16 +563,19 @@ impl LoopMemory for SqliteMemoryStore {
 
     /// Run the shared consolidation pass and rewrite the survivors.
     ///
-    /// Folds the access log into the entries, delegates to
+    /// Consumes the pending access stamps — every row, from any store
+    /// instance on this file and from before any restart — inside the
+    /// transaction, folds them into
+    /// [`last_accessed`](MemoryEntry::last_accessed) and
+    /// [`access_count`](MemoryEntry::access_count), then delegates to
     /// [`consolidate_entries`](loopctl::memory::consolidate::consolidate_entries)
-    /// — the same decay, merge, and prune pass every backend runs — then
-    /// rewrites the table and the full-text index in one transaction, so
-    /// pruned entries stay gone after a restart. The transaction opens
-    /// before the load: a concurrent store's commit either precedes this
-    /// pass's snapshot or fails its write upgrade — it can never land
-    /// between the read and the rewrite and be silently clobbered. The
-    /// access stamps are cleared only after the commit succeeds, so a
-    /// failed pass leaves them pending for the next one to re-fold.
+    /// — the same decay, merge, and prune pass every backend runs — and
+    /// rewrites the table and the full-text index in the same
+    /// transaction, so pruned entries stay gone after a restart. The
+    /// transaction opens before any read: a concurrent writer's commit
+    /// either precedes this pass's snapshot or fails its write upgrade,
+    /// so a stamp can never be lost to a retrieve racing this pass — it
+    /// is either folded here or survives as a row for the next pass.
     fn consolidate(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
@@ -534,15 +587,15 @@ impl LoopMemory for SqliteMemoryStore {
                 .map_err(SqliteMemoryError::from)
                 .map_err(LoopError::from)?;
             let mut entries = Self::load_all_entries(&tx)?;
-            {
-                let access_log = recover_guard(self.access_log.lock());
-                for entry in &mut entries {
-                    if let Some(stamp) = access_log.get(&entry.id) {
-                        entry.last_accessed = entry.last_accessed.max(Some(*stamp));
-                        entry.access_count = entry.access_count.saturating_add(1);
-                    }
+            let stamps = Self::load_access_stamps(&tx)?;
+            for entry in &mut entries {
+                if let Some(stamp) = stamps.get(&entry.id) {
+                    entry.last_accessed = entry.last_accessed.max(Some(*stamp));
+                    entry.access_count = entry.access_count.saturating_add(1);
                 }
             }
+            tx.execute("DELETE FROM access_stamps", [])
+                .map_err(SqliteMemoryError::from)?;
             let stats = consolidate_entries(&mut entries, &self.consolidation, now);
             tx.execute("DELETE FROM memory_entries", [])
                 .map_err(SqliteMemoryError::from)?;
@@ -552,7 +605,6 @@ impl LoopMemory for SqliteMemoryStore {
                 Self::insert_entry(&tx, entry)?;
             }
             tx.commit().map_err(SqliteMemoryError::from)?;
-            recover_guard(self.access_log.lock()).clear();
             Ok(stats)
         })
     }

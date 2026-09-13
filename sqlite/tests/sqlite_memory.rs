@@ -402,6 +402,60 @@ async fn losing_the_full_text_index_loses_no_recall() {
 }
 
 #[tokio::test]
+async fn access_stamps_are_shared_across_store_instances() {
+    let dir = temp_dir("shared-stamps");
+    let path = dir.join("memory.db");
+
+    let writer = SqliteMemoryStore::open(&path).unwrap();
+    let mut entry = MemoryEntry::new(MemoryCategory::Fact, "grip large files with both hands");
+    entry.relevance = 0.9;
+    writer.store(entry.clone()).await.unwrap();
+
+    let reader = SqliteMemoryStore::open(&path).unwrap();
+    reader.retrieve("grip large files", 3).await.unwrap();
+    drop(reader);
+
+    writer.consolidate().await.unwrap();
+
+    let probe = rusqlite::Connection::open(&path).unwrap();
+    let pending: i64 = probe
+        .query_row("SELECT COUNT(*) FROM access_stamps", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(pending, 0, "the pass consumed every pending stamp row");
+
+    let consolidated = writer.retrieve("grip large files", 3).await.unwrap();
+    assert_eq!(
+        consolidated.first().map(|e| e.access_count),
+        Some(1),
+        "the consolidating instance consumed the stamp the other instance wrote"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn access_stamps_survive_a_restart() {
+    let dir = temp_dir("stamps-restart");
+    let path = dir.join("memory.db");
+
+    let store = SqliteMemoryStore::open(&path).unwrap();
+    let mut entry = MemoryEntry::new(MemoryCategory::Fact, "verify the diff compiles");
+    entry.relevance = 0.9;
+    store.store(entry.clone()).await.unwrap();
+    store.retrieve("verify diff", 3).await.unwrap();
+    drop(store);
+
+    let reopened = SqliteMemoryStore::open(&path).unwrap();
+    reopened.consolidate().await.unwrap();
+    let consolidated = reopened.retrieve("verify diff", 3).await.unwrap();
+    assert_eq!(
+        consolidated.first().map(|e| e.access_count),
+        Some(1),
+        "the stamp written before the restart folds into the next pass"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn an_in_memory_database_round_trips_without_the_filesystem() {
     let store = SqliteMemoryStore::in_memory().unwrap();
     let entry = loaded_entry();

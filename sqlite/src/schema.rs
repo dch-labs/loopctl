@@ -36,9 +36,20 @@ CREATE INDEX IF NOT EXISTS idx_memory_category  ON memory_entries(category);";
 /// rowid — `INSERT OR REPLACE` on the core table assigns a fresh rowid,
 /// which would silently desynchronize a rowid-linked external-content
 /// index. The porter unicode61 tokenizer gives stemming and
-/// case-folding. Retrieval currently loads every entry and ranks it in
-/// Rust with the shared [`score_entry`](loopctl::memory::score::score_entry)
-/// for exact parity with the flat backends, so this index is maintained
-/// on every write but not yet consulted — it is reserved for a future
-/// indexed path that preserves that ranking contract.
+/// case-folding. Retrieval ranks every entry in Rust with the shared
+/// [`score_entry`](loopctl::memory::score::score_entry) for exact
+/// parity with the flat backends, so this index is maintained on every
+/// write but not consulted by retrieval.
 pub const CREATE_FTS_TABLE: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(memory, id UNINDEXED, tokenize='porter unicode61')";
+
+/// Creates the pending access-stamp table.
+///
+/// One row per entry id, holding the newest retrieval stamp. Writes are
+/// upserts from `retrieve`; consolidation reads, folds, and deletes the
+/// rows inside its transaction — so stamps are shared across every store
+/// instance on the same file, survive a process restart, and can never
+/// be lost to a retrieve racing a consolidate.
+pub const CREATE_STAMPS_TABLE: &str = "CREATE TABLE IF NOT EXISTS access_stamps (
+    id         TEXT PRIMARY KEY,
+    stamped_at INTEGER NOT NULL
+);";

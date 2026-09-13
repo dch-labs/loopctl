@@ -22,7 +22,7 @@ use serde::Deserialize;
 use crate::api::{ApiClient, StreamRequest};
 use crate::error::LoopError;
 use crate::memory::LoopMemory;
-use crate::memory::entry::{MemoryCategory, MemoryEntry};
+use crate::memory::entry::{MemoryCategory, MemoryEntry, PROVIDER_DERIVED_TAG};
 use crate::memory::trajectory::{TrajectoryOutcome, TrajectoryRecord, outcome_label};
 use crate::message::Message;
 use crate::observer::LoopObserver;
@@ -1168,7 +1168,7 @@ fn wire_to_extracted(wire: LlmMemoryWire) -> Option<ExtractedMemory> {
     {
         tags.push(selecting.into());
     }
-    tags.push("provider-derived".into());
+    tags.push(PROVIDER_DERIVED_TAG.into());
     Some(ExtractedMemory {
         category,
         content: wire.content,

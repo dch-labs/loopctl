@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use uuid::Uuid;
 
+/// The provenance tag marking a memory whose content a provider authored.
+///
+/// Stamped by the LLM extraction strategies
+/// ([`extractor`](super::extractor)) on every wire-mined memory and read
+/// at injection time to frame such entries as untrusted learned text.
+/// One constant shared by both halves — the tag is a wire contract and
+/// a second literal could drift.
+pub const PROVIDER_DERIVED_TAG: &str = "provider-derived";
+
 /// A single memory entry.
 ///
 /// Each entry represents one discrete piece of information the agent has

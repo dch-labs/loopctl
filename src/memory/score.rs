@@ -61,3 +61,69 @@ pub fn score_entry(entry: &MemoryEntry, query_trimmed: &str, query_words: &[&str
         matched,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::score_entry;
+    use crate::memory::entry::{MemoryCategory, MemoryEntry};
+
+    fn entry(text: &str, relevance: f32) -> MemoryEntry {
+        let mut entry = MemoryEntry::new(MemoryCategory::Fact, text);
+        entry.relevance = relevance;
+        entry
+    }
+
+    #[test]
+    fn an_unmatched_entry_scores_half_its_relevance_plus_the_baseline() {
+        let (score, matched) = score_entry(&entry("unrelated text", 0.8), "deploy", &["deploy"]);
+        assert!(
+            (score - 0.5).abs() < 1e-6,
+            "0.8 relevance with no match: {score}"
+        );
+        assert!(!matched, "no word overlap and no tag hit means unmatched");
+    }
+
+    #[test]
+    fn word_overlap_scales_the_query_bonus() {
+        let (score, matched) =
+            score_entry(&entry("rust traits", 1.0), "rust async", &["rust", "async"]);
+        assert!(
+            (score - 0.8).abs() < 1e-6,
+            "half of one matched word out of two: {score}"
+        );
+        assert!(matched);
+    }
+
+    #[test]
+    fn a_tag_hit_adds_the_bonus_and_marks_the_entry_matched() {
+        let mut tagged = entry("scripts live in ops", 0.9);
+        tagged.tags.push("deploy".to_string());
+        let (score, matched) = score_entry(&tagged, "deploy", &["deploy"]);
+        assert!(
+            (score - (0.9 * 0.5 + 0.3 + 0.1)).abs() < 1e-6,
+            "relevance half plus tag bonus plus baseline: {score}"
+        );
+        assert!(matched, "a tag hit matches even without word overlap");
+    }
+
+    #[test]
+    fn an_empty_query_ranks_every_entry_by_baseline_only() {
+        let (score, matched) = score_entry(&entry("anything", 0.6), "", &[]);
+        assert!(
+            (score - 0.4).abs() < 1e-6,
+            "0.6 relevance baseline: {score}"
+        );
+        assert!(!matched, "an empty query can never match");
+    }
+
+    #[test]
+    fn out_of_range_relevance_scores_as_zero() {
+        for poisoned in [1.5, -0.1, f32::NAN, f32::INFINITY] {
+            let (score, _) = score_entry(&entry("rust traits", poisoned), "rust", &["rust"]);
+            assert!(
+                (score - (0.4 + 0.1)).abs() < 1e-6,
+                "poisoned relevance {poisoned} contributes nothing: {score}"
+            );
+        }
+    }
+}

@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, RwLock};
 use std::time::SystemTime;
 use uuid::Uuid;
@@ -114,6 +115,14 @@ pub struct FileMemoryStore {
     /// [`InMemoryStore`](super::builtin::InMemoryStore) uses; set per
     /// store with [`with_consolidation`](Self::with_consolidation).
     consolidation: ConsolidationConfig,
+
+    /// Whether an append failure could not even be truncated back.
+    ///
+    /// Set when a partial line was written and restoring the original
+    /// file length failed — the file may now hold a partial line, so
+    /// every further append is rejected until a fresh
+    /// [`open`](Self::open) loads and repairs the file.
+    append_unusable: AtomicBool,
 }
 
 impl FileMemoryStore {
@@ -146,6 +155,7 @@ impl FileMemoryStore {
             entries: RwLock::new(entries),
             access_log: Mutex::new(HashMap::new()),
             consolidation: ConsolidationConfig::default(),
+            append_unusable: AtomicBool::new(false),
         })
     }
 
@@ -161,6 +171,7 @@ impl FileMemoryStore {
             entries: RwLock::new(Vec::new()),
             access_log: Mutex::new(HashMap::new()),
             consolidation: ConsolidationConfig::default(),
+            append_unusable: AtomicBool::new(false),
         }
     }
 
@@ -198,42 +209,61 @@ impl FileMemoryStore {
 
     /// Load a JSONL file into a vec of entries, applying the corruption rules.
     ///
-    /// A missing file yields an empty store. Blank lines are skipped.
-    /// A malformed final line is a torn write — skipped with a warning,
-    /// and reported in the returned flag so the caller repairs the file
-    /// — while a malformed earlier line is surfaced as an error.
+    /// The file is read as raw bytes and split at newline boundaries, so
+    /// a torn final fragment that ends mid–multi-byte character is
+    /// droppable like any other torn write — a strict UTF-8 read of the
+    /// whole file would reject valid complete lines over one broken
+    /// tail byte. A missing file yields an empty store. Blank lines are
+    /// skipped. A malformed final fragment — invalid UTF-8 or
+    /// undecodable JSON — is a torn write: skipped with a warning and
+    /// reported in the returned flag so the caller repairs the file,
+    /// while a malformed complete line anywhere is surfaced as an error.
     ///
     /// # Errors
     ///
     /// [`LoopError::Memory`] if the file cannot be read, or if any
-    /// non-final line fails to deserialize.
+    /// complete line is not valid UTF-8 or fails to deserialize.
     fn load_entries(path: &Path) -> Result<(Vec<MemoryEntry>, bool), LoopError> {
-        let contents = match std::fs::read_to_string(path) {
-            Ok(text) => text,
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
             Err(e) => return Err(LoopError::Memory(format!("cannot read memory file: {e}"))),
         };
+        let (complete, trailing) = split_complete_lines(&bytes);
         let mut entries = Vec::new();
         let mut torn_tail = false;
-        let lines: Vec<&str> = contents.lines().collect();
-        for (index, line) in lines.iter().enumerate() {
+        for (index, line_bytes) in complete.iter().enumerate() {
+            let line = match std::str::from_utf8(line_bytes) {
+                Ok(line) => line,
+                Err(e) => {
+                    return Err(LoopError::Memory(format!(
+                        "corrupt memory line {}: not valid UTF-8: {e}",
+                        index.saturating_add(1)
+                    )));
+                }
+            };
             if line.trim().is_empty() {
                 continue;
             }
             match serde_json::from_str(line) {
                 Ok(entry) => entries.push(entry),
                 Err(e) => {
-                    let is_last = index.saturating_add(1) == lines.len();
-                    if is_last {
-                        torn_tail = true;
-                        tracing::warn!(error = %e, "dropping a torn final memory line");
-                    } else {
-                        return Err(LoopError::Memory(format!(
-                            "corrupt memory line {}: {e}",
-                            index.saturating_add(1)
-                        )));
-                    }
+                    return Err(LoopError::Memory(format!(
+                        "corrupt memory line {}: {e}",
+                        index.saturating_add(1)
+                    )));
                 }
+            }
+        }
+        if let Some(fragment) = trailing {
+            let decodable = std::str::from_utf8(fragment)
+                .ok()
+                .and_then(|text| serde_json::from_str(text).ok());
+            if let Some(entry) = decodable {
+                entries.push(entry);
+            } else {
+                torn_tail = true;
+                tracing::warn!("dropping a torn final memory line");
             }
         }
         Ok((entries, torn_tail))
@@ -245,23 +275,48 @@ impl FileMemoryStore {
     /// and lines can never interleave. The line is flushed to the OS —
     /// visible to other processes and safe against a process crash, but
     /// not fsynced; callers needing power-loss durability call
-    /// [`flush`](Self::flush).
+    /// [`flush`](Self::flush). If the write or flush fails partway, the
+    /// file is truncated back to its pre-append length so a partial line
+    /// cannot sit in later appends' way; if even the truncation fails,
+    /// the store marks itself unusable and every further append is
+    /// rejected until a fresh [`open`](Self::open) repairs the file.
     ///
     /// # Errors
     ///
-    /// [`LoopError::Memory`] if the file cannot be opened for append or
-    /// the line cannot be written and flushed.
-    fn append_line(path: &Path, line: &str) -> Result<(), LoopError> {
-        use std::io::Write as _;
+    /// [`LoopError::Memory`] if the file cannot be opened for append,
+    /// the line cannot be written and flushed, or the store is unusable
+    /// after an earlier unrecoverable append failure.
+    fn append_line(&self, line: &str) -> Result<(), LoopError> {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        if self.append_unusable.load(AtomicOrdering::SeqCst) {
+            return Err(LoopError::Memory(
+                "the memory file is unusable after an unrecoverable append failure; reopen the store to repair it"
+                    .to_string(),
+            ));
+        }
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
+            .open(&self.path)
             .map_err(|e| LoopError::Memory(format!("cannot open memory file for append: {e}")))?;
-        file.write_all(line.as_bytes())
+        let original_len = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| LoopError::Memory(format!("cannot size the memory file: {e}")))?;
+        let write_result = file
+            .write_all(line.as_bytes())
             .and_then(|()| file.write_all(b"\n"))
-            .and_then(|()| file.flush())
-            .map_err(|e| LoopError::Memory(format!("cannot append to memory file: {e}")))
+            .and_then(|()| file.flush());
+        if let Err(e) = write_result {
+            let truncation = file.set_len(original_len).and_then(|()| file.flush());
+            if truncation.is_err() {
+                self.append_unusable.store(true, AtomicOrdering::SeqCst);
+            }
+            return Err(LoopError::Memory(format!(
+                "cannot append to memory file: {e}"
+            )));
+        }
+        Ok(())
     }
 
     /// Rewrite `path` with `entries`, atomically.
@@ -305,6 +360,31 @@ impl FileMemoryStore {
     }
 }
 
+/// Split raw file bytes into complete lines and the trailing fragment.
+///
+/// Complete lines are the newline-terminated segments; the fragment is
+/// whatever follows the last newline (`None` when the file ends with a
+/// newline or is empty). A torn write's partial bytes can only ever be
+/// the fragment, so decoding it may fail without condemning the
+/// complete lines before it.
+fn split_complete_lines(bytes: &[u8]) -> (Vec<&[u8]>, Option<&[u8]>) {
+    let split_point = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at.saturating_add(1));
+    let (complete_region, fragment) = bytes.split_at(split_point);
+    let complete = complete_region
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    let trailing = if fragment.is_empty() {
+        None
+    } else {
+        Some(fragment)
+    };
+    (complete, trailing)
+}
+
 impl LoopMemory for FileMemoryStore {
     /// Append `entry` to the file and the in-memory mirror.
     ///
@@ -320,7 +400,7 @@ impl LoopMemory for FileMemoryStore {
                 LoopError::Memory(format!("memory entry serialization failed: {e}"))
             })?;
             let mut entries = recover_guard(self.entries.write());
-            Self::append_line(&self.path, &line)?;
+            self.append_line(&line)?;
             entries.push(entry);
             Ok(())
         })
@@ -382,8 +462,10 @@ impl LoopMemory for FileMemoryStore {
     /// persists the survivors with an atomic rewrite before swapping
     /// them into the mirror, so pruned entries do not come back on the
     /// next restart. On a rewrite failure the method returns `Err` with
-    /// both the file and the mirror still in their pre-consolidation
-    /// state — the two sides never diverge.
+    /// the file, the mirror, and the pending access stamps all still in
+    /// their pre-consolidation state — the stamps are only cleared once
+    /// the rewrite has succeeded, held under the access-log lock across
+    /// it, so the next pass re-folds them instead of losing them.
     fn consolidate(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
@@ -391,18 +473,17 @@ impl LoopMemory for FileMemoryStore {
             let now = SystemTime::now();
             let mut guard = recover_guard(self.entries.write());
             let mut next = guard.clone();
-            let stats = {
-                let mut access_log = recover_guard(self.access_log.lock());
-                for entry in &mut next {
-                    if let Some(stamp) = access_log.get(&entry.id) {
-                        entry.last_accessed = entry.last_accessed.max(Some(*stamp));
-                        entry.access_count = entry.access_count.saturating_add(1);
-                    }
+            let mut access_log = recover_guard(self.access_log.lock());
+            for entry in &mut next {
+                if let Some(stamp) = access_log.get(&entry.id) {
+                    entry.last_accessed = entry.last_accessed.max(Some(*stamp));
+                    entry.access_count = entry.access_count.saturating_add(1);
                 }
-                access_log.clear();
-                consolidate_entries(&mut next, &self.consolidation, now)
-            };
+            }
+            let stats = consolidate_entries(&mut next, &self.consolidation, now);
             Self::rewrite(&self.path, &next)?;
+            access_log.clear();
+            drop(access_log);
             *guard = next;
             Ok(stats)
         })
@@ -414,5 +495,169 @@ impl LoopMemory for FileMemoryStore {
     /// engine's consolidate hook after each run.
     fn len(&self) -> usize {
         recover_guard(self.entries.read()).len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_complete_lines;
+
+    #[test]
+    fn a_file_ending_in_a_newline_has_no_trailing_fragment() {
+        let (complete, trailing) = split_complete_lines(b"one\ntwo\n");
+        assert_eq!(complete, vec![b"one".as_slice(), b"two".as_slice()]);
+        assert!(trailing.is_none(), "nothing follows the last newline");
+    }
+
+    #[test]
+    fn bytes_after_the_last_newline_form_the_fragment() {
+        let (complete, trailing) = split_complete_lines(b"one\ntw");
+        assert_eq!(complete, vec![b"one".as_slice()]);
+        assert_eq!(trailing, Some(b"tw".as_slice()));
+    }
+
+    #[test]
+    fn a_file_with_no_newline_is_all_fragment() {
+        let (complete, trailing) = split_complete_lines(b"torn");
+        assert!(complete.is_empty(), "no newline means no complete line");
+        assert_eq!(trailing, Some(b"torn".as_slice()));
+    }
+
+    #[test]
+    fn an_empty_file_yields_no_lines_and_no_fragment() {
+        let (complete, trailing) = split_complete_lines(b"");
+        assert!(complete.is_empty());
+        assert!(trailing.is_none());
+    }
+
+    #[test]
+    fn append_line_writes_the_line_and_a_trailing_newline() {
+        let dir = std::env::temp_dir().join(format!(
+            "loopctl-file-memory-unit-append-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("append.jsonl");
+        assert!(
+            !path.try_exists().unwrap(),
+            "new() does not touch the disk, so the file starts absent"
+        );
+
+        let store = super::FileMemoryStore::new(&path);
+        store.append_line("{\"line\":1}").unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"line\":1}\n",
+            "an append is exactly the line plus its terminating newline"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rewrite_emits_one_line_per_entry_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!(
+            "loopctl-file-memory-unit-rewrite-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rewrite.jsonl");
+
+        let entries = vec![
+            crate::memory::MemoryEntry::new(crate::memory::MemoryCategory::Fact, "first"),
+            crate::memory::MemoryEntry::new(crate::memory::MemoryCategory::Fact, "second"),
+        ];
+        super::FileMemoryStore::rewrite(&path, &entries).unwrap();
+
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = rewritten.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per entry: {rewritten}");
+        assert!(
+            rewritten.ends_with('\n'),
+            "the file is newline-terminated: {rewritten:?}"
+        );
+        assert!(
+            !dir.join("rewrite.jsonl.tmp").try_exists().unwrap(),
+            "a successful rename consumes the temp file"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn flush_creates_the_file_from_new_and_persists_the_mirror() {
+        use crate::memory::LoopMemory as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "loopctl-file-memory-unit-flush-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flush.jsonl");
+
+        let store = super::FileMemoryStore::new(&path);
+        store.flush().unwrap();
+        assert!(
+            path.try_exists().unwrap() && std::fs::read_to_string(&path).unwrap().is_empty(),
+            "flushing an empty mirror creates an empty file"
+        );
+
+        store
+            .store(crate::memory::MemoryEntry::new(
+                crate::memory::MemoryCategory::Fact,
+                "flushed",
+            ))
+            .await
+            .unwrap();
+        store.flush().unwrap();
+        let flushed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            flushed.lines().count(),
+            1,
+            "the mirror is on disk: {flushed}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_entries_reports_a_missing_file_as_empty_and_intact() {
+        let (entries, torn) =
+            super::FileMemoryStore::load_entries(std::path::Path::new("/nonexistent-l21")).unwrap();
+        assert!(entries.is_empty());
+        assert!(!torn, "nothing was dropped, so there is nothing to repair");
+    }
+
+    #[test]
+    fn load_entries_flags_a_undecodable_trailing_fragment() {
+        let dir =
+            std::env::temp_dir().join(format!("loopctl-file-memory-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flag.jsonl");
+        std::fs::write(&path, b"{\"torn\"").unwrap();
+        let (entries, torn) = super::FileMemoryStore::load_entries(&path).unwrap();
+        assert!(entries.is_empty());
+        assert!(torn, "the caller must repair a torn tail");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_entries_keeps_a_complete_undecodable_line_loud() {
+        let dir = std::env::temp_dir().join(format!(
+            "loopctl-file-memory-unit-loud-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("loud.jsonl");
+        std::fs::write(&path, b"not json\nvalid later\n").unwrap();
+        assert!(
+            super::FileMemoryStore::load_entries(&path).is_err(),
+            "a complete malformed line is corruption, not a torn tail"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn blank_lines_do_not_reach_the_complete_list() {
+        let (complete, trailing) = split_complete_lines(b"\n\none\n\n");
+        assert_eq!(complete, vec![b"one".as_slice()]);
+        assert!(trailing.is_none());
     }
 }

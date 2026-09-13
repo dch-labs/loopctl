@@ -260,6 +260,99 @@ async fn a_torn_tail_is_repaired_so_later_stores_survive() {
 }
 
 #[tokio::test]
+async fn a_torn_utf8_fragment_is_dropped_and_repaired() {
+    let dir = temp_dir("torn-utf8");
+    let path = dir.join("memory.jsonl");
+
+    let entry = MemoryEntry::new(MemoryCategory::Fact, "a whole multi-byte line survived");
+    let mut contents = serde_json::to_string(&entry).unwrap().into_bytes();
+    contents.push(b'\n');
+    contents.extend_from_slice(b"{\"id\":\"torn \xFF\xFE");
+    std::fs::write(&path, &contents).unwrap();
+
+    let store = FileMemoryStore::open(&path).unwrap();
+    assert_eq!(
+        store.len(),
+        1,
+        "the invalid-UTF-8 tail fragment is dropped, the complete lines load"
+    );
+    let second = MemoryEntry::new(MemoryCategory::Fact, "stored after the utf8 repair");
+    store.store(second.clone()).await.unwrap();
+    drop(store);
+
+    let reopened = FileMemoryStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.len(),
+        2,
+        "the repair removed the fragment before the append"
+    );
+    assert_eq!(
+        reopened
+            .retrieve("whole multi-byte", 3)
+            .await
+            .unwrap()
+            .first()
+            .map(|e| e.id),
+        Some(entry.id),
+        "the pre-crash entry survives"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn invalid_utf8_in_a_complete_line_fails_the_open() {
+    let dir = temp_dir("utf8-corrupt");
+    let path = dir.join("memory.jsonl");
+
+    let entry = MemoryEntry::new(MemoryCategory::Fact, "a valid entry");
+    let mut contents = b"not json \xFF\n".to_vec();
+    contents.extend_from_slice(serde_json::to_string(&entry).unwrap().as_bytes());
+    contents.push(b'\n');
+    std::fs::write(&path, &contents).unwrap();
+
+    let result = FileMemoryStore::open(&path);
+    assert!(
+        matches!(result, Err(loopctl::error::LoopError::Memory(_))),
+        "invalid UTF-8 in a complete (newline-terminated) line is corruption, not a torn tail"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn access_stamps_survive_a_failed_consolidation() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = temp_dir("stamps-survive");
+    let path = dir.join("memory.jsonl");
+    let store = FileMemoryStore::open(&path).unwrap();
+    let mut entry = MemoryEntry::new(MemoryCategory::Fact, "grip large files with both hands");
+    entry.relevance = 0.9;
+    store.store(entry.clone()).await.unwrap();
+    store.retrieve("grip large files", 3).await.unwrap();
+
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o500);
+    std::fs::set_permissions(&dir, perms).unwrap();
+    let failed = store.consolidate().await;
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&dir, perms).unwrap();
+    assert!(failed.is_err(), "the rewrite cannot create its temp file");
+
+    store.consolidate().await.unwrap();
+    let reloaded = store.retrieve("grip large files", 3).await.unwrap();
+    let stamped = reloaded
+        .first()
+        .expect("the entry is retrievable after the successful pass");
+    assert_eq!(
+        stamped.access_count, 1,
+        "the access stamp from before the failed pass was preserved and re-folded, not lost"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn concurrent_consolidations_leave_a_reopenable_store() {
     let dir = temp_dir("concurrent-consolidate");
     let path = dir.join("memory.jsonl");
@@ -292,6 +385,28 @@ async fn concurrent_consolidations_leave_a_reopenable_store() {
         "no temp file is left behind"
     );
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unrecoverable_append_failure_marks_the_store_unusable() {
+    let store = FileMemoryStore::new("/dev/full");
+    let first = store
+        .store(MemoryEntry::new(MemoryCategory::Fact, "first"))
+        .await;
+    assert!(
+        first.is_err(),
+        "writing to /dev/full always fails with ENOSPC"
+    );
+    let second = store
+        .store(MemoryEntry::new(MemoryCategory::Fact, "second"))
+        .await;
+    let message = second.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(
+        message.contains("unusable"),
+        "when even the truncation fails, later appends are rejected until \
+        the store is reopened: {message}"
+    );
 }
 
 #[tokio::test]

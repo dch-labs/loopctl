@@ -562,13 +562,14 @@ fn access_count_column(count: usize) -> i64 {
 
 /// Quote each query term for FTS5 and join with `OR`.
 ///
-/// Single quotes inside a term are doubled per FTS5 string syntax, so
-/// arbitrary user text can never produce invalid match syntax; `None`
-/// for a whitespace-only query, which matches nothing by construction.
+/// A phrase in FTS5 match syntax is a double-quoted string, with an
+/// embedded double quote doubled — so arbitrary user text can never
+/// produce invalid match syntax; `None` for a whitespace-only query,
+/// which matches nothing by construction.
 fn fts_match_expression(query: &str) -> Option<String> {
     let terms = query
         .split_whitespace()
-        .map(|term| format!("'{}'", term.replace('\'', "''")))
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect::<Vec<_>>();
     if terms.is_empty() {
         None
@@ -672,29 +673,33 @@ impl LoopMemory for SqliteMemoryStore {
     /// [`consolidate_entries`](loopctl::memory::consolidate::consolidate_entries)
     /// — the same decay, merge, and prune pass every backend runs — then
     /// rewrites the table and the full-text index in one transaction, so
-    /// pruned entries stay gone after a restart.
+    /// pruned entries stay gone after a restart. The transaction opens
+    /// before the load: a concurrent store's commit either precedes this
+    /// pass's snapshot or fails its write upgrade — it can never land
+    /// between the read and the rewrite and be silently clobbered. The
+    /// access stamps are cleared only after the commit succeeds, so a
+    /// failed pass leaves them pending for the next one to re-fold.
     fn consolidate(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
         Box::pin(async move {
             let now = SystemTime::now();
             let mut conn = recover_guard(self.conn.lock());
-            let mut entries = Self::load_all_entries(&conn)?;
+            let tx = conn
+                .transaction()
+                .map_err(SqliteMemoryError::from)
+                .map_err(LoopError::from)?;
+            let mut entries = Self::load_all_entries(&tx)?;
             {
-                let mut access_log = recover_guard(self.access_log.lock());
+                let access_log = recover_guard(self.access_log.lock());
                 for entry in &mut entries {
                     if let Some(stamp) = access_log.get(&entry.id) {
                         entry.last_accessed = entry.last_accessed.max(Some(*stamp));
                         entry.access_count = entry.access_count.saturating_add(1);
                     }
                 }
-                access_log.clear();
             }
             let stats = consolidate_entries(&mut entries, &self.consolidation, now);
-            let tx = conn
-                .transaction()
-                .map_err(SqliteMemoryError::from)
-                .map_err(LoopError::from)?;
             tx.execute("DELETE FROM memory_entries", [])
                 .map_err(SqliteMemoryError::from)?;
             tx.execute("DELETE FROM memory_fts", [])
@@ -703,6 +708,7 @@ impl LoopMemory for SqliteMemoryStore {
                 Self::insert_entry(&tx, entry)?;
             }
             tx.commit().map_err(SqliteMemoryError::from)?;
+            recover_guard(self.access_log.lock()).clear();
             Ok(stats)
         })
     }
@@ -725,5 +731,187 @@ impl LoopMemory for SqliteMemoryStore {
                 0
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EntryRow, access_count_column, category_from_name, category_name, decode_entry,
+        fts_match_expression, millis_to_time, time_to_millis,
+    };
+    use crate::error::SqliteMemoryError;
+    use loopctl::memory::MemoryCategory;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn valid_row() -> EntryRow {
+        EntryRow {
+            id: "0b9a2c78-6d1e-4a3f-8f2c-9c5a6b7d8e9f".to_string(),
+            category: "strategy".to_string(),
+            memory: "verify the diff compiles".to_string(),
+            tags: "[\"editing\"]".to_string(),
+            created_at: 1_234_567_890_000,
+            relevance: 0.42,
+            access_count: 7,
+            validated: 1,
+            last_accessed: Some(1_234_567_891_000),
+            last_decayed: None,
+        }
+    }
+
+    #[test]
+    fn decode_entry_rebuilds_every_field() {
+        let entry = decode_entry(&valid_row()).unwrap();
+        assert_eq!(entry.memory, "verify the diff compiles");
+        assert_eq!(entry.category, MemoryCategory::Strategy);
+        assert_eq!(entry.tags, vec!["editing".to_string()]);
+        assert!((entry.relevance - 0.42).abs() < 1e-6);
+        assert_eq!(entry.access_count, 7);
+        assert!(entry.validated);
+        assert_eq!(
+            entry.created_at,
+            UNIX_EPOCH + Duration::from_secs(1_234_567_890)
+        );
+        assert_eq!(entry.last_decayed, None);
+    }
+
+    #[test]
+    fn decode_entry_rejects_a_non_uuid_id() {
+        let mut row = valid_row();
+        row.id = "not-a-uuid".to_string();
+        assert!(matches!(
+            decode_entry(&row),
+            Err(SqliteMemoryError::InvalidEntry(_))
+        ));
+    }
+
+    #[test]
+    fn decode_entry_rejects_an_unknown_category() {
+        let mut row = valid_row();
+        row.category = "no_such_category".to_string();
+        assert!(decode_entry(&row).is_err());
+    }
+
+    #[test]
+    fn decode_entry_rejects_malformed_tags_json() {
+        let mut row = valid_row();
+        row.tags = "not json".to_string();
+        assert!(decode_entry(&row).is_err());
+    }
+
+    #[test]
+    fn category_names_round_trip_through_the_serde_form() {
+        for category in [
+            MemoryCategory::Fact,
+            MemoryCategory::Strategy,
+            MemoryCategory::ErrorPattern,
+        ] {
+            let name = category_name(category).unwrap();
+            assert_eq!(category_from_name(&name).unwrap(), category);
+        }
+        assert!(category_from_name("unknown").is_err());
+    }
+
+    #[test]
+    fn time_conversions_round_trip_at_millisecond_resolution() {
+        let stamp = UNIX_EPOCH + Duration::from_millis(1_724_000_000_123);
+        assert_eq!(millis_to_time(time_to_millis(stamp)), stamp);
+    }
+
+    #[test]
+    fn pre_epoch_times_clamp_to_zero_and_negatives_to_the_epoch() {
+        let before = UNIX_EPOCH - Duration::from_secs(10);
+        assert_eq!(time_to_millis(before), 0);
+        assert_eq!(millis_to_time(-1), UNIX_EPOCH);
+    }
+
+    #[test]
+    fn huge_durations_saturate_instead_of_panicking() {
+        let enormous = UNIX_EPOCH + Duration::from_millis(u64::MAX);
+        assert_eq!(time_to_millis(enormous), i64::MAX);
+        assert_eq!(access_count_column(usize::MAX), i64::MAX);
+    }
+
+    fn seeded_connection() -> (rusqlite::Connection, Vec<loopctl::memory::MemoryEntry>) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::SqliteMemoryStore::configure(&conn).unwrap();
+        let mut entries = Vec::new();
+        for (text, relevance) in [
+            ("alpha notes", 0.9),
+            ("gamma notes", 0.5),
+            ("plain text", 0.1),
+        ] {
+            let mut entry =
+                loopctl::memory::MemoryEntry::new(loopctl::memory::MemoryCategory::Fact, text);
+            entry.relevance = relevance;
+            super::SqliteMemoryStore::insert_entry(&conn, &entry).unwrap();
+            entries.push(entry);
+        }
+        (conn, entries)
+    }
+
+    #[test]
+    fn like_candidates_match_any_query_word() {
+        let (conn, entries) = seeded_connection();
+        let words: Vec<String> = vec!["alpha".to_string(), "gamma".to_string()];
+        let ids = super::SqliteMemoryStore::like_candidate_ids(&conn, &words).unwrap();
+        assert_eq!(ids.len(), 2, "each word contributes its own rows");
+        assert!(ids.contains(&entries[0].id.to_string()));
+        assert!(ids.contains(&entries[1].id.to_string()));
+    }
+
+    #[test]
+    fn top_relevance_excluding_skips_excluded_ids_and_orders_by_relevance() {
+        let (conn, entries) = seeded_connection();
+        let excluded: std::collections::HashSet<String> = [entries[0].id.to_string()].into();
+        let top = super::SqliteMemoryStore::top_relevance_excluding(&conn, &excluded, 1).unwrap();
+        assert_eq!(top.len(), 1, "the limit is respected");
+        assert_eq!(
+            top[0].id, entries[1].id,
+            "the highest-relevance entry that is not excluded is delivered"
+        );
+    }
+
+    #[test]
+    fn load_entries_by_ids_preserves_the_callers_order() {
+        let (conn, entries) = seeded_connection();
+        let wanted: Vec<String> = vec![entries[2].id.to_string(), entries[0].id.to_string()];
+        let loaded = super::SqliteMemoryStore::load_entries_by_ids(&conn, &wanted).unwrap();
+        assert_eq!(
+            loaded.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![entries[2].id, entries[0].id],
+            "the delivery order follows the requested ids, not the table order"
+        );
+    }
+
+    #[test]
+    fn fts_candidates_match_terms_and_report_fallibility() {
+        let (conn, entries) = seeded_connection();
+        let matched = super::SqliteMemoryStore::fts_candidate_ids(&conn, "\"alpha\"", 10);
+        assert_eq!(
+            matched,
+            Some(vec![entries[0].id.to_string()]),
+            "a matching term yields the entry's id"
+        );
+
+        conn.execute("DROP TABLE memory_fts", []).unwrap();
+        assert!(
+            super::SqliteMemoryStore::fts_candidate_ids(&conn, "\"alpha\"", 10).is_none(),
+            "an FTS5 failure signals the LIKE fallback with None"
+        );
+    }
+
+    #[test]
+    fn fts_terms_are_quoted_joined_and_escapable() {
+        assert_eq!(
+            fts_match_expression("rust async").as_deref(),
+            Some("\"rust\" OR \"async\"")
+        );
+        assert_eq!(
+            fts_match_expression("it\"s").as_deref(),
+            Some("\"it\"\"s\"")
+        );
+        assert_eq!(fts_match_expression("   "), None);
+        assert_eq!(fts_match_expression(""), None);
     }
 }

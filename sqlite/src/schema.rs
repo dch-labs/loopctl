@@ -36,7 +36,9 @@ CREATE INDEX IF NOT EXISTS idx_memory_category  ON memory_entries(category);";
 /// rowid — `INSERT OR REPLACE` on the core table assigns a fresh rowid,
 /// which would silently desynchronize a rowid-linked external-content
 /// index. The porter unicode61 tokenizer gives stemming and
-/// case-folding; candidate ranking itself happens in Rust with the
-/// shared [`score_entry`](loopctl::memory::score::score_entry), so
-/// matched candidates order by the same formula as the flat backends.
+/// case-folding. Retrieval currently loads every entry and ranks it in
+/// Rust with the shared [`score_entry`](loopctl::memory::score::score_entry)
+/// for exact parity with the flat backends, so this index is maintained
+/// on every write but not yet consulted — it is reserved for a future
+/// indexed path that preserves that ranking contract.
 pub const CREATE_FTS_TABLE: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(memory, id UNINDEXED, tokenize='porter unicode61')";

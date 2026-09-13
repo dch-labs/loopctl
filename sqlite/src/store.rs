@@ -21,8 +21,8 @@ use loopctl::memory::LoopMemory;
 use loopctl::memory::consolidate::{ConsolidationConfig, consolidate_entries};
 use loopctl::memory::entry::{ConsolidationStats, MemoryCategory, MemoryEntry};
 use loopctl::memory::score::score_entry;
-use rusqlite::{Connection, params, params_from_iter};
-use std::collections::{HashMap, HashSet};
+use rusqlite::{Connection, params};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -40,16 +40,13 @@ use uuid::Uuid;
 ///
 /// # Retrieval shape
 ///
-/// Candidates come from the FTS5 index (or the `LIKE` fallback when the
-/// query is not valid FTS5 syntax, e.g. odd punctuation), are re-scored
-/// with [`score_entry`](loopctl::memory::score::score_entry), and — when
-/// fewer than `limit` matched — are topped up from the
-/// highest-relevance rows, mirroring the flat backends' behavior of
-/// delivering baseline-ranked entries when the store is sparser than
-/// the limit. Recall is token-level: FTS5 matches stemmed whole words,
-/// so a query that appears only as a substring inside a word (the flat
-/// backends' substring matching) surfaces through fill-up, not as a
-/// match.
+/// Retrieval loads every entry and ranks it with the shared
+/// [`score_entry`](loopctl::memory::score::score_entry) — the same
+/// results, ordering, and tie-breaking as the flat backends (loading in
+/// rowid order matches their insertion-order stable sort, so even
+/// baseline ties deliver identically). The FTS5 index is maintained on
+/// every write but not consulted by retrieval; it is reserved for a
+/// future indexed path that can preserve this exact ranking contract.
 ///
 /// # Example
 ///
@@ -271,125 +268,6 @@ impl SqliteMemoryStore {
         collect_decoded(rows)
     }
 
-    /// Load the entries with the given ids, preserving the input order.
-    ///
-    /// # Errors
-    ///
-    /// The SELECT fails, or any stored row does not decode into a valid
-    /// entry.
-    fn load_entries_by_ids(
-        conn: &Connection,
-        ids: &[String],
-    ) -> Result<Vec<MemoryEntry>, SqliteMemoryError> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql =
-            format!("SELECT {ENTRY_COLUMNS} FROM memory_entries WHERE id IN ({placeholders})");
-        let mut statement = conn.prepare(&sql).map_err(SqliteMemoryError::from)?;
-        let rows = statement
-            .query_map(params_from_iter(ids.iter()), read_entry_row)
-            .map_err(SqliteMemoryError::from)?;
-        let loaded = collect_decoded(rows)?;
-        let by_id: HashMap<String, MemoryEntry> = loaded
-            .into_iter()
-            .map(|entry| (entry.id.to_string(), entry))
-            .collect();
-        Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
-    }
-
-    /// Load up to `limit` highest-relevance entries not in `exclude`.
-    ///
-    /// The retrieval fill-up: when fewer entries than `limit` matched
-    /// the query, the flat backends still deliver baseline-ranked
-    /// entries, so this tops the candidate set up the same way.
-    ///
-    /// # Errors
-    ///
-    /// The SELECT fails, or any stored row does not decode into a valid
-    /// entry.
-    fn top_relevance_excluding(
-        conn: &Connection,
-        exclude: &HashSet<String>,
-        limit: usize,
-    ) -> Result<Vec<MemoryEntry>, SqliteMemoryError> {
-        let sql =
-            format!("SELECT {ENTRY_COLUMNS} FROM memory_entries ORDER BY relevance DESC, rowid");
-        let mut statement = conn.prepare(&sql).map_err(SqliteMemoryError::from)?;
-        let rows = statement
-            .query_map([], read_entry_row)
-            .map_err(SqliteMemoryError::from)?;
-        let decoded = collect_decoded(rows)?;
-        Ok(decoded
-            .into_iter()
-            .filter(|entry| !exclude.contains(&entry.id.to_string()))
-            .take(limit)
-            .collect())
-    }
-
-    /// Ids of entries the FTS5 index matches, or `None` to fall back.
-    ///
-    /// Any FTS5 failure — unsupported syntax, index trouble — yields
-    /// `None` after a warning, and the caller retries with `LIKE`; a
-    /// query that is valid but matches nothing yields `Some(vec![])`.
-    fn fts_candidate_ids(conn: &Connection, expression: &str, limit: usize) -> Option<Vec<String>> {
-        let result = (|| -> Result<Vec<String>, rusqlite::Error> {
-            let mut statement = conn.prepare(
-                "SELECT id FROM memory_fts WHERE memory MATCH ?1 \
-                     ORDER BY bm25(memory_fts) LIMIT ?2",
-            )?;
-            let rows = statement.query_map(
-                params![expression, i64::try_from(limit).unwrap_or(i64::MAX)],
-                |row| row.get::<_, String>(0),
-            )?;
-            rows.collect()
-        })();
-        match result {
-            Ok(ids) => Some(ids),
-            Err(error) => {
-                tracing::warn!(%error, "fts query failed; falling back to LIKE");
-                None
-            }
-        }
-    }
-
-    /// Ids of entries whose memory text contains any query word.
-    ///
-    /// The fallback path when FTS5 rejects the query; `%` and `_` in the
-    /// query act as their LIKE selves, which can only over-match.
-    ///
-    /// # Errors
-    ///
-    /// The SELECT fails.
-    fn like_candidate_ids(
-        conn: &Connection,
-        words: &[String],
-    ) -> Result<Vec<String>, SqliteMemoryError> {
-        if words.is_empty() {
-            return Ok(Vec::new());
-        }
-        let clauses = words
-            .iter()
-            .enumerate()
-            .map(|(index, _)| format!("memory LIKE ?{}", index.saturating_add(1)))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        let patterns = words
-            .iter()
-            .map(|word| format!("%{word}%"))
-            .collect::<Vec<_>>();
-        let sql = format!("SELECT id FROM memory_entries WHERE {clauses}");
-        let mut statement = conn.prepare(&sql).map_err(SqliteMemoryError::from)?;
-        let rows = statement
-            .query_map(params_from_iter(patterns), |row| row.get::<_, String>(0))
-            .map_err(SqliteMemoryError::from)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(SqliteMemoryError::from)
-    }
-
     /// Write one entry's core row and FTS row inside the given transaction.
     ///
     /// The core write is `INSERT OR REPLACE` keyed by the entry's UUID,
@@ -560,24 +438,6 @@ fn access_count_column(count: usize) -> i64 {
     i64::try_from(count).unwrap_or(i64::MAX)
 }
 
-/// Quote each query term for FTS5 and join with `OR`.
-///
-/// A phrase in FTS5 match syntax is a double-quoted string, with an
-/// embedded double quote doubled — so arbitrary user text can never
-/// produce invalid match syntax; `None` for a whitespace-only query,
-/// which matches nothing by construction.
-fn fts_match_expression(query: &str) -> Option<String> {
-    let terms = query
-        .split_whitespace()
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-        .collect::<Vec<_>>();
-    if terms.is_empty() {
-        None
-    } else {
-        Some(terms.join(" OR "))
-    }
-}
-
 impl LoopMemory for SqliteMemoryStore {
     /// Upsert the entry and its full-text row in one transaction.
     ///
@@ -599,14 +459,17 @@ impl LoopMemory for SqliteMemoryStore {
         })
     }
 
-    /// Full-text candidates, re-ranked with the shared scorer.
+    /// Rank the whole store with the shared scorer, identical to the
+    /// flat backends.
     ///
-    /// Pulls candidates from FTS5 (or `LIKE` on any FTS5 failure), tops
-    /// the set up from the highest-relevance rows when fewer than
-    /// `limit` matched — the flat backends deliver baseline-ranked
-    /// entries on sparse stores — then sorts with
-    /// [`score_entry`](loopctl::memory::score::score_entry) and stamps
-    /// the access log for delivered query-matched entries.
+    /// Loads every entry in rowid order, scores each with
+    /// [`score_entry`](loopctl::memory::score::score_entry), sorts by
+    /// descending composite score, and takes `limit` — so results,
+    /// ordering, and tie-breaking all match
+    /// [`InMemoryStore`](loopctl::memory::builtin::InMemoryStore)
+    /// (and, under loopctl's `file_memory` feature,
+    /// `FileMemoryStore`) — then stamps the access log for delivered
+    /// query-matched entries.
     fn retrieve<'a>(
         &'a self,
         query: &'a str,
@@ -617,32 +480,13 @@ impl LoopMemory for SqliteMemoryStore {
             let query_lower = query.to_lowercase();
             let trimmed = query_lower.trim().to_string();
             let words: Vec<String> = query_lower.split_whitespace().map(str::to_string).collect();
-            let mut entries = {
+            let entries = {
                 let conn = recover_guard(self.conn.lock());
-                let mut candidates = if trimmed.is_empty() {
-                    Self::load_all_entries(&conn)?
-                } else {
-                    let ids = fts_match_expression(&trimmed)
-                        .and_then(|expression| {
-                            Self::fts_candidate_ids(&conn, &expression, limit.saturating_mul(5))
-                        })
-                        .map_or_else(|| Self::like_candidate_ids(&conn, &words), Ok)?;
-                    Self::load_entries_by_ids(&conn, &ids)?
-                };
-                if candidates.len() < limit {
-                    let present: HashSet<String> = candidates
-                        .iter()
-                        .map(|entry| entry.id.to_string())
-                        .collect();
-                    let needed = limit.saturating_sub(candidates.len());
-                    let fill = Self::top_relevance_excluding(&conn, &present, needed)?;
-                    candidates.extend(fill);
-                }
-                candidates
+                Self::load_all_entries(&conn)?
             };
             let word_refs: Vec<&str> = words.iter().map(String::as_str).collect();
             let mut scored: Vec<(f32, bool, MemoryEntry)> = entries
-                .drain(..)
+                .into_iter()
                 .map(|entry| {
                     let (score, matched) = score_entry(&entry, &trimmed, &word_refs);
                     (score, matched, entry)
@@ -738,7 +582,7 @@ impl LoopMemory for SqliteMemoryStore {
 mod tests {
     use super::{
         EntryRow, access_count_column, category_from_name, category_name, decode_entry,
-        fts_match_expression, millis_to_time, time_to_millis,
+        millis_to_time, time_to_millis,
     };
     use crate::error::SqliteMemoryError;
     use loopctl::memory::MemoryCategory;
@@ -830,88 +674,5 @@ mod tests {
         let enormous = UNIX_EPOCH + Duration::from_millis(u64::MAX);
         assert_eq!(time_to_millis(enormous), i64::MAX);
         assert_eq!(access_count_column(usize::MAX), i64::MAX);
-    }
-
-    fn seeded_connection() -> (rusqlite::Connection, Vec<loopctl::memory::MemoryEntry>) {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::SqliteMemoryStore::configure(&conn).unwrap();
-        let mut entries = Vec::new();
-        for (text, relevance) in [
-            ("alpha notes", 0.9),
-            ("gamma notes", 0.5),
-            ("plain text", 0.1),
-        ] {
-            let mut entry =
-                loopctl::memory::MemoryEntry::new(loopctl::memory::MemoryCategory::Fact, text);
-            entry.relevance = relevance;
-            super::SqliteMemoryStore::insert_entry(&conn, &entry).unwrap();
-            entries.push(entry);
-        }
-        (conn, entries)
-    }
-
-    #[test]
-    fn like_candidates_match_any_query_word() {
-        let (conn, entries) = seeded_connection();
-        let words: Vec<String> = vec!["alpha".to_string(), "gamma".to_string()];
-        let ids = super::SqliteMemoryStore::like_candidate_ids(&conn, &words).unwrap();
-        assert_eq!(ids.len(), 2, "each word contributes its own rows");
-        assert!(ids.contains(&entries[0].id.to_string()));
-        assert!(ids.contains(&entries[1].id.to_string()));
-    }
-
-    #[test]
-    fn top_relevance_excluding_skips_excluded_ids_and_orders_by_relevance() {
-        let (conn, entries) = seeded_connection();
-        let excluded: std::collections::HashSet<String> = [entries[0].id.to_string()].into();
-        let top = super::SqliteMemoryStore::top_relevance_excluding(&conn, &excluded, 1).unwrap();
-        assert_eq!(top.len(), 1, "the limit is respected");
-        assert_eq!(
-            top[0].id, entries[1].id,
-            "the highest-relevance entry that is not excluded is delivered"
-        );
-    }
-
-    #[test]
-    fn load_entries_by_ids_preserves_the_callers_order() {
-        let (conn, entries) = seeded_connection();
-        let wanted: Vec<String> = vec![entries[2].id.to_string(), entries[0].id.to_string()];
-        let loaded = super::SqliteMemoryStore::load_entries_by_ids(&conn, &wanted).unwrap();
-        assert_eq!(
-            loaded.iter().map(|entry| entry.id).collect::<Vec<_>>(),
-            vec![entries[2].id, entries[0].id],
-            "the delivery order follows the requested ids, not the table order"
-        );
-    }
-
-    #[test]
-    fn fts_candidates_match_terms_and_report_fallibility() {
-        let (conn, entries) = seeded_connection();
-        let matched = super::SqliteMemoryStore::fts_candidate_ids(&conn, "\"alpha\"", 10);
-        assert_eq!(
-            matched,
-            Some(vec![entries[0].id.to_string()]),
-            "a matching term yields the entry's id"
-        );
-
-        conn.execute("DROP TABLE memory_fts", []).unwrap();
-        assert!(
-            super::SqliteMemoryStore::fts_candidate_ids(&conn, "\"alpha\"", 10).is_none(),
-            "an FTS5 failure signals the LIKE fallback with None"
-        );
-    }
-
-    #[test]
-    fn fts_terms_are_quoted_joined_and_escapable() {
-        assert_eq!(
-            fts_match_expression("rust async").as_deref(),
-            Some("\"rust\" OR \"async\"")
-        );
-        assert_eq!(
-            fts_match_expression("it\"s").as_deref(),
-            Some("\"it\"\"s\"")
-        );
-        assert_eq!(fts_match_expression("   "), None);
-        assert_eq!(fts_match_expression(""), None);
     }
 }

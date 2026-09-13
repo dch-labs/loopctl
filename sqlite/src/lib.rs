@@ -4,12 +4,11 @@
 //! [`SqliteMemoryStore`] implements loopctl's memory trait over a local
 //! SQLite database (`rusqlite` with the `bundled` feature, so no system
 //! SQLite is required): WAL journaling for concurrent readers with one
-//! writer, an FTS5 full-text index over the memory text with a `LIKE`
-//! fallback, and retrieval re-ranked in Rust with loopctl's shared
-//! scorer — matched candidates order by the same formula as the other
-//! backends, though recall is token-level (stemmed whole words; a
-//! substring-only hit surfaces through baseline fill-up, not as a
-//! match).
+//! writer, and retrieval that loads every entry and ranks it in Rust
+//! with loopctl's shared scorer — the same entries match, in the same
+//! order with the same tie-breaking, as the in-memory and file
+//! backends. An FTS5 index is maintained on every write for a future
+//! indexed path.
 //!
 //! Add this crate as a direct dependency; no feature on `loopctl`
 //! itself is required:

@@ -275,38 +275,102 @@ async fn token_matches_rank_identically_to_the_in_memory_store() {
 }
 
 #[tokio::test]
-async fn substring_hits_surface_as_fill_up_in_sqlite() {
+async fn substring_hits_match_exactly_like_the_flat_backends() {
     let sqlite_store = SqliteMemoryStore::in_memory().unwrap();
     let flat_store = loopctl::memory::builtin::InMemoryStore::new();
 
-    let entry = MemoryEntry::new(MemoryCategory::Fact, "the currency crashed overnight");
+    let mut entry = MemoryEntry::new(MemoryCategory::Fact, "the currency crashed overnight");
+    entry.relevance = 0.5;
     sqlite_store.store(entry.clone()).await.unwrap();
     flat_store.store(entry.clone()).await.unwrap();
+    for filler_text in ["a quiet note about rust", "another quiet note about async"] {
+        let mut filler = MemoryEntry::new(MemoryCategory::Fact, filler_text);
+        filler.relevance = 0.9;
+        sqlite_store.store(filler.clone()).await.unwrap();
+        flat_store.store(filler).await.unwrap();
+    }
 
-    let from_flat = flat_store.retrieve("curr", 3).await.unwrap();
-    let from_sqlite = sqlite_store.retrieve("curr", 3).await.unwrap();
+    let from_flat = flat_store.retrieve("curr", 2).await.unwrap();
+    let from_sqlite = sqlite_store.retrieve("curr", 2).await.unwrap();
     assert_eq!(
         from_flat.first().map(|e| e.id),
         Some(entry.id),
         "the flat backends match substrings anywhere in the text"
     );
     assert_eq!(
-        from_sqlite.iter().map(|e| e.id).collect::<Vec<_>>(),
-        vec![entry.id],
-        "FTS5 matches whole tokens, so the substring-only hit surfaces via \
-        baseline fill-up — delivered, but not a token match"
-    );
-
-    let token_hit = sqlite_store.retrieve("currency", 3).await.unwrap();
-    assert_eq!(
-        token_hit.first().map(|e| e.id),
+        from_sqlite.first().map(|e| e.id),
         Some(entry.id),
-        "the whole token matches through FTS5"
+        "the text scan carries the same substring match below the \
+        fill-up cut — same result, not a rescued baseline entry"
     );
 }
 
 #[tokio::test]
-async fn a_missing_fts_index_falls_back_to_like() {
+async fn tag_hits_match_exactly_like_the_flat_backends() {
+    let sqlite_store = SqliteMemoryStore::in_memory().unwrap();
+    let flat_store = loopctl::memory::builtin::InMemoryStore::new();
+
+    let mut tagged = MemoryEntry::new(MemoryCategory::Insight, "scripts live in ops");
+    tagged.relevance = 0.5;
+    tagged.tags.push("deploy".to_string());
+    let mut textual = MemoryEntry::new(MemoryCategory::Fact, "deploy checklist nightly");
+    textual.relevance = 0.4;
+    sqlite_store.store(tagged.clone()).await.unwrap();
+    flat_store.store(tagged.clone()).await.unwrap();
+    sqlite_store.store(textual.clone()).await.unwrap();
+    flat_store.store(textual.clone()).await.unwrap();
+    for filler_text in ["a quiet note about rust", "another quiet note about async"] {
+        let mut filler = MemoryEntry::new(MemoryCategory::Fact, filler_text);
+        filler.relevance = 0.9;
+        sqlite_store.store(filler.clone()).await.unwrap();
+        flat_store.store(filler).await.unwrap();
+    }
+
+    let from_flat = flat_store.retrieve("deploy", 2).await.unwrap();
+    let from_sqlite = sqlite_store.retrieve("deploy", 2).await.unwrap();
+    let flat_ids: Vec<_> = from_flat.iter().map(|entry| entry.id).collect();
+    let sqlite_ids: Vec<_> = from_sqlite.iter().map(|entry| entry.id).collect();
+    assert_eq!(
+        flat_ids, sqlite_ids,
+        "tag matches reach the candidate pool and rank identically to the \
+        flat backends — fill-up alone cannot deliver them below the limit"
+    );
+    assert_eq!(
+        sqlite_ids.first(),
+        Some(&textual.id),
+        "the word hit ranks first"
+    );
+    assert_eq!(
+        sqlite_ids.get(1),
+        Some(&tagged.id),
+        "the tag hit follows on its bonus"
+    );
+}
+
+#[tokio::test]
+async fn equal_score_ties_order_like_the_flat_backends() {
+    let sqlite_store = SqliteMemoryStore::in_memory().unwrap();
+    let flat_store = loopctl::memory::builtin::InMemoryStore::new();
+
+    for text in ["first quiet note", "second quiet note", "third quiet note"] {
+        let entry = MemoryEntry::new(MemoryCategory::Fact, text);
+        sqlite_store.store(entry.clone()).await.unwrap();
+        flat_store.store(entry).await.unwrap();
+    }
+
+    let from_flat = flat_store.retrieve("unrelated", 2).await.unwrap();
+    let from_sqlite = sqlite_store.retrieve("unrelated", 2).await.unwrap();
+    let flat_ids: Vec<_> = from_flat.iter().map(|entry| entry.id).collect();
+    let sqlite_ids: Vec<_> = from_sqlite.iter().map(|entry| entry.id).collect();
+    assert_eq!(
+        flat_ids, sqlite_ids,
+        "baseline ties keep insertion order in both stores — rowid order \
+        matches the flat stores' stable sort"
+    );
+}
+
+#[tokio::test]
+async fn losing_the_full_text_index_loses_no_recall() {
     let dir = temp_dir("fts-fallback");
     let path = dir.join("memory.db");
 
@@ -332,7 +396,7 @@ async fn a_missing_fts_index_falls_back_to_like() {
     assert_eq!(
         hits.first().map(|entry| entry.id),
         Some(target.id),
-        "retrieve still finds the low-relevance entry through the LIKE fallback — baseline fill-up alone could not reach it below the limit"
+        "the full-text index is a supplement — losing it costs no recall, the text scan still reaches the low-relevance entry below the limit"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }

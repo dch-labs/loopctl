@@ -232,13 +232,13 @@ impl FileMemoryStore {
     /// (both handles then observe the same entries); otherwise it
     /// starts empty without reading or creating the file — the first
     /// [`store`](LoopMemory::store) or [`flush`](Self::flush) creates
-    /// it. Use [`open`](Self::open) to load an existing file when no
-    /// handle is live.
+    /// it. Entries already in an existing file are neither loaded nor
+    /// preserved: the next `flush` or `consolidate` persists only what
+    /// the live handles stored. Use [`open`](Self::open) to load an
+    /// existing file when no handle is live.
     #[must_use]
     pub fn new(path: impl AsRef<Path>) -> Self {
-        let path = path.as_ref().to_path_buf();
-        let key = std::fs::canonicalize(&path)
-            .unwrap_or_else(|_| std::path::absolute(&path).unwrap_or_else(|_| path.clone()));
+        let key = Self::registry_key(path.as_ref());
         let inner = {
             let mut registry = recover_guard(live_stores().lock());
             let attached = registry.get(&key).and_then(Weak::upgrade);
@@ -255,6 +255,29 @@ impl FileMemoryStore {
             inner,
             consolidation: ConsolidationConfig::default(),
         }
+    }
+
+    /// Derive the registry key for a path that may not exist yet.
+    ///
+    /// An existing file canonicalizes outright. A missing final
+    /// component carries no symlink ambiguity of its own, so
+    /// canonicalizing the parent and re-joining the file name matches
+    /// what [`open`](Self::open) will derive once it creates the file —
+    /// through symlinked directories too. Only when the parent itself
+    /// cannot be resolved (missing as well, or gone between the two
+    /// lookups) does the key fall back to the lexical `absolute` form.
+    fn registry_key(path: &Path) -> PathBuf {
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            return canonical;
+        }
+        if let Some(key) = path
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+        {
+            return key;
+        }
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
     /// Set the configuration driving this store's consolidation pass.
@@ -589,7 +612,103 @@ impl LoopMemory for FileMemoryStore {
 
 #[cfg(test)]
 mod tests {
+    use super::FileMemoryStore;
     use super::split_complete_lines;
+
+    fn unit_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "loopctl-file-memory-key-unit-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_file_keys_by_its_canonical_location() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unit_dir("existing");
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.join("link");
+        symlink(&real, &link).unwrap();
+        let through_link = link.join("memory.jsonl");
+        std::fs::File::create(&through_link).unwrap();
+
+        assert_eq!(
+            FileMemoryStore::registry_key(&through_link),
+            real.join("memory.jsonl"),
+            "an existing file keys by where it really lives, resolving the \
+            symlinked directory"
+        );
+
+        let file_link = dir.join("mem-link.jsonl");
+        symlink(real.join("memory.jsonl"), &file_link).unwrap();
+        assert_eq!(
+            FileMemoryStore::registry_key(&file_link),
+            real.join("memory.jsonl"),
+            "a symlinked file keys by its target — only the outright \
+            canonicalization resolves a symlink on the file itself"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_file_keys_by_its_canonical_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unit_dir("missing");
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.join("link");
+        symlink(&real, &link).unwrap();
+        let absent_through_link = link.join("memory.jsonl");
+
+        assert_eq!(
+            FileMemoryStore::registry_key(&absent_through_link),
+            real.join("memory.jsonl"),
+            "a missing final component carries no ambiguity of its own — \
+            the key is the canonical parent plus the name, exactly what \
+            open derives once it creates the file"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unresolvable_path_falls_back_to_the_lexical_absolute_form() {
+        let absent = std::path::Path::new("/nonexistent-file-memory-unit/parent/mem.jsonl");
+        assert_eq!(
+            FileMemoryStore::registry_key(absent),
+            absent.to_path_buf(),
+            "with neither the file nor its parent resolvable, the already \
+            absolute spelling is returned as-is"
+        );
+    }
+
+    #[test]
+    fn an_empty_path_falls_back_to_the_raw_spelling() {
+        let empty = std::path::Path::new("");
+        assert_eq!(
+            FileMemoryStore::registry_key(empty),
+            empty.to_path_buf(),
+            "the empty path resolves nowhere at any stage — the final \
+            fallback returns the raw spelling instead of panicking"
+        );
+    }
+
+    #[test]
+    fn a_trailing_dotdot_still_yields_a_key() {
+        let edge = std::path::Path::new("/nonexistent-file-memory-unit/..");
+        assert_eq!(
+            FileMemoryStore::registry_key(edge),
+            edge.to_path_buf(),
+            "a path with no file name component skips the parent-join arm \
+            without panicking and lands in the lexical fallback"
+        );
+    }
 
     #[test]
     fn a_file_ending_in_a_newline_has_no_trailing_fragment() {
@@ -708,8 +827,10 @@ mod tests {
 
     #[test]
     fn load_entries_reports_a_missing_file_as_empty_and_intact() {
-        let (entries, torn) =
-            super::FileMemoryStore::load_entries(std::path::Path::new("/nonexistent-l21")).unwrap();
+        let (entries, torn) = super::FileMemoryStore::load_entries(std::path::Path::new(
+            "/nonexistent-file-memory-probe",
+        ))
+        .unwrap();
         assert!(entries.is_empty());
         assert!(!torn, "nothing was dropped, so there is nothing to repair");
     }

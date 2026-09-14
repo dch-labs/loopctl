@@ -571,6 +571,48 @@ async fn new_attaches_to_a_live_store_for_the_same_path() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn new_and_open_share_state_through_a_symlinked_directory() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("symlink-key");
+    let real = dir.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = dir.join("link");
+    symlink(&real, &link).unwrap();
+    let through_link = link.join("memory.jsonl");
+    let first = FileMemoryStore::new(&through_link);
+    first
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "nightly deploys pause the world",
+        ))
+        .await
+        .unwrap();
+    let second = FileMemoryStore::open(&through_link).unwrap();
+    second
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "grip large files with both hands",
+        ))
+        .await
+        .unwrap();
+    first.consolidate().await.unwrap();
+    drop(first);
+    drop(second);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened.len(),
+        2,
+        "new and open derive the same registry key through a symlinked \
+        parent, so both handles share state and no entry is lost — \
+        verified by reopening through the real path"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn mid_file_corruption_fails_the_open() {
     let dir = temp_dir("corrupt");

@@ -445,6 +445,133 @@ async fn an_unrecoverable_append_failure_marks_the_store_unusable() {
 }
 
 #[tokio::test]
+async fn two_handles_on_one_path_lose_no_entries() {
+    let dir = temp_dir("two-handles");
+    let path = dir.join("memory.jsonl");
+
+    let first = FileMemoryStore::open(&path).unwrap();
+    let second = FileMemoryStore::open(&path).unwrap();
+    first
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "nightly deploys pause the world",
+        ))
+        .await
+        .unwrap();
+    second
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "grip large files with both hands",
+        ))
+        .await
+        .unwrap();
+    first.consolidate().await.unwrap();
+    assert_eq!(first.len(), 2, "both handles see the shared mirror");
+    drop(first);
+    drop(second);
+
+    let reopened = FileMemoryStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.len(),
+        2,
+        "the consolidate rewrote from the shared mirror — no handle's \
+        entries are silently dropped from disk"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_stores_through_two_handles_never_weld() {
+    const WRITERS: usize = 8;
+    let dir = temp_dir("two-handles-concurrent");
+    let path = dir.join("memory.jsonl");
+    let first = Arc::new(FileMemoryStore::open(&path).unwrap());
+    let second = Arc::new(FileMemoryStore::open(&path).unwrap());
+
+    let mut tasks = Vec::new();
+    for index in 0..WRITERS {
+        let store = if index % 2 == 0 {
+            Arc::clone(&first)
+        } else {
+            Arc::clone(&second)
+        };
+        tasks.push(tokio::task::spawn(async move {
+            store
+                .store(MemoryEntry::new(
+                    MemoryCategory::Fact,
+                    format!("writer {index} stored a whole line"),
+                ))
+                .await
+                .unwrap();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    drop(first);
+    drop(second);
+
+    let reopened = FileMemoryStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.len(),
+        WRITERS,
+        "appends through both handles serialize behind the shared lock — \
+        one parseable line per store, no welded lines"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn new_attaches_to_a_live_store_for_the_same_path() {
+    let dir = temp_dir("new-attaches");
+    let path = dir.join("memory.jsonl");
+
+    let opened = FileMemoryStore::open(&path).unwrap();
+    opened
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "stored through open",
+        ))
+        .await
+        .unwrap();
+    let attached = FileMemoryStore::new(&path);
+    assert_eq!(
+        attached.len(),
+        1,
+        "new attaches to the live shared state for the path instead of \
+        starting a private empty mirror"
+    );
+    attached
+        .store(MemoryEntry::new(MemoryCategory::Fact, "stored through new"))
+        .await
+        .unwrap();
+    assert_eq!(
+        opened.len(),
+        2,
+        "the open handle sees the new handle's entry"
+    );
+    drop(opened);
+    drop(attached);
+
+    let fresh = FileMemoryStore::new(dir.join("fresh.jsonl"));
+    fresh
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "stored before any open",
+        ))
+        .await
+        .unwrap();
+    let reopened = FileMemoryStore::open(dir.join("fresh.jsonl")).unwrap();
+    assert_eq!(
+        reopened.len(),
+        1,
+        "a new-first store persists through its first store, and a later \
+        open attaches to it"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn mid_file_corruption_fails_the_open() {
     let dir = temp_dir("corrupt");
     let path = dir.join("memory.jsonl");

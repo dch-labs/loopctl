@@ -8,9 +8,10 @@
 //! order identically to the in-memory store. Enable with the
 //! `file_memory` feature.
 //!
-//! The store is single-process: two processes writing the same file will
-//! interleave and corrupt it. For multi-process durability use a
-//! database-backed companion such as `loopctl-sqlite`.
+//! Handles on one path within a process share state — opening the same
+//! file twice is safe. Cross-process access is unsupported: two
+//! processes writing the same file will interleave and corrupt it; for
+//! that, use a database-backed companion such as `loopctl-sqlite`.
 
 use crate::error::{LoopError, recover_guard};
 use crate::memory::LoopMemory;
@@ -21,8 +22,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -51,14 +53,16 @@ use uuid::Uuid;
 ///
 /// # Concurrency
 ///
-/// Safe to share via `Arc<FileMemoryStore>` within one process: the
-/// internal `RwLock` serializes writers, and every file-mutating path
-/// (`store`'s append, `flush`'s and `consolidate`'s rewrite) holds the
-/// write lock across its I/O, so concurrent stores can never interleave
-/// partial lines and concurrent rewrites can never collide on the temp
-/// file or strand an append on a replaced file. Multi-process access to
-/// the same file is not supported — there is no file locking, and two
-/// processes will corrupt the file.
+/// Within one process this is safe at every level: sharing a handle
+/// via `Arc`, and opening or constructing several handles for the same
+/// path — they all attach to one shared state, so every file-mutating
+/// path (`store`'s append, `flush`'s and `consolidate`'s rewrite) goes
+/// through the same locks: concurrent stores can never interleave
+/// partial lines, concurrent rewrites can never collide on the temp
+/// file or strand an append on a replaced file, and no handle can
+/// rewrite the file without the others' entries. Multi-process access
+/// to the same file is not supported — there is no file locking, and
+/// two processes will corrupt the file.
 ///
 /// # Example
 ///
@@ -85,13 +89,37 @@ use uuid::Uuid;
 /// # });
 /// ```
 pub struct FileMemoryStore {
+    /// The state shared by every live handle on this file path.
+    ///
+    /// Appends, rewrites, and the access log all serialize behind the
+    /// shared locks inside, so two handles constructed for one path —
+    /// `open`, `new`, or a mix — observe and mutate the same store.
+    inner: Arc<Inner>,
+
+    /// The configuration driving this handle's consolidation pass.
+    ///
+    /// Defaults to the same configuration
+    /// [`InMemoryStore`](super::builtin::InMemoryStore) uses; set per
+    /// handle with [`with_consolidation`](Self::with_consolidation). A
+    /// pass runs with the consolidating handle's config over the shared
+    /// entries.
+    consolidation: ConsolidationConfig,
+}
+
+/// The mutable state shared by every live [`FileMemoryStore`] on one path.
+///
+/// One `Inner` exists per live path per process (the registry in
+/// [`live_stores`] enforces that), so every file-mutating path through
+/// any handle serializes behind these locks.
+struct Inner {
     /// Path of the JSONL file backing the store.
     ///
-    /// Created empty by [`open`](Self::open) when missing, and rewritten
-    /// atomically by [`flush`](Self::flush); the store never removes it.
+    /// Created empty by [`open`](FileMemoryStore::open) when missing,
+    /// and rewritten atomically by [`flush`](FileMemoryStore::flush);
+    /// the store never removes it.
     path: PathBuf,
 
-    /// The stored entries — the single source of truth while the store is open.
+    /// The stored entries — the single source of truth while any handle is live.
     ///
     /// Mirrors the file: `store` appends to the file first, then pushes
     /// here under the same write lock, so the two can never disagree on
@@ -110,20 +138,41 @@ pub struct FileMemoryStore {
     /// log.
     access_log: Mutex<HashMap<Uuid, SystemTime>>,
 
-    /// The configuration driving this store's consolidation pass.
-    ///
-    /// Defaults to the same configuration
-    /// [`InMemoryStore`](super::builtin::InMemoryStore) uses; set per
-    /// store with [`with_consolidation`](Self::with_consolidation).
-    consolidation: ConsolidationConfig,
-
     /// Whether an append failure could not even be truncated back.
     ///
     /// Set when a partial line was written and restoring the original
     /// file length failed — the file may now hold a partial line, so
-    /// every further append is rejected until a fresh
-    /// [`open`](Self::open) loads and repairs the file.
+    /// every further append through any handle is rejected until a
+    /// fresh [`open`](FileMemoryStore::open) loads and repairs the
+    /// file.
     append_unusable: AtomicBool,
+}
+
+impl Inner {
+    /// Assemble the shared state for one file path.
+    ///
+    /// `entries` is whatever the constructing call loaded (or nothing,
+    /// for a fresh `new`); the registry call site is responsible for
+    /// registering the result.
+    fn new(path: PathBuf, entries: Vec<MemoryEntry>) -> Self {
+        Self {
+            path,
+            entries: RwLock::new(entries),
+            access_log: Mutex::new(HashMap::new()),
+            append_unusable: AtomicBool::new(false),
+        }
+    }
+}
+
+/// The process-wide registry of live shared store states, by path.
+///
+/// Constructors look a path up here and attach to the live state when
+/// one exists, so two handles on one file share locks and mirror
+/// instead of racing each other into data loss. Dead entries are
+/// pruned opportunistically on lookup.
+fn live_stores() -> &'static Mutex<HashMap<PathBuf, Weak<Inner>>> {
+    static LIVE: OnceLock<Mutex<HashMap<PathBuf, Weak<Inner>>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 impl FileMemoryStore {
@@ -136,43 +185,75 @@ impl FileMemoryStore {
     /// `store` cannot weld itself onto the fragment — while a malformed
     /// line anywhere earlier is real corruption and fails the open.
     ///
+    /// A live handle for this path is attached to instead of loading —
+    /// both handles then share one mirror and one set of locks, so
+    /// neither can rewrite the file without the other's entries. The
+    /// load, the torn-tail check, and the repair below run only when no
+    /// live handle exists.
+    ///
     /// # Errors
     ///
-    /// Returns [`LoopError::Memory`] if the path cannot be created or
-    /// read, if any non-final line fails to deserialize, or if the
-    /// torn-tail repair rewrite fails.
+    /// Returns [`LoopError::Memory`] if the path cannot be created,
+    /// resolved, or read, if any non-final line fails to deserialize,
+    /// or if the torn-tail repair rewrite fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LoopError> {
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
             std::fs::File::create(&path)
                 .map_err(|e| LoopError::Memory(format!("cannot create memory file: {e}")))?;
         }
-        let (entries, torn_tail) = Self::load_entries(&path)?;
-        if torn_tail {
-            Self::rewrite(&path, &entries)?;
-        }
+        let canonical = std::fs::canonicalize(&path)
+            .map_err(|e| LoopError::Memory(format!("cannot resolve memory file path: {e}")))?;
+        let inner = {
+            let mut registry = recover_guard(live_stores().lock());
+            let attached = registry.get(&canonical).and_then(Weak::upgrade);
+            if let Some(inner) = attached {
+                inner
+            } else {
+                registry.remove(&canonical);
+                let (entries, torn_tail) = Self::load_entries(&canonical)?;
+                if torn_tail {
+                    Self::rewrite(&canonical, &entries)?;
+                }
+                let inner = Arc::new(Inner::new(canonical.clone(), entries));
+                registry.insert(canonical, Arc::downgrade(&inner));
+                inner
+            }
+        };
         Ok(Self {
-            path,
-            entries: RwLock::new(entries),
-            access_log: Mutex::new(HashMap::new()),
+            inner,
             consolidation: ConsolidationConfig::default(),
-            append_unusable: AtomicBool::new(false),
         })
     }
 
     /// Create a fresh empty store that persists to `path` on first `store`.
     ///
-    /// Does not read or create the file — use [`open`](Self::open) to
-    /// load an existing one. The first [`store`](LoopMemory::store) or
-    /// [`flush`](Self::flush) creates it.
+    /// Attaches to the live shared store for the path when one exists
+    /// (both handles then observe the same entries); otherwise it
+    /// starts empty without reading or creating the file — the first
+    /// [`store`](LoopMemory::store) or [`flush`](Self::flush) creates
+    /// it. Use [`open`](Self::open) to load an existing file when no
+    /// handle is live.
     #[must_use]
     pub fn new(path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref().to_path_buf();
+        let key = std::fs::canonicalize(&path)
+            .unwrap_or_else(|_| std::path::absolute(&path).unwrap_or_else(|_| path.clone()));
+        let inner = {
+            let mut registry = recover_guard(live_stores().lock());
+            let attached = registry.get(&key).and_then(Weak::upgrade);
+            if let Some(inner) = attached {
+                inner
+            } else {
+                registry.remove(&key);
+                let inner = Arc::new(Inner::new(key.clone(), Vec::new()));
+                registry.insert(key, Arc::downgrade(&inner));
+                inner
+            }
+        };
         Self {
-            path: path.as_ref().to_path_buf(),
-            entries: RwLock::new(Vec::new()),
-            access_log: Mutex::new(HashMap::new()),
+            inner,
             consolidation: ConsolidationConfig::default(),
-            append_unusable: AtomicBool::new(false),
         }
     }
 
@@ -204,8 +285,8 @@ impl FileMemoryStore {
     /// [`LoopError::Memory`] on any I/O or serialization failure. On
     /// failure the original file is left untouched.
     pub fn flush(&self) -> Result<(), LoopError> {
-        let entries = recover_guard(self.entries.write());
-        Self::rewrite(&self.path, &entries)
+        let entries = recover_guard(self.inner.entries.write());
+        Self::rewrite(&self.inner.path, &entries)
     }
 
     /// Load a JSONL file into a vec of entries, applying the corruption rules.
@@ -293,16 +374,16 @@ impl FileMemoryStore {
     fn append_line(&self, line: &str) -> Result<(), LoopError> {
         use std::io::{Seek as _, SeekFrom, Write as _};
         use std::sync::atomic::Ordering as AtomicOrdering;
-        if self.append_unusable.load(AtomicOrdering::SeqCst) {
+        if self.inner.append_unusable.load(AtomicOrdering::SeqCst) {
             return Err(LoopError::Memory(
-                "the memory file is unusable after an unrecoverable append failure; reopen the store to repair it"
+                "the memory file is unusable after an unrecoverable append failure; drop every live handle and reopen to repair it"
                     .to_string(),
             ));
         }
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)
+            .open(&self.inner.path)
             .map_err(|e| LoopError::Memory(format!("cannot open memory file for append: {e}")))?;
         let original_len = file
             .seek(SeekFrom::End(0))
@@ -314,7 +395,9 @@ impl FileMemoryStore {
         if let Err(e) = write_result {
             let truncation = file.set_len(original_len).and_then(|()| file.flush());
             if truncation.is_err() {
-                self.append_unusable.store(true, AtomicOrdering::SeqCst);
+                self.inner
+                    .append_unusable
+                    .store(true, AtomicOrdering::SeqCst);
             }
             return Err(LoopError::Memory(format!(
                 "cannot append to memory file: {e}"
@@ -403,7 +486,7 @@ impl LoopMemory for FileMemoryStore {
             let line = serde_json::to_string(&entry).map_err(|e| {
                 LoopError::Memory(format!("memory entry serialization failed: {e}"))
             })?;
-            let mut entries = recover_guard(self.entries.write());
+            let mut entries = recover_guard(self.inner.entries.write());
             self.append_line(&line)?;
             entries.push(entry);
             Ok(())
@@ -427,8 +510,10 @@ impl LoopMemory for FileMemoryStore {
             let query_lower = query.to_lowercase();
             let query_trimmed = query_lower.trim();
             let query_words: Vec<&str> = query_lower.split_whitespace().collect();
-            let snapshot: Vec<MemoryEntry> =
-                recover_guard(self.entries.read()).iter().cloned().collect();
+            let snapshot: Vec<MemoryEntry> = recover_guard(self.inner.entries.read())
+                .iter()
+                .cloned()
+                .collect();
             let mut scored: Vec<(f32, bool, MemoryEntry)> = snapshot
                 .into_iter()
                 .map(|entry| {
@@ -443,7 +528,7 @@ impl LoopMemory for FileMemoryStore {
                 .map(|(_, matched, entry)| (matched, entry))
                 .collect();
             let now = SystemTime::now();
-            let mut access_log = recover_guard(self.access_log.lock());
+            let mut access_log = recover_guard(self.inner.access_log.lock());
             for (matched, entry) in &selected {
                 if !matched {
                     continue;
@@ -475,9 +560,9 @@ impl LoopMemory for FileMemoryStore {
     ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
         Box::pin(async move {
             let now = SystemTime::now();
-            let mut guard = recover_guard(self.entries.write());
+            let mut guard = recover_guard(self.inner.entries.write());
             let mut next = guard.clone();
-            let mut access_log = recover_guard(self.access_log.lock());
+            let mut access_log = recover_guard(self.inner.access_log.lock());
             for entry in &mut next {
                 if let Some(stamp) = access_log.get(&entry.id) {
                     entry.last_accessed = entry.last_accessed.max(Some(*stamp));
@@ -485,7 +570,7 @@ impl LoopMemory for FileMemoryStore {
                 }
             }
             let stats = consolidate_entries(&mut next, &self.consolidation, now);
-            Self::rewrite(&self.path, &next)?;
+            Self::rewrite(&self.inner.path, &next)?;
             access_log.clear();
             drop(access_log);
             *guard = next;
@@ -498,7 +583,7 @@ impl LoopMemory for FileMemoryStore {
     /// Used by [`is_empty`](LoopMemory::is_empty) and reported by the
     /// engine's consolidate hook after each run.
     fn len(&self) -> usize {
-        recover_guard(self.entries.read()).len()
+        recover_guard(self.inner.entries.read()).len()
     }
 }
 

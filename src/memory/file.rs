@@ -175,6 +175,14 @@ fn live_stores() -> &'static Mutex<HashMap<PathBuf, Weak<Inner>>> {
     LIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// How many final-component symlinks registry key derivation will follow.
+///
+/// Bounds the chain walk below the kernel's own `ELOOP` threshold; a
+/// loop of links simply exhausts the budget and keys by the last
+/// resolved spelling, which every handle through the loop derives
+/// identically.
+const SYMLINK_FOLLOW_LIMIT: usize = 8;
+
 impl FileMemoryStore {
     /// Open (or create) a store backed by `path`, loading existing entries.
     ///
@@ -257,23 +265,58 @@ impl FileMemoryStore {
         }
     }
 
+    /// Resolve a dangling symlink's final component to its target.
+    ///
+    /// Returns `Some` only when `path` itself is a symlink that does
+    /// not resolve to an existing file (the caller has already failed
+    /// to canonicalize it): the target is read, and a relative target
+    /// is anchored at the canonicalized parent of the link. A `None`
+    /// covers every other shape — an ordinary missing path, or a
+    /// symlink whose metadata cannot be read.
+    fn dangling_final_symlink(path: &Path) -> Option<PathBuf> {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_symlink() {
+            return None;
+        }
+        let target = std::fs::read_link(path).ok()?;
+        if target.is_absolute() {
+            Some(target)
+        } else {
+            let parent = path.parent()?.canonicalize().ok()?;
+            Some(parent.join(target))
+        }
+    }
+
     /// Derive the registry key for a path that may not exist yet.
     ///
-    /// An existing file canonicalizes outright. A missing final
-    /// component carries no symlink ambiguity of its own, so
+    /// An existing file canonicalizes outright — including through
+    /// symlinked directories and symlinked final components. A dangling
+    /// final symlink is resolved to its target first (following chains,
+    /// bounded by [`SYMLINK_FOLLOW_LIMIT`]), so a store created through
+    /// the link keys by where its data will really live — matching what
+    /// [`open`](Self::open) derives once the first `store` creates the
+    /// target through the link. What remains is a genuinely missing
+    /// final component, which carries no symlink ambiguity of its own:
     /// canonicalizing the parent and re-joining the file name matches
-    /// what [`open`](Self::open) will derive once it creates the file —
-    /// through symlinked directories too. Only when the parent itself
-    /// cannot be resolved (missing as well, or gone between the two
-    /// lookups) does the key fall back to the lexical `absolute` form.
+    /// what `open` will derive once it creates the file. Only when the
+    /// parent itself cannot be resolved (missing as well, or gone
+    /// between the two lookups) does the key fall back to the lexical
+    /// `absolute` form.
     fn registry_key(path: &Path) -> PathBuf {
-        if let Ok(canonical) = std::fs::canonicalize(path) {
-            return canonical;
+        let mut current = path.to_path_buf();
+        for _ in 0..SYMLINK_FOLLOW_LIMIT {
+            if let Ok(canonical) = std::fs::canonicalize(&current) {
+                return canonical;
+            }
+            match Self::dangling_final_symlink(&current) {
+                Some(target) => current = target,
+                None => break,
+            }
         }
-        if let Some(key) = path
+        if let Some(key) = current
             .parent()
             .and_then(|parent| parent.canonicalize().ok())
-            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .and_then(|parent| current.file_name().map(|name| parent.join(name)))
         {
             return key;
         }
@@ -673,6 +716,50 @@ mod tests {
             "a missing final component carries no ambiguity of its own — \
             the key is the canonical parent plus the name, exactly what \
             open derives once it creates the file"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_final_symlink_keys_by_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unit_dir("dangling");
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let absolute_link = dir.join("abs-link.jsonl");
+        symlink(elsewhere.join("target.jsonl"), &absolute_link).unwrap();
+        assert_eq!(
+            FileMemoryStore::registry_key(&absolute_link),
+            elsewhere.join("target.jsonl"),
+            "a dangling final symlink keys by its absolute target — where \
+            the first store will create the data"
+        );
+
+        let relative_link = dir.join("rel-link.jsonl");
+        symlink(
+            std::path::Path::new("elsewhere/rel-target.jsonl"),
+            &relative_link,
+        )
+        .unwrap();
+        assert_eq!(
+            FileMemoryStore::registry_key(&relative_link),
+            elsewhere.join("rel-target.jsonl"),
+            "a relative target is anchored at the canonicalized parent of \
+            the link before keying"
+        );
+
+        let chain_end = elsewhere.join("chain-end.jsonl");
+        let chain_mid = elsewhere.join("chain-mid.jsonl");
+        symlink(&chain_end, &chain_mid).unwrap();
+        let chain_link = dir.join("chain-link.jsonl");
+        symlink(&chain_mid, &chain_link).unwrap();
+        assert_eq!(
+            FileMemoryStore::registry_key(&chain_link),
+            elsewhere.join("chain-end.jsonl"),
+            "a chain of dangling links is followed to its end"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

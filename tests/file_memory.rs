@@ -613,6 +613,60 @@ async fn new_and_open_share_state_through_a_symlinked_directory() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn dangling_link_handles_share_state_and_the_link_survives() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("dangling-link");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let target = elsewhere.join("target.jsonl");
+    let link = dir.join("mem-link.jsonl");
+    symlink(&target, &link).unwrap();
+
+    let first = FileMemoryStore::new(&link);
+    first
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "nightly deploys pause the world",
+        ))
+        .await
+        .unwrap();
+    let second = FileMemoryStore::open(&link).unwrap();
+    second
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "grip large files with both hands",
+        ))
+        .await
+        .unwrap();
+    first.consolidate().await.unwrap();
+    drop(first);
+    drop(second);
+
+    let reopened = FileMemoryStore::open(&link).unwrap();
+    assert_eq!(
+        reopened.len(),
+        2,
+        "new and open agree on the dangling link's target, so both \
+        handles share state and no entry is lost"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the consolidation rewrote the target, not the link — the symlink \
+        itself survives"
+    );
+    assert!(
+        target.is_file(),
+        "the physical data lives at the target as a regular file"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn mid_file_corruption_fails_the_open() {
     let dir = temp_dir("corrupt");

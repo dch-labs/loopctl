@@ -338,9 +338,11 @@ impl FileMemoryStore {
     ///
     /// Used internally by [`consolidate`](LoopMemory::consolidate); also
     /// exposed for callers that want a checkpoint after bulk mutation.
-    /// The rewrite is atomic — a sibling temp file is written, synced,
-    /// and renamed over the target — so a crash mid-rewrite leaves the
-    /// previous file intact. The entries write lock is held across the
+    /// The rewrite is atomic and durable — a sibling temp file under an
+    /// unpredictable name is written and synced, renamed over the
+    /// target, and the containing directory is synced so the rename
+    /// itself survives power loss — so a crash mid-rewrite leaves the
+    /// previous file intact and a completed flush is on disk. The entries write lock is held across the
     /// whole rewrite, so concurrent `flush`es, `consolidate`s, and
     /// `store`s are serialized: two rewrites can never interleave on the
     /// temp file, and an append can never land on the unlinked old file
@@ -474,21 +476,30 @@ impl FileMemoryStore {
 
     /// Rewrite `path` with `entries`, atomically.
     ///
-    /// Writes a sibling temp file (target path plus a `.tmp` suffix),
-    /// syncs it, and renames it over the target — readers observe either
-    /// the old or the new file, never a partial one. The temp file is
-    /// removed on failure.
+    /// Writes a sibling temp file under an unpredictable name
+    /// (`<name>.<uuid>.tmp`) created exclusively — `create_new` fails if
+    /// anything exists at the path, symlinks included, so a planted
+    /// link can never redirect the rewrite's contents into another
+    /// file — syncs it, renames it over the target, and then syncs the
+    /// containing directory so the rename itself is durable. Readers
+    /// observe either the old or the new file, never a partial one; the
+    /// temp file is removed on failure, and a successful rewrite also
+    /// sweeps `<name>.<uuid>.tmp` siblings left behind by earlier
+    /// crashed rewrites (random names never collide with a live one, so
+    /// a crash between create and rename leaves at most an orphan the
+    /// next successful pass removes).
     ///
     /// # Errors
     ///
-    /// [`LoopError::Memory`] if any entry cannot be serialized, or the
-    /// temp file cannot be written, synced, or renamed over the target.
-    /// The original file is left untouched.
+    /// [`LoopError::Memory`] if any entry cannot be serialized, the
+    /// temp file cannot be created, written, synced, or renamed over
+    /// the target, or the post-rename directory sync fails — that last
+    /// case means the new file is already in place but its durability
+    /// is unconfirmed. Every failure except the last leaves the
+    /// original file untouched.
     fn rewrite(path: &Path, entries: &[MemoryEntry]) -> Result<(), LoopError> {
         use std::io::Write as _;
-        let mut temp_name = path.as_os_str().to_os_string();
-        temp_name.push(".tmp");
-        let temp_path = PathBuf::from(temp_name);
+        let temp_path = Self::temp_sibling_path(path);
         let write_result = (|| -> Result<(), LoopError> {
             let mut buffer = String::new();
             for entry in entries {
@@ -498,18 +509,103 @@ impl FileMemoryStore {
                 buffer.push_str(&line);
                 buffer.push('\n');
             }
-            let mut file = std::fs::File::create(&temp_path)
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
                 .map_err(|e| LoopError::Memory(format!("cannot create rewrite temp file: {e}")))?;
             file.write_all(buffer.as_bytes())
                 .and_then(|()| file.sync_all())
                 .map_err(|e| LoopError::Memory(format!("cannot write rewrite temp file: {e}")))?;
             std::fs::rename(&temp_path, path)
-                .map_err(|e| LoopError::Memory(format!("cannot finalize memory rewrite: {e}")))
+                .map_err(|e| LoopError::Memory(format!("cannot finalize memory rewrite: {e}")))?;
+            Self::sync_parent_directory(path)?;
+            Self::drop_stale_temp_siblings(path);
+            Ok(())
         })();
         if write_result.is_err() {
             drop(std::fs::remove_file(&temp_path));
         }
         write_result
+    }
+
+    /// Build the unpredictable temp-sibling path for a rewrite of `path`.
+    ///
+    /// `<name>.<uuid>.tmp` next to the target: unpredictable, so a
+    /// local attacker cannot pre-plant it, and distinct per rewrite, so
+    /// leftovers from crashed passes never collide with a live one.
+    fn temp_sibling_path(path: &Path) -> PathBuf {
+        let mut temp_name = path.as_os_str().to_os_string();
+        temp_name.push(format!(".{}.tmp", Uuid::new_v4()));
+        PathBuf::from(temp_name)
+    }
+
+    /// Sync the directory holding `path` so a completed rename is durable.
+    ///
+    /// A rename changes a directory entry, and on Unix that change is
+    /// not durable until the containing directory itself is synced —
+    /// without this step a power loss can lose a rewrite the caller
+    /// already saw succeed. A missing or empty parent skips the sync
+    /// rather than failing the rewrite.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Memory`] if the parent directory cannot be opened
+    /// or synced. Called after a successful rename, so this failure
+    /// means the new file is in place but its durability is
+    /// unconfirmed.
+    #[cfg(unix)]
+    fn sync_parent_directory(path: &Path) -> Result<(), LoopError> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        match parent {
+            Some(parent) => std::fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| {
+                    LoopError::Memory(format!("cannot sync directory after memory rewrite: {e}"))
+                }),
+            None => Ok(()),
+        }
+    }
+
+    /// No-op parent sync where directory handles cannot be synced.
+    ///
+    /// Non-Unix platforms keep the rewrite path byte-identical to
+    /// before the directory-sync change.
+    #[cfg(not(unix))]
+    fn sync_parent_directory(_path: &Path) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Remove `<name>.<uuid>.tmp` siblings left by earlier crashed rewrites.
+    ///
+    /// Called only from a successful rewrite, which already holds the
+    /// entries write lock, so no live temp file of this store can
+    /// exist. Best-effort janitorial work: removal errors are ignored,
+    /// and a missing or empty parent sweeps the current directory.
+    fn drop_stale_temp_siblings(path: &Path) {
+        let directory = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let stem = path
+            .file_name()
+            .map_or_else(String::new, |name| format!("{}.", name.to_string_lossy()));
+        if stem.is_empty() {
+            return;
+        }
+        if let Ok(siblings) = std::fs::read_dir(&directory) {
+            for sibling in siblings.flatten() {
+                let name = sibling.file_name().to_string_lossy().to_string();
+                let is_temp = std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext == "tmp");
+                if name.starts_with(&stem) && is_temp {
+                    drop(std::fs::remove_file(sibling.path()));
+                }
+            }
+        }
     }
 }
 
@@ -861,6 +957,7 @@ mod tests {
             crate::memory::MemoryEntry::new(crate::memory::MemoryCategory::Fact, "first"),
             crate::memory::MemoryEntry::new(crate::memory::MemoryCategory::Fact, "second"),
         ];
+        std::fs::write(dir.join("rewrite.jsonl.orphan.tmp"), b"stale").unwrap();
         super::FileMemoryStore::rewrite(&path, &entries).unwrap();
 
         let rewritten = std::fs::read_to_string(&path).unwrap();
@@ -870,11 +967,38 @@ mod tests {
             rewritten.ends_with('\n'),
             "the file is newline-terminated: {rewritten:?}"
         );
+        let temp_leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| {
+                std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext == "tmp")
+            })
+            .collect();
         assert!(
-            !dir.join("rewrite.jsonl.tmp").try_exists().unwrap(),
-            "a successful rename consumes the temp file"
+            temp_leftovers.is_empty(),
+            "a successful rename consumes the temp file and sweeps stale \
+            siblings: {temp_leftovers:?}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn temp_sibling_paths_are_unpredictable_and_well_shaped() {
+        let dir = std::path::Path::new("/store");
+        let first = super::FileMemoryStore::temp_sibling_path(&dir.join("memory.jsonl"));
+        let second = super::FileMemoryStore::temp_sibling_path(&dir.join("memory.jsonl"));
+        assert_ne!(
+            first, second,
+            "each rewrite gets its own unpredictable temp"
+        );
+        let first = first.to_string_lossy();
+        assert!(
+            first.starts_with("/store/memory.jsonl.") && first.ends_with(".tmp"),
+            "the temp sibling carries the target name, a unique middle, and \
+            the tmp suffix: {first}"
+        );
     }
 
     #[tokio::test]

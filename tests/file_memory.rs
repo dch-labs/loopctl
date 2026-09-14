@@ -25,6 +25,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// Assert no temp sibling remains in `dir` for any of its files.
+///
+/// Scans the directory rather than probing a literal name, so it stays
+/// valid under the rewrite's unpredictable temp names.
+fn assert_no_temp_siblings(dir: &std::path::Path, context: &str) {
+    let leftovers: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext == "tmp")
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "{context}: {leftovers:?}");
+}
+
 /// Create a fresh temp directory unique to this test invocation.
 ///
 /// Uniqueness comes from the test process's id plus a per-process
@@ -134,10 +151,7 @@ async fn consolidate_prunes_and_rewrites_the_file() {
         Some(keep.id),
         "the survivor is the durable lesson"
     );
-    assert!(
-        !dir.join("memory.jsonl.tmp").try_exists().unwrap(),
-        "a successful rewrite leaves no temp file behind"
-    );
+    assert_no_temp_siblings(&dir, "a successful rewrite leaves no temp sibling");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -165,10 +179,7 @@ async fn a_failed_rewrite_leaves_the_original_file_intact() {
         flush_result.is_err(),
         "the rewrite cannot create its temp file"
     );
-    assert!(
-        !dir.join("memory.jsonl.tmp").try_exists().unwrap(),
-        "the failed rewrite cleaned up its temp file"
-    );
+    assert_no_temp_siblings(&dir, "the failed rewrite cleaned up its temp");
     drop(store);
 
     let reopened = FileMemoryStore::open(&path).unwrap();
@@ -415,10 +426,7 @@ async fn concurrent_consolidations_leave_a_reopenable_store() {
         2,
         "the serialized rewrites leave a clean file — no interleaved temp content"
     );
-    assert!(
-        !dir.join("memory.jsonl.tmp").try_exists().unwrap(),
-        "no temp file is left behind"
-    );
+    assert_no_temp_siblings(&dir, "no temp sibling is left behind");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -663,6 +671,83 @@ async fn dangling_link_handles_share_state_and_the_link_survives() {
     assert!(
         target.is_file(),
         "the physical data lives at the target as a regular file"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_planted_symlink_at_a_predictable_temp_path_is_not_followed() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("temp-symlink");
+    let path = dir.join("memory.jsonl");
+    let store = FileMemoryStore::open(&path).unwrap();
+    store
+        .store(MemoryEntry::new(MemoryCategory::Fact, "legitimate entry"))
+        .await
+        .unwrap();
+
+    let victim = dir.join("victim.txt");
+    std::fs::write(&victim, "precious contents").unwrap();
+    symlink(&victim, dir.join("memory.jsonl.tmp")).unwrap();
+
+    store.flush().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "precious contents",
+        "the rewrite's exclusive, unpredictable temp create never follows a \
+        planted symlink — the victim is untouched"
+    );
+    assert_eq!(
+        store.len(),
+        1,
+        "the store itself is unaffected by the planted link"
+    );
+    drop(std::fs::remove_file(dir.join("memory.jsonl.tmp")));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unopenable_parent_reports_unconfirmed_durability_after_the_rename() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = temp_dir("dir-sync");
+    let path = dir.join("memory.jsonl");
+    let store = FileMemoryStore::open(&path).unwrap();
+    let entry = MemoryEntry::new(MemoryCategory::Fact, "checkpointed before the sync failed");
+    store.store(entry.clone()).await.unwrap();
+
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o300);
+    std::fs::set_permissions(&dir, perms).unwrap();
+    let flush_result = store.flush();
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&dir, perms).unwrap();
+
+    let error = flush_result.expect_err("the directory cannot be opened for the sync");
+    assert!(
+        error.to_string().contains("cannot sync directory"),
+        "the failure is the post-rename directory sync: {error}"
+    );
+    assert_eq!(
+        store.len(),
+        1,
+        "the rename itself already happened — the new file is in place"
+    );
+    let reopened = FileMemoryStore::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .retrieve("checkpointed", 3)
+            .await
+            .unwrap()
+            .first()
+            .map(|e| e.id),
+        Some(entry.id),
+        "the checkpoint content is the post-rename state — only its \
+        durability is unconfirmed"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }

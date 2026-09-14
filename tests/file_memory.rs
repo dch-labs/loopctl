@@ -752,6 +752,63 @@ async fn an_unopenable_parent_reports_unconfirmed_durability_after_the_rename() 
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_durability_unconfirmed_consolidation_still_commits_the_pass() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = temp_dir("commit-on-not-durable");
+    let path = dir.join("memory.jsonl");
+    let store = FileMemoryStore::open(&path).unwrap();
+    let mut durable = MemoryEntry::new(MemoryCategory::Fact, "nightly deploys pause the world");
+    durable.relevance = 0.9;
+    let mut spent = MemoryEntry::new(MemoryCategory::Fact, "a spent lesson");
+    spent.relevance = 0.01;
+    store.store(durable.clone()).await.unwrap();
+    store.store(spent).await.unwrap();
+
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o300);
+    std::fs::set_permissions(&dir, perms).unwrap();
+    let result = store.consolidate().await;
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&dir, perms).unwrap();
+    let error = result.expect_err("the directory sync after the rename fails");
+    assert!(
+        error.to_string().contains("cannot sync directory"),
+        "the failure is the durability-unconfirmed class: {error}"
+    );
+
+    assert_eq!(
+        store.len(),
+        1,
+        "the pass committed to the live mirror despite the error — the \
+        rename had already landed"
+    );
+    store.flush().unwrap();
+    drop(store);
+
+    let reopened = FileMemoryStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.len(),
+        1,
+        "a later flush from the committed mirror does not resurrect the \
+        pruned entry on disk"
+    );
+    assert_eq!(
+        reopened
+            .retrieve("nightly deploys", 3)
+            .await
+            .unwrap()
+            .first()
+            .map(|e| e.id),
+        Some(durable.id),
+        "the survivor is the durable entry"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn mid_file_corruption_fails_the_open() {
     let dir = temp_dir("corrupt");

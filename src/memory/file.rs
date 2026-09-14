@@ -183,6 +183,40 @@ fn live_stores() -> &'static Mutex<HashMap<PathBuf, Weak<Inner>>> {
 /// identically.
 const SYMLINK_FOLLOW_LIMIT: usize = 8;
 
+/// Why a file-store rewrite failed, split by how far it got.
+///
+/// The two classes call for opposite caller reactions: a pre-commit
+/// failure leaves the file untouched, so a caller proposing a next
+/// state should discard it; a committed-but-not-durable failure has
+/// already replaced the file, so the proposal must be committed —
+/// discarding it would leave the caller's state behind the disk.
+#[derive(Debug)]
+enum RewriteError {
+    /// The rewrite never reached the rename; the file is untouched.
+    ///
+    /// Serialization, temp-file creation, writing, syncing, or the
+    /// rename itself failed — the caller's proposed next state should
+    /// be discarded, since the disk never saw it.
+    PreCommit(LoopError),
+
+    /// The rename landed; the parent-directory sync failed. The new
+    /// file is in place — only its durability is unconfirmed.
+    ///
+    /// The file already holds the rewritten entries; a caller holding
+    /// a proposed next state must commit it to stay level with the
+    /// disk, and may surface the inner error to report the unconfirmed
+    /// durability.
+    NotDurable(LoopError),
+}
+
+impl From<RewriteError> for LoopError {
+    fn from(error: RewriteError) -> Self {
+        match error {
+            RewriteError::PreCommit(error) | RewriteError::NotDurable(error) => error,
+        }
+    }
+}
+
 impl FileMemoryStore {
     /// Open (or create) a store backed by `path`, loading existing entries.
     ///
@@ -221,7 +255,7 @@ impl FileMemoryStore {
                 registry.remove(&canonical);
                 let (entries, torn_tail) = Self::load_entries(&canonical)?;
                 if torn_tail {
-                    Self::rewrite(&canonical, &entries)?;
+                    Self::rewrite(&canonical, &entries).map_err(LoopError::from)?;
                 }
                 let inner = Arc::new(Inner::new(canonical.clone(), entries));
                 registry.insert(canonical, Arc::downgrade(&inner));
@@ -354,7 +388,7 @@ impl FileMemoryStore {
     /// failure the original file is left untouched.
     pub fn flush(&self) -> Result<(), LoopError> {
         let entries = recover_guard(self.inner.entries.write());
-        Self::rewrite(&self.inner.path, &entries)
+        Self::rewrite(&self.inner.path, &entries).map_err(LoopError::from)
     }
 
     /// Load a JSONL file into a vec of entries, applying the corruption rules.
@@ -491,20 +525,23 @@ impl FileMemoryStore {
     ///
     /// # Errors
     ///
-    /// [`LoopError::Memory`] if any entry cannot be serialized, the
-    /// temp file cannot be created, written, synced, or renamed over
-    /// the target, or the post-rename directory sync fails — that last
-    /// case means the new file is already in place but its durability
-    /// is unconfirmed. Every failure except the last leaves the
-    /// original file untouched.
-    fn rewrite(path: &Path, entries: &[MemoryEntry]) -> Result<(), LoopError> {
+    /// [`RewriteError::PreCommit`](RewriteError::PreCommit) if
+    /// any entry cannot be serialized or the temp file cannot be
+    /// created, written, synced, or renamed over the target — the
+    /// original file is untouched.
+    /// [`RewriteError::NotDurable`](RewriteError::NotDurable) if
+    /// the post-rename directory sync fails: the new file is already
+    /// in place, only its durability is unconfirmed.
+    fn rewrite(path: &Path, entries: &[MemoryEntry]) -> Result<(), RewriteError> {
         use std::io::Write as _;
         let temp_path = Self::temp_sibling_path(path);
-        let write_result = (|| -> Result<(), LoopError> {
+        let write_result = (|| -> Result<(), RewriteError> {
             let mut buffer = String::new();
             for entry in entries {
                 let line = serde_json::to_string(entry).map_err(|e| {
-                    LoopError::Memory(format!("memory entry serialization failed: {e}"))
+                    RewriteError::PreCommit(LoopError::Memory(format!(
+                        "memory entry serialization failed: {e}"
+                    )))
                 })?;
                 buffer.push_str(&line);
                 buffer.push('\n');
@@ -513,13 +550,24 @@ impl FileMemoryStore {
                 .write(true)
                 .create_new(true)
                 .open(&temp_path)
-                .map_err(|e| LoopError::Memory(format!("cannot create rewrite temp file: {e}")))?;
+                .map_err(|e| {
+                    RewriteError::PreCommit(LoopError::Memory(format!(
+                        "cannot create rewrite temp file: {e}"
+                    )))
+                })?;
             file.write_all(buffer.as_bytes())
                 .and_then(|()| file.sync_all())
-                .map_err(|e| LoopError::Memory(format!("cannot write rewrite temp file: {e}")))?;
-            std::fs::rename(&temp_path, path)
-                .map_err(|e| LoopError::Memory(format!("cannot finalize memory rewrite: {e}")))?;
-            Self::sync_parent_directory(path)?;
+                .map_err(|e| {
+                    RewriteError::PreCommit(LoopError::Memory(format!(
+                        "cannot write rewrite temp file: {e}"
+                    )))
+                })?;
+            std::fs::rename(&temp_path, path).map_err(|e| {
+                RewriteError::PreCommit(LoopError::Memory(format!(
+                    "cannot finalize memory rewrite: {e}"
+                )))
+            })?;
+            Self::sync_parent_directory(path).map_err(RewriteError::NotDurable)?;
             Self::drop_stale_temp_siblings(path);
             Ok(())
         })();
@@ -582,8 +630,11 @@ impl FileMemoryStore {
     ///
     /// Called only from a successful rewrite, which already holds the
     /// entries write lock, so no live temp file of this store can
-    /// exist. Best-effort janitorial work: removal errors are ignored,
-    /// and a missing or empty parent sweeps the current directory.
+    /// exist. Only UUID-shaped middles are removed — a sibling like
+    /// `<name>.backup.tmp` does not match a real temp's
+    /// `<name>.<uuid>.tmp` shape and is left alone. Best-effort
+    /// janitorial work: removal errors are ignored, and a missing or
+    /// empty parent sweeps the current directory.
     fn drop_stale_temp_siblings(path: &Path) {
         let directory = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
@@ -598,10 +649,11 @@ impl FileMemoryStore {
         if let Ok(siblings) = std::fs::read_dir(&directory) {
             for sibling in siblings.flatten() {
                 let name = sibling.file_name().to_string_lossy().to_string();
-                let is_temp = std::path::Path::new(&name)
-                    .extension()
-                    .is_some_and(|ext| ext == "tmp");
-                if name.starts_with(&stem) && is_temp {
+                let is_our_temp = name
+                    .strip_prefix(&stem)
+                    .and_then(|rest| rest.strip_suffix(".tmp"))
+                    .is_some_and(|middle| Uuid::parse_str(middle).is_ok());
+                if is_our_temp {
                     drop(std::fs::remove_file(sibling.path()));
                 }
             }
@@ -716,7 +768,11 @@ impl LoopMemory for FileMemoryStore {
     /// the file, the mirror, and the pending access stamps all still in
     /// their pre-consolidation state — the stamps are only cleared once
     /// the rewrite has succeeded, held under the access-log lock across
-    /// it, so the next pass re-folds them instead of losing them.
+    /// it, so the next pass re-folds them instead of losing them. A
+    /// durability-unconfirmed failure (the rename landed, the
+    /// directory sync did not) still commits the pass to the mirror
+    /// and the file before returning the error — only fsync-durability
+    /// is unconfirmed, never the pass itself.
     fn consolidate(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
@@ -732,7 +788,16 @@ impl LoopMemory for FileMemoryStore {
                 }
             }
             let stats = consolidate_entries(&mut next, &self.consolidation, now);
-            Self::rewrite(&self.inner.path, &next)?;
+            match Self::rewrite(&self.inner.path, &next) {
+                Ok(()) => {}
+                Err(RewriteError::NotDurable(error)) => {
+                    access_log.clear();
+                    drop(access_log);
+                    *guard = next;
+                    return Err(error);
+                }
+                Err(RewriteError::PreCommit(error)) => return Err(error),
+            }
             access_log.clear();
             drop(access_log);
             *guard = next;
@@ -957,7 +1022,12 @@ mod tests {
             crate::memory::MemoryEntry::new(crate::memory::MemoryCategory::Fact, "first"),
             crate::memory::MemoryEntry::new(crate::memory::MemoryCategory::Fact, "second"),
         ];
-        std::fs::write(dir.join("rewrite.jsonl.orphan.tmp"), b"stale").unwrap();
+        std::fs::write(
+            dir.join(format!("rewrite.jsonl.{}.tmp", uuid::Uuid::new_v4())),
+            b"stale",
+        )
+        .unwrap();
+        std::fs::write(dir.join("rewrite.jsonl.backup.tmp"), b"user data").unwrap();
         super::FileMemoryStore::rewrite(&path, &entries).unwrap();
 
         let rewritten = std::fs::read_to_string(&path).unwrap();
@@ -976,10 +1046,17 @@ mod tests {
                     .is_some_and(|ext| ext == "tmp")
             })
             .collect();
-        assert!(
-            temp_leftovers.is_empty(),
+        assert_eq!(
+            temp_leftovers,
+            vec!["rewrite.jsonl.backup.tmp".to_string()],
             "a successful rename consumes the temp file and sweeps stale \
-            siblings: {temp_leftovers:?}"
+            UUID-shaped siblings — a user file sharing the prefix and \
+            suffix is preserved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("rewrite.jsonl.backup.tmp")).unwrap(),
+            "user data",
+            "the preserved sibling keeps its contents"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

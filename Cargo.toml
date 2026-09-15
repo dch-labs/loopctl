@@ -41,7 +41,7 @@ async-stream = { version = "0.3", optional = true }
 httpdate = { version = "1", optional = true }
 jsonschema = { version = "0.52", optional = true }
 regex = { version = "1", optional = true, default-features = false, features = ["std"] }
-rmcp = { version = "3", optional = true, default-features = false, features = ["client", "server", "macros", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-io"] }
+rmcp = { version = "3.4", optional = true, default-features = false, features = ["client", "server", "macros", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-io"] }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }

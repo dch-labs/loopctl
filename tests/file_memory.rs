@@ -1184,6 +1184,103 @@ async fn a_dropped_sibling_s_entries_survive_convergence() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn exhausted_chain_handles_share_state_once_it_resolves() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("chain-resolve");
+    let real = dir.join("realdir");
+    let mut head = dir.join("link-8.jsonl");
+    symlink(real.join("memory.jsonl"), &head).unwrap();
+    for step in (0..8).rev() {
+        let link = dir.join(format!("link-{step}.jsonl"));
+        symlink(&head, &link).unwrap();
+        head = link;
+    }
+    let first = FileMemoryStore::new(&head);
+
+    std::fs::create_dir_all(&real).unwrap();
+    let second = FileMemoryStore::open(&head).unwrap();
+    first
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "alpha grip large files with both hands",
+        ))
+        .await
+        .unwrap();
+    second
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "alpha nightly deploys pause the world",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        first.len(),
+        2,
+        "the chain-head handle attaches to the resolved store — an \
+        exhausted chain's provisional key re-derives once the chain \
+        resolves"
+    );
+    assert_eq!(second.len(), 2, "the resolving handle shares it");
+    drop(first);
+    drop(second);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened.len(),
+        2,
+        "every entry persists through the real path — the appends went \
+        through the chain to one file"
+    );
+    reopened.consolidate().await.unwrap();
+    drop(reopened);
+    let after = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        after.len(),
+        2,
+        "a rewrite through the real path — the only spelling whose final \
+        component is not a symlink — keeps both entries"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_rewrite_refuses_to_replace_a_final_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("chain-refuse");
+    let real = dir.join("realdir");
+    let mut head = dir.join("link-8.jsonl");
+    symlink(real.join("memory.jsonl"), &head).unwrap();
+    for step in (0..8).rev() {
+        let link = dir.join(format!("link-{step}.jsonl"));
+        symlink(&head, &link).unwrap();
+        head = link;
+    }
+    let store = FileMemoryStore::new(&head);
+
+    let flush_result = store.flush();
+    let message = flush_result
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(
+        message.contains("refusing to replace the link"),
+        "the rewrite must refuse to rename over a final-component \
+        symlink: {message}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&head).is_ok_and(|metadata| metadata.file_type().is_symlink()),
+        "the head of the chain is still a symlink — the refusal left it \
+        untouched"
+    );
+    assert_no_temp_siblings(&dir, "the refused rewrite cleaned up its temp");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn a_planted_symlink_at_a_predictable_temp_path_is_not_followed() {
     use std::os::unix::fs::symlink;
 

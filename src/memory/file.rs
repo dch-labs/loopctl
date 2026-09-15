@@ -162,8 +162,10 @@ struct Inner {
     ///
     /// Set when construction fell back to the lexical spelling because
     /// nothing on the path resolved yet — a parent symlink still
-    /// dangling; later constructions re-derive the key and move or
-    /// unify the registration once the world resolves. Never cleared —
+    /// dangling — or when a symlink chain outran the follow budget and
+    /// the deepest spelling reached may be resolvable in principle;
+    /// later constructions re-derive the key and move or unify the
+    /// registration once the world resolves. Never cleared —
     /// re-derivation is idempotent, so the flag only marks the entry
     /// as worth re-checking.
     is_fallback: bool,
@@ -358,9 +360,10 @@ fn injected_fault_at(path: &Path, stage: RewriteFaultStage) -> bool {
 /// How many final-component symlinks registry key derivation will follow.
 ///
 /// Bounds the chain walk below the kernel's own `ELOOP` threshold; a
-/// loop of links simply exhausts the budget and keys by the last
-/// resolved spelling, which every handle through the loop derives
-/// identically.
+/// loop of links simply exhausts the budget, and the deepest spelling
+/// reached keys the store — provisionally, since the world may
+/// resolve past it, so every handle through the loop derives the same
+/// re-derivable key.
 const SYMLINK_FOLLOW_LIMIT: usize = 8;
 
 /// Why a file-store rewrite failed, split by how far it got.
@@ -550,26 +553,31 @@ impl FileMemoryStore {
     /// target through the link. What remains is a genuinely missing
     /// final component, which carries no symlink ambiguity of its own:
     /// canonicalizing the parent and re-joining the file name matches
-    /// what `open` will derive once it creates the file. Only when the
-    /// parent itself cannot be resolved (missing or dangling, or gone
-    /// between the two lookups) does the key fall back to the lexical
-    /// `absolute` form — returned flagged as provisional, since that
-    /// spelling can stop matching the world once the parent resolves;
-    /// later constructions re-derive flagged keys and move the
-    /// registration
+    /// what `open` will derive once it creates the file — unless the
+    /// chain budget ran out first, in which case the key is the deepest
+    /// spelling reached, flagged provisional exactly like a fallback,
+    /// because the world may resolve past it. Only when the parent
+    /// itself cannot be resolved (missing or dangling, or gone between
+    /// the two lookups) does the key fall back to the lexical
+    /// `absolute` form — also flagged provisional, since that spelling
+    /// can stop matching the world once the parent resolves; later
+    /// constructions re-derive flagged keys and move the registration
     /// (see [`migrate_provisional_entries`](Self::migrate_provisional_entries)).
     ///
-    /// Returns the derived key and whether it came from the provisional
-    /// fallback arm.
+    /// Returns the derived key and whether it is provisional — either
+    /// from the lexical fallback arm or from chain-budget exhaustion.
     fn registry_key(path: &Path) -> (PathBuf, bool) {
         let mut current = path.to_path_buf();
+        let mut exhausted = true;
         for _ in 0..SYMLINK_FOLLOW_LIMIT {
             if let Ok(canonical) = std::fs::canonicalize(&current) {
                 return (canonical, false);
             }
-            match Self::dangling_final_symlink(&current) {
-                Some(target) => current = target,
-                None => break,
+            if let Some(target) = Self::dangling_final_symlink(&current) {
+                current = target;
+            } else {
+                exhausted = false;
+                break;
             }
         }
         if let Some(key) = current
@@ -577,7 +585,7 @@ impl FileMemoryStore {
             .and_then(|parent| parent.canonicalize().ok())
             .and_then(|parent| current.file_name().map(|name| parent.join(name)))
         {
-            return (key, false);
+            return (key, exhausted);
         }
         (
             std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
@@ -890,7 +898,11 @@ impl FileMemoryStore {
     /// anything exists at the path, symlinks included, so a planted
     /// link can never redirect the rewrite's contents into another
     /// file — syncs it, renames it over the target, and then syncs the
-    /// containing directory so the rename itself is durable. Readers
+    /// containing directory so the rename itself is durable. The rename
+    /// is refused when the target's final component is a symlink: a
+    /// rename never follows it, so replacing the link would fork the
+    /// chain's data — the refusal is pre-commit, the link survives,
+    /// and the caller keeps its mirror. Readers
     /// observe either the old or the new file, never a partial one; the
     /// temp file is removed on failure, and a successful rewrite also
     /// sweeps `<name>.<uuid>.tmp` siblings left behind by earlier
@@ -901,9 +913,10 @@ impl FileMemoryStore {
     /// # Errors
     ///
     /// [`RewriteError::PreCommit`](RewriteError::PreCommit) if
-    /// any entry cannot be serialized or the temp file cannot be
-    /// created, written, synced, or renamed over the target — the
-    /// original file is untouched.
+    /// any entry cannot be serialized, the temp file cannot be
+    /// created, written, synced, or renamed over the target, or the
+    /// target's final component is a symlink — the original file is
+    /// untouched.
     /// [`RewriteError::NotDurable`](RewriteError::NotDurable) if
     /// the post-rename directory sync fails: the new file is already
     /// in place, only its durability is unconfirmed.
@@ -943,6 +956,14 @@ impl FileMemoryStore {
                         "cannot write rewrite temp file: {e}"
                     )))
                 })?;
+            let path_is_symlink = std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            if path_is_symlink {
+                return Err(RewriteError::PreCommit(LoopError::Memory(
+                    "memory file path resolves to a symlink; refusing to replace the link"
+                        .to_string(),
+                )));
+            }
             std::fs::rename(&temp_path, path).map_err(|e| {
                 RewriteError::PreCommit(LoopError::Memory(format!(
                     "cannot finalize memory rewrite: {e}"
@@ -1335,6 +1356,35 @@ mod tests {
             chain_key,
             elsewhere.join("chain-end.jsonl"),
             "a chain of dangling links is followed to its end"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exhausted_symlink_chain_keys_provisionally() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unit_dir("exhausted");
+        let mut deepest = dir.join(format!("link-{}.jsonl", super::SYMLINK_FOLLOW_LIMIT));
+        symlink(dir.join("absent-target.jsonl"), &deepest).unwrap();
+        for step in (0..super::SYMLINK_FOLLOW_LIMIT).rev() {
+            let link = dir.join(format!("link-{step}.jsonl"));
+            symlink(&deepest, &link).unwrap();
+            deepest = link;
+        }
+
+        let (key, is_fallback) = FileMemoryStore::registry_key(&deepest);
+        assert_eq!(
+            key,
+            dir.join(format!("link-{}.jsonl", super::SYMLINK_FOLLOW_LIMIT)),
+            "budget exhaustion keys by the deepest spelling reached"
+        );
+        assert!(
+            is_fallback,
+            "the world may resolve past the deepest spelling, so an \
+            exhausted chain's key is provisional — later constructions \
+            re-derive it"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -60,9 +60,15 @@ use uuid::Uuid;
 /// through the same locks: concurrent stores can never interleave
 /// partial lines, concurrent rewrites can never collide on the temp
 /// file or strand an append on a replaced file, and no handle can
-/// rewrite the file without the others' entries. Multi-process access
-/// to the same file is not supported — there is no file locking, and
-/// two processes will corrupt the file.
+/// rewrite the file without the others' entries. A handle constructed
+/// while a parent symlink was still dangling keys provisionally by
+/// the given spelling; the next construction re-derives that key and
+/// moves the registration, so both handles share state once the path
+/// resolves — unless the derived key is already occupied by another
+/// live handle from the same pre-resolution window, a doubly unusual
+/// construction this store does not attempt to merge. Multi-process
+/// access to the same file is not supported — there is no file
+/// locking, and two processes will corrupt the file.
 ///
 /// # Example
 ///
@@ -146,20 +152,32 @@ struct Inner {
     /// fresh [`open`](FileMemoryStore::open) loads and repairs the
     /// file.
     append_unusable: AtomicBool,
+
+    /// Whether this store was registered under a provisional key.
+    ///
+    /// Set when construction fell back to the lexical spelling because
+    /// nothing on the path resolved yet — a parent symlink still
+    /// dangling; later constructions re-derive the key and move the
+    /// registration once the world resolves. Never cleared —
+    /// re-derivation is idempotent, so the flag only marks the entry
+    /// as worth re-checking.
+    is_fallback: bool,
 }
 
 impl Inner {
     /// Assemble the shared state for one file path.
     ///
     /// `entries` is whatever the constructing call loaded (or nothing,
-    /// for a fresh `new`); the registry call site is responsible for
+    /// for a fresh `new`); `is_fallback` mirrors the key derivation's
+    /// provisional flag; the registry call site is responsible for
     /// registering the result.
-    fn new(path: PathBuf, entries: Vec<MemoryEntry>) -> Self {
+    fn new(path: PathBuf, entries: Vec<MemoryEntry>, is_fallback: bool) -> Self {
         Self {
             path,
             entries: RwLock::new(entries),
             access_log: Mutex::new(HashMap::new()),
             append_unusable: AtomicBool::new(false),
+            is_fallback,
         }
     }
 }
@@ -211,7 +229,7 @@ pub enum RewriteFaultStage {
 /// determinism on privileged runners; absent from normal builds.
 #[cfg(feature = "testing")]
 pub fn fail_next_rewrite_at(path: &Path, stage: RewriteFaultStage) {
-    let key = FileMemoryStore::registry_key(path);
+    let key = FileMemoryStore::registry_key(path).0;
     recover_guard(registered_faults().lock()).push((key, stage));
 }
 
@@ -321,6 +339,7 @@ impl FileMemoryStore {
             .map_err(|e| LoopError::Memory(format!("cannot resolve memory file path: {e}")))?;
         let inner = {
             let mut registry = recover_guard(live_stores().lock());
+            Self::migrate_provisional_entries(&mut registry);
             let attached = registry.get(&canonical).and_then(Weak::upgrade);
             if let Some(inner) = attached {
                 inner
@@ -330,7 +349,7 @@ impl FileMemoryStore {
                 if torn_tail {
                     Self::rewrite(&canonical, &entries).map_err(LoopError::from)?;
                 }
-                let inner = Arc::new(Inner::new(canonical.clone(), entries));
+                let inner = Arc::new(Inner::new(canonical.clone(), entries, false));
                 registry.insert(canonical, Arc::downgrade(&inner));
                 inner
             }
@@ -353,15 +372,16 @@ impl FileMemoryStore {
     /// existing file when no handle is live.
     #[must_use]
     pub fn new(path: impl AsRef<Path>) -> Self {
-        let key = Self::registry_key(path.as_ref());
+        let (key, is_fallback) = Self::registry_key(path.as_ref());
         let inner = {
             let mut registry = recover_guard(live_stores().lock());
+            Self::migrate_provisional_entries(&mut registry);
             let attached = registry.get(&key).and_then(Weak::upgrade);
             if let Some(inner) = attached {
                 inner
             } else {
                 registry.remove(&key);
-                let inner = Arc::new(Inner::new(key.clone(), Vec::new()));
+                let inner = Arc::new(Inner::new(key.clone(), Vec::new(), is_fallback));
                 registry.insert(key, Arc::downgrade(&inner));
                 inner
             }
@@ -406,14 +426,21 @@ impl FileMemoryStore {
     /// final component, which carries no symlink ambiguity of its own:
     /// canonicalizing the parent and re-joining the file name matches
     /// what `open` will derive once it creates the file. Only when the
-    /// parent itself cannot be resolved (missing as well, or gone
+    /// parent itself cannot be resolved (missing or dangling, or gone
     /// between the two lookups) does the key fall back to the lexical
-    /// `absolute` form.
-    fn registry_key(path: &Path) -> PathBuf {
+    /// `absolute` form — returned flagged as provisional, since that
+    /// spelling can stop matching the world once the parent resolves;
+    /// later constructions re-derive flagged keys and move the
+    /// registration
+    /// (see [`migrate_provisional_entries`](Self::migrate_provisional_entries)).
+    ///
+    /// Returns the derived key and whether it came from the provisional
+    /// fallback arm.
+    fn registry_key(path: &Path) -> (PathBuf, bool) {
         let mut current = path.to_path_buf();
         for _ in 0..SYMLINK_FOLLOW_LIMIT {
             if let Ok(canonical) = std::fs::canonicalize(&current) {
-                return canonical;
+                return (canonical, false);
             }
             match Self::dangling_final_symlink(&current) {
                 Some(target) => current = target,
@@ -425,9 +452,52 @@ impl FileMemoryStore {
             .and_then(|parent| parent.canonicalize().ok())
             .and_then(|parent| current.file_name().map(|name| parent.join(name)))
         {
-            return key;
+            return (key, false);
         }
-        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+        (
+            std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
+            true,
+        )
+    }
+
+    /// Move provisional registrations onto the keys the world now yields.
+    ///
+    /// Runs inside the constructors' registry critical section, before
+    /// their attach-or-create lookup, so a handle constructed while a
+    /// parent symlink was dangling is found once the path resolves:
+    /// every live [`Inner`] flagged as a fallback has its key
+    /// re-derived, and a registration whose derived key differs moves
+    /// there. [`Inner::path`] deliberately keeps the fallback spelling —
+    /// it is read lock-free by appends and rewrites, and once the
+    /// symlink target exists that spelling resolves to the same file,
+    /// renames onto the same target, and syncs the same directory
+    /// inode. A derived key already occupied by another live
+    /// registration is left untouched: reaching that state takes two
+    /// fallback-registered handles on one file from before its
+    /// directory existed, and merging two live mirrors is out of this
+    /// migration's proportion.
+    fn migrate_provisional_entries(registry: &mut HashMap<PathBuf, Weak<Inner>>) {
+        let mut moves = Vec::new();
+        for (registered, weak) in registry.iter() {
+            let Some(inner) = weak.upgrade() else {
+                continue;
+            };
+            if !inner.is_fallback {
+                continue;
+            }
+            let derived = Self::registry_key(&inner.path).0;
+            if &derived != registered && !registry.contains_key(&derived) {
+                moves.push((registered.clone(), derived));
+            }
+        }
+        for (registered, derived) in moves {
+            if registry.contains_key(&derived) {
+                continue;
+            }
+            if let Some(weak) = registry.remove(&registered) {
+                registry.insert(derived, weak);
+            }
+        }
     }
 
     /// Set the configuration driving this store's consolidation pass.
@@ -926,17 +996,24 @@ mod tests {
         let through_link = link.join("memory.jsonl");
         std::fs::File::create(&through_link).unwrap();
 
+        let (key, is_fallback) = FileMemoryStore::registry_key(&through_link);
         assert_eq!(
-            FileMemoryStore::registry_key(&through_link),
+            key,
             real.join("memory.jsonl"),
             "an existing file keys by where it really lives, resolving the \
             symlinked directory"
         );
+        assert!(
+            !is_fallback,
+            "an outright canonical resolution is never provisional — no \
+            later construction needs to migrate it"
+        );
 
         let file_link = dir.join("mem-link.jsonl");
         symlink(real.join("memory.jsonl"), &file_link).unwrap();
+        let (file_key, _) = FileMemoryStore::registry_key(&file_link);
         assert_eq!(
-            FileMemoryStore::registry_key(&file_link),
+            file_key,
             real.join("memory.jsonl"),
             "a symlinked file keys by its target — only the outright \
             canonicalization resolves a symlink on the file itself"
@@ -956,12 +1033,18 @@ mod tests {
         symlink(&real, &link).unwrap();
         let absent_through_link = link.join("memory.jsonl");
 
+        let (key, is_fallback) = FileMemoryStore::registry_key(&absent_through_link);
         assert_eq!(
-            FileMemoryStore::registry_key(&absent_through_link),
+            key,
             real.join("memory.jsonl"),
             "a missing final component carries no ambiguity of its own — \
             the key is the canonical parent plus the name, exactly what \
             open derives once it creates the file"
+        );
+        assert!(
+            !is_fallback,
+            "the canonical-parent arm resolves the world, so its key is \
+            never provisional"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -977,11 +1060,17 @@ mod tests {
 
         let absolute_link = dir.join("abs-link.jsonl");
         symlink(elsewhere.join("target.jsonl"), &absolute_link).unwrap();
+        let (key, is_fallback) = FileMemoryStore::registry_key(&absolute_link);
         assert_eq!(
-            FileMemoryStore::registry_key(&absolute_link),
+            key,
             elsewhere.join("target.jsonl"),
             "a dangling final symlink keys by its absolute target — where \
             the first store will create the data"
+        );
+        assert!(
+            !is_fallback,
+            "a dangling final symlink resolves to a definite target, so \
+            its key is never provisional"
         );
 
         let relative_link = dir.join("rel-link.jsonl");
@@ -990,8 +1079,9 @@ mod tests {
             &relative_link,
         )
         .unwrap();
+        let (relative_key, _) = FileMemoryStore::registry_key(&relative_link);
         assert_eq!(
-            FileMemoryStore::registry_key(&relative_link),
+            relative_key,
             elsewhere.join("rel-target.jsonl"),
             "a relative target is anchored at the canonicalized parent of \
             the link before keying"
@@ -1002,8 +1092,9 @@ mod tests {
         symlink(&chain_end, &chain_mid).unwrap();
         let chain_link = dir.join("chain-link.jsonl");
         symlink(&chain_mid, &chain_link).unwrap();
+        let (chain_key, _) = FileMemoryStore::registry_key(&chain_link);
         assert_eq!(
-            FileMemoryStore::registry_key(&chain_link),
+            chain_key,
             elsewhere.join("chain-end.jsonl"),
             "a chain of dangling links is followed to its end"
         );
@@ -1013,33 +1104,50 @@ mod tests {
     #[test]
     fn an_unresolvable_path_falls_back_to_the_lexical_absolute_form() {
         let absent = std::path::Path::new("/nonexistent-file-memory-unit/parent/mem.jsonl");
+        let (key, is_fallback) = FileMemoryStore::registry_key(absent);
         assert_eq!(
-            FileMemoryStore::registry_key(absent),
+            key,
             absent.to_path_buf(),
             "with neither the file nor its parent resolvable, the already \
             absolute spelling is returned as-is"
+        );
+        assert!(
+            is_fallback,
+            "only the unresolved lexical arm marks the key provisional — \
+            later constructions re-derive it"
         );
     }
 
     #[test]
     fn an_empty_path_falls_back_to_the_raw_spelling() {
         let empty = std::path::Path::new("");
+        let (key, is_fallback) = FileMemoryStore::registry_key(empty);
         assert_eq!(
-            FileMemoryStore::registry_key(empty),
+            key,
             empty.to_path_buf(),
             "the empty path resolves nowhere at any stage — the final \
             fallback returns the raw spelling instead of panicking"
+        );
+        assert!(
+            is_fallback,
+            "a key that resolves nothing is provisional by construction"
         );
     }
 
     #[test]
     fn a_trailing_dotdot_still_yields_a_key() {
         let edge = std::path::Path::new("/nonexistent-file-memory-unit/..");
+        let (key, is_fallback) = FileMemoryStore::registry_key(edge);
         assert_eq!(
-            FileMemoryStore::registry_key(edge),
+            key,
             edge.to_path_buf(),
             "a path with no file name component skips the parent-join arm \
             without panicking and lands in the lexical fallback"
+        );
+        assert!(
+            is_fallback,
+            "the lexical fallback marks its keys provisional so a later \
+            construction can move the registration"
         );
     }
 

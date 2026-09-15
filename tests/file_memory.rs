@@ -726,6 +726,56 @@ async fn dangling_link_handles_share_state_and_the_link_survives() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn dangling_parent_handles_share_state_once_the_path_resolves() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("dangling-parent");
+    let real = dir.join("realdir");
+    let link = dir.join("link");
+    symlink(&real, &link).unwrap();
+    let through_link = link.join("memory.jsonl");
+    let first = FileMemoryStore::new(&through_link);
+
+    std::fs::create_dir_all(&real).unwrap();
+    let second = FileMemoryStore::open(&through_link).unwrap();
+    first
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "grip large files with both hands",
+        ))
+        .await
+        .unwrap();
+    second
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "nightly deploys pause the world",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        first.len(),
+        2,
+        "the handle born while the parent link was still dangling \
+        attaches to the same shared state as the handle constructed \
+        after the path resolved"
+    );
+    assert_eq!(second.len(), 2, "both handles observe both entries");
+    first.consolidate().await.unwrap();
+    drop(first);
+    drop(second);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened.len(),
+        2,
+        "one shared mirror means the consolidation persisted both \
+        handles' entries — verified by reopening through the real path"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn a_planted_symlink_at_a_predictable_temp_path_is_not_followed() {
     use std::os::unix::fs::symlink;
 

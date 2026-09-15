@@ -941,6 +941,107 @@ async fn mirrors_written_before_unification_merge_into_the_surviving_store() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn an_existing_handle_converges_before_it_rewrites() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("converge-consolidate");
+    let real = dir.join("realdir");
+    let link1 = dir.join("link1");
+    let link2 = dir.join("link2");
+    symlink(&real, &link1).unwrap();
+    symlink(&real, &link2).unwrap();
+    let first = FileMemoryStore::new(link1.join("memory.jsonl"));
+    let second = FileMemoryStore::new(link2.join("memory.jsonl"));
+
+    std::fs::create_dir_all(&real).unwrap();
+    first
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "grip large files with both hands",
+        ))
+        .await
+        .unwrap();
+    second
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "nightly deploys pause the world",
+        ))
+        .await
+        .unwrap();
+
+    first.consolidate().await.unwrap();
+    assert_eq!(
+        second.len(),
+        2,
+        "the consolidation converged the registry first — the stale \
+        side is re-pointed at the unified mirror"
+    );
+    drop(first);
+    drop(second);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened.len(),
+        2,
+        "the consolidation rewrote from the unified mirror — no \
+        construction ran between the stores and the rewrite, and both \
+        handles' entries persist through the real path"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_flush_on_a_converged_handle_rewrites_from_the_unified_mirror() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("converge-flush");
+    let real = dir.join("realdir");
+    let link1 = dir.join("link1");
+    let link2 = dir.join("link2");
+    symlink(&real, &link1).unwrap();
+    symlink(&real, &link2).unwrap();
+    let first = FileMemoryStore::new(link1.join("memory.jsonl"));
+    let second = FileMemoryStore::new(link2.join("memory.jsonl"));
+
+    std::fs::create_dir_all(&real).unwrap();
+    first
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "grip large files with both hands",
+        ))
+        .await
+        .unwrap();
+    second
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "nightly deploys pause the world",
+        ))
+        .await
+        .unwrap();
+
+    first.flush().unwrap();
+    assert_eq!(
+        second.len(),
+        2,
+        "the flush converged the registry first — the stale side is \
+        re-pointed at the unified mirror"
+    );
+    drop(first);
+    drop(second);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened.len(),
+        2,
+        "the flush rewrote from the unified mirror — both handles' \
+        entries persist through the real path"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn a_planted_symlink_at_a_predictable_temp_path_is_not_followed() {
     use std::os::unix::fs::symlink;
 

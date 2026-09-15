@@ -66,7 +66,9 @@ use uuid::Uuid;
 /// moves the registration — and spellings that collide, having
 /// resolved to one file, unify: their mirrors merge and the stale
 /// handle is re-pointed, so every handle shares one state as soon as
-/// any construction resolves the path. Multi-process access to the
+/// any construction or rewrite observes the paths converged — a
+/// flush or consolidation on a converged handle unifies first, then
+/// rewrites from the one mirror. Multi-process access to the
 /// same file is not supported — there is no file locking, and two
 /// processes will corrupt the file.
 ///
@@ -588,8 +590,12 @@ impl FileMemoryStore {
     ///
     /// Runs inside the constructors' registry critical section, before
     /// their attach-or-create lookup, so handles constructed while a
-    /// parent symlink was dangling are found once the path resolves.
-    /// Every live cell flagged as a fallback has its key re-derived; a
+    /// parent symlink was dangling are found once the path resolves;
+    /// and before every mirror-driven rewrite, via
+    /// [`converge_with_registry`](Self::converge_with_registry), so a
+    /// rewrite from one mirror cannot delete a converged sibling's
+    /// entries. Every live cell flagged as a fallback has its key
+    /// re-derived; a
     /// registration whose derived key is unoccupied moves there, and
     /// one whose derived key is already occupied unifies into the
     /// occupant — mirrors merge
@@ -716,6 +722,26 @@ impl FileMemoryStore {
         self
     }
 
+    /// Re-derive provisional registrations before a mirror-driven rewrite.
+    ///
+    /// [`flush`](Self::flush) and
+    /// [`consolidate`](LoopMemory::consolidate) rewrite the file from
+    /// a mirror, so a handle whose path has converged with another's
+    /// since construction must unify first — otherwise the rewrite
+    /// would persist one mirror and silently delete the other's
+    /// entries from disk. Takes the registry mutex as a leaf —
+    /// acquired and released before any other lock, since nothing in
+    /// this module takes it while holding one — and must run before
+    /// the caller's whole-operation `current` guard, so the rewrite
+    /// then executes entirely against the post-redirect [`Inner`]. If
+    /// this handle is the stale side of a collision, the migration
+    /// merges its mirror into the target before redirecting, so
+    /// nothing it stored before converging is lost by the redirect.
+    fn converge_with_registry() {
+        let mut registry = recover_guard(live_stores().lock());
+        Self::migrate_provisional_entries(&mut registry);
+    }
+
     /// Persist the full in-memory state, rewriting the file atomically.
     ///
     /// Used internally by [`consolidate`](LoopMemory::consolidate); also
@@ -736,6 +762,7 @@ impl FileMemoryStore {
     /// [`LoopError::Memory`] on any I/O or serialization failure. On
     /// failure the original file is left untouched.
     pub fn flush(&self) -> Result<(), LoopError> {
+        Self::converge_with_registry();
         let shared = recover_guard(self.inner.current.read());
         let entries = recover_guard(shared.entries.write());
         Self::rewrite(&shared.path, &entries).map_err(LoopError::from)
@@ -1090,6 +1117,7 @@ impl LoopMemory for FileMemoryStore {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
         Box::pin(async move {
+            Self::converge_with_registry();
             let shared = recover_guard(self.inner.current.read());
             let now = SystemTime::now();
             let mut guard = recover_guard(shared.entries.write());

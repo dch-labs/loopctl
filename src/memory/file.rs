@@ -18,7 +18,7 @@ use crate::memory::LoopMemory;
 use crate::memory::consolidate::{ConsolidationConfig, consolidate_entries};
 use crate::memory::entry::{ConsolidationStats, MemoryEntry};
 use crate::memory::score::score_entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -63,12 +63,12 @@ use uuid::Uuid;
 /// rewrite the file without the others' entries. A handle constructed
 /// while a parent symlink was still dangling keys provisionally by
 /// the given spelling; the next construction re-derives that key and
-/// moves the registration, so both handles share state once the path
-/// resolves — unless the derived key is already occupied by another
-/// live handle from the same pre-resolution window, a doubly unusual
-/// construction this store does not attempt to merge. Multi-process
-/// access to the same file is not supported — there is no file
-/// locking, and two processes will corrupt the file.
+/// moves the registration — and spellings that collide, having
+/// resolved to one file, unify: their mirrors merge and the stale
+/// handle is re-pointed, so every handle shares one state as soon as
+/// any construction resolves the path. Multi-process access to the
+/// same file is not supported — there is no file locking, and two
+/// processes will corrupt the file.
 ///
 /// # Example
 ///
@@ -95,12 +95,13 @@ use uuid::Uuid;
 /// # });
 /// ```
 pub struct FileMemoryStore {
-    /// The state shared by every live handle on this file path.
+    /// The redirectable state shared by every live handle on this file path.
     ///
-    /// Appends, rewrites, and the access log all serialize behind the
-    /// shared locks inside, so two handles constructed for one path —
-    /// `open`, `new`, or a mix — observe and mutate the same store.
-    inner: Arc<Inner>,
+    /// Operations pin the current shared state for their whole duration
+    /// under a read guard (see [`SharedInner`]), so handles — however
+    /// constructed, and re-pointed by a spelling unification — always
+    /// observe one store.
+    inner: Arc<SharedInner>,
 
     /// The configuration driving this handle's consolidation pass.
     ///
@@ -112,11 +113,13 @@ pub struct FileMemoryStore {
     consolidation: ConsolidationConfig,
 }
 
-/// The mutable state shared by every live [`FileMemoryStore`] on one path.
+/// The mutable state of one store, held as the current value of a
+/// [`SharedInner`].
 ///
-/// One `Inner` exists per live path per process (the registry in
-/// [`live_stores`] enforces that), so every file-mutating path through
-/// any handle serializes behind these locks.
+/// One `Inner` serves every handle that converged on one registry key;
+/// a unification of two pre-resolution spellings retires the stale one
+/// and re-points its holders, so every file-mutating path through any
+/// handle serializes behind these locks.
 struct Inner {
     /// Path of the JSONL file backing the store.
     ///
@@ -157,8 +160,8 @@ struct Inner {
     ///
     /// Set when construction fell back to the lexical spelling because
     /// nothing on the path resolved yet — a parent symlink still
-    /// dangling; later constructions re-derive the key and move the
-    /// registration once the world resolves. Never cleared —
+    /// dangling; later constructions re-derive the key and move or
+    /// unify the registration once the world resolves. Never cleared —
     /// re-derivation is idempotent, so the flag only marks the entry
     /// as worth re-checking.
     is_fallback: bool,
@@ -180,6 +183,90 @@ impl Inner {
             is_fallback,
         }
     }
+
+    /// Append one serialized entry as a line to the file.
+    ///
+    /// The caller holds the entries write lock, so appends are serialized
+    /// and lines can never interleave. The line is flushed to the OS —
+    /// visible to other processes and safe against a process crash, but
+    /// not fsynced; callers needing power-loss durability call
+    /// [`FileMemoryStore::flush`]. If the write or flush fails partway,
+    /// the file is truncated back to its pre-append length so a partial
+    /// line cannot sit in later appends' way; if even the truncation
+    /// fails, the store marks itself unusable and every further append
+    /// is rejected until a fresh [`FileMemoryStore::open`] repairs the
+    /// file.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Memory`] if the file cannot be opened for append,
+    /// the line cannot be written and flushed, or the store is unusable
+    /// after an earlier unrecoverable append failure.
+    fn append_line(&self, line: &str) -> Result<(), LoopError> {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        if self.append_unusable.load(AtomicOrdering::SeqCst) {
+            return Err(LoopError::Memory(
+                "the memory file is unusable after an unrecoverable append failure; drop every live handle and reopen to repair it"
+                    .to_string(),
+            ));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| LoopError::Memory(format!("cannot open memory file for append: {e}")))?;
+        let original_len = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| LoopError::Memory(format!("cannot size the memory file: {e}")))?;
+        let write_result = file
+            .write_all(line.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.flush());
+        if let Err(e) = write_result {
+            let truncation = file.set_len(original_len).and_then(|()| file.flush());
+            if truncation.is_err() {
+                self.append_unusable.store(true, AtomicOrdering::SeqCst);
+            }
+            return Err(LoopError::Memory(format!(
+                "cannot append to memory file: {e}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The redirectable cell holding the current [`Inner`] of one store.
+///
+/// Every handle holds one of these instead of the [`Inner`] itself, so
+/// a unification of two pre-resolution spellings of one file can
+/// re-point the stale cell's holders at the unified state. Operations
+/// pin the current `Inner` for their whole duration under a read guard
+/// — the airtightness rule: a redirect happens under a write guard, so
+/// it can never interleave with an operation that already observed the
+/// old state, and no in-flight append can land in a mirror the redirect
+/// is about to retire; the retired `Inner` drops once the last
+/// in-flight operation releases its guard.
+struct SharedInner {
+    /// The live shared state, replaceable only by a unification.
+    ///
+    /// Readers hold a read guard for their entire operation; a redirect
+    /// installs the unified store's [`Inner`] here under a write guard,
+    /// after which every handle on this cell observes the unified
+    /// store.
+    current: RwLock<Arc<Inner>>,
+}
+
+impl SharedInner {
+    /// Wrap one shared state as the current state of a fresh cell.
+    ///
+    /// Constructors call this once per new store; the cell is only
+    /// re-pointed afterwards, never re-wrapped.
+    fn new(inner: Arc<Inner>) -> Self {
+        Self {
+            current: RwLock::new(inner),
+        }
+    }
 }
 
 /// The process-wide registry of live shared store states, by path.
@@ -188,8 +275,8 @@ impl Inner {
 /// one exists, so two handles on one file share locks and mirror
 /// instead of racing each other into data loss. Dead entries are
 /// pruned opportunistically on lookup.
-fn live_stores() -> &'static Mutex<HashMap<PathBuf, Weak<Inner>>> {
-    static LIVE: OnceLock<Mutex<HashMap<PathBuf, Weak<Inner>>>> = OnceLock::new();
+fn live_stores() -> &'static Mutex<HashMap<PathBuf, Weak<SharedInner>>> {
+    static LIVE: OnceLock<Mutex<HashMap<PathBuf, Weak<SharedInner>>>> = OnceLock::new();
     LIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -337,25 +424,29 @@ impl FileMemoryStore {
         }
         let canonical = std::fs::canonicalize(&path)
             .map_err(|e| LoopError::Memory(format!("cannot resolve memory file path: {e}")))?;
-        let inner = {
+        let shared = {
             let mut registry = recover_guard(live_stores().lock());
             Self::migrate_provisional_entries(&mut registry);
             let attached = registry.get(&canonical).and_then(Weak::upgrade);
-            if let Some(inner) = attached {
-                inner
+            if let Some(shared) = attached {
+                shared
             } else {
                 registry.remove(&canonical);
                 let (entries, torn_tail) = Self::load_entries(&canonical)?;
                 if torn_tail {
                     Self::rewrite(&canonical, &entries).map_err(LoopError::from)?;
                 }
-                let inner = Arc::new(Inner::new(canonical.clone(), entries, false));
-                registry.insert(canonical, Arc::downgrade(&inner));
-                inner
+                let shared = Arc::new(SharedInner::new(Arc::new(Inner::new(
+                    canonical.clone(),
+                    entries,
+                    false,
+                ))));
+                registry.insert(canonical, Arc::downgrade(&shared));
+                shared
             }
         };
         Ok(Self {
-            inner,
+            inner: shared,
             consolidation: ConsolidationConfig::default(),
         })
     }
@@ -373,21 +464,25 @@ impl FileMemoryStore {
     #[must_use]
     pub fn new(path: impl AsRef<Path>) -> Self {
         let (key, is_fallback) = Self::registry_key(path.as_ref());
-        let inner = {
+        let shared = {
             let mut registry = recover_guard(live_stores().lock());
             Self::migrate_provisional_entries(&mut registry);
             let attached = registry.get(&key).and_then(Weak::upgrade);
-            if let Some(inner) = attached {
-                inner
+            if let Some(shared) = attached {
+                shared
             } else {
                 registry.remove(&key);
-                let inner = Arc::new(Inner::new(key.clone(), Vec::new(), is_fallback));
-                registry.insert(key, Arc::downgrade(&inner));
-                inner
+                let shared = Arc::new(SharedInner::new(Arc::new(Inner::new(
+                    key.clone(),
+                    Vec::new(),
+                    is_fallback,
+                ))));
+                registry.insert(key, Arc::downgrade(&shared));
+                shared
             }
         };
         Self {
-            inner,
+            inner: shared,
             consolidation: ConsolidationConfig::default(),
         }
     }
@@ -460,42 +555,124 @@ impl FileMemoryStore {
         )
     }
 
-    /// Move provisional registrations onto the keys the world now yields.
+    /// Move or unify provisional registrations onto the keys the world
+    /// now yields.
     ///
     /// Runs inside the constructors' registry critical section, before
-    /// their attach-or-create lookup, so a handle constructed while a
-    /// parent symlink was dangling is found once the path resolves:
-    /// every live [`Inner`] flagged as a fallback has its key
-    /// re-derived, and a registration whose derived key differs moves
-    /// there. [`Inner::path`] deliberately keeps the fallback spelling —
-    /// it is read lock-free by appends and rewrites, and once the
-    /// symlink target exists that spelling resolves to the same file,
-    /// renames onto the same target, and syncs the same directory
-    /// inode. A derived key already occupied by another live
-    /// registration is left untouched: reaching that state takes two
-    /// fallback-registered handles on one file from before its
-    /// directory existed, and merging two live mirrors is out of this
-    /// migration's proportion.
-    fn migrate_provisional_entries(registry: &mut HashMap<PathBuf, Weak<Inner>>) {
-        let mut moves = Vec::new();
+    /// their attach-or-create lookup, so handles constructed while a
+    /// parent symlink was dangling are found once the path resolves.
+    /// Every live cell flagged as a fallback has its key re-derived; a
+    /// registration whose derived key is unoccupied moves there, and
+    /// one whose derived key is already occupied unifies into the
+    /// occupant — mirrors merge
+    /// (see [`merge_mirrors`](Self::merge_mirrors)), the stale cell is
+    /// re-pointed at the occupant's [`Inner`]
+    /// (see [`unify_shared_states`](Self::unify_shared_states)), and
+    /// the stale registration key is re-registered against the
+    /// occupant, so a late construction through either spelling
+    /// attaches to the one unified store. [`Inner::path`] keeps its
+    /// spelling on both sides — it is read lock-free by appends and
+    /// rewrites, and every spelling of one file resolves to the same
+    /// file, rename target, and directory inode once the path resolves.
+    /// Lock order for a unification: the registry mutex (held by the
+    /// caller), both `current` write locks in deterministic pointer
+    /// order, then the mirrors' locks as documented on
+    /// [`merge_mirrors`] — nothing in this module takes the registry
+    /// mutex while holding any of the others, so the order cannot
+    /// cycle.
+    fn migrate_provisional_entries(registry: &mut HashMap<PathBuf, Weak<SharedInner>>) {
+        let mut candidates = Vec::new();
         for (registered, weak) in registry.iter() {
-            let Some(inner) = weak.upgrade() else {
+            let Some(shared) = weak.upgrade() else {
                 continue;
             };
+            let inner = recover_guard(shared.current.read()).clone();
             if !inner.is_fallback {
                 continue;
             }
             let derived = Self::registry_key(&inner.path).0;
-            if &derived != registered && !registry.contains_key(&derived) {
-                moves.push((registered.clone(), derived));
+            if &derived != registered {
+                candidates.push((registered.clone(), derived, shared));
             }
         }
-        for (registered, derived) in moves {
-            if registry.contains_key(&derived) {
-                continue;
+        candidates.sort_by_key(|(_, _, shared)| Arc::as_ptr(shared) as usize);
+        for (registered, derived, shared) in candidates {
+            let occupant = registry.get(&derived).and_then(Weak::upgrade);
+            match occupant {
+                None => {
+                    if let Some(weak) = registry.remove(&registered) {
+                        registry.insert(derived, weak);
+                    }
+                }
+                Some(target) if Arc::ptr_eq(&shared, &target) => {}
+                Some(target) => {
+                    Self::unify_shared_states(&shared, &target);
+                    registry.insert(registered, Arc::downgrade(&target));
+                }
             }
-            if let Some(weak) = registry.remove(&registered) {
-                registry.insert(derived, weak);
+        }
+    }
+
+    /// Re-point one cell at another and fold the stale mirror in.
+    ///
+    /// Takes both `current` write locks in deterministic pointer order
+    /// (the caller holds the registry mutex; nothing here or in an
+    /// operation takes that mutex while holding any of these locks, so
+    /// the order cannot cycle), merges the stale mirror into the
+    /// target (see [`merge_mirrors`](Self::merge_mirrors)), then
+    /// installs the target's [`Inner`] as the stale cell's current
+    /// state — in-flight operations on the stale cell finish against
+    /// the retired `Inner`, and every later operation observes the
+    /// unified store.
+    fn unify_shared_states(stale: &Arc<SharedInner>, target: &Arc<SharedInner>) {
+        let mut cells = [stale, target];
+        cells.sort_by_key(|cell| Arc::as_ptr(*cell) as usize);
+        let [lesser, greater] = cells;
+        let mut first_current = recover_guard(lesser.current.write());
+        let mut second_current = recover_guard(greater.current.write());
+        let (stale_current, target_current) = if Arc::ptr_eq(stale, lesser) {
+            (&mut first_current, &mut second_current)
+        } else {
+            (&mut second_current, &mut first_current)
+        };
+        let stale_inner = stale_current.clone();
+        let target_inner = target_current.clone();
+        Self::merge_mirrors(&stale_inner, &target_inner);
+        **stale_current = target_inner;
+    }
+
+    /// Fold a retired mirror into the store that survives it.
+    ///
+    /// Both mirrors' appends already reached the same physical file —
+    /// the mirror is the divergence — so the union restores
+    /// completeness: entries present only in the stale mirror (matched
+    /// by id) are appended to the target mirror, and the access logs
+    /// union with the same max-stamp rule retrieval applies. Locks, in
+    /// order: the stale mirror's entries read, the target mirror's
+    /// entries write, then both access logs — safe because the caller
+    /// pins both cells under their `current` write locks, so no
+    /// operation can hold either mirror's locks concurrently.
+    fn merge_mirrors(stale: &Inner, target: &Inner) {
+        let stale_entries = recover_guard(stale.entries.read());
+        let mut target_entries = recover_guard(target.entries.write());
+        let present: HashSet<Uuid> = target_entries.iter().map(|entry| entry.id).collect();
+        for entry in stale_entries.iter() {
+            if !present.contains(&entry.id) {
+                target_entries.push(entry.clone());
+            }
+        }
+        drop(stale_entries);
+        drop(target_entries);
+        let stale_log = recover_guard(stale.access_log.lock());
+        let mut target_log = recover_guard(target.access_log.lock());
+        for (id, stamp) in stale_log.iter() {
+            match target_log.get_mut(id) {
+                Some(existing) => {
+                    *existing = (*existing).max(*stamp);
+                }
+                None => {
+                    target_log.insert(*id, *stamp);
+                }
             }
         }
     }
@@ -519,7 +696,8 @@ impl FileMemoryStore {
     /// unpredictable name is written and synced, renamed over the
     /// target, and the containing directory is synced so the rename
     /// itself survives power loss — so a crash mid-rewrite leaves the
-    /// previous file intact and a completed flush is on disk. The entries write lock is held across the
+    /// previous file intact and a completed flush is on disk. The shared
+    /// state stays pinned and the entries write lock held across the
     /// whole rewrite, so concurrent `flush`es, `consolidate`s, and
     /// `store`s are serialized: two rewrites can never interleave on the
     /// temp file, and an append can never land on the unlinked old file
@@ -530,8 +708,9 @@ impl FileMemoryStore {
     /// [`LoopError::Memory`] on any I/O or serialization failure. On
     /// failure the original file is left untouched.
     pub fn flush(&self) -> Result<(), LoopError> {
-        let entries = recover_guard(self.inner.entries.write());
-        Self::rewrite(&self.inner.path, &entries).map_err(LoopError::from)
+        let shared = recover_guard(self.inner.current.read());
+        let entries = recover_guard(shared.entries.write());
+        Self::rewrite(&shared.path, &entries).map_err(LoopError::from)
     }
 
     /// Load a JSONL file into a vec of entries, applying the corruption rules.
@@ -597,58 +776,6 @@ impl FileMemoryStore {
             }
         }
         Ok((entries, torn_tail))
-    }
-
-    /// Append one serialized entry as a line to the file.
-    ///
-    /// The caller holds the entries write lock, so appends are serialized
-    /// and lines can never interleave. The line is flushed to the OS —
-    /// visible to other processes and safe against a process crash, but
-    /// not fsynced; callers needing power-loss durability call
-    /// [`flush`](Self::flush). If the write or flush fails partway, the
-    /// file is truncated back to its pre-append length so a partial line
-    /// cannot sit in later appends' way; if even the truncation fails,
-    /// the store marks itself unusable and every further append is
-    /// rejected until a fresh [`open`](Self::open) repairs the file.
-    ///
-    /// # Errors
-    ///
-    /// [`LoopError::Memory`] if the file cannot be opened for append,
-    /// the line cannot be written and flushed, or the store is unusable
-    /// after an earlier unrecoverable append failure.
-    fn append_line(&self, line: &str) -> Result<(), LoopError> {
-        use std::io::{Seek as _, SeekFrom, Write as _};
-        use std::sync::atomic::Ordering as AtomicOrdering;
-        if self.inner.append_unusable.load(AtomicOrdering::SeqCst) {
-            return Err(LoopError::Memory(
-                "the memory file is unusable after an unrecoverable append failure; drop every live handle and reopen to repair it"
-                    .to_string(),
-            ));
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.inner.path)
-            .map_err(|e| LoopError::Memory(format!("cannot open memory file for append: {e}")))?;
-        let original_len = file
-            .seek(SeekFrom::End(0))
-            .map_err(|e| LoopError::Memory(format!("cannot size the memory file: {e}")))?;
-        let write_result = file
-            .write_all(line.as_bytes())
-            .and_then(|()| file.write_all(b"\n"))
-            .and_then(|()| file.flush());
-        if let Err(e) = write_result {
-            let truncation = file.set_len(original_len).and_then(|()| file.flush());
-            if truncation.is_err() {
-                self.inner
-                    .append_unusable
-                    .store(true, AtomicOrdering::SeqCst);
-            }
-            return Err(LoopError::Memory(format!(
-                "cannot append to memory file: {e}"
-            )));
-        }
-        Ok(())
     }
 
     /// Rewrite `path` with `entries`, atomically.
@@ -844,9 +971,10 @@ fn split_complete_lines(bytes: &[u8]) -> (Vec<&[u8]>, Option<&[u8]>) {
 impl LoopMemory for FileMemoryStore {
     /// Append `entry` to the file and the in-memory mirror.
     ///
-    /// The file append happens first, under the entries write lock: on
-    /// success the mirror is updated to match; on failure neither side
-    /// changes, so the two can never disagree.
+    /// The file append happens first, with the shared state pinned and
+    /// the entries write lock held: on success the mirror is updated to
+    /// match; on failure neither side changes, so the two can never
+    /// disagree.
     fn store(
         &self,
         entry: MemoryEntry,
@@ -855,8 +983,9 @@ impl LoopMemory for FileMemoryStore {
             let line = serde_json::to_string(&entry).map_err(|e| {
                 LoopError::Memory(format!("memory entry serialization failed: {e}"))
             })?;
-            let mut entries = recover_guard(self.inner.entries.write());
-            self.append_line(&line)?;
+            let shared = recover_guard(self.inner.current.read());
+            let mut entries = recover_guard(shared.entries.write());
+            shared.append_line(&line)?;
             entries.push(entry);
             Ok(())
         })
@@ -876,10 +1005,11 @@ impl LoopMemory for FileMemoryStore {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<MemoryEntry>, LoopError>> + Send + 'a>> {
         let query = query.to_string();
         Box::pin(async move {
+            let shared = recover_guard(self.inner.current.read());
             let query_lower = query.to_lowercase();
             let query_trimmed = query_lower.trim();
             let query_words: Vec<&str> = query_lower.split_whitespace().collect();
-            let snapshot: Vec<MemoryEntry> = recover_guard(self.inner.entries.read())
+            let snapshot: Vec<MemoryEntry> = recover_guard(shared.entries.read())
                 .iter()
                 .cloned()
                 .collect();
@@ -897,7 +1027,7 @@ impl LoopMemory for FileMemoryStore {
                 .map(|(_, matched, entry)| (matched, entry))
                 .collect();
             let now = SystemTime::now();
-            let mut access_log = recover_guard(self.inner.access_log.lock());
+            let mut access_log = recover_guard(shared.access_log.lock());
             for (matched, entry) in &selected {
                 if !matched {
                     continue;
@@ -932,10 +1062,11 @@ impl LoopMemory for FileMemoryStore {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
         Box::pin(async move {
+            let shared = recover_guard(self.inner.current.read());
             let now = SystemTime::now();
-            let mut guard = recover_guard(self.inner.entries.write());
+            let mut guard = recover_guard(shared.entries.write());
             let mut next = guard.clone();
-            let mut access_log = recover_guard(self.inner.access_log.lock());
+            let mut access_log = recover_guard(shared.access_log.lock());
             for entry in &mut next {
                 if let Some(stamp) = access_log.get(&entry.id) {
                     entry.last_accessed = entry.last_accessed.max(Some(*stamp));
@@ -943,7 +1074,7 @@ impl LoopMemory for FileMemoryStore {
                 }
             }
             let stats = consolidate_entries(&mut next, &self.consolidation, now);
-            match Self::rewrite(&self.inner.path, &next) {
+            match Self::rewrite(&shared.path, &next) {
                 Ok(()) => {}
                 Err(RewriteError::NotDurable(error)) => {
                     access_log.clear();
@@ -965,7 +1096,8 @@ impl LoopMemory for FileMemoryStore {
     /// Used by [`is_empty`](LoopMemory::is_empty) and reported by the
     /// engine's consolidate hook after each run.
     fn len(&self) -> usize {
-        recover_guard(self.inner.entries.read()).len()
+        let shared = recover_guard(self.inner.current.read());
+        recover_guard(shared.entries.read()).len()
     }
 }
 
@@ -1193,7 +1325,8 @@ mod tests {
         );
 
         let store = super::FileMemoryStore::new(&path);
-        store.append_line("{\"line\":1}").unwrap();
+        let inner = super::recover_guard(store.inner.current.read());
+        inner.append_line("{\"line\":1}").unwrap();
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"{\"line\":1}\n",

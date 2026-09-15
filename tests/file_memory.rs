@@ -250,6 +250,48 @@ async fn each_registration_injects_exactly_one_fault() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[cfg(all(unix, feature = "testing"))]
+#[tokio::test]
+async fn a_fault_for_a_later_stage_survives_an_earlier_stage_strike() {
+    use loopctl::memory::file::RewriteFaultStage;
+
+    let dir = temp_dir("fault-stages");
+    let path = dir.join("memory.jsonl");
+    let store = FileMemoryStore::open(&path).unwrap();
+    store
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "must survive two staged injected faults",
+        ))
+        .await
+        .unwrap();
+
+    loopctl::memory::file::fail_next_rewrite_at(&path, RewriteFaultStage::TempCreate);
+    loopctl::memory::file::fail_next_rewrite_at(&path, RewriteFaultStage::DirectorySync);
+    assert!(
+        store.flush().is_err(),
+        "the TempCreate registration strikes the first rewrite before \
+        anything is written"
+    );
+    assert!(
+        store.flush().is_err(),
+        "the DirectorySync registration survives the TempCreate strike and \
+        fires at its own stage"
+    );
+    let rewritten = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        rewritten.lines().count(),
+        1,
+        "the second failure is post-rename — the entry is on disk and only \
+        its durability is unconfirmed: {rewritten}"
+    );
+    assert!(
+        store.flush().is_ok(),
+        "with both registrations consumed, the rewrite path is clean again"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn a_torn_final_line_is_dropped_on_open() {
     let dir = temp_dir("torn");
@@ -770,6 +812,129 @@ async fn dangling_parent_handles_share_state_once_the_path_resolves() {
         2,
         "one shared mirror means the consolidation persisted both \
         handles' entries — verified by reopening through the real path"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn two_provisional_handles_unify_when_their_paths_resolve_to_one_file() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("unify");
+    let real = dir.join("realdir");
+    let link1 = dir.join("link1");
+    let link2 = dir.join("link2");
+    symlink(&real, &link1).unwrap();
+    symlink(&real, &link2).unwrap();
+    let through_link1 = link1.join("memory.jsonl");
+    let through_link2 = link2.join("memory.jsonl");
+    let first = FileMemoryStore::new(&through_link1);
+    let second = FileMemoryStore::new(&through_link2);
+
+    std::fs::create_dir_all(&real).unwrap();
+    let third = FileMemoryStore::open(&through_link1).unwrap();
+    first
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "grip large files with both hands",
+        ))
+        .await
+        .unwrap();
+    second
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "nightly deploys pause the world",
+        ))
+        .await
+        .unwrap();
+    third
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "read the whole file before editing",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        first.len(),
+        3,
+        "the link1 handle observes the unified store, not a private \
+        mirror"
+    );
+    assert_eq!(
+        second.len(),
+        3,
+        "the link2 handle — whose registration collided — is re-pointed \
+        at the same shared state as the other two"
+    );
+    assert_eq!(third.len(), 3, "the resolving handle shares it too");
+    second.consolidate().await.unwrap();
+    drop(first);
+    drop(second);
+    drop(third);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened.len(),
+        3,
+        "one unified mirror means the consolidation persisted every \
+        handle's entry — verified by reopening through the real path"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mirrors_written_before_unification_merge_into_the_surviving_store() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("unify-merge");
+    let real = dir.join("realdir");
+    let link1 = dir.join("link1");
+    let link2 = dir.join("link2");
+    symlink(&real, &link1).unwrap();
+    symlink(&real, &link2).unwrap();
+    let through_link1 = link1.join("memory.jsonl");
+    let through_link2 = link2.join("memory.jsonl");
+    let first = FileMemoryStore::new(&through_link1);
+    let second = FileMemoryStore::new(&through_link2);
+
+    std::fs::create_dir_all(&real).unwrap();
+    first
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "grip large files with both hands",
+        ))
+        .await
+        .unwrap();
+    second
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "nightly deploys pause the world",
+        ))
+        .await
+        .unwrap();
+
+    let third = FileMemoryStore::open(&through_link1).unwrap();
+    assert_eq!(
+        first.len(),
+        2,
+        "entries stored through each pre-resolution spelling reach the \
+        unified mirror"
+    );
+    assert_eq!(second.len(), 2, "the collided handle observes the union");
+    assert_eq!(third.len(), 2, "the resolving handle observes the union");
+    third.consolidate().await.unwrap();
+    drop(first);
+    drop(second);
+    drop(third);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened.len(),
+        2,
+        "the union survived the consolidation — no handle's entry was \
+        discarded by the rewrite"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }

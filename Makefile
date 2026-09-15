@@ -13,9 +13,11 @@ test:
 	cargo test --all-features
 	cargo test --doc --all-features
 	cargo test -p loopctl-derive
+	cargo test -p loopctl-sqlite
 
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets -p loopctl-sqlite -- -D warnings
 
 fmt:
 	cargo fmt --all -- --check
@@ -25,9 +27,11 @@ lint:
 
 docs:
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p loopctl-sqlite
 
 examples:
 	cargo build --examples --all-features
+	cargo build -p loopctl-sqlite --examples
 
 define PROBE_TEXT
 fn main() {

@@ -43,6 +43,7 @@ doc-valid-idents = [
     "AccessKit", "CoreFoundation", "Direct2D",
     "Direct3D", "DirectWrite", "OpenSSL",
     "MinGW", "NaN", "NaNs",
+    "SQLite",
 ]
 
 # Lint behavior

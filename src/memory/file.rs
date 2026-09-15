@@ -64,13 +64,13 @@ use uuid::Uuid;
 /// while a parent symlink was still dangling keys provisionally by
 /// the given spelling; the next construction re-derives that key and
 /// moves the registration — and spellings that collide, having
-/// resolved to one file, unify: their mirrors merge and the stale
-/// handle is re-pointed, so every handle shares one state as soon as
-/// any construction or rewrite observes the paths converged — a
-/// flush or consolidation on a converged handle unifies first, then
-/// rewrites from the one mirror. Multi-process access to the
-/// same file is not supported — there is no file locking, and two
-/// processes will corrupt the file.
+/// resolved to one file, unify: their mirrors merge in the file's
+/// append order and the stale handle is re-pointed, so every handle
+/// shares one state as soon as any construction or rewrite observes
+/// the paths converged — a flush or consolidation on a converged
+/// handle unifies first, then rewrites from the one mirror.
+/// Multi-process access to the same file is not supported — there is
+/// no file locking, and two processes will corrupt the file.
 ///
 /// # Example
 ///
@@ -680,12 +680,16 @@ impl FileMemoryStore {
     /// Both mirrors' appends already reached the same physical file —
     /// the mirror is the divergence — so the union restores
     /// completeness: entries present only in the stale mirror (matched
-    /// by id) are appended to the target mirror, and the access logs
-    /// union with the same max-stamp rule retrieval applies. Locks, in
-    /// order: the stale mirror's entries read, the target mirror's
-    /// entries write, then both access logs — safe because the caller
-    /// pins both cells under their `current` write locks, so no
-    /// operation can hold either mirror's locks concurrently.
+    /// by id) are appended to the target mirror, the merged order is
+    /// then reset against the backing file (see
+    /// [`reorder_merged_entries`](Self::reorder_merged_entries)) so
+    /// the arbitrary target/stale assignment cannot flip retrieval's
+    /// insertion order, and the access logs union with the same
+    /// max-stamp rule retrieval applies. Locks, in order: the stale
+    /// mirror's entries read, the target mirror's entries write, then
+    /// both access logs — safe because the caller pins both cells
+    /// under their `current` write locks, so no operation can hold
+    /// either mirror's locks concurrently.
     fn merge_mirrors(stale: &Inner, target: &Inner) {
         let stale_entries = recover_guard(stale.entries.read());
         let mut target_entries = recover_guard(target.entries.write());
@@ -694,6 +698,9 @@ impl FileMemoryStore {
             if !present.contains(&entry.id) {
                 target_entries.push(entry.clone());
             }
+        }
+        if let Some(reordered) = Self::reorder_merged_entries(&target_entries, &target.path) {
+            *target_entries = reordered;
         }
         drop(stale_entries);
         drop(target_entries);
@@ -709,6 +716,49 @@ impl FileMemoryStore {
                 }
             }
         }
+    }
+
+    /// Reset a merged mirror against the backing file's entry order.
+    ///
+    /// The file is the durable record of append order — the order
+    /// retrieval's stable tie-break names as insertion order — and the
+    /// target/stale assignment of a unification is arbitrary, so the
+    /// merged mirror is reordered to the file's sequence. The file is
+    /// the truth for content too: an entry found in both keeps the
+    /// mirror copy (fresher access state), while a file-only entry is
+    /// adopted from the file itself — mirrors never deliberately drop
+    /// entries outside consolidation, which rewrites the file in the
+    /// same pass, so file-only content can only be a dropped
+    /// sibling's un-converged appends, exactly what must survive the
+    /// convergence rewrite. Mirror-only entries (not expected —
+    /// `store` appends before mirroring) keep their merged order at
+    /// the end. The file read runs under the registry mutex the
+    /// caller holds — convergence is rare, so a read-only lookup
+    /// there is a deliberate trade-off. A file that cannot be loaded
+    /// (mid-file corruption) returns `None` and leaves the merged
+    /// mirror as-is; the next `open` surfaces that corruption loudly —
+    /// ordering is best-effort, completeness is not.
+    fn reorder_merged_entries(merged: &[MemoryEntry], path: &Path) -> Option<Vec<MemoryEntry>> {
+        let file_entries = Self::load_entries(path).ok()?.0;
+        let file_ids: HashSet<Uuid> = file_entries.iter().map(|entry| entry.id).collect();
+        let mut by_id: HashMap<Uuid, MemoryEntry> = merged
+            .iter()
+            .cloned()
+            .map(|entry| (entry.id, entry))
+            .collect();
+        let mut reordered = Vec::with_capacity(merged.len());
+        for entry in &file_entries {
+            match by_id.remove(&entry.id) {
+                Some(matched) => reordered.push(matched),
+                None => reordered.push(entry.clone()),
+            }
+        }
+        for entry in merged {
+            if !file_ids.contains(&entry.id) {
+                reordered.push(entry.clone());
+            }
+        }
+        Some(reordered)
     }
 
     /// Set the configuration driving this store's consolidation pass.

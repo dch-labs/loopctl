@@ -1042,6 +1042,148 @@ async fn a_flush_on_a_converged_handle_rewrites_from_the_unified_mirror() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn convergence_preserves_the_backing_files_append_order() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("converge-order");
+    let real = dir.join("realdir");
+    let link1 = dir.join("link1");
+    let link2 = dir.join("link2");
+    symlink(&real, &link1).unwrap();
+    symlink(&real, &link2).unwrap();
+    let first = FileMemoryStore::new(link1.join("memory.jsonl"));
+    let second = FileMemoryStore::new(link2.join("memory.jsonl"));
+
+    std::fs::create_dir_all(&real).unwrap();
+    let a1 = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha grip large files with both hands",
+    );
+    let b = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha nightly deploys pause the world",
+    );
+    let a2 = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha read the whole file before editing",
+    );
+    first.store(a1.clone()).await.unwrap();
+    second.store(b.clone()).await.unwrap();
+    first.store(a2.clone()).await.unwrap();
+
+    let third = FileMemoryStore::open(link1.join("memory.jsonl")).unwrap();
+    let hits = third.retrieve("alpha", 5).await.unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![a1.id, b.id, a2.id],
+        "convergence resets the merged mirror against the file's append \
+        order — the interleaved stores rule out either side winning the \
+        collision, so retrieval's insertion-order tie-break matches the \
+        file under any assignment"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_convergence_then_consolidation_preserves_the_files_append_order() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("converge-order-rewrite");
+    let real = dir.join("realdir");
+    let link1 = dir.join("link1");
+    let link2 = dir.join("link2");
+    symlink(&real, &link1).unwrap();
+    symlink(&real, &link2).unwrap();
+    let first = FileMemoryStore::new(link1.join("memory.jsonl"));
+    let second = FileMemoryStore::new(link2.join("memory.jsonl"));
+
+    std::fs::create_dir_all(&real).unwrap();
+    let a1 = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha grip large files with both hands",
+    );
+    let b = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha nightly deploys pause the world",
+    );
+    let a2 = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha read the whole file before editing",
+    );
+    first.store(a1.clone()).await.unwrap();
+    second.store(b.clone()).await.unwrap();
+    first.store(a2.clone()).await.unwrap();
+
+    first.consolidate().await.unwrap();
+    drop(first);
+    drop(second);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    let hits = reopened.retrieve("alpha", 5).await.unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![a1.id, b.id, a2.id],
+        "the converged rewrite keeps the file's append order durable — \
+        the consolidation rewrote from the file-ordered merged mirror, \
+        so the reopened store delivers the original sequence"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dropped_sibling_s_entries_survive_convergence() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("converge-adopt");
+    let real = dir.join("realdir");
+    let link1 = dir.join("link1");
+    let link2 = dir.join("link2");
+    let link3 = dir.join("link3");
+    symlink(&real, &link1).unwrap();
+    symlink(&real, &link2).unwrap();
+    symlink(&real, &link3).unwrap();
+    let first = FileMemoryStore::new(link1.join("memory.jsonl"));
+    let second = FileMemoryStore::new(link2.join("memory.jsonl"));
+    let third = FileMemoryStore::new(link3.join("memory.jsonl"));
+
+    std::fs::create_dir_all(&real).unwrap();
+    let a1 = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha grip large files with both hands",
+    );
+    let b = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha nightly deploys pause the world",
+    );
+    let c = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha read the whole file before editing",
+    );
+    first.store(a1.clone()).await.unwrap();
+    second.store(b.clone()).await.unwrap();
+    third.store(c.clone()).await.unwrap();
+    drop(third);
+
+    first.flush().unwrap();
+    drop(first);
+    drop(second);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    let hits = reopened.retrieve("alpha", 5).await.unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![a1.id, b.id, c.id],
+        "the convergence rewrite adopts the dropped sibling's entries \
+        from the file — the file is the truth for content, not just \
+        order, so every append survives in file order"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn a_planted_symlink_at_a_predictable_temp_path_is_not_followed() {
     use std::os::unix::fs::symlink;
 

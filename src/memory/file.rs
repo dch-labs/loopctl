@@ -175,6 +175,69 @@ fn live_stores() -> &'static Mutex<HashMap<PathBuf, Weak<Inner>>> {
     LIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Which rewrite stage an injected fault should strike.
+///
+/// Exists for test determinism on privileged runners, where directory
+/// permission bits cannot force rewrite failures; absent from normal
+/// builds.
+#[cfg(feature = "testing")]
+#[derive(Clone, Copy)]
+pub enum RewriteFaultStage {
+    /// Fail the temp file's exclusive create (pre-commit).
+    ///
+    /// The rewrite returns before anything is written, exactly as a
+    /// real create failure would.
+    TempCreate,
+
+    /// Fail the post-rename parent-directory sync (not durable).
+    ///
+    /// The rewrite returns after the rename landed, so the new file is
+    /// in place and only its durability is unconfirmed — the ordering
+    /// the durability pins assert.
+    DirectorySync,
+}
+
+/// Register a fault for the next rewrite of exactly one path.
+///
+/// The registration is keyed by the path's canonical location when it
+/// resolves (falling back to the given spelling) and consumed by the
+/// first rewrite that matches — parallel tests registering against
+/// their own unique temp paths cannot interfere. Test-only surface
+/// for determinism on privileged runners; absent from normal builds.
+#[cfg(feature = "testing")]
+pub fn fail_next_rewrite_at(path: &Path, stage: RewriteFaultStage) {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    recover_guard(registered_faults().lock()).push((key, stage));
+}
+
+/// The registered per-path rewrite faults.
+///
+/// Static plumbing behind [`fail_next_rewrite_at`]; never touched
+/// outside this module.
+#[cfg(feature = "testing")]
+fn registered_faults() -> &'static Mutex<Vec<(PathBuf, RewriteFaultStage)>> {
+    static FAULTS: OnceLock<Mutex<Vec<(PathBuf, RewriteFaultStage)>>> = OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Consume the fault registered for `path` when it strikes `stage`.
+///
+/// [`rewrite`](FileMemoryStore::rewrite) calls this at each stage it
+/// can inject; a registration for the other stage stays queued for
+/// its own site.
+#[cfg(feature = "testing")]
+fn injected_fault_at(path: &Path, stage: RewriteFaultStage) -> bool {
+    let mut faults = recover_guard(registered_faults().lock());
+    let wanted = std::mem::discriminant(&stage);
+    let hit = faults
+        .iter()
+        .any(|(faulted, at)| faulted == path && std::mem::discriminant(at) == wanted);
+    if hit {
+        faults.retain(|(faulted, at)| !(faulted == path && std::mem::discriminant(at) == wanted));
+    }
+    hit
+}
+
 /// How many final-component symlinks registry key derivation will follow.
 ///
 /// Bounds the chain walk below the kernel's own `ELOOP` threshold; a
@@ -536,6 +599,12 @@ impl FileMemoryStore {
         use std::io::Write as _;
         let temp_path = Self::temp_sibling_path(path);
         let write_result = (|| -> Result<(), RewriteError> {
+            #[cfg(feature = "testing")]
+            if injected_fault_at(path, RewriteFaultStage::TempCreate) {
+                return Err(RewriteError::PreCommit(LoopError::Memory(
+                    "cannot create rewrite temp file: injected fault".to_string(),
+                )));
+            }
             let mut buffer = String::new();
             for entry in entries {
                 let line = serde_json::to_string(entry).map_err(|e| {
@@ -567,6 +636,12 @@ impl FileMemoryStore {
                     "cannot finalize memory rewrite: {e}"
                 )))
             })?;
+            #[cfg(feature = "testing")]
+            if injected_fault_at(path, RewriteFaultStage::DirectorySync) {
+                return Err(RewriteError::NotDurable(LoopError::Memory(
+                    "cannot sync directory after memory rewrite: injected fault".to_string(),
+                )));
+            }
             Self::sync_parent_directory(path).map_err(RewriteError::NotDurable)?;
             Self::drop_stale_temp_siblings(path);
             Ok(())

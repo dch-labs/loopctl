@@ -155,10 +155,10 @@ async fn consolidate_prunes_and_rewrites_the_file() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "testing"))]
 #[tokio::test]
 async fn a_failed_rewrite_leaves_the_original_file_intact() {
-    use std::os::unix::fs::PermissionsExt as _;
+    use loopctl::memory::file::RewriteFaultStage;
 
     let dir = temp_dir("atomic");
     let path = dir.join("memory.jsonl");
@@ -167,13 +167,8 @@ async fn a_failed_rewrite_leaves_the_original_file_intact() {
     let entry = MemoryEntry::new(MemoryCategory::Insight, "must survive the failed rewrite");
     store.store(entry.clone()).await.unwrap();
 
-    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-    perms.set_mode(0o500);
-    std::fs::set_permissions(&dir, perms).unwrap();
+    loopctl::memory::file::fail_next_rewrite_at(&path, RewriteFaultStage::TempCreate);
     let flush_result = store.flush();
-    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-    perms.set_mode(0o700);
-    std::fs::set_permissions(&dir, perms).unwrap();
 
     assert!(
         flush_result.is_err(),
@@ -365,9 +360,10 @@ async fn invalid_utf8_in_a_complete_line_fails_the_open() {
 }
 
 #[cfg(unix)]
+#[cfg(all(unix, feature = "testing"))]
 #[tokio::test]
 async fn access_stamps_survive_a_failed_consolidation() {
-    use std::os::unix::fs::PermissionsExt as _;
+    use loopctl::memory::file::RewriteFaultStage;
 
     let dir = temp_dir("stamps-survive");
     let path = dir.join("memory.jsonl");
@@ -377,13 +373,8 @@ async fn access_stamps_survive_a_failed_consolidation() {
     store.store(entry.clone()).await.unwrap();
     store.retrieve("grip large files", 3).await.unwrap();
 
-    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-    perms.set_mode(0o500);
-    std::fs::set_permissions(&dir, perms).unwrap();
+    loopctl::memory::file::fail_next_rewrite_at(&path, RewriteFaultStage::TempCreate);
     let failed = store.consolidate().await;
-    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-    perms.set_mode(0o700);
-    std::fs::set_permissions(&dir, perms).unwrap();
     assert!(failed.is_err(), "the rewrite cannot create its temp file");
 
     store.consolidate().await.unwrap();
@@ -708,10 +699,10 @@ async fn a_planted_symlink_at_a_predictable_temp_path_is_not_followed() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "testing"))]
 #[tokio::test]
 async fn an_unopenable_parent_reports_unconfirmed_durability_after_the_rename() {
-    use std::os::unix::fs::PermissionsExt as _;
+    use loopctl::memory::file::RewriteFaultStage;
 
     let dir = temp_dir("dir-sync");
     let path = dir.join("memory.jsonl");
@@ -719,13 +710,8 @@ async fn an_unopenable_parent_reports_unconfirmed_durability_after_the_rename() 
     let entry = MemoryEntry::new(MemoryCategory::Fact, "checkpointed before the sync failed");
     store.store(entry.clone()).await.unwrap();
 
-    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-    perms.set_mode(0o300);
-    std::fs::set_permissions(&dir, perms).unwrap();
+    loopctl::memory::file::fail_next_rewrite_at(&path, RewriteFaultStage::DirectorySync);
     let flush_result = store.flush();
-    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-    perms.set_mode(0o700);
-    std::fs::set_permissions(&dir, perms).unwrap();
 
     let error = flush_result.expect_err("the directory cannot be opened for the sync");
     assert!(
@@ -752,10 +738,10 @@ async fn an_unopenable_parent_reports_unconfirmed_durability_after_the_rename() 
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "testing"))]
 #[tokio::test]
 async fn a_durability_unconfirmed_consolidation_still_commits_the_pass() {
-    use std::os::unix::fs::PermissionsExt as _;
+    use loopctl::memory::file::RewriteFaultStage;
 
     let dir = temp_dir("commit-on-not-durable");
     let path = dir.join("memory.jsonl");
@@ -767,13 +753,8 @@ async fn a_durability_unconfirmed_consolidation_still_commits_the_pass() {
     store.store(durable.clone()).await.unwrap();
     store.store(spent).await.unwrap();
 
-    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-    perms.set_mode(0o300);
-    std::fs::set_permissions(&dir, perms).unwrap();
+    loopctl::memory::file::fail_next_rewrite_at(&path, RewriteFaultStage::DirectorySync);
     let result = store.consolidate().await;
-    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-    perms.set_mode(0o700);
-    std::fs::set_permissions(&dir, perms).unwrap();
     let error = result.expect_err("the directory sync after the rename fails");
     assert!(
         error.to_string().contains("cannot sync directory"),

@@ -398,12 +398,14 @@ impl From<RewriteError> for LoopError {
 impl FileMemoryStore {
     /// Open (or create) a store backed by `path`, loading existing entries.
     ///
-    /// If `path` does not exist it is created empty. If it exists, each
-    /// line is deserialized as one [`MemoryEntry`]: a malformed final
-    /// line is a torn write and is dropped with a `tracing` warning —
-    /// and the file is repaired, its tail rewritten away, so a later
-    /// `store` cannot weld itself onto the fragment — while a malformed
-    /// line anywhere earlier is real corruption and fails the open.
+    /// If `path` does not exist it is created empty (created without
+    /// truncating, so a concurrent open cannot discard a writer's
+    /// lines). If it exists, each line is deserialized as one
+    /// [`MemoryEntry`]: a malformed final line is a torn write and is
+    /// dropped with a `tracing` warning — and the file is repaired,
+    /// its tail rewritten away, so a later `store` cannot weld itself
+    /// onto the fragment — while a malformed line anywhere earlier is
+    /// real corruption and fails the open.
     ///
     /// A live handle for this path is attached to instead of loading —
     /// both handles then share one mirror and one set of locks, so
@@ -418,10 +420,7 @@ impl FileMemoryStore {
     /// or if the torn-tail repair rewrite fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LoopError> {
         let path = path.as_ref().to_path_buf();
-        if !path.exists() {
-            std::fs::File::create(&path)
-                .map_err(|e| LoopError::Memory(format!("cannot create memory file: {e}")))?;
-        }
+        Self::ensure_file(&path)?;
         let canonical = std::fs::canonicalize(&path)
             .map_err(|e| LoopError::Memory(format!("cannot resolve memory file path: {e}")))?;
         let shared = {
@@ -449,6 +448,35 @@ impl FileMemoryStore {
             inner: shared,
             consolidation: ConsolidationConfig::default(),
         })
+    }
+
+    /// Ensure the memory file exists, creating it if it is missing.
+    ///
+    /// An existing file returns immediately, whatever its permission
+    /// state — a read-only file opens read-only, as loading a frozen
+    /// memory requires. Only a missing path is created, via append
+    /// mode: a create that cannot truncate, so when two opens race on
+    /// one missing path the loser's create discards none of the
+    /// winner's already-appended lines. A probe that cannot decide
+    /// (an inaccessible parent) is treated as missing, letting the
+    /// append-create surface the underlying error itself. The handle
+    /// is dropped — the file only needs to exist for the caller's
+    /// next step.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Memory`] if the file cannot be created or opened
+    /// for append.
+    fn ensure_file(path: &Path) -> Result<(), LoopError> {
+        if path.try_exists().unwrap_or(false) {
+            return Ok(());
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| LoopError::Memory(format!("cannot create memory file: {e}")))?;
+        Ok(())
     }
 
     /// Create a fresh empty store that persists to `path` on first `store`.
@@ -1309,6 +1337,76 @@ mod tests {
         let (complete, trailing) = split_complete_lines(b"");
         assert!(complete.is_empty());
         assert!(trailing.is_none());
+    }
+
+    #[test]
+    fn ensuring_an_existing_file_never_truncates() {
+        let dir = std::env::temp_dir().join(format!(
+            "loopctl-file-memory-unit-ensure-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ensure.jsonl");
+        let entry = crate::memory::MemoryEntry::new(
+            crate::memory::MemoryCategory::Fact,
+            "must survive an interleaved open",
+        );
+        let line = format!("{}\n", serde_json::to_string(&entry).unwrap());
+        std::fs::write(&path, line.as_bytes()).unwrap();
+
+        FileMemoryStore::ensure_file(&path).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            line.as_bytes(),
+            "ensuring an existing file leaves its bytes untouched — a \
+            concurrent writer's appends survive an interleaved open"
+        );
+
+        let missing = dir.join("missing.jsonl");
+        FileMemoryStore::ensure_file(&missing).unwrap();
+        assert_eq!(
+            std::fs::read(&missing).unwrap(),
+            b"",
+            "ensuring a missing path creates the file empty"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_only_memory_file_still_opens() {
+        use crate::memory::LoopMemory as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "loopctl-file-memory-unit-readonly-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("readonly.jsonl");
+        let entry = crate::memory::MemoryEntry::new(
+            crate::memory::MemoryCategory::Fact,
+            "frozen memory opens read-only",
+        );
+        let line = format!("{}\n", serde_json::to_string(&entry).unwrap());
+        std::fs::write(&path, line.as_bytes()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let store = FileMemoryStore::open(&path).unwrap();
+        assert_eq!(store.len(), 1, "the read-only file loads its entry");
+        assert_eq!(
+            store
+                .retrieve("frozen", 3)
+                .await
+                .unwrap()
+                .first()
+                .map(|hit| hit.id),
+            Some(entry.id),
+            "retrieval works over the read-only store"
+        );
+        drop(store);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

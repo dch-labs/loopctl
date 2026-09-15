@@ -192,6 +192,64 @@ async fn a_failed_rewrite_leaves_the_original_file_intact() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[cfg(all(unix, feature = "testing"))]
+#[tokio::test]
+async fn a_fault_registered_before_creation_through_a_symlinked_parent_fires() {
+    use loopctl::memory::file::RewriteFaultStage;
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("fault-key");
+    let real = dir.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = dir.join("link");
+    symlink(&real, &link).unwrap();
+    let through_link = link.join("memory.jsonl");
+    let store = FileMemoryStore::new(&through_link);
+
+    loopctl::memory::file::fail_next_rewrite_at(&through_link, RewriteFaultStage::TempCreate);
+    let flush_result = store.flush();
+
+    assert!(
+        flush_result.is_err(),
+        "a registration keys exactly as the store keys the path it rewrites, \
+        so the fault registered through a symlinked parent before the file \
+        existed still strikes the rewrite"
+    );
+    assert!(
+        !through_link.exists(),
+        "the fault fires before the first rewrite creates anything through \
+        the link"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(all(unix, feature = "testing"))]
+#[tokio::test]
+async fn each_registration_injects_exactly_one_fault() {
+    use loopctl::memory::file::RewriteFaultStage;
+
+    let dir = temp_dir("fault-count");
+    let path = dir.join("memory.jsonl");
+    let store = FileMemoryStore::open(&path).unwrap();
+
+    loopctl::memory::file::fail_next_rewrite_at(&path, RewriteFaultStage::TempCreate);
+    loopctl::memory::file::fail_next_rewrite_at(&path, RewriteFaultStage::TempCreate);
+    assert!(
+        store.flush().is_err(),
+        "the first registration strikes the first rewrite"
+    );
+    assert!(
+        store.flush().is_err(),
+        "the second registration strikes the second rewrite — one hit \
+        consumes exactly one registration"
+    );
+    assert!(
+        store.flush().is_ok(),
+        "with both registrations consumed, the rewrite path is clean again"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn a_torn_final_line_is_dropped_on_open() {
     let dir = temp_dir("torn");

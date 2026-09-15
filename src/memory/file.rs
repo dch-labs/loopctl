@@ -199,14 +199,19 @@ pub enum RewriteFaultStage {
 
 /// Register a fault for the next rewrite of exactly one path.
 ///
-/// The registration is keyed by the path's canonical location when it
-/// resolves (falling back to the given spelling) and consumed by the
-/// first rewrite that matches — parallel tests registering against
-/// their own unique temp paths cannot interfere. Test-only surface
-/// for determinism on privileged runners; absent from normal builds.
+/// The registration is keyed exactly as the store keys the path it
+/// rewrites — an existing file by its canonical location, a missing one
+/// by its canonical parent plus name, a dangling final symlink by its
+/// resolved target — so a registration made before the file exists, or
+/// through a symlinked spelling, still matches the rewrite that later
+/// strikes it. Each registration injects exactly one fault and is
+/// consumed by the first matching rewrite — register N times for N
+/// consecutive failures; parallel tests registering against their own
+/// unique temp paths cannot interfere. Test-only surface for
+/// determinism on privileged runners; absent from normal builds.
 #[cfg(feature = "testing")]
 pub fn fail_next_rewrite_at(path: &Path, stage: RewriteFaultStage) {
-    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let key = FileMemoryStore::registry_key(path);
     recover_guard(registered_faults().lock()).push((key, stage));
 }
 
@@ -220,22 +225,27 @@ fn registered_faults() -> &'static Mutex<Vec<(PathBuf, RewriteFaultStage)>> {
     FAULTS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Consume the fault registered for `path` when it strikes `stage`.
+/// Consume one fault registered for `path` when it strikes `stage`.
 ///
 /// [`rewrite`](FileMemoryStore::rewrite) calls this at each stage it
-/// can inject; a registration for the other stage stays queued for
-/// its own site.
+/// can inject; exactly the first matching registration is removed, so
+/// further registrations for the same path and stage stay queued for
+/// later rewrites, and a registration for the other stage stays queued
+/// for its own site.
 #[cfg(feature = "testing")]
 fn injected_fault_at(path: &Path, stage: RewriteFaultStage) -> bool {
     let mut faults = recover_guard(registered_faults().lock());
     let wanted = std::mem::discriminant(&stage);
-    let hit = faults
+    match faults
         .iter()
-        .any(|(faulted, at)| faulted == path && std::mem::discriminant(at) == wanted);
-    if hit {
-        faults.retain(|(faulted, at)| !(faulted == path && std::mem::discriminant(at) == wanted));
+        .position(|(faulted, at)| faulted == path && std::mem::discriminant(at) == wanted)
+    {
+        Some(index) => {
+            faults.remove(index);
+            true
+        }
+        None => false,
     }
-    hit
 }
 
 /// How many final-component symlinks registry key derivation will follow.

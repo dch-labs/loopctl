@@ -18,7 +18,7 @@ use crate::memory::LoopMemory;
 use crate::memory::consolidate::{ConsolidationConfig, consolidate_entries};
 use crate::memory::entry::{ConsolidationStats, MemoryEntry};
 use crate::memory::score::score_entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -782,31 +782,50 @@ impl FileMemoryStore {
     /// entries outside consolidation, which rewrites the file in the
     /// same pass, so file-only content can only be a dropped
     /// sibling's un-converged appends, exactly what must survive the
-    /// convergence rewrite. Mirror-only entries (not expected —
+    /// convergence rewrite. Entries sharing an id pair by
+    /// occurrence — the i-th file occurrence keeps the i-th mirror
+    /// copy, so divergent copies under one id all survive with their
+    /// own content; a mirror copy beyond the file's occurrence count
+    /// falls to the tail. Mirror-only entries (not expected —
     /// `store` appends before mirroring) keep their merged order at
-    /// the end. The file read runs under the registry mutex the
-    /// caller holds — convergence is rare, so a read-only lookup
-    /// there is a deliberate trade-off. A file that cannot be loaded
+    /// the end. The file read runs under whichever lock domain the
+    /// caller holds — the registry mutex during a unification merge
+    /// (convergence is rare, so a read-only lookup there is a
+    /// deliberate trade-off) and the entries write lock during a
+    /// pre-rewrite re-sync, the stronger serialization. A file that cannot be loaded
     /// (mid-file corruption) returns `None` and leaves the merged
-    /// mirror as-is; the next `open` surfaces that corruption loudly —
+    /// mirror as-is — in the unification-merge role the next `open`
+    /// surfaces that corruption loudly, while in the pre-rewrite role
+    /// the subsequent rewrite replaces the file from the mirror and
+    /// erases it —
     /// ordering is best-effort, completeness is not.
     fn reorder_merged_entries(merged: &[MemoryEntry], path: &Path) -> Option<Vec<MemoryEntry>> {
         let file_entries = Self::load_entries(path).ok()?.0;
-        let file_ids: HashSet<Uuid> = file_entries.iter().map(|entry| entry.id).collect();
-        let mut by_id: HashMap<Uuid, MemoryEntry> = merged
-            .iter()
-            .cloned()
-            .map(|entry| (entry.id, entry))
-            .collect();
+        let mut by_id: HashMap<Uuid, VecDeque<MemoryEntry>> = HashMap::new();
+        for entry in merged.iter().cloned() {
+            by_id.entry(entry.id).or_default().push_back(entry);
+        }
+        let mut consumed: HashMap<Uuid, usize> = HashMap::new();
         let mut reordered = Vec::with_capacity(merged.len());
         for entry in &file_entries {
-            match by_id.remove(&entry.id) {
-                Some(matched) => reordered.push(matched),
+            match by_id
+                .get_mut(&entry.id)
+                .and_then(std::collections::VecDeque::pop_front)
+            {
+                Some(matched) => {
+                    let consumed = consumed.entry(entry.id).or_default();
+                    *consumed = (*consumed).saturating_add(1);
+                    reordered.push(matched);
+                }
                 None => reordered.push(entry.clone()),
             }
         }
         for entry in merged {
-            if !file_ids.contains(&entry.id) {
+            if let Some(consumed) = consumed.get_mut(&entry.id)
+                && *consumed > 0
+            {
+                *consumed = (*consumed).saturating_sub(1);
+            } else {
                 reordered.push(entry.clone());
             }
         }
@@ -862,7 +881,12 @@ impl FileMemoryStore {
     /// sibling's durable append that this mirror never observed —
     /// through a spelling whose convergence happened outside this
     /// call, or a sibling dropped before it — is adopted rather than
-    /// stranded on the replaced inode; a canonically-keyed store skips
+    /// stranded on the replaced inode; an append landing in the
+    /// window between the re-sync read and the rename is the bounded
+    /// residual (the sibling's mirror retains it and the next
+    /// convergence restores it, if the sibling is still live then —
+    /// a sibling dropped before that convergence loses the append).
+    /// A canonically-keyed store skips
     /// the read and keeps its documented discard of an existing file's
     /// old entries. A successful rewrite repairs the tail, so it also
     /// re-arms appends after an earlier append failure latched the
@@ -883,11 +907,17 @@ impl FileMemoryStore {
         {
             *entries = adopted;
         }
-        let rewrite_result = Self::rewrite(&backing_path, &entries).map_err(LoopError::from);
-        if rewrite_result.is_ok() {
-            shared.append_unusable.store(false, AtomicOrdering::SeqCst);
+        match Self::rewrite(&backing_path, &entries) {
+            Ok(()) => {
+                shared.append_unusable.store(false, AtomicOrdering::SeqCst);
+                Ok(())
+            }
+            Err(RewriteError::NotDurable(error)) => {
+                shared.append_unusable.store(false, AtomicOrdering::SeqCst);
+                Err(error)
+            }
+            Err(RewriteError::PreCommit(error)) => Err(error),
         }
-        rewrite_result
     }
 
     /// Load a JSONL file into a vec of entries, applying the corruption rules.
@@ -903,12 +933,22 @@ impl FileMemoryStore {
     /// warning) and a decodable one loads, but either way the returned
     /// flag tells the caller to repair, since the next append would
     /// weld onto an unterminated line. A malformed complete line
-    /// anywhere is surfaced as an error.
+    /// anywhere is surfaced as an error, and so is a decodable line
+    /// whose [`relevance`](MemoryEntry::relevance) would be
+    /// non-finite: a valid-JSON number beyond `f32`'s range decodes
+    /// to infinity on some dependency configurations (and is
+    /// rejected by the deserializer's own range check on others) —
+    /// either way the value is one the store's own writer refuses,
+    /// and through the loader it would ride the mirror until a
+    /// rewrite serialized it as a null that bricks the next open, so
+    /// the open is the loud place and this guard is the store's own
+    /// enforcement regardless of which layer refuses first.
     ///
     /// # Errors
     ///
-    /// [`LoopError::Memory`] if the file cannot be read, or if any
-    /// complete line is not valid UTF-8 or fails to deserialize.
+    /// [`LoopError::Memory`] if the file cannot be read, if any
+    /// complete line is not valid UTF-8 or fails to deserialize, or if
+    /// any complete line's decoded relevance is non-finite.
     fn load_entries(path: &Path) -> Result<(Vec<MemoryEntry>, bool), LoopError> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
@@ -931,8 +971,14 @@ impl FileMemoryStore {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str(line) {
-                Ok(entry) => entries.push(entry),
+            match serde_json::from_str::<MemoryEntry>(line) {
+                Ok(entry) if entry.relevance.is_finite() => entries.push(entry),
+                Ok(_) => {
+                    return Err(LoopError::Memory(format!(
+                        "corrupt memory line {}: non-finite relevance",
+                        index.saturating_add(1)
+                    )));
+                }
                 Err(e) => {
                     return Err(LoopError::Memory(format!(
                         "corrupt memory line {}: {e}",
@@ -945,11 +991,17 @@ impl FileMemoryStore {
             torn_tail = true;
             let decodable = std::str::from_utf8(fragment)
                 .ok()
-                .and_then(|text| serde_json::from_str(text).ok());
-            if let Some(entry) = decodable {
-                entries.push(entry);
-            } else {
-                tracing::warn!("dropping a torn final memory line");
+                .and_then(|text| serde_json::from_str::<MemoryEntry>(text).ok());
+            match decodable {
+                Some(entry) if entry.relevance.is_finite() => entries.push(entry),
+                Some(_) => {
+                    return Err(LoopError::Memory(
+                        "corrupt torn final line: non-finite relevance".to_string(),
+                    ));
+                }
+                None => {
+                    tracing::warn!("dropping a torn final memory line");
+                }
             }
         }
         Ok((entries, torn_tail))
@@ -1172,12 +1224,27 @@ impl LoopMemory for FileMemoryStore {
     /// The file append happens first, with the shared state pinned and
     /// the entries write lock held: on success the mirror is updated to
     /// match; on failure neither side changes, so the two can never
-    /// disagree.
+    /// disagree. A non-finite [`relevance`](MemoryEntry::relevance) is
+    /// refused before anything is written — serialized, it would be a
+    /// `null` the loader treats as fatal mid-file corruption, so the
+    /// refusal is loud and immediate rather than a file that bricks
+    /// the next open.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Memory`] if the entry's relevance is not finite,
+    /// if serialization fails, or if the append fails.
     fn store(
         &self,
         entry: MemoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>> {
         Box::pin(async move {
+            if !entry.relevance.is_finite() {
+                return Err(LoopError::Memory(format!(
+                    "memory entry relevance must be finite: {}",
+                    entry.relevance
+                )));
+            }
             let line = serde_json::to_string(&entry).map_err(|e| {
                 LoopError::Memory(format!("memory entry serialization failed: {e}"))
             })?;

@@ -7,7 +7,7 @@
 //! [`FileMemoryStore`](super::file::FileMemoryStore), and external
 //! companions such as `loopctl-sqlite` rank identical entry sets
 //! identically for the same query. A pure function: no locks, no I/O, no
-//! allocation beyond the lowercased entry text.
+//! allocation beyond the lowercased entry text and tags.
 
 use crate::memory::entry::MemoryEntry;
 

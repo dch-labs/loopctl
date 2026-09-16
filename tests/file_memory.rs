@@ -670,6 +670,124 @@ async fn unconverged_spellings_concurrent_stores_never_weld_a_line() {
 }
 
 #[tokio::test]
+async fn a_non_finite_relevance_is_refused_before_it_bricks_the_file() {
+    let dir = temp_dir("nan-relevance");
+    let path = dir.join("memory.jsonl");
+    let store = FileMemoryStore::open(&path).unwrap();
+    let healthy = MemoryEntry::new(MemoryCategory::Fact, "alpha survives the poisoned sibling");
+    store.store(healthy.clone()).await.unwrap();
+
+    let mut poisoned = MemoryEntry::new(MemoryCategory::Fact, "relevance from a broken scorer");
+    poisoned.relevance = f32::NAN;
+    assert!(
+        store.store(poisoned).await.is_err(),
+        "a non-finite relevance is refused loudly at store time — \
+        serialized it would be a null the loader treats as fatal \
+        mid-file corruption"
+    );
+    let mut infinite = MemoryEntry::new(MemoryCategory::Fact, "infinite relevance");
+    infinite.relevance = f32::INFINITY;
+    assert!(
+        store.store(infinite).await.is_err(),
+        "infinity is the same class — refused before the append"
+    );
+
+    drop(store);
+    let reopened = FileMemoryStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.len(),
+        1,
+        "the file reopens with its healthy entry — no null line ever \
+        reached it"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn divergent_copies_under_one_id_survive_a_convergence_flush() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("duplicate-content-flush");
+    let real = dir.join("realdir");
+    let link = dir.join("link");
+    symlink(&real, &link).unwrap();
+    let store = FileMemoryStore::new(link.join("memory.jsonl"));
+
+    std::fs::create_dir_all(&real).unwrap();
+    let mut first_copy = MemoryEntry::new(MemoryCategory::Fact, "alpha version one content");
+    first_copy.relevance = 0.9;
+    let mut second_copy = first_copy.clone();
+    second_copy.memory = "alpha version two content".to_string();
+    second_copy.relevance = 0.1;
+    store.store(first_copy.clone()).await.unwrap();
+    store.store(second_copy.clone()).await.unwrap();
+
+    store.flush().unwrap();
+    drop(store);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    let hits = reopened.retrieve("alpha", 5).await.unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|hit| (hit.memory.clone(), hit.relevance))
+            .collect::<Vec<_>>(),
+        vec![
+            ("alpha version one content".to_string(), 0.9),
+            ("alpha version two content".to_string(), 0.1),
+        ],
+        "two divergent copies stored under one id keep both contents \
+        in file order across a convergence rewrite — the count was \
+        never the contract, the content is"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn divergent_copies_under_one_id_survive_a_unification() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("duplicate-content-unify");
+    let real = dir.join("realdir");
+    let link1 = dir.join("link1");
+    let link2 = dir.join("link2");
+    symlink(&real, &link1).unwrap();
+    symlink(&real, &link2).unwrap();
+    let first = FileMemoryStore::new(link1.join("memory.jsonl"));
+    let second = FileMemoryStore::new(link2.join("memory.jsonl"));
+
+    std::fs::create_dir_all(&real).unwrap();
+    let mut first_copy = MemoryEntry::new(MemoryCategory::Fact, "alpha version one content");
+    first_copy.relevance = 0.9;
+    let mut second_copy = first_copy.clone();
+    second_copy.memory = "alpha version two content".to_string();
+    second_copy.relevance = 0.1;
+    first.store(first_copy.clone()).await.unwrap();
+    second.store(second_copy.clone()).await.unwrap();
+
+    let third = FileMemoryStore::open(link1.join("memory.jsonl")).unwrap();
+    drop(first);
+    drop(second);
+    drop(third);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    let hits = reopened.retrieve("alpha", 5).await.unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|hit| (hit.memory.clone(), hit.relevance))
+            .collect::<Vec<_>>(),
+        vec![
+            ("alpha version one content".to_string(), 0.9),
+            ("alpha version two content".to_string(), 0.1),
+        ],
+        "a unification of two spellings preserves both contents under \
+        one id — each copy pairs with its own file occurrence"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
 async fn a_new_store_discards_entries_already_in_the_file() {
     let dir = temp_dir("new-discards");
     let path = dir.join("memory.jsonl");
@@ -1622,6 +1740,40 @@ async fn mid_file_corruption_fails_the_open() {
     assert!(
         matches!(result, Err(loopctl::error::LoopError::Memory(_))),
         "corruption before the last line is surfaced, not skipped"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_foreign_infinite_relevance_line_fails_the_open() {
+    let dir = temp_dir("ingress-inf");
+    let path = dir.join("memory.jsonl");
+
+    let mut entry = MemoryEntry::new(MemoryCategory::Fact, "a foreign hand edit");
+    entry.relevance = 0.5;
+    let mut value = serde_json::to_value(&entry).unwrap();
+    value["relevance"] = serde_json::json!(1e40_f64);
+    let spliced = format!("{}\n", serde_json::to_string(&value).unwrap());
+    std::fs::write(&path, spliced.as_bytes()).unwrap();
+
+    let result = FileMemoryStore::open(&path);
+    let message = result
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(
+        message.contains("non-finite relevance") || message.contains("out of range"),
+        "a valid-JSON number that overflows f32 must never reach the \
+        mirror — the loader refuses it at the open, whichever layer \
+        catches it (the store's own guard, or serde_json's range \
+        check under dependency configurations that enable it), or \
+        the first flush bricks the reopen: {message}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        spliced.as_bytes(),
+        "the refused open leaves the foreign bytes untouched for the \
+        operator to repair"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -328,7 +328,12 @@ impl SqliteMemoryStore {
     /// one row — the last stored copy, at the end of insertion order.
     /// Storing the same id twice is therefore a documented divergence
     /// from the flat backends, which append and keep both copies; a
-    /// duplicate-id store here collapses to the newest copy. The FTS
+    /// duplicate-id store here collapses to the newest copy. A
+    /// non-finite `relevance` is rejected loudly here as well: SQLite
+    /// stores NaN as `NULL` against the `NOT NULL` column, so the
+    /// constraint failure names the field's table — the same
+    /// refuse-the-input class the file backend guards before its
+    /// append. The FTS
     /// row is deleted-then-inserted by the same id —
     /// the standalone index is keyed by UUID, not by the core table's
     /// rowid, which `INSERT OR REPLACE` would change.

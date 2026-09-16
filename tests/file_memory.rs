@@ -1301,6 +1301,53 @@ async fn a_dropped_sibling_s_entries_survive_convergence() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn a_flush_from_a_lone_provisional_spelling_adopts_the_file() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("lone-move-adopt");
+    let real = dir.join("realdir");
+    let link1 = dir.join("link1");
+    let link2 = dir.join("link2");
+    symlink(&real, &link1).unwrap();
+    symlink(&real, &link2).unwrap();
+    let first = FileMemoryStore::new(link1.join("memory.jsonl"));
+    let second = FileMemoryStore::new(link2.join("memory.jsonl"));
+
+    std::fs::create_dir_all(&real).unwrap();
+    let a1 = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha grip large files with both hands",
+    );
+    let x = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha nightly deploys pause the world",
+    );
+    first.store(a1.clone()).await.unwrap();
+    second.store(x.clone()).await.unwrap();
+    drop(second);
+
+    first.flush().unwrap();
+    drop(first);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened.len(),
+        2,
+        "a rewrite from a store that was ever provisionally keyed \
+        re-syncs against the file first — the dropped sibling's \
+        durable append is adopted, not stranded on the replaced inode"
+    );
+    let hits = reopened.retrieve("alpha", 5).await.unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![a1.id, x.id],
+        "the adopted entries land in the file's append order"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn exhausted_chain_handles_share_state_once_it_resolves() {
     use std::os::unix::fs::symlink;
 

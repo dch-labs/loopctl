@@ -130,8 +130,10 @@ struct EntryRow {
 
     /// How often the entry was surfaced by retrieval.
     ///
-    /// Widened from `usize` on the way in and saturated back on the
-    /// way out, so a foreign writer's absurd value cannot panic a load.
+    /// Widened from `usize` on the way in and rejected on the way out
+    /// when it does not fit back — a foreign writer's negative or
+    /// oversized count is corruption, surfaced like any malformed
+    /// field instead of panicking or inventing a value.
     access_count: i64,
 
     /// Whether the entry is validated, 0 or 1.
@@ -414,13 +416,21 @@ where
 ///
 /// # Errors
 ///
-/// The stored id is not a UUID, the category name is unknown, or the
-/// tags column is not a JSON array of strings.
+/// The stored id is not a UUID, the category name is unknown, the
+/// tags column is not a JSON array of strings, or the access count
+/// does not fit a `usize` (a negative value, or past the platform's
+/// width).
 fn decode_entry(row: &EntryRow) -> Result<MemoryEntry, SqliteMemoryError> {
     let id = Uuid::parse_str(&row.id)
         .map_err(|e| SqliteMemoryError::InvalidEntry(format!("stored id is not a UUID: {e}")))?;
     let category = category_from_name(&row.category)?;
     let tags: Vec<String> = serde_json::from_str(&row.tags).map_err(SqliteMemoryError::from)?;
+    let access_count = usize::try_from(row.access_count).map_err(|_| {
+        SqliteMemoryError::InvalidEntry(format!(
+            "stored access count is not a valid usize: {}",
+            row.access_count
+        ))
+    })?;
     Ok(MemoryEntry {
         id,
         category,
@@ -428,7 +438,7 @@ fn decode_entry(row: &EntryRow) -> Result<MemoryEntry, SqliteMemoryError> {
         tags,
         created_at: millis_to_time(row.created_at),
         relevance: row.relevance,
-        access_count: usize::try_from(row.access_count).unwrap_or(usize::MAX),
+        access_count,
         validated: row.validated != 0,
         last_accessed: row.last_accessed.map(millis_to_time),
         last_decayed: row.last_decayed.map(millis_to_time),
@@ -700,15 +710,30 @@ mod tests {
     }
 
     #[test]
-    fn decode_entry_saturates_an_absurd_access_count() {
+    fn decode_entry_rejects_a_negative_access_count() {
         let mut row = valid_row();
         row.access_count = -5;
+        let decoded = decode_entry(&row);
+        assert!(
+            matches!(decoded, Err(SqliteMemoryError::InvalidEntry(_))),
+            "a negative stored count is foreign corruption — rejected on \
+            load like a malformed id or category, never surfaced as a \
+            value"
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn decode_entry_loads_the_largest_count_the_write_path_can_store() {
+        let mut row = valid_row();
+        row.access_count = i64::MAX;
         let entry = decode_entry(&row).unwrap();
         assert_eq!(
             entry.access_count,
-            usize::MAX,
-            "a foreign writer's absurd count saturates on the way out — \
-            it cannot panic a load and does not read as an honest zero"
+            usize::try_from(i64::MAX).unwrap(),
+            "the write path saturates at i64::MAX, so the ceiling a \
+            legitimate store can produce loads back exactly — the \
+            rejection bites only what no legitimate writer writes"
         );
     }
 
@@ -742,6 +767,16 @@ mod tests {
     fn huge_durations_saturate_instead_of_panicking() {
         let enormous = UNIX_EPOCH + Duration::from_millis(u64::MAX);
         assert_eq!(time_to_millis(enormous), i64::MAX);
-        assert_eq!(access_count_column(usize::MAX), i64::MAX);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_widest_access_count_saturates_to_the_column_ceiling() {
+        assert_eq!(
+            access_count_column(usize::MAX),
+            i64::MAX,
+            "a count past the column's width saturates at the ceiling — \
+            never panics, never truncates"
+        );
     }
 }

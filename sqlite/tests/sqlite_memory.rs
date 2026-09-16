@@ -540,6 +540,9 @@ async fn consolidates_racing_retrieves_never_lose_a_stamp() {
         before the final pass folded into it — repeated re-stamping may \
         fold several times, but none may be lost"
     );
+    drop(retriever);
+    drop(consolidator);
+    drop(probe);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -680,5 +683,7 @@ async fn a_count_error_reads_as_zero_with_the_entry_table_gone() {
         "the trait's len is infallible — a database that errors under \
         the count reads as zero, the documented error signal"
     );
+    drop(store);
+    drop(saboteur);
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -156,13 +156,17 @@ struct Inner {
     /// log.
     access_log: Mutex<HashMap<Uuid, SystemTime>>,
 
-    /// Whether an append failure could not even be truncated back.
+    /// Whether an append failed and left the tail suspect.
     ///
-    /// Set when a partial line was written and restoring the original
-    /// file length failed — the file may now hold a partial line, so
-    /// every further append through a handle sharing this state is
-    /// rejected until a fresh [`open`](FileMemoryStore::open) loads
-    /// and repairs the file. A sibling handle on a second,
+    /// Set when a write or flush fails — the file may hold a partial
+    /// line, and no rollback is attempted because restoring the
+    /// pre-append length could delete a concurrent writer's line that
+    /// landed in the window, so every further append through a handle
+    /// sharing this state is rejected until a repair: a fresh
+    /// [`open`](FileMemoryStore::open) loads and fixes the file, or a
+    /// [`flush`](FileMemoryStore::flush) or consolidation rewrites it
+    /// whole from the intact mirror — both clear the latch. A
+    /// sibling handle on a second,
     /// not-yet-converged spelling shares no state with this one, so
     /// its appends are not blocked here; one landing after such a
     /// partial write turns the repairable tail into a mid-file line
@@ -221,12 +225,13 @@ impl Inner {
     /// flushed to the OS — visible to other processes and safe against
     /// a process crash, but not fsynced; callers needing power-loss
     /// durability call [`FileMemoryStore::flush`]. If the write or
-    /// flush fails partway, the file is truncated back to its
-    /// pre-append length so a partial line cannot sit in later
-    /// appends' way; if even the truncation fails, the store marks
-    /// itself unusable and every further append through a handle
-    /// sharing this state is rejected until a fresh
-    /// [`FileMemoryStore::open`] repairs the file.
+    /// flush fails, the failed append never removes bytes: a rollback
+    /// to the pre-append length could delete a concurrent writer's
+    /// line that landed in the window, so any partial bytes stay for
+    /// the reopen's torn-tail repair, and the store marks itself
+    /// unusable — every further append through a handle sharing this
+    /// state is rejected until a fresh [`FileMemoryStore::open`] loads
+    /// and repairs the file.
     ///
     /// # Errors
     ///
@@ -234,7 +239,7 @@ impl Inner {
     /// the line cannot be written and flushed, or the store is unusable
     /// after an earlier unrecoverable append failure.
     fn append_line(&self, line: &str) -> Result<(), LoopError> {
-        use std::io::{Seek as _, SeekFrom, Write as _};
+        use std::io::Write as _;
         use std::sync::atomic::Ordering as AtomicOrdering;
         if self.append_unusable.load(AtomicOrdering::SeqCst) {
             return Err(LoopError::Memory(
@@ -248,17 +253,11 @@ impl Inner {
             .append(true)
             .open(&backing_path)
             .map_err(|e| LoopError::Memory(format!("cannot open memory file for append: {e}")))?;
-        let original_len = file
-            .seek(SeekFrom::End(0))
-            .map_err(|e| LoopError::Memory(format!("cannot size the memory file: {e}")))?;
         let mut line_bytes = line.as_bytes().to_vec();
         line_bytes.push(b'\n');
         let write_result = file.write_all(&line_bytes).and_then(|()| file.flush());
         if let Err(e) = write_result {
-            let truncation = file.set_len(original_len).and_then(|()| file.flush());
-            if truncation.is_err() {
-                self.append_unusable.store(true, AtomicOrdering::SeqCst);
-            }
+            self.append_unusable.store(true, AtomicOrdering::SeqCst);
             return Err(LoopError::Memory(format!(
                 "cannot append to memory file: {e}"
             )));
@@ -766,12 +765,17 @@ impl FileMemoryStore {
         }
     }
 
-    /// Reset a merged mirror against the backing file's entry order.
+    /// Reset a merged or provisional mirror against the backing file's
+    /// entry order.
     ///
-    /// The file is the durable record of append order — the order
-    /// retrieval's stable tie-break names as insertion order — and the
-    /// target/stale assignment of a unification is arbitrary, so the
-    /// merged mirror is reordered to the file's sequence. The file is
+    /// Called from a unification's merge and, before every rewrite
+    /// out of a store that was ever provisionally keyed, from
+    /// [`flush`](Self::flush) and
+    /// [`consolidate`](LoopMemory::consolidate) — in both roles the
+    /// file is the durable record of append order — the order
+    /// retrieval's stable tie-break names as insertion order — and
+    /// which side of a convergence a mirror sat on is arbitrary, so
+    /// the mirror is reordered to the file's sequence. The file is
     /// the truth for content too: an entry found in both keeps the
     /// mirror copy (fresher access state), while a file-only entry is
     /// adopted from the file itself — mirrors never deliberately drop
@@ -853,18 +857,37 @@ impl FileMemoryStore {
     /// whole rewrite, so concurrent `flush`es, `consolidate`s, and
     /// `store`s are serialized: two rewrites can never interleave on the
     /// temp file, and an append can never land on the unlinked old file
-    /// after the rename.
+    /// after the rename. A store that was ever provisionally keyed
+    /// re-syncs its mirror against the file before rewriting, so a
+    /// sibling's durable append that this mirror never observed —
+    /// through a spelling whose convergence happened outside this
+    /// call, or a sibling dropped before it — is adopted rather than
+    /// stranded on the replaced inode; a canonically-keyed store skips
+    /// the read and keeps its documented discard of an existing file's
+    /// old entries. A successful rewrite repairs the tail, so it also
+    /// re-arms appends after an earlier append failure latched the
+    /// store unusable.
     ///
     /// # Errors
     ///
     /// [`LoopError::Memory`] on any I/O or serialization failure. On
     /// failure the original file is left untouched.
     pub fn flush(&self) -> Result<(), LoopError> {
+        use std::sync::atomic::Ordering as AtomicOrdering;
         Self::converge_with_registry();
         let shared = recover_guard(self.inner.current.read());
-        let entries = recover_guard(shared.entries.write());
+        let mut entries = recover_guard(shared.entries.write());
         let backing_path = shared.backing_path();
-        Self::rewrite(&backing_path, &entries).map_err(LoopError::from)
+        if shared.is_fallback
+            && let Some(adopted) = Self::reorder_merged_entries(&entries, &backing_path)
+        {
+            *entries = adopted;
+        }
+        let rewrite_result = Self::rewrite(&backing_path, &entries).map_err(LoopError::from);
+        if rewrite_result.is_ok() {
+            shared.append_unusable.store(false, AtomicOrdering::SeqCst);
+        }
+        rewrite_result
     }
 
     /// Load a JSONL file into a vec of entries, applying the corruption rules.
@@ -1218,7 +1241,10 @@ impl LoopMemory for FileMemoryStore {
     ///
     /// Folds the access log into a copy of the entries (stamping
     /// [`last_accessed`](MemoryEntry::last_accessed) and bumping
-    /// [`access_count`](MemoryEntry::access_count)), then delegates to
+    /// [`access_count`](MemoryEntry::access_count)), re-syncs a store
+    /// that was ever provisionally keyed against the file first (so a
+    /// sibling's unobserved durable append is adopted into the pass
+    /// rather than stranded by the rewrite), then delegates to
     /// [`consolidate_entries`]
     /// — the same decay, merge, and prune pass
     /// [`InMemoryStore`](super::builtin::InMemoryStore) runs — and
@@ -1232,10 +1258,13 @@ impl LoopMemory for FileMemoryStore {
     /// durability-unconfirmed failure (the rename landed, the
     /// directory sync did not) still commits the pass to the mirror
     /// and the file before returning the error — only fsync-durability
-    /// is unconfirmed, never the pass itself.
+    /// is unconfirmed, never the pass itself. A rewrite that lands —
+    /// durable or not — repairs the tail and re-arms appends after an
+    /// earlier append failure latched the store unusable.
     fn consolidate(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<ConsolidationStats, LoopError>> + Send + '_>> {
+        use std::sync::atomic::Ordering as AtomicOrdering;
         Box::pin(async move {
             Self::converge_with_registry();
             let shared = recover_guard(self.inner.current.read());
@@ -1249,14 +1278,22 @@ impl LoopMemory for FileMemoryStore {
                     entry.access_count = entry.access_count.saturating_add(1);
                 }
             }
-            let stats = consolidate_entries(&mut next, &self.consolidation, now);
             let backing_path = shared.backing_path();
+            if shared.is_fallback
+                && let Some(adopted) = Self::reorder_merged_entries(&next, &backing_path)
+            {
+                next = adopted;
+            }
+            let stats = consolidate_entries(&mut next, &self.consolidation, now);
             match Self::rewrite(&backing_path, &next) {
-                Ok(()) => {}
+                Ok(()) => {
+                    shared.append_unusable.store(false, AtomicOrdering::SeqCst);
+                }
                 Err(RewriteError::NotDurable(error)) => {
                     access_log.clear();
                     drop(access_log);
                     *guard = next;
+                    shared.append_unusable.store(false, AtomicOrdering::SeqCst);
                     return Err(error);
                 }
                 Err(RewriteError::PreCommit(error)) => return Err(error),

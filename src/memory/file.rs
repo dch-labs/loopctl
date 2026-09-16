@@ -1336,12 +1336,17 @@ impl LoopMemory for FileMemoryStore {
 
     /// Run the shared consolidation pass and rewrite the file atomically.
     ///
-    /// Folds the access log into a copy of the entries (stamping
+    /// Re-syncs a store that was ever provisionally keyed against the
+    /// file first (so a sibling's unobserved durable append is adopted
+    /// into the pass rather than stranded by the rewrite, and so each
+    /// mirror copy pairs with its equal durable occurrence while the
+    /// two still carry identical metadata), then folds the access log
+    /// into the result (stamping
     /// [`last_accessed`](MemoryEntry::last_accessed) and bumping
-    /// [`access_count`](MemoryEntry::access_count)), re-syncs a store
-    /// that was ever provisionally keyed against the file first (so a
-    /// sibling's unobserved durable append is adopted into the pass
-    /// rather than stranded by the rewrite), then delegates to
+    /// [`access_count`](MemoryEntry::access_count)) — folding first
+    /// would break the equality pairing and leave a durable and a
+    /// stamped copy for the pass to double-count or persist twice —
+    /// then delegates to
     /// [`consolidate_entries`]
     /// — the same decay, merge, and prune pass
     /// [`InMemoryStore`](super::builtin::InMemoryStore) runs — and
@@ -1369,17 +1374,17 @@ impl LoopMemory for FileMemoryStore {
             let mut guard = recover_guard(shared.entries.write());
             let mut next = guard.clone();
             let mut access_log = recover_guard(shared.access_log.lock());
-            for entry in &mut next {
-                if let Some(stamp) = access_log.get(&entry.id) {
-                    entry.last_accessed = entry.last_accessed.max(Some(*stamp));
-                    entry.access_count = entry.access_count.saturating_add(1);
-                }
-            }
             let backing_path = shared.backing_path();
             if shared.is_fallback
                 && let Some(adopted) = Self::reorder_merged_entries(&next, &backing_path)
             {
                 next = adopted;
+            }
+            for entry in &mut next {
+                if let Some(stamp) = access_log.get(&entry.id) {
+                    entry.last_accessed = entry.last_accessed.max(Some(*stamp));
+                    entry.access_count = entry.access_count.saturating_add(1);
+                }
             }
             let stats = consolidate_entries(&mut next, &self.consolidation, now);
             match Self::rewrite(&backing_path, &next) {

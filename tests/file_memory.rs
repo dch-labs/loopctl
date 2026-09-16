@@ -787,6 +787,79 @@ async fn divergent_copies_under_one_id_survive_a_unification() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_provisional_consolidate_does_not_double_count_prior_accesses() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("fold-order");
+    let real = dir.join("realdir");
+    let link = dir.join("link");
+    symlink(&real, &link).unwrap();
+    let store = FileMemoryStore::new(link.join("memory.jsonl"));
+
+    std::fs::create_dir_all(&real).unwrap();
+    let mut entry = MemoryEntry::new(MemoryCategory::Fact, "alpha accessed twice");
+    entry.relevance = 0.9;
+    store.store(entry).await.unwrap();
+
+    store.retrieve("alpha", 3).await.unwrap();
+    store.consolidate().await.unwrap();
+    store.retrieve("alpha", 3).await.unwrap();
+    store.consolidate().await.unwrap();
+    drop(store);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    let hits = reopened.retrieve("alpha", 3).await.unwrap();
+    assert_eq!(hits.len(), 1, "one entry, not a durable and a stamped copy");
+    assert_eq!(
+        hits.first().map(|hit| hit.access_count),
+        Some(2),
+        "two retrieves mean two counted accesses — the stamped mirror \
+        copy must pair with its durable occurrence before the fold \
+        changes its metadata, or the pass merges and double-counts \
+        the prior history"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_provisional_consolidate_with_merging_disabled_keeps_one_copy() {
+    use loopctl::memory::consolidate::ConsolidationConfig;
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("fold-order-nomerge");
+    let real = dir.join("realdir");
+    let link = dir.join("link");
+    symlink(&real, &link).unwrap();
+    let store =
+        FileMemoryStore::new(link.join("memory.jsonl")).with_consolidation(ConsolidationConfig {
+            merge: false,
+            ..ConsolidationConfig::default()
+        });
+
+    std::fs::create_dir_all(&real).unwrap();
+    let mut entry = MemoryEntry::new(MemoryCategory::Fact, "alpha never merged");
+    entry.relevance = 0.9;
+    store.store(entry).await.unwrap();
+
+    store.retrieve("alpha", 3).await.unwrap();
+    store.consolidate().await.unwrap();
+    drop(store);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened.len(),
+        1,
+        "with clustering disabled there is nothing to fold the stray \
+        stamped copy into — the pre-fold pairing is the only thing \
+        keeping one entry on disk instead of a durable and a stamped \
+        duplicate"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn a_new_store_discards_entries_already_in_the_file() {
     let dir = temp_dir("new-discards");

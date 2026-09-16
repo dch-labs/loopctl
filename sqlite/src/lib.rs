@@ -9,7 +9,11 @@
 //! order with the same tie-breaking, as the in-memory and file
 //! backends. An FTS5 index is maintained on every write; retrieval
 //! does not consult it — ranking every entry is what guarantees the
-//! parity contract.
+//! parity contract. Durability here is transactional: a committed
+//! write survives a process crash, but WAL with
+//! `synchronous = NORMAL` may lose the most recent commits to power
+//! loss — the same process-crash/power-loss distinction the file
+//! backend draws between its appends and its synced rewrites.
 //!
 //! Add this crate as a direct dependency; no feature on `loopctl`
 //! itself is required:

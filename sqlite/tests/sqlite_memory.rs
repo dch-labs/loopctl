@@ -465,3 +465,220 @@ async fn an_in_memory_database_round_trips_without_the_filesystem() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits.first().map(|e| e.id), Some(entry.id));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consolidates_racing_retrieves_never_lose_a_stamp() {
+    let dir = temp_dir("stamp-race");
+    let path = dir.join("memory.db");
+
+    let writer = SqliteMemoryStore::open(&path).unwrap();
+    let mut entry = MemoryEntry::new(MemoryCategory::Fact, "grip large files with both hands");
+    entry.relevance = 0.9;
+    writer.store(entry.clone()).await.unwrap();
+    drop(writer);
+
+    let retriever = std::sync::Arc::new(SqliteMemoryStore::open(&path).unwrap());
+    let consolidator = std::sync::Arc::new(SqliteMemoryStore::open(&path).unwrap());
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let retriever = std::sync::Arc::clone(&retriever);
+        tasks.push(tokio::task::spawn(async move {
+            let mut attempts = 0;
+            loop {
+                match retriever.retrieve("grip large files", 3).await {
+                    Ok(_) => return,
+                    Err(error) => {
+                        attempts += 1;
+                        assert!(
+                            attempts < 200,
+                            "a busy database must eventually yield: {error}"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }));
+    }
+    for _ in 0..4 {
+        let consolidator = std::sync::Arc::clone(&consolidator);
+        tasks.push(tokio::task::spawn(async move {
+            let mut attempts = 0;
+            loop {
+                match consolidator.consolidate().await {
+                    Ok(_) => return,
+                    Err(error) => {
+                        attempts += 1;
+                        assert!(
+                            attempts < 200,
+                            "a busy database must eventually yield: {error}"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    consolidator.consolidate().await.unwrap();
+
+    let probe = rusqlite::Connection::open(&path).unwrap();
+    let pending: i64 = probe
+        .query_row("SELECT COUNT(*) FROM access_stamps", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        pending, 0,
+        "every stamp written before the final pass was folded by it — \
+        none was lost to a retrieve racing a consolidate"
+    );
+    let consolidated = consolidator.retrieve("grip large files", 3).await.unwrap();
+    let folded = consolidated.first().map_or(0, |e| e.access_count);
+    assert!(
+        folded >= 1,
+        "the entry survived the racing passes and every stamp written \
+        before the final pass folded into it — repeated re-stamping may \
+        fold several times, but none may be lost"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_custom_consolidation_config_shapes_the_pass() {
+    use loopctl::memory::consolidate::ConsolidationConfig;
+
+    let default_store = SqliteMemoryStore::in_memory().unwrap();
+    let tuned_store =
+        SqliteMemoryStore::in_memory()
+            .unwrap()
+            .with_consolidation(ConsolidationConfig {
+                prune_floor: 0.0,
+                ..ConsolidationConfig::default()
+            });
+    let mut spent = MemoryEntry::new(MemoryCategory::Fact, "a spent lesson");
+    spent.relevance = 0.01;
+    default_store.store(spent.clone()).await.unwrap();
+    tuned_store.store(spent).await.unwrap();
+    default_store.consolidate().await.unwrap();
+    tuned_store.consolidate().await.unwrap();
+
+    assert_eq!(
+        default_store.len(),
+        0,
+        "the default floor prunes the spent entry"
+    );
+    assert_eq!(
+        tuned_store.len(),
+        1,
+        "the per-handle config shapes this handle's pass — a zero prune \
+        floor keeps what the default prunes"
+    );
+}
+
+#[tokio::test]
+async fn all_three_backends_rank_identically_including_ties() {
+    use loopctl::memory::FileMemoryStore;
+    use loopctl::memory::builtin::InMemoryStore;
+
+    let dir = temp_dir("three-way");
+    let sqlite_store = SqliteMemoryStore::in_memory().unwrap();
+    let file_store = FileMemoryStore::new(dir.join("memory.jsonl"));
+    let flat_store = InMemoryStore::new();
+    let entries = [
+        MemoryEntry::new(
+            MemoryCategory::Fact,
+            "alpha grip large files with both hands",
+        ),
+        MemoryEntry::new(
+            MemoryCategory::Fact,
+            "alpha nightly deploys pause the world",
+        ),
+        MemoryEntry::new(
+            MemoryCategory::Fact,
+            "alpha read the whole file before editing",
+        ),
+    ];
+    for entry in &entries {
+        sqlite_store.store(entry.clone()).await.unwrap();
+        file_store.store(entry.clone()).await.unwrap();
+        flat_store.store(entry.clone()).await.unwrap();
+    }
+
+    for query in ["alpha", "deploy", "grip files", "unmatched query"] {
+        let sqlite_ids = sqlite_store
+            .retrieve(query, 5)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.id, entry.memory.clone()))
+            .collect::<Vec<_>>();
+        let file_ids = file_store
+            .retrieve(query, 5)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.id, entry.memory.clone()))
+            .collect::<Vec<_>>();
+        let flat_ids = flat_store
+            .retrieve(query, 5)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.id, entry.memory.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(sqlite_ids, flat_ids, "sqlite matches the flat oracle");
+        assert_eq!(
+            file_ids, flat_ids,
+            "the file store matches the flat oracle directly, not transitively"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_id_stores_collapse_to_one_copy_here_but_not_in_the_file_store() {
+    use loopctl::memory::FileMemoryStore;
+
+    let dir = temp_dir("duplicate-id");
+    let sqlite_store = SqliteMemoryStore::in_memory().unwrap();
+    let file_store = FileMemoryStore::new(dir.join("memory.jsonl"));
+    let entry = MemoryEntry::new(MemoryCategory::Fact, "stored twice under one id");
+
+    sqlite_store.store(entry.clone()).await.unwrap();
+    sqlite_store.store(entry.clone()).await.unwrap();
+    file_store.store(entry.clone()).await.unwrap();
+    file_store.store(entry.clone()).await.unwrap();
+
+    assert_eq!(
+        sqlite_store.len(),
+        1,
+        "the core write is INSERT OR REPLACE keyed by UUID — a \
+        duplicate-id store keeps the newest single copy"
+    );
+    assert_eq!(
+        file_store.len(),
+        2,
+        "the file backend appends and keeps both copies — the pinned, \
+        documented divergence between the backends"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_count_error_reads_as_zero_with_the_entry_table_gone() {
+    let dir = temp_dir("count-error");
+    let path = dir.join("memory.db");
+    let store = SqliteMemoryStore::open(&path).unwrap();
+    store.store(loaded_entry()).await.unwrap();
+    assert_eq!(store.len(), 1, "the store counts its one row");
+
+    let saboteur = rusqlite::Connection::open(&path).unwrap();
+    saboteur.execute("DROP TABLE memory_entries", []).unwrap();
+    assert_eq!(
+        store.len(),
+        0,
+        "the trait's len is infallible — a database that errors under \
+        the count reads as zero, the documented error signal"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

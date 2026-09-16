@@ -323,7 +323,11 @@ impl SqliteMemoryStore {
     ///
     /// The core write is `INSERT OR REPLACE` keyed by the entry's UUID,
     /// so re-storing an entry (post-consolidation rewrite, dedup) keeps
-    /// one row. The FTS row is deleted-then-inserted by the same id —
+    /// one row — the last stored copy, at the end of insertion order.
+    /// Storing the same id twice is therefore a documented divergence
+    /// from the flat backends, which append and keep both copies; a
+    /// duplicate-id store here collapses to the newest copy. The FTS
+    /// row is deleted-then-inserted by the same id —
     /// the standalone index is keyed by UUID, not by the core table's
     /// rowid, which `INSERT OR REPLACE` would change.
     ///
@@ -424,7 +428,7 @@ fn decode_entry(row: &EntryRow) -> Result<MemoryEntry, SqliteMemoryError> {
         tags,
         created_at: millis_to_time(row.created_at),
         relevance: row.relevance,
-        access_count: usize::try_from(row.access_count).unwrap_or(0),
+        access_count: usize::try_from(row.access_count).unwrap_or(usize::MAX),
         validated: row.validated != 0,
         last_accessed: row.last_accessed.map(millis_to_time),
         last_decayed: row.last_decayed.map(millis_to_time),
@@ -693,6 +697,19 @@ mod tests {
         let mut row = valid_row();
         row.tags = "not json".to_string();
         assert!(decode_entry(&row).is_err());
+    }
+
+    #[test]
+    fn decode_entry_saturates_an_absurd_access_count() {
+        let mut row = valid_row();
+        row.access_count = -5;
+        let entry = decode_entry(&row).unwrap();
+        assert_eq!(
+            entry.access_count,
+            usize::MAX,
+            "a foreign writer's absurd count saturates on the way out — \
+            it cannot panic a load and does not read as an honest zero"
+        );
     }
 
     #[test]

@@ -459,7 +459,6 @@ async fn invalid_utf8_in_a_complete_line_fails_the_open() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[cfg(unix)]
 #[cfg(all(unix, feature = "testing"))]
 #[tokio::test]
 async fn access_stamps_survive_a_failed_consolidation() {
@@ -521,7 +520,7 @@ async fn concurrent_consolidations_leave_a_reopenable_store() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_unrecoverable_append_failure_marks_the_store_unusable() {
     let store = FileMemoryStore::new("/dev/full");
@@ -616,6 +615,124 @@ async fn concurrent_stores_through_two_handles_never_weld() {
         WRITERS,
         "appends through both handles serialize behind the shared lock — \
         one parseable line per store, no welded lines"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unconverged_spellings_concurrent_stores_never_weld_a_line() {
+    use std::os::unix::fs::symlink;
+
+    const WRITERS_PER_SPELLING: usize = 8;
+    let dir = temp_dir("two-spellings-concurrent");
+    let real = dir.join("realdir");
+    let link1 = dir.join("link1");
+    let link2 = dir.join("link2");
+    symlink(&real, &link1).unwrap();
+    symlink(&real, &link2).unwrap();
+    let first = Arc::new(FileMemoryStore::new(link1.join("memory.jsonl")));
+    let second = Arc::new(FileMemoryStore::new(link2.join("memory.jsonl")));
+
+    std::fs::create_dir_all(&real).unwrap();
+    let mut tasks = Vec::new();
+    for index in 0..(WRITERS_PER_SPELLING * 2) {
+        let store = if index % 2 == 0 {
+            Arc::clone(&first)
+        } else {
+            Arc::clone(&second)
+        };
+        tasks.push(tokio::task::spawn(async move {
+            store
+                .store(MemoryEntry::new(
+                    MemoryCategory::Fact,
+                    format!("writer {index} stored a whole line"),
+                ))
+                .await
+                .unwrap();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    drop(first);
+    drop(second);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened.len(),
+        WRITERS_PER_SPELLING * 2,
+        "unconverged spellings hold separate locks, so the weld guard is \
+        the single-write append itself — one parseable line per store, \
+        never a corrupt mid-file line"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_new_store_discards_entries_already_in_the_file() {
+    let dir = temp_dir("new-discards");
+    let path = dir.join("memory.jsonl");
+    let previous = FileMemoryStore::open(&path).unwrap();
+    let old = MemoryEntry::new(MemoryCategory::Fact, "written by an earlier process");
+    previous.store(old).await.unwrap();
+    drop(previous);
+
+    let replacement = FileMemoryStore::new(&path);
+    let fresh = MemoryEntry::new(MemoryCategory::Fact, "written by the fresh store");
+    replacement.store(fresh.clone()).await.unwrap();
+    replacement.flush().unwrap();
+    drop(replacement);
+
+    let reopened = FileMemoryStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.len(),
+        1,
+        "a fresh new() neither loads nor preserves an existing file's \
+        entries — the rewrite persists only what the live handles stored"
+    );
+    assert_eq!(
+        reopened
+            .retrieve("fresh", 3)
+            .await
+            .unwrap()
+            .first()
+            .map(|hit| hit.id),
+        Some(fresh.id),
+        "the surviving entry is the new store's, not the file's old one"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_custom_consolidation_config_shapes_the_pass() {
+    use loopctl::memory::consolidate::ConsolidationConfig;
+
+    let dir = temp_dir("config-floor");
+    let default_store = FileMemoryStore::open(dir.join("default.jsonl")).unwrap();
+    let tuned_store = FileMemoryStore::open(dir.join("tuned.jsonl"))
+        .unwrap()
+        .with_consolidation(ConsolidationConfig {
+            prune_floor: 0.0,
+            ..ConsolidationConfig::default()
+        });
+    let mut spent = MemoryEntry::new(MemoryCategory::Fact, "a spent lesson");
+    spent.relevance = 0.01;
+    default_store.store(spent.clone()).await.unwrap();
+    tuned_store.store(spent).await.unwrap();
+    default_store.consolidate().await.unwrap();
+    tuned_store.consolidate().await.unwrap();
+
+    assert_eq!(
+        default_store.len(),
+        0,
+        "the default floor prunes the spent entry"
+    );
+    assert_eq!(
+        tuned_store.len(),
+        1,
+        "the per-handle config shapes this handle's pass over the shared \
+        mirror — a zero prune floor keeps what the default prunes"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -1276,6 +1393,46 @@ async fn a_rewrite_refuses_to_replace_a_final_symlink() {
         untouched"
     );
     assert_no_temp_siblings(&dir, "the refused rewrite cleaned up its temp");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_live_exhausted_handle_checkpoints_once_the_chain_resolves() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("chain-live");
+    let real = dir.join("realdir");
+    let mut head = dir.join("link-8.jsonl");
+    symlink(real.join("memory.jsonl"), &head).unwrap();
+    for step in (0..8).rev() {
+        let link = dir.join(format!("link-{step}.jsonl"));
+        symlink(&head, &link).unwrap();
+        head = link;
+    }
+    let store = FileMemoryStore::new(&head);
+
+    std::fs::create_dir_all(&real).unwrap();
+    let entry = MemoryEntry::new(MemoryCategory::Fact, "checkpointed through the chain head");
+    store.store(entry.clone()).await.unwrap();
+
+    store.flush().unwrap();
+    store.consolidate().await.unwrap();
+    drop(store);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened
+            .retrieve("checkpointed", 3)
+            .await
+            .unwrap()
+            .first()
+            .map(|hit| hit.id),
+        Some(entry.id),
+        "the live handle checkpointed through the converged path — the \
+        chain-head spelling a provisional registration moved off of no \
+        longer reaches the rewrite"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

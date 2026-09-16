@@ -18,7 +18,7 @@ use crate::memory::LoopMemory;
 use crate::memory::consolidate::{ConsolidationConfig, consolidate_entries};
 use crate::memory::entry::{ConsolidationStats, MemoryEntry};
 use crate::memory::score::score_entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -66,9 +66,19 @@ use uuid::Uuid;
 /// moves the registration — and spellings that collide, having
 /// resolved to one file, unify: their mirrors merge in the file's
 /// append order and the stale handle is re-pointed, so every handle
-/// shares one state as soon as any construction or rewrite observes
-/// the paths converged — a flush or consolidation on a converged
-/// handle unifies first, then rewrites from the one mirror.
+/// shares one state as soon as any construction, append, or rewrite
+/// observes the paths converged — each of those converges the
+/// registration before it touches the file, so no file-mutating
+/// operation ever runs while a second spelling of the same file
+/// still holds its own lock domain. The one exception is a pair of
+/// spellings whose symlink chains both outran the key derivation's
+/// follow budget: those can key apart forever, share no locks and
+/// no latch, and a weld between them is reported loudly by the next
+/// `open`. A flush or consolidation on a converged handle unifies
+/// first, then rewrites from the one mirror; a store that latched
+/// itself unusable after a failed append refuses a converging
+/// sibling's append too, because the sibling joins the latched
+/// state before it can write.
 /// Multi-process access to the same file is not supported — there is
 /// no file locking, and two processes will corrupt the file.
 ///
@@ -161,17 +171,21 @@ struct Inner {
     /// Set when a write or flush fails — the file may hold a partial
     /// line, and no rollback is attempted because restoring the
     /// pre-append length could delete a concurrent writer's line that
-    /// landed in the window, so every further append through a handle
-    /// sharing this state is rejected until a repair: a fresh
-    /// [`open`](FileMemoryStore::open) loads and fixes the file, or a
-    /// [`flush`](FileMemoryStore::flush) or consolidation rewrites it
-    /// whole from the intact mirror — both clear the latch. A
-    /// sibling handle on a second,
-    /// not-yet-converged spelling shares no state with this one, so
-    /// its appends are not blocked here; one landing after such a
-    /// partial write turns the repairable tail into a mid-file line
-    /// the next `open` reports loudly. Any construction or rewrite
-    /// converges the spellings and closes that window.
+    /// landed in the window, so every further append through a
+    /// handle that converges with this state is rejected until a
+    /// repair: appends converge the registration before writing, so
+    /// every live handle within the key derivation's follow budget
+    /// shares this latch by the time it could append, and a
+    /// unification carries a latched side's poison into the
+    /// surviving state — two budget-exhausted spellings that keyed
+    /// apart share no latch, and the next `open` reports any weld
+    /// loudly. A fresh [`open`](FileMemoryStore::open) loads and
+    /// fixes the file, and a [`flush`](FileMemoryStore::flush) or
+    /// consolidation rewrites it whole from the intact mirror — both
+    /// clear the latch. The residual hazard is cross-process only:
+    /// a second process, which no convergence can reach, can append
+    /// onto the partial line — multi-process access is unsupported
+    /// by contract.
     append_unusable: AtomicBool,
 
     /// Whether this store was registered under a provisional key.
@@ -216,12 +230,15 @@ impl Inner {
 
     /// Append one serialized entry as a line to the file.
     ///
-    /// The caller holds the entries write lock, so appends through one
-    /// shared state are serialized and their lines can never
-    /// interleave; the line and its terminator go out as a single
-    /// write, so even appenders through a not-yet-converged second
-    /// spelling of the same file — a second lock domain the caller
-    /// cannot cover — can never weld a line mid-file. The line is
+    /// The caller holds the entries write lock, and every caller —
+    /// this is only [`store`](LoopMemory::store) — converges the
+    /// registration before pinning, so appends through every
+    /// spelling that converges serialize behind one shared lock and
+    /// their lines can never interleave. The line and its
+    /// terminator still go out
+    /// as a single write, a last-line defense for direct use of an
+    /// [`Inner`] outside the registry's reach: even two lock domains
+    /// writing at once cannot weld a line mid-file. The line is
     /// flushed to the OS — visible to other processes and safe against
     /// a process crash, but not fsynced; callers needing power-loss
     /// durability call [`FileMemoryStore::flush`]. If the write or
@@ -229,9 +246,11 @@ impl Inner {
     /// to the pre-append length could delete a concurrent writer's
     /// line that landed in the window, so any partial bytes stay for
     /// the reopen's torn-tail repair, and the store marks itself
-    /// unusable — every further append through a handle sharing this
-    /// state is rejected until a fresh [`FileMemoryStore::open`] loads
-    /// and repairs the file.
+    /// unusable — every further append through any handle in the
+    /// process is rejected, since the next
+    /// [`store`](LoopMemory::store) converges onto the latched state,
+    /// until a fresh [`FileMemoryStore::open`] loads and repairs the
+    /// file.
     ///
     /// # Errors
     ///
@@ -628,11 +647,13 @@ impl FileMemoryStore {
     ///
     /// Runs inside the constructors' registry critical section, before
     /// their attach-or-create lookup, so handles constructed while a
-    /// parent symlink was dangling are found once the path resolves;
-    /// and before every mirror-driven rewrite, via
+    /// parent symlink was still dangling are found once the path
+    /// resolves; before every mirror-driven rewrite, via
     /// [`converge_with_registry`](Self::converge_with_registry), so a
     /// rewrite from one mirror cannot delete a converged sibling's
-    /// entries. Every live cell flagged as a fallback has its key
+    /// entries; and before every append, so no append runs while a
+    /// second spelling of the same file still holds its own lock
+    /// domain. Every live cell flagged as a fallback has its key
     /// re-derived; a
     /// registration whose derived key is unoccupied moves there, and
     /// one whose derived key is already occupied unifies into the
@@ -724,25 +745,26 @@ impl FileMemoryStore {
     ///
     /// Both mirrors' appends already reached the same physical file —
     /// the mirror is the divergence — so the union restores
-    /// completeness: entries present only in the stale mirror (matched
-    /// by id) are appended to the target mirror, the merged order is
-    /// then reset against the backing file (see
-    /// [`reorder_merged_entries`](Self::reorder_merged_entries)) so
-    /// the arbitrary target/stale assignment cannot flip retrieval's
-    /// insertion order, and the access logs union with the same
+    /// completeness: every stale copy joins the target mirror, including
+    /// copies that share an id with a target entry — the file holds one
+    /// line per append, so a duplicate id means two real occurrences,
+    /// and which copy belongs to which occurrence is settled by content
+    /// when the merged order is reset against the backing file (see
+    /// [`reorder_merged_entries`](Self::reorder_merged_entries)). A
+    /// stale side that latched itself unusable after a failed append
+    /// poisons the unified state too — the suspect tail is the file's,
+    /// whichever spelling wrote it. The access logs union with the same
     /// max-stamp rule retrieval applies. Locks, in order: the stale
     /// mirror's entries read, the target mirror's entries write, then
     /// both access logs — safe because the caller pins both cells
     /// under their `current` write locks, so no operation can hold
     /// either mirror's locks concurrently.
     fn merge_mirrors(stale: &Inner, target: &Inner) {
+        use std::sync::atomic::Ordering as AtomicOrdering;
         let stale_entries = recover_guard(stale.entries.read());
         let mut target_entries = recover_guard(target.entries.write());
-        let present: HashSet<Uuid> = target_entries.iter().map(|entry| entry.id).collect();
         for entry in stale_entries.iter() {
-            if !present.contains(&entry.id) {
-                target_entries.push(entry.clone());
-            }
+            target_entries.push(entry.clone());
         }
         if let Some(reordered) =
             Self::reorder_merged_entries(&target_entries, &target.backing_path())
@@ -751,6 +773,9 @@ impl FileMemoryStore {
         }
         drop(stale_entries);
         drop(target_entries);
+        if stale.append_unusable.load(AtomicOrdering::SeqCst) {
+            target.append_unusable.store(true, AtomicOrdering::SeqCst);
+        }
         let stale_log = recover_guard(stale.access_log.lock());
         let mut target_log = recover_guard(target.access_log.lock());
         for (id, stamp) in stale_log.iter() {
@@ -776,28 +801,22 @@ impl FileMemoryStore {
     /// retrieval's stable tie-break names as insertion order — and
     /// which side of a convergence a mirror sat on is arbitrary, so
     /// the mirror is reordered to the file's sequence. The file is
-    /// the truth for content too: an entry found in both keeps the
-    /// mirror copy (fresher access state), while a file-only entry is
-    /// adopted from the file itself — mirrors never deliberately drop
-    /// entries outside consolidation, which rewrites the file in the
-    /// same pass, so file-only content can only be a dropped
-    /// sibling's un-converged appends, exactly what must survive the
-    /// convergence rewrite. Entries sharing an id pair by
-    /// occurrence — the i-th file occurrence keeps the i-th mirror
-    /// copy, so divergent copies under one id all survive with their
-    /// own content; a mirror copy beyond the file's occurrence count
-    /// falls to the tail. Mirror-only entries (not expected —
-    /// `store` appends before mirroring) keep their merged order at
-    /// the end. The file read runs under whichever lock domain the
-    /// caller holds — the registry mutex during a unification merge
-    /// (convergence is rare, so a read-only lookup there is a
-    /// deliberate trade-off) and the entries write lock during a
-    /// pre-rewrite re-sync, the stronger serialization. A file that cannot be loaded
-    /// (mid-file corruption) returns `None` and leaves the merged
-    /// mirror as-is — in the unification-merge role the next `open`
-    /// surfaces that corruption loudly, while in the pre-rewrite role
-    /// the subsequent rewrite replaces the file from the mirror and
-    /// erases it —
+    /// the truth for content too: each occurrence keeps the mirror
+    /// copy equal to it, and an occurrence with no equal copy left —
+    /// a lone provisional spelling's mirror next to a file that holds
+    /// an earlier duplicate, or a line whose only mirror copy sat in
+    /// a dropped sibling — adopts its own durable content from the
+    /// file itself, so the pairing can never borrow a divergent copy
+    /// and leave an occurrence's content nowhere. Mirror copies
+    /// beyond the file's
+    /// occurrences — only possible for a dropped sibling's
+    /// un-converged appends, exactly what must survive the
+    /// convergence rewrite — keep their merged order at the tail. A
+    /// file that cannot be loaded (mid-file corruption) returns `None`
+    /// and leaves the merged mirror as-is — in the unification-merge
+    /// role the next `open` surfaces that corruption loudly, while in
+    /// the pre-rewrite role the subsequent rewrite replaces the file
+    /// from the mirror and erases it —
     /// ordering is best-effort, completeness is not.
     fn reorder_merged_entries(merged: &[MemoryEntry], path: &Path) -> Option<Vec<MemoryEntry>> {
         let file_entries = Self::load_entries(path).ok()?.0;
@@ -805,31 +824,34 @@ impl FileMemoryStore {
         for entry in merged.iter().cloned() {
             by_id.entry(entry.id).or_default().push_back(entry);
         }
-        let mut consumed: HashMap<Uuid, usize> = HashMap::new();
         let mut reordered = Vec::with_capacity(merged.len());
-        for entry in &file_entries {
-            match by_id
-                .get_mut(&entry.id)
-                .and_then(std::collections::VecDeque::pop_front)
-            {
-                Some(matched) => {
-                    let consumed = consumed.entry(entry.id).or_default();
-                    *consumed = (*consumed).saturating_add(1);
-                    reordered.push(matched);
-                }
-                None => reordered.push(entry.clone()),
-            }
+        for file_entry in &file_entries {
+            let matched = Self::take_equal_copy(by_id.get_mut(&file_entry.id), file_entry);
+            reordered.push(matched.unwrap_or_else(|| file_entry.clone()));
         }
         for entry in merged {
-            if let Some(consumed) = consumed.get_mut(&entry.id)
-                && *consumed > 0
-            {
-                *consumed = (*consumed).saturating_sub(1);
-            } else {
-                reordered.push(entry.clone());
+            if let Some(copy) = Self::take_equal_copy(by_id.get_mut(&entry.id), entry) {
+                reordered.push(copy);
             }
         }
         Some(reordered)
+    }
+
+    /// Remove and return the queue's first copy equal to `entry`.
+    ///
+    /// The pairing helper of
+    /// [`reorder_merged_entries`](Self::reorder_merged_entries): a
+    /// mirror copy claims exactly the file occurrence whose content it
+    /// equals, leaving every other occurrence to its own durable copy.
+    /// Returns `None` when the id has no queue or no equal copy is
+    /// left in it.
+    fn take_equal_copy(
+        queue: Option<&mut VecDeque<MemoryEntry>>,
+        entry: &MemoryEntry,
+    ) -> Option<MemoryEntry> {
+        let queue = queue?;
+        let position = queue.iter().position(|copy| copy == entry)?;
+        queue.remove(position)
     }
 
     /// Set the configuration driving this store's consolidation pass.
@@ -843,21 +865,25 @@ impl FileMemoryStore {
         self
     }
 
-    /// Re-derive provisional registrations before a mirror-driven rewrite.
+    /// Re-derive provisional registrations before any file-mutating
+    /// operation.
     ///
     /// [`flush`](Self::flush) and
     /// [`consolidate`](LoopMemory::consolidate) rewrite the file from
-    /// a mirror, so a handle whose path has converged with another's
-    /// since construction must unify first — otherwise the rewrite
-    /// would persist one mirror and silently delete the other's
-    /// entries from disk. Takes the registry mutex as a leaf —
-    /// acquired and released before any other lock, since nothing in
-    /// this module takes it while holding one — and must run before
-    /// the caller's whole-operation `current` guard, so the rewrite
-    /// then executes entirely against the post-redirect [`Inner`]. If
-    /// this handle is the stale side of a collision, the migration
-    /// merges its mirror into the target before redirecting, so
-    /// nothing it stored before converging is lost by the redirect.
+    /// a mirror, and [`store`](LoopMemory::store) appends to it, so a
+    /// handle whose path has converged with another's since
+    /// construction must unify first — otherwise the rewrite would
+    /// persist one mirror and silently delete the other's entries
+    /// from disk, and an append would run beside a sibling's lock
+    /// domain, free to weld onto its torn tail or be stranded by its
+    /// rename. Takes the registry mutex as a leaf — acquired and
+    /// released before any other lock, since nothing in this module
+    /// takes it while holding one — and must run before the caller's
+    /// whole-operation `current` guard, so the mutation then executes
+    /// entirely against the post-redirect [`Inner`]. If this handle is
+    /// the stale side of a collision, the migration merges its mirror
+    /// into the target before redirecting, so nothing it stored before
+    /// converging is lost by the redirect.
     fn converge_with_registry() {
         let mut registry = recover_guard(live_stores().lock());
         Self::migrate_provisional_entries(&mut registry);
@@ -874,19 +900,17 @@ impl FileMemoryStore {
     /// previous file intact and a completed flush is on disk. The shared
     /// state stays pinned and the entries write lock held across the
     /// whole rewrite, so concurrent `flush`es, `consolidate`s, and
-    /// `store`s are serialized: two rewrites can never interleave on the
-    /// temp file, and an append can never land on the unlinked old file
-    /// after the rename. A store that was ever provisionally keyed
-    /// re-syncs its mirror against the file before rewriting, so a
-    /// sibling's durable append that this mirror never observed —
-    /// through a spelling whose convergence happened outside this
-    /// call, or a sibling dropped before it — is adopted rather than
-    /// stranded on the replaced inode; an append landing in the
-    /// window between the re-sync read and the rename is the bounded
-    /// residual (the sibling's mirror retains it and the next
-    /// convergence restores it, if the sibling is still live then —
-    /// a sibling dropped before that convergence loses the append).
-    /// A canonically-keyed store skips
+    /// `store`s are serialized: two rewrites can never interleave on
+    /// the temp file, and an append can never land on the unlinked old
+    /// file after the rename — an append through a spelling that
+    /// converges with this one queues on the same lock and lands on
+    /// the replaced file. A store
+    /// that was ever provisionally keyed re-syncs its mirror against
+    /// the file before rewriting, so a sibling's durable append that
+    /// this mirror never observed — through a spelling whose
+    /// convergence happened outside this call, or a sibling dropped
+    /// before it — is adopted rather than stranded on the replaced
+    /// inode. A canonically-keyed store skips
     /// the read and keeps its documented discard of an existing file's
     /// old entries. A successful rewrite repairs the tail, so it also
     /// re-arms appends after an earlier append failure latched the
@@ -1221,14 +1245,19 @@ fn split_complete_lines(bytes: &[u8]) -> (Vec<&[u8]>, Option<&[u8]>) {
 impl LoopMemory for FileMemoryStore {
     /// Append `entry` to the file and the in-memory mirror.
     ///
-    /// The file append happens first, with the shared state pinned and
-    /// the entries write lock held: on success the mirror is updated to
-    /// match; on failure neither side changes, so the two can never
-    /// disagree. A non-finite [`relevance`](MemoryEntry::relevance) is
-    /// refused before anything is written — serialized, it would be a
-    /// `null` the loader treats as fatal mid-file corruption, so the
-    /// refusal is loud and immediate rather than a file that bricks
-    /// the next open.
+    /// The append converges the registration first — exactly as a rewrite
+    /// does — so a handle constructed under a provisional spelling
+    /// attaches to the shared state before any byte moves: an append
+    /// through a second spelling of one file can never run beside a
+    /// sibling's lock domain, weld onto its torn tail, or be stranded by
+    /// its rewrite. The file append then happens first, with the shared
+    /// state pinned and the entries write lock held: on success the
+    /// mirror is updated to match; on failure neither side changes, so
+    /// the two can never disagree. A non-finite
+    /// [`relevance`](MemoryEntry::relevance) is refused before anything
+    /// is written — serialized, it would be a `null` the loader treats
+    /// as fatal mid-file corruption, so the refusal is loud and
+    /// immediate rather than a file that bricks the next open.
     ///
     /// # Errors
     ///
@@ -1248,6 +1277,7 @@ impl LoopMemory for FileMemoryStore {
             let line = serde_json::to_string(&entry).map_err(|e| {
                 LoopError::Memory(format!("memory entry serialization failed: {e}"))
             })?;
+            Self::converge_with_registry();
             let shared = recover_guard(self.inner.current.read());
             let mut entries = recover_guard(shared.entries.write());
             shared.append_line(&line)?;
@@ -1768,6 +1798,136 @@ mod tests {
             LINES_PER_THREAD * 2,
             "two unconverged spellings share no lock — the weld guard is \
             the single-write append itself, so every line parses whole"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_latched_append_failure_refuses_a_sibling_spellings_store() {
+        use crate::memory::LoopMemory as _;
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let dir = std::env::temp_dir().join(format!(
+            "loopctl-file-memory-unit-latch-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("realdir");
+        let link1 = dir.join("link1");
+        let link2 = dir.join("link2");
+        symlink(&real, &link1).unwrap();
+        symlink(&real, &link2).unwrap();
+        let first = super::FileMemoryStore::new(link1.join("memory.jsonl"));
+        let second = super::FileMemoryStore::new(link2.join("memory.jsonl"));
+        std::fs::create_dir_all(&real).unwrap();
+
+        let latched = super::recover_guard(first.inner.current.read()).clone();
+        latched.append_unusable.store(true, AtomicOrdering::SeqCst);
+
+        let outcome = second
+            .store(crate::memory::MemoryEntry::new(
+                crate::memory::MemoryCategory::Fact,
+                "appends onto a suspect tail are refused",
+            ))
+            .await;
+        assert!(
+            outcome.is_err(),
+            "a store converges the spellings before appending, so the \
+            sibling shares the latched state instead of welding onto the \
+            torn tail"
+        );
+        let shared = super::recover_guard(second.inner.current.read()).clone();
+        assert!(
+            shared.append_unusable.load(AtomicOrdering::SeqCst),
+            "the latch survives the unification from either side — the \
+            file's tail is what a failed append damaged, whichever \
+            spelling wrote it"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn merge_mirrors_keeps_a_stale_duplicate_for_its_own_occurrence() {
+        let dir = std::env::temp_dir().join(format!(
+            "loopctl-file-memory-unit-merge-dup-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.jsonl");
+        let mut first_copy = crate::memory::MemoryEntry::new(
+            crate::memory::MemoryCategory::Fact,
+            "alpha version one content",
+        );
+        first_copy.relevance = 0.9;
+        let mut second_copy = first_copy.clone();
+        second_copy.memory = "alpha version two content".to_string();
+        second_copy.relevance = 0.1;
+        let file_body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first_copy).unwrap(),
+            serde_json::to_string(&second_copy).unwrap()
+        );
+        std::fs::write(&path, file_body.as_bytes()).unwrap();
+
+        let stale = super::Inner::new(path.clone(), vec![first_copy], true);
+        let target = super::Inner::new(path, vec![second_copy], true);
+        super::FileMemoryStore::merge_mirrors(&stale, &target);
+        let merged = super::recover_guard(target.entries.read());
+        assert_eq!(
+            merged
+                .iter()
+                .map(|entry| (entry.memory.clone(), entry.relevance))
+                .collect::<Vec<_>>(),
+            vec![
+                ("alpha version one content".to_string(), 0.9),
+                ("alpha version two content".to_string(), 0.1),
+            ],
+            "a duplicate the stale mirror holds pairs with its own file \
+            occurrence — the earlier copy's content survives the merge no \
+            matter which side of the convergence held it"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reorder_pairs_each_duplicate_occurrence_with_its_own_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "loopctl-file-memory-unit-reorder-dup-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.jsonl");
+        let mut first_copy = crate::memory::MemoryEntry::new(
+            crate::memory::MemoryCategory::Fact,
+            "alpha version one content",
+        );
+        first_copy.relevance = 0.9;
+        let mut second_copy = first_copy.clone();
+        second_copy.memory = "alpha version two content".to_string();
+        second_copy.relevance = 0.1;
+        let file_body = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first_copy).unwrap(),
+            serde_json::to_string(&second_copy).unwrap()
+        );
+        std::fs::write(&path, file_body.as_bytes()).unwrap();
+
+        let reordered =
+            super::FileMemoryStore::reorder_merged_entries(&[second_copy], &path).unwrap();
+        assert_eq!(
+            reordered
+                .iter()
+                .map(|entry| (entry.memory.clone(), entry.relevance))
+                .collect::<Vec<_>>(),
+            vec![
+                ("alpha version one content".to_string(), 0.9),
+                ("alpha version two content".to_string(), 0.1),
+            ],
+            "an occurrence without an equal mirror copy adopts its own \
+            durable content — the pairing cannot borrow a divergent copy \
+            and leave the occurrence's content nowhere"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

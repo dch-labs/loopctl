@@ -662,9 +662,9 @@ async fn unconverged_spellings_concurrent_stores_never_weld_a_line() {
     assert_eq!(
         reopened.len(),
         WRITERS_PER_SPELLING * 2,
-        "unconverged spellings hold separate locks, so the weld guard is \
-        the single-write append itself — one parseable line per store, \
-        never a corrupt mid-file line"
+        "each store converges the spellings before appending, so every \
+        writer serializes behind the one shared lock — one parseable \
+        line per store, never a corrupt mid-file line"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -1460,6 +1460,162 @@ async fn a_flush_from_a_lone_provisional_spelling_adopts_the_file() {
         hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
         vec![a1.id, x.id],
         "the adopted entries land in the file's append order"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_store_through_a_second_spelling_converges_before_it_appends() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("store-converges");
+    let real = dir.join("realdir");
+    let link1 = dir.join("link1");
+    let link2 = dir.join("link2");
+    symlink(&real, &link1).unwrap();
+    symlink(&real, &link2).unwrap();
+    let first = FileMemoryStore::new(link1.join("memory.jsonl"));
+    let second = FileMemoryStore::new(link2.join("memory.jsonl"));
+
+    std::fs::create_dir_all(&real).unwrap();
+    let a = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha stored through the first spelling",
+    );
+    let x = MemoryEntry::new(
+        MemoryCategory::Fact,
+        "alpha stored through the second spelling",
+    );
+    first.store(a.clone()).await.unwrap();
+    second.store(x.clone()).await.unwrap();
+
+    assert_eq!(
+        first.len(),
+        2,
+        "the second store converges the spellings before appending — both \
+        handles share one mirror from the first append on"
+    );
+    assert_eq!(
+        second.len(),
+        2,
+        "the converging handle observes the union, not just its own appends"
+    );
+    drop(first);
+    drop(second);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened
+            .retrieve("alpha", 5)
+            .await
+            .unwrap()
+            .iter()
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>(),
+        vec![a.id, x.id],
+        "the file holds both appends in the order they were stored"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lone_spellings_flush_keeps_a_files_earlier_duplicate_content() {
+    use std::os::unix::fs::symlink;
+
+    let dir = temp_dir("lone-duplicate");
+    let real = dir.join("realdir");
+    let link = dir.join("link");
+    symlink(&real, &link).unwrap();
+    let store = FileMemoryStore::new(link.join("memory.jsonl"));
+
+    std::fs::create_dir_all(&real).unwrap();
+    let path = real.join("memory.jsonl");
+    let mut first_copy = MemoryEntry::new(MemoryCategory::Fact, "alpha version one content");
+    first_copy.relevance = 0.9;
+    let mut second_copy = first_copy.clone();
+    second_copy.memory = "alpha version two content".to_string();
+    second_copy.relevance = 0.1;
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&first_copy).unwrap()).as_bytes(),
+    )
+    .unwrap();
+
+    store.store(second_copy.clone()).await.unwrap();
+    store.flush().unwrap();
+    drop(store);
+
+    let reopened = FileMemoryStore::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .retrieve("alpha", 5)
+            .await
+            .unwrap()
+            .iter()
+            .map(|hit| (hit.memory.clone(), hit.relevance))
+            .collect::<Vec<_>>(),
+        vec![
+            ("alpha version one content".to_string(), 0.9),
+            ("alpha version two content".to_string(), 0.1),
+        ],
+        "a duplicate occurrence without an equal mirror copy adopts its \
+        own durable content — the re-sync cannot swap a divergent copy \
+        into an occurrence it did not come from"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stores_racing_a_flush_never_lose_an_append() {
+    use std::os::unix::fs::symlink;
+
+    const WRITERS: usize = 8;
+    const FLUSHERS: usize = 2;
+    let dir = temp_dir("store-vs-flush");
+    let real = dir.join("realdir");
+    let link1 = dir.join("link1");
+    let link2 = dir.join("link2");
+    symlink(&real, &link1).unwrap();
+    symlink(&real, &link2).unwrap();
+    let writers = Arc::new(FileMemoryStore::new(link1.join("memory.jsonl")));
+    let flushers = Arc::new(FileMemoryStore::new(link2.join("memory.jsonl")));
+    std::fs::create_dir_all(&real).unwrap();
+
+    let mut tasks = Vec::new();
+    for index in 0..WRITERS {
+        let store = Arc::clone(&writers);
+        tasks.push(tokio::task::spawn(async move {
+            store
+                .store(MemoryEntry::new(
+                    MemoryCategory::Fact,
+                    format!("alpha writer {index} appended a whole line"),
+                ))
+                .await
+                .unwrap();
+        }));
+    }
+    for _ in 0..FLUSHERS {
+        let store = Arc::clone(&flushers);
+        tasks.push(tokio::task::spawn(async move {
+            store.flush().unwrap();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    drop(writers);
+    drop(flushers);
+
+    let reopened = FileMemoryStore::open(real.join("memory.jsonl")).unwrap();
+    assert_eq!(
+        reopened.len(),
+        WRITERS,
+        "every append either precedes the flush's re-sync read — and is \
+        adopted — or queues behind the rewrite on the shared lock; none \
+        is stranded on the replaced inode"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -33,7 +33,7 @@ pub const PROVIDER_DERIVED_TAG: &str = "provider-derived";
 ///     .with_tag("performance")
 ///     .validated();
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryEntry {
     /// UUID v4 for deduplication and stable reference during consolidation.
     ///

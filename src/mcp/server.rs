@@ -50,7 +50,7 @@ use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::CallToolRequestParams;
 use rmcp::model::PaginatedRequestParams;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::model::ToolsCapability;
 use rmcp::service::RequestContext;
 use rmcp::service::RoleServer;
@@ -96,13 +96,13 @@ pub struct McpServerAdapter {
     /// logical session.
     context: Arc<ToolContext>,
 
-    /// Server name reported in `initialize` → `ServerInfo`.
+    /// Server name reported in `initialize` → `ServerConfig`.
     ///
     /// Populates the `name` field of the rmcp `Implementation` struct. What the
     /// client shows as the server identity (e.g. in the client's server list).
     server_name: String,
 
-    /// Server version reported in `initialize` → `ServerInfo`.
+    /// Server version reported in `initialize` → `ServerConfig`.
     ///
     /// Populates the `version` field of the rmcp `Implementation` struct.
     server_version: String,
@@ -111,7 +111,7 @@ pub struct McpServerAdapter {
 impl McpServerAdapter {
     /// Build an adapter wrapping `registry`, dispatching every tool call with `context`.
     ///
-    /// `server_name` / `server_version` populate the MCP `ServerInfo` returned
+    /// `server_name` / `server_version` populate the MCP `ServerConfig` returned
     /// during the `initialize` handshake (what the client shows as the server
     /// identity, e.g. in the client's server list). Use your application's
     /// name and version.
@@ -228,8 +228,8 @@ impl ServerHandler for McpServerAdapter {
     /// are neither implemented nor advertised; their [`ServerHandler`]
     /// defaults (no-ops / `None`) apply. `listChanged` is not advertised —
     /// the adapter serves the snapshot taken at construction.
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.capabilities.tools = Some(ToolsCapability::default());
         info.server_info.name.clone_from(&self.server_name);
         info.server_info.version.clone_from(&self.server_version);

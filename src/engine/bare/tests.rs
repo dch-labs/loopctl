@@ -1834,6 +1834,120 @@ async fn serialize_drop_deserialize_resume_preserves_history() {
     );
 }
 
+#[test]
+fn from_machine_with_managers_seeds_the_conversation() {
+    let client = MockClient::new("test-model");
+    let machine = LoopMachine::from_history(vec![Message::user("hi"), Message::assistant("hello")]);
+    let config = SessionConfig::default()
+        .with_context_window(700)
+        .with_compact_threshold(80);
+    let agent = BareLoop::from_machine_with_managers(
+        machine,
+        config,
+        Arc::new(client),
+        ToolRegistry::new(),
+        LoopManagers::new().with_observer(Arc::new(CountingObserver::new())),
+    );
+    assert_eq!(
+        agent.conversation().len(),
+        2,
+        "the seeded machine's history must be visible before the first run"
+    );
+    let Some(installed) = agent.managers.context_manager() else {
+        panic!("a context-manager-free bundle must get the session-synced default");
+    };
+    assert_eq!(
+        installed.context_window(),
+        700,
+        "the seeded default context manager mirrors the session config's window"
+    );
+    assert_eq!(
+        installed.threshold(),
+        80,
+        "the seeded default context manager mirrors the session config's threshold"
+    );
+}
+
+#[tokio::test]
+async fn seeded_history_reaches_the_api_request() {
+    let client = RecordingClient::new("test-model");
+    client.add_text_response("done");
+    let machine = LoopMachine::from_history(vec![Message::user("hi"), Message::assistant("hello")]);
+    let mut agent = BareLoop::from_machine_with_managers(
+        machine,
+        make_config(),
+        Arc::new(client.clone()),
+        ToolRegistry::new(),
+        LoopManagers::new(),
+    );
+    agent.run("continue", &RunConfig::default()).await.unwrap();
+
+    let seen = client.first_seen();
+    let pairs: Vec<(Role, String)> = seen.iter().map(|m| (m.role, m.text_content())).collect();
+    assert_eq!(
+        pairs,
+        vec![
+            (Role::User, "hi".to_string()),
+            (Role::Assistant, "hello".to_string()),
+            (Role::User, "continue".to_string()),
+        ],
+        "the seeded history must ride the outbound request ahead of the new input"
+    );
+}
+
+#[tokio::test]
+async fn managers_observers_survive_the_resume_construction() {
+    let client = MockClient::new("test-model");
+    client.add_text_response("resumed");
+    let observer = Arc::new(CountingObserver::new());
+    let machine = LoopMachine::from_history(vec![Message::user("hi"), Message::assistant("hello")]);
+    let mut agent = BareLoop::from_machine_with_managers(
+        machine,
+        make_config(),
+        Arc::new(client),
+        ToolRegistry::new(),
+        LoopManagers::new().with_observer(observer.clone()),
+    );
+    agent.run("continue", &RunConfig::default()).await.unwrap();
+
+    assert_eq!(
+        observer.run_starts.load(Ordering::SeqCst),
+        1,
+        "the observer installed via the managers bundle must fire for the resumed run"
+    );
+    assert_eq!(
+        observer.turn_ends.load(Ordering::SeqCst),
+        1,
+        "observer fan-out must come from the caller's managers, not a fresh bundle"
+    );
+}
+
+#[test]
+fn a_caller_context_manager_is_used_as_is() {
+    let client = MockClient::new("test-model");
+    let config = SessionConfig::default().with_context_window(700);
+    let caller_manager = crate::compact::ContextManager::new(Arc::new(
+        crate::compact::TruncatingCompactor::default(),
+    ))
+    .with_context_window(32_000);
+    let machine = LoopMachine::from_history(vec![Message::user("hi")]);
+    let agent = BareLoop::from_machine_with_managers(
+        machine,
+        config,
+        Arc::new(client),
+        ToolRegistry::new(),
+        LoopManagers::new().with_context_manager(Arc::new(caller_manager)),
+    );
+    let Some(installed) = agent.managers.context_manager() else {
+        panic!("the caller-supplied context manager must remain installed");
+    };
+    assert_eq!(
+        installed.context_window(),
+        32_000,
+        "a bundle that carries a context manager is used as-is, not replaced by the session-synced default"
+    );
+}
+
 #[tokio::test]
 async fn session_id_stable_and_run_id_rotates_across_runs() {
     let client = MockClient::new("test-model");

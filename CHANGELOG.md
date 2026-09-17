@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 - **`MemoryEntry` implements `PartialEq`** — copies compare by content, which is what a file-store convergence uses to pair each mirror copy with the file occurrence it belongs to (and user code can compare learned memories directly).
 
+- **`BareLoop::from_machine_with_managers`** — the resume constructor that keeps the host's `LoopManagers`: the machine arrives seeded (via `LoopMachine::from_history` or a deserialized checkpoint) and the caller's bundle — observer host, dispatch pipeline, context manager — survives into the resumed loop, where `from_machine` builds a fresh bundle (dropping every installed observer) and `new_with_managers` starts from an empty machine. A bundle that carries no `ContextManager` gets the default one synced from the session config, matching `new_with_managers`; one that already carries a context manager is used as-is. Loop semantics untouched — additive only. Pinned by `from_machine_with_managers_seeds_the_conversation`, `seeded_history_reaches_the_api_request`, `managers_observers_survive_the_resume_construction`, and `a_caller_context_manager_is_used_as_is`.
+
 ### Changed
 
 - **`McpServerAdapter` follows rmcp's `ServerInfo` → `ServerConfig` rename** — the `mcp` feature's optional dependency minimum rises to `rmcp = "3.4"`, whose release deprecated the old alias (any `-D warnings` build naming it now fails); behavior is unchanged, as both names alias the same `InitializeResult`.
@@ -28,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 - **`#[derive(Tool)]` matches serde's rename rules for fields** — including the split `rename_all(serialize = …, deserialize = …)` form, where the schema follows the deserialization rule (pinned by `split_rename_rules_follow_the_deserialization_side`); `rename_all = "snake_case"` and `"lowercase"` are identities on fields (serde's field arm treats them the same; the previous conversion invented names serde rejects), the case-changing strategies convert ASCII-only exactly as serde does, `"SCREAMING-KEBAB-CASE"` is accepted in serde's spelling, `#[serde(default)]` is found after value-bearing serde keys like `with = "…"`, and flag keys reject `= value` and parenthesized misuse with a named error.
 
 - **Pre-cancelled tool calls no longer start** — the core tool dispatch skips pre-cancelled calls deterministically instead of relying on `select!`'s random branch order, which could poll a side-effecting tool once before the cancel branch won.
+
+- **Stale `BareLoop` docs reconciled with the machine-seeding constructors** — `conversation()`, `machine()`, and the `machine` field claimed the machine is "(re)created at the top of every `run()` call" and the conversation is "empty until the first `run()`", false since the `accept_input` refactor and for both machine-taking constructors: the machine exists from construction, `run()` reuses it (committed history preserved, per-run state reset), and a seeded machine's history is visible — and rides the first outbound request — before any `run()`. The struct doc's `# Construction` index now lists all four constructors (the resume pair was missing), and the `managers` field doc no longer says "fresh on construction" for the caller-bundle constructors. Doc-only; the resume constructor's default-seeding direction (a context-manager-free bundle gets the session-synced `ContextManager`) is now pinned by `from_machine_with_managers_seeds_the_conversation`.
 
 ## [0.3.1] - 2026-09-05
 

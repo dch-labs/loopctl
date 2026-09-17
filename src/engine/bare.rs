@@ -136,6 +136,10 @@ pub use model_switch::ModelSwitch;
 /// - [`new()`](BareLoop::new) — client + tools + config.
 /// - [`new_with_managers()`](BareLoop::new_with_managers) — full control,
 ///   including a [`LoopManagers`].
+/// - [`from_machine()`](BareLoop::from_machine) — resume a state machine,
+///   with fresh managers.
+/// - [`from_machine_with_managers()`](BareLoop::from_machine_with_managers) —
+///   resume a state machine, keeping your own [`LoopManagers`].
 ///
 /// # Example
 ///
@@ -189,10 +193,12 @@ pub struct BareLoop<C: ApiClient> {
     /// [`model_response`](LoopMachine::model_response),
     /// [`tool_results`](LoopMachine::tool_results),
     /// [`compaction_result`](LoopMachine::compaction_result), and
-    /// [`inject`](LoopMachine::inject). It is (re)created at the top of every
-    /// [`run()`](crate::engine::core::Loop::run) call from the run config
-    /// and user prompt; before that it holds an empty machine (no history, no
-    /// pending messages) so the struct is always valid.
+    /// [`inject`](LoopMachine::inject). It exists from construction and is
+    /// reused by every [`run()`](crate::engine::core::Loop::run) call, which
+    /// appends the run's input to the pending buffer and resets per-run
+    /// state while preserving the committed history; the machine-taking
+    /// constructors may supply it pre-seeded (see
+    /// [`from_machine_with_managers`](Self::from_machine_with_managers)).
     machine: LoopMachine,
 
     /// Framework managers bundle — holds all cross-cutting infrastructure.
@@ -208,8 +214,8 @@ pub struct BareLoop<C: ApiClient> {
     /// - Optional [`HookExecutor`] — bidirectional lifecycle hooks.
     /// - Optional [`ToolHealthRegistry`] — per-tool health tracking.
     ///
-    /// Fresh on construction; call [`LoopManagers::reset_all`] to
-    /// reinitialise mid-session.
+    /// Caller-supplied by the manager-taking constructors, fresh otherwise;
+    /// call [`LoopManagers::reset_all`] to reinitialise mid-session.
     ///
     /// [`FallbackManager`]: crate::fallback::FallbackManager
     /// [`DetectionManager`]: crate::detection::DetectionManager
@@ -433,7 +439,10 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Use this constructor when you need to supply a pre-configured
     /// [`LoopManagers`] — for example, to enable loop detection or
-    /// circuit-breaker policies.
+    /// circuit-breaker policies. The conversation starts empty; a host
+    /// resuming a saved session on top of its own managers should use
+    /// [`Self::from_machine_with_managers`], which accepts a pre-seeded
+    /// machine.
     ///
     /// When the supplied bundle carries no [`ContextManager`], a default one
     /// (a [`TruncatingCompactor`](crate::compact::TruncatingCompactor)) is
@@ -509,8 +518,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// not the original messages — a compactor is free to summarize or drop
     /// entries, so the opening user message and early turns may no longer be
     /// present verbatim. Contributor messages are transient by design and are
-    /// never persisted into history. Empty until the first
-    /// [`run()`](crate::engine::core::Loop::run) call mints a machine.
+    /// never persisted into history. Before the first
+    /// [`run()`](crate::engine::core::Loop::run) call this is empty for loops
+    /// built by [`Self::new`] / [`Self::new_with_managers`], and carries the
+    /// seeded history for loops built by the machine-taking constructors
+    /// ([`Self::from_machine`], [`Self::from_machine_with_managers`]).
     pub fn conversation(&self) -> Vec<Message> {
         self.machine.full_history()
     }
@@ -657,9 +669,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// Returns a reference to the [`LoopMachine`] that owns the current run's
     /// history and decisions. Useful for inspecting the run in flight (e.g. the
     /// accumulated history, turns taken, or the machine's internal state). The
-    /// machine is (re)created at the top of every
-    /// [`run()`](crate::engine::core::Loop::run) call; before the first run
-    /// it holds an empty machine (no history, no pending messages).
+    /// machine exists from construction and is reused by every
+    /// [`run()`](crate::engine::core::Loop::run) call — each run appends its
+    /// input to the machine's pending buffer and resets per-run state while
+    /// preserving the committed history. Before the first run it holds the
+    /// seeded history for the machine-taking constructors
+    /// ([`Self::from_machine`], [`Self::from_machine_with_managers`]) and no
+    /// history otherwise.
     #[must_use]
     pub fn machine(&self) -> &LoopMachine {
         &self.machine
@@ -687,7 +703,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// each `run()` call — the machine itself stores no configuration. A
     /// fresh [`LoopManagers`] is created with a default
     /// [`ContextManager`] synced from `session_config` (see
-    /// [`Self::new_with_managers`]).
+    /// [`Self::new_with_managers`]); hosts whose observers and pipeline live
+    /// in their own bundle should use
+    /// [`Self::from_machine_with_managers`] instead, which keeps that bundle
+    /// intact.
     #[must_use]
     pub fn from_machine(
         machine: LoopMachine,
@@ -723,15 +742,114 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
+    /// Build a loop around an existing state machine and caller-supplied
+    /// managers.
+    ///
+    /// The twin of [`Self::new_with_managers`] for resumed runs: the machine
+    /// arrives seeded — e.g. via
+    /// [`LoopMachine::from_history`](crate::engine::core::LoopMachine::from_history)
+    /// or a deserialized checkpoint — and the managers (observer host, dispatch
+    /// pipeline, context manager) are the caller's, exactly as in a fresh
+    /// construction. Use this when the host's observers live in its
+    /// [`LoopManagers`] bundle: unlike [`Self::from_machine`], which builds a
+    /// fresh bundle, everything the bundle carries survives into the resumed
+    /// loop. A bundle that carries no
+    /// [`ContextManager`](crate::compact::ContextManager) gets the default one
+    /// synced from `session_config`, matching [`Self::new_with_managers`]; one
+    /// that already carries a context manager is used as-is.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "testing")]
+    /// # fn example() {
+    /// use std::sync::Arc;
+    /// use loopctl::config::SessionConfig;
+    /// use loopctl::engine::BareLoop;
+    /// use loopctl::engine::core::LoopMachine;
+    /// use loopctl::managers::LoopManagers;
+    /// use loopctl::message::Message;
+    /// use loopctl::observer::{LoopObserver, RunEndContext};
+    /// # use loopctl::testing::MockApiClient;
+    /// # use loopctl::tool::ToolRegistry;
+    ///
+    /// struct RunLogger;
+    /// impl LoopObserver for RunLogger {
+    ///     fn name(&self) -> &str {
+    ///         "run-logger"
+    ///     }
+    ///     fn on_run_end(&self, _ctx: &RunEndContext) {
+    ///         println!("resumed run finished");
+    ///     }
+    /// }
+    ///
+    /// // Restored from a saved session: the history rides the machine.
+    /// let machine = LoopMachine::from_history(vec![
+    ///     Message::user("hi"),
+    ///     Message::assistant("hello"),
+    /// ]);
+    /// let managers = LoopManagers::new().with_observer(Arc::new(RunLogger));
+    /// let agent = BareLoop::from_machine_with_managers(
+    ///     machine,
+    ///     SessionConfig::default(),
+    ///     Arc::new(MockApiClient::new("resumed-model")),
+    ///     ToolRegistry::new(),
+    ///     managers,
+    /// );
+    /// # let _ = agent;
+    /// # }
+    /// # fn main() {
+    /// # #[cfg(feature = "testing")]
+    /// # example();
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn from_machine_with_managers(
+        machine: LoopMachine,
+        session_config: SessionConfig,
+        client: Arc<C>,
+        tools: ToolRegistry,
+        mut managers: LoopManagers,
+    ) -> Self {
+        if managers.context_manager().is_none() {
+            let seeded = Self::default_context_manager(&session_config);
+            managers.set_context_manager(Arc::new(seeded));
+        }
+        let session = Session::new(session_config);
+        let session_temp_dir = Some(Self::session_temp_subdir(&std::env::temp_dir(), session.id));
+        Self {
+            client,
+            tools: Arc::new(tools),
+            session,
+            session_temp_dir,
+            machine,
+            managers,
+            reflector: Arc::new(NoopReflector),
+            recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
+            cancelled: Arc::new(CancelSignal::new()),
+            #[cfg(feature = "streaming")]
+            text_streamer: None,
+            contributors: Vec::new(),
+            overhead: std::sync::OnceLock::new(),
+            deferred_transient_tokens: 0,
+            detection_disabled: std::sync::atomic::AtomicBool::new(false),
+            request_options: RequestOptions::default(),
+            last_routed_model: None,
+            token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
+            turn_mode: default_turn_mode(),
+        }
+    }
+
     /// Build the default context manager for a session config.
     ///
     /// A [`TruncatingCompactor`] behind a [`ContextManager`] whose context
     /// window and threshold mirror `session_config`'s. Installed by
-    /// [`Self::new_with_managers`] and [`Self::from_machine`] when the
-    /// manager bundle carries no compaction machinery of its own, so the
-    /// session's auto-compaction trigger is never an alarm without a
-    /// sprinkler. Hosts that want different behavior install their own
-    /// manager, which is never overridden.
+    /// [`Self::new_with_managers`], [`Self::from_machine`], and
+    /// [`Self::from_machine_with_managers`] when the manager bundle carries
+    /// no compaction machinery of its own, so the session's auto-compaction
+    /// trigger is never an alarm without a sprinkler. Hosts that want
+    /// different behavior install their own manager, which is never
+    /// overridden.
     fn default_context_manager(session_config: &SessionConfig) -> ContextManager {
         ContextManager::new(Arc::new(TruncatingCompactor::default()))
             .with_context_window(session_config.context_window)

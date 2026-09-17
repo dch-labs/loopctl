@@ -45,6 +45,7 @@ use uuid::Uuid;
 use crate::config::ParallelDispatchConfig;
 use crate::engine::core::machine::MachineState;
 use crate::error::LoopError;
+use crate::stream::StreamStopReason;
 
 use crate::reflection::{Correction, CorrectionResult, CorrectionType};
 
@@ -433,6 +434,19 @@ pub struct Turn {
     /// The completion-side token count — the size of the response the model
     /// produced for this turn.
     pub output_tokens: u64,
+
+    /// Why the model stopped producing output for this turn.
+    ///
+    /// The turn-level reason, sourced from the provider's stop field:
+    /// [`MaxTokens`](StreamStopReason::MaxTokens) means the answer is
+    /// truncated, [`EndTurn`](StreamStopReason::EndTurn) a natural finish —
+    /// a distinction a caller cannot recover from the text alone. Distinct
+    /// from [`Run::stop_reason`](crate::engine::core::Run::stop_reason),
+    /// which records why the *run* ended and only carries terminal errors.
+    /// Deserializes to [`EndTurn`](StreamStopReason::EndTurn) for runs
+    /// serialized before this field existed.
+    #[serde(default)]
+    pub stop_reason: StreamStopReason,
 }
 
 /// One prompt → loop → final answer.
@@ -511,6 +525,11 @@ pub struct Run {
     /// `None` while the run is in flight or completed normally. Set to the
     /// terminal [`LoopError`] (`Cancelled`, `MaxTurnsExceeded`, etc.) when
     /// the run ended abnormally. Populated by the engine in `finalize`.
+    ///
+    /// The run-level half of a pair: this field says why the *run* ended,
+    /// while each [`Turn::stop_reason`](crate::engine::core::Turn::stop_reason)
+    /// says why that turn's *model* stopped — a max-tokens truncation is a
+    /// turn-level fact and never appears here.
     #[serde(skip)]
     pub stop_reason: Option<LoopError>,
 }

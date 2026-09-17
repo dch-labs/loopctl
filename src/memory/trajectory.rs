@@ -905,10 +905,13 @@ impl LoopObserver for TrajectoryObserver {
 
     /// Close a turn's slot, folding in the phase's duration and tokens.
     ///
-    /// The engine emits turn-end per phase (model, then tools), so the
-    /// duration sums across both while the token figures stay
-    /// last-wins; a turn-end with no prior slot opens one lazily rather
-    /// than dropping the event.
+    /// The engine fires exactly one turn-end event per turn — the
+    /// tool-phase event for a turn that requested tools, so such a turn's
+    /// recorded duration covers dispatch only. The fold still sums
+    /// durations across multiple events for one turn (a hand-driven
+    /// stream or a future engine shape may send more) while the token
+    /// figures stay last-wins; a turn-end with no prior slot opens one
+    /// lazily rather than dropping the event.
     fn on_turn_end(&self, ctx: &TurnEndContext) {
         let mut guard = recover_guard(self.inner.lock());
         let Some(builder) = guard.as_mut() else {
@@ -1344,6 +1347,7 @@ mod tests {
             duration_ms: 20,
             input_tokens: 10,
             output_tokens: 5,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1607,6 +1611,7 @@ mod tests {
             duration_ms: 1,
             input_tokens: 1,
             output_tokens: 1,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1733,6 +1738,7 @@ mod tests {
             duration_ms: 42,
             input_tokens: 7,
             output_tokens: 9,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1785,6 +1791,7 @@ mod tests {
             duration_ms: 10,
             input_tokens: 1,
             output_tokens: 1,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 5,
@@ -1797,6 +1804,7 @@ mod tests {
             duration_ms: 11,
             input_tokens: 1,
             output_tokens: 1,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         // Turn 3's end arrives only after two later turns have closed.
         observer.on_turn_end(&TurnEndContext {
@@ -1806,6 +1814,7 @@ mod tests {
             duration_ms: 42,
             input_tokens: 7,
             output_tokens: 9,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1849,6 +1858,7 @@ mod tests {
             duration_ms: 33,
             input_tokens: 4,
             output_tokens: 6,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         // A later turn remains in flight; the late end must not close it.
         observer.on_turn_start(&TurnStartContext {
@@ -1895,6 +1905,7 @@ mod tests {
             duration_ms: 20,
             input_tokens: 10,
             output_tokens: 5,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_turn_end(&TurnEndContext {
             turn: 0,
@@ -1903,6 +1914,7 @@ mod tests {
             duration_ms: 22,
             input_tokens: 30,
             output_tokens: 15,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1997,6 +2009,7 @@ mod tests {
                     duration_ms: *duration,
                     input_tokens: *input,
                     output_tokens: *output,
+                    stop_reason: crate::stream::StreamStopReason::EndTurn,
                 });
             }
         }
@@ -2089,6 +2102,7 @@ mod tests {
             duration_ms: 5,
             input_tokens: 1,
             output_tokens: 1,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 2,
@@ -2139,6 +2153,7 @@ mod tests {
             duration_ms: 5,
             input_tokens: 1,
             output_tokens: 1,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 1,
@@ -2191,6 +2206,7 @@ mod tests {
             duration_ms: 5,
             input_tokens: 1,
             output_tokens: 1,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 8,
@@ -2465,6 +2481,7 @@ mod tests {
             duration_ms: 1,
             input_tokens: 1,
             output_tokens: 1,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 4,
@@ -2477,6 +2494,7 @@ mod tests {
             duration_ms: 2,
             input_tokens: 1,
             output_tokens: 1,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 3,
@@ -2489,6 +2507,7 @@ mod tests {
             duration_ms: 3,
             input_tokens: 2,
             output_tokens: 2,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         });
         observer.on_run_end(&RunEndContext {
             success: true,

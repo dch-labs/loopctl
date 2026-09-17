@@ -102,6 +102,18 @@ pub struct TurnEndContext {
     /// Sum of tokens across all assistant responses in the turn,
     /// including intermediate tool-call rounds.
     pub output_tokens: u64,
+
+    /// Why the model stopped producing output for this turn.
+    ///
+    /// Mirrors [`Turn::stop_reason`](crate::engine::core::Turn::stop_reason)
+    /// from the run record, so an observer sees the truncation-vs-finished
+    /// distinction without reading the record back.
+    /// [`MaxTokens`](crate::stream::StreamStopReason::MaxTokens) marks a
+    /// truncated answer even though [`success`](Self::success) is `true`. A
+    /// turn that failed before the model finished carries the
+    /// [`EndTurn`](crate::stream::StreamStopReason::EndTurn) default — the
+    /// [`error`](Self::error) field tells that story.
+    pub stop_reason: crate::stream::StreamStopReason,
 }
 
 /// Context for [`LoopObserver::on_stream_success`](crate::observer::LoopObserver::on_stream_success).

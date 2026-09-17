@@ -20,7 +20,7 @@ use crate::observer::{
     FallbackContext, ResponseContext, RunEndContext, RunStartContext, StreamContext,
     StreamFailureContext, ToolCallReceivedContext, TurnEndContext, TurnStartContext,
 };
-use crate::stream::Usage;
+use crate::stream::{StreamStopReason, Usage};
 
 /// Data for an `on_turn_end` notification.
 ///
@@ -35,9 +35,11 @@ pub(super) struct TurnEnd<'a> {
     ///
     /// Lets observers pair an `on_turn_end` with its earlier
     /// [`on_turn_start`](crate::observer::LoopObserver::on_turn_start) by
-    /// index. Stable across both the LLM-phase and tool-phase turn-end
-    /// events for the same turn — they share this number so an observer can
-    /// tell which model call a dispatch belonged to.
+    /// index. Exactly one turn-end event fires per turn — the LLM-phase
+    /// event for a tool-free turn, the tool-phase event for a turn whose
+    /// model call requested tools — and both kinds share this number, so an
+    /// observer can tell which model call an event belonged to without
+    /// distinguishing them.
     pub turn: usize,
 
     /// Whether the turn reached its intended completion without a hard error.
@@ -67,9 +69,11 @@ pub(super) struct TurnEnd<'a> {
     /// Measured from the start of the relevant handler — for the LLM phase,
     /// from `handle_call_llm`'s entry to the response being recorded; for the
     /// tool phase, from `handle_call_tools`'s entry through dispatch
-    /// completion. The two phases time separately, so a single model turn
-    /// that triggers tools produces two turn-end events with disjoint
-    /// durations (one per phase), not one combined figure. Converted to
+    /// completion. Exactly one turn-end event fires per turn: the LLM
+    /// phase's for a tool-free turn (covering the model call), the tool
+    /// phase's for a turn whose model call requested tools (covering
+    /// dispatch). The phase that does not fire contributes no event, so the
+    /// two durations never double-count. Converted to
     /// `duration_ms` (via [`millis_u64`](BareLoop::millis_u64)) when the
     /// observer context is built.
     pub duration: Duration,
@@ -94,6 +98,18 @@ pub(super) struct TurnEnd<'a> {
     /// observer event — a host billing per-turn reads both from one callback
     /// rather than correlating across `on_response` and `on_turn_end`.
     pub output_tokens: u64,
+
+    /// Why the model stopped producing output for this turn.
+    ///
+    /// The provider's stop field, forwarded onto
+    /// [`TurnEndContext::stop_reason`](crate::observer::TurnEndContext::stop_reason).
+    /// On the LLM phase it is the stop reason the turn's model call returned;
+    /// on the tool phase it is forwarded from the recorded
+    /// [`Turn`](crate::engine::core::Turn), matching the token-pair
+    /// provenance. Turns that failed before the model finished (cancellation,
+    /// stream error) carry the [`EndTurn`](StreamStopReason::EndTurn)
+    /// default — the `success`/`error` fields carry that story.
+    pub stop_reason: StreamStopReason,
 }
 
 impl<C: ApiClient> BareLoop<C> {
@@ -173,6 +189,7 @@ impl<C: ApiClient> BareLoop<C> {
             duration_ms: Self::millis_u64(data.duration),
             input_tokens: data.input_tokens,
             output_tokens: data.output_tokens,
+            stop_reason: data.stop_reason,
         });
     }
 

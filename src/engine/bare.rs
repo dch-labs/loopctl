@@ -387,6 +387,15 @@ struct TurnAccounting {
     /// [`Turn`]: crate::engine::core::Turn
     /// [`dispatch_and_record`]: BareLoop::dispatch_and_record
     output_tokens: u64,
+
+    /// Why the model stopped producing output for the turn being accounted.
+    ///
+    /// Same provenance as the token pair: sourced from the recorded
+    /// [`Turn`] for the current turn, not re-derived during dispatch, and
+    /// surfaced unchanged on the tool phase's turn-end event.
+    ///
+    /// [`Turn`]: crate::engine::core::Turn
+    stop_reason: StreamStopReason,
 }
 
 impl<C: ApiClient> BareLoop<C> {
@@ -1021,6 +1030,7 @@ impl<C: ApiClient> BareLoop<C> {
                     duration: turn_duration,
                     input_tokens: accounting.input_tokens,
                     output_tokens: accounting.output_tokens,
+                    stop_reason: accounting.stop_reason,
                 });
                 Ok(parts)
             }
@@ -1033,6 +1043,7 @@ impl<C: ApiClient> BareLoop<C> {
                     duration: turn_duration,
                     input_tokens: accounting.input_tokens,
                     output_tokens: accounting.output_tokens,
+                    stop_reason: accounting.stop_reason,
                 });
                 Err(e)
             }
@@ -1190,6 +1201,7 @@ impl<C: ApiClient> BareLoop<C> {
                     duration: turn_start.elapsed(),
                     input_tokens: 0,
                     output_tokens: 0,
+                    stop_reason: StreamStopReason::EndTurn,
                 });
                 return Err(LoopError::Cancelled);
             }
@@ -1202,6 +1214,7 @@ impl<C: ApiClient> BareLoop<C> {
                     duration: turn_start.elapsed(),
                     input_tokens: 0,
                     output_tokens: 0,
+                    stop_reason: StreamStopReason::EndTurn,
                 });
                 return Err(e);
             }
@@ -1251,6 +1264,7 @@ impl<C: ApiClient> BareLoop<C> {
                 duration: turn_start.elapsed(),
                 input_tokens: turn_in,
                 output_tokens: turn_out,
+                stop_reason: stream_stop,
             });
             return Err(e);
         }
@@ -1291,6 +1305,7 @@ impl<C: ApiClient> BareLoop<C> {
                 tool_calls,
                 input_tokens: turn_in,
                 output_tokens: turn_out,
+                stop_reason: stream_stop,
             });
         }
 
@@ -1302,6 +1317,7 @@ impl<C: ApiClient> BareLoop<C> {
                 duration: turn_start.elapsed(),
                 input_tokens: turn_in,
                 output_tokens: turn_out,
+                stop_reason: stream_stop,
             });
         }
         Ok(())
@@ -1514,15 +1530,18 @@ impl<C: ApiClient> BareLoop<C> {
         let mut tool_calls: Vec<ToolCall> = Vec::with_capacity(calls.len());
         let mut slots: Vec<Option<MessagePart>> = vec![None; calls.len()];
         let mut dispatch_calls: Vec<ToolCall> = Vec::new();
-        let (turn_in, turn_out) = self
+        let (turn_in, turn_out, turn_stop) = self
             .session
             .current_run()
             .and_then(|r| r.turns.iter().rev().find(|t| t.turn == turn))
-            .map_or((0, 0), |t| (t.input_tokens, t.output_tokens));
+            .map_or((0, 0, StreamStopReason::EndTurn), |t| {
+                (t.input_tokens, t.output_tokens, t.stop_reason)
+            });
         let accounting = TurnAccounting {
             start: turn_start,
             input_tokens: turn_in,
             output_tokens: turn_out,
+            stop_reason: turn_stop,
         };
 
         for (idx, pending) in calls.iter().enumerate() {

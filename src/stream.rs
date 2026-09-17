@@ -669,6 +669,21 @@ impl StreamStopReason {
     }
 }
 
+impl Default for StreamStopReason {
+    /// The absent-field stand-in: a response that stopped on its own.
+    ///
+    /// Matches the wire layer's precedent for a missing or unrecognized
+    /// stop-reason field — an event stream that never says why it stopped
+    /// is treated as a natural end of turn. This is also the value a
+    /// [`Turn`](crate::engine::core::Turn) serialized before the
+    /// [`stop_reason`](crate::engine::core::Turn::stop_reason) field existed
+    /// deserializes with, and the value turn-end events carry when a turn
+    /// failed before the model finished.
+    fn default() -> Self {
+        Self::EndTurn
+    }
+}
+
 /// A delta update for the message, typically emitted at the end of the stream.
 ///
 /// Carries the final [`StreamStopReason`] (why the model stopped) and

@@ -20,7 +20,7 @@ use crate::observer::{
     FallbackContext, ResponseContext, RunEndContext, RunStartContext, StreamContext,
     StreamFailureContext, ToolCallReceivedContext, TurnEndContext, TurnStartContext,
 };
-use crate::stream::Usage;
+use crate::stream::{StreamStopReason, Usage};
 
 /// Data for an `on_turn_end` notification.
 ///
@@ -94,6 +94,18 @@ pub(super) struct TurnEnd<'a> {
     /// observer event — a host billing per-turn reads both from one callback
     /// rather than correlating across `on_response` and `on_turn_end`.
     pub output_tokens: u64,
+
+    /// Why the model stopped producing output for this turn.
+    ///
+    /// The provider's stop field, forwarded onto
+    /// [`TurnEndContext::stop_reason`](crate::observer::TurnEndContext::stop_reason).
+    /// On the LLM phase it is the stop reason the turn's model call returned;
+    /// on the tool phase it is forwarded from the recorded
+    /// [`Turn`](crate::engine::core::Turn), matching the token-pair
+    /// provenance. Turns that failed before the model finished (cancellation,
+    /// stream error) carry the [`EndTurn`](StreamStopReason::EndTurn)
+    /// default — the `success`/`error` fields carry that story.
+    pub stop_reason: StreamStopReason,
 }
 
 impl<C: ApiClient> BareLoop<C> {
@@ -173,6 +185,7 @@ impl<C: ApiClient> BareLoop<C> {
             duration_ms: Self::millis_u64(data.duration),
             input_tokens: data.input_tokens,
             output_tokens: data.output_tokens,
+            stop_reason: data.stop_reason,
         });
     }
 

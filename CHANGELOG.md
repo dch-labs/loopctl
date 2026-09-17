@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-turn stop reason (`Turn::stop_reason`, `TurnEndContext::stop_reason`)** — a run's turn record and the `on_turn_end` observer event now say why each turn's *model* stopped, so a max-tokens truncation (`StreamStopReason::MaxTokens`) is distinguishable from a clean final answer (`EndTurn`) without parsing the text — the distinction a caller could not recover before (`Run::stop_reason` covers only terminal run *errors*, so a truncation passed as success). The value is the provider's stop field verbatim: `Turn` records it from the turn's model call, turn-end events carry it on both phases (the tool phase forwards it from the recorded turn, matching the token-pair provenance), and turns that failed before the model finished hold the `EndTurn` default with `success`/`error` telling that story. `StreamStopReason` gains `Default` (`EndTurn`), matching the wire layer's absent-field precedent, so runs serialized before the field existed deserialize with `stop_reason == EndTurn`. Pinned by `a_max_tokens_stop_surfaces_on_the_turn_record`, `a_normal_end_turn_is_distinguishable_from_max_tokens`, `the_tool_phase_forwards_the_recorded_turns_stop_reason`, `runs_serialized_before_the_field_still_deserialize`, and the cancel-path assertion in `run_cancel_during_streaming_returns_fast`.
+
+### Changed
+
+- **Breaking:** **`Turn` and `TurnEndContext` gain a public `stop_reason` field** (`StreamStopReason`, `#[serde(default)]` on `Turn`). Serialization is backwards-compatible. Migration: exhaustive struct literals add `stop_reason: StreamStopReason::EndTurn` (or the turn's real reason); struct-update (`..base`) and serde consumers are unaffected.
+
 ## [0.3.2] - 2026-09-17
 
 ### Added

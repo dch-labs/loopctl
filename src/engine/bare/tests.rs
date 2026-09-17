@@ -1980,6 +1980,132 @@ async fn max_tokens_stop_reason_preserved() {
     assert_eq!(result.turn_count(), 1);
 }
 
+/// Records the stop reason of every `on_turn_end` event, oldest first.
+///
+/// One entry per fired event, so a test can assert on both phases of a
+/// tool-carrying turn and on the failure-path default alongside each other.
+struct StopReasonCapture {
+    reasons: Arc<Mutex<Vec<crate::stream::StreamStopReason>>>,
+}
+
+impl crate::observer::LoopObserver for StopReasonCapture {
+    fn name(&self) -> &'static str {
+        "stop-reason-capture"
+    }
+    fn on_turn_end(&self, ctx: &crate::observer::TurnEndContext) {
+        crate::error::recover_guard(self.reasons.lock()).push(ctx.stop_reason);
+    }
+}
+
+#[tokio::test]
+async fn a_max_tokens_stop_surfaces_on_the_turn_record() {
+    let client = MockClient::new("test-model");
+    client.add_max_tokens_response("truncated");
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        LoopManagers::new().with_observer(Arc::new(StopReasonCapture {
+            reasons: Arc::clone(&reasons),
+        })),
+    );
+    let result = agent.run("generate", &RunConfig::default()).await.unwrap();
+
+    assert_eq!(
+        result.turns.first().map(|t| t.stop_reason),
+        Some(crate::stream::StreamStopReason::MaxTokens),
+        "a truncation must read as MaxTokens on the run's turn record, not pass as a clean answer"
+    );
+    assert!(
+        crate::error::recover_guard(reasons.lock())
+            .contains(&crate::stream::StreamStopReason::MaxTokens),
+        "the turn-end observer event must carry the same MaxTokens reason"
+    );
+}
+
+#[tokio::test]
+async fn a_normal_end_turn_is_distinguishable_from_max_tokens() {
+    let client = MockClient::new("test-model");
+    client.add_text_response("done");
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        LoopManagers::new().with_observer(Arc::new(StopReasonCapture {
+            reasons: Arc::clone(&reasons),
+        })),
+    );
+    let result = agent.run("answer me", &RunConfig::default()).await.unwrap();
+
+    assert_eq!(
+        result.turns.first().map(|t| t.stop_reason),
+        Some(crate::stream::StreamStopReason::EndTurn),
+        "a clean final answer must read as EndTurn on the turn record"
+    );
+    assert!(
+        crate::error::recover_guard(reasons.lock())
+            .iter()
+            .all(|r| *r == crate::stream::StreamStopReason::EndTurn),
+        "every turn-end event for the clean run carries EndTurn"
+    );
+}
+
+#[test]
+fn runs_serialized_before_the_field_still_deserialize() {
+    let pre_field = r#"{
+        "turn": 0,
+        "input": "prompt",
+        "output": "answer",
+        "tool_calls": [],
+        "input_tokens": 3,
+        "output_tokens": 5
+    }"#;
+    let turn: crate::engine::core::Turn =
+        serde_json::from_str(pre_field).expect("pre-field Turn deserializes");
+    assert_eq!(
+        turn.stop_reason,
+        crate::stream::StreamStopReason::EndTurn,
+        "a run serialized before the field existed defaults to EndTurn on read"
+    );
+}
+
+#[tokio::test]
+async fn the_tool_phase_forwards_the_recorded_turns_stop_reason() {
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "done");
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        registry,
+        make_config(),
+        LoopManagers::new().with_observer(Arc::new(StopReasonCapture {
+            reasons: Arc::clone(&reasons),
+        })),
+    );
+    let result = agent.run("echo hi", &RunConfig::default()).await.unwrap();
+
+    let tool_turn = result
+        .turns
+        .iter()
+        .find(|t| !t.tool_calls.is_empty())
+        .expect("the tool-carrying turn is recorded");
+    assert_eq!(
+        tool_turn.stop_reason,
+        crate::stream::StreamStopReason::ToolCall,
+        "the model's tool_call stop is the recorded turn's reason"
+    );
+    assert!(
+        crate::error::recover_guard(reasons.lock())
+            .contains(&crate::stream::StreamStopReason::ToolCall),
+        "the tool phase's turn-end event forwards the recorded turn's reason, not a default"
+    );
+}
+
 #[tokio::test]
 async fn test_bare_loop_max_turns_exceeded() {
     let client = MockClient::new("test-model");
@@ -3935,6 +4061,7 @@ async fn run_end_reason_complete() {
             tool_calls: vec![],
             input_tokens: 0,
             output_tokens: 0,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         },
         crate::engine::core::Turn {
             turn: 1,
@@ -3943,6 +4070,7 @@ async fn run_end_reason_complete() {
             tool_calls: vec![],
             input_tokens: 0,
             output_tokens: 0,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         },
     ];
 
@@ -3968,6 +4096,7 @@ async fn run_end_reason_cancelled() {
             tool_calls: vec![],
             input_tokens: 0,
             output_tokens: 0,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         },
         crate::engine::core::Turn {
             turn: 1,
@@ -3976,6 +4105,7 @@ async fn run_end_reason_cancelled() {
             tool_calls: vec![],
             input_tokens: 0,
             output_tokens: 0,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         },
     ];
     loop_.cancelled.cancel();
@@ -4023,6 +4153,7 @@ async fn run_end_reason_complete_on_max_turn_boundary() {
             tool_calls: vec![],
             input_tokens: 0,
             output_tokens: 0,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
         })
         .collect();
 
@@ -4191,6 +4322,10 @@ async fn run_cancel_during_streaming_returns_fast() {
     let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
     let observer = Arc::new(CountingObserver::new());
     agent.register_observer(observer.clone());
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(StopReasonCapture {
+        reasons: Arc::clone(&reasons),
+    }));
     let signal = agent.cancel_signal();
 
     let handle = tokio::spawn(async move { agent.run("Hi", &RunConfig::default()).await });
@@ -4216,6 +4351,11 @@ async fn run_cancel_during_streaming_returns_fast() {
         observer.turn_ends.load(Ordering::SeqCst),
         1,
         "on_turn_end should fire once on cancel",
+    );
+    assert_eq!(
+        *crate::error::recover_guard(reasons.lock()).first().unwrap(),
+        crate::stream::StreamStopReason::EndTurn,
+        "a turn cancelled before the model finished carries the EndTurn default"
     );
 }
 

@@ -2106,6 +2106,52 @@ async fn the_tool_phase_forwards_the_recorded_turns_stop_reason() {
     );
 }
 
+/// Records the (turn, stop reason) of every `on_turn_end` event, oldest first.
+///
+/// The pair shape lets a test pin the event mapping itself — which turn each
+/// event belongs to and in what order — not just the values carried.
+struct TurnEventShapeCapture {
+    events: Arc<Mutex<Vec<(usize, crate::stream::StreamStopReason)>>>,
+}
+
+impl crate::observer::LoopObserver for TurnEventShapeCapture {
+    fn name(&self) -> &'static str {
+        "turn-event-shape-capture"
+    }
+    fn on_turn_end(&self, ctx: &crate::observer::TurnEndContext) {
+        crate::error::recover_guard(self.events.lock()).push((ctx.turn, ctx.stop_reason));
+    }
+}
+
+#[tokio::test]
+async fn each_turn_fires_exactly_one_turn_end_event() {
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "done");
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        registry,
+        make_config(),
+        LoopManagers::new().with_observer(Arc::new(TurnEventShapeCapture {
+            events: Arc::clone(&events),
+        })),
+    );
+    agent.run("echo hi", &RunConfig::default()).await.unwrap();
+
+    let shape = crate::error::recover_guard(events.lock()).clone();
+    assert_eq!(
+        shape,
+        vec![
+            (0, crate::stream::StreamStopReason::ToolCall),
+            (1, crate::stream::StreamStopReason::EndTurn),
+        ],
+        "one turn-end event per turn: the tool phase for the tool-carrying turn, the LLM phase for the text turn"
+    );
+}
+
 #[tokio::test]
 async fn test_bare_loop_max_turns_exceeded() {
     let client = MockClient::new("test-model");

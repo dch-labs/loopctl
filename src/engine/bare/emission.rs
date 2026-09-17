@@ -35,9 +35,11 @@ pub(super) struct TurnEnd<'a> {
     ///
     /// Lets observers pair an `on_turn_end` with its earlier
     /// [`on_turn_start`](crate::observer::LoopObserver::on_turn_start) by
-    /// index. Stable across both the LLM-phase and tool-phase turn-end
-    /// events for the same turn — they share this number so an observer can
-    /// tell which model call a dispatch belonged to.
+    /// index. Exactly one turn-end event fires per turn — the LLM-phase
+    /// event for a tool-free turn, the tool-phase event for a turn whose
+    /// model call requested tools — and both kinds share this number, so an
+    /// observer can tell which model call an event belonged to without
+    /// distinguishing them.
     pub turn: usize,
 
     /// Whether the turn reached its intended completion without a hard error.
@@ -67,9 +69,11 @@ pub(super) struct TurnEnd<'a> {
     /// Measured from the start of the relevant handler — for the LLM phase,
     /// from `handle_call_llm`'s entry to the response being recorded; for the
     /// tool phase, from `handle_call_tools`'s entry through dispatch
-    /// completion. The two phases time separately, so a single model turn
-    /// that triggers tools produces two turn-end events with disjoint
-    /// durations (one per phase), not one combined figure. Converted to
+    /// completion. Exactly one turn-end event fires per turn: the LLM
+    /// phase's for a tool-free turn (covering the model call), the tool
+    /// phase's for a turn whose model call requested tools (covering
+    /// dispatch). The phase that does not fire contributes no event, so the
+    /// two durations never double-count. Converted to
     /// `duration_ms` (via [`millis_u64`](BareLoop::millis_u64)) when the
     /// observer context is built.
     pub duration: Duration,

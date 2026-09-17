@@ -905,10 +905,13 @@ impl LoopObserver for TrajectoryObserver {
 
     /// Close a turn's slot, folding in the phase's duration and tokens.
     ///
-    /// The engine emits turn-end per phase (model, then tools), so the
-    /// duration sums across both while the token figures stay
-    /// last-wins; a turn-end with no prior slot opens one lazily rather
-    /// than dropping the event.
+    /// The engine fires exactly one turn-end event per turn — the
+    /// tool-phase event for a turn that requested tools, so such a turn's
+    /// recorded duration covers dispatch only. The fold still sums
+    /// durations across multiple events for one turn (a hand-driven
+    /// stream or a future engine shape may send more) while the token
+    /// figures stay last-wins; a turn-end with no prior slot opens one
+    /// lazily rather than dropping the event.
     fn on_turn_end(&self, ctx: &TurnEndContext) {
         let mut guard = recover_guard(self.inner.lock());
         let Some(builder) = guard.as_mut() else {

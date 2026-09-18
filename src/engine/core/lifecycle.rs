@@ -447,6 +447,19 @@ pub struct Turn {
     /// serialized before this field existed.
     #[serde(default)]
     pub stop_reason: StreamStopReason,
+
+    /// Whether this turn was served by the non-streaming transport
+    /// fallback.
+    ///
+    /// `true` when streaming exhausted its retry ceiling and the handler's
+    /// last-chance `create_message` served the turn instead — the answer is
+    /// complete, but the transport was degraded, which a caller may want to
+    /// surface (telemetry, review strictness) rather than report as a fully
+    /// healthy turn. Counted by
+    /// [`transport_fallback_count`](Run::transport_fallback_count).
+    /// Deserializes to `false` for runs serialized before the flag existed.
+    #[serde(default)]
+    pub transport_fallback: bool,
 }
 
 /// One prompt → loop → final answer.
@@ -493,10 +506,15 @@ pub struct Run {
     ///
     /// Each entry records one model call and any tools it triggered: the
     /// input text the model saw, the output it produced, the tool calls it
-    /// requested, and the token cost of that call. Derived totals
+    /// requested, the token cost of that call, why the model stopped
+    /// ([`stop_reason`](Turn::stop_reason)), and whether the non-streaming
+    /// transport fallback served it
+    /// ([`transport_fallback`](Turn::transport_fallback)). Derived totals
     /// ([`turn_count`](Self::turn_count), [`input_tokens`](Self::input_tokens),
     /// [`output_tokens`](Self::output_tokens),
-    /// [`tool_call_count`](Self::tool_call_count)) aggregate over this list.
+    /// [`tool_call_count`](Self::tool_call_count),
+    /// [`transport_fallback_count`](Self::transport_fallback_count))
+    /// aggregate over this list.
     pub turns: Vec<Turn>,
 
     /// The user prompt that started this run.
@@ -575,6 +593,20 @@ impl Run {
     #[must_use]
     pub fn turn_count(&self) -> usize {
         self.turns.len()
+    }
+
+    /// Number of turns served by the non-streaming transport fallback.
+    ///
+    /// Derived over [`turns`](Self::turns), matching the run's other
+    /// derived totals: each turn whose
+    /// [`transport_fallback`](Turn::transport_fallback) flag is set counts
+    /// once. Zero on a run whose every turn streamed healthily.
+    #[must_use]
+    pub fn transport_fallback_count(&self) -> usize {
+        self.turns
+            .iter()
+            .filter(|turn| turn.transport_fallback)
+            .count()
     }
 
     /// Total input tokens consumed across all turns.

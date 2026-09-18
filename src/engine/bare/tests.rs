@@ -646,6 +646,15 @@ async fn non_streaming_turn_returns_assembled_message() {
         result.output.as_deref(),
         Some("assembled via create_message")
     );
+    assert!(
+        result.turns.iter().all(|t| !t.transport_fallback),
+        "a turn served directly by create_message is never a transport fallback"
+    );
+    assert_eq!(
+        result.transport_fallback_count(),
+        0,
+        "the non-streaming turn mode counts no fallback turns"
+    );
 }
 
 #[tokio::test]
@@ -2149,6 +2158,449 @@ async fn each_turn_fires_exactly_one_turn_end_event() {
             (1, crate::stream::StreamStopReason::EndTurn),
         ],
         "one turn-end event per turn: the tool phase for the tool-carrying turn, the LLM phase for the text turn"
+    );
+}
+
+/// A client whose streams fail immediately with a retryable transport error
+/// while its non-streaming path serves a healthy final answer — the exact
+/// shape that drives the handler's last-chance fallback.
+#[cfg(feature = "streaming")]
+struct FailingStreamFallbackClient {
+    model_name: Arc<Mutex<String>>,
+}
+
+#[cfg(feature = "streaming")]
+impl ApiClient for FailingStreamFallbackClient {
+    fn model(&self) -> String {
+        crate::error::recover_guard(self.model_name.lock()).clone()
+    }
+
+    fn set_model(&self, model: &str) -> bool {
+        if model.trim().is_empty() {
+            return false;
+        }
+        *crate::error::recover_guard(self.model_name.lock()) = model.to_string();
+        true
+    }
+
+    fn stream_messages(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        Box::pin(futures::stream::once(async {
+            Err(ApiError::api("stream transport broke"))
+        }))
+    }
+
+    fn create_message(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        Box::pin(async {
+            let events = vec![
+                StreamEvent::MessageStart(MessageStart {
+                    message: MessageMetadata {
+                        id: "msg_fb".into(),
+                        role: "assistant".into(),
+                        model: "test-model".into(),
+                    },
+                }),
+                StreamEvent::PartStart(PartStart {
+                    index: 0,
+                    part: Some(MessagePart::text("fallback answer")),
+                }),
+                StreamEvent::IndexedDelta(IndexedDelta {
+                    index: 0,
+                    delta: crate::stream::DeltaPart::Text {
+                        text: "fallback answer".into(),
+                    },
+                }),
+                StreamEvent::PartStop { index: Some(0) },
+                StreamEvent::MessageDelta(MessageDelta {
+                    delta: MessageDeltaPayload {
+                        stop_reason: Some("end_turn".into()),
+                    },
+                    usage: Some(Usage::new(4, 6)),
+                }),
+                StreamEvent::MessageStop,
+            ];
+            assemble_response(events)
+        })
+    }
+}
+
+/// Records which lifecycle events fired and for which turn, oldest first,
+/// plus the stop reason each transport-fallback event carried.
+///
+/// The tagged shape lets a test pin ordering across different observer
+/// callbacks — e.g. that a transport-fallback event precedes both the
+/// turn's stream-success and its turn-end — and the reason log pins the
+/// payload against the run record.
+#[cfg(feature = "streaming")]
+struct TransportEventCapture {
+    log: Arc<Mutex<Vec<(&'static str, usize)>>>,
+    fallback_reasons: Arc<Mutex<Vec<crate::stream::StreamStopReason>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::observer::LoopObserver for TransportEventCapture {
+    fn name(&self) -> &'static str {
+        "transport-event-capture"
+    }
+    fn on_transport_fallback(&self, ctx: &crate::observer::TransportFallbackContext) {
+        crate::error::recover_guard(self.log.lock()).push(("transport_fallback", ctx.turn));
+        crate::error::recover_guard(self.fallback_reasons.lock()).push(ctx.stop_reason);
+    }
+    fn on_stream_success(&self, ctx: &crate::observer::StreamContext) {
+        crate::error::recover_guard(self.log.lock()).push(("stream_success", ctx.turn));
+    }
+    fn on_turn_end(&self, ctx: &crate::observer::TurnEndContext) {
+        crate::error::recover_guard(self.log.lock()).push(("turn_end", ctx.turn));
+    }
+}
+
+/// A handler whose retry ladder exhausts after one fast retry, leaving the
+/// non-streaming fallback as the configured last chance.
+#[cfg(feature = "streaming")]
+fn fast_exhausting_handler(fallback: bool) -> crate::stream::handler::StreamHandler {
+    use crate::stream::handler::{StreamHandler, StreamRetryConfig, StreamTimeoutConfig};
+    StreamHandler::new()
+        .with_retry_config(StreamRetryConfig {
+            max_retries: 1,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter_factor: 0.0,
+        })
+        .with_timeout_config(StreamTimeoutConfig {
+            fallback_to_non_streaming: fallback,
+            ..Default::default()
+        })
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_fallback_served_turn_is_flagged_on_the_run_record() {
+    let managers = LoopManagers::new().with_stream_handler(fast_exhausting_handler(true));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(FailingStreamFallbackClient {
+            model_name: Arc::new(Mutex::new("test-model".to_string())),
+        }),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    let result = agent.run("Hi", &RunConfig::default()).await.unwrap();
+
+    assert_eq!(result.turn_count(), 1, "the fallback served the turn");
+    assert!(
+        result.turns.first().is_some_and(|t| t.transport_fallback),
+        "the fallback-served turn is flagged on the run record"
+    );
+    assert_eq!(
+        result.transport_fallback_count(),
+        1,
+        "the run totals its fallback-served turns"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_healthy_streamed_turn_is_never_flagged() {
+    let client = MockClient::new("test-model");
+    client.add_text_response("healthy");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let result = agent.run("Hi", &RunConfig::default()).await.unwrap();
+
+    assert!(
+        result.turns.iter().all(|t| !t.transport_fallback),
+        "a healthy streamed turn never carries the fallback flag"
+    );
+    assert_eq!(
+        result.transport_fallback_count(),
+        0,
+        "a healthy run counts no fallback-served turns"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn disabling_the_fallback_still_fails_the_turn_outright() {
+    let managers = LoopManagers::new().with_stream_handler(fast_exhausting_handler(false));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(FailingStreamFallbackClient {
+            model_name: Arc::new(Mutex::new("test-model".to_string())),
+        }),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    let result = agent.run("Hi", &RunConfig::default()).await;
+
+    assert!(
+        result.is_err(),
+        "with the fallback off, the exhausted ladder fails the turn"
+    );
+    let failed_run = agent
+        .session()
+        .runs
+        .last()
+        .expect("the failed run is recorded");
+    assert!(
+        failed_run.turns.is_empty(),
+        "the failed turn is never recorded, so nothing can be flagged"
+    );
+}
+
+#[test]
+fn runs_serialized_before_the_flag_still_deserialize() {
+    let pre_flag = r#"{
+        "turn": 0,
+        "input": "prompt",
+        "output": "answer",
+        "tool_calls": [],
+        "input_tokens": 3,
+        "output_tokens": 5,
+        "stop_reason": "EndTurn"
+    }"#;
+    let turn: crate::engine::core::Turn =
+        serde_json::from_str(pre_flag).expect("pre-flag Turn deserializes");
+    assert!(
+        !turn.transport_fallback,
+        "a run serialized before the flag existed deserializes with it unset"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn the_observer_hook_fires_for_fallback_turns_only() {
+    let fallback_log = Arc::new(Mutex::new(Vec::new()));
+    let fallback_reasons = Arc::new(Mutex::new(Vec::new()));
+    let managers = LoopManagers::new()
+        .with_stream_handler(fast_exhausting_handler(true))
+        .with_observer(Arc::new(TransportEventCapture {
+            log: Arc::clone(&fallback_log),
+            fallback_reasons: Arc::clone(&fallback_reasons),
+        }));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(FailingStreamFallbackClient {
+            model_name: Arc::new(Mutex::new("test-model".to_string())),
+        }),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    let result = agent.run("Hi", &RunConfig::default()).await.unwrap();
+
+    let entries = crate::error::recover_guard(fallback_log.lock()).clone();
+    let hook_pos = entries
+        .iter()
+        .position(|e| e.0 == "transport_fallback")
+        .expect("the hook fires for the fallback turn");
+    let success_pos = entries
+        .iter()
+        .position(|e| e.0 == "stream_success")
+        .expect("the stream-success fires for the fallback turn");
+    let turn_end_pos = entries
+        .iter()
+        .position(|e| e.0 == "turn_end")
+        .expect("the turn-end fires for the fallback turn");
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.0 == "transport_fallback")
+            .count(),
+        1,
+        "one hook event per fallback turn"
+    );
+    assert!(
+        hook_pos < turn_end_pos,
+        "the hook fires before its turn-end event"
+    );
+    assert!(
+        hook_pos < success_pos && success_pos < turn_end_pos,
+        "the hook fires before the turn's success bookkeeping, which fires before its turn-end"
+    );
+    let flagged_stop = result
+        .turns
+        .iter()
+        .find(|t| t.transport_fallback)
+        .expect("the flagged turn is recorded")
+        .stop_reason;
+    assert_eq!(
+        crate::error::recover_guard(fallback_reasons.lock())
+            .first()
+            .copied(),
+        Some(flagged_stop),
+        "the hook's stop-reason payload equals the flagged turn's recorded reason"
+    );
+
+    let healthy_log = Arc::new(Mutex::new(Vec::new()));
+    let healthy_client = MockClient::new("test-model");
+    healthy_client.add_text_response("healthy");
+    let mut healthy_agent = BareLoop::new_with_managers(
+        Arc::new(healthy_client),
+        ToolRegistry::new(),
+        make_config(),
+        LoopManagers::new().with_observer(Arc::new(TransportEventCapture {
+            log: Arc::clone(&healthy_log),
+            fallback_reasons: Arc::new(Mutex::new(Vec::new())),
+        })),
+    );
+    healthy_agent
+        .run("Hi", &RunConfig::default())
+        .await
+        .unwrap();
+    assert!(
+        crate::error::recover_guard(healthy_log.lock())
+            .iter()
+            .all(|e| e.0 != "transport_fallback"),
+        "the hook never fires for a healthy turn"
+    );
+}
+
+/// A client whose streams always fail while its non-streaming path serves
+/// queued response batches in order — driving multi-turn, tool-carrying
+/// fallback runs at the engine level.
+#[cfg(feature = "streaming")]
+struct QueuedFallbackClient {
+    model_name: Arc<Mutex<String>>,
+    responses: Arc<Mutex<Vec<Vec<StreamEvent>>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl ApiClient for QueuedFallbackClient {
+    fn model(&self) -> String {
+        crate::error::recover_guard(self.model_name.lock()).clone()
+    }
+
+    fn set_model(&self, model: &str) -> bool {
+        if model.trim().is_empty() {
+            return false;
+        }
+        *crate::error::recover_guard(self.model_name.lock()) = model.to_string();
+        true
+    }
+
+    fn stream_messages(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        Box::pin(futures::stream::once(async {
+            Err(ApiError::api("stream transport broke"))
+        }))
+    }
+
+    fn create_message(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        let batch = crate::error::recover_guard(self.responses.lock()).pop_front();
+        Box::pin(async move {
+            let events = batch.ok_or_else(|| ApiError::api("no queued response"))?;
+            assemble_response(events)
+        })
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_tool_calling_fallback_run_counts_every_fallback_turn() {
+    let tool_events = vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_tool_fb".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::tool_call("tool_1", "echo", Value::Null)),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: crate::stream::DeltaPart::InputJson {
+                partial_json: r#"{"message":"hi"}"#.into(),
+            },
+        }),
+        StreamEvent::PartStop { index: Some(0) },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("tool_call".into()),
+            },
+            usage: Some(Usage::new(4, 6)),
+        }),
+        StreamEvent::MessageStop,
+    ];
+    let text_events = vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_text_fb".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("fallback answer")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: crate::stream::DeltaPart::Text {
+                text: "fallback answer".into(),
+            },
+        }),
+        StreamEvent::PartStop { index: Some(0) },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".into()),
+            },
+            usage: Some(Usage::new(3, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ];
+
+    let managers = LoopManagers::new().with_stream_handler(fast_exhausting_handler(true));
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(QueuedFallbackClient {
+            model_name: Arc::new(Mutex::new("test-model".to_string())),
+            responses: Arc::new(Mutex::new(vec![tool_events, text_events])),
+        }),
+        registry,
+        make_config(),
+        managers,
+    );
+    let result = agent
+        .run("use the tool", &RunConfig::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.turn_count(),
+        2,
+        "the tool turn and the answer turn both ran"
+    );
+    assert_eq!(
+        result.transport_fallback_count(),
+        2,
+        "the run totals every fallback-served turn, not just the first"
+    );
+    let tool_turn = result
+        .turns
+        .first()
+        .expect("the tool-carrying turn is recorded");
+    assert!(
+        !tool_turn.tool_calls.is_empty(),
+        "the fallback-served turn carried its tool call"
+    );
+    assert_eq!(
+        tool_turn.stop_reason,
+        crate::stream::StreamStopReason::ToolCall,
+        "the fallback response's tool-call stop reaches the record"
     );
 }
 
@@ -4108,6 +4560,7 @@ async fn run_end_reason_complete() {
             input_tokens: 0,
             output_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
+            transport_fallback: false,
         },
         crate::engine::core::Turn {
             turn: 1,
@@ -4117,6 +4570,7 @@ async fn run_end_reason_complete() {
             input_tokens: 0,
             output_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
+            transport_fallback: false,
         },
     ];
 
@@ -4143,6 +4597,7 @@ async fn run_end_reason_cancelled() {
             input_tokens: 0,
             output_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
+            transport_fallback: false,
         },
         crate::engine::core::Turn {
             turn: 1,
@@ -4152,6 +4607,7 @@ async fn run_end_reason_cancelled() {
             input_tokens: 0,
             output_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
+            transport_fallback: false,
         },
     ];
     loop_.cancelled.cancel();
@@ -4200,6 +4656,7 @@ async fn run_end_reason_complete_on_max_turn_boundary() {
             input_tokens: 0,
             output_tokens: 0,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
+            transport_fallback: false,
         })
         .collect();
 

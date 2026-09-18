@@ -7,8 +7,8 @@
 # Maximum cognitive complexity per function before warning.
 cognitive-complexity-threshold = 30
 
-# Maximum number of struct fields before suggesting a builder.
-struct-field-name-threshold = 8
+# Field count at which clippy::struct_field_names begins checking field/struct-name stutter.
+struct-field-name-threshold = 9
 
 # Type complexity threshold (default is 250).
 type-complexity-threshold = 250

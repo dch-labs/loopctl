@@ -580,6 +580,27 @@ impl<C: ApiClient> BareLoop<C> {
             })
     }
 
+    /// Classify the turn's stop reason for the machine's `ModelResponse`.
+    ///
+    /// The wire-level reason maps one-to-one, with one refinement: an
+    /// `EndTurn` that arrived carrying tool calls is recorded as
+    /// `ToolCall` — the turn's real next step is dispatch, and the
+    /// machine's decision feed should say so.
+    fn engine_stop_reason(stream_stop: StreamStopReason, without_tool_calls: bool) -> StopReason {
+        match stream_stop {
+            StreamStopReason::ToolCall => StopReason::ToolCall,
+            StreamStopReason::MaxTokens => StopReason::MaxTokens,
+            StreamStopReason::StopSequence => StopReason::StopSequence,
+            StreamStopReason::EndTurn => {
+                if without_tool_calls {
+                    StopReason::EndTurn
+                } else {
+                    StopReason::ToolCall
+                }
+            }
+        }
+    }
+
     /// Build the policy struct the machine needs for `next_step()`.
     ///
     /// Combines the run's `max_turns` with the session's compaction knobs
@@ -1191,8 +1212,13 @@ impl<C: ApiClient> BareLoop<C> {
         self.notify_turn_start(turn, &turn_input);
 
         let turn_outcome = self.do_turn(turn, messages).await;
-        let (msg, usage, stream_stop) = match turn_outcome {
-            Ok(triple) => triple,
+        let llm_turn::TurnServing {
+            message: msg,
+            usage,
+            stop_reason: stream_stop,
+            transport_fallback,
+        } = match turn_outcome {
+            Ok(serving) => serving,
             Err(LoopError::Cancelled) => {
                 self.notify_turn_end(&TurnEnd {
                     turn,
@@ -1269,18 +1295,8 @@ impl<C: ApiClient> BareLoop<C> {
             return Err(e);
         }
 
-        let stop_reason = match stream_stop {
-            StreamStopReason::ToolCall => StopReason::ToolCall,
-            StreamStopReason::MaxTokens => StopReason::MaxTokens,
-            StreamStopReason::StopSequence => StopReason::StopSequence,
-            StreamStopReason::EndTurn => {
-                if tool_calls.is_empty() {
-                    StopReason::EndTurn
-                } else {
-                    StopReason::ToolCall
-                }
-            }
-        };
+        let is_empty = tool_calls.is_empty();
+        let stop_reason = Self::engine_stop_reason(stream_stop, is_empty);
         let model_response = ModelResponse {
             message: msg,
             input_tokens: turn_in,
@@ -1296,7 +1312,6 @@ impl<C: ApiClient> BareLoop<C> {
         self.machine.model_response(model_response, context_tokens);
 
         let turn_index = turn;
-        let is_empty = tool_calls.is_empty();
         if let Some(run) = self.session.current_run_mut() {
             run.turns.push(crate::engine::core::Turn {
                 turn: turn_index,
@@ -1306,6 +1321,7 @@ impl<C: ApiClient> BareLoop<C> {
                 input_tokens: turn_in,
                 output_tokens: turn_out,
                 stop_reason: stream_stop,
+                transport_fallback,
             });
         }
 

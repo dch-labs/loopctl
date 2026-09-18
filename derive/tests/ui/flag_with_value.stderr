@@ -1,0 +1,5 @@
+error: `skip` takes no value
+ --> tests/ui/flag_with_value.rs:8:12
+  |
+8 |     #[tool(skip = true)]
+  |            ^^^^^^

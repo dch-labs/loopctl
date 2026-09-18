@@ -217,16 +217,29 @@ pub struct MockApiClient {
     /// since it never reached the wire.
     requests: Arc<Mutex<Vec<crate::api::StreamRequest>>>,
 
+    /// Streaming requests the mock has served, oldest first.
+    ///
+    /// Both streaming methods record a clone of every incoming request
+    /// at the moment the mock is called — before the returned stream is
+    /// polled — mirroring the non-streaming capture's point-in-time
+    /// contract, so tests assert on the exact wire shape a caller
+    /// produced whichever transport served it. A request rejected before
+    /// sending (unsupported options) is counted by `with_options_calls`
+    /// but not captured, since it never reached the wire.
+    stream_requests: Arc<Mutex<Vec<crate::api::StreamRequest>>>,
+
     /// Count of plain [`create_message`](ApiClient::create_message) calls.
     ///
     /// The options-carrying variants are counted separately and never
     /// increment this, so the two counters are disjoint.
     create_message_calls: Arc<Mutex<usize>>,
 
-    /// Count of `create_message_with_options` calls.
+    /// Count of `*_with_options` calls on both transports.
     ///
-    /// Rejecting calls (unsupported options) count too — the method was
-    /// called either way.
+    /// Both `create_message_with_options` and
+    /// `stream_messages_with_options` increment it. Rejecting calls
+    /// (unsupported options) count too — the method was called either
+    /// way.
     with_options_calls: Arc<Mutex<usize>>,
 }
 
@@ -393,6 +406,7 @@ impl MockApiClient {
             error: None,
             errors: Arc::new(Mutex::new(Vec::new())),
             requests: Arc::new(Mutex::new(Vec::new())),
+            stream_requests: Arc::new(Mutex::new(Vec::new())),
             create_message_calls: Arc::new(Mutex::new(0)),
             with_options_calls: Arc::new(Mutex::new(0)),
         }
@@ -550,8 +564,8 @@ impl MockApiClient {
     /// Each call to [`create_message`](ApiClient::create_message) or
     /// [`stream_messages`](ApiClient::stream_messages) (and their
     /// options-carrying twins) consumes the front script entry: a
-    /// `Some` fails that one call with the carried message — the request
-    /// is still counted and captured, exactly like
+    /// `Some` fails that one call with the carried message — the
+    /// request is still captured, exactly like
     /// [`with_error`](MockApiClient::with_error)'s — and a `None` serves
     /// the configured responses as usual. Once the script is exhausted
     /// every further call succeeds, so a test can fail exactly one
@@ -631,6 +645,39 @@ impl MockApiClient {
         crate::error::recover_guard(self.requests.lock()).clone()
     }
 
+    /// Streaming requests the mock has served, oldest-first.
+    ///
+    /// The streaming twin of [`captured_requests`](MockApiClient::captured_requests):
+    /// a clone of every request the mock was called with on the streaming
+    /// transport, recorded at call time — before the returned stream is
+    /// polled — so a test keys behavior or asserts on the exact
+    /// system/messages shape a caller produced without matching on the
+    /// request's `Debug` rendering. A request rejected at the options
+    /// guard is counted by
+    /// [`with_options_calls`](MockApiClient::with_options_calls) but
+    /// never appears here, since it never reached the wire.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// use futures::StreamExt;
+    /// use loopctl::api::{ApiClient, StreamRequest};
+    /// use loopctl::testing::MockApiClient;
+    ///
+    /// let client = MockApiClient::new("test-model").with_text_response("Hi!");
+    /// let _ = client
+    ///     .stream_messages(&StreamRequest::new(vec![]))
+    /// .collect::<Vec<_>>()
+    /// .await;
+    /// assert_eq!(client.captured_stream_requests().len(), 1);
+    /// # });
+    /// ```
+    #[must_use]
+    pub fn captured_stream_requests(&self) -> Vec<crate::api::StreamRequest> {
+        crate::error::recover_guard(self.stream_requests.lock()).clone()
+    }
+
     /// How many times the plain [`create_message`](ApiClient::create_message)
     /// method was called.
     ///
@@ -655,13 +702,17 @@ impl MockApiClient {
         *crate::error::recover_guard(self.create_message_calls.lock())
     }
 
-    /// How many times an options-carrying non-streaming variant was
-    /// called.
+    /// How many times an options-carrying variant was called, on either
+    /// transport.
     ///
-    /// Counts `create_message_with_options` including its rejecting
-    /// calls. Paired with
+    /// Counts `create_message_with_options` and
+    /// `stream_messages_with_options`, including their rejecting calls.
+    /// Paired with
     /// [`create_message_calls`](MockApiClient::create_message_calls) to
-    /// pin which wire path a caller took; the two counters are disjoint.
+    /// pin which non-streaming wire path a caller took; the two counters
+    /// are disjoint (streaming has no plain-path counter — capture with
+    /// [`captured_stream_requests`](MockApiClient::captured_stream_requests)
+    /// instead).
     ///
     /// # Example
     ///
@@ -946,8 +997,9 @@ impl ApiClient for MockApiClient {
     /// ```
     fn stream_messages(
         &self,
-        _request: &crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        crate::error::recover_guard(self.stream_requests.lock()).push(request.clone());
         let model = crate::error::recover_guard(self.model_name.lock()).clone();
         let events = self.stream_events(model);
         Box::pin(futures::stream::iter(events))
@@ -989,12 +1041,17 @@ impl ApiClient for MockApiClient {
     /// ```
     fn stream_messages_with_options(
         &self,
-        _request: &crate::api::StreamRequest,
+        request: &crate::api::StreamRequest,
         options: crate::structured::RequestOptions,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        {
+            let mut calls = crate::error::recover_guard(self.with_options_calls.lock());
+            *calls = calls.saturating_add(1);
+        }
         if let Some(err) = unsupported_mock_option(&options) {
             return Box::pin(futures::stream::once(async move { Err(err) }));
         }
+        crate::error::recover_guard(self.stream_requests.lock()).push(request.clone());
         let model = options
             .model
             .unwrap_or_else(|| crate::error::recover_guard(self.model_name.lock()).clone());
@@ -1838,6 +1895,267 @@ mod tests {
             client.captured_requests().len(),
             0,
             "a request rejected before sending never reached the wire, so it is not captured"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streaming_request_is_captured_with_its_exact_shape() {
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        let request =
+            crate::api::StreamRequest::new(vec![crate::message::Message::user("hello there")])
+                .with_system(Some("be terse".to_string()));
+        let stream = crate::api::ApiClient::stream_messages(&client, &request);
+        let _ = futures::StreamExt::collect::<Vec<_>>(stream).await;
+
+        let captured = client.captured_stream_requests();
+        assert_eq!(
+            captured.len(),
+            1,
+            "the served streaming request is captured"
+        );
+        let got = captured.first().expect("one captured request");
+        assert_eq!(
+            got.system.as_deref(),
+            Some("be terse"),
+            "the captured clone carries the caller's system prompt verbatim"
+        );
+        assert_eq!(
+            got.messages
+                .first()
+                .map(crate::message::Message::text_content),
+            Some("hello there".to_string()),
+            "the captured clone carries the caller's messages verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streaming_request_rejected_before_send_is_counted_not_captured() {
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        let opts = crate::structured::RequestOptions {
+            tool_constraint: crate::structured::ToolConstraint::Strict,
+            ..Default::default()
+        };
+        let stream = crate::api::ApiClient::stream_messages_with_options(
+            &client,
+            &crate::api::StreamRequest::new(vec![]),
+            opts,
+        );
+        let events = futures::StreamExt::collect::<Vec<_>>(stream).await;
+        assert!(
+            events.first().is_some_and(std::result::Result::is_err),
+            "the rejection still fails loudly"
+        );
+        assert_eq!(
+            client.with_options_calls(),
+            1,
+            "the rejected streaming options call is counted, mirroring the non-streaming rule"
+        );
+        assert_eq!(
+            client.captured_stream_requests().len(),
+            0,
+            "a request rejected before sending never reached the wire, so it is not captured"
+        );
+    }
+
+    #[tokio::test]
+    async fn captures_preserve_call_order_across_both_transports() {
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        let first = crate::api::StreamRequest::new(vec![crate::message::Message::user("s1")])
+            .with_system(Some("stream-one".to_string()));
+        let _ = futures::StreamExt::collect::<Vec<_>>(crate::api::ApiClient::stream_messages(
+            &client, &first,
+        ))
+        .await;
+        client
+            .create_message(&crate::api::StreamRequest::new(vec![
+                crate::message::Message::user("n1"),
+            ]))
+            .await
+            .expect("the non-streaming call is served");
+        let third = crate::api::StreamRequest::new(vec![crate::message::Message::user("s2")])
+            .with_system(Some("stream-two".to_string()));
+        let _ = futures::StreamExt::collect::<Vec<_>>(crate::api::ApiClient::stream_messages(
+            &client, &third,
+        ))
+        .await;
+
+        let streamed: Vec<_> = client
+            .captured_stream_requests()
+            .iter()
+            .map(|r| r.system.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            streamed,
+            vec!["stream-one".to_string(), "stream-two".to_string()],
+            "each transport's list keeps call order, oldest first"
+        );
+        assert_eq!(
+            client.captured_requests().len(),
+            1,
+            "the non-streaming list holds only its own transport's calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streaming_request_is_captured_before_the_stream_is_polled() {
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        let request = crate::api::StreamRequest::new(vec![crate::message::Message::user("early")])
+            .with_system(Some("before-poll".to_string()));
+        let stream = crate::api::ApiClient::stream_messages(&client, &request);
+        assert_eq!(
+            client.captured_stream_requests().len(),
+            1,
+            "capture happens at call time — the entry exists before the \
+            returned stream is polled at all"
+        );
+        let _ = futures::StreamExt::collect::<Vec<_>>(stream).await;
+        assert_eq!(
+            client.captured_stream_requests().len(),
+            1,
+            "polling must not record the request a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scripted_streaming_failure_is_still_captured() {
+        let client = MockApiClient::new("test-model")
+            .with_text_response("hi")
+            .with_errors(vec![Some("pool timed out".to_string())]);
+        let request = crate::api::StreamRequest::new(vec![crate::message::Message::user("fails")]);
+        let events = futures::StreamExt::collect::<Vec<_>>(crate::api::ApiClient::stream_messages(
+            &client, &request,
+        ))
+        .await;
+        assert!(
+            events.first().is_some_and(std::result::Result::is_err),
+            "the scripted failure surfaces on the stream"
+        );
+        let captured = client.captured_stream_requests();
+        assert_eq!(
+            captured.len(),
+            1,
+            "a failed streaming call is captured like a served one — the \
+            request reached the mock, only the reply failed"
+        );
+        assert_eq!(
+            captured
+                .first()
+                .and_then(|r| r.messages.first())
+                .map(crate::message::Message::text_content),
+            Some("fails".to_string()),
+            "the captured clone is the caller's exact request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_streaming_call_between_accepted_ones_leaves_the_list_contiguous() {
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        let opts = crate::structured::RequestOptions {
+            tool_constraint: crate::structured::ToolConstraint::Strict,
+            ..Default::default()
+        };
+        let first = crate::api::StreamRequest::new(vec![crate::message::Message::user("s1")])
+            .with_system(Some("accepted-one".to_string()));
+        let _ = futures::StreamExt::collect::<Vec<_>>(crate::api::ApiClient::stream_messages(
+            &client, &first,
+        ))
+        .await;
+        let _ = futures::StreamExt::collect::<Vec<_>>(
+            crate::api::ApiClient::stream_messages_with_options(
+                &client,
+                &crate::api::StreamRequest::new(vec![]),
+                opts,
+            ),
+        )
+        .await;
+        let third = crate::api::StreamRequest::new(vec![crate::message::Message::user("s2")])
+            .with_system(Some("accepted-two".to_string()));
+        let _ = futures::StreamExt::collect::<Vec<_>>(crate::api::ApiClient::stream_messages(
+            &client, &third,
+        ))
+        .await;
+
+        let streamed: Vec<_> = client
+            .captured_stream_requests()
+            .iter()
+            .map(|r| r.system.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            streamed,
+            vec!["accepted-one".to_string(), "accepted-two".to_string()],
+            "the rejected middle call leaves the accepted requests contiguous \
+            and in call order — rejection never writes a placeholder"
+        );
+        assert_eq!(
+            client.with_options_calls(),
+            1,
+            "the rejected call is still counted, mirroring the non-streaming rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_on_both_transports_keep_their_captures_intact() {
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        let streaming_client = client.clone();
+        let streaming = tokio::spawn(async move {
+            for i in 0..4 {
+                let request = crate::api::StreamRequest::new(vec![crate::message::Message::user(
+                    format!("s{i}"),
+                )])
+                .with_system(Some(format!("stream-{i}")));
+                let _ = futures::StreamExt::collect::<Vec<_>>(
+                    crate::api::ApiClient::stream_messages(&streaming_client, &request),
+                )
+                .await;
+            }
+        });
+        let non_streaming_client = client.clone();
+        let non_streaming = tokio::spawn(async move {
+            for i in 0..4 {
+                let request = crate::api::StreamRequest::new(vec![crate::message::Message::user(
+                    format!("n{i}"),
+                )])
+                .with_system(Some(format!("plain-{i}")));
+                crate::api::ApiClient::create_message(&non_streaming_client, &request)
+                    .await
+                    .expect("the non-streaming call is served");
+            }
+        });
+        streaming.await.expect("the streaming task finishes");
+        non_streaming
+            .await
+            .expect("the non-streaming task finishes");
+
+        let streamed: Vec<_> = client
+            .captured_stream_requests()
+            .iter()
+            .map(|r| r.system.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            streamed,
+            vec![
+                "stream-0".to_string(),
+                "stream-1".to_string(),
+                "stream-2".to_string(),
+                "stream-3".to_string()
+            ],
+            "every concurrent streaming write lands, none is lost or duplicated"
+        );
+        let plain: Vec<_> = client
+            .captured_requests()
+            .iter()
+            .map(|r| r.system.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            plain,
+            vec![
+                "plain-0".to_string(),
+                "plain-1".to_string(),
+                "plain-2".to_string(),
+                "plain-3".to_string()
+            ],
+            "every concurrent non-streaming write lands in its own list, \
+            untouched by the streaming task"
         );
     }
 

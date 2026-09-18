@@ -1,0 +1,12 @@
+error[E0277]: `Result<ToolOutput, ToolError>` is not a future
+ --> tests/ui/handler_wrong_shape.rs:6:10
+  |
+6 | #[derive(Tool, Deserialize)]
+  |          ^^^^
+  |          |
+  |          `Result<ToolOutput, ToolError>` is not a future
+  |          this call returns `Result<ToolOutput, ToolError>`
+  |
+  = help: the trait `Future` is not implemented for `Result<ToolOutput, ToolError>`
+  = note: Result<ToolOutput, ToolError> must be a future or must implement `IntoFuture` to be awaited
+  = note: required for `Result<ToolOutput, ToolError>` to implement `IntoFuture`

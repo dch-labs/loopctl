@@ -22,15 +22,18 @@ pub(crate) struct ContainerAttrs {
     /// Override for the derived tool name.
     ///
     /// When `None`, the codegen falls back to the `snake_cased` struct
-    /// identifier (`EchoInput` → `echo_input`). Non-empty and stable
-    /// for the session, per the trait's contract.
+    /// identifier (`EchoInput` → `echo_input`). An explicit empty
+    /// string is rejected at the attribute's span — a tool with no
+    /// name has nothing to register under.
     pub name: Option<String>,
 
     /// Override for the description.
     ///
-    /// When `None`, the struct's `///` doc comment is used; when
-    /// neither is present the derive errors — the trait requires a
-    /// non-empty description.
+    /// When `None`, the struct's `///` doc comment is used; an
+    /// all-empty doc comment counts as absent. When neither source
+    /// yields text the derive errors — an explicit empty string is
+    /// rejected at the attribute's span, so an empty description
+    /// never reaches the wire.
     pub description: Option<String>,
 
     /// Emit `is_read_only() -> true`.
@@ -106,6 +109,7 @@ pub(crate) struct FieldAttrs {
 /// fails at compile time, not as a silently ignored attribute.
 const CONTAINER_KEYS: &str =
     "name, description, read_only, concurrency_safe, system_prompt, handler, allow_extra";
+
 /// Accepted keys on a field-level `#[tool(...)]` attribute.
 ///
 /// Unknown keys are rejected with this list in the error.
@@ -125,9 +129,9 @@ pub(crate) fn parse_container(attrs: &[Attribute]) -> syn::Result<ContainerAttrs
     for attr in attrs.iter().filter(|a| a.path().is_ident("tool")) {
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("name") {
-                out.name = Some(string_value(&meta)?);
+                out.name = Some(non_empty_string_value(&meta, "tool(name)")?);
             } else if meta.path.is_ident("description") {
-                out.description = Some(string_value(&meta)?);
+                out.description = Some(non_empty_string_value(&meta, "tool(description)")?);
             } else if meta.path.is_ident("system_prompt") {
                 out.system_prompt = Some(string_value(&meta)?);
             } else if meta.path.is_ident("handler") {
@@ -200,6 +204,25 @@ fn string_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<String> {
     Ok(lit.value())
 }
 
+/// Read a `key = "value"` string whose value must be non-empty.
+///
+/// Name- and description-shaped keys become provider-facing schema
+/// text, where an empty string is rejected at request time far from
+/// its cause; the derive fails instead at the attribute itself.
+///
+/// # Errors
+///
+/// Returns a spanned error when the value is not a string literal or
+/// is empty.
+fn non_empty_string_value(meta: &syn::meta::ParseNestedMeta<'_>, key: &str) -> syn::Result<String> {
+    let value = string_value(meta)?;
+    if value.is_empty() {
+        Err(meta.error(format!("`{key}` must not be an empty string")))
+    } else {
+        Ok(value)
+    }
+}
+
 /// Reject anything trailing a flag-shaped `#[tool(...)]` key.
 ///
 /// `read_only`, `concurrency_safe`, `allow_extra`, `skip`, and
@@ -236,7 +259,7 @@ pub(crate) fn doc_string(attrs: &[Attribute]) -> Option<String> {
             lines.push(s.value().trim().to_string());
         }
     }
-    if lines.is_empty() {
+    if lines.iter().all(String::is_empty) {
         None
     } else {
         Some(lines.join(" "))
@@ -1025,5 +1048,25 @@ mod tests {
     fn rename_all_from_str_rejects_unknown_names() {
         assert!(RenameAll::from_str("NonsenseCase").is_none());
         assert!(RenameAll::from_str("").is_none());
+    }
+
+    #[test]
+    fn later_tool_attributes_win_for_repeated_keys() {
+        use syn::parse_quote;
+        let attrs: Vec<Attribute> = parse_quote! {
+            #[tool(name = "first", description = "kept")]
+            #[tool(name = "second")]
+        };
+        let parsed = parse_container(&attrs).expect("well-formed attributes parse");
+        assert_eq!(
+            parsed.name.as_deref(),
+            Some("second"),
+            "the later attribute overwrites the earlier value for a repeated key"
+        );
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("kept"),
+            "a key set once keeps its value — repetition overwrites, it does not clear"
+        );
     }
 }

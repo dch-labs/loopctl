@@ -1,0 +1,5 @@
+error: `#[tool(allow_extra)]` omits `additionalProperties: false` while `#[serde(deny_unknown_fields)]` rejects any unknown key — the schema would invite payloads serde refuses; drop one of the two
+ --> tests/ui/allow_extra_conflict.rs:8:8
+  |
+8 | struct Conflicting {
+  |        ^^^^^^^^^^^

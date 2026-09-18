@@ -1,0 +1,5 @@
+error: `EmptyDoc` has no description: set `#[tool(description = "…")]` or add a `///` doc comment
+ --> tests/ui/empty_doc_comment.rs:6:8
+  |
+6 | struct EmptyDoc {
+  |        ^^^^^^^^

@@ -17,4 +17,19 @@ fn ui() {
     t.compile_fail("tests/ui/unknown_rename_all.rs");
     t.compile_fail("tests/ui/serde_transparent.rs");
     t.compile_fail("tests/ui/serde_deserialize_with.rs");
+    t.compile_fail("tests/ui/allow_extra_conflict.rs");
+    t.compile_fail("tests/ui/lifetime_struct.rs");
+    t.compile_fail("tests/ui/handler_not_ident.rs");
+    t.compile_fail("tests/ui/non_string_value.rs");
+    t.compile_fail("tests/ui/tuple_struct.rs");
+    t.compile_fail("tests/ui/unit_struct.rs");
+    t.compile_fail("tests/ui/serde_container_from.rs");
+    t.compile_fail("tests/ui/serde_rename_all_fields.rs");
+    t.compile_fail("tests/ui/flag_with_value.rs");
+    t.compile_fail("tests/ui/handler_wrong_shape.rs");
+    t.compile_fail("tests/ui/empty_name.rs");
+    t.compile_fail("tests/ui/empty_description.rs");
+    t.compile_fail("tests/ui/empty_doc_comment.rs");
+    t.pass("tests/ui/private_field_pass.rs");
+    t.pass("tests/ui/deny_unknown_alone_pass.rs");
 }

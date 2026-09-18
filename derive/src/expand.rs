@@ -83,6 +83,21 @@ fn check_allow_extra_conflict(
     Ok(())
 }
 
+/// Resolve the ident the consumer's manifest binds `loopctl` under.
+///
+/// Generated code must reach the `Tool` trait and its types through the
+/// crate name the *consumer* uses, which a manifest rename changes
+/// (`lc = { package = "loopctl" }`). Reads the consumer's manifest at
+/// expansion time; when it cannot be read the plain crate name is used,
+/// which matches every unrenamed build.
+fn tool_crate_ident() -> proc_macro2::Ident {
+    let name = match proc_macro_crate::crate_name("loopctl") {
+        Ok(proc_macro_crate::FoundCrate::Name(name)) => name,
+        Ok(proc_macro_crate::FoundCrate::Itself) | Err(_) => "loopctl".to_string(),
+    };
+    proc_macro2::Ident::new(&name, proc_macro2::Span::call_site())
+}
+
 /// The codegen core.
 ///
 /// # Errors
@@ -112,7 +127,8 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     if !input.generics.params.is_empty() {
         return Err(syn::Error::new(
             ident.span(),
-            "`Tool` cannot be derived for generic structs; implement it manually",
+            "`Tool` cannot be derived for generic structs (type or lifetime \
+             parameters); implement it manually",
         ));
     }
     let container = attr::parse_container(&input.attrs)?;
@@ -179,10 +195,11 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         )
     })?;
     let overrides = provided_overrides(&container);
+    let krate = tool_crate_ident();
 
     Ok(quote! {
         #[automatically_derived]
-        impl loopctl::tool::Tool for #ident {
+        impl #krate ::tool::Tool for #ident {
             fn name(&self) -> &str {
                 #tool_name
             }
@@ -191,11 +208,11 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 #description
             }
 
-            fn schema(&self) -> loopctl::tool::ToolSchema {
-                loopctl::tool::ToolSchema {
+            fn schema(&self) -> #krate ::tool::ToolSchema {
+                #krate ::tool::ToolSchema {
                     tool: #tool_name.to_string(),
                     description: #description.to_string(),
-                    input_schema: loopctl::__private::serde_json::json!({
+                    input_schema: #krate ::__private::serde_json::json!({
                         "type": "object",
                         #additional
                         "properties": { #(#properties),* },
@@ -206,14 +223,14 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
             fn call(
                 &self,
-                input: loopctl::__private::serde_json::Value,
-                ctx: &loopctl::tool::ToolContext,
+                input: #krate ::__private::serde_json::Value,
+                ctx: &#krate ::tool::ToolContext,
             ) -> std::pin::Pin<
                 std::boxed::Box<
                     dyn std::future::Future<
                         Output = Result<
-                            loopctl::tool::ToolOutput,
-                            loopctl::tool::ToolError,
+                            #krate ::tool::ToolOutput,
+                            #krate ::tool::ToolError,
                         >,
                     > + std::marker::Send
                     + '_,
@@ -223,11 +240,11 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 // `self`'s lifetime alone, so it cannot borrow `ctx`.
                 let ctx = std::clone::Clone::clone(ctx);
                 std::boxed::Box::pin(async move {
-                    let parsed: Self = match loopctl::__private::serde_json::from_value(input) {
+                    let parsed: Self = match #krate ::__private::serde_json::from_value(input) {
                         Ok(value) => value,
                         Err(err) => {
                             return Err(
-                                loopctl::tool::ToolError::InvalidInput(
+                                #krate ::tool::ToolError::InvalidInput(
                                     err.to_string(),
                                 )
                             );

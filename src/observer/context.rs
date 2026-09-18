@@ -445,6 +445,35 @@ pub struct FallbackContext {
     pub to: String,
 }
 
+/// Context for
+/// [`LoopObserver::on_transport_fallback`](crate::observer::LoopObserver::on_transport_fallback).
+///
+/// Fired when a turn is served by the non-streaming transport fallback —
+/// streaming exhausted its retry ceiling and the handler's last-chance
+/// `create_message` produced the answer. The fallback itself is a
+/// degradation report, not a failure, and the turn proceeds normally from
+/// here; unrelated policies can still abort the turn afterwards, in which
+/// case no flagged record exists for it (see
+/// [`on_transport_fallback`](crate::observer::LoopObserver::on_transport_fallback)
+/// for the tally-vs-count distinction).
+#[derive(Debug, Clone)]
+pub struct TransportFallbackContext {
+    /// Turn number.
+    ///
+    /// Matches the value passed to the corresponding
+    /// [`on_turn_start`](crate::observer::LoopObserver::on_turn_start) —
+    /// the event fires after the turn's model response is known and before
+    /// its [`on_turn_end`](crate::observer::LoopObserver::on_turn_end).
+    pub turn: usize,
+
+    /// Why the fallback response's model stopped.
+    ///
+    /// The stop reason carried by the non-streaming response, the same
+    /// value the turn's record holds in
+    /// [`Turn::stop_reason`](crate::engine::core::Turn::stop_reason).
+    pub stop_reason: crate::stream::StreamStopReason,
+}
+
 /// Context for [`LoopObserver::on_model_switched`](crate::observer::LoopObserver::on_model_switched).
 ///
 /// Emitted when the model is hot-swapped via

@@ -1,12 +1,15 @@
 //! Observer and hook fan-out — the single home for every lifecycle notification.
 //!
-//! Every [`LoopObserver`](crate::observer::LoopObserver) callback and every
-//! hook notification fired by the driver is dispatched from this module: run
-//! start/end, turn start/end, response, tool-call-received, tool pre/post,
-//! stream success/failure, and fallback. Co-locating them here means a reader
-//! looking for "where does `on_turn_end` fire" finds it in one place, and the
-//! driver modules (`llm_turn`, `dispatch`, `compact`) never fire observers
-//! directly — they call into the `notify_*` / `record_*` helpers here.
+//! The lifecycle notifications the driver fires are dispatched from this
+//! module: run start/end, turn start/end, response, tool-call-received,
+//! tool pre/post, stream success/failure, model fallback, and transport
+//! fallback. Two per-event families live with their natural home instead —
+//! the streaming deltas (`on_text_delta`, `on_thinking_delta`) and
+//! `on_model_switched` fire from `llm_turn` — but everything else routes
+//! through the `notify_*` / `record_*` helpers here, so a reader looking
+//! for "where does `on_turn_end` fire" finds it in one place and the
+//! driver modules (`llm_turn`, `dispatch`, `compact`) never fire those
+//! observers directly.
 
 use super::{ApiClient, BareLoop, Duration, LoopError, Run, ToolCall};
 use crate::capabilities::FallbackCapable;
@@ -283,9 +286,28 @@ impl<C: ApiClient> BareLoop<C> {
         Ok(self.routed_model()?.unwrap_or_else(|| self.client.model()))
     }
 
+    /// Fire [`on_transport_fallback`](crate::observer::LoopObserver::on_transport_fallback).
+    ///
+    /// Reports that this turn was served by the non-streaming transport
+    /// fallback — streaming exhausted its retry ceiling and the handler's
+    /// last-chance `create_message` produced the answer. Fired from the
+    /// engine's stream path the moment the fallback response is in hand,
+    /// before the turn's success bookkeeping and well before its
+    /// `on_turn_end`, so a live consumer hears about the degradation as it
+    /// happens rather than re-reading the run record. Streaming-only: the
+    /// fallback is a stream-handler behavior, so no other turn path calls
+    /// this.
+    #[cfg(feature = "streaming")]
+    pub(super) fn notify_transport_fallback(&self, turn: usize, stop_reason: StreamStopReason) {
+        self.managers.observers().on_transport_fallback(
+            &crate::observer::TransportFallbackContext { turn, stop_reason },
+        );
+    }
+
     /// Record a successful LLM turn: tells the fallback manager the model is
     /// healthy and fires
     /// [`on_stream_success`](crate::observer::LoopObserver::on_stream_success).
+    ///
     /// # Errors
     ///
     /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the fallback state lock is poisoned.

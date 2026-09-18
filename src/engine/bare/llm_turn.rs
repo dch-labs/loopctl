@@ -31,6 +31,40 @@ use crate::stream::{StreamStopReason, Usage};
 #[cfg(feature = "streaming")]
 use futures::StreamExt;
 
+/// One served model turn, in the shape the run loop consumes.
+///
+/// Bundles what every turn path — streaming and non-streaming — hands
+/// back to the driver: the assembled message, the provider-reported usage,
+/// the model's stop reason, and whether the turn was served by the
+/// non-streaming transport fallback (streaming exhausted its retry
+/// ceiling and the handler's last-chance `create_message` produced the
+/// answer). Field-named rather than a tuple so the call sites that read
+/// it cannot transpose adjacent values.
+pub(super) struct TurnServing {
+    /// The assembled assistant message for this turn.
+    ///
+    /// Built by the streaming accumulator, or handed over verbatim by the
+    /// non-streaming fallback response.
+    pub(super) message: Message,
+
+    /// Provider-reported token usage, when the provider sent any.
+    ///
+    /// `None` on providers that omit usage from the response shape.
+    pub(super) usage: Option<Usage>,
+
+    /// Why the model stopped producing output for this turn.
+    ///
+    /// The same value the turn's record holds in
+    /// [`Turn::stop_reason`](crate::engine::core::Turn::stop_reason).
+    pub(super) stop_reason: StreamStopReason,
+
+    /// Whether the non-streaming transport fallback served this turn.
+    ///
+    /// `true` only on the handler's last-chance fallback path; counted by
+    /// [`Run::transport_fallback_count`](crate::engine::core::Run::transport_fallback_count).
+    pub(super) transport_fallback: bool,
+}
+
 impl<C: ApiClient> BareLoop<C> {
     /// Build tool schemas for the API request.
     ///
@@ -143,7 +177,7 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         turn: usize,
         messages: Vec<Message>,
-    ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
+    ) -> Result<TurnServing, LoopError> {
         if self.cancelled.is_cancelled() {
             return Err(LoopError::Cancelled);
         }
@@ -174,7 +208,7 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         turn: usize,
         messages: Vec<Message>,
-    ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
+    ) -> Result<TurnServing, LoopError> {
         let request = self.build_turn_request(messages);
         let cancel = std::sync::Arc::clone(&self.cancelled);
         let client = &self.client;
@@ -197,7 +231,12 @@ impl<C: ApiClient> BareLoop<C> {
         match result {
             Ok(response) => {
                 self.record_turn_success(turn, response.usage.as_ref())?;
-                Ok((response.message, response.usage, response.stop_reason))
+                Ok(TurnServing {
+                    message: response.message,
+                    usage: response.usage,
+                    stop_reason: response.stop_reason,
+                    transport_fallback: false,
+                })
             }
             Err(e) => Err(self.record_turn_failure(turn, e)),
         }
@@ -217,11 +256,14 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         turn: usize,
         messages: Vec<Message>,
-    ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
+    ) -> Result<TurnServing, LoopError> {
         match self.stream_turn(messages).await {
-            Ok((msg, usage, stop)) => {
-                self.record_turn_success(turn, usage.as_ref())?;
-                Ok((msg, usage, stop))
+            Ok(serving) => {
+                if serving.transport_fallback {
+                    self.notify_transport_fallback(turn, serving.stop_reason);
+                }
+                self.record_turn_success(turn, serving.usage.as_ref())?;
+                Ok(serving)
             }
             Err(e) => Err(self.record_turn_failure(turn, e)),
         }
@@ -241,7 +283,7 @@ impl<C: ApiClient> BareLoop<C> {
     pub(super) async fn stream_turn(
         &self,
         messages: Vec<Message>,
-    ) -> Result<(Message, Option<Usage>, StreamStopReason), LoopError> {
+    ) -> Result<TurnServing, LoopError> {
         let handler = self.managers.stream_handler();
         let request = self.build_turn_request(messages);
         let mut stream = handler.stream_turn(
@@ -268,13 +310,23 @@ impl<C: ApiClient> BareLoop<C> {
                     stop_reason: fallback_stop_reason,
                     usage: fallback_usage,
                 } => {
-                    return Ok((message, fallback_usage, fallback_stop_reason));
+                    return Ok(TurnServing {
+                        message,
+                        usage: fallback_usage,
+                        stop_reason: fallback_stop_reason,
+                        transport_fallback: true,
+                    });
                 }
             }
         }
 
         let usage = accumulator.usage().copied();
-        Ok((accumulator.build(), usage, stop_reason))
+        Ok(TurnServing {
+            message: accumulator.build(),
+            usage,
+            stop_reason,
+            transport_fallback: false,
+        })
     }
 
     /// Dispatch one stream event: fire per-delta observer callbacks

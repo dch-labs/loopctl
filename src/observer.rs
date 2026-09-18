@@ -18,6 +18,7 @@
 //! - [`ToolPreContext`] / [`ToolPostContext`] — tool dispatch lifecycle
 //! - [`CompactedContext`] — context window compaction
 //! - [`FallbackContext`] — model fallback event
+//! - [`TransportFallbackContext`] — non-streaming transport fallback event
 //! - [`LoopDetectedContext`] — loop detection event
 //! - [`ConvergenceDetectedContext`] — convergence detection event
 //!
@@ -45,7 +46,7 @@ pub use context::{
     CompactedContext, ConvergenceDetectedContext, FallbackContext, LoopDetectedContext,
     ModelSwitchedContext, ResponseContext, RunEndContext, RunStartContext, StreamContext,
     StreamFailureContext, TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext,
-    ToolPostContext, ToolPreContext, TurnEndContext, TurnStartContext,
+    ToolPostContext, ToolPreContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
 };
 
 /// A notification observer that receives typed callbacks at agent loop lifecycle points.
@@ -90,7 +91,13 @@ pub trait LoopObserver: Send + Sync {
     /// Called after the model streams a response successfully.
     ///
     /// Provides token counts for the completed streaming request.
-    /// Not fired when the stream fails — see [`on_stream_failure`](Self::on_stream_failure).
+    /// Not fired when the stream fails — see
+    /// [`on_stream_failure`](Self::on_stream_failure) — with one shape to
+    /// know about: a turn served by the non-streaming transport fallback
+    /// fires this without a preceding `on_stream_failure`, because the
+    /// failed stream's answer was recovered. Pair with
+    /// [`on_transport_fallback`](Self::on_transport_fallback) to
+    /// distinguish recovered turns from healthy ones.
     fn on_stream_success(&self, _ctx: &StreamContext) {}
 
     /// Called when the API stream fails.
@@ -219,6 +226,23 @@ pub trait LoopObserver: Send + Sync {
     /// Indicates that the primary model failed and a fallback model
     /// was selected for subsequent requests.
     fn on_fallback(&self, _ctx: &FallbackContext) {}
+
+    /// Called when a turn is served by the non-streaming transport
+    /// fallback.
+    ///
+    /// Streaming exhausted its retry ceiling and the handler's last-chance
+    /// `create_message` produced the turn's answer — the fallback itself
+    /// is a degradation report, not a failure, and the turn proceeds
+    /// normally from here. Unrelated policies can still abort the turn
+    /// afterwards (a loop-detection hard stop, a poisoned lock), in which
+    /// case the run records no flagged turn for it — tally this event, not
+    /// [`Run::transport_fallback_count`](crate::engine::core::Run::transport_fallback_count),
+    /// if you need every fallback occurrence. Distinct from
+    /// [`on_fallback`](Self::on_fallback), which reports a *model*
+    /// fallback; this is a transport-level fallback on the same model.
+    /// Fires once per fallback-served turn, before that turn's
+    /// [`on_turn_end`](Self::on_turn_end).
+    fn on_transport_fallback(&self, _ctx: &TransportFallbackContext) {}
 
     /// Called when the model is hot-swapped at runtime.
     ///
@@ -372,7 +396,11 @@ impl ObserverHost {
     /// Fired when a streaming model call completes successfully.
     /// Iterates registered observers in registration order. Not fired
     /// when the stream fails — see
-    /// [`on_stream_failure`](Self::on_stream_failure).
+    /// [`on_stream_failure`](Self::on_stream_failure) — except that a
+    /// turn served by the non-streaming transport fallback still fires
+    /// this (the failed stream was recovered); pair with
+    /// [`on_transport_fallback`](Self::on_transport_fallback) to tell
+    /// them apart.
     pub fn on_stream_success(&self, ctx: &StreamContext) {
         self.dispatch(|obs| obs.on_stream_success(ctx));
     }
@@ -459,6 +487,16 @@ impl ObserverHost {
     /// for subsequent requests.
     pub fn on_fallback(&self, ctx: &FallbackContext) {
         self.dispatch(|obs| obs.on_fallback(ctx));
+    }
+
+    /// Dispatch [`LoopObserver::on_transport_fallback`] to all observers.
+    ///
+    /// Fired when a turn is served by the non-streaming transport
+    /// fallback, carrying the turn and the fallback response's stop
+    /// reason. Iterates registered observers in registration order; fires
+    /// once per fallback-served turn, before that turn's `on_turn_end`.
+    pub fn on_transport_fallback(&self, ctx: &TransportFallbackContext) {
+        self.dispatch(|obs| obs.on_transport_fallback(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_model_switched`] to all observers.

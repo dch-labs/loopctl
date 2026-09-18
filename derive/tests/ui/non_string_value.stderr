@@ -1,0 +1,5 @@
+error: expected string literal
+ --> tests/ui/non_string_value.rs:6:15
+  |
+6 | #[tool(name = 123)]
+  |               ^^^

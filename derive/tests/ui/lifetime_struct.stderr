@@ -1,5 +1,5 @@
 error: `Tool` cannot be derived for generic structs (type or lifetime parameters); implement it manually
- --> tests/ui/generic_struct.rs:5:8
+ --> tests/ui/lifetime_struct.rs:5:8
   |
-5 | struct Generic<T> {
-  |        ^^^^^^^
+5 | struct Borrowed<'a> {
+  |        ^^^^^^^^

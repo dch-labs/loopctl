@@ -1,0 +1,5 @@
+error: `tool(name)` must not be an empty string
+ --> tests/ui/empty_name.rs:6:8
+  |
+6 | #[tool(name = "")]
+  |        ^^^^^^^^^

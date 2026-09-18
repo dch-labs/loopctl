@@ -1,6 +1,6 @@
-.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal
+.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal derive-consumer
 
-ci: fmt check check-default clippy test docs examples redaction-minimal
+ci: fmt check check-default clippy test docs examples redaction-minimal derive-consumer
 
 check:
 	cargo check --all-features
@@ -86,3 +86,6 @@ e2e-ollama:
 	LOOPCTL_E2E=1 cargo test --features ollama --test examples_e2e -- --nocapture
 	LOOPCTL_E2E=1 cargo test --features ollama --test provider_survival -- --nocapture
 	LOOPCTL_E2E=1 cargo test --features ollama --test structured_output -- --nocapture
+
+derive-consumer:
+	RUSTFLAGS="-D warnings" cargo build --manifest-path derive/tests/consumer/Cargo.toml --quiet

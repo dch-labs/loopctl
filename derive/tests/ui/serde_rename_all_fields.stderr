@@ -1,0 +1,11 @@
+error: `#[serde(rename_all_fields)]` changes what serde reads on the wire in ways `#[derive(Tool)]` cannot mirror — write a manual `Tool` impl for this input
+ --> tests/ui/serde_rename_all_fields.rs:6:9
+  |
+6 | #[serde(rename_all_fields = "kebab-case")]
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: #[serde(rename_all_fields)] can only be used on enums
+ --> tests/ui/serde_rename_all_fields.rs:6:9
+  |
+6 | #[serde(rename_all_fields = "kebab-case")]
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

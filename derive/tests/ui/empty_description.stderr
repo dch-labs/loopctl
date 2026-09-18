@@ -1,0 +1,5 @@
+error: `tool(description)` must not be an empty string
+ --> tests/ui/empty_description.rs:6:8
+  |
+6 | #[tool(description = "")]
+  |        ^^^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: `Tool` can only be derived for structs with named fields
+ --> tests/ui/tuple_struct.rs:6:8
+  |
+6 | struct Tuple(String);
+  |        ^^^^^

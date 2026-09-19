@@ -298,6 +298,38 @@ fn scrub_drops_noise_response_headers_and_rewrites_sensitive_queries() {
 }
 
 #[test]
+fn renames_handle_prefix_overlapping_ids() {
+    let mut interactions = vec![Interaction {
+        when: WhenSpec {
+            body: Some(r#"{"echo":"msg_abcd","note":"msg_abextra"}"#.to_string()),
+            ..Default::default()
+        },
+        then: ThenSpec {
+            status: Some(200),
+            body: Some(r#"{"a":"msg_ab","b":"msg_abcd"}"#.to_string()),
+            ..Default::default()
+        },
+    }];
+
+    scrub(&mut interactions);
+
+    assert_eq!(
+        interactions[0].then.body.as_deref().unwrap(),
+        r#"{"a":"msg_cassette_1","b":"msg_cassette_2"}"#,
+        "each minted id keeps its own placeholder even when one is a \
+        strict prefix of the other — sequential replacement would \
+        corrupt the longer one into `msg_cassette_1cd`"
+    );
+    assert_eq!(
+        interactions[0].when.body.as_deref().unwrap(),
+        r#"{"echo":"msg_cassette_2","note":"msg_abextra"}"#,
+        "the longer id's echo renames whole, and an id-shaped token that \
+        was never minted stays untouched — ids rename as tokens, not as \
+        substrings"
+    );
+}
+
+#[test]
 fn cassette_safety_flags_a_planted_key() {
     let planted = r#"
 - when:

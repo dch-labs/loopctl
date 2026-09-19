@@ -511,6 +511,14 @@ fn apply_then(mut spec: httpmock::Then, then: &ThenSpec) -> httpmock::Then {
 /// hitting it with real credentials is not something a test run does
 /// by accident.
 ///
+/// The credential crosses the client-to-proxy hop in cleartext, on
+/// loopback only, and that is the accepted posture: anyone positioned
+/// to sniff loopback traffic is equally positioned to read the key
+/// from this process's environment, so the hop adds no exposure the
+/// environment variable does not already have, and encrypting it
+/// would cost an all-or-nothing TLS mockserver every plain-TCP pin
+/// depends on being without.
+///
 /// # Panics
 ///
 /// Panics when either half of the deliberate-act contract is missing.
@@ -632,7 +640,9 @@ fn collect_id_renames(interactions: &[Interaction]) -> Vec<(String, String)> {
 /// that echoed it back), the request path, and every recorded pair
 /// value — a provider that puts a generated id in a URL path or query
 /// keeps the whole exchange consistent under the rename, so replay's
-/// byte matching survives the scrub.
+/// byte matching survives the scrub. Each text is rewritten in a
+/// single pass ([`rename_ids_in_text`]), so placeholders can never be
+/// rescanned and one-to-one mappings stay one-to-one.
 fn apply_id_renames(interactions: &mut [Interaction], renames: &[(String, String)]) {
     for interaction in interactions {
         let mut texts = vec![
@@ -652,11 +662,45 @@ fn apply_id_renames(interactions: &mut [Interaction], renames: &[(String, String
             }
         }
         for text in texts.into_iter().flatten() {
-            for (from, to) in renames {
-                *text = text.replace(from, to);
-            }
+            *text = rename_ids_in_text(text, renames);
         }
     }
+}
+
+/// Rewrite one text by replacing whole id tokens, longest match first.
+///
+/// A single left-to-right pass over the original text: at each
+/// character boundary, the longest source id that matches *and ends at
+/// a token boundary* wins; every other byte is copied verbatim. Two
+/// properties sequential `replace` calls cannot give: a placeholder
+/// written earlier in the pass is never itself rescanned, and a
+/// shorter id that prefixes a longer one (`msg_ab` inside `msg_abcd`)
+/// never corrupts the longer token.
+fn rename_ids_in_text(text: &str, renames: &[(String, String)]) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let matched = renames
+            .iter()
+            .filter(|(from, _)| {
+                text[i..].starts_with(from.as_str())
+                    && !bytes
+                        .get(i + from.len())
+                        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+            })
+            .max_by_key(|(from, _)| from.len());
+        if let Some((from, to)) = matched {
+            out.push_str(to);
+            i += from.len();
+        } else {
+            let step = text[i..].chars().next().map_or(1, char::len_utf8);
+            let end = (i + step).min(bytes.len());
+            out.push_str(&text[i..end]);
+            i = end;
+        }
+    }
+    out
 }
 
 /// Extract provider-generated ids from one body, in appearance order.

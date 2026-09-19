@@ -130,4 +130,47 @@ async fn tool_call_lifecycle_replays_from_cassette() {
             .any(|e| matches!(e, loopctl::stream::StreamEvent::MessageStop)),
         "the recorded stream ends with MessageStop after the tool call"
     );
+
+    let tool_part_start = events
+        .iter()
+        .position(|event| match event {
+            loopctl::stream::StreamEvent::PartStart(start) => {
+                start.index == 0
+                    && matches!(
+                        &start.part,
+                        Some(loopctl::message::MessagePart::ToolCall { id, name, .. })
+                            if id == "call_cassette_2" && name == "get_weather"
+                    )
+            }
+            _ => false,
+        })
+        .expect("the tool lane opens with a PartStart carrying the recorded call identity");
+    let tool_delta = events
+        .iter()
+        .position(|event| match event {
+            loopctl::stream::StreamEvent::IndexedDelta(delta) => {
+                delta.index == 0
+                    && matches!(
+                        delta.delta,
+                        loopctl::stream::DeltaPart::ToolCall { .. }
+                            | loopctl::stream::DeltaPart::InputJson { .. }
+                    )
+            }
+            _ => false,
+        })
+        .expect("the tool lane carries its argument delta on the same index");
+    let tool_part_stop = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                loopctl::stream::StreamEvent::PartStop { index: Some(0) }
+            )
+        })
+        .expect("the tool lane closes with a PartStop on the same index");
+    assert!(
+        tool_part_start < tool_delta && tool_delta < tool_part_stop,
+        "the tool lane is a PartStart → IndexedDelta → PartStop sequence on \
+        lane index 0 — a client that drops either boundary event fails here"
+    );
 }

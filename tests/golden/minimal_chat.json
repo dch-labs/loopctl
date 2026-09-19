@@ -1,0 +1,24 @@
+[
+  {
+    "options": {
+      "model": null,
+      "response_format": null,
+      "tool_constraint": "None"
+    },
+    "request": {
+      "messages": [
+        {
+          "parts": [
+            {
+              "text": "Reply with the single word: ready.",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "system": null,
+      "tools": null
+    }
+  }
+]

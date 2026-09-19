@@ -18,6 +18,8 @@
 
 use crate::cassette;
 use crate::{collect_events, text_of, usage_of};
+use futures::StreamExt;
+use loopctl::api::ApiClient;
 
 fn scenario(name: &str) -> cassette::Scenario {
     cassette::scenarios()
@@ -97,5 +99,62 @@ async fn tool_call_lifecycle_replays_from_cassette() {
             .iter()
             .any(|e| matches!(e, loopctl::stream::StreamEvent::MessageStop)),
         "the recorded stream ends with MessageStop after the tool call"
+    );
+}
+
+#[tokio::test]
+#[ignore = "the cassette lands when a recording attempt actually meets a 429"]
+async fn rate_limit_error_replays_from_cassette() {
+    let scenario = scenario("rate_limit_error");
+    let expected_retry_after = cassette::load_interactions(scenario.provider, scenario.name)
+        .first()
+        .and_then(|interaction| interaction.then.header.as_ref())
+        .and_then(|headers| {
+            headers
+                .iter()
+                .find(|pair| pair.name == "retry-after")
+                .map(|pair| pair.value.clone())
+        })
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs);
+
+    let server = httpmock::MockServer::start_async().await;
+    let session =
+        cassette::CassetteSession::start(scenario.provider, scenario.name, "", &server).await;
+    let client = loopctl::provider::OpenAiClient::builder()
+        .with_api_key(cassette::CASSETTE_KEY)
+        .with_base_url(cassette::client_base_url(
+            scenario.provider,
+            &session.base_url(),
+        ))
+        .with_model(scenario.model)
+        .with_stream_usage(scenario.stream_usage)
+        .build()
+        .unwrap();
+    let request =
+        loopctl::api::StreamRequest::new(vec![loopctl::message::Message::user(scenario.prompt)]);
+    let stream = client.stream_messages(&request);
+    let mut stream = std::pin::pin!(stream);
+    let mut rate_limit = None;
+    while let Some(result) = stream.next().await {
+        match result {
+            Err(loopctl::api::error::ApiError::RateLimit { retry_after, .. }) => {
+                rate_limit = Some(retry_after);
+            }
+            other => panic!(
+                "a replayed 429 must surface as the structured rate-limit error, got {other:?}"
+            ),
+        }
+    }
+    session.finish().await;
+
+    assert!(
+        rate_limit.is_some(),
+        "the replayed rate-limit exchange must reach the caller as the structured error"
+    );
+    assert_eq!(
+        rate_limit.flatten(),
+        expected_retry_after,
+        "the recorded Retry-After must reach the caller parsed"
     );
 }

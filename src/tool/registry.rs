@@ -51,15 +51,16 @@ pub struct ToolRegistry {
     /// tools of different concrete types uniformly. Insertion
     /// ([`register`](ToolRegistry::register)) overwrites any existing
     /// entry under the same name; lookup
-    /// ([`get`](ToolRegistry::get)) and schema enumeration
-    /// ([`all_schemas`](ToolRegistry::all_schemas)) iterate this map.
+    /// ([`get`](ToolRegistry::get)) resolves through this map by name.
     tools: HashMap<String, Box<dyn Tool>>,
 
     /// Registration order of the tool names.
     ///
     /// A name is appended when first registered and keeps its position
-    /// when a same-name registration overwrites the tool — the source
-    /// of [`all_tools`](ToolRegistry::all_tools)'s ordering.
+    /// when a same-name registration overwrites the tool — the
+    /// ordering source for both
+    /// [`all_tools`](ToolRegistry::all_tools) and
+    /// [`all_schemas`](ToolRegistry::all_schemas).
     order: Vec<String>,
 }
 
@@ -145,7 +146,10 @@ impl ToolRegistry {
     ///
     /// Called by the agent loop to build the tool list sent to the LLM
     /// at the start of each session (or turn, if the tool set changes).
-    /// The order is unspecified.
+    /// The schemas arrive in registration order — the same order
+    /// [`all_tools`](Self::all_tools) yields — so outbound requests are
+    /// reproducible byte-for-byte across processes for an unchanged
+    /// registry.
     ///
     /// Each schema is freshly constructed via [`Tool::schema`],
     /// so the caller does not need to worry about stale data.
@@ -160,7 +164,11 @@ impl ToolRegistry {
     /// ```
     #[must_use]
     pub fn all_schemas(&self) -> Vec<ToolSchema> {
-        self.tools.values().map(|t| t.schema()).collect()
+        self.order
+            .iter()
+            .filter_map(|name| self.tools.get(name))
+            .map(|tool| tool.schema())
+            .collect()
     }
 
     /// Return all registered tool names, sorted alphabetically.
@@ -646,6 +654,40 @@ mod tests {
         registry.register(make_tool("tool_a"));
         registry.register(make_tool("tool_b"));
         assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn all_schemas_preserve_registration_order() {
+        // Eight non-alphabetical names: a regression to map iteration
+        // would have to coincidentally draw the registration order out
+        // of 8! possibilities — a single local run cannot pass by luck.
+        let registered = [
+            "kilo", "zulu", "alpha", "romeo", "mike", "xray", "bravo", "tango",
+        ];
+        let mut registry = ToolRegistry::new();
+        for name in registered {
+            registry.register(make_tool(name));
+        }
+        let names: Vec<String> = registry
+            .all_schemas()
+            .into_iter()
+            .map(|schema| schema.tool)
+            .collect();
+        assert_eq!(
+            names, registered,
+            "the advertised tool order must be the registration order, not map order, so identical registries build identical requests"
+        );
+
+        registry.register(make_tool("zulu"));
+        let names: Vec<String> = registry
+            .all_schemas()
+            .into_iter()
+            .map(|schema| schema.tool)
+            .collect();
+        assert_eq!(
+            names, registered,
+            "a re-registration keeps the position of the first registration"
+        );
     }
 
     #[test]

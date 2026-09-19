@@ -8,7 +8,10 @@
 //! allowlisted headers, and **body bytes** — a request built
 //! differently than recorded misses every mock and fails the test.
 //! That miss is the outbound-drift guard: the entire point of the
-//! harness.
+//! harness. Each mock also requires the provider's contract headers to
+//! be *present* (never their values) — a client refactor that drops an
+//! auth or version header fails replay instead of passing every
+//! hermetic test and failing only against the real provider.
 //!
 //! Recording is a deliberate human act: set `LOOPCTL_CASSETTE=record`
 //! plus `LOOPCTL_E2E=1` (and real credentials for non-local providers)
@@ -18,7 +21,10 @@
 //! `cmpl-`, `chatcmpl-`, `resp_`) become deterministic placeholders so
 //! replay stays stable across recordings; provider values outside
 //! those prefixes ride verbatim — responses are served, never
-//! matched.
+//! matched. A rate-limit recording cannot be ordered from the
+//! provider: the attempt driver runs the request once and the
+//! session's gate writes the cassette only when the provider actually
+//! answered 429.
 
 #![allow(
     dead_code,
@@ -322,7 +328,7 @@ impl<'s> CassetteSession<'s> {
         match mode_from_env() {
             CassetteMode::Replay => {
                 let interactions = load_interactions(provider, scenario);
-                let mocks = register_replay_mocks(server, &interactions).await;
+                let mocks = register_replay_mocks(server, provider, &interactions).await;
                 CassetteSession {
                     server,
                     mode: CassetteMode::Replay,
@@ -389,39 +395,102 @@ impl<'s> CassetteSession<'s> {
                 cassette_path(&self.provider, &self.scenario)
             }
             CassetteMode::Record => {
-                let recording = self.recording.expect("record session holds its recording");
-                let bytes = recording
-                    .export_async()
-                    .await
-                    .expect("the recording exports")
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "nothing was recorded for {}/{}",
-                            self.provider, self.scenario
-                        )
-                    });
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                let mut interactions = Vec::new();
-                for document in serde_yaml::Deserializer::from_str(&text) {
-                    let value = serde::Deserialize::deserialize(document)
-                        .unwrap_or_else(|e| panic!("recorded exchange does not parse: {e}"));
-                    let interaction: Interaction = serde_yaml::from_value(value)
-                        .unwrap_or_else(|e| panic!("recorded interaction does not parse: {e}"));
-                    interactions.push(interaction);
-                }
-                scrub(&mut interactions);
-                let path = cassette_path(&self.provider, &self.scenario);
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .unwrap_or_else(|e| panic!("cannot create {parent:?}: {e}"));
-                }
-                let yaml = serde_yaml::to_string(&interactions)
-                    .unwrap_or_else(|e| panic!("scrubbed cassette does not serialize: {e}"));
-                std::fs::write(&path, yaml)
-                    .unwrap_or_else(|e| panic!("cannot write {path:?}: {e}"));
-                path
+                let (provider, scenario, interactions) = self.export_raw().await;
+                write_cassette(&provider, &scenario, interactions)
             }
         }
+    }
+
+    /// Close the session, writing the cassette only when the provider
+    /// actually rate-limited the attempt.
+    ///
+    /// A rate-limit exchange cannot be ordered from the provider — the
+    /// attempt runs, and this gate decides what is true: every recorded
+    /// response must be a 429 for the cassette to be written, otherwise
+    /// the exchange is dropped and `None` returns, so the scenario's
+    /// name never lies about what the file holds. The deliberate-act
+    /// gates all ran at [`start`](Self::start); this only refuses to
+    /// persist a non-rate-limited exchange.
+    ///
+    /// In replay mode this is a plain [`finish`](Self::finish): the
+    /// gate concerns recording only.
+    pub async fn finish_rate_limited(self) -> Option<PathBuf> {
+        match self.mode {
+            CassetteMode::Replay => Some(self.finish().await),
+            CassetteMode::Record => {
+                let (provider, scenario, interactions) = self.export_raw().await;
+                let rate_limited = interactions
+                    .iter()
+                    .all(|interaction| interaction.then.status == Some(429));
+                if !rate_limited {
+                    return None;
+                }
+                Some(write_cassette(&provider, &scenario, interactions))
+            }
+        }
+    }
+
+    /// Export the recording into parsed, unscrubbed interactions.
+    ///
+    /// The shared front half of every writer: the recording exports
+    /// exactly once, parses as a multi-document YAML stream, and hands
+    /// the interactions to the caller, which decides what survives.
+    async fn export_raw(self) -> (String, String, Vec<Interaction>) {
+        let recording = self.recording.expect("record session holds its recording");
+        let bytes = recording
+            .export_async()
+            .await
+            .expect("the recording exports")
+            .unwrap_or_else(|| {
+                panic!(
+                    "nothing was recorded for {}/{}",
+                    self.provider, self.scenario
+                )
+            });
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let mut interactions = Vec::new();
+        for document in serde_yaml::Deserializer::from_str(&text) {
+            let value = serde::Deserialize::deserialize(document)
+                .unwrap_or_else(|e| panic!("recorded exchange does not parse: {e}"));
+            let interaction: Interaction = serde_yaml::from_value(value)
+                .unwrap_or_else(|e| panic!("recorded interaction does not parse: {e}"));
+            interactions.push(interaction);
+        }
+        (self.provider, self.scenario, interactions)
+    }
+}
+
+/// Scrub a recorded exchange and write it as a cassette.
+///
+/// The shared back half of every writer: scrub, serialize, create the
+/// provider directory, write — returning the cassette's path.
+fn write_cassette(provider: &str, scenario: &str, mut interactions: Vec<Interaction>) -> PathBuf {
+    scrub(&mut interactions);
+    let path = cassette_path(provider, scenario);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("cannot create {parent:?}: {e}"));
+    }
+    let yaml = serde_yaml::to_string(&interactions)
+        .unwrap_or_else(|e| panic!("scrubbed cassette does not serialize: {e}"));
+    std::fs::write(&path, yaml).unwrap_or_else(|e| panic!("cannot write {path:?}: {e}"));
+    path
+}
+
+/// The per-provider contract headers replay asserts are present.
+///
+/// Presence only — never the value. The recorded allowlist pins the
+/// value headers (`content-type`, `accept`); these pin the headers
+/// whose values are either credentials (never recorded, by policy) or
+/// version strings, so a client refactor that stops sending one fails
+/// replay exactly like a body drift instead of passing the whole suite
+/// and failing only against the real provider. An unknown provider
+/// asserts nothing — the table covers the corpus's wire dialects.
+pub fn required_replay_headers(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "anthropic" | "zai" => &["x-api-key", "anthropic-version"],
+        "gemini" => &["x-goog-api-key"],
+        "openai" | "deepseek" | "grok" | "openai-compat" => &["authorization"],
+        _ => &[],
     }
 }
 
@@ -430,7 +499,11 @@ impl<'s> CassetteSession<'s> {
 /// Matching covers method, path, query, the recorded header allowlist,
 /// and the full request body — anything else the client sends is
 /// ignored, and anything recorded that the client builds differently
-/// misses.
+/// misses. On top of the recorded bytes, every mock requires the
+/// provider's [`required_replay_headers`] to be *present* — a header
+/// the wire contract needs is drift too, and its value is deliberately
+/// not matched (credentials are never recorded, so presence is the
+/// strongest honest assertion available).
 ///
 /// # Panics
 ///
@@ -440,8 +513,10 @@ impl<'s> CassetteSession<'s> {
 /// the only honest replay.
 pub async fn register_replay_mocks<'s>(
     server: &'s MockServer,
+    provider: &str,
     interactions: &[Interaction],
 ) -> Vec<Mock<'s>> {
+    let required = required_replay_headers(provider).to_vec();
     let mut mocks = Vec::new();
     for interaction in interactions {
         if interaction.when.body_base64.is_some() || interaction.then.body_base64.is_some() {
@@ -451,10 +526,14 @@ pub async fn register_replay_mocks<'s>(
         }
         let when = interaction.when.clone();
         let then = interaction.then.clone();
+        let required = required.clone();
         mocks.push(
             server
                 .mock_async(move |when_spec, then_spec| {
-                    apply_when(when_spec, &when);
+                    let mut spec = apply_when(when_spec, &when);
+                    for name in &required {
+                        spec = spec.header_exists(*name);
+                    }
                     apply_then(then_spec, &then);
                 })
                 .await,
@@ -888,6 +967,14 @@ pub fn scenarios() -> Vec<Scenario> {
             stream_usage: true,
         },
         Scenario {
+            provider: "openai",
+            name: "rate_limit_error",
+            model: "gpt-4.1-mini",
+            prompt: "Say hello in exactly 3 words.",
+            tools: false,
+            stream_usage: true,
+        },
+        Scenario {
             provider: "anthropic",
             name: "tool_call_lifecycle",
             model: "claude-sonnet-4-5",
@@ -896,11 +983,27 @@ pub fn scenarios() -> Vec<Scenario> {
             stream_usage: false,
         },
         Scenario {
+            provider: "anthropic",
+            name: "rate_limit_error",
+            model: "claude-sonnet-4-5",
+            prompt: "Say hello in exactly 3 words.",
+            tools: false,
+            stream_usage: false,
+        },
+        Scenario {
             provider: "gemini",
             name: "tool_call_lifecycle",
             model: "gemini-3.5-flash",
             prompt: "Use the get_weather tool to check the weather in Paris.",
             tools: true,
+            stream_usage: false,
+        },
+        Scenario {
+            provider: "gemini",
+            name: "rate_limit_error",
+            model: "gemini-3.5-flash",
+            prompt: "Say hello in exactly 3 words.",
+            tools: false,
             stream_usage: false,
         },
         Scenario {

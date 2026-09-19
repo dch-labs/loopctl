@@ -59,12 +59,30 @@ fn recorded_interaction(path: &str, body: &str) -> Interaction {
 /// run under every feature set, and the request bytes must be under
 /// the test's exact control — one flipped character is the experiment.
 fn raw_post(server: &MockServer, path: &str, body: &str) -> (u16, String) {
+    raw_post_with_headers(server, path, body, &[("Content-Type", "application/json")])
+}
+
+/// A byte-exact POST whose header set the caller controls completely.
+///
+/// The presence pins must be able to omit and add contract headers —
+/// the fixed-header [`raw_post`] cannot express either direction.
+fn raw_post_with_headers(
+    server: &MockServer,
+    path: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> (u16, String) {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect(server.address()).unwrap();
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: cassette-pin\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: cassette-pin\r\nContent-Length: {}\r\n",
         body.len()
     );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("Connection: close\r\n\r\n");
+    request.push_str(body);
     stream.write_all(request.as_bytes()).unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).unwrap();
@@ -83,7 +101,7 @@ async fn replay_fails_on_body_drift() {
     let recorded_body = r#"{"model":"qwen","messages":[{"role":"user","content":"hi"}]}"#;
     let interaction = recorded_interaction("/v1/chat/completions", recorded_body);
     let server = MockServer::start_async().await;
-    let mocks = register_replay_mocks(&server, &[interaction]).await;
+    let mocks = register_replay_mocks(&server, "", &[interaction]).await;
 
     let (ok_status, ok_body) = raw_post(&server, "/v1/chat/completions", recorded_body);
     assert_eq!(ok_status, 200, "the recorded bytes must be served");
@@ -111,10 +129,47 @@ async fn replay_consumes_every_interaction() {
     let first = recorded_interaction("/v1/chat/completions", r#"{"turn":1}"#);
     let second = recorded_interaction("/v1/chat/completions", r#"{"turn":2}"#);
     let server = MockServer::start_async().await;
-    let mocks = register_replay_mocks(&server, &[first, second]).await;
+    let mocks = register_replay_mocks(&server, "", &[first, second]).await;
 
     let (status, _) = raw_post(&server, "/v1/chat/completions", r#"{"turn":1}"#);
     assert_eq!(status, 200, "the driven interaction is served");
+
+    for mock in &mocks {
+        mock.assert();
+    }
+}
+
+#[tokio::test]
+async fn replay_requires_the_provider_contract_headers() {
+    let interaction = recorded_interaction("/v1/messages", "{}");
+    let server = MockServer::start_async().await;
+    let mocks = register_replay_mocks(&server, "anthropic", &[interaction]).await;
+
+    let (missing, _) = raw_post_with_headers(
+        &server,
+        "/v1/messages",
+        "{}",
+        &[("Content-Type", "application/json")],
+    );
+    assert_eq!(
+        missing, 404,
+        "a request missing the provider's contract headers must miss the mock — a header dropout is drift too"
+    );
+
+    let (present, _) = raw_post_with_headers(
+        &server,
+        "/v1/messages",
+        "{}",
+        &[
+            ("Content-Type", "application/json"),
+            ("x-api-key", "any-value"),
+            ("anthropic-version", "any-version"),
+        ],
+    );
+    assert_eq!(
+        present, 200,
+        "presence — never the value — is what the guard asserts"
+    );
 
     for mock in &mocks {
         mock.assert();
@@ -446,7 +501,7 @@ async fn binary_cassette_bodies_are_refused_at_replay() {
         },
     };
     let server = MockServer::start_async().await;
-    register_replay_mocks(&server, &[interaction]).await;
+    register_replay_mocks(&server, "", &[interaction]).await;
 }
 
 #[cfg(feature = "testing")]

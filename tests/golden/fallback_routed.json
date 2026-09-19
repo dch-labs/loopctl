@@ -1,0 +1,46 @@
+[
+  {
+    "options": {
+      "model": "primary-model",
+      "response_format": null,
+      "tool_constraint": "None"
+    },
+    "request": {
+      "messages": [
+        {
+          "parts": [
+            {
+              "text": "Route me to whichever model is healthy.",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "system": null,
+      "tools": null
+    }
+  },
+  {
+    "options": {
+      "model": "fallback-model",
+      "response_format": null,
+      "tool_constraint": "None"
+    },
+    "request": {
+      "messages": [
+        {
+          "parts": [
+            {
+              "text": "Route me to whichever model is healthy.",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "system": null,
+      "tools": null
+    }
+  }
+]

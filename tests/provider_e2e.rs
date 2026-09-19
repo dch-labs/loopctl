@@ -394,8 +394,9 @@ async fn record_anthropic_cassette() {
         return;
     }
     for scenario in cassette::scenarios()
+        // The rate-limit scenario is a gated attempt, not a driven recording.
         .into_iter()
-        .filter(|s| s.provider == "anthropic")
+        .filter(|s| s.provider == "anthropic" && s.name != "rate_limit_error")
     {
         let server = httpmock::MockServer::start_async().await;
         let session = cassette::CassetteSession::start(
@@ -427,9 +428,10 @@ async fn record_gemini_cassette() {
         eprintln!("{DIM}skip{RESET}  cassette recording (gemini)");
         return;
     }
+    // The rate-limit scenario is a gated attempt, not a driven recording.
     let scenarios: Vec<_> = cassette::scenarios()
         .into_iter()
-        .filter(|s| s.provider == "gemini")
+        .filter(|s| s.provider == "gemini" && s.name != "rate_limit_error")
         .collect();
     for scenario in scenarios {
         let api_key = std::env::var("GEMINI_API_KEY")
@@ -465,10 +467,11 @@ async fn record_openai_cassettes() {
     if !cassette_recording_enabled() || std::env::var("OPENAI_API_KEY").is_err() {
         eprintln!("{DIM}skip{RESET}  cassette recording (openai)");
         return;
+        // The rate-limit scenario is a gated attempt, not a driven recording.
     }
     for scenario in cassette::scenarios()
         .into_iter()
-        .filter(|s| s.provider == "openai")
+        .filter(|s| s.provider == "openai" && s.name != "rate_limit_error")
     {
         let server = httpmock::MockServer::start_async().await;
         let session = cassette::CassetteSession::start(
@@ -602,4 +605,120 @@ async fn record_zai_cassette() {
         .build()
         .unwrap();
     drive_scenario_and_save(&client, &scenario, session).await;
+}
+
+/// One rate-limit recording attempt: the minimal request against the
+/// real provider, with the session's gate deciding what is true.
+///
+/// A 429 cannot be ordered from the provider, so the attempt runs once
+/// — no bursts — and [`finish_rate_limited`](cassette::CassetteSession::finish_rate_limited)
+/// writes the cassette only when every recorded response is a 429.
+async fn attempt_rate_limit_recording<C: ApiClient>(
+    scenario: &cassette::Scenario,
+    real_base_url: &str,
+    build_client: impl FnOnce(&str) -> C,
+) {
+    let server = httpmock::MockServer::start_async().await;
+    let session =
+        cassette::CassetteSession::start(scenario.provider, scenario.name, real_base_url, &server)
+            .await;
+    let client = build_client(&session.base_url());
+    let request =
+        loopctl::api::StreamRequest::new(vec![loopctl::message::Message::user(scenario.prompt)]);
+    let stream = client.stream_messages(&request);
+    let mut stream = std::pin::pin!(stream);
+    // The provider's choice, not the driver's: a 429 surfaces as an
+    // error event, a success as a served stream. Either way the
+    // exchange is on the recording; the gate at the finish decides
+    // whether a cassette names itself rate-limited.
+    while let Some(result) = stream.next().await {
+        if let Err(e) = result {
+            eprintln!("rate-limit attempt ({}): {e}", scenario.name);
+        }
+    }
+    match session.finish_rate_limited().await {
+        Some(path) => println!("{GREEN}CASSETTE{RESET} {} → {path:?}", scenario.name),
+        None => eprintln!(
+            "{DIM}no 429{RESET}  {} — cassette not written",
+            scenario.name
+        ),
+    }
+}
+
+#[cfg(feature = "anthropic")]
+#[tokio::test]
+async fn attempt_anthropic_rate_limit_cassette() {
+    if !cassette_recording_enabled() || std::env::var("ANTHROPIC_API_KEY").is_err() {
+        eprintln!("{DIM}skip{RESET}  rate-limit attempt (anthropic)");
+        return;
+    }
+    let scenario = cassette::scenarios()
+        .into_iter()
+        .find(|s| s.provider == "anthropic" && s.name == "rate_limit_error")
+        .unwrap();
+    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap();
+    attempt_rate_limit_recording(&scenario, "https://api.anthropic.com", |base| {
+        loopctl::provider::AnthropicClient::builder()
+            .with_api_key(api_key.clone())
+            .with_base_url(cassette::client_base_url(scenario.provider, base))
+            .with_model(scenario.model)
+            .build()
+            .unwrap()
+    })
+    .await;
+}
+
+#[cfg(feature = "gemini")]
+#[tokio::test]
+async fn attempt_gemini_rate_limit_cassette() {
+    if !cassette_recording_enabled()
+        || (std::env::var("GEMINI_API_KEY").is_err() && std::env::var("GOOGLE_API_KEY").is_err())
+    {
+        eprintln!("{DIM}skip{RESET}  rate-limit attempt (gemini)");
+        return;
+    }
+    let scenario = cassette::scenarios()
+        .into_iter()
+        .find(|s| s.provider == "gemini" && s.name == "rate_limit_error")
+        .unwrap();
+    let api_key = std::env::var("GEMINI_API_KEY")
+        .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+        .unwrap();
+    attempt_rate_limit_recording(
+        &scenario,
+        "https://generativelanguage.googleapis.com",
+        |base| {
+            loopctl::provider::GeminiClient::builder()
+                .with_api_key(api_key.clone())
+                .with_base_url(cassette::client_base_url(scenario.provider, base))
+                .with_model(scenario.model)
+                .build()
+                .unwrap()
+        },
+    )
+    .await;
+}
+
+#[cfg(feature = "openai")]
+#[tokio::test]
+async fn attempt_openai_rate_limit_cassette() {
+    if !cassette_recording_enabled() || std::env::var("OPENAI_API_KEY").is_err() {
+        eprintln!("{DIM}skip{RESET}  rate-limit attempt (openai)");
+        return;
+    }
+    let scenario = cassette::scenarios()
+        .into_iter()
+        .find(|s| s.provider == "openai" && s.name == "rate_limit_error")
+        .unwrap();
+    let api_key = std::env::var("OPENAI_API_KEY").unwrap();
+    attempt_rate_limit_recording(&scenario, "https://api.openai.com", |base| {
+        loopctl::provider::OpenAiClient::builder()
+            .with_api_key(api_key.clone())
+            .with_base_url(cassette::client_base_url(scenario.provider, base))
+            .with_model(scenario.model)
+            .with_stream_usage(scenario.stream_usage)
+            .build()
+            .unwrap()
+    })
+    .await;
 }

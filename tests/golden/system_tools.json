@@ -1,0 +1,70 @@
+[
+  {
+    "options": {
+      "model": null,
+      "response_format": null,
+      "tool_constraint": "None"
+    },
+    "request": {
+      "messages": [
+        {
+          "parts": [
+            {
+              "text": "Probe the registered note tools.",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "system": "You are a deterministic fixture agent.",
+      "tools": [
+        {
+          "description": "Read a saved note by title",
+          "input_schema": {
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "type": "object"
+          },
+          "tool": "read_note"
+        },
+        {
+          "description": "Search saved notes for a term",
+          "input_schema": {
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "type": "object"
+          },
+          "tool": "search_notes"
+        },
+        {
+          "description": "Save a note with a title and body",
+          "input_schema": {
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "type": "object"
+          },
+          "tool": "write_note"
+        }
+      ]
+    }
+  }
+]

@@ -93,14 +93,17 @@ impl JsonSchemaGrammar {
     /// # Errors
     ///
     /// Returns a config-validation [`ApiError`] when a tool's
-    /// `input_schema` constrains its arguments to anything other than a
-    /// JSON object (a declared non-object `type` in either the string or
-    /// the array form, or a schema document that is not an object at
-    /// all) — the grammar envelope maps tool names to object schemas, so
-    /// any other shape would guide the completion to nonsense — or,
-    /// defensively, when the compiled envelope itself fails to
-    /// serialize. Both fail here, at construction, before any request
-    /// can leave with a silently unconstrained grammar.
+    /// `input_schema` does not explicitly declare the string
+    /// `type: "object"` — a declared non-object type in either the
+    /// string or the array form, a schema with no `type` at all (an
+    /// `enum`- or `const`-only schema can emit a non-object value, and
+    /// the tightening pass never injects the missing type), or a schema
+    /// document that is not an object — because the grammar envelope
+    /// maps tool names to object schemas and guarantees object-valued
+    /// arguments only under that explicit declaration. A defensive
+    /// envelope-serialization failure is typed too. Everything fails
+    /// here, at construction, before any request can leave with a
+    /// silently unconstrained grammar.
     ///
     /// The array form of `type` is rejected even when it names only
     /// `"object"` (`{"type": ["object"]}`): the tightening pass reads
@@ -133,15 +136,17 @@ impl JsonSchemaGrammar {
     }
 }
 
-/// Why a schema rules out object-shaped tool arguments, as a phrase for
-/// the rejection error — the grammar envelope's fail-loud reason.
+/// Why a schema cannot guarantee object-valued tool arguments, as a
+/// phrase for the rejection error — the grammar envelope's fail-loud
+/// reason.
 ///
-/// An object-typed schema, or one that declares no recognizable `type`
-/// at all, yields `None`: the first is exactly what the envelope wants,
-/// and the second cannot be proven non-object. Everything else names
-/// what it declares instead — including the array form of `type`, which
-/// is rejected outright (not just its non-object members) because the
-/// tightening pass only reads the string form.
+/// Only the explicit string `type: "object"` passes: the tightening
+/// pass never injects a missing type, and the envelope's
+/// object-valued-arguments guarantee holds only under that explicit
+/// declaration — so absence, an `enum`/`const`-only schema, a
+/// non-string `type` value, and every array form (even `["object"]`,
+/// which would ride untightened) all reject, each naming what the
+/// schema declares instead.
 fn non_object_reason(schema: &serde_json::Value) -> Option<String> {
     match schema {
         serde_json::Value::Object(map) => match map.get("type") {
@@ -153,19 +158,22 @@ fn non_object_reason(schema: &serde_json::Value) -> Option<String> {
                 }
             }
             Some(serde_json::Value::Array(declared)) => {
-                let kinds: Vec<&str> = declared
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .collect();
-                if kinds.is_empty() || kinds.len() != declared.len() {
-                    None
+                if declared.is_empty() {
+                    Some("an empty type array".to_string())
                 } else {
-                    Some(format!("type array-form [{}]", kinds.join(", ")))
+                    let kinds: Vec<&str> = declared
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect();
+                    if kinds.len() == declared.len() {
+                        Some(format!("type array-form [{}]", kinds.join(", ")))
+                    } else {
+                        Some("a type array with non-string members".to_string())
+                    }
                 }
             }
-            // Absent `type`, or a non-string non-array value: the schema
-            // cannot be proven non-object, so it passes.
-            None | Some(_) => None,
+            None => Some("no `type` declaration".to_string()),
+            Some(_) => Some("a non-string `type` value".to_string()),
         },
         serde_json::Value::Bool(_) => Some("a boolean schema document".to_string()),
         serde_json::Value::Array(_) => Some("an array schema document".to_string()),
@@ -296,6 +304,21 @@ mod tests {
                 serde_json::json!({"type": ["object"]}),
                 "array-form [object]",
             ),
+            (
+                // Degenerate array forms are declarations too — reject,
+                // do not fall back to "unprovable".
+                serde_json::json!({"type": []}),
+                "an empty type array",
+            ),
+            (
+                serde_json::json!({"type": [1]}),
+                "a type array with non-string members",
+            ),
+            // A schema with no `type` at all can emit non-object values
+            // (`{"enum": [1]}` permits the number 1), and tightening never
+            // injects the missing type — so absence rejects, fail-closed.
+            (serde_json::json!({"enum": [1]}), "no `type` declaration"),
+            (serde_json::json!({"const": []}), "no `type` declaration"),
         ] {
             let rejection = vec![ToolSchema {
                 tool: "search".into(),
@@ -303,7 +326,7 @@ mod tests {
                 input_schema: schema,
             }];
             let error = JsonSchemaGrammar::from_schemas(&rejection)
-                .expect_err("every array-form type declaration must fail compilation");
+                .expect_err("every non-explicitly-object type declaration must fail compilation");
             assert!(
                 matches!(error, ApiError::Config(ref message) if message.contains(expected_fragment)),
                 "the rejection names the declared form ({expected_fragment}): {error:?}"
@@ -407,48 +430,10 @@ mod tests {
                 .into_iter()
                 .collect::<Result<_, _>>()
                 .expect("stream ok");
-            // Two serving shapes can answer a grammar-constrained
-            // request: a native tool call (InputJson deltas carry the
-            // arguments object, and a ToolCall part names a registered
-            // tool), or the whole-output envelope (Text deltas carry one
-            // JSON object keyed by a registered tool name). Either is a
-            // valid tool call; anything else — or nothing — is not.
-            let mut native_args = String::new();
-            let mut envelope_text = String::new();
-            let mut native_tool_registered = false;
-            for ev in events {
-                match ev {
-                    crate::stream::StreamEvent::IndexedDelta(d) => match d.delta {
-                        crate::stream::DeltaPart::InputJson { partial_json } => {
-                            native_args.push_str(&partial_json);
-                        }
-                        crate::stream::DeltaPart::Text { text } => {
-                            envelope_text.push_str(&text);
-                        }
-                        _ => {}
-                    },
-                    crate::stream::StreamEvent::PartStart(part) => {
-                        if let Some(crate::message::MessagePart::ToolCall { name, .. }) = part.part
-                            && registered.contains(&name)
-                        {
-                            native_tool_registered = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let native_valid = native_tool_registered
-                && serde_json::from_str::<serde_json::Value>(&native_args)
-                    .is_ok_and(|value| value.is_object());
-            let envelope_valid = serde_json::from_str::<serde_json::Value>(&envelope_text)
-                .is_ok_and(|value| {
-                    value.as_object().is_some_and(|object| {
-                        object.len() == 1
-                            && registered.contains(object.keys().next().expect("len checked"))
-                    })
-                });
+            // The oracle is the shared helper, unit-pinned beside it:
+            // either serving shape counts, anything else does not.
             total = total.saturating_add(1);
-            if native_valid || envelope_valid {
+            if one_valid_tool_call(&events, &registered) {
                 valid = valid.saturating_add(1);
             }
         }
@@ -459,6 +444,155 @@ mod tests {
              valid tool call — native object arguments for a registered tool, \
              or a whole-output envelope keyed by one ({valid}/{total}); the \
              statistical bar waits for a larger benchmark corpus"
+        );
+    }
+
+    /// Whether one prompt's stream shows exactly one valid tool call.
+    ///
+    /// The live smoke's validity oracle, extracted so its judgment is
+    /// unit-pinnable rather than living only behind the `#[ignore]`d
+    /// live test. Two serving shapes count: exactly **one** native tool
+    /// call for a registered tool whose accumulated argument fragments
+    /// parse as one JSON object, or — when the server honored the
+    /// grammar — text that parses as one whole-output envelope: a
+    /// single-key JSON object keyed by a registered tool name whose
+    /// value is itself an object. Two tool starts, non-object
+    /// arguments, a non-object envelope value, an unregistered tool,
+    /// and plain text all fail.
+    fn one_valid_tool_call(events: &[crate::stream::StreamEvent], registered: &[String]) -> bool {
+        let mut native_args = String::new();
+        let mut envelope_text = String::new();
+        let mut registered_starts = 0usize;
+        for event in events {
+            match event {
+                crate::stream::StreamEvent::IndexedDelta(d) => match &d.delta {
+                    crate::stream::DeltaPart::InputJson { partial_json } => {
+                        native_args.push_str(partial_json);
+                    }
+                    crate::stream::DeltaPart::Text { text } => {
+                        envelope_text.push_str(text);
+                    }
+                    _ => {}
+                },
+                crate::stream::StreamEvent::PartStart(part) => {
+                    if let Some(crate::message::MessagePart::ToolCall { name, .. }) = &part.part
+                        && registered.contains(name)
+                    {
+                        registered_starts = registered_starts.saturating_add(1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let native_valid = registered_starts == 1
+            && serde_json::from_str::<serde_json::Value>(&native_args)
+                .is_ok_and(|value| value.is_object());
+        let envelope_valid =
+            serde_json::from_str::<serde_json::Value>(&envelope_text).is_ok_and(|value| {
+                value.as_object().is_some_and(|object| {
+                    object.len() == 1
+                        && object
+                            .iter()
+                            .next()
+                            .is_some_and(|(key, args)| registered.contains(key) && args.is_object())
+                })
+            });
+        native_valid || envelope_valid
+    }
+
+    /// A `PartStart` opening a native tool-call lane for `name`.
+    fn tool_start(name: &str) -> crate::stream::StreamEvent {
+        crate::stream::StreamEvent::PartStart(crate::stream::PartStart {
+            index: 0,
+            part: Some(crate::message::MessagePart::tool_call(
+                "call_test",
+                name,
+                serde_json::json!({}),
+            )),
+        })
+    }
+
+    /// An `IndexedDelta` carrying one fragment of native tool arguments.
+    fn json_delta(fragment: &str) -> crate::stream::StreamEvent {
+        crate::stream::StreamEvent::IndexedDelta(crate::stream::IndexedDelta {
+            index: 0,
+            delta: crate::stream::DeltaPart::InputJson {
+                partial_json: fragment.to_string(),
+            },
+        })
+    }
+
+    /// An `IndexedDelta` carrying one fragment of completion text.
+    fn text_delta(text: &str) -> crate::stream::StreamEvent {
+        crate::stream::StreamEvent::IndexedDelta(crate::stream::IndexedDelta {
+            index: 0,
+            delta: crate::stream::DeltaPart::Text {
+                text: text.to_string(),
+            },
+        })
+    }
+
+    #[test]
+    fn the_smoke_oracle_accepts_one_valid_call_and_rejects_the_rest() {
+        let registered = vec!["search".to_string(), "calc".to_string()];
+
+        let events = vec![
+            tool_start("search"),
+            json_delta(r#"{"q":"#),
+            json_delta(r#""rust"}"#),
+        ];
+        assert!(
+            one_valid_tool_call(&events, &registered),
+            "one native registered call with object arguments is valid"
+        );
+
+        // Two registered starts whose fragments concatenate into one
+        // object: not one tool call, however the fragments merge.
+        let events = vec![
+            tool_start("search"),
+            tool_start("calc"),
+            json_delta(r#"{"a":"#),
+            json_delta(r#"1}"#),
+        ];
+        assert!(
+            !one_valid_tool_call(&events, &registered),
+            "two tool starts cannot pass as one call"
+        );
+
+        let events = vec![tool_start("calc"), json_delta("42")];
+        assert!(
+            !one_valid_tool_call(&events, &registered),
+            "non-object native arguments are not a valid call"
+        );
+
+        let events = vec![tool_start("unknown"), json_delta(r#"{"x":1}"#)];
+        assert!(
+            !one_valid_tool_call(&events, &registered),
+            "an unregistered tool is not a valid call"
+        );
+
+        let events = vec![text_delta(r#"{"search": {"q":"#), text_delta(r#""rust"}}"#)];
+        assert!(
+            one_valid_tool_call(&events, &registered),
+            "a well-formed whole-output envelope is valid"
+        );
+
+        let events = vec![text_delta(r#"{"search": 42}"#)];
+        assert!(
+            !one_valid_tool_call(&events, &registered),
+            "an envelope value that is not an object is not a tool call"
+        );
+
+        let events = vec![text_delta(r#"{"unknown": {}}"#)];
+        assert!(
+            !one_valid_tool_call(&events, &registered),
+            "an envelope keyed by an unregistered tool is not a valid call"
+        );
+
+        let events = vec![text_delta("hello")];
+        assert!(
+            !one_valid_tool_call(&events, &registered),
+            "plain text is not a tool call"
         );
     }
 }

@@ -833,6 +833,14 @@ impl<C: ApiClient> BareLoop<C> {
     /// # example();
     /// # }
     /// ```
+    ///
+    /// Checkpoints resume at run boundaries: a machine serialized
+    /// mid-phase (a model response whose tools never ran) keeps its
+    /// pending work visible in the seeded history until the first
+    /// [`run`](crate::engine::core::Loop::run), which begins a fresh
+    /// run — the pending tool calls are dropped, never dispatched,
+    /// and the committed history survives. Drive a mid-phase tool
+    /// phase to completion in the run that started it.
     #[must_use]
     pub fn from_machine_with_managers(
         machine: LoopMachine,
@@ -1176,7 +1184,6 @@ impl<C: ApiClient> BareLoop<C> {
         }
         if fallback.state()? == crate::fallback::FallbackState::Fallback
             && fallback.active_model()?.is_none()
-            && !fallback.fallback_models()?.is_empty()
         {
             return Err(LoopError::FallbackExhausted);
         }

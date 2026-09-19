@@ -1878,6 +1878,85 @@ fn from_machine_with_managers_seeds_the_conversation() {
 }
 
 #[tokio::test]
+async fn resuming_a_mid_tool_phase_checkpoint_drops_the_pending_work() {
+    let client = RecordingClient::new("test-model");
+    client.add_text_response("answered");
+
+    // A machine serialized mid-phase: the model responded with a tool
+    // call, the tool phase never ran.
+    let mut machine = LoopMachine::from_history(vec![Message::user("check this")]);
+    let _ = machine.next_step(crate::engine::core::MachinePolicy {
+        max_turns: 5,
+        context_window: 1_000,
+        compact_threshold: 200,
+        auto_compact: false,
+    });
+    machine.model_response(
+        crate::engine::core::ModelResponse {
+            message: crate::message::Message::new(
+                crate::message::Role::Assistant,
+                vec![crate::message::MessagePart::tool_call(
+                    "call_pending",
+                    "echo",
+                    json!({ "message": "hi" }),
+                )],
+            ),
+            input_tokens: 5,
+            output_tokens: 5,
+            stop_reason: crate::engine::core::StopReason::ToolCall,
+            available_tools: Vec::new(),
+        },
+        0,
+    );
+
+    let mut agent = BareLoop::from_machine_with_managers(
+        machine,
+        make_config(),
+        Arc::new(client),
+        ToolRegistry::new(),
+        LoopManagers::new(),
+    );
+
+    // Before the run, the seeded machine's full history still shows
+    // the pending assistant tool-call message; the run boundary is
+    // where it drops.
+    assert_eq!(
+        agent.conversation().len(),
+        2,
+        "the seeded full history carries the committed user message and \
+         the pending assistant message"
+    );
+
+    let result = agent.run("next question", &RunConfig::default()).await;
+    assert!(result.is_ok(), "the resumed run completes: {result:?}");
+    let conversation = agent.conversation();
+    let pending_survives = conversation.iter().any(|message| {
+        message.parts.iter().any(|part| {
+            matches!(
+                part,
+                crate::message::MessagePart::ToolCall { id, .. } if id == "call_pending"
+            )
+        })
+    });
+    assert!(
+        !pending_survives,
+        "the run begins at a run boundary: the mid-phase pending tool call \
+         is dropped, never dispatched"
+    );
+    assert_eq!(
+        conversation.len(),
+        3,
+        "committed history + the new question + the new answer survive"
+    );
+    let turns = result.unwrap().turns;
+    assert_eq!(
+        turns.len(),
+        1,
+        "the run is one fresh turn, not a continuation of the tool phase"
+    );
+}
+
+#[tokio::test]
 async fn seeded_history_reaches_the_api_request() {
     let client = RecordingClient::new("test-model");
     client.add_text_response("done");
@@ -4471,7 +4550,7 @@ async fn switch_model_resets_fallback_circuit() {
     loop_
         .managers
         .fallback()
-        .set_original_model("primary".into())
+        .set_original_model("primary")
         .unwrap();
     loop_
         .managers
@@ -6322,4 +6401,123 @@ async fn cancel_during_tool_invocation_drops_the_in_flight_call() {
         !finished.load(Ordering::SeqCst),
         "dispatch races the cancel signal and drops the in-flight invocation — tools must be cancellation-safe"
     );
+}
+
+#[cfg(feature = "tool_health")]
+#[tokio::test]
+async fn gate_refusals_reach_the_loop_detector() {
+    use crate::detection::{DetectionConfig, DetectionManager};
+    use crate::managers::LoopManagers;
+    use crate::tool::health::ToolHealthRegistry;
+
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let client = MockClient::new("test");
+    for i in 0..10 {
+        client.add_tool_only_response(&format!("call_{i}"), "echo", &json!({ "message": "hi" }));
+    }
+
+    let health = Arc::new(ToolHealthRegistry::new());
+    let breaker = health.get_circuit_breaker("echo");
+    while health.allow_request("echo") {
+        breaker.record_failure();
+    }
+
+    let managers = LoopManagers::new()
+        .with_detection(
+            DetectionManager::new_with_config(DetectionConfig {
+                loop_threshold: 2,
+                stop_threshold: 2,
+                ..Default::default()
+            })
+            .expect("valid detection config"),
+        )
+        .with_health_registry(Arc::clone(&health));
+
+    let mut agent =
+        BareLoop::new_with_managers(Arc::new(client), registry, make_config(), managers);
+    let result = agent
+        .run(
+            "test",
+            &RunConfig {
+                max_turns: 6,
+                ..RunConfig::default()
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(LoopError::LoopDetected { .. })),
+        "a model hammering a breaker-open tool is exactly the non-adapting \
+         repetition the detector exists to catch, got {result:?}"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_fallback_turn_aborted_by_detection_leaves_no_flagged_record() {
+    use crate::detection::{ConvergenceAction, DetectionConfig, DetectionManager};
+
+    let fallback_log = Arc::new(Mutex::new(Vec::new()));
+    let fallback_reasons = Arc::new(Mutex::new(Vec::new()));
+    let managers = LoopManagers::new()
+        .with_stream_handler(fast_exhausting_handler(true))
+        .with_observer(Arc::new(TransportEventCapture {
+            log: Arc::clone(&fallback_log),
+            fallback_reasons: Arc::clone(&fallback_reasons),
+        }))
+        .with_detection(
+            DetectionManager::new_with_config(DetectionConfig {
+                convergence_count: 2,
+                on_converge: ConvergenceAction::Stop,
+                ..Default::default()
+            })
+            .expect("valid detection config"),
+        );
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(FailingStreamFallbackClient {
+            model_name: Arc::new(Mutex::new("test-model".to_string())),
+        }),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+
+    // The first run serves its fallback-served turn cleanly and flags
+    // it; the detection manager persists across runs, so the identical
+    // second answer crosses the threshold mid-turn.
+    let first = agent.run("Hi", &RunConfig::default()).await.unwrap();
+    assert_eq!(
+        first.transport_fallback_count(),
+        1,
+        "the first run's fallback-served turn is flagged"
+    );
+
+    let second = agent.run("Hi", &RunConfig::default()).await;
+    let Err(error) = &second else {
+        panic!("the hard-stop detection aborts the second run, got {second:?}")
+    };
+    assert!(
+        matches!(error, LoopError::LoopDetected { .. }),
+        "the abort is the typed loop-detected error, got {error:?}"
+    );
+    let entries = crate::error::recover_guard(fallback_log.lock()).clone();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.0 == "transport_fallback")
+            .count(),
+        2,
+        "the hook fired for the aborted turn too — before the policy aborted it"
+    );
+    // The no-record contract, mechanically: the abort path returns
+    // before any Turn is pushed, so the only turn record in existence
+    // is the first run's — the second run produced an error and no
+    // Run at all, which is what "no flagged record" means here.
+    assert_eq!(
+        first.turns.len(),
+        1,
+        "exactly one turn record exists across both runs"
+    );
+    assert_eq!(first.transport_fallback_count(), 1);
 }

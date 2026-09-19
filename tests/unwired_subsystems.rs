@@ -1743,6 +1743,89 @@ mod breaker_sequences {
     }
 
     #[tokio::test]
+    async fn breaker_retrips_with_a_nonzero_cooldown_too() {
+        // Non-zero cooldown, one tool call per run, a fresh client each
+        // time (the shared health registry carries the breaker state):
+        // run one trips, the post-cooldown probe in run two fails and
+        // re-trips, the post-cooldown probe in run three succeeds and
+        // closes. The engine drives the same re-trip through a window
+        // it actually waits out, not only the zero-cooldown fast path.
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let health = Arc::new(ToolHealthRegistry::new().with_config(
+            loopctl::tool::health::CircuitBreakerConfig {
+                failure_threshold: 1,
+                recovery_duration: std::time::Duration::from_millis(60),
+                probe_timeout: std::time::Duration::from_millis(60),
+            },
+        ));
+
+        let run_once = |executions: Arc<Mutex<Vec<()>>>,
+                        script: Vec<bool>,
+                        health: Arc<ToolHealthRegistry>,
+                        prompt: &'static str| async move {
+            let client = MockApiClient::new("m").with_responses(vec![
+                MockResponse {
+                    text: "go".to_string(),
+                    tool_call: Some(MockToolCall {
+                        id: "c".to_string(),
+                        name: "scripted".to_string(),
+                        input: serde_json::json!({}),
+                    }),
+                    stop_reason: "tool_use".to_string(),
+                },
+                MockResponse {
+                    text: "done".to_string(),
+                    tool_call: None,
+                    stop_reason: "end_turn".to_string(),
+                },
+            ]);
+            let mut registry = ToolRegistry::new();
+            registry.register(ScriptedTool { executions, script });
+            let mut loop_ = BareLoop::new(Arc::new(client), registry, SessionConfig::default());
+            loop_.set_health_registry(health);
+            loop_
+                .run(prompt, &RunConfig::default())
+                .await
+                .expect("run completes");
+        };
+
+        run_once(
+            Arc::clone(&executions),
+            vec![true, true],
+            Arc::clone(&health),
+            "one: trips",
+        )
+        .await;
+        assert_eq!(executions.lock().expect("log lock").len(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        run_once(
+            Arc::clone(&executions),
+            vec![true, true],
+            Arc::clone(&health),
+            "two: failed probe re-trips",
+        )
+        .await;
+        assert_eq!(
+            executions.lock().expect("log lock").len(),
+            2,
+            "the post-cooldown probe executes and its failure re-trips"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        run_once(
+            Arc::clone(&executions),
+            vec![false],
+            health,
+            "three: successful probe closes",
+        )
+        .await;
+        assert_eq!(
+            executions.lock().expect("log lock").len(),
+            3,
+            "after the re-trip's cooldown the next probe closes the breaker"
+        );
+    }
+
+    #[tokio::test]
     async fn breaker_retrips_on_a_failed_probe_then_closes_on_success() {
         // Zero cooldown: fail (trip) -> next call is the recovery probe,
         // fails (re-trip) -> next call probes again, succeeds (close) ->

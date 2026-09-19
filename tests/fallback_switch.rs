@@ -626,6 +626,115 @@ async fn probe_failure_retrips_to_the_fallback_model() {
     );
 }
 
+#[tokio::test]
+async fn transient_probe_failure_retrips_to_the_fallback_model() {
+    let config = loopctl::fallback::FallbackConfig {
+        trip_threshold: 1,
+        recovery_timeout: std::time::Duration::from_millis(50),
+        ..loopctl::fallback::FallbackConfig::default()
+    };
+    let manager = FallbackManager::new_with_config(config);
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-model").unwrap();
+
+    let client = ScriptedClient::new(vec![
+        Step::AuthFail,
+        Step::Text("on fallback".into()),
+        Step::AuthFail,
+        Step::Text("on fallback again".into()),
+    ]);
+    let requests = Arc::clone(&client.requests);
+    let mut agent = make_agent(client, manager);
+
+    assert!(agent.run("q", &RunConfig::default()).await.is_err());
+    assert!(agent.run("q", &RunConfig::default()).await.is_ok());
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert!(
+        agent.run("q", &RunConfig::default()).await.is_err(),
+        "the transient-failing probe fails the run"
+    );
+    assert!(
+        agent.run("q", &RunConfig::default()).await.is_ok(),
+        "the re-tripped breaker serves the fallback again instead of locking out"
+    );
+
+    let models = requests.lock().unwrap().clone();
+    assert_eq!(
+        models,
+        vec![
+            Some("primary-model".to_string()),
+            Some("fallback-model".to_string()),
+            Some("primary-model".to_string()),
+            Some("fallback-model".to_string()),
+        ],
+        "trip → fallback → transient-failing probe re-trips → fallback again"
+    );
+}
+
+#[tokio::test]
+async fn tripped_empty_chain_fails_the_turn_instead_of_serving_the_primary() {
+    let config = loopctl::fallback::FallbackConfig {
+        trip_threshold: 1,
+        ..loopctl::fallback::FallbackConfig::default()
+    };
+    let manager = FallbackManager::new_with_config(config);
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+
+    let client = ScriptedClient::new(vec![Step::AuthFail, Step::Text("never".into())]);
+    let requests = Arc::clone(&client.requests);
+    let mut agent = make_agent(client, manager);
+
+    assert!(agent.run("q", &RunConfig::default()).await.is_err());
+    let second = agent.run("q", &RunConfig::default()).await;
+    assert!(
+        matches!(second, Err(loopctl::error::LoopError::FallbackExhausted)),
+        "a tripped breaker with no fallback chain refuses to serve the known-bad primary: {second:?}"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "no request may be sent to the primary after the trip"
+    );
+}
+
+#[tokio::test]
+async fn reset_managers_returns_a_tripped_breaker_to_the_primary() {
+    let manager = FallbackManager::new(1, 1);
+    manager
+        .set_original_model("primary-model".to_string())
+        .unwrap();
+    manager.set_fallback_model("fallback-model").unwrap();
+
+    let client = ScriptedClient::new(vec![Step::AuthFail, Step::AuthFail]);
+    let requests = Arc::clone(&client.requests);
+    let mut agent = make_agent(client, manager);
+
+    assert!(
+        agent.run("q", &RunConfig::default()).await.is_err(),
+        "the first run trips the breaker"
+    );
+    let second = agent
+        .run("q", &RunConfig::default().with_reset_managers(true))
+        .await;
+    assert!(
+        second.is_err(),
+        "with no scripted responses left the re-probed primary fails again"
+    );
+    let models = requests.lock().unwrap().clone();
+    assert_eq!(
+        models,
+        vec![
+            Some("primary-model".to_string()),
+            Some("primary-model".to_string()),
+        ],
+        "reset_managers clears the trip: the second run routes to the primary, not the fallback"
+    );
+}
+
 #[test]
 fn scripted_client_text_events_shape_is_valid() {
     let events = text_events("x");

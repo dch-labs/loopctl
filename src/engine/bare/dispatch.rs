@@ -577,6 +577,7 @@ impl<C: ApiClient> BareLoop<C> {
                     true,
                     None,
                 );
+                self.post_detection(&tc, &refused);
                 self.notify_tool_post(turn_idx, &tc, &refused);
                 return Ok(refused);
             }

@@ -1697,6 +1697,29 @@ mod tests {
     }
 
     #[test]
+    fn request_body_carries_a_configured_max_tokens() {
+        let msgs = vec![Message::user("hi")];
+        let spec = RequestBodySpec {
+            model: "claude-sonnet-4",
+            messages: &msgs,
+            system: None,
+            tools: None,
+            response_format: None,
+            tool_constraint: &ToolConstraint::None,
+        };
+        let body = build_request_body(&spec, false, 1_024);
+        assert_eq!(
+            body["max_tokens"], 1_024,
+            "a non-default budget rides the wire verbatim"
+        );
+        let body = build_request_body(&spec, false, DEFAULT_MAX_TOKENS);
+        assert_eq!(
+            body["max_tokens"], DEFAULT_MAX_TOKENS,
+            "and the default is what the builder sends when nothing is set"
+        );
+    }
+
+    #[test]
     fn request_body_model() {
         let msgs = vec![Message::user("hi")];
         let body = build_request_body(

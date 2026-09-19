@@ -1,0 +1,55 @@
+[
+  {
+    "options": {
+      "model": null,
+      "response_format": {
+        "name": "greeting",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "greeting": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "greeting"
+          ],
+          "type": "object"
+        },
+        "strict": true
+      },
+      "tool_constraint": "None"
+    },
+    "request": {
+      "messages": [
+        {
+          "parts": [
+            {
+              "text": "Return a greeting object.",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "system": null,
+      "tools": [
+        {
+          "description": "Read a saved note by title",
+          "input_schema": {
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "type": "object"
+          },
+          "tool": "read_note"
+        }
+      ]
+    }
+  }
+]

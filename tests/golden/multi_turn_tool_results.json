@@ -1,0 +1,107 @@
+[
+  {
+    "options": {
+      "model": null,
+      "response_format": null,
+      "tool_constraint": "None"
+    },
+    "request": {
+      "messages": [
+        {
+          "parts": [
+            {
+              "text": "Echo the word ping through the echo tool.",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "system": null,
+      "tools": [
+        {
+          "description": "Echo a word back",
+          "input_schema": {
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "type": "object"
+          },
+          "tool": "echo"
+        }
+      ]
+    }
+  },
+  {
+    "options": {
+      "model": null,
+      "response_format": null,
+      "tool_constraint": "None"
+    },
+    "request": {
+      "messages": [
+        {
+          "parts": [
+            {
+              "text": "Echo the word ping through the echo tool.",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "parts": [
+            {
+              "text": "calling the echo tool",
+              "type": "text"
+            },
+            {
+              "id": "call_gold_echo",
+              "input": {
+                "text": "ping"
+              },
+              "name": "echo",
+              "type": "tool_call"
+            }
+          ],
+          "role": "assistant"
+        },
+        {
+          "parts": [
+            {
+              "call_id": "call_gold_echo",
+              "is_error": false,
+              "name": "echo",
+              "output": "pong",
+              "type": "tool_result"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "system": null,
+      "tools": [
+        {
+          "description": "Echo a word back",
+          "input_schema": {
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "type": "object"
+          },
+          "tool": "echo"
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,52 @@
+{
+  "max_tokens": 8192,
+  "messages": [
+    {
+      "content": "Check the weather in Paris with the weather tool.",
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "id": "call_gold_weather",
+          "input": {
+            "city": "Paris"
+          },
+          "name": "get_weather",
+          "type": "tool_use"
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "content": "18 degrees, clear sky",
+          "tool_use_id": "call_gold_weather",
+          "type": "tool_result"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "golden-model",
+  "stream": true,
+  "system": "You are a concise weather agent.",
+  "tools": [
+    {
+      "description": "Look up the current weather for a city",
+      "input_schema": {
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "type": "object"
+      },
+      "name": "get_weather"
+    }
+  ]
+}

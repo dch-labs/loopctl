@@ -667,15 +667,29 @@ fn apply_id_renames(interactions: &mut [Interaction], renames: &[(String, String
     }
 }
 
+/// The byte class an id is made of — the single definition shared by
+/// discovery and replacement, so the two can never disagree about what
+/// a token is.
+///
+/// ASCII word characters only: a preceding multi-byte character's
+/// continuation byte falls outside the class, which is exactly the
+/// boundary semantics the id grammar needs.
+fn is_id_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+}
+
 /// Rewrite one text by replacing whole id tokens, longest match first.
 ///
 /// A single left-to-right pass over the original text: at each
-/// character boundary, the longest source id that matches *and ends at
-/// a token boundary* wins; every other byte is copied verbatim. Two
+/// character boundary, the longest source id that starts *and* ends at
+/// a token boundary wins; every other byte is copied verbatim. Three
 /// properties sequential `replace` calls cannot give: a placeholder
-/// written earlier in the pass is never itself rescanned, and a
-/// shorter id that prefixes a longer one (`msg_ab` inside `msg_abcd`)
-/// never corrupts the longer token.
+/// written earlier in the pass is never itself rescanned, a shorter id
+/// that prefixes a longer one (`msg_ab` inside `msg_abcd`) never
+/// corrupts the longer token, and an id-shaped suffix inside a longer
+/// client word (`msg_ab` inside `foomsg_ab`) is never touched — the
+/// scrubbed request must stay byte-identical to what the replay client
+/// sends.
 fn rename_ids_in_text(text: &str, renames: &[(String, String)]) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -685,9 +699,8 @@ fn rename_ids_in_text(text: &str, renames: &[(String, String)]) -> String {
             .iter()
             .filter(|(from, _)| {
                 text[i..].starts_with(from.as_str())
-                    && !bytes
-                        .get(i + from.len())
-                        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+                    && (i == 0 || !bytes.get(i - 1).is_some_and(|b| is_id_byte(*b)))
+                    && !bytes.get(i + from.len()).is_some_and(|b| is_id_byte(*b))
             })
             .max_by_key(|(from, _)| from.len());
         if let Some((from, to)) = matched {
@@ -707,22 +720,25 @@ fn rename_ids_in_text(text: &str, renames: &[(String, String)]) -> String {
 ///
 /// A hand-rolled scan rather than a regex: the id grammar is a known
 /// prefix followed by word characters, and the policy (which prefixes,
-/// what replacement) belongs in named constants a reader can find.
+/// what replacement) belongs in named constants a reader can find. An
+/// id is only discovered as a whole token — the same leading and
+/// trailing boundaries [`rename_ids_in_text`] enforces — so an
+/// id-shaped suffix inside a longer word never enters the rename
+/// table and the placeholder numbering stays independent of prose.
 fn scan_generated_ids(body: &str) -> Vec<String> {
     let mut ids = Vec::new();
     let bytes = body.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         let remaining = &body[i..];
-        if let Some(prefix) = GENERATED_ID_PREFIXES
-            .iter()
-            .find(|prefix| remaining.starts_with(**prefix))
+        if (i == 0 || !bytes.get(i - 1).is_some_and(|b| is_id_byte(*b)))
+            && let Some(prefix) = GENERATED_ID_PREFIXES
+                .iter()
+                .find(|prefix| remaining.starts_with(**prefix))
         {
             let id_start = i;
             let mut end = i + prefix.len();
-            while end < bytes.len()
-                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'-')
-            {
+            while end < bytes.len() && is_id_byte(bytes[end]) {
                 end += 1;
             }
             if end > i + prefix.len() {

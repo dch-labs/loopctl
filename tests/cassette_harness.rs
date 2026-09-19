@@ -330,6 +330,38 @@ fn renames_handle_prefix_overlapping_ids() {
 }
 
 #[test]
+fn renames_require_a_leading_token_boundary() {
+    let mut interactions = vec![Interaction {
+        when: WhenSpec {
+            body: Some(r#"{"prompt":"foomsg_ab and msg_ab"}"#.to_string()),
+            ..Default::default()
+        },
+        then: ThenSpec {
+            status: Some(200),
+            body: Some(r#"{"id":"msg_ab","noise":"foomsg_cd"}"#.to_string()),
+            ..Default::default()
+        },
+    }];
+
+    scrub(&mut interactions);
+
+    assert_eq!(
+        interactions[0].when.body.as_deref().unwrap(),
+        r#"{"prompt":"foomsg_ab and msg_cassette_1"}"#,
+        "an id-shaped suffix inside a client word must survive verbatim — \
+        rewriting it would scrub the recorded request into bytes the \
+        replay client never sends, and the miss would read as client drift"
+    );
+    assert_eq!(
+        interactions[0].then.body.as_deref().unwrap(),
+        r#"{"id":"msg_cassette_1","noise":"foomsg_cd"}"#,
+        "the standalone minted id renames while a mid-word suffix never \
+        even enters the rename table — the leading boundary narrows both \
+        discovery and replacement"
+    );
+}
+
+#[test]
 fn cassette_safety_flags_a_planted_key() {
     let planted = r#"
 - when:

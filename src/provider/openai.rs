@@ -841,10 +841,16 @@ impl RequestBody {
                 #[cfg(feature = "grammar")]
                 ToolConstraint::Grammar(provider) => {
                     let has_tools = tools.is_some_and(|t| !t.is_empty());
-                    (
-                        tools.map(convert_tools),
-                        has_tools.then(|| provider.grammar().to_string()),
-                    )
+                    let guided_json = has_tools.then(|| {
+                        let grammar = provider.grammar().to_string();
+                        tracing::debug!(
+                            envelope = "whole-output guided_json",
+                            grammar_bytes = grammar.len(),
+                            "the constrained request rides the whole-output grammar envelope"
+                        );
+                        grammar
+                    });
+                    (tools.map(convert_tools), guided_json)
                 }
             }
         };
@@ -3612,7 +3618,9 @@ mod tests {
             description: "Echo".into(),
             input_schema: serde_json::json!({"type": "object"}),
         }];
-        let grammar = std::sync::Arc::new(JsonSchemaGrammar::from_schemas(&tools));
+        let grammar = std::sync::Arc::new(
+            JsonSchemaGrammar::from_schemas(&tools).expect("well-formed test schemas compile"),
+        );
         let constraint = ToolConstraint::Grammar(grammar);
         let body = RequestBody::build("gpt-4o", &msgs, None, Some(&tools), None, &constraint);
         let json = body.to_json(false);
@@ -3638,7 +3646,9 @@ mod tests {
         use crate::structured::ToolConstraint;
 
         let msgs = vec![Message::user("hi")];
-        let grammar = std::sync::Arc::new(JsonSchemaGrammar::from_schemas(&[]));
+        let grammar = std::sync::Arc::new(
+            JsonSchemaGrammar::from_schemas(&[]).expect("an empty slice compiles"),
+        );
         let constraint = ToolConstraint::Grammar(grammar);
 
         // No tools registered: guided_json must be absent so the model's

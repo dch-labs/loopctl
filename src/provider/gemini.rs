@@ -2414,7 +2414,8 @@ mod tests {
             .unwrap();
         let opts = crate::structured::RequestOptions::default().with_tool_constraint(
             crate::structured::ToolConstraint::Grammar(std::sync::Arc::new(
-                crate::provider::grammar::JsonSchemaGrammar::from_schemas(&[]),
+                crate::provider::grammar::JsonSchemaGrammar::from_schemas(&[])
+                    .expect("an empty slice compiles"),
             )),
         );
         let mut stream =

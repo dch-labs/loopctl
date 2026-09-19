@@ -1,0 +1,27 @@
+- when:
+    method: POST
+    path: /v1/chat/completions
+    header:
+    - name: content-type
+      value: application/json
+    - name: accept
+      value: '*/*'
+    body: '{"messages":[{"content":"Say hello in exactly 3 words.","role":"user"}],"model":"qwen2.5:7b","stream":true,"stream_options":{"include_usage":true}}'
+  then:
+    status: 200
+    header:
+    - name: content-type
+      value: text/event-stream
+    body: |+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789767361,"model":"qwen2.5:7b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"},"finish_reason":null}]}
+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789767361,"model":"qwen2.5:7b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" there"},"finish_reason":null}]}
+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789767361,"model":"qwen2.5:7b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null}]}
+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789767361,"model":"qwen2.5:7b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789767361,"model":"qwen2.5:7b","system_fingerprint":"fp_ollama","choices":[],"usage":{"prompt_tokens":37,"prompt_tokens_details":{"cached_tokens":36},"completion_tokens":4,"total_tokens":41}}
+
+      data: [DONE]
+

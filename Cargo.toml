@@ -9,6 +9,7 @@ homepage = "https://loopctl.rs"
 documentation = "https://docs.rs/loopctl"
 keywords = ["agent", "framework", "llm", "loop"]
 categories = ["api-bindings", "development-tools"]
+exclude = ["tests/cassettes/**"]
 readme = "README.md"
 rust-version = "1.98"
 
@@ -46,6 +47,8 @@ rmcp = { version = "3.4", optional = true, default-features = false, features = 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
 proptest = "1"
+httpmock = { version = "0.8.3", default-features = false, features = ["record"] }
+serde_yaml = "0.9"
 
 [features]
 default = []

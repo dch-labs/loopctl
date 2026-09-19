@@ -39,6 +39,8 @@
 use futures::StreamExt;
 use loopctl::api::ApiClient;
 
+mod cassette;
+
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const CYAN: &str = "\x1b[36m";
@@ -288,4 +290,159 @@ async fn bedrock_streamed_usage_test() {
     }
     let client = loopctl::provider::BedrockClient::from_env().unwrap();
     run_streamed_usage_test(&client, "Bedrock streamed usage").await;
+}
+
+/// Cassette recording driver.
+///
+/// With `LOOPCTL_CASSETTE=record` and `LOOPCTL_E2E=1`, each scenario in
+/// the scenario table runs once against the real provider *through the
+/// forwarding proxy*, and the scrubbed exchange lands in
+/// `tests/cassettes/<provider>/<scenario>.yaml`. Without those
+/// variables every driver here skips — recording is a deliberate human
+/// act, never a CI step.
+fn cassette_recording_enabled() -> bool {
+    std::env::var("LOOPCTL_E2E").as_deref() == Ok("1")
+        && std::env::var("LOOPCTL_CASSETTE").as_deref() == Ok("record")
+}
+
+async fn drive_scenario_and_save(
+    client: &dyn ApiClient,
+    scenario: &cassette::Scenario,
+    session: cassette::CassetteSession<'_>,
+) {
+    let mut request =
+        loopctl::api::StreamRequest::new(vec![loopctl::message::Message::user(scenario.prompt)]);
+    if scenario.tools {
+        request = request.with_tools(Some(vec![cassette::get_weather_tool()]));
+    }
+    let stream = client.stream_messages(&request);
+    let mut stream = std::pin::pin!(stream);
+    let mut events = Vec::new();
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(event) => events.push(event),
+            Err(e) => panic!("{} recording failed mid-stream: {e}", scenario.name),
+        }
+    }
+
+    let has_stop = events
+        .iter()
+        .any(|e| matches!(e, loopctl::stream::StreamEvent::MessageStop));
+    assert!(
+        has_stop,
+        "{}: the recorded exchange must end with MessageStop, or the cassette is junk",
+        scenario.name
+    );
+    if scenario.stream_usage {
+        let usage = events.iter().find_map(|e| match e {
+            loopctl::stream::StreamEvent::MessageDelta(md) => md.usage,
+            _ => None,
+        });
+        assert!(
+            usage.is_some_and(|u| u.input_tokens > 0),
+            "{}: the scenario exists to pin usage-on-final-chunk — the stream must carry it",
+            scenario.name
+        );
+    }
+
+    let path = session.finish().await;
+    println!("{GREEN}CASSETTE{RESET} {} → {path:?}", scenario.name);
+}
+
+#[cfg(feature = "openai")]
+#[tokio::test]
+async fn record_openai_compat_cassettes() {
+    if !cassette_recording_enabled() {
+        eprintln!("{DIM}skip{RESET}  cassette recording (openai-compat)");
+        return;
+    }
+    // The proxy forwards to an origin — the request path (/v1/…) is
+    // preserved from what the client sends, so no /v1 suffix here.
+    let real_base_url = std::env::var("LOOPCTL_CASSETTE_UPSTREAM")
+        .unwrap_or_else(|_| "http://localhost:11434".into());
+    for scenario in cassette::scenarios()
+        .into_iter()
+        .filter(|s| s.provider == "openai-compat")
+    {
+        let server = httpmock::MockServer::start_async().await;
+        let session = cassette::CassetteSession::start(
+            scenario.provider,
+            scenario.name,
+            &real_base_url,
+            &server,
+        )
+        .await;
+        let client = loopctl::provider::OpenAiClient::builder()
+            .with_api_key("ollama")
+            .with_base_url(cassette::client_base_url(
+                scenario.provider,
+                &session.base_url(),
+            ))
+            .with_model(scenario.model)
+            .with_stream_usage(scenario.stream_usage)
+            .build()
+            .unwrap();
+        drive_scenario_and_save(&client, &scenario, session).await;
+    }
+}
+
+#[cfg(feature = "anthropic")]
+#[tokio::test]
+async fn record_anthropic_cassette() {
+    if !cassette_recording_enabled() || std::env::var("ANTHROPIC_API_KEY").is_err() {
+        eprintln!("{DIM}skip{RESET}  cassette recording (anthropic)");
+        return;
+    }
+    let scenario = cassette::scenarios()
+        .into_iter()
+        .find(|s| s.provider == "anthropic")
+        .unwrap();
+    let server = httpmock::MockServer::start_async().await;
+    let session = cassette::CassetteSession::start(
+        scenario.provider,
+        scenario.name,
+        "https://api.anthropic.com",
+        &server,
+    )
+    .await;
+    let client = loopctl::provider::AnthropicClient::builder()
+        .with_api_key(std::env::var("ANTHROPIC_API_KEY").unwrap())
+        .with_base_url(session.base_url())
+        .with_model(scenario.model)
+        .build()
+        .unwrap();
+    drive_scenario_and_save(&client, &scenario, session).await;
+}
+
+#[cfg(feature = "gemini")]
+#[tokio::test]
+async fn record_gemini_cassette() {
+    if !cassette_recording_enabled()
+        || (std::env::var("GEMINI_API_KEY").is_err() && std::env::var("GOOGLE_API_KEY").is_err())
+    {
+        eprintln!("{DIM}skip{RESET}  cassette recording (gemini)");
+        return;
+    }
+    let scenario = cassette::scenarios()
+        .into_iter()
+        .find(|s| s.provider == "gemini")
+        .unwrap();
+    let api_key = std::env::var("GEMINI_API_KEY")
+        .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+        .unwrap();
+    let server = httpmock::MockServer::start_async().await;
+    let session = cassette::CassetteSession::start(
+        scenario.provider,
+        scenario.name,
+        "https://generativelanguage.googleapis.com",
+        &server,
+    )
+    .await;
+    let client = loopctl::provider::GeminiClient::builder()
+        .with_api_key(api_key)
+        .with_base_url(session.base_url())
+        .with_model(scenario.model)
+        .build()
+        .unwrap();
+    drive_scenario_and_save(&client, &scenario, session).await;
 }

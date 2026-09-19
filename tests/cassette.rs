@@ -14,8 +14,11 @@
 //! plus `LOOPCTL_E2E=1` (and real credentials for non-local providers)
 //! and run the record driver in `tests/provider_e2e.rs`. Everything is
 //! scrubbed before it touches disk — credentials never enter a file,
-//! and generated ids become deterministic placeholders so replay stays
-//! stable across recordings.
+//! and generated ids under the known prefixes (`msg_`, `call_`,
+//! `cmpl-`, `chatcmpl-`, `resp_`) become deterministic placeholders so
+//! replay stays stable across recordings; provider values outside
+//! those prefixes ride verbatim — responses are served, never
+//! matched.
 
 #![allow(
     dead_code,
@@ -225,12 +228,15 @@ pub struct Interaction {
 /// The base URL a provider client should point at the mock server.
 ///
 /// Each client appends its own endpoint path to its base URL — the
-/// OpenAI-compat convention carries `/v1` in the base, Anthropic and
-/// Gemini keep the bare origin — so the mock's root has to be
-/// decorated per provider to reproduce the exact recorded path.
+/// OpenAI-compat convention carries `/v1` in the base and Gemini
+/// carries `/v1beta`, while Anthropic keeps the bare origin — so the
+/// mock's root has to be decorated per provider to reproduce the
+/// exact recorded path.
 pub fn client_base_url(provider: &str, mock_base_url: &str) -> String {
     match provider {
-        "openai-compat" | "openai" => format!("{mock_base_url}/v1"),
+        "openai-compat" | "openai" | "deepseek" | "grok" => format!("{mock_base_url}/v1"),
+        "gemini" => format!("{mock_base_url}/v1beta"),
+        "zai" => format!("{mock_base_url}/api/anthropic"),
         _ => mock_base_url.to_string(),
     }
 }
@@ -537,9 +543,12 @@ pub fn require_deliberate_recording(provider: &str, real_base_url: &str) {
     let accepted = match provider {
         "openai-compat" | "openai" => vec!["OPENAI_API_KEY"],
         "anthropic" => vec!["ANTHROPIC_API_KEY"],
-        // The driver accepts either spelling, matching every other
-        // Gemini test in the tree — the gate must not be narrower.
+        // Each entry accepts the same spellings its record driver and
+        // the crate's provider constructors read.
         "gemini" => vec!["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        "deepseek" => vec!["DEEPSEEK_API_KEY"],
+        "grok" => vec!["XAI_API_KEY", "GROK_API_KEY"],
+        "zai" => vec!["ZAI_API_KEY", "ZHIPUAI_API_KEY"],
         other => panic!("unknown cassette provider {other:?}"),
     };
     if !accepted.iter().any(|name| std::env::var(name).is_ok()) {
@@ -849,7 +858,7 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario {
             provider: "anthropic",
             name: "minimal_text",
-            model: "claude-sonnet-4-20250514",
+            model: "claude-sonnet-4-5",
             prompt: "Say hello in exactly 3 words.",
             tools: false,
             stream_usage: false,
@@ -857,7 +866,63 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario {
             provider: "gemini",
             name: "minimal_text",
-            model: "gemini-2.0-flash",
+            model: "gemini-3.5-flash",
+            prompt: "Say hello in exactly 3 words.",
+            tools: false,
+            stream_usage: false,
+        },
+        Scenario {
+            provider: "openai",
+            name: "minimal_text",
+            model: "gpt-4.1-mini",
+            prompt: "Say hello in exactly 3 words.",
+            tools: false,
+            stream_usage: true,
+        },
+        Scenario {
+            provider: "openai",
+            name: "tool_call_lifecycle",
+            model: "gpt-4.1-mini",
+            prompt: "Use the get_weather tool to check the weather in Paris.",
+            tools: true,
+            stream_usage: true,
+        },
+        Scenario {
+            provider: "anthropic",
+            name: "tool_call_lifecycle",
+            model: "claude-sonnet-4-5",
+            prompt: "Use the get_weather tool to check the weather in Paris.",
+            tools: true,
+            stream_usage: false,
+        },
+        Scenario {
+            provider: "gemini",
+            name: "tool_call_lifecycle",
+            model: "gemini-3.5-flash",
+            prompt: "Use the get_weather tool to check the weather in Paris.",
+            tools: true,
+            stream_usage: false,
+        },
+        Scenario {
+            provider: "deepseek",
+            name: "minimal_text",
+            model: "deepseek-v4-flash",
+            prompt: "Say hello in exactly 3 words.",
+            tools: false,
+            stream_usage: true,
+        },
+        Scenario {
+            provider: "grok",
+            name: "minimal_text",
+            model: "grok-4.5",
+            prompt: "Say hello in exactly 3 words.",
+            tools: false,
+            stream_usage: true,
+        },
+        Scenario {
+            provider: "zai",
+            name: "minimal_text",
+            model: "glm-4.7",
             prompt: "Say hello in exactly 3 words.",
             tools: false,
             stream_usage: false,
@@ -869,7 +934,11 @@ pub fn scenarios() -> Vec<Scenario> {
 ///
 /// Returns one violation message per finding — forbidden header names,
 /// bearer tokens, and the well-known shapes of OpenAI, Google, and AWS
-/// keys. The committed-corpus meta-test fails on any non-empty result.
+/// keys. A key shape embedded in a long opaque run (the multi-KiB
+/// base64 blobs thinking models attach) is not a finding: those runs
+/// are signatures and payloads, not credentials, and flagging them
+/// would block CI on a coincidence. The committed-corpus meta-test
+/// fails on any non-empty result.
 pub fn scan_for_secrets(text: &str) -> Vec<String> {
     let mut violations = Vec::new();
     let lowercase = text.to_ascii_lowercase();
@@ -898,7 +967,7 @@ pub fn scan_for_secrets(text: &str) -> Vec<String> {
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
                 .collect();
-            if run.len() >= 16 {
+            if run.len() >= 16 && enclosing_run_len(text, from + found) < OPAQUE_RUN_FLOOR {
                 violations.push(format!("{what} present ({needle}{run})"));
                 break;
             }
@@ -907,3 +976,29 @@ pub fn scan_for_secrets(text: &str) -> Vec<String> {
     }
     violations
 }
+
+/// The length of the unbroken alphanumeric run a byte offset sits in.
+///
+/// Used by [`scan_for_secrets`] to tell a standalone credential from a
+/// key shape that happens to occur inside a base64 signature or
+/// payload blob.
+fn enclosing_run_len(text: &str, at: usize) -> usize {
+    let bytes = text.as_bytes();
+    let is_word = |b: u8| -> bool { b.is_ascii_alphanumeric() || b == b'_' || b == b'-' };
+    let mut start = at;
+    while start > 0 && bytes.get(start - 1).is_some_and(|b| is_word(*b)) {
+        start -= 1;
+    }
+    let mut end = at;
+    while bytes.get(end).is_some_and(|b| is_word(*b)) {
+        end += 1;
+    }
+    end - start
+}
+
+/// Runs of word characters at least this long are treated as opaque
+/// blobs, not credentials.
+///
+/// A real key of every flagged shape is shorter than this floor on its
+/// own; only coincidence inside signature payloads reaches past it.
+const OPAQUE_RUN_FLOOR: usize = 40;

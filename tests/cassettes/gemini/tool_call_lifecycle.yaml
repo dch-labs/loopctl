@@ -1,0 +1,18 @@
+- when:
+    method: POST
+    path: /v1beta/models/gemini-3.5-flash:streamGenerateContent
+    query_param:
+    - name: alt
+      value: sse
+    header:
+    - name: content-type
+      value: application/json
+    - name: accept
+      value: '*/*'
+    body: '{"contents":[{"parts":[{"text":"Use the get_weather tool to check the weather in Paris."}],"role":"user"}],"tools":[{"functionDeclarations":[{"description":"Get the current weather for a city.","name":"get_weather","parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"}}]}]}'
+  then:
+    status: 200
+    header:
+    - name: content-type
+      value: text/event-stream
+    body: "data: {\"candidates\": [{\"content\": {\"parts\": [{\"functionCall\": {\"name\": \"get_weather\",\"args\": {\"city\": \"Paris\"},\"id\": \"call_cassette_1\"},\"thoughtSignature\": \"ErwDCrkDAWkUfROKc7knHLq+dlzNjmAq0d6Ly9AJ2YSLYX220h0rpqcV/38PXpupOQ1fJ2puUi+KwgnyYZXxwrhQiujqay9wu4VOn2UXE0++cdxjlIGnP6jmwPsHavNUYNnKSkjhjPpAEznSm1rU4Hn0De9FTVc2qw9LBQJqWqr+yT8NF4vnbhjqxLbgS4ncebSBFfrL1x1tLaHE5poCf5blR+2orBC+lulsz5la25qCOdPkNFHbpswlNnmREDwYaQnZyHbzWYEEqGIVkUBI7emVw/C8ZOC3ODsJYTcRx5ze9iUzADP3yZE+TsUsofWP3hfo2fwcl/shERI9EfZ3J95+MZvu0070GmZBqbt2VMhTNHYNIQerfcPrTsCYlf0xz1eyqR13w75f13XDbM+R3+r8dRcFOM5ot9YglEy653K9LJSYFLyki1IDl8F2nQ3otYSOHldUviQkZsxvX4+O//9fNqihR21q/ZTZE2P6dC5q++aK+OgW3ranXg8L3szrhZUDTLdBRO34Oqscu5j2uEki2j4/pI1VZBH8CR+5EzREKMTZh3z7HRN/LoiKYJXdkqDlrb8MFEbMX8T/3TQj\"}],\"role\": \"model\"},\"index\": 0}],\"usageMetadata\": {\"promptTokenCount\": 59,\"candidatesTokenCount\": 16,\"totalTokenCount\": 143,\"promptTokensDetails\": [{\"modality\": \"TEXT\",\"tokenCount\": 59}],\"thoughtsTokenCount\": 68,\"serviceTier\": \"standard\"},\"modelVersion\": \"gemini-3.5-flash\",\"responseId\": \"i_CtaoPzMdnBvr0Pj9f34AI\"}\r\n\r\ndata: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"\"}],\"role\": \"model\"},\"finishReason\": \"STOP\",\"index\": 0}],\"usageMetadata\": {\"promptTokenCount\": 59,\"candidatesTokenCount\": 16,\"totalTokenCount\": 143,\"promptTokensDetails\": [{\"modality\": \"TEXT\",\"tokenCount\": 59}],\"thoughtsTokenCount\": 68,\"serviceTier\": \"standard\"},\"modelVersion\": \"gemini-3.5-flash\",\"responseId\": \"i_CtaoPzMdnBvr0Pj9f34AI\"}\r\n\r\n"

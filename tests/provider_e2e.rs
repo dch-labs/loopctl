@@ -393,25 +393,29 @@ async fn record_anthropic_cassette() {
         eprintln!("{DIM}skip{RESET}  cassette recording (anthropic)");
         return;
     }
-    let scenario = cassette::scenarios()
+    for scenario in cassette::scenarios()
         .into_iter()
-        .find(|s| s.provider == "anthropic")
-        .unwrap();
-    let server = httpmock::MockServer::start_async().await;
-    let session = cassette::CassetteSession::start(
-        scenario.provider,
-        scenario.name,
-        "https://api.anthropic.com",
-        &server,
-    )
-    .await;
-    let client = loopctl::provider::AnthropicClient::builder()
-        .with_api_key(std::env::var("ANTHROPIC_API_KEY").unwrap())
-        .with_base_url(session.base_url())
-        .with_model(scenario.model)
-        .build()
-        .unwrap();
-    drive_scenario_and_save(&client, &scenario, session).await;
+        .filter(|s| s.provider == "anthropic")
+    {
+        let server = httpmock::MockServer::start_async().await;
+        let session = cassette::CassetteSession::start(
+            scenario.provider,
+            scenario.name,
+            "https://api.anthropic.com",
+            &server,
+        )
+        .await;
+        let client = loopctl::provider::AnthropicClient::builder()
+            .with_api_key(std::env::var("ANTHROPIC_API_KEY").unwrap())
+            .with_base_url(cassette::client_base_url(
+                scenario.provider,
+                &session.base_url(),
+            ))
+            .with_model(scenario.model)
+            .build()
+            .unwrap();
+        drive_scenario_and_save(&client, &scenario, session).await;
+    }
 }
 
 #[cfg(feature = "gemini")]
@@ -423,24 +427,177 @@ async fn record_gemini_cassette() {
         eprintln!("{DIM}skip{RESET}  cassette recording (gemini)");
         return;
     }
+    let scenarios: Vec<_> = cassette::scenarios()
+        .into_iter()
+        .filter(|s| s.provider == "gemini")
+        .collect();
+    for scenario in scenarios {
+        let api_key = std::env::var("GEMINI_API_KEY")
+            .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+            .unwrap();
+        let server = httpmock::MockServer::start_async().await;
+        let session = cassette::CassetteSession::start(
+            scenario.provider,
+            scenario.name,
+            "https://generativelanguage.googleapis.com",
+            &server,
+        )
+        .await;
+        let client = loopctl::provider::GeminiClient::builder()
+            .with_api_key(api_key.clone())
+            .with_base_url(cassette::client_base_url(
+                scenario.provider,
+                &session.base_url(),
+            ))
+            .with_model(scenario.model)
+            .build()
+            .unwrap();
+        drive_scenario_and_save(&client, &scenario, session).await;
+    }
+}
+
+/// Cloud-OpenAI recordings: the openai-compat corpus's local Ollama
+/// truth, backed by the real OpenAI wire — including the fragmented
+/// tool-argument streaming Ollama emits as one delta.
+#[cfg(feature = "openai")]
+#[tokio::test]
+async fn record_openai_cassettes() {
+    if !cassette_recording_enabled() || std::env::var("OPENAI_API_KEY").is_err() {
+        eprintln!("{DIM}skip{RESET}  cassette recording (openai)");
+        return;
+    }
+    for scenario in cassette::scenarios()
+        .into_iter()
+        .filter(|s| s.provider == "openai")
+    {
+        let server = httpmock::MockServer::start_async().await;
+        let session = cassette::CassetteSession::start(
+            scenario.provider,
+            scenario.name,
+            "https://api.openai.com",
+            &server,
+        )
+        .await;
+        let client = loopctl::provider::OpenAiClient::builder()
+            .with_api_key(std::env::var("OPENAI_API_KEY").unwrap())
+            .with_base_url(cassette::client_base_url(
+                scenario.provider,
+                &session.base_url(),
+            ))
+            .with_model(scenario.model)
+            .with_stream_usage(scenario.stream_usage)
+            .build()
+            .unwrap();
+        drive_scenario_and_save(&client, &scenario, session).await;
+    }
+}
+
+/// DeepSeek cloud recording: the shared OpenAI-compat converter
+/// against DeepSeek's own response shapes.
+///
+/// One scenario per run of the driver table's DeepSeek entries; skips
+/// without the deliberate-act environment or the credential.
+#[cfg(feature = "deepseek")]
+#[tokio::test]
+async fn record_deepseek_cassettes() {
+    if !cassette_recording_enabled() || std::env::var("DEEPSEEK_API_KEY").is_err() {
+        eprintln!("{DIM}skip{RESET}  cassette recording (deepseek)");
+        return;
+    }
+    for scenario in cassette::scenarios()
+        .into_iter()
+        .filter(|s| s.provider == "deepseek")
+    {
+        let server = httpmock::MockServer::start_async().await;
+        let session = cassette::CassetteSession::start(
+            scenario.provider,
+            scenario.name,
+            "https://api.deepseek.com",
+            &server,
+        )
+        .await;
+        let client = loopctl::provider::deepseek_builder()
+            .with_base_url(cassette::client_base_url(
+                scenario.provider,
+                &session.base_url(),
+            ))
+            .with_model(scenario.model)
+            .with_stream_usage(scenario.stream_usage)
+            .build()
+            .unwrap();
+        drive_scenario_and_save(&client, &scenario, session).await;
+    }
+}
+
+/// Grok cloud recording: the shared OpenAI-compat converter against
+/// xAI's own response shapes.
+///
+/// One scenario per run of the driver table's Grok entries; skips
+/// without the deliberate-act environment or the credential.
+#[cfg(feature = "grok")]
+#[tokio::test]
+async fn record_grok_cassettes() {
+    let has_key = std::env::var("XAI_API_KEY").is_ok() || std::env::var("GROK_API_KEY").is_ok();
+    if !cassette_recording_enabled() || !has_key {
+        eprintln!("{DIM}skip{RESET}  cassette recording (grok)");
+        return;
+    }
+    for scenario in cassette::scenarios()
+        .into_iter()
+        .filter(|s| s.provider == "grok")
+    {
+        let server = httpmock::MockServer::start_async().await;
+        let session = cassette::CassetteSession::start(
+            scenario.provider,
+            scenario.name,
+            "https://api.x.ai",
+            &server,
+        )
+        .await;
+        let client = loopctl::provider::grok_builder()
+            .with_base_url(cassette::client_base_url(
+                scenario.provider,
+                &session.base_url(),
+            ))
+            .with_model(scenario.model)
+            .with_stream_usage(scenario.stream_usage)
+            .build()
+            .unwrap();
+        drive_scenario_and_save(&client, &scenario, session).await;
+    }
+}
+
+/// Z.ai cloud recording: the Anthropic-compatible dialect on its own
+/// endpoint.
+///
+/// Runs the driver table's Z.ai entries through the shared
+/// Anthropic wire shape; skips without the deliberate-act
+/// environment or the credential.
+#[cfg(feature = "zai")]
+#[tokio::test]
+async fn record_zai_cassette() {
+    let has_key = std::env::var("ZAI_API_KEY").is_ok() || std::env::var("ZHIPUAI_API_KEY").is_ok();
+    if !cassette_recording_enabled() || !has_key {
+        eprintln!("{DIM}skip{RESET}  cassette recording (zai)");
+        return;
+    }
     let scenario = cassette::scenarios()
         .into_iter()
-        .find(|s| s.provider == "gemini")
-        .unwrap();
-    let api_key = std::env::var("GEMINI_API_KEY")
-        .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+        .find(|s| s.provider == "zai")
         .unwrap();
     let server = httpmock::MockServer::start_async().await;
     let session = cassette::CassetteSession::start(
         scenario.provider,
         scenario.name,
-        "https://generativelanguage.googleapis.com",
+        "https://api.z.ai",
         &server,
     )
     .await;
-    let client = loopctl::provider::GeminiClient::builder()
-        .with_api_key(api_key)
-        .with_base_url(session.base_url())
+    let client = loopctl::provider::zai_builder()
+        .with_base_url(cassette::client_base_url(
+            scenario.provider,
+            &session.base_url(),
+        ))
         .with_model(scenario.model)
         .build()
         .unwrap();

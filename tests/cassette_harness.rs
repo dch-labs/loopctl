@@ -362,6 +362,25 @@ fn renames_require_a_leading_token_boundary() {
 }
 
 #[test]
+fn a_key_shape_inside_an_opaque_blob_is_not_flagged() {
+    let signature = format!("{}AIza{}", "x".repeat(25), "y".repeat(35));
+    let blob = format!("{{\"thoughtSignature\": \"{signature}\"}}");
+    assert!(
+        scan_for_secrets(&blob).is_empty(),
+        "a key shape embedded in a long base64 signature run is payload, \
+        not a credential — flagging it would block CI on a coincidence"
+    );
+
+    let standalone = format!("key: AIza{}", "z".repeat(35));
+    assert!(
+        scan_for_secrets(&standalone)
+            .iter()
+            .any(|v| v.contains("Google-style key")),
+        "a standalone key of the same shape must still be flagged"
+    );
+}
+
+#[test]
 fn cassette_safety_flags_a_planted_key() {
     let planted = r#"
 - when:

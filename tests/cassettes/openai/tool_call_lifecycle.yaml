@@ -1,0 +1,33 @@
+- when:
+    method: POST
+    path: /v1/chat/completions
+    header:
+    - name: content-type
+      value: application/json
+    - name: accept
+      value: '*/*'
+    body: '{"messages":[{"content":"Use the get_weather tool to check the weather in Paris.","role":"user"}],"model":"gpt-4.1-mini","stream":true,"stream_options":{"include_usage":true},"tools":[{"function":{"description":"Get the current weather for a city.","name":"get_weather","parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"}},"type":"function"}]}'
+  then:
+    status: 200
+    header:
+    - name: content-type
+      value: text/event-stream; charset=utf-8
+    body: |+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789784181,"model":"gpt-4.1-mini-2025-04-14","service_tier":"default","system_fingerprint":"fp_33e21cda63","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_cassette_2","type":"function","function":{"name":"get_weather","arguments":""}}],"refusal":null},"logprobs":null,"finish_reason":null}],"usage":null,"obfuscation":"nhv"}
+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789784181,"model":"gpt-4.1-mini-2025-04-14","service_tier":"default","system_fingerprint":"fp_33e21cda63","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\""}}]},"logprobs":null,"finish_reason":null}],"usage":null,"obfuscation":"nGChOcU5kWHJO"}
+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789784181,"model":"gpt-4.1-mini-2025-04-14","service_tier":"default","system_fingerprint":"fp_33e21cda63","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"city"}}]},"logprobs":null,"finish_reason":null}],"usage":null,"obfuscation":"RjbVt9Kzhh2P"}
+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789784181,"model":"gpt-4.1-mini-2025-04-14","service_tier":"default","system_fingerprint":"fp_33e21cda63","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\":\""}}]},"logprobs":null,"finish_reason":null}],"usage":null,"obfuscation":"jALa5gIK7q4"}
+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789784181,"model":"gpt-4.1-mini-2025-04-14","service_tier":"default","system_fingerprint":"fp_33e21cda63","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Paris"}}]},"logprobs":null,"finish_reason":null}],"usage":null,"obfuscation":"I3WHK0fgkwV"}
+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789784181,"model":"gpt-4.1-mini-2025-04-14","service_tier":"default","system_fingerprint":"fp_33e21cda63","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"}"}}]},"logprobs":null,"finish_reason":null}],"usage":null,"obfuscation":"eAgLMwJCMcaSp"}
+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789784181,"model":"gpt-4.1-mini-2025-04-14","service_tier":"default","system_fingerprint":"fp_33e21cda63","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"tool_calls"}],"usage":null,"obfuscation":"5N1SFUQdeBhIdw"}
+
+      data: {"id":"chatcmpl-cassette_1","object":"chat.completion.chunk","created":1789784181,"model":"gpt-4.1-mini-2025-04-14","service_tier":"default","system_fingerprint":"fp_33e21cda63","choices":[],"usage":{"prompt_tokens":57,"completion_tokens":14,"total_tokens":71,"prompt_tokens_details":{"cached_tokens":0,"audio_tokens":0},"completion_tokens_details":{"reasoning_tokens":0,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0}},"obfuscation":"GoT4KLz3p"}
+
+      data: [DONE]
+

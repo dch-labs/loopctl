@@ -730,6 +730,7 @@ struct ProfileSeed {
     missing_model_error: Option<ApiError>,
 }
 
+#[cfg(any(feature = "openai", feature = "anthropic"))]
 impl ProfileSeed {
     /// Record the credential variable a seeded key was read from.
     ///

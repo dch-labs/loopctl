@@ -16,10 +16,8 @@
     clippy::indexing_slicing
 )]
 
-#[path = "../cassette.rs"]
-mod cassette;
-
-use cassette::{CassetteSession, client_base_url, get_weather_tool};
+use crate::cassette;
+use crate::cassette::{CassetteSession, client_base_url, get_weather_tool};
 use futures::StreamExt;
 use loopctl::api::ApiClient;
 

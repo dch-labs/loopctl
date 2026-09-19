@@ -1023,6 +1023,7 @@ impl FallbackManager {
         index: usize,
         model: impl Into<String>,
     ) -> Result<(), crate::error::LoopError> {
+        let model = validated_model_name(&model.into())?;
         let mut state = self.lock_state()?;
         let entry = FallbackEntry::new(model).with_max_fail_count(self.config.max_fail_count);
         if index >= state.fallback_models.len() {
@@ -1096,6 +1097,10 @@ impl FallbackManager {
     ///
     /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
     pub fn set_fallback_models(&self, models: Vec<String>) -> Result<(), crate::error::LoopError> {
+        let models = models
+            .into_iter()
+            .map(|name| validated_model_name(&name))
+            .collect::<Result<Vec<String>, crate::error::LoopError>>()?;
         let max_fc = self.config.max_fail_count;
         let mut state = self.lock_state()?;
         state.fallback_models = models
@@ -2310,6 +2315,46 @@ mod tests {
             mgr.active_model().unwrap().as_deref(),
             Some("fallback"),
             "after the re-trip the fallback serves again"
+        );
+    }
+
+    #[test]
+    fn chain_mutation_apis_validate_names_all_or_nothing() {
+        let mgr = FallbackManager::new(1, 1);
+        mgr.set_fallback_model("fb-one").unwrap();
+
+        assert!(
+            mgr.insert_fallback_model(0, "  ").is_err(),
+            "insert rejects a whitespace-only name like every other entry point"
+        );
+        assert!(
+            mgr.insert_fallback_model(0, "  fb-two  ").is_ok(),
+            "and trims what it accepts"
+        );
+        assert_eq!(
+            mgr.fallback_models().unwrap().first().cloned(),
+            Some("fb-two".to_string()),
+            "the trimmed insert landed at the requested index"
+        );
+
+        // The bulk replacement is all-or-nothing: one bad name rejects
+        // the whole call and leaves the existing chain intact.
+        assert!(
+            mgr.set_fallback_models(vec!["good".to_string(), "\t".to_string()])
+                .is_err(),
+            "the bulk API rejects an input containing a bad name"
+        );
+        assert_eq!(
+            mgr.fallback_models().unwrap().len(),
+            2,
+            "the rejected bulk call left the chain untouched"
+        );
+        mgr.set_fallback_models(vec!["  a  ".to_string(), "b".to_string()])
+            .unwrap();
+        assert_eq!(
+            mgr.fallback_models().unwrap(),
+            vec!["a".to_string(), "b".to_string()],
+            "a fully valid bulk input replaces the chain with trimmed names"
         );
     }
 

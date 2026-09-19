@@ -6510,14 +6510,21 @@ async fn a_fallback_turn_aborted_by_detection_leaves_no_flagged_record() {
         2,
         "the hook fired for the aborted turn too — before the policy aborted it"
     );
-    // The no-record contract, mechanically: the abort path returns
-    // before any Turn is pushed, so the only turn record in existence
-    // is the first run's — the second run produced an error and no
-    // Run at all, which is what "no flagged record" means here.
+    // The no-record contract, mechanically: `run` pushes each Run at
+    // the top of the run, aborted or not, so the second run's record
+    // exists and must carry zero turns — the abort path returned before
+    // any Turn was pushed into it.
+    let runs = &agent.session().runs;
     assert_eq!(
-        first.turns.len(),
-        1,
-        "exactly one turn record exists across both runs"
+        runs.len(),
+        2,
+        "both runs are recorded, the aborted one included"
+    );
+    assert_eq!(
+        runs.get(1).map(|run| run.turns.len()),
+        Some(0),
+        "the detection-aborted run recorded no turns — its fallback-served \
+         turn left no flagged record"
     );
     assert_eq!(first.transport_fallback_count(), 1);
 }

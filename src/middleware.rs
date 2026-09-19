@@ -168,6 +168,24 @@ pub(crate) fn shell_words(command: &str) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
+/// Absolutize a working-directory spelling against the process's
+/// current directory when it is relative.
+///
+/// `ToolContext::cwd` defaults to `"."`, and lexical resolution of a
+/// relative cwd would anchor to the filesystem root — the wrong
+/// directory for every check that follows. This joins a relative
+/// spelling onto the process cwd lexically (no `canonicalize`: the
+/// join target need not exist, and symlink identity is not part of any
+/// contract here); absolute spellings ride through unchanged.
+pub(crate) fn resolved_cwd(cwd: &str) -> String {
+    if cwd.starts_with('/') {
+        return cwd.to_string();
+    }
+    let process =
+        std::env::current_dir().map_or_else(|_| ".".to_string(), |dir| dir.display().to_string());
+    lexical_path(&process, cwd)
+}
+
 /// Whether a token stream opens with a `<shell> -c` wrapper.
 ///
 /// Shell-likeness is name-shaped (`sh`, `bash`, anything ending in

@@ -76,16 +76,21 @@ impl PathExtractor for WritePathExtractor {
 
 /// The redirection targets of a shell command, verbatim.
 ///
-/// One level of `<shell> -c` wrapping is unwrapped first, so a wrapped
-/// payload's redirections are seen; an unparseable command (unbalanced
-/// quote) yields no targets — the verifier is the component that fails
-/// loud on unparseable input, the extractor only reports what it can
-/// trust.
+/// Both the command and one level of `<shell> -c` payload are scanned,
+/// so a redirection outside the wrapper and one inside it are both
+/// seen; an unparseable command (unbalanced quote) yields no targets —
+/// the verifier is the component that fails loud on unparseable input,
+/// the extractor only reports what it can trust.
 fn redirection_targets(command: &str) -> Vec<String> {
     let Ok(tokens) = shell_words(command) else {
         return Vec::new();
     };
-    let tokens = unwrap_shell_payload(tokens);
+    let payload = if is_wrapped_shell(&tokens) {
+        unwrap_shell_payload(tokens.clone())
+    } else {
+        Vec::new()
+    };
+    let tokens: Vec<String> = tokens.into_iter().chain(payload).collect();
     let mut targets = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         if let Some(target) = inline_redirect_target(token) {

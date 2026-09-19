@@ -314,6 +314,34 @@ fn shell_redirection_extraction() {
         );
     }
 
+    // A redirection outside the wrapper evicts too: the wrapper's own
+    // output is as much a write as the payload's.
+    let paths = extractor.paths_with_cwd(
+        "Bash",
+        &json!({"command": "sh -c 'echo hi' > out.txt"}),
+        "/repo",
+    );
+    assert_eq!(
+        paths,
+        vec!["/repo/out.txt".to_string()],
+        "an outer redirection survives the wrapper"
+    );
+
+    // Both levels at once: outer and inner targets are extracted
+    // together.
+    let paths = extractor.paths_with_cwd(
+        "Bash",
+        &json!({"command": "sh -c 'x > inner.txt' > outer.txt"}),
+        "/repo",
+    );
+    let mut sorted = paths;
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        vec!["/repo/inner.txt".to_string(), "/repo/outer.txt".to_string()],
+        "outer and inner redirections are one write set"
+    );
+
     // A wrapped payload's redirections are seen through the wrapper.
     for (command, expected) in [
         ("sh -c 'echo hi > out.txt'", "/repo/out.txt"),
@@ -567,8 +595,35 @@ async fn verification_judges_the_input_as_sent_not_as_rewritten() {
 }
 
 #[tokio::test]
+async fn the_default_cwd_checks_the_real_parent() {
+    // ToolContext::default() carries cwd "."; with the root-anchoring
+    // fixed, a relative target resolves against the process's working
+    // directory (the crate root under cargo test), so an existing file
+    // passes and a genuinely missing parent fails — not /.
+    let verifier = CommandVerifier::new();
+    let ctx = ToolContext::default();
+    let result = verifier
+        .verify_call(&ctx, "Write", &json!({"path": "Cargo.toml"}))
+        .await;
+    assert!(
+        result.passed,
+        "the crate manifest's parent exists — the default cwd checks the \
+         real directory: {result:?}"
+    );
+    let result = verifier
+        .verify_call(&ctx, "Write", &json!({"path": "no-such-dir/x.txt"}))
+        .await;
+    assert!(
+        !result.passed && result.diagnostics.contains("no-such-dir"),
+        "a missing parent under the real cwd fails with its name: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn root_target_gets_a_coherent_diagnostic() {
-    for path in ["/", ".."] {
+    // "/" is the root target; ".." is not — under a resolved cwd it
+    // names the parent of the working directory, a real directory.
+    for path in ["/"] {
         let result = verify(json!({"path": path})).await;
         assert!(
             !result.passed,

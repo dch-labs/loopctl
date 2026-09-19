@@ -12,7 +12,7 @@ use std::pin::Pin;
 
 use serde_json::Value;
 
-use super::super::{is_wrapped_shell, lexical_path, shell_words, string_field};
+use super::super::{is_wrapped_shell, lexical_path, resolved_cwd, shell_words, string_field};
 use super::{Verifier, VerifyResult};
 use crate::tool::ToolContext;
 
@@ -210,7 +210,7 @@ impl CommandVerifier {
     /// The filesystem root is rejected outright — it is a directory,
     /// never a writable file target.
     fn verify_write_path(ctx: &ToolContext, path: &str) -> VerifyResult {
-        let resolved = lexical_path(&ctx.cwd, path);
+        let resolved = lexical_path(&resolved_cwd(&ctx.cwd), path);
         let Some(parent) = std::path::Path::new(&resolved)
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())

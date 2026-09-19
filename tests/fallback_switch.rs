@@ -735,6 +735,35 @@ async fn reset_managers_returns_a_tripped_breaker_to_the_primary() {
     );
 }
 
+#[tokio::test]
+async fn routing_uses_slash_bearing_model_names_verbatim() {
+    // A second primary-name family: provider-style names with slashes
+    // and dots ride the routing machinery verbatim — no sanitization,
+    // no truncation at a separator.
+    let manager = FallbackManager::new(1, 1);
+    manager
+        .set_original_model("org/infra.primary-2".to_string())
+        .unwrap();
+    manager
+        .set_fallback_model("fallback.vendor/model-b")
+        .unwrap();
+    let client = ScriptedClient::new(vec![Step::AuthFail, Step::Text("served".into())]);
+    let requests = Arc::clone(&client.requests);
+    let mut agent = make_agent(client, manager);
+
+    assert!(agent.run("q", &RunConfig::default()).await.is_err());
+    assert!(agent.run("q", &RunConfig::default()).await.is_ok());
+    let models = requests.lock().unwrap().clone();
+    assert_eq!(
+        models,
+        vec![
+            Some("org/infra.primary-2".to_string()),
+            Some("fallback.vendor/model-b".to_string()),
+        ],
+        "slash-bearing names route verbatim in both directions"
+    );
+}
+
 #[test]
 fn scripted_client_text_events_shape_is_valid() {
     let events = text_events("x");

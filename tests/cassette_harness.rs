@@ -367,8 +367,14 @@ fn a_key_shape_inside_an_opaque_blob_is_not_flagged() {
     let blob = format!("{{\"thoughtSignature\": \"{signature}\"}}");
     assert!(
         scan_for_secrets(&blob).is_empty(),
-        "a key shape embedded in a long base64 signature run is payload, \
-        not a credential — flagging it would block CI on a coincidence"
+        "a key shape that begins mid-token, inside a base64 signature \
+        blob, is payload coincidence — flagging it would block CI on a \
+        coincidence"
+    );
+    let sk_blob = format!("{}sk-{}", "x".repeat(25), "y".repeat(48));
+    assert!(
+        scan_for_secrets(&sk_blob).is_empty(),
+        "an sk- shape mid-token inside a blob is the same payload class"
     );
 
     let standalone = format!("key: AIza{}", "z".repeat(35));
@@ -378,6 +384,17 @@ fn a_key_shape_inside_an_opaque_blob_is_not_flagged() {
             .any(|v| v.contains("Google-style key")),
         "a standalone key of the same shape must still be flagged"
     );
+    for real_length in [
+        format!("key: sk-{}", "a".repeat(48)),
+        format!("key: sk-proj-{}", "b".repeat(43)),
+    ] {
+        assert!(
+            scan_for_secrets(&real_length)
+                .iter()
+                .any(|v| v.contains("OpenAI-style key")),
+            "a real-length standalone OpenAI key ({real_length:?}) — itself a             run of 51+ word characters — must be flagged: a credential             always arrives delimited, so its needle starts a token, and             length alone must never exempt it"
+        );
+    }
 }
 
 #[test]

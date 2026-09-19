@@ -934,11 +934,13 @@ pub fn scenarios() -> Vec<Scenario> {
 ///
 /// Returns one violation message per finding — forbidden header names,
 /// bearer tokens, and the well-known shapes of OpenAI, Google, and AWS
-/// keys. A key shape embedded in a long opaque run (the multi-KiB
-/// base64 blobs thinking models attach) is not a finding: those runs
-/// are signatures and payloads, not credentials, and flagging them
-/// would block CI on a coincidence. The committed-corpus meta-test
-/// fails on any non-empty result.
+/// keys. A key shape that begins mid-token — inside one of the
+/// multi-KiB base64 signature blobs thinking models attach — is not a
+/// finding: that is payload coincidence, not a credential. A key
+/// shape at the start of its token is a finding at any length,
+/// because a real credential always arrives delimited (a JSON value,
+/// a header, a query parameter), never as the tail of a longer word.
+/// The committed-corpus meta-test fails on any non-empty result.
 pub fn scan_for_secrets(text: &str) -> Vec<String> {
     let mut violations = Vec::new();
     let lowercase = text.to_ascii_lowercase();
@@ -967,7 +969,12 @@ pub fn scan_for_secrets(text: &str) -> Vec<String> {
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
                 .collect();
-            if run.len() >= 16 && enclosing_run_len(text, from + found) < OPAQUE_RUN_FLOOR {
+            let needle_start = from + found;
+            let mid_token = text
+                .as_bytes()
+                .get(needle_start.wrapping_sub(1))
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-');
+            if run.len() >= 16 && !mid_token {
                 violations.push(format!("{what} present ({needle}{run})"));
                 break;
             }
@@ -976,29 +983,3 @@ pub fn scan_for_secrets(text: &str) -> Vec<String> {
     }
     violations
 }
-
-/// The length of the unbroken alphanumeric run a byte offset sits in.
-///
-/// Used by [`scan_for_secrets`] to tell a standalone credential from a
-/// key shape that happens to occur inside a base64 signature or
-/// payload blob.
-fn enclosing_run_len(text: &str, at: usize) -> usize {
-    let bytes = text.as_bytes();
-    let is_word = |b: u8| -> bool { b.is_ascii_alphanumeric() || b == b'_' || b == b'-' };
-    let mut start = at;
-    while start > 0 && bytes.get(start - 1).is_some_and(|b| is_word(*b)) {
-        start -= 1;
-    }
-    let mut end = at;
-    while bytes.get(end).is_some_and(|b| is_word(*b)) {
-        end += 1;
-    }
-    end - start
-}
-
-/// Runs of word characters at least this long are treated as opaque
-/// blobs, not credentials.
-///
-/// A real key of every flagged shape is shorter than this floor on its
-/// own; only coincidence inside signature payloads reaches past it.
-const OPAQUE_RUN_FLOOR: usize = 40;

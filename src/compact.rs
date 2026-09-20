@@ -481,6 +481,12 @@ pub trait ContextCompactor: Send + Sync {
     /// Returns a [`CompactionOutcome`] containing the compacted message
     /// list and telemetry data.
     ///
+    /// Cancellation safety: the engine races this future against the
+    /// loop's cancel signal, and a cancel drops it mid-flight — the same
+    /// contract tool invocations follow. Implementations must be
+    /// cancellation-safe (drop-safe futures; no required cleanup that
+    /// only runs to completion).
+    ///
     /// # Arguments
     ///
     /// * `messages` — The full conversation history to compact.

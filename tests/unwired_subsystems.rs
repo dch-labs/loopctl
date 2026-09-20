@@ -65,11 +65,11 @@ impl Tool for FailingTool {
         "Always fails"
     }
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }
+        ToolSchema::new(
+            self.name().to_string(),
+            self.description().to_string(),
+            serde_json::json!({"type": "object"}),
+        )
     }
     fn call(
         &self,
@@ -278,13 +278,7 @@ mod hook_guidance {
                     messages.remove(0);
                 }
                 let tokens_after = context.counter.count(&messages);
-                CompactionOutcome {
-                    messages,
-                    tokens_after,
-                    tokens_saved: context.tokens_before.saturating_sub(tokens_after),
-                    success: true,
-                    error: None,
-                }
+                CompactionOutcome::compacted(messages, context.tokens_before, tokens_after)
             })
         }
     }
@@ -299,11 +293,11 @@ mod hook_guidance {
             "Echoes"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,
@@ -466,14 +460,14 @@ mod shield_enforcement {
             "Counts"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({
                     "type": "object",
                     "properties": {"command": {"type": "string"}}
                 }),
-            }
+            )
         }
         fn call(
             &self,
@@ -505,14 +499,14 @@ mod shield_enforcement {
             "Counts"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({
                     "type": "object",
                     "properties": {"command": {"type": "string"}}
                 }),
-            }
+            )
         }
         fn call(
             &self,
@@ -1749,11 +1743,11 @@ mod breaker_sequences {
             "Scripted outcomes"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,
@@ -1845,11 +1839,11 @@ mod breaker_sequences {
             "Always succeeds"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,
@@ -2161,11 +2155,11 @@ mod breaker_sequences {
             "Hangs"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,
@@ -2344,14 +2338,14 @@ mod shield_sequences {
             "Counts"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({
                     "type": "object",
                     "properties": {"command": {"type": "string"}}
                 }),
-            }
+            )
         }
         fn call(
             &self,
@@ -2479,13 +2473,7 @@ mod hook_sequences {
                     messages.remove(0);
                 }
                 let tokens_after = context.counter.count(&messages);
-                CompactionOutcome {
-                    messages,
-                    tokens_after,
-                    tokens_saved: context.tokens_before.saturating_sub(tokens_after),
-                    success: true,
-                    error: None,
-                }
+                CompactionOutcome::compacted(messages, context.tokens_before, tokens_after)
             })
         }
     }
@@ -2500,11 +2488,11 @@ mod hook_sequences {
             "Echoes"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,
@@ -2738,11 +2726,11 @@ mod parallel_gate {
             "Fails slowly"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn is_concurrency_safe(&self) -> bool {
             true
@@ -2954,11 +2942,11 @@ mod full_stack {
             "Always fails"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,
@@ -2985,11 +2973,11 @@ mod full_stack {
             "Echoes"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,
@@ -3015,14 +3003,14 @@ mod full_stack {
             "Shell"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({
                     "type": "object",
                     "properties": {"command": {"type": "string"}}
                 }),
-            }
+            )
         }
         fn call(
             &self,
@@ -3070,13 +3058,7 @@ mod full_stack {
                     messages.remove(0);
                 }
                 let tokens_after = context.counter.count(&messages);
-                CompactionOutcome {
-                    messages,
-                    tokens_after,
-                    tokens_saved: context.tokens_before.saturating_sub(tokens_after),
-                    success: true,
-                    error: None,
-                }
+                CompactionOutcome::compacted(messages, context.tokens_before, tokens_after)
             })
         }
     }
@@ -3236,11 +3218,11 @@ mod randomized_sweep {
             "Echoes"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,
@@ -3265,11 +3247,11 @@ mod randomized_sweep {
             "Scripted outcomes"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,
@@ -3302,14 +3284,14 @@ mod randomized_sweep {
             "Shell"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({
                     "type": "object",
                     "properties": {"command": {"type": "string"}}
                 }),
-            }
+            )
         }
         fn call(
             &self,
@@ -3488,11 +3470,11 @@ mod cancellation_recovery {
             "Scripted hang"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,
@@ -3724,11 +3706,11 @@ mod cancellation_recovery {
             "Echoes"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,

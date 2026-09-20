@@ -117,6 +117,20 @@ mod scenarios {
         events: AtomicUsize,
     }
 
+    /// An observer counting compaction events behind a shared handle.
+    struct CountingObserver {
+        events: Arc<AtomicUsize>,
+    }
+
+    impl LoopObserver for CountingObserver {
+        fn name(&self) -> &'static str {
+            "CountingObserver"
+        }
+        fn on_compaction(&self, _ctx: &CompactedContext) {
+            self.events.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     /// A contributor injecting a fixed chunk of transient context.
     struct ChunkyContributor {
         chars: usize,
@@ -169,13 +183,7 @@ mod scenarios {
         ) -> Pin<Box<dyn Future<Output = CompactionOutcome> + Send + '_>> {
             Box::pin(async move {
                 let tokens_after = HeuristicTokenCounter.count(&messages);
-                CompactionOutcome {
-                    tokens_saved: 0,
-                    messages,
-                    tokens_after,
-                    success: false,
-                    error: Some("summarizer unavailable".to_string()),
-                }
+                CompactionOutcome::failed(messages, tokens_after, "summarizer unavailable")
             })
         }
     }
@@ -217,11 +225,11 @@ mod scenarios {
         }
 
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
 
         fn call(
@@ -585,13 +593,7 @@ mod scenarios {
             ) -> Pin<Box<dyn Future<Output = CompactionOutcome> + Send + '_>> {
                 Box::pin(async move {
                     let tokens_after = context.counter.count(&messages);
-                    CompactionOutcome {
-                        tokens_saved: 0,
-                        messages,
-                        tokens_after,
-                        success: true,
-                        error: None,
-                    }
+                    CompactionOutcome::compacted(messages, tokens_after, tokens_after)
                 })
             }
         }
@@ -702,6 +704,38 @@ mod scenarios {
         assert!(
             client_handle.served_request_tokens().is_empty(),
             "the run dies at the failed compaction — no request is served"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_compactor_keeps_the_compaction_observer_silent() {
+        // A failed pass never fires on_compaction — the event means a
+        // compaction happened, and no savings can be reported for one
+        // that did not.
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model").with_responses(vec![final_response()]),
+        );
+        let config = SessionConfig::default()
+            .with_context_window(300)
+            .with_compact_threshold(80)
+            .with_system_prompt("s".repeat(200));
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+        agent.set_context_manager(Arc::new(ContextManager::new(Arc::new(FailingCompactor))));
+        let events = Arc::new(AtomicUsize::new(0));
+        agent.register_observer(Arc::new(CountingObserver {
+            events: Arc::clone(&events),
+        }));
+
+        let result = agent.run(&"x".repeat(1_000), &RunConfig::default()).await;
+
+        assert!(
+            matches!(result, Err(LoopError::ContextExceeded { .. })),
+            "the failing compactor ends the run: {result:?}"
+        );
+        assert_eq!(
+            events.load(Ordering::SeqCst),
+            0,
+            "on_compaction never fires for a failed pass"
         );
     }
 
@@ -892,13 +926,7 @@ mod scenarios {
                         kept.remove(1);
                     }
                     let tokens_after = context.counter.count(&kept);
-                    CompactionOutcome {
-                        tokens_saved: context.tokens_before.saturating_sub(tokens_after),
-                        messages: kept,
-                        tokens_after,
-                        success: true,
-                        error: None,
-                    }
+                    CompactionOutcome::compacted(kept, context.tokens_before, tokens_after)
                 })
             }
         }
@@ -1233,13 +1261,7 @@ mod scenarios {
                     ran.store(true, Ordering::SeqCst);
                     let kept: Vec<Message> = messages.last().cloned().into_iter().collect();
                     let tokens_after = context.counter.count(&kept);
-                    CompactionOutcome {
-                        tokens_saved: context.tokens_before.saturating_sub(tokens_after),
-                        messages: kept,
-                        tokens_after,
-                        success: true,
-                        error: None,
-                    }
+                    CompactionOutcome::compacted(kept, context.tokens_before, tokens_after)
                 })
             }
         }

@@ -1153,6 +1153,37 @@ mod tests {
     }
 
     #[test]
+    fn the_turn_budget_beats_emergency_compaction() {
+        // turns_taken >= max_turns is decided before the emergency
+        // check: a context at 97% of the window on the last permitted
+        // turn ends MaxTurnsExceeded, not compaction-then-overflow.
+        let policy = MachinePolicy {
+            max_turns: 1,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: true,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user("q")]);
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::CallLLM { .. }
+        ));
+        machine.model_response(tool_response("echo", &[], 10), 10);
+        let _ = machine.next_step(policy);
+        machine.tool_results(vec![Message::user("done")]);
+        machine.set_context_tokens(97);
+
+        assert!(
+            matches!(
+                machine.next_step(policy),
+                MachineStep::Done(MachineOutcome::MaxTurnsExceeded)
+            ),
+            "the exhausted turn budget wins over the emergency compaction \
+             the same step could request"
+        );
+    }
+
+    #[test]
     fn fail_during_awaiting_tools_yields_done_failed() {
         let mut machine = small_machine();
         let _ = machine.next_step(test_policy(5));

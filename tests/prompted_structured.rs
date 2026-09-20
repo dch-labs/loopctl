@@ -204,7 +204,7 @@ async fn a_tool_call_only_failure_still_reports_its_input() {
                 "the input value itself stays visible: {message}"
             );
         }
-        other @ StructuredError::Api(_) => panic!("expected Deserialize, got {other:?}"),
+        other => panic!("expected Deserialize, got {other:?}"),
     }
 }
 
@@ -299,7 +299,7 @@ async fn a_second_failure_returns_the_reason_and_bounded_last_output() {
                 "the embedded output is bounded, not unbounded"
             );
         }
-        other @ StructuredError::Api(_) => panic!("expected Deserialize, got {other:?}"),
+        other => panic!("expected Deserialize, got {other:?}"),
     }
 }
 
@@ -376,7 +376,7 @@ async fn an_api_failure_fails_fast_without_a_retry() {
     .expect_err("the provider failure surfaces as the api error");
     match err {
         StructuredError::Api(_) => {}
-        other @ StructuredError::Deserialize(_) => panic!("expected Api, got {other:?}"),
+        other => panic!("expected Api, got {other:?}"),
     }
     assert_eq!(
         client.create_message_calls(),
@@ -399,7 +399,7 @@ async fn an_api_failure_on_the_retry_itself_surfaces_as_the_api_error() {
     .expect_err("a retry that itself fails surfaces as the api error");
     match err {
         StructuredError::Api(_) => {}
-        other @ StructuredError::Deserialize(_) => panic!("expected Api, got {other:?}"),
+        other => panic!("expected Api, got {other:?}"),
     }
     assert_eq!(
         client.create_message_calls(),

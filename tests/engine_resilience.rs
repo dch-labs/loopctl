@@ -159,11 +159,11 @@ async fn a_zero_probe_timeout_still_converges_through_the_gate() {
             "Fails while the flag is set"
         }
         fn schema(&self) -> loopctl::tool::ToolSchema {
-            loopctl::tool::ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            loopctl::tool::ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,

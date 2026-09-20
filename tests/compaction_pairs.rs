@@ -146,16 +146,13 @@ fn part_id(messages: &[Message], idx: usize) -> String {
 
 /// A fixed compaction context, irrelevant to the pairing contracts.
 fn ctx() -> CompactionContext {
-    CompactionContext {
-        tokens_before: 10_000,
-        reason: CompactReason::ThresholdExceeded,
-        context_window: 8_000,
-        turn: 3,
-        counter: Arc::new(HeuristicTokenCounter),
-
-        instructions: None,
-        additional_context: Vec::new(),
-    }
+    CompactionContext::new(
+        10_000,
+        CompactReason::ThresholdExceeded,
+        8_000,
+        3,
+        Arc::new(HeuristicTokenCounter),
+    )
 }
 
 #[tokio::test]

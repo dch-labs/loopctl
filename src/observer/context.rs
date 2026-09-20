@@ -22,7 +22,11 @@ pub struct RunStartContext {
 ///
 /// Captures the run's completion status, optional error description, total
 /// turns executed, and wall-clock duration in milliseconds.
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases — construct through [`new`](Self::new); struct
+/// literals compile only inside the crate.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RunEndContext {
     /// Whether the run completed successfully.
     ///
@@ -47,6 +51,34 @@ pub struct RunEndContext {
     pub duration_ms: u64,
 }
 
+impl RunEndContext {
+    /// Create a run-end context from its four facts.
+    ///
+    /// The construction path for code outside the crate — the type is
+    /// `#[non_exhaustive]`, so struct literals compile only inside the
+    /// crate. Hosts testing their observers build synthetic events
+    /// through this constructor.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::observer::RunEndContext;
+    ///
+    /// let ctx = RunEndContext::new(true, None, 3, 1_500);
+    /// assert!(ctx.success);
+    /// assert_eq!(ctx.total_turns, 3);
+    /// ```
+    #[must_use]
+    pub fn new(success: bool, error: Option<String>, total_turns: usize, duration_ms: u64) -> Self {
+        Self {
+            success,
+            error,
+            total_turns,
+            duration_ms,
+        }
+    }
+}
+
 /// Context for [`LoopObserver::on_turn_start`](crate::observer::LoopObserver::on_turn_start).
 ///
 /// Provides the turn number and the user query that initiated it.
@@ -68,7 +100,11 @@ pub struct TurnStartContext {
 ///
 /// Reports whether the turn succeeded, any error, its duration,
 /// and the token counts consumed during the turn.
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is constructed by the engine — external code
+/// reads it, never builds it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TurnEndContext {
     /// Turn number.
     ///
@@ -327,7 +363,11 @@ pub struct ToolCallReceivedContext {
 ///
 /// Sent before a tool is executed, providing the tool name and
 /// the call ID assigned by the API.
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is constructed by the engine — external code
+/// reads it, never builds it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ToolPreContext {
     /// Turn number.
     ///
@@ -403,7 +443,11 @@ pub struct ToolPostContext {
 ///
 /// Reports the estimated token counts before and after compaction and the
 /// number of tokens saved.
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is constructed by the engine — external code
+/// reads it, never builds it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CompactedContext {
     /// Estimated token count before compaction.
     ///
@@ -456,7 +500,11 @@ pub struct FallbackContext {
 /// case no flagged record exists for it (see
 /// [`on_transport_fallback`](crate::observer::LoopObserver::on_transport_fallback)
 /// for the tally-vs-count distinction).
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is constructed by the engine — external code
+/// reads it, never builds it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TransportFallbackContext {
     /// Turn number.
     ///

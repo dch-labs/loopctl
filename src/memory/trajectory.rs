@@ -22,12 +22,7 @@
 //! observer.on_run_start(&RunStartContext {
 //!     session_id: uuid::Uuid::new_v4(),
 //! });
-//! observer.on_run_end(&RunEndContext {
-//!     success: true,
-//!     error: None,
-//!     total_turns: 0,
-//!     duration_ms: 0,
-//! });
+//! observer.on_run_end(&RunEndContext::new(true, None, 0, 0));
 //!
 //! let records = observer.records();
 //! assert_eq!(records.len(), 1);

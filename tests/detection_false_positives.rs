@@ -207,11 +207,11 @@ impl Tool for ChangingMultipartTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: "search".into(),
-            description: "Returns a changing multipart result".into(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }
+        ToolSchema::new(
+            "search",
+            "Returns a changing multipart result",
+            serde_json::json!({"type": "object"}),
+        )
     }
 
     fn call(
@@ -248,11 +248,11 @@ impl Tool for StuckMultipartTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: "search".into(),
-            description: "Returns the same multipart result every call".into(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }
+        ToolSchema::new(
+            "search",
+            "Returns the same multipart result every call",
+            serde_json::json!({"type": "object"}),
+        )
     }
 
     fn call(
@@ -285,11 +285,11 @@ impl Tool for ChangingTextTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: "search".into(),
-            description: "Returns a changing text result".into(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }
+        ToolSchema::new(
+            "search",
+            "Returns a changing text result",
+            serde_json::json!({"type": "object"}),
+        )
     }
 
     fn call(
@@ -326,11 +326,11 @@ impl Tool for FlippingTool {
         "Returns stuck results, then changing ones"
     }
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: "search".into(),
-            description: "Returns stuck results, then changing ones".into(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }
+        ToolSchema::new(
+            "search",
+            "Returns stuck results, then changing ones",
+            serde_json::json!({"type": "object"}),
+        )
     }
     fn call(
         &self,
@@ -415,11 +415,11 @@ impl Tool for IdenticalOutputTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: "search".into(),
-            description: "Returns the same result for every input".into(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }
+        ToolSchema::new(
+            "search",
+            "Returns the same result for every input",
+            serde_json::json!({"type": "object"}),
+        )
     }
 
     fn call(

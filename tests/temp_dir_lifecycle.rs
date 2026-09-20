@@ -48,11 +48,11 @@ impl Tool for CaptureCtxTool {
         "Records its tool context"
     }
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: serde_json::json!({"type": "object", "properties": {}}),
-        }
+        ToolSchema::new(
+            self.name().to_string(),
+            self.description().to_string(),
+            serde_json::json!({"type": "object", "properties": {}}),
+        )
     }
     fn call(
         &self,

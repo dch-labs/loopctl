@@ -40,21 +40,21 @@
 //! let user_msg = Message::user("What files are in /tmp?");
 //!
 //! // Create an assistant message with a tool invocation
-//! let assistant_msg = Message {
-//!     role: Role::Assistant,
-//!     parts: vec![
+//! let assistant_msg = Message::new(
+//!     Role::Assistant,
+//!     vec![
 //!         MessagePart::text("Let me check that for you."),
 //!         MessagePart::tool_call("tool_1", "list_files", serde_json::json!({"path": "/tmp"})),
 //!     ],
-//! };
+//! );
 //!
 //! // Create a tool-result message
-//! let tool_result_msg = Message {
-//!     role: Role::User, // tool results are sent back as "user" role
-//!     parts: vec![
+//! let tool_result_msg = Message::new(
+//!     Role::User, // tool results are sent back as "user" role
+//!     vec![
 //!         MessagePart::tool_result("tool_1", "list_files", ToolContent::from_string("file1.txt\nfile2.txt"), false),
 //!     ],
-//! };
+//! );
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -83,7 +83,12 @@ use std::fmt;
 /// assert_eq!(msg.role, Role::User);
 /// assert_eq!(msg.parts.len(), 1);
 /// ```
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases — construct through [`new`](Self::new) or the
+/// `Message::user`-style helpers; struct literals compile
+/// only inside the crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Message {
     /// Who sent this message.
     ///
@@ -326,8 +331,14 @@ impl fmt::Display for Role {
 /// let tool_part = MessagePart::tool_call("id1", "search", serde_json::json!({"q": "test"}));
 /// let result_part = MessagePart::tool_result("id1", "search", "found 3 results", false);
 /// ```
+/// `#[non_exhaustive]` so new part kinds can arrive in minor
+/// releases — matches need a `_` wildcard arm. The
+/// [`ToolResult`](Self::ToolResult) variant is itself
+/// `#[non_exhaustive]`; patterns over its fields keep using
+/// `..`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum MessagePart {
     /// Plain text content.
     ///
@@ -402,6 +413,7 @@ pub enum MessagePart {
     /// variant and appends it to the conversation history so the model
     /// can reason about the output.
     #[serde(rename = "tool_result")]
+    #[non_exhaustive]
     ToolResult {
         /// The ID of the tool-call part this result corresponds to.
         ///

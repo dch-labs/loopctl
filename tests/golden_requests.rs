@@ -395,15 +395,15 @@ impl Tool for FixtureTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name.to_string(),
-            description: self.description.to_string(),
-            input_schema: json!({
+        ToolSchema::new(
+            self.name.to_string(),
+            self.description.to_string(),
+            json!({
                 "type": "object",
                 "properties": {"text": {"type": "string"}},
                 "required": ["text"]
             }),
-        }
+        )
     }
 
     fn call(
@@ -445,15 +445,15 @@ fn shared_conversation() -> StreamRequest {
         ),
     ])
     .with_system(Some("You are a concise weather agent.".to_string()))
-    .with_tools(Some(vec![ToolSchema {
-        tool: "get_weather".to_string(),
-        description: "Look up the current weather for a city".to_string(),
-        input_schema: json!({
+    .with_tools(Some(vec![ToolSchema::new(
+        "get_weather".to_string(),
+        "Look up the current weather for a city".to_string(),
+        json!({
             "type": "object",
             "properties": {"city": {"type": "string"}},
             "required": ["city"]
         }),
-    }]))
+    )]))
 }
 
 /// Capture the exact body a provider client puts on the wire for the
@@ -882,4 +882,105 @@ fn update_goldens_is_explicit() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The structured-exclusivity claim, pinned at the wire: a
+/// `response_format` option removes the tool array from the body the
+/// provider built — a regression emitting both fails here instead of
+/// only against the live API.
+async fn constrained_wire_omits_tools<C: ApiClient>(build_client: impl FnOnce(&str) -> C) -> Value {
+    let server = httpmock::MockServer::start_async().await;
+    let recording = server
+        .record_async(|rule| {
+            rule.filter(|when| {
+                when.any_request();
+            });
+        })
+        .await;
+    let client = build_client(&server.base_url());
+    let request = shared_conversation();
+    let options = loopctl::structured::RequestOptions::new().with_response_format(
+        loopctl::structured::ResponseFormat {
+            name: "out".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: false,
+        },
+    );
+    let mut stream = client.stream_messages_with_options(&request, options);
+    while stream.next().await.is_some() {}
+    let bytes = recording
+        .export_async()
+        .await
+        .expect("the recording exports")
+        .expect("the provider client sent its request");
+    let body = first_recorded_request_body(&String::from_utf8_lossy(&bytes));
+    let value: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("the constrained wire body is not JSON: {error}"));
+    value
+}
+
+#[tokio::test]
+#[cfg(feature = "openai")]
+async fn openai_constrained_wire_omits_tools() {
+    let value = constrained_wire_omits_tools(|base| {
+        loopctl::provider::OpenAiClient::builder()
+            .with_api_key("golden-key")
+            .with_base_url(format!("{base}/v1"))
+            .with_model("golden-model")
+            .build()
+            .expect("the openai client builds")
+    })
+    .await;
+    assert!(
+        value.get("tools").is_none(),
+        "the openai-shaped body carries no tools array at all under a format"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "anthropic")]
+async fn anthropic_constrained_wire_omits_tools() {
+    let value = constrained_wire_omits_tools(|base| {
+        loopctl::provider::AnthropicClient::builder()
+            .with_api_key("golden-key")
+            .with_base_url(base.to_string())
+            .with_model("golden-model")
+            .build()
+            .expect("the anthropic client builds")
+    })
+    .await;
+    // Anthropic expresses the format as a forced tool: the registry's
+    // tools are gone and exactly the forced entry remains.
+    let tools = value
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("the forced tool rides the tools array");
+    assert_eq!(
+        tools.len(),
+        1,
+        "one forced tool, not the registry: {tools:?}"
+    );
+    assert_eq!(
+        tools[0].get("name").and_then(Value::as_str),
+        Some("out"),
+        "the forced entry is the format's own tool"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "gemini")]
+async fn gemini_constrained_wire_omits_tools() {
+    let value = constrained_wire_omits_tools(|base| {
+        loopctl::provider::GeminiClient::builder()
+            .with_api_key("golden-key")
+            .with_base_url(base.to_string())
+            .with_model("golden-model")
+            .build()
+            .expect("the gemini client builds")
+    })
+    .await;
+    assert!(
+        value.get("tools").is_none(),
+        "the gemini body carries no tools array at all under a format"
+    );
 }

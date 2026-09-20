@@ -50,15 +50,15 @@ impl Tool for CountingTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name.to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
+        ToolSchema::new(
+            self.name.to_string(),
+            self.description().to_string(),
+            json!({
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"]
             }),
-        }
+        )
     }
 
     fn call(

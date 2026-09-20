@@ -21,7 +21,10 @@ use std::sync::Arc;
 /// Different triggers may warrant different compaction strategies.
 /// For example, an [`Emergency`](CompactReason::Emergency) compaction
 /// should be more aggressive than a routine threshold check.
+/// `#[non_exhaustive]` so new reasons can arrive in minor
+/// releases — matches need a `_` wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum CompactReason {
     /// Token usage exceeded the configured threshold percentage.
     ///
@@ -64,7 +67,11 @@ impl fmt::Display for CompactReason {
 /// Compactors can use this information to decide how aggressively to
 /// compact — e.g. an emergency compaction may use more aggressive
 /// summarization than a routine threshold check.
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases — construct through [`new`](Self::new); struct
+/// literals compile only inside the crate.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct CompactionContext {
     /// Estimated token count before compaction.
     ///
@@ -122,12 +129,46 @@ pub struct CompactionContext {
     pub additional_context: Vec<String>,
 }
 
+impl CompactionContext {
+    /// Create a compaction context with no hook contributions.
+    ///
+    /// The construction path for code outside the crate — the type is
+    /// `#[non_exhaustive]`, so struct literals compile only inside the
+    /// crate. The driver populates the hook fields (`instructions`,
+    /// `additional_context`) when hooks supply them; this constructor
+    /// covers the hook-less shape, which is what a compactor's unit
+    /// fixtures need.
+    #[must_use]
+    pub fn new(
+        tokens_before: u64,
+        reason: CompactReason,
+        context_window: u64,
+        turn: usize,
+        counter: Arc<dyn TokenCounter>,
+    ) -> Self {
+        Self {
+            tokens_before,
+            reason,
+            context_window,
+            turn,
+            counter,
+            instructions: None,
+            additional_context: Vec::new(),
+        }
+    }
+}
+
 /// Result of a single compaction pass.
 ///
 /// Returned by [`ContextCompactor::compact`](super::ContextCompactor::compact),
 /// this struct contains the compacted message list along with telemetry data
 /// about what happened.
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases — compactors construct it through
+/// [`compacted`](Self::compacted), [`no_change`](Self::no_change),
+/// or [`failed`](Self::failed).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CompactionOutcome {
     /// The compacted message list.
     ///
@@ -201,6 +242,23 @@ impl CompactionOutcome {
         }
     }
 
+    /// Create an outcome representing a failed compaction pass.
+    ///
+    /// For compactors that could not produce a usable result — the
+    /// carried error explains why, and the message list passes through
+    /// unchanged so the caller can compare real measurements. Token
+    /// savings are zero: nothing was committed, so nothing was saved.
+    #[must_use]
+    pub fn failed(messages: Vec<Message>, tokens_after: u64, error: impl Into<String>) -> Self {
+        Self {
+            tokens_saved: 0,
+            messages,
+            tokens_after,
+            success: false,
+            error: Some(error.into()),
+        }
+    }
+
     /// Estimate the token count for a slice of messages.
     ///
     /// Convenience static method for compactor implementations that need to
@@ -222,7 +280,11 @@ impl CompactionOutcome {
 /// Produced by [`ContextManager::ensure_context_fits`](super::ContextManager::ensure_context_fits)
 /// when compaction occurs. Observers receive this via
 /// [`on_compaction`](crate::observer::LoopObserver::on_compaction).
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is produced by the compaction machinery —
+/// external code reads it, never builds it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CompactTelemetry {
     /// Why compaction was triggered.
     ///
@@ -259,7 +321,11 @@ pub struct CompactTelemetry {
 /// across user/assistant/tool roles. Captured by
 /// [`ContextManager::build_telemetry`](super::ContextManager::build_telemetry)
 /// and bundled into [`CompactTelemetry::pre_compact`].
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is produced by the compaction machinery —
+/// external code reads it, never builds it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PreCompactStats {
     /// Total number of messages in the conversation.
     ///
@@ -301,7 +367,11 @@ pub struct PreCompactStats {
 /// with how much the pass reclaimed. Captured by
 /// [`ContextManager::build_telemetry`](super::ContextManager::build_telemetry)
 /// and bundled into [`CompactTelemetry::post_compact`].
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is produced by the compaction machinery —
+/// external code reads it, never builds it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PostCompactStats {
     /// Total number of messages after compaction.
     ///
@@ -424,7 +494,10 @@ impl std::error::Error for ContextOverflow {}
 ///
 /// Tells the caller whether compaction occurred and provides the
 /// (possibly compacted) message list.
+/// `#[non_exhaustive]` so new variants can arrive in minor
+/// releases — matches need a `_` wildcard arm.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum EnsureContextResult {
     /// Compaction occurred and produced a shorter message list.
     ///

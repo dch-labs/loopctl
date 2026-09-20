@@ -41,11 +41,11 @@ impl Tool for EchoTool {
         "Echoes a fixed output"
     }
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }
+        ToolSchema::new(
+            self.name().to_string(),
+            self.description().to_string(),
+            serde_json::json!({"type": "object"}),
+        )
     }
     fn call(
         &self,

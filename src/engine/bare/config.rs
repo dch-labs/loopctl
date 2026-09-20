@@ -507,6 +507,13 @@ impl<C: ApiClient> BareLoop<C> {
     ///     RequestOptions::new().with_tool_constraint(ToolConstraint::Strict),
     /// );
     /// ```
+    ///
+    /// Like every `set_*` configurator, this asserts the loop has not
+    /// started running only in debug builds; a release build accepts a
+    /// call between runs — after `run()` returns, even once the session
+    /// has started — and the new options apply from the next provider
+    /// turn (options are read per turn). Configure before the first
+    /// `run()`; reconfiguring a live session is not a supported path.
     pub fn set_request_options(&mut self, options: RequestOptions) {
         self.debug_assert_idle();
         self.request_options = options;

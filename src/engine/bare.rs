@@ -245,8 +245,9 @@ pub struct BareLoop<C: ApiClient> {
     ///
     /// Set via [`cancel()`](BareLoop::cancel). Checked at the top of every
     /// loop iteration (before streaming) and between tool dispatches.
-    /// Streaming is also cancel-aware via `tokio::select!` — the loop
-    /// will wake up mid-stream when cancelled.
+    /// Streaming, tool invocations, and in-flight compaction passes are
+    /// also cancel-aware via `tokio::select!` — the loop will wake up
+    /// mid-stream, mid-tool, or mid-compaction when cancelled.
     cancelled: Arc<CancelSignal>,
 
     /// Optional callback invoked for each text delta during streaming.
@@ -937,6 +938,11 @@ impl<C: ApiClient> BareLoop<C> {
     ///   must therefore be cancellation-safe (drop-safe futures; no required
     ///   cleanup that only runs to completion), the same contract the
     ///   dispatch path and the MCP server adapter impose.
+    /// - During a compaction pass: the in-flight pass is raced against the
+    ///   cancel signal in a biased `tokio::select!`, and when cancel wins
+    ///   the pass is dropped mid-flight — compactors follow the same
+    ///   cancellation-safety contract as tools (drop-safe futures; no
+    ///   required cleanup that only runs to completion).
     pub fn cancel(&self) {
         self.cancelled.cancel();
     }
@@ -1628,13 +1634,20 @@ impl<C: ApiClient> BareLoop<C> {
     /// # Errors
     ///
     /// Propagates [`LoopError::ContextExceeded`] when compaction could not
-    /// reduce the history enough.
+    /// reduce the history enough, and [`LoopError::Cancelled`] when the
+    /// cancel signal fires while a pass is in flight — the machine stays
+    /// awaiting its compaction result and the uncompacted history survives.
     async fn handle_compact(
         &mut self,
         reason: crate::compact::types::CompactReason,
     ) -> Result<(), LoopError> {
         let turn = self.machine.turns_taken();
-        let outcome = self.run_compaction(turn, reason).await?;
+        let cancelled = Arc::clone(&self.cancelled);
+        let outcome = tokio::select! {
+            biased;
+            () = cancelled.notified() => return Err(LoopError::Cancelled),
+            outcome = self.run_compaction(turn, reason) => outcome?,
+        };
         match outcome.compacted {
             Some(compacted) => {
                 self.machine.compaction_result(

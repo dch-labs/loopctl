@@ -510,9 +510,10 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Like every `set_*` configurator, this asserts the loop has not
     /// started running only in debug builds; a release build accepts a
-    /// mid-run call; the new options apply from the next turn (options
-    /// are read per turn). Configure before `run()` — mid-run
-    /// reconfiguration is not a supported path.
+    /// call between runs — after `run()` returns, even once the session
+    /// has started — and the new options apply from the next provider
+    /// turn (options are read per turn). Configure before the first
+    /// `run()`; reconfiguring a live session is not a supported path.
     pub fn set_request_options(&mut self, options: RequestOptions) {
         self.debug_assert_idle();
         self.request_options = options;

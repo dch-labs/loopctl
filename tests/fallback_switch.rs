@@ -1062,6 +1062,7 @@ async fn host_override_precedence_holds_on_the_non_streaming_transport() {
     let client = OptionsClient::new(vec![Step::Text("served".into())]);
     let seen = Arc::clone(&client.seen);
     let mut agent = options_agent(client, None);
+    agent.set_turn_mode(loopctl::engine::TurnMode::NonStreaming);
     agent.set_request_options(loopctl::structured::RequestOptions::new().with_model("host-model"));
     agent
         .run("q", &RunConfig::default())

@@ -502,9 +502,8 @@ pub struct Turn {
 /// assert_eq!(run.output.as_deref(), Some("4"));
 /// ```
 /// `#[non_exhaustive]` so fields can be added in minor
-/// releases; it is produced by the engine and carried by
-/// serde — external code reads it and deserializes it, never
-/// builds it.
+/// releases; the engine produces it, serde carries it, and external
+/// code constructs it through [`new`](Self::new).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Run {
@@ -714,9 +713,8 @@ impl Default for Run {
 /// assert_eq!(session.runs.len(), 2);
 /// ```
 /// `#[non_exhaustive]` so fields can be added in minor
-/// releases; it is produced by the engine and carried by
-/// serde — external code reads it and deserializes it, never
-/// builds it.
+/// releases; the engine produces it, serde carries it, and external
+/// code constructs it through [`new`](Self::new).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Session {

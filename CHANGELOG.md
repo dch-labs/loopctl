@@ -41,9 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/2.0.0.
   | `MemoryEntry` | `MemoryEntry::new(category, text)` for fresh entries (already existed); a store restoring a persisted row uses the new restore builders (`with_id`, `with_tags`, `with_created_at`, `with_relevance`, `with_access_count`, `with_last_accessed`, `with_last_decayed`) alongside the existing `with_tag`/`validated` |
   | `CompactionOutcome` | `CompactionOutcome::compacted(messages, tokens_before, tokens_after)` / `no_change(messages)` / the new `failed(messages, tokens_after, error)` |
   | `RunEndContext` | `RunEndContext::new(success, error, total_turns, duration_ms)` |
-  | `TurnEndContext`, `ToolPreContext`, `CompactedContext`, `TransportFallbackContext` | matches add a `_` arm; engine-constructed, no external construction to migrate |
+  | `TurnEndContext`, `ToolPreContext`, `CompactedContext`, `TransportFallbackContext` | engine-constructed structs, nothing to construct or match — destructuring patterns need `..` |
   | `StructuredError` | matches add a `_` arm; variant construction is unaffected |
-  | `Turn`, `Run`, `Session`, `ToolCall` | engine-constructed and serde-carried; deserialization unchanged, nothing to migrate |
+  | `Turn`, `ToolCall` | engine-constructed and serde-carried; deserialization unchanged, nothing to migrate |
+  | `Run`, `Session` | `Run::new(input, config)` and `Session::new(config)` remain the public constructors — unaffected by the marker |
   | `CompactTelemetry` | engine-constructed, nothing to migrate |
   | `CompactionContext` | `CompactionContext::new(tokens_before, reason, context_window, turn, counter)` — the hook-less fixture shape; the driver fills hook fields internally |
   | `CompactReason`, `EnsureContextResult` | matches add a `_` arm; variant construction unaffected |

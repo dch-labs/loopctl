@@ -9,7 +9,7 @@
 use serde_json::Value;
 
 use super::PathExtractor;
-use crate::middleware::{is_wrapped_shell, lexical_path, shell_words, string_field};
+use crate::middleware::{is_wrapped_shell, lexical_path, resolved_cwd, shell_words, string_field};
 
 /// The input field names probed, in order, for an edit/write target
 /// path.
@@ -48,11 +48,13 @@ const REDIRECT_OPERATORS: &[&str] = &[">>", "2>>", "2>", "1>>", "1>", "&>", ">&"
 ///   statically knowable, and over-returning guesses would flush the
 ///   cache on every shell call.
 ///
-/// Paths are normalized lexically against the cwd, so a relative read
+/// Paths are normalized lexically against the cwd (a relative spelling
+/// anchoring to the process working directory), so a relative read
 /// under `/repo` and a write to the same file under a different cwd
-/// spelling land on one string. The context-free [`paths`](PathExtractor::paths)
-/// seam normalizes against the process root instead — through the
-/// middleware, the intended path, the call's real cwd is always used.
+/// spelling land on one string — the same path identity the write
+/// verifier uses. The context-free [`paths`](PathExtractor::paths) seam
+/// anchors its implicit `.` the same way; through the middleware, the
+/// intended path, the call's real cwd is always used.
 pub struct WritePathExtractor;
 
 impl PathExtractor for WritePathExtractor {
@@ -61,14 +63,15 @@ impl PathExtractor for WritePathExtractor {
     }
 
     fn paths_with_cwd(&self, _tool_name: &str, input: &Value, cwd: &str) -> Vec<String> {
+        let cwd = resolved_cwd(cwd);
         if let Some(command) = string_field(input, &["command", "cmd"]) {
             return redirection_targets(command)
                 .iter()
-                .map(|target| lexical_path(cwd, target))
+                .map(|target| lexical_path(&cwd, target))
                 .collect();
         }
         match string_field(input, PATH_FIELDS) {
-            Some(path) => vec![lexical_path(cwd, path)],
+            Some(path) => vec![lexical_path(&cwd, path)],
             None => Vec::new(),
         }
     }

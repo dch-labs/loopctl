@@ -426,6 +426,55 @@ async fn write_invalidates_cached_read() {
 }
 
 #[tokio::test]
+async fn an_outer_wrapped_redirection_evicts_the_cached_read() {
+    let read_executions = Arc::new(std::sync::Mutex::new(0usize));
+    let bash_executions = Arc::new(std::sync::Mutex::new(0usize));
+    let mut registry = ToolRegistry::new();
+    registry.register(CountingTool {
+        name: "Read",
+        executions: Arc::clone(&read_executions),
+    });
+    registry.register(CountingTool {
+        name: "Bash",
+        executions: Arc::clone(&bash_executions),
+    });
+    let pipeline = ToolPipeline::builder()
+        .with_middleware(MemoizingMiddleware::new(
+            vec!["Read".to_string()],
+            vec!["Bash".to_string()],
+            Arc::new(WritePathExtractor),
+            5,
+        ))
+        .with_core(Arc::new(registry))
+        .build()
+        .expect("the pin's pipeline builds");
+
+    let read_input = json!({"path": "out.txt"});
+    let mut ctx = ctx_for("Read", read_input.clone(), "/repo");
+    pipeline.dispatch(&mut ctx).await;
+    let mut ctx = ctx_for("Read", read_input.clone(), "/repo");
+    pipeline.dispatch(&mut ctx).await;
+    assert_eq!(
+        *read_executions.lock().unwrap(),
+        1,
+        "the second read is served from the cache"
+    );
+
+    // The redirection sits OUTSIDE the wrapper — the extraction level
+    // the unwrapping could silently drop.
+    let bash_input = json!({"command": "sh -c 'echo new' > out.txt"});
+    let mut ctx = ctx_for("Bash", bash_input, "/repo");
+    pipeline.dispatch(&mut ctx).await;
+    let mut ctx = ctx_for("Read", read_input, "/repo");
+    pipeline.dispatch(&mut ctx).await;
+    assert_eq!(
+        *read_executions.lock().unwrap(),
+        2,
+        "an outer wrapped redirection evicts the cached read of its target"
+    );
+}
+
+#[tokio::test]
 async fn profile_wiring_is_explicit_this_release() {
     let mut registry = ToolRegistry::new();
     registry.register(CountingTool {
@@ -609,6 +658,17 @@ async fn the_default_cwd_checks_the_real_parent() {
         result.passed,
         "the crate manifest's parent exists — the default cwd checks the \
          real directory: {result:?}"
+    );
+    // The fail-first direction: `src`'s parent is the crate's src
+    // directory, which exists — while the root-anchored `/src` does
+    // not, so this pass fails under the old root-anchored resolution.
+    let result = verifier
+        .verify_call(&ctx, "Write", &json!({"path": "src/x.txt"}))
+        .await;
+    assert!(
+        result.passed,
+        "the real src/ parent exists — under root anchoring this checked \
+         /src and failed: {result:?}"
     );
     let result = verifier
         .verify_call(&ctx, "Write", &json!({"path": "no-such-dir/x.txt"}))

@@ -740,11 +740,36 @@ async fn record_openai_model_override_cassette() {
         loopctl::api::StreamRequest::new(vec![loopctl::message::Message::user(scenario.prompt)]);
     let stream = client.stream_messages_with_options(&request, options);
     let mut stream = std::pin::pin!(stream);
+    let mut events = Vec::new();
     while let Some(result) = stream.next().await {
-        if let Err(e) = result {
-            panic!("{} recording failed mid-stream: {e}", scenario.name);
+        match result {
+            Ok(event) => events.push(event),
+            Err(e) => panic!("{} recording failed mid-stream: {e}", scenario.name),
         }
     }
+
+    // The same junk-cassette gate every driver applies: a clean-but-
+    // truncated stream must fail here, not freeze as truth.
+    let has_stop = events
+        .iter()
+        .any(|e| matches!(e, loopctl::stream::StreamEvent::MessageStop));
+    assert!(
+        has_stop,
+        "{}: the recorded exchange must end with MessageStop, or the cassette is junk",
+        scenario.name
+    );
+    if scenario.stream_usage {
+        let usage = events.iter().find_map(|e| match e {
+            loopctl::stream::StreamEvent::MessageDelta(md) => md.usage,
+            _ => None,
+        });
+        assert!(
+            usage.is_some_and(|u| u.input_tokens > 0),
+            "{}: the scenario exists to pin usage-on-final-chunk — the stream must carry it",
+            scenario.name
+        );
+    }
+
     let path = session.finish().await;
     println!("{GREEN}CASSETTE{RESET} {} → {path:?}", scenario.name);
 }

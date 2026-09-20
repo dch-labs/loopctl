@@ -128,6 +128,7 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
                 from,
                 to: trimmed.to_string(),
             });
+        loop_.last_routed_model = Some(trimmed.to_string());
 
         Ok(())
     }

@@ -57,7 +57,7 @@ use tracing::{debug, info, warn};
 /// | `Primary`     | `Fallback`    | Consecutive failures ≥ [`FallbackConfig::trip_threshold`]                              |
 /// | `Fallback`    | `Recovering`  | [`transition_to_recovering`](FallbackManager::transition_to_recovering) after cooldown |
 /// | `Recovering`  | `Primary`     | Successes ≥ [`FallbackConfig::recovery_successes_needed`]                              |
-/// | `Recovering`  | `Fallback`    | Any single failure during recovery                                                     |
+/// | `Recovering`  | `Fallback`    | A `RateLimit` failure (immediate); `Transient` failures reset the success streak and re-trip at [`trip_threshold`](FallbackConfig::trip_threshold) |
 ///
 /// # Example
 ///
@@ -561,6 +561,11 @@ impl FallbackManager {
     /// [`new_with_config`](Self::new_with_config) for config-driven
     /// construction; use this builder when chaining off [`new`](Self::new).
     ///
+    /// The replacement is total: the `trip_threshold` and
+    /// `recovery_successes_needed` positional arguments passed to
+    /// [`new`](Self::new) are discarded by this call — set those values
+    /// on the [`FallbackConfig`] itself when chaining off `new`.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -813,9 +818,10 @@ impl FallbackManager {
     /// When the circuit is in [`FallbackState::Fallback`], returns the
     /// fallback model (if one has been set via
     /// [`set_fallback_model`](Self::set_fallback_model) or
-    /// [`add_fallback_model`](Self::add_fallback_model)),
-    /// falling back to the original model if no dedicated fallback is
-    /// configured. When the circuit is in [`FallbackState::Primary`] or
+    /// [`add_fallback_model`](Self::add_fallback_model)); an empty or
+    /// exhausted chain yields `None` — the caller fails rather than
+    /// retreating to the known-bad primary (see `Returns`). When the
+    /// circuit is in [`FallbackState::Primary`] or
     /// [`FallbackState::Recovering`] (half-open probe), always returns the
     /// original model — the manager is testing whether the primary has
     /// recovered.
@@ -2485,5 +2491,124 @@ mod tests {
             Some("primary"),
             "a dedicated fallback is configured; the exhausted chain must not silently route back to the failed primary"
         );
+    }
+
+    #[test]
+    fn external_chain_mutation_between_engine_steps_fails_closed_at_the_route_input() {
+        // The single-writer contract's fail-closed direction: an
+        // external writer emptying the chain between the engine's
+        // routing steps makes the next route's input None — never the
+        // known-bad primary. The engine maps active_model() == None in
+        // Fallback to FallbackExhausted (pinned at engine level in
+        // tests/fallback_switch.rs).
+        let manager = FallbackManager::new(1, 1);
+        manager.set_original_model("primary".to_string()).unwrap();
+        manager.set_fallback_model("fallback".to_string()).unwrap();
+        assert!(
+            manager
+                .record_failure(crate::fallback::FailureKind::Transient)
+                .expect("record failure"),
+            "the threshold-1 failure trips the breaker"
+        );
+        assert_eq!(
+            manager.active_model().expect("active model").as_deref(),
+            Some("fallback")
+        );
+        // The external writer, between engine steps:
+        manager.set_fallback_models(Vec::new()).unwrap();
+        assert_eq!(
+            manager.active_model().expect("active model"),
+            None,
+            "the next route's input fails closed — no retreat to the known-bad primary"
+        );
+    }
+
+    /// The manager's routing answer over random lifetimes: whatever the
+    /// failure and recovery interleaving, the model it names is the
+    /// primary or a configured chain member — never a foreign name —
+    /// and an emptied chain mid-flight always fails closed.
+    #[test]
+    fn proptest_active_model_never_names_a_foreign_model() {
+        use proptest::prelude::*;
+
+        proptest!(|(
+            seed in any::<u64>(),
+            trip in 1usize..4,
+            needed in 1usize..3,
+            max_fail in 1usize..3,
+            chain_len in 1usize..4,
+        )| {
+            let chain: Vec<String> = (0..chain_len).map(|i| format!("fb-{i}")).collect();
+            let config = FallbackConfig {
+                trip_threshold: trip,
+                recovery_timeout: std::time::Duration::ZERO,
+                recovery_successes_needed: needed,
+                max_fail_count: max_fail,
+            };
+            let manager = FallbackManager::for_model("primary")
+                .unwrap()
+                .with_config(config);
+            manager.set_fallback_models(chain.clone()).unwrap();
+
+            let mut rng = seed;
+            let mut next = move || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            for _ in 0..400 {
+                // The engine's turn-boundary protocol: probe
+                // eligibility first, then route, then record against
+                // the model that served.
+                if manager.is_using_fallback().unwrap()
+                    && manager
+                        .should_try_resume_primary(std::time::Duration::ZERO)
+                        .unwrap()
+                {
+                    manager.transition_to_recovering().unwrap();
+                }
+                let Some(served) = manager.active_model().unwrap() else {
+                    break;
+                };
+                prop_assert!(
+                    served == "primary" || chain.contains(&served),
+                    "active_model named {served:?}, which is neither the                      primary nor a configured chain member"
+                );
+                let on_fallback = served != "primary";
+                let roll = next() % 3;
+                if roll == 0 {
+                    manager.record_success().unwrap();
+                } else {
+                    let kind = if roll == 1 {
+                        FailureKind::RateLimit
+                    } else {
+                        FailureKind::Transient
+                    };
+                    manager.record_failure(kind).unwrap();
+                    if on_fallback {
+                        manager.mark_fallback_failed(&served).unwrap();
+                    }
+                }
+            }
+            manager.set_fallback_models(Vec::new()).unwrap();
+            let state = manager.state().unwrap();
+            if state == FallbackState::Fallback {
+                prop_assert_eq!(
+                    manager.active_model().unwrap(),
+                    None,
+                    "an emptied chain fails closed while the breaker is in \
+                     Fallback"
+                );
+            } else {
+                let routed = manager.active_model().unwrap();
+                prop_assert_eq!(
+                    routed.as_deref(),
+                    Some("primary"),
+                    "outside Fallback the primary is the answer regardless \
+                     of the chain"
+                );
+            }
+        });
     }
 }

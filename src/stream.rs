@@ -780,7 +780,11 @@ pub struct MessageDeltaPayload {
 /// assert_eq!(usage.output_tokens, 75);
 /// assert_eq!(usage.total_tokens(), 225);
 /// ```
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases — construct through [`new`](Self::new); struct
+/// literals compile only inside the crate.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Usage {
     /// Number of tokens in the input prompt.
     ///

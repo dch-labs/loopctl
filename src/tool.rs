@@ -93,21 +93,23 @@ pub use registry::{FnTool, ToolRegistry};
 ///
 /// # Construction
 ///
-/// Typically produced by [`Tool::schema`] inside each tool implementation:
+/// Typically produced by [`Tool::schema`] inside each tool
+/// implementation, or built directly through
+/// [`ToolSchema::new`](Self::new):
 ///
 /// ```rust,ignore
 /// fn schema(&self) -> ToolSchema {
-///     ToolSchema {
-///         tool: "read_file".into(),
-///         description: "Read a file from disk".into(),
-///         input_schema: json!({
+///     ToolSchema::new(
+///         "read_file",
+///         "Read a file from disk",
+///         json!({
 ///             "type": "object",
 ///             "properties": {
 ///                 "path": { "type": "string", "description": "File path" }
 ///             },
 ///             "required": ["path"]
 ///         }),
-///     }
+///     )
 /// }
 /// ```
 ///
@@ -115,7 +117,11 @@ pub use registry::{FnTool, ToolRegistry};
 ///
 /// [`ToolSchema`] derives [`Serialize`] and [`Deserialize`] so it can be
 /// embedded directly in LLM API request payloads.
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases — construct through [`new`](Self::new); struct
+/// literals compile only inside the crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolSchema {
     /// The tool's unique name identifier.
     ///
@@ -135,6 +141,40 @@ pub struct ToolSchema {
     /// Conforms to JSON Schema Draft 07. The LLM uses this to construct
     /// valid `input` objects for [`Tool::call`].
     pub input_schema: Value,
+}
+
+impl ToolSchema {
+    /// Create a tool schema from its name, description, and input
+    /// JSON Schema.
+    ///
+    /// The construction path for code outside the crate — `ToolSchema`
+    /// is `#[non_exhaustive]`, so struct literals compile only inside
+    /// the crate. The arguments map one-to-one onto the fields in
+    /// declaration order, and `#[derive(Tool)]` emits this constructor
+    /// in its generated `schema()` implementation.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::tool::ToolSchema;
+    ///
+    /// let schema = ToolSchema::new("echo", "Echoes the input", serde_json::json!({
+    ///     "type": "object"
+    /// }));
+    /// assert_eq!(schema.tool, "echo");
+    /// ```
+    #[must_use]
+    pub fn new(
+        tool: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
+        Self {
+            tool: tool.into(),
+            description: description.into(),
+            input_schema,
+        }
+    }
 }
 
 /// Advisory rendering hint attached to a [`ToolOutput`].
@@ -1641,6 +1681,23 @@ mod tests {
     #[cfg(feature = "testing")]
     use crate::engine::core::Loop;
     use serde_json::json;
+
+    #[test]
+    fn the_readme_example_builds_through_the_constructor() {
+        // The README is not compiled as a doctest, so its example can
+        // rot silently — this pins the construction shape it shows.
+        let readme = include_str!("../README.md");
+        assert!(
+            readme.contains("ToolSchema::new("),
+            "the README's tool example constructs through the constructor"
+        );
+        assert_eq!(
+            readme.matches("ToolSchema {").count(),
+            readme.matches("-> ToolSchema {").count(),
+            "every `ToolSchema {{` in the README is a return-type signature, \
+             not a struct literal"
+        );
+    }
 
     struct EchoTool;
 

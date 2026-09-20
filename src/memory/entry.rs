@@ -33,7 +33,12 @@ pub const PROVIDER_DERIVED_TAG: &str = "provider-derived";
 ///     .with_tag("performance")
 ///     .validated();
 /// ```
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases — construct through [`new`](Self::new) and the
+/// builder methods; struct literals compile only inside the
+/// crate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MemoryEntry {
     /// UUID v4 for deduplication and stable reference during consolidation.
     ///
@@ -204,6 +209,81 @@ impl MemoryEntry {
     #[must_use]
     pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
         self.tags.push(tag.into());
+        self
+    }
+
+    /// Set the entry's id (builder style).
+    ///
+    /// Fresh entries mint their own id in [`new`](Self::new); a store
+    /// restoring a persisted row sets the original id back so
+    /// deduplication and consolidation keep working against the same
+    /// identity.
+    #[must_use]
+    pub fn with_id(mut self, id: Uuid) -> Self {
+        self.id = id;
+        self
+    }
+
+    /// Replace the entry's tags wholesale (builder style).
+    ///
+    /// The restore-side counterpart of [`with_tag`](Self::with_tag):
+    /// sets the whole tag list in one call instead of appending one
+    /// tag at a time.
+    #[must_use]
+    pub fn with_tags(mut self, tags: Vec<String>) -> Self {
+        self.tags = tags;
+        self
+    }
+
+    /// Set the entry's creation time (builder style).
+    ///
+    /// Fresh entries stamp `SystemTime::now()`; a store restoring a
+    /// row sets the persisted timestamp so recency weighting sees the
+    /// original age.
+    #[must_use]
+    pub fn with_created_at(mut self, created_at: SystemTime) -> Self {
+        self.created_at = created_at;
+        self
+    }
+
+    /// Set the entry's relevance score (builder style).
+    ///
+    /// Fresh entries start at `1.0`; a store restoring a row sets the
+    /// persisted score so decay and consolidation continue from it.
+    #[must_use]
+    pub fn with_relevance(mut self, relevance: f32) -> Self {
+        self.relevance = relevance;
+        self
+    }
+
+    /// Set the entry's access count (builder style).
+    ///
+    /// Fresh entries start at zero; a store restoring a row restores
+    /// the persisted count so retrieval's usage weighting keeps its
+    /// history.
+    #[must_use]
+    pub fn with_access_count(mut self, access_count: usize) -> Self {
+        self.access_count = access_count;
+        self
+    }
+
+    /// Set when the entry was last accessed (builder style).
+    ///
+    /// Fresh entries have never been accessed; a store restoring a row
+    /// sets the persisted timestamp, if any.
+    #[must_use]
+    pub fn with_last_accessed(mut self, last_accessed: Option<SystemTime>) -> Self {
+        self.last_accessed = last_accessed;
+        self
+    }
+
+    /// Set when the entry last decayed (builder style).
+    ///
+    /// Fresh entries have never decayed; a store restoring a row sets
+    /// the persisted timestamp, if any.
+    #[must_use]
+    pub fn with_last_decayed(mut self, last_decayed: Option<SystemTime>) -> Self {
+        self.last_decayed = last_decayed;
         self
     }
 

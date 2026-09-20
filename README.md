@@ -60,15 +60,15 @@ impl Tool for EchoTool {
     fn description(&self) -> &str { "Echoes back the input" }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: "echo".into(),
-            description: "Echoes back the input".into(),
-            input_schema: json!({
+        ToolSchema::new(
+            "echo",
+            "Echoes back the input",
+            json!({
                 "type": "object",
                 "properties": { "message": { "type": "string" } },
                 "required": ["message"]
             }),
-        }
+        )
     }
 
     fn call(&self, input: Value, _ctx: &ToolContext)

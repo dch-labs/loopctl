@@ -896,17 +896,17 @@ pub struct Scenario {
 /// the recorded bodies readable, real enough to drive the full
 /// tool-call streaming lifecycle.
 pub fn get_weather_tool() -> loopctl::tool::ToolSchema {
-    loopctl::tool::ToolSchema {
-        tool: "get_weather".to_string(),
-        description: "Get the current weather for a city.".to_string(),
-        input_schema: serde_json::json!({
+    loopctl::tool::ToolSchema::new(
+        "get_weather".to_string(),
+        "Get the current weather for a city.".to_string(),
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "city": { "type": "string" }
             },
             "required": ["city"]
         }),
-    }
+    )
 }
 
 /// The scenario set the record driver and replay suites share.

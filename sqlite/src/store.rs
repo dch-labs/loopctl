@@ -436,18 +436,18 @@ fn decode_entry(row: &EntryRow) -> Result<MemoryEntry, SqliteMemoryError> {
             row.access_count
         ))
     })?;
-    Ok(MemoryEntry {
-        id,
-        category,
-        memory: row.memory.clone(),
-        tags,
-        created_at: millis_to_time(row.created_at),
-        relevance: row.relevance,
-        access_count,
-        validated: row.validated != 0,
-        last_accessed: row.last_accessed.map(millis_to_time),
-        last_decayed: row.last_decayed.map(millis_to_time),
-    })
+    let mut entry = MemoryEntry::new(category, row.memory.clone())
+        .with_id(id)
+        .with_tags(tags)
+        .with_created_at(millis_to_time(row.created_at))
+        .with_relevance(row.relevance)
+        .with_access_count(access_count)
+        .with_last_accessed(row.last_accessed.map(millis_to_time))
+        .with_last_decayed(row.last_decayed.map(millis_to_time));
+    if row.validated != 0 {
+        entry = entry.validated();
+    }
+    Ok(entry)
 }
 
 /// Serialize a category to its `snake_case` serde name.

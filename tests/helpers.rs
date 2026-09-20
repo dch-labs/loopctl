@@ -13,10 +13,10 @@
 
 pub fn test_tools() -> Vec<loopctl::tool::ToolSchema> {
     vec![
-        loopctl::tool::ToolSchema {
-            tool: "read_file".into(),
-            description: "Read a file from disk".into(),
-            input_schema: serde_json::json!({
+        loopctl::tool::ToolSchema::new(
+            "read_file",
+            "Read a file from disk",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Absolute file path"},
@@ -24,11 +24,11 @@ pub fn test_tools() -> Vec<loopctl::tool::ToolSchema> {
                 },
                 "required": ["path"]
             }),
-        },
-        loopctl::tool::ToolSchema {
-            tool: "search".into(),
-            description: "Search the web".into(),
-            input_schema: serde_json::json!({
+        ),
+        loopctl::tool::ToolSchema::new(
+            "search",
+            "Search the web",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
@@ -36,11 +36,11 @@ pub fn test_tools() -> Vec<loopctl::tool::ToolSchema> {
                 },
                 "required": ["query"]
             }),
-        },
-        loopctl::tool::ToolSchema {
-            tool: "write_file".into(),
-            description: "Write content to a file".into(),
-            input_schema: serde_json::json!({
+        ),
+        loopctl::tool::ToolSchema::new(
+            "write_file",
+            "Write content to a file",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
@@ -49,11 +49,11 @@ pub fn test_tools() -> Vec<loopctl::tool::ToolSchema> {
                 },
                 "required": ["path", "content"]
             }),
-        },
-        loopctl::tool::ToolSchema {
-            tool: "run_command".into(),
-            description: "Execute a shell command".into(),
-            input_schema: serde_json::json!({
+        ),
+        loopctl::tool::ToolSchema::new(
+            "run_command",
+            "Execute a shell command",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The command to execute"},
@@ -67,11 +67,11 @@ pub fn test_tools() -> Vec<loopctl::tool::ToolSchema> {
                 },
                 "required": ["command"]
             }),
-        },
-        loopctl::tool::ToolSchema {
-            tool: "git_commit".into(),
-            description: "Create a git commit with staged changes".into(),
-            input_schema: serde_json::json!({
+        ),
+        loopctl::tool::ToolSchema::new(
+            "git_commit",
+            "Create a git commit with staged changes",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "message": {"type": "string", "description": "Commit message"},
@@ -84,7 +84,7 @@ pub fn test_tools() -> Vec<loopctl::tool::ToolSchema> {
                 },
                 "required": ["message"]
             }),
-        },
+        ),
     ]
 }
 

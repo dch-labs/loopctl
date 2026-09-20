@@ -63,15 +63,15 @@ impl Tool for EchoTool {
         "Echo back the message field"
     }
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: "echo".into(),
-            description: "Echo back the message field".into(),
-            input_schema: json!({
+        ToolSchema::new(
+            "echo",
+            "Echo back the message field",
+            json!({
                 "type": "object",
                 "properties": { "message": { "type": "string" } },
                 "required": ["message"]
             }),
-        }
+        )
     }
     fn call(
         &self,
@@ -104,11 +104,11 @@ impl Tool for FailTool {
         "Always fails with a hard tool error"
     }
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: "fail".into(),
-            description: "Always fails with a hard tool error".into(),
-            input_schema: json!({"type": "object"}),
-        }
+        ToolSchema::new(
+            "fail",
+            "Always fails with a hard tool error",
+            json!({"type": "object"}),
+        )
     }
     fn call(
         &self,

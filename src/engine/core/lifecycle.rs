@@ -320,7 +320,12 @@ pub(crate) fn default_turn_mode() -> TurnMode {
 ///
 /// Implements `Serialize` and `Deserialize` for persistence and inter-process
 /// communication.
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is produced by the engine from the wire and
+/// carried by serde — external code reads it and deserializes
+/// it, never builds it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ToolCall {
     /// The call identifier assigned by the LLM API.
     ///
@@ -409,7 +414,12 @@ impl ToolCall {
 /// Each entry in [`Run::turns`] records what happened during one loop
 /// iteration: the model's response text, any tool calls it requested, and the
 /// token cost of that call.
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is produced by the engine and carried by
+/// serde — external code reads it and deserializes it, never
+/// builds it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Turn {
     /// The 0-indexed position of this turn within its run.
     ///
@@ -491,7 +501,12 @@ pub struct Turn {
 ///
 /// assert_eq!(run.output.as_deref(), Some("4"));
 /// ```
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is produced by the engine and carried by
+/// serde — external code reads it and deserializes it, never
+/// builds it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Run {
     /// A fresh identifier unique to this run.
     ///
@@ -698,7 +713,12 @@ impl Default for Run {
 /// session.runs.push(Run::new("second prompt", &Default::default()));
 /// assert_eq!(session.runs.len(), 2);
 /// ```
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is produced by the engine and carried by
+/// serde — external code reads it and deserializes it, never
+/// builds it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Session {
     /// Unique session identifier.
     ///

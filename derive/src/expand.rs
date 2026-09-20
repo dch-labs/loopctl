@@ -209,16 +209,16 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             }
 
             fn schema(&self) -> #krate ::tool::ToolSchema {
-                #krate ::tool::ToolSchema {
-                    tool: #tool_name.to_string(),
-                    description: #description.to_string(),
-                    input_schema: #krate ::__private::serde_json::json!({
+                #krate ::tool::ToolSchema::new(
+                    #tool_name.to_string(),
+                    #description.to_string(),
+                    #krate ::__private::serde_json::json!({
                         "type": "object",
                         #additional
                         "properties": { #(#properties),* },
                         "required": [#(#required_tokens),*]
                     }),
-                }
+                )
             }
 
             fn call(

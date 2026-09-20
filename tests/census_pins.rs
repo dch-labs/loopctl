@@ -86,11 +86,11 @@ impl Tool for FixedTool {
         "test fixture"
     }
     fn schema(&self) -> loopctl::tool::ToolSchema {
-        loopctl::tool::ToolSchema {
-            tool: self.name.to_string(),
-            description: "test fixture".to_string(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }
+        loopctl::tool::ToolSchema::new(
+            self.name.to_string(),
+            "test fixture".to_string(),
+            serde_json::json!({"type": "object"}),
+        )
     }
     fn call(
         &self,

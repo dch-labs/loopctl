@@ -136,6 +136,17 @@ pub trait FallbackCapable {
     ///
     /// Use this to record API failures and check whether the circuit
     /// breaker has tripped, indicating the primary model is unavailable.
+    ///
+    /// Single-writer contract: the engine drives the manager's state
+    /// through a multi-step protocol per turn (recovery probe decision,
+    /// routing, failure recording, chain advance), and every mutator
+    /// here takes `&self`. A handle obtained through this method is
+    /// safe for pre-run configuration and for reading, but mutating the
+    /// manager concurrently with a running loop interleaves with that
+    /// protocol — the loop may route against a chain state that has
+    /// since changed, or record a failure against a model that no
+    /// longer is the active fallback. Configure before running, or
+    /// stop the loop first.
     fn fallback(&self) -> &FallbackManager;
 }
 

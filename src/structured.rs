@@ -374,7 +374,10 @@ impl RequestOptions {
 /// Covers the full extract-and-validate pipeline: transport failures
 /// surface as the underlying API error, everything else as a typed
 /// variant naming the failed stage.
+/// `#[non_exhaustive]` so new variants can arrive in minor
+/// releases — matches need a `_` wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StructuredError {
     /// The model's output did not deserialize into the target type.
     ///

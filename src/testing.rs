@@ -241,6 +241,17 @@ pub struct MockApiClient {
     /// (unsupported options) count too — the method was called either
     /// way.
     with_options_calls: Arc<Mutex<usize>>,
+
+    /// Whether tool-call constraints are served instead of rejected.
+    ///
+    /// Off by default: the mock scripts responses rather than
+    /// enforcing constraints, so a constraint it cannot mirror is
+    /// rejected loudly rather than silently ignored. Turn it on with
+    /// [`with_tool_constraint_support`](MockApiClient::with_tool_constraint_support)
+    /// to drive the engine's constrained paths through the mock — the
+    /// constraint rides the options and the scripted response is served
+    /// unchanged.
+    accept_tool_constraints: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A single canned response produced by [`MockApiClient`].
@@ -409,6 +420,7 @@ impl MockApiClient {
             stream_requests: Arc::new(Mutex::new(Vec::new())),
             create_message_calls: Arc::new(Mutex::new(0)),
             with_options_calls: Arc::new(Mutex::new(0)),
+            accept_tool_constraints: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -596,6 +608,21 @@ impl MockApiClient {
         if !errors.is_empty() {
             *crate::error::recover_guard(self.errors.lock()) = errors;
         }
+        self
+    }
+
+    /// Serve tool-call constraints instead of rejecting them.
+    ///
+    /// By default the mock rejects a non-`None` `tool_constraint`
+    /// loudly — it cannot mirror what a strict-mode server would
+    /// enforce. With this knob set, the constraint is accepted and the
+    /// scripted response served unchanged, so engine-level tests can
+    /// drive the strict/grammar request paths through the mock and
+    /// assert the options that reached the wire.
+    #[must_use]
+    pub fn with_tool_constraint_support(self) -> Self {
+        self.accept_tool_constraints
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
@@ -907,13 +934,17 @@ impl MockApiClient {
 /// The one request option the mock cannot serve: a tool-call
 /// constraint shapes the tool-calling path, which the mock scripts
 /// rather than executes against a real model.
-fn unsupported_mock_option(options: &crate::structured::RequestOptions) -> Option<ApiError> {
+fn unsupported_mock_option(
+    options: &crate::structured::RequestOptions,
+    accept_tool_constraints: &std::sync::atomic::AtomicBool,
+) -> Option<ApiError> {
     if !matches!(
         options.tool_constraint,
         crate::structured::ToolConstraint::None
-    ) {
+    ) && !accept_tool_constraints.load(std::sync::atomic::Ordering::Relaxed)
+    {
         return Some(ApiError::config(
-            "this client does not support tool-call constraints (tool_constraint)",
+            "this client does not support tool-call constraints (tool_constraint); construct with with_tool_constraint_support to serve them",
         ));
     }
     None
@@ -1048,7 +1079,7 @@ impl ApiClient for MockApiClient {
             let mut calls = crate::error::recover_guard(self.with_options_calls.lock());
             *calls = calls.saturating_add(1);
         }
-        if let Some(err) = unsupported_mock_option(&options) {
+        if let Some(err) = unsupported_mock_option(&options, &self.accept_tool_constraints) {
             return Box::pin(futures::stream::once(async move { Err(err) }));
         }
         crate::error::recover_guard(self.stream_requests.lock()).push(request.clone());
@@ -1123,7 +1154,7 @@ impl ApiClient for MockApiClient {
             let mut calls = crate::error::recover_guard(self.with_options_calls.lock());
             *calls = calls.saturating_add(1);
         }
-        if let Some(err) = unsupported_mock_option(&options) {
+        if let Some(err) = unsupported_mock_option(&options, &self.accept_tool_constraints) {
             return Box::pin(async move { Err(err) });
         }
         crate::error::recover_guard(self.requests.lock()).push(request.clone());
@@ -1925,6 +1956,35 @@ mod tests {
                 .map(crate::message::Message::text_content),
             Some("hello there".to_string()),
             "the captured clone carries the caller's messages verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_constraints_are_rejected_until_opted_into() {
+        use crate::structured::{RequestOptions, ToolConstraint};
+        let strict = RequestOptions::new().with_tool_constraint(ToolConstraint::Strict);
+
+        let rejecting = MockApiClient::new("m");
+        let stream = rejecting
+            .stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), strict.clone());
+        let error = futures::StreamExt::next(&mut std::pin::pin!(stream))
+            .await
+            .expect("the default mock rejects the constraint")
+            .expect_err("the rejection is an error event");
+        assert!(
+            error.to_string().contains("tool_constraint"),
+            "the rejection names the unsupported option: {error}"
+        );
+
+        let accepting = MockApiClient::new("m").with_tool_constraint_support();
+        let stream =
+            accepting.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), strict);
+        let first = futures::StreamExt::next(&mut std::pin::pin!(stream))
+            .await
+            .expect("the opted-in mock serves the call");
+        assert!(
+            first.is_ok(),
+            "the scripted response is served unchanged under the constraint"
         );
     }
 

@@ -532,4 +532,107 @@ mod contracts {
             );
         }
     }
+
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn explicit_fallback_to_non_streaming_serves_the_exhausted_turn() {
+        async fn read_request(sock: &mut tokio::net::TcpStream) {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Ok(text) = std::str::from_utf8(&buf)
+                    && let Some(head_end) = text.find("\r\n\r\n")
+                {
+                    let length = text[..head_end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= head_end + 4 + length {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut sock, _) = listener.accept().await.unwrap();
+            read_request(&mut sock).await;
+            let rejected = concat!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 20\r\n",
+                "retry-after: 0\r\nConnection: close\r\n\r\n",
+                "{\"error\":\"slow down\"}"
+            );
+            sock.write_all(rejected.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            let (mut sock, _) = listener.accept().await.unwrap();
+            read_request(&mut sock).await;
+            sock.write_all(rejected.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            let (mut sock, _) = listener.accept().await.unwrap();
+            read_request(&mut sock).await;
+            let body = concat!(
+                "{\"id\":\"x\",\"object\":\"chat.completion\",\"created\":0,",
+                "\"model\":\"m\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",",
+                "\"content\":\"served\"},\"finish_reason\":\"stop\"}],",
+                "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}"
+            );
+            let served = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(served.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        let server = TestServer {
+            base_url: format!("http://{addr}"),
+            task,
+        };
+        let client = openai_at(&server.base_url);
+        let handler = StreamHandler::new()
+            .with_rate_limit_config(RateLimitConfig {
+                respect_retry_after: true,
+                default_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(5),
+                max_retries: 1,
+                fallback_after_retries: 1,
+                ..Default::default()
+            })
+            .with_timeout_config(StreamTimeoutConfig {
+                initial_event_timeout: Duration::from_secs(5),
+                per_event_timeout: Duration::from_secs(5),
+                total_stream_timeout: Duration::from_secs(30),
+                max_consecutive_timeouts: 3,
+                fallback_to_non_streaming: true,
+            });
+        let cancel = Arc::new(CancelSignal::new());
+        let request = StreamRequest::new(vec![]);
+        let mut stream = handler.stream_turn(&client, &request, RequestOptions::default(), &cancel);
+        let mut served = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(_) => served = true,
+                Err(e) => panic!("the exhausted ladder must fall back to non-streaming, got {e:?}"),
+            }
+        }
+        server.task.await.unwrap();
+        assert!(
+            served,
+            "with fallback_to_non_streaming set, the turn is served after the retries exhaust"
+        );
+    }
 }

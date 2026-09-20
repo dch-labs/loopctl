@@ -158,3 +158,47 @@ async fn rate_limit_error_replays_from_cassette() {
         "the recorded Retry-After must reach the caller parsed"
     );
 }
+
+#[tokio::test]
+async fn model_override_replays_from_cassette() {
+    let scenario = scenario("model_override");
+    // The recorded body must carry the override model, not the client
+    // default — computed from the cassette, never hardcoded.
+    let expected_model = cassette::load_interactions(scenario.provider, scenario.name)
+        .first()
+        .and_then(|interaction| interaction.when.body.as_ref())
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .and_then(|body| {
+            body.get("model")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .expect("the cassette holds a JSON body with a model field");
+    assert_ne!(
+        expected_model, "gpt-4o-mini",
+        "the override, not the client default, is what was recorded"
+    );
+
+    let server = httpmock::MockServer::start_async().await;
+    let session =
+        cassette::CassetteSession::start(scenario.provider, scenario.name, "", &server).await;
+    let client = loopctl::provider::OpenAiClient::builder()
+        .with_api_key(cassette::CASSETTE_KEY)
+        .with_base_url(cassette::client_base_url(
+            scenario.provider,
+            &session.base_url(),
+        ))
+        .with_model("gpt-4o-mini")
+        .with_stream_usage(scenario.stream_usage)
+        .build()
+        .unwrap();
+    let request =
+        loopctl::api::StreamRequest::new(vec![loopctl::message::Message::user(scenario.prompt)]);
+    let options = loopctl::structured::RequestOptions::new().with_model(&expected_model);
+    let stream = client.stream_messages_with_options(&request, options);
+    let mut stream = std::pin::pin!(stream);
+    while let Some(result) = stream.next().await {
+        result.expect("replayed events arrive as recorded");
+    }
+    session.finish().await;
+}

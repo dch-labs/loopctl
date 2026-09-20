@@ -189,6 +189,20 @@ impl RunConfig {
         self
     }
 
+    /// Ask the next run to reset shared manager state before it
+    /// starts.
+    ///
+    /// When `true`, [`run`](crate::engine::core::Loop::run) resets the
+    /// manager bundle (fallback breakers and friends) at the run
+    /// boundary, so a tripped breaker from a previous run does not
+    /// steer this one. The default `false` keeps manager state across
+    /// runs — the resume-oriented behavior.
+    #[must_use]
+    pub fn with_reset_managers(mut self, reset: bool) -> Self {
+        self.reset_managers = reset;
+        self
+    }
+
     /// Set whether provider-derived memories join the turn context.
     ///
     /// Builder-style convenience for `#[non_exhaustive]` compliance; see

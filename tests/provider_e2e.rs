@@ -469,10 +469,9 @@ async fn record_openai_cassettes() {
         return;
         // The rate-limit scenario is a gated attempt, not a driven recording.
     }
-    for scenario in cassette::scenarios()
-        .into_iter()
-        .filter(|s| s.provider == "openai" && s.name != "rate_limit_error")
-    {
+    for scenario in cassette::scenarios().into_iter().filter(|s| {
+        s.provider == "openai" && s.name != "rate_limit_error" && s.name != "model_override"
+    }) {
         let server = httpmock::MockServer::start_async().await;
         let session = cassette::CassetteSession::start(
             scenario.provider,
@@ -697,6 +696,82 @@ async fn attempt_gemini_rate_limit_cassette() {
         },
     )
     .await;
+}
+
+/// Record the model-override cassette: the same minimal request, but
+/// the loop carries a per-request model override, so the recorded body
+/// pins the override on the wire — the one request-shape dimension no
+/// other cassette exercises.
+#[cfg(feature = "openai")]
+#[tokio::test]
+async fn record_openai_model_override_cassette() {
+    if !cassette_recording_enabled() || std::env::var("OPENAI_API_KEY").is_err() {
+        eprintln!("{DIM}skip{RESET}  cassette recording (openai model_override)");
+        return;
+    }
+    let scenario = cassette::scenarios()
+        .into_iter()
+        .find(|s| s.provider == "openai" && s.name == "model_override")
+        .unwrap();
+    let api_key = std::env::var("OPENAI_API_KEY").unwrap();
+    let server = httpmock::MockServer::start_async().await;
+    let session = cassette::CassetteSession::start(
+        scenario.provider,
+        scenario.name,
+        "https://api.openai.com",
+        &server,
+    )
+    .await;
+    let client = loopctl::provider::OpenAiClient::builder()
+        .with_api_key(api_key.clone())
+        .with_base_url(cassette::client_base_url(
+            scenario.provider,
+            &session.base_url(),
+        ))
+        .with_model("gpt-4o-mini")
+        .with_stream_usage(scenario.stream_usage)
+        .build()
+        .unwrap();
+    // The client's own model is gpt-4o-mini; the per-request override
+    // names the scenario model, so the recorded body must carry the
+    // override, not the client default.
+    let options = loopctl::structured::RequestOptions::new().with_model(scenario.model);
+    let request =
+        loopctl::api::StreamRequest::new(vec![loopctl::message::Message::user(scenario.prompt)]);
+    let stream = client.stream_messages_with_options(&request, options);
+    let mut stream = std::pin::pin!(stream);
+    let mut events = Vec::new();
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(event) => events.push(event),
+            Err(e) => panic!("{} recording failed mid-stream: {e}", scenario.name),
+        }
+    }
+
+    // The same junk-cassette gate every driver applies: a clean-but-
+    // truncated stream must fail here, not freeze as truth.
+    let has_stop = events
+        .iter()
+        .any(|e| matches!(e, loopctl::stream::StreamEvent::MessageStop));
+    assert!(
+        has_stop,
+        "{}: the recorded exchange must end with MessageStop, or the cassette is junk",
+        scenario.name
+    );
+    if scenario.stream_usage {
+        let usage = events.iter().find_map(|e| match e {
+            loopctl::stream::StreamEvent::MessageDelta(md) => md.usage,
+            _ => None,
+        });
+        assert!(
+            usage.is_some_and(|u| u.input_tokens > 0),
+            "{}: the scenario exists to pin usage-on-final-chunk — the stream must carry it",
+            scenario.name
+        );
+    }
+
+    let path = session.finish().await;
+    println!("{GREEN}CASSETTE{RESET} {} → {path:?}", scenario.name);
 }
 
 #[cfg(feature = "openai")]

@@ -367,6 +367,29 @@ impl Default for FallbackConfig {
 ///
 /// The complete mutable circuit-breaker state.
 ///
+/// Reject an empty or whitespace-only model name, returning the
+/// trimmed form otherwise.
+///
+/// The fallback machinery routes per-request model overrides from
+/// these names; an empty one would surface as a wire-level API error
+/// instead of a typed configuration error, so it fails here instead —
+/// the same discipline `ModelSwitch::apply` follows.
+///
+/// # Errors
+///
+/// Returns [`Config`](crate::error::LoopError::Config) for an empty
+/// or whitespace-only name.
+fn validated_model_name(name: &str) -> Result<String, crate::error::LoopError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        Err(crate::error::LoopError::Config(
+            "model name cannot be empty or whitespace-only".to_string(),
+        ))
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 /// Every field that can change over the lifetime of a
 /// [`FallbackManager`] lives here, behind a single
 /// [`Mutex`](std::sync::Mutex). Holding the whole state under one lock
@@ -383,9 +406,10 @@ struct BreakerState {
 
     /// Consecutive failures on the current model.
     ///
-    /// Incremented by the `record_*_failure` methods while in `Primary`;
-    /// reaching [`FallbackManager::fallback_threshold`] trips the
-    /// circuit. Reset to `0` on trip and on any success in `Primary`.
+    /// Incremented by the `record_*_failure` methods while in `Primary`
+    /// and by transient failures while `Recovering`; reaching
+    /// [`FallbackConfig::trip_threshold`] trips the circuit from
+    /// either state. Reset to `0` on trip and on any success.
     consecutive_failures: usize,
 
     /// Consecutive successes on the primary accumulated during
@@ -620,9 +644,10 @@ impl FallbackManager {
     ///
     /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
     pub fn for_model(primary_model: impl Into<String>) -> Result<Self, crate::error::LoopError> {
+        let primary_model = validated_model_name(&primary_model.into())?;
         let mgr = Self::new(3, 2);
         let mut state = mgr.lock_state()?;
-        state.original_model = Some(primary_model.into());
+        state.original_model = Some(primary_model);
         drop(state);
         Ok(mgr)
     }
@@ -741,13 +766,17 @@ impl FallbackManager {
     /// use loopctl::fallback::{FallbackManager, FailureKind};
     /// let mgr = FallbackManager::new(3, 2);
     /// assert_eq!(mgr.original_model().unwrap(), None);
-    /// mgr.set_original_model("llm-70b".into()).unwrap();
+    /// mgr.set_original_model("llm-70b").unwrap();
     /// assert_eq!(mgr.original_model().unwrap(), Some("llm-70b".to_string()));
     /// ```
     /// # Errors
     ///
     /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
-    pub fn set_original_model(&self, model: String) -> Result<(), crate::error::LoopError> {
+    pub fn set_original_model(
+        &self,
+        model: impl Into<String>,
+    ) -> Result<(), crate::error::LoopError> {
+        let model = validated_model_name(&model.into())?;
         let mut state = self.lock_state()?;
         state.original_model = Some(model);
 
@@ -814,11 +843,7 @@ impl FallbackManager {
         let state = self.lock_state()?;
         Ok(match state.state {
             FallbackState::Primary | FallbackState::Recovering => state.original_model.clone(),
-            FallbackState::Fallback => match &state.active_fallback {
-                Some(model) => Some(model.clone()),
-                None if state.fallback_models.is_empty() => state.original_model.clone(),
-                None => None,
-            },
+            FallbackState::Fallback => state.active_fallback.clone(),
         })
     }
 
@@ -862,6 +887,7 @@ impl FallbackManager {
         &self,
         model: impl Into<String>,
     ) -> Result<(), crate::error::LoopError> {
+        let model = validated_model_name(&model.into())?;
         let mut state = self.lock_state()?;
         state.fallback_models.clear();
         state
@@ -956,6 +982,7 @@ impl FallbackManager {
         &self,
         model: impl Into<String>,
     ) -> Result<(), crate::error::LoopError> {
+        let model = validated_model_name(&model.into())?;
         let mut state = self.lock_state()?;
         state
             .fallback_models
@@ -996,6 +1023,7 @@ impl FallbackManager {
         index: usize,
         model: impl Into<String>,
     ) -> Result<(), crate::error::LoopError> {
+        let model = validated_model_name(&model.into())?;
         let mut state = self.lock_state()?;
         let entry = FallbackEntry::new(model).with_max_fail_count(self.config.max_fail_count);
         if index >= state.fallback_models.len() {
@@ -1069,6 +1097,10 @@ impl FallbackManager {
     ///
     /// Returns [`LockPoisoned`](crate::error::LoopError::LockPoisoned) when the lock is poisoned.
     pub fn set_fallback_models(&self, models: Vec<String>) -> Result<(), crate::error::LoopError> {
+        let models = models
+            .into_iter()
+            .map(|name| validated_model_name(&name))
+            .collect::<Result<Vec<String>, crate::error::LoopError>>()?;
         let max_fc = self.config.max_fail_count;
         let mut state = self.lock_state()?;
         state.fallback_models = models
@@ -1356,14 +1388,17 @@ impl FallbackManager {
     ///   Returns `false`; the counter is unchanged.
     /// - **[`Recovering`](FallbackState::Recovering)**: A
     ///   [`FailureKind::RateLimit`] re-trips the circuit to
-    ///   [`Fallback`](FallbackState::Fallback) — the primary is still
-    ///   rate-limited, so probing it further is pointless. A
-    ///   [`FailureKind::Transient`] error leaves the half-open probe in
-    ///   place. Returns `false` either way.
+    ///   [`Fallback`](FallbackState::Fallback) immediately — the
+    ///   primary is still rate-limited, so probing it further is
+    ///   pointless. A [`FailureKind::Transient`] error resets the
+    ///   success streak and counts toward the trip threshold: reaching
+    ///   it re-trips to `Fallback` (a primary that keeps failing
+    ///   through its probes does not lock the manager half-open);
+    ///   below it, the probe stays half-open.
     ///
     /// # Returns
     ///
-    /// `true` only when this call tripped the circuit from `Primary` to
+    /// `true` when this call tripped the circuit — from `Primary` to
     /// `Fallback`; `false` otherwise.
     ///
     /// # Example
@@ -1416,11 +1451,22 @@ impl FallbackManager {
                 }
                 FailureKind::Transient => {
                     state.primary_success_count = 0;
-                    warn!(
-                        consecutive_failures = state.consecutive_failures,
-                        "Transient failure recorded during recovery; success streak reset, staying half-open"
-                    );
-                    false
+                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                    if state.consecutive_failures >= self.config.trip_threshold {
+                        warn!(
+                            consecutive_failures = state.consecutive_failures,
+                            "Primary model still failing transiently during recovery; re-tripping to fallback"
+                        );
+                        Self::transition_to_fallback_impl(&mut state);
+                        true
+                    } else {
+                        warn!(
+                            consecutive_failures = state.consecutive_failures,
+                            threshold = self.config.trip_threshold,
+                            "Transient failure recorded during recovery; success streak reset, staying half-open"
+                        );
+                        false
+                    }
                 }
             },
         };
@@ -1490,6 +1536,7 @@ impl FallbackManager {
             }
             FallbackState::Fallback => {}
             FallbackState::Recovering => {
+                state.consecutive_failures = 0;
                 state.primary_success_count = state.primary_success_count.saturating_add(1);
                 debug!(
                     successes = state.primary_success_count,
@@ -2183,7 +2230,7 @@ mod tests {
     }
 
     #[test]
-    fn tripped_breaker_with_empty_chain_keeps_serving_the_primary() {
+    fn tripped_breaker_with_empty_chain_refuses_the_primary() {
         let mgr = FallbackManager::for_model("primary")
             .unwrap()
             .with_config(FallbackConfig {
@@ -2198,18 +2245,143 @@ mod tests {
         );
         assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
         assert_eq!(
-            mgr.active_model().unwrap().as_deref(),
-            Some("primary"),
-            "an empty chain keeps serving the primary — the trip state is \
-             bookkeeping, not an outage"
+            mgr.active_model().unwrap(),
+            None,
+            "an empty chain is as exhausted as a spent one — no retreat to \
+             the primary the breaker just declared bad"
         );
 
+        // The recovery path still exists: a probing caller that resumes
+        // and sees a success closes the circuit back.
         mgr.transition_to_recovering().unwrap();
         mgr.record_success().unwrap();
         assert_eq!(
             mgr.state().unwrap(),
             FallbackState::Primary,
-            "and the normal resume path recovers it"
+            "the normal resume path recovers it"
+        );
+    }
+
+    #[test]
+    fn transient_failures_during_recovery_retrip_after_the_threshold() {
+        let mgr = FallbackManager::for_model("primary")
+            .unwrap()
+            .with_config(FallbackConfig {
+                trip_threshold: 3,
+                recovery_successes_needed: 2,
+                max_fail_count: 5,
+                ..FallbackConfig::default()
+            });
+        mgr.set_fallback_model("fallback").unwrap();
+        assert!(!mgr.record_failure(FailureKind::Transient).unwrap());
+        assert!(!mgr.record_failure(FailureKind::Transient).unwrap());
+        assert!(
+            mgr.record_failure(FailureKind::Transient).unwrap(),
+            "the third consecutive failure reaches the trip threshold"
+        );
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
+        assert_eq!(
+            mgr.active_model().unwrap().as_deref(),
+            Some("fallback"),
+            "the trip hands routing to the fallback"
+        );
+
+        mgr.transition_to_recovering().unwrap();
+        assert_eq!(mgr.state().unwrap(), FallbackState::Recovering);
+
+        // Below the threshold the half-open probe tolerates blips.
+        for _ in 0..2 {
+            assert!(!mgr.record_failure(FailureKind::Transient).unwrap());
+        }
+        assert_eq!(
+            mgr.state().unwrap(),
+            FallbackState::Recovering,
+            "two transient blips under the threshold stay half-open"
+        );
+
+        // A success resets the window: the counter starts over rather
+        // than accumulating across probe generations.
+        mgr.record_success().unwrap();
+        assert!(!mgr.record_failure(FailureKind::Transient).unwrap());
+        assert_eq!(mgr.state().unwrap(), FallbackState::Recovering);
+
+        // Reaching the threshold re-trips: the primary is not coming
+        // back, and the fallback takes over instead of a lockout.
+        mgr.record_failure(FailureKind::Transient).unwrap();
+        let tripped = mgr.record_failure(FailureKind::Transient).unwrap();
+        assert!(tripped, "the third transient in the window re-trips");
+        assert_eq!(mgr.state().unwrap(), FallbackState::Fallback);
+        assert_eq!(
+            mgr.active_model().unwrap().as_deref(),
+            Some("fallback"),
+            "after the re-trip the fallback serves again"
+        );
+    }
+
+    #[test]
+    fn chain_mutation_apis_validate_names_all_or_nothing() {
+        let mgr = FallbackManager::new(1, 1);
+        mgr.set_fallback_model("fb-one").unwrap();
+
+        assert!(
+            mgr.insert_fallback_model(0, "  ").is_err(),
+            "insert rejects a whitespace-only name like every other entry point"
+        );
+        assert!(
+            mgr.insert_fallback_model(0, "  fb-two  ").is_ok(),
+            "and trims what it accepts"
+        );
+        assert_eq!(
+            mgr.fallback_models().unwrap().first().cloned(),
+            Some("fb-two".to_string()),
+            "the trimmed insert landed at the requested index"
+        );
+
+        // The bulk replacement is all-or-nothing: one bad name rejects
+        // the whole call and leaves the existing chain intact.
+        assert!(
+            mgr.set_fallback_models(vec!["good".to_string(), "\t".to_string()])
+                .is_err(),
+            "the bulk API rejects an input containing a bad name"
+        );
+        assert_eq!(
+            mgr.fallback_models().unwrap().len(),
+            2,
+            "the rejected bulk call left the chain untouched"
+        );
+        mgr.set_fallback_models(vec!["  a  ".to_string(), "b".to_string()])
+            .unwrap();
+        assert_eq!(
+            mgr.fallback_models().unwrap(),
+            vec!["a".to_string(), "b".to_string()],
+            "a fully valid bulk input replaces the chain with trimmed names"
+        );
+    }
+
+    #[test]
+    fn model_name_setters_reject_empty_and_whitespace_names() {
+        assert!(
+            FallbackManager::for_model("").is_err(),
+            "an empty primary name is a configuration error, not a wire error"
+        );
+        assert!(FallbackManager::for_model("   ").is_err());
+
+        let mgr = FallbackManager::new(1, 1);
+        assert!(mgr.set_original_model("  ".to_string()).is_err());
+        assert!(mgr.set_fallback_model("").is_err());
+        assert!(mgr.add_fallback_model("\t".to_string()).is_err());
+
+        // Names are stored trimmed, matching the trim-then-use
+        // discipline of the model-switch path.
+        mgr.set_fallback_model("  fb  ").unwrap();
+        mgr.set_original_model("primary".to_string()).unwrap();
+        for _ in 0..3 {
+            mgr.record_failure(FailureKind::Transient).unwrap();
+        }
+        assert_eq!(
+            mgr.active_model().unwrap().as_deref(),
+            Some("fb"),
+            "the trimmed name is what routing uses"
         );
     }
 

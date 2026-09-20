@@ -35,8 +35,9 @@ use super::{ToolDispatchContext, ToolDispatchResult, ToolMiddleware, ToolPipelin
 /// Implement this trait to supply the verification logic for
 /// [`VerifyMiddleware`] — typically a build / lint / typecheck command
 /// run against the project state the write tool just modified.
-/// Domain-specific impls (e.g. `cargo check`, `tsc`) live in the
-/// consumer crate; loopctl ships only the trait and the middleware.
+/// Project-state impls (`cargo check`, `tsc`) live in the consumer
+/// crate; for call-level static checks loopctl ships
+/// [`CommandVerifier`] beside the trait.
 ///
 /// # Side effects
 ///
@@ -78,6 +79,24 @@ pub trait Verifier: Send + Sync {
         ctx: &'a ToolContext,
         tool_name: &'a str,
     ) -> Pin<Box<dyn Future<Output = VerifyResult> + Send + 'a>>;
+
+    /// Verify one specific call, with the model's input in hand.
+    ///
+    /// The call-level seam: a verifier that judges the call itself —
+    /// a static command parse, an argument sanity check — needs the
+    /// input the model sent, which [`verify`](Self::verify) never
+    /// sees. The default implementation ignores the input and defers
+    /// to [`verify`](Self::verify), so project-state verifiers are
+    /// unaffected; call-level verifiers override this instead.
+    fn verify_call<'a>(
+        &'a self,
+        ctx: &'a ToolContext,
+        tool_name: &'a str,
+        input: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = VerifyResult> + Send + 'a>> {
+        let _ = input;
+        self.verify(ctx, tool_name)
+    }
 }
 
 /// The outcome of a verification run.
@@ -256,6 +275,11 @@ impl ToolMiddleware for VerifyMiddleware {
         let verifier = &self.verifier;
         let write_tools = &self.write_tools;
         Box::pin(async move {
+            // The call's input as the model sent it: an inner
+            // middleware (a permission modifier, say) may rewrite
+            // `ctx.input` during dispatch, and a call-level verifier
+            // judges the original, not the rewrite.
+            let input_at_call = ctx.input.clone();
             let mut result = next.dispatch(ctx).await;
             let resolved = if result.resolved_tool_name.is_empty() {
                 &ctx.tool_name
@@ -268,7 +292,9 @@ impl ToolMiddleware for VerifyMiddleware {
                 return result;
             }
 
-            let verify = verifier.verify(&ctx.tool_context, resolved).await;
+            let verify = verifier
+                .verify_call(&ctx.tool_context, resolved, &input_at_call)
+                .await;
             append_verify_result(&mut result.output, &verify);
             result
         })
@@ -293,6 +319,9 @@ fn append_verify_result(output: &mut ToolContent, verify: &VerifyResult) {
         }
     }
 }
+
+mod builtin;
+pub use builtin::CommandVerifier;
 
 #[cfg(test)]
 mod tests {
@@ -764,6 +793,73 @@ mod tests {
             1,
             "the cached value carries no verify block — only the freshly appended one: \
              {hit_rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memoize_outside_verify_serves_cached_hits_unverified() {
+        let (verifier, called) = make_verifier(false, "stale");
+        let registry = Arc::new(ToolRegistry::new());
+        let pipeline = ToolPipeline::builder()
+            .with_middleware(MemoizingMiddleware::new(
+                vec!["Write".to_string()],
+                vec!["Write".to_string()],
+                Arc::new(NoopPathExtractor),
+                10,
+            ))
+            .with_middleware(VerifyMiddleware::new(verifier, write_tools()))
+            .with_middleware(FixedOutputMiddleware {
+                output: ToolContent::from_string("wrote"),
+                is_error: false,
+            })
+            .with_core(registry)
+            .build()
+            .expect("pipeline builds");
+
+        let mut ctx = ctx_for("Write");
+        let first = pipeline.dispatch(&mut ctx).await;
+        assert!(
+            first.output.to_string().contains("[verify] failed"),
+            "the first, uncached call is verified"
+        );
+        let mut ctx = ctx_for("Write");
+        let second = pipeline.dispatch(&mut ctx).await;
+        assert!(
+            second.output.to_string().contains("[verify] failed"),
+            "the cached hit replays the verdict stored on the first call"
+        );
+        assert!(
+            *called.lock().unwrap(),
+            "the verifier itself ran exactly once — the replayed block is \
+             cache content, not a fresh verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_outer_cap_can_truncate_the_verdict_away() {
+        let (verifier, _called) = make_verifier(false, "broken-state: the edit did not compile");
+        let registry = Arc::new(ToolRegistry::new());
+        let pipeline = ToolPipeline::builder()
+            .with_middleware(OutputLimitMiddleware::new(6))
+            .with_middleware(VerifyMiddleware::new(verifier, write_tools()))
+            .with_middleware(FixedOutputMiddleware {
+                output: ToolContent::from_string("wrote"),
+                is_error: false,
+            })
+            .with_core(registry)
+            .build()
+            .expect("pipeline builds");
+
+        let mut ctx = ctx_for("Write");
+        let result = pipeline.dispatch(&mut ctx).await;
+        let text = result.output.to_string();
+        assert!(
+            !text.contains("[verify] failed"),
+            "the verdict is truncated away when an outer cap consumes the budget: {text}"
+        );
+        assert!(
+            text.contains("[truncated]"),
+            "the cap's own marker shows it acted on the combined output: {text}"
         );
     }
 }

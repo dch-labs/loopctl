@@ -37,8 +37,8 @@ use crate::engine::RunConfig;
 use crate::error::LoopError;
 use crate::message::{Message, MessagePart, Role};
 use crate::middleware::{
-    MemoizingMiddleware, NoopPathExtractor, NoopVerifier, OutputLimitMiddleware, ToolPipeline,
-    VerifyMiddleware,
+    CommandVerifier, MemoizingMiddleware, NoopPathExtractor, NoopVerifier, OutputLimitMiddleware,
+    ToolPipeline, VerifyMiddleware, WritePathExtractor,
 };
 use crate::structured::{RequestOptions, ToolConstraint};
 
@@ -72,6 +72,13 @@ const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit"];
 /// pure waste.
 const MEMOIZED_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
 
+/// Shell-class tool names the builtin-verified variant also verifies.
+///
+/// The default write list is edit-class only; a shell tool can write
+/// too, so the verified pipeline routes these names through the
+/// [`CommandVerifier`] as well.
+const SHELL_TOOLS: &[&str] = &["Bash", "bash", "shell", "run_command", "execute"];
+
 /// The small-model-tuned runtime profile.
 ///
 /// Bundles context-budget machinery (a context manager that compacts the
@@ -89,12 +96,15 @@ const MEMOIZED_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
 /// arguments, and installs machinery that catches each. Frontier models
 /// tolerate the same defaults fine; use [`FrontierProfile`] to opt out.
 ///
-/// The no-op verifier and path extractor are wired by default so the profile
-/// is functional out of the box — but no actual verification or path-based
-/// cache invalidation happens until you swap in real impls. The verify
-/// middleware still registers and the cache still works by TTL; replacing
-/// [`NoopVerifier`] with `cargo check` / `tsc` and [`NoopPathExtractor`] with
-/// a path-aware extractor is the intended upgrade path.
+/// Two verification levels ship. The default [`pipeline_builder`](Self::pipeline_builder)
+/// wires the no-op verifier and path extractor: the middleware registers
+/// and the cache works by TTL, but nothing verifies and no path-based
+/// invalidation happens — bring your own `cargo check` / `tsc` verifier
+/// for project-state checks. The builtin-verified variant
+/// ([`pipeline_builder_with_builtin_verification`](Self::pipeline_builder_with_builtin_verification))
+/// wires loopctl's own [`CommandVerifier`] (static, no execution)
+/// and [`WritePathExtractor`] (path-aware cache invalidation) with
+/// zero host code.
 ///
 /// Small-model recipe: register the `think` scratchpad tool
 /// (`tool::builtin::ThinkTool`, behind the `builtin_tools` feature)
@@ -159,6 +169,43 @@ impl ConstrainedProfile {
                 MEMOIZED_TOOLS.iter().map(|s| (*s).to_string()).collect(),
                 WRITE_TOOLS.iter().map(|s| (*s).to_string()).collect(),
                 Arc::new(NoopPathExtractor),
+                MEMOIZE_TTL_TURNS,
+            ))
+    }
+
+    /// The builtin-verified [`ToolPipeline`]: the small-model stack
+    /// with the shipped verifier and path extractor wired in place of
+    /// the no-ops.
+    ///
+    /// Same stack and ordering as [`pipeline_builder`](Self::pipeline_builder),
+    /// with two differences: [`VerifyMiddleware`] runs
+    /// [`CommandVerifier`] (static command parse with a deny set;
+    /// parent-existence and writability checks for edit/write inputs)
+    /// over the write list extended with the shell-class tool names,
+    /// and [`MemoizingMiddleware`] extracts paths with
+    /// [`WritePathExtractor`], so a write to a path evicts cached
+    /// results for that path instead of waiting out the TTL.
+    ///
+    /// The default [`pipeline_builder`](Self::pipeline_builder) keeps
+    /// the no-ops; wiring these builtins by default is planned for a
+    /// future release.
+    #[must_use]
+    pub fn pipeline_builder_with_builtin_verification() -> crate::middleware::ToolPipelineBuilder {
+        let verified: Vec<String> = WRITE_TOOLS
+            .iter()
+            .chain(SHELL_TOOLS.iter())
+            .map(|tool| (*tool).to_string())
+            .collect();
+        ToolPipeline::builder()
+            .with_middleware(OutputLimitMiddleware::new(OUTPUT_CAP_CHARS))
+            .with_middleware(VerifyMiddleware::new(
+                Arc::new(CommandVerifier::new()),
+                verified.clone(),
+            ))
+            .with_middleware(MemoizingMiddleware::new(
+                MEMOIZED_TOOLS.iter().map(|s| (*s).to_string()).collect(),
+                verified,
+                Arc::new(WritePathExtractor),
                 MEMOIZE_TTL_TURNS,
             ))
     }

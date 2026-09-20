@@ -968,6 +968,14 @@ pub fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             provider: "openai",
+            name: "model_override",
+            model: "gpt-4.1-mini",
+            prompt: "Say hello in exactly 3 words.",
+            tools: false,
+            stream_usage: true,
+        },
+        Scenario {
+            provider: "openai",
             name: "rate_limit_error",
             model: "gpt-4.1-mini",
             prompt: "Say hello in exactly 3 words.",

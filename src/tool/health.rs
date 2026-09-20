@@ -1578,6 +1578,36 @@ mod tests {
     }
 
     #[test]
+    fn late_failure_after_probe_expiry_re_anchors_the_cooldown() {
+        let cb = ToolCircuitBreaker::new(Duration::from_millis(40), 1)
+            .with_probe_timeout(Duration::from_millis(60));
+        cb.record_failure();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(cb.allow_request(), "the probe is granted");
+
+        std::thread::sleep(Duration::from_millis(80));
+        cb.record_failure();
+        assert_eq!(
+            cb.state_label(),
+            "open",
+            "a failure arriving after the probe lease expired is fresh bad \
+             news — accepted, not discarded"
+        );
+        // The cooldown is anchored to the observation time, not the
+        // original trip: immediately after the late failure no probe is
+        // granted, and one full cooldown later one is.
+        assert!(
+            !cb.would_allow_request(),
+            "the re-anchored cooldown holds right after the late failure"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            cb.allow_request(),
+            "a fresh probe is granted after the re-anchored cooldown"
+        );
+    }
+
+    #[test]
     fn would_allow_true_means_the_next_call_grants() {
         let cb = ToolCircuitBreaker::new(Duration::from_millis(40), 1)
             .with_probe_timeout(Duration::from_millis(60));
@@ -1963,5 +1993,46 @@ mod tests {
             Duration::from_secs(5),
             "doc: maximum single-call duration recorded so far"
         );
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// The pure oracle and the mutating gate agree at every instant,
+    /// over random interleavings of probes and outcomes.
+    ///
+    /// The documented invariant the engine's single-probe guarantee
+    /// rests on: immediately before every
+    /// [`allow_request`](ToolCircuitBreaker::allow_request) call, the
+    /// pure [`would_allow_request`](ToolCircuitBreaker::would_allow_request)
+    /// oracle names the same verdict the mutating call grants. A long
+    /// recovery window keeps the property deterministic — no
+    /// time-based transition fires mid-sequence.
+    #[test]
+    fn oracle_and_gate_agree_over_random_interleavings() {
+        proptest!(|(ops in prop::collection::vec(
+            prop_oneof![
+                Just("allow"),
+                Just("success"),
+                Just("failure"),
+            ],
+            0..40,
+        ))| {
+            let breaker = ToolCircuitBreaker::new(Duration::from_secs(3600), 2);
+            for op in &ops {
+                match *op {
+                    "allow" => {
+                        let oracle = breaker.would_allow_request();
+                        prop_assert_eq!(breaker.allow_request(), oracle);
+                    }
+                    "success" => breaker.record_success(),
+                    "failure" => breaker.record_failure(),
+                    other => panic!("fixed op set: {other}"),
+                }
+            }
+        });
     }
 }

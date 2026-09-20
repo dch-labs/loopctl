@@ -80,6 +80,21 @@ pub trait PathExtractor: Send + Sync {
     /// write invalidating file reads under it), the impl must emit the
     /// matching prefix form itself.
     fn paths(&self, tool_name: &str, input: &Value) -> Vec<String>;
+
+    /// The context-aware twin of [`paths`](Self::paths): the same
+    /// extraction, resolved against the working directory the call
+    /// ran under.
+    ///
+    /// The default ignores `cwd` and defers to [`paths`](Self::paths),
+    /// so extractors that emit already-absolute paths are unaffected;
+    /// extractors that normalize relative paths override this instead.
+    /// The middleware calls this seam, so a relative `{"path":
+    /// "src/lib.rs"}` read under one cwd and a write under another
+    /// still land on the same normalized string.
+    fn paths_with_cwd(&self, tool_name: &str, input: &Value, cwd: &str) -> Vec<String> {
+        let _ = cwd;
+        self.paths(tool_name, input)
+    }
 }
 
 /// A [`PathExtractor`] that extracts no paths.
@@ -329,11 +344,19 @@ impl ToolMiddleware for MemoizingMiddleware {
             let result = next.dispatch(ctx).await;
 
             if is_write && !result.is_error {
-                let write_paths = self.path_extractor.paths(&ctx.tool_name, &ctx.input);
+                let write_paths = self.path_extractor.paths_with_cwd(
+                    &ctx.tool_name,
+                    &ctx.input,
+                    &ctx.tool_context.cwd,
+                );
                 invalidate_paths(&self.cache, &write_paths);
             } else if is_memoized && !result.is_error {
                 let input = input_at_key.as_ref().unwrap_or(&ctx.input);
-                let paths = self.path_extractor.paths(&ctx.tool_name, input);
+                let paths = self.path_extractor.paths_with_cwd(
+                    &ctx.tool_name,
+                    input,
+                    &ctx.tool_context.cwd,
+                );
                 if let (Some(key), Some(epoch)) = (key, epoch_at_dispatch) {
                     insert(&self.cache, key, result.clone(), current_turn, paths, epoch);
                 }
@@ -462,6 +485,9 @@ fn append_cached_marker(output: &mut ToolContent) {
         }),
     }
 }
+
+mod builtin;
+pub use builtin::WritePathExtractor;
 
 #[cfg(test)]
 mod tests {
@@ -1521,6 +1547,126 @@ mod tests {
             calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "the expired entry re-runs the inner dispatch"
+        );
+    }
+    /// Random interleavings of reads and writes never serve a stale
+    /// entry: after a completed write to a path, the next read of that
+    /// path executes.
+    ///
+    /// The shadow model tracks which paths hold a valid cache entry
+    /// (inserted by an executed read, evicted by a write); every read's
+    /// `[cached]` marker must agree with it. This is the sequential
+    /// core of the epoch/invalidation contract — the concurrent races
+    /// are covered by the epoch-guard pins.
+    #[test]
+    fn no_stale_entry_survives_a_completed_write_over_random_interleavings() {
+        use proptest::prelude::*;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime builds");
+
+        proptest!(|(ops in prop::collection::vec(
+            prop_oneof![Just("read-a"), Just("read-b"), Just("write-a"), Just("write-b")],
+            0..40,
+        ))| {
+            let (pipeline, _calls) = pipeline(make_middleware(Arc::new(PathFromInput), 1_000), ToolContent::from_string("ok"), false);
+            let mut valid: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (turn, op) in ops.iter().enumerate() {
+                match *op {
+                    read @ ("read-a" | "read-b") => {
+                        let path = if read == "read-a" { "a.rs" } else { "b.rs" };
+                        let mut ctx = ctx_for("Read", serde_json::json!({"path": path}), turn);
+                        let result = runtime.block_on(pipeline.dispatch(&mut ctx));
+                        let cached = result.output.to_string().contains("[cached]");
+                        prop_assert!(
+                            cached == valid.contains(path),
+                            "turn {}: cache disagrees with the shadow model for {}",
+                            turn,
+                            path
+                        );
+                        if !cached {
+                            valid.insert(path);
+                        }
+                    }
+                    write @ ("write-a" | "write-b") => {
+                        let path = if write == "write-a" { "a.rs" } else { "b.rs" };
+                        let mut ctx = ctx_for("Write", serde_json::json!({"path": path}), turn);
+                        let _ = runtime.block_on(pipeline.dispatch(&mut ctx));
+                        valid.remove(path);
+                    }
+                    other => panic!("fixed op set: {other}"),
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_wave_of_identical_reads_all_execute() {
+        // The inner tool sleeps briefly so all eight dispatches are
+        // genuinely in flight before the first completes — an instantly
+        // resolving tool would let each future run to completion on its
+        // first poll, which is sequential, not concurrent.
+        struct SlowFixedOutput {
+            output: ToolContent,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl ToolMiddleware for SlowFixedOutput {
+            fn name(&self) -> &'static str {
+                "slow_fixed_output"
+            }
+            fn dispatch<'a>(
+                &'a self,
+                _ctx: &'a mut ToolDispatchContext,
+                _next: &'a ToolPipeline,
+            ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
+                let output = self.output.clone();
+                let calls = Arc::clone(&self.calls);
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ToolDispatchResult {
+                        output,
+                        is_error: false,
+                        resolved_tool_name: String::new(),
+                        tool_call_id: String::new(),
+                        duration: std::time::Duration::ZERO,
+                        display_hint: None,
+                    }
+                })
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = ToolPipeline::builder()
+            .with_middleware(make_middleware(Arc::new(PathFromInput), 1_000))
+            .with_middleware(SlowFixedOutput {
+                output: ToolContent::from_string("ok"),
+                calls: Arc::clone(&calls),
+            })
+            .with_core(Arc::new(ToolRegistry::new()))
+            .build()
+            .expect("pipeline builds");
+        let mut contexts = Vec::new();
+        for _ in 0..8 {
+            contexts.push(ctx_for("Read", serde_json::json!({"path": "wave.rs"}), 0));
+        }
+        let mut joins = Vec::new();
+        for mut ctx in contexts {
+            let pipeline_ref = &pipeline;
+            joins.push(async move { pipeline_ref.dispatch(&mut ctx).await });
+        }
+        let results = futures::future::join_all(joins).await;
+        assert_eq!(results.len(), 8, "every wave member completed");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            8,
+            "no coalescing: every concurrent duplicate executes"
+        );
+        let mut ctx = ctx_for("Read", serde_json::json!({"path": "wave.rs"}), 1);
+        let cached = pipeline.dispatch(&mut ctx).await;
+        assert!(
+            cached.output.to_string().contains("[cached]"),
+            "after the wave settles, the next identical read is served from the cache"
         );
     }
 }

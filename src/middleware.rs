@@ -74,7 +74,8 @@ use std::sync::Arc;
 
 pub use crate::tool::ToolDispatchResult;
 
-pub use memoize::{MemoizingMiddleware, NoopPathExtractor, PathExtractor};
+pub use memoize::{MemoizingMiddleware, NoopPathExtractor, PathExtractor, WritePathExtractor};
+
 pub use output_limit::OutputLimitMiddleware;
 pub use permission::{AskResolverFn, PermissionCheckFn, PermissionMiddleware};
 #[cfg(feature = "redaction")]
@@ -84,7 +85,130 @@ pub use shield::SafetyShieldMiddleware;
 pub use timeout::{TimeoutConfig, TimeoutMiddleware};
 pub use tool_call::ToolCallMiddleware;
 pub use unknown_tool::UnknownToolMiddleware;
-pub use verify::{NoopVerifier, Verifier, VerifyMiddleware, VerifyResult};
+pub use verify::{CommandVerifier, NoopVerifier, Verifier, VerifyMiddleware, VerifyResult};
+
+/// Resolve `path` against `cwd` lexically, without touching the
+/// filesystem.
+///
+/// `.` segments drop and `..` segments pop one segment; a write target
+/// that does not exist yet is fine — this is normalization, not
+/// canonicalization, because canonicalizing would fail exactly for the
+/// not-yet-written paths that verification and invalidation care about.
+/// The result always carries a leading `/`, so identical targets
+/// normalize to identical strings regardless of the cwd spelling they
+/// arrived under.
+pub(crate) fn lexical_path(cwd: &str, path: &str) -> String {
+    let joined = if path.starts_with('/') || cwd.is_empty() {
+        path.to_string()
+    } else {
+        format!("{cwd}/{path}")
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in joined.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    format!("/{}", segments.join("/"))
+}
+
+/// Split a command into shell words, honoring single and double
+/// quotes.
+///
+/// Shared by the verifier and the path extractor so both judge
+/// identical word-splitting semantics. Nothing is executed and no
+/// expansion happens — the words are the literal shell tokens, with
+/// whitespace inside quotes retained as part of one token.
+///
+/// # Errors
+///
+/// Returns the unterminated-quote diagnosis when the command ends
+/// inside a quoted segment.
+pub(crate) fn shell_words(command: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut started = false;
+    for character in command.chars() {
+        match character {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                started = true;
+            }
+            character if character.is_whitespace() && !in_single && !in_double => {
+                if started {
+                    tokens.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            character => {
+                current.push(character);
+                started = true;
+            }
+        }
+    }
+    if in_single {
+        return Err("unterminated single quote".to_string());
+    }
+    if in_double {
+        return Err("unterminated double quote".to_string());
+    }
+    if started {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
+/// Absolutize a working-directory spelling against the process's
+/// current directory when it is relative.
+///
+/// `ToolContext::cwd` defaults to `"."`, and lexical resolution of a
+/// relative cwd would anchor to the filesystem root — the wrong
+/// directory for every check that follows. This joins a relative
+/// spelling onto the process cwd lexically (no `canonicalize`: the
+/// join target need not exist, and symlink identity is not part of any
+/// contract here); absolute spellings ride through unchanged.
+pub(crate) fn resolved_cwd(cwd: &str) -> String {
+    if cwd.starts_with('/') {
+        return cwd.to_string();
+    }
+    let process =
+        std::env::current_dir().map_or_else(|_| ".".to_string(), |dir| dir.display().to_string());
+    lexical_path(&process, cwd)
+}
+
+/// Whether a token stream opens with a `<shell> -c` wrapper.
+///
+/// Shell-likeness is name-shaped (`sh`, `bash`, anything ending in
+/// `sh` or `shell`); the allowlist judgment belongs to the verifier,
+/// which can name the offending interpreter in its diagnostic, and the
+/// extractor simply unwraps to the payload it wants to scan.
+pub(crate) fn is_wrapped_shell(tokens: &[String]) -> bool {
+    let first = tokens.first().map(String::as_str).unwrap_or_default();
+    let shell_like =
+        first == "sh" || first == "bash" || first.ends_with("sh") || first.ends_with("shell");
+    shell_like && tokens.get(1).map(String::as_str) == Some("-c")
+}
+
+/// The first of `fields` present as a string on `input`.
+///
+/// Shared field probing for the `command`-style and `path`-style
+/// conventions; returns the first hit so callers can prefer their
+/// primary spelling.
+pub(crate) fn string_field<'v>(input: &'v serde_json::Value, fields: &[&str]) -> Option<&'v str> {
+    fields
+        .iter()
+        .find_map(|field| input.get(*field).and_then(serde_json::Value::as_str))
+}
 
 /// Context for a single tool invocation, passed through the middleware chain.
 ///
@@ -1747,5 +1871,131 @@ mod tests {
             }
             other @ ToolContent::Text(_) => panic!("expected Multipart, got {other:?}"),
         }
+    }
+    #[test]
+    fn shell_words_splits_on_unquoted_whitespace_and_keeps_quoted_runs() {
+        assert_eq!(
+            shell_words("echo \"two words\" one").expect("balanced quotes"),
+            vec![
+                "echo".to_string(),
+                "two words".to_string(),
+                "one".to_string()
+            ]
+        );
+        assert_eq!(
+            shell_words("cut -d' ' -f1").expect("balanced quotes"),
+            vec!["cut".to_string(), "-d ".to_string(), "-f1".to_string()]
+        );
+        assert_eq!(
+            shell_words("a'b c'd").expect("balanced quotes"),
+            vec!["ab cd".to_string()],
+            "adjacent quoted and unquoted segments join into one word"
+        );
+        assert_eq!(
+            shell_words("tab\tsep\nline").expect("balanced quotes"),
+            vec!["tab".to_string(), "sep".to_string(), "line".to_string()],
+            "tabs and newlines separate unquoted words"
+        );
+        assert_eq!(
+            shell_words("héllo wörld").expect("balanced quotes"),
+            vec!["héllo".to_string(), "wörld".to_string()],
+            "multi-byte characters survive as word content"
+        );
+        assert!(shell_words("").expect("empty").is_empty());
+    }
+
+    #[test]
+    fn shell_words_names_the_unterminated_quote() {
+        let error = shell_words("echo \"unclosed").expect_err("the double quote never closes");
+        assert!(
+            error.contains("double"),
+            "the error names the quote: {error}"
+        );
+        let error = shell_words("it's").expect_err("the single quote never closes");
+        assert!(
+            error.contains("single"),
+            "the error names the quote: {error}"
+        );
+    }
+
+    #[test]
+    fn is_wrapped_shell_recognizes_shell_shaped_dash_c_openings() {
+        let tokens = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| (*word).to_string())
+                .collect::<Vec<String>>()
+        };
+        for opening in [
+            &["sh", "-c", "echo hi"][..],
+            &["bash", "-c"][..],
+            &["zsh", "-c"][..],
+            &["fish", "-c"][..],
+            &["/bin/bash", "-c"][..],
+        ] {
+            assert!(
+                is_wrapped_shell(&tokens(opening)),
+                "{opening:?}: a shell-shaped binary followed by -c is a wrapper"
+            );
+        }
+        for plain in [
+            &["echo", "hi"][..],
+            &["sh", "script.sh"][..],
+            &["-c"][..],
+            &[][..],
+        ] {
+            assert!(
+                !is_wrapped_shell(&tokens(plain)),
+                "{plain:?}: not a wrapper opening"
+            );
+        }
+    }
+
+    #[test]
+    fn string_field_returns_the_first_present_string() {
+        let input = json!({"path": "/a/b", "file_path": "/c", "count": 3});
+        assert_eq!(
+            string_field(&input, &["path", "file_path"]),
+            Some("/a/b"),
+            "the first listed field wins"
+        );
+        assert_eq!(
+            string_field(&input, &["file_path", "filename"]),
+            Some("/c"),
+            "the fallback field is used when the primary is absent"
+        );
+        assert_eq!(
+            string_field(&input, &["filename"]),
+            None,
+            "an absent field yields nothing"
+        );
+        assert_eq!(
+            string_field(&input, &["count"]),
+            None,
+            "a non-string field is skipped, not coerced"
+        );
+    }
+
+    #[test]
+    fn lexical_path_joins_drops_and_clamps() {
+        assert_eq!(lexical_path("/repo", "src/lib.rs"), "/repo/src/lib.rs");
+        assert_eq!(
+            lexical_path("/repo", "/etc/absolute.conf"),
+            "/etc/absolute.conf"
+        );
+        assert_eq!(
+            lexical_path("/repo/a", "../shared/x.md"),
+            "/repo/shared/x.md"
+        );
+        assert_eq!(lexical_path("/repo/a", "../../shared/x.md"), "/shared/x.md");
+        assert_eq!(
+            lexical_path("/repo", "../../../../escape"),
+            "/escape",
+            ".. past the root clamps at the root"
+        );
+        assert_eq!(lexical_path("/repo/", "src/lib.rs"), "/repo/src/lib.rs");
+        assert_eq!(lexical_path("/repo", "src/./lib.rs"), "/repo/src/lib.rs");
+        assert_eq!(lexical_path("", "relative.txt"), "/relative.txt");
+        assert_eq!(lexical_path("/repo", ""), "/repo");
     }
 }

@@ -231,31 +231,39 @@ fn curated(kind: &'static str, literal: &'static str) -> Option<SecretPattern> {
 
 /// Redact high-entropy tokens no explicit pattern matched.
 ///
-/// Splits on spaces (preserving all other structure), trims
-/// non-token characters from each piece's edges, and replaces any
-/// remaining core of [`MIN_ENTROPY_TOKEN_LEN`] or more characters whose
-/// Shannon entropy reaches [`ENTROPY_THRESHOLD`]. Returns the number of
-/// tokens redacted.
+/// Splits on whitespace — spaces, tabs, carriage returns, newlines —
+/// preserving every separator, and replaces any resulting core of
+/// [`MIN_ENTROPY_TOKEN_LEN`] or more characters whose Shannon entropy
+/// reaches [`ENTROPY_THRESHOLD`]. Whitespace bounding is the contract:
+/// a credential never spans a newline, while space-free multi-line
+/// tool output (a piped `ls` listing, CRLF logs) must not merge into
+/// one giant candidate. Returns the number of tokens redacted.
 fn scrub_high_entropy(text: &mut String) -> usize {
-    let pieces: Vec<(String, bool)> = std::mem::take(text)
-        .split(' ')
+    let mut count = 0usize;
+    let mut out = String::new();
+    for (piece, changed) in std::mem::take(text)
+        .split_inclusive(char::is_whitespace)
         .map(redact_piece_if_high_entropy)
-        .collect();
-    let count = pieces.iter().filter(|(_, changed)| *changed).count();
-    *text = pieces
-        .into_iter()
-        .map(|(piece, _)| piece)
-        .collect::<Vec<_>>()
-        .join(" ");
+    {
+        if changed {
+            count = count.saturating_add(1);
+        }
+        out.push_str(&piece);
+    }
+    *text = out;
     count
 }
 
-/// Redact the token core of one space-delimited piece, if it qualifies.
+/// Redact the token core of one whitespace-delimited piece, if it
+/// qualifies.
 ///
-/// Returns the (possibly rewritten) piece and whether a substitution
-/// happened — the flag, not marker sniffing, is what counts, so a
-/// piece already carrying a placeholder (an echoed earlier redaction)
-/// is passed through without being counted again.
+/// A piece is a token plus its trailing separator run; the edge trim
+/// below strips the separator (and any quotes or brackets) so only the
+/// interior core is measured. Returns the (possibly rewritten) piece
+/// and whether a substitution happened — the flag, not marker
+/// sniffing, is what counts, so a piece already carrying a placeholder
+/// (an echoed earlier redaction) is passed through without being
+/// counted again.
 fn redact_piece_if_high_entropy(piece: &str) -> (String, bool) {
     let core = piece.trim_matches(|c: char| !is_token_char(c));
     if core.len() < MIN_ENTROPY_TOKEN_LEN || shannon_entropy(core) < ENTROPY_THRESHOLD {

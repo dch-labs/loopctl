@@ -325,6 +325,34 @@ impl<C: ApiClient> BareLoop<C> {
         self.managers.set_memory(memory);
     }
 
+    /// Set the demotion sink for compaction passes.
+    ///
+    /// When a compaction pass removes messages, the loop hands them to
+    /// this sink before the compacted history replaces the old one —
+    /// eviction becomes a handoff instead of a discard. Without a sink,
+    /// the no-op default discards removed messages. Must be called before
+    /// [`run()`](crate::engine::core::Loop::run).
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::compact::demote::MemoryDemotionSink;
+    /// use loopctl::memory::InMemoryStore;
+    /// use std::sync::Arc;
+    ///
+    /// let mut agent = BareLoop::new(client, registry, config);
+    /// let memory = Arc::new(InMemoryStore::new());
+    /// agent.set_demotion_sink(Arc::new(MemoryDemotionSink::new(memory)));
+    /// ```
+    pub fn set_demotion_sink(&mut self, sink: Arc<dyn crate::compact::demote::DemotionSink>) {
+        self.debug_assert_idle();
+        self.managers.set_demotion_sink(sink);
+    }
+
     /// Set the middleware pipeline for tool dispatch.
     ///
     /// Replaces the default (no pipeline) with a caller-supplied
@@ -625,6 +653,17 @@ impl<C: ApiClient> BareLoop<C> {
     #[must_use]
     pub fn with_memory(mut self, memory: Arc<dyn crate::memory::LoopMemory>) -> Self {
         self.set_memory(memory);
+        self
+    }
+
+    /// Set the demotion sink, consuming `self`. Fluent mirror of
+    /// [`set_demotion_sink`](BareLoop::set_demotion_sink).
+    #[must_use]
+    pub fn with_demotion_sink(
+        mut self,
+        sink: Arc<dyn crate::compact::demote::DemotionSink>,
+    ) -> Self {
+        self.set_demotion_sink(sink);
         self
     }
 

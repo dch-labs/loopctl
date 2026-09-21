@@ -540,8 +540,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// Get the session configuration.
     ///
     /// Returns a reference to the [`SessionConfig`] that holds session-scoped
-    /// parameters: the session ID, system prompt, and context window.
-    /// The config is immutable for the lifetime of the loop.
+    /// parameters: the session ID, system prompt, and context window. The
+    /// config is fixed at construction except for the context window, which
+    /// [`switch_model`](Self::switch_model) may rewrite mid-session (the
+    /// installed context manager is re-synced in the same operation).
     pub fn session_config(&self) -> &SessionConfig {
         &self.session.config
     }

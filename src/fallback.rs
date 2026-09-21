@@ -482,6 +482,14 @@ impl Default for BreakerState {
 /// `&FallbackManager` is `Send + Sync` and can be freely shared across
 /// threads (e.g. via `Arc<FallbackManager>`). No `&mut self` is needed
 /// for any operation.
+///
+/// Routing is expressed as a per-request model override, so the client
+/// must implement the options-carrying request calls
+/// (`create_message_with_options`/`stream_messages_with_options`). On a
+/// client that does not, a tripped breaker surfaces as a typed
+/// configuration error naming the missing per-request override support
+/// — loud at the first rerouted request, never a silently misrouted
+/// one.
 pub struct FallbackManager {
     /// Immutable configuration: thresholds and timeouts.
     ///
@@ -1852,6 +1860,50 @@ mod tests {
         assert!(
             mgr.set_original_model("x".to_string()).is_err(),
             "a poisoned breaker must not silently accept writes"
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn a_poisoned_breaker_aborts_the_switch_before_any_state_changes() {
+        use crate::api::ApiClient as _;
+        use crate::engine::BareLoop;
+        use crate::managers::LoopManagers;
+        use crate::tool::ToolRegistry;
+
+        let config = crate::config::SessionConfig::default();
+        let original_window = config.context_window;
+        let client = std::sync::Arc::new(crate::testing::MockApiClient::new("primary"));
+        let mgr = std::sync::Arc::new(FallbackManager::for_model("primary").unwrap());
+        poison(&mgr);
+        let Ok(unwrapped) = std::sync::Arc::try_unwrap(mgr) else {
+            panic!("sole owner once the poisoning thread exited");
+        };
+        let managers = LoopManagers::new().with_fallback(unwrapped);
+        let mut loop_ = BareLoop::new_with_managers(
+            std::sync::Arc::clone(&client),
+            ToolRegistry::new(),
+            config,
+            managers,
+        );
+
+        let result = loop_
+            .switch_model("m2")
+            .with_context_window(original_window.saturating_add(1))
+            .apply();
+        assert!(
+            matches!(result, Err(crate::error::LoopError::LockPoisoned { .. })),
+            "the poison preflight aborts the switch: {result:?}"
+        );
+        assert_eq!(
+            client.model(),
+            "primary",
+            "the client's model is untouched by the aborted switch"
+        );
+        assert_eq!(
+            loop_.session_config().context_window,
+            original_window,
+            "the session window is untouched by the aborted switch"
         );
     }
 

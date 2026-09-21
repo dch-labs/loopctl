@@ -1231,3 +1231,77 @@ async fn the_full_adversarial_cycle_trips_retrips_exhausts_and_recovers() {
         "one on_fallback per genuine activation: the trip, then the re-trip"
     );
 }
+
+/// A client that has not overridden the options-carrying calls — the
+/// shape Bedrock-style and custom clients have. The trait defaults
+/// fail loud on any per-request model override.
+#[derive(Default)]
+struct NoOverridesClient {
+    model: Mutex<String>,
+}
+
+impl ApiClient for NoOverridesClient {
+    fn model(&self) -> String {
+        self.model.lock().unwrap().clone()
+    }
+
+    fn set_model(&self, model: &str) -> bool {
+        *self.model.lock().unwrap() = model.to_string();
+        true
+    }
+
+    fn stream_messages(
+        &self,
+        _request: &StreamRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        Box::pin(futures::stream::empty())
+    }
+
+    fn create_message(
+        &self,
+        _request: &StreamRequest,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<loopctl::api::NonStreamingResponse, ApiError>> + Send + '_>,
+    > {
+        Box::pin(async { Err(ApiError::api("these tests drive the streaming path")) })
+    }
+}
+
+#[tokio::test]
+async fn an_options_less_client_fails_loud_when_the_breaker_reroutes() {
+    // Routing is a per-request model override, so a client without the
+    // options-carrying calls cannot serve a reroute: the failure is a
+    // typed config error naming the missing capability — never a
+    // silently misrouted request.
+    use loopctl::fallback::{FailureKind, FallbackConfig};
+
+    let fallback = FallbackManager::for_model("primary-model")
+        .unwrap()
+        .with_config(FallbackConfig {
+            trip_threshold: 1,
+            recovery_successes_needed: 1,
+            ..FallbackConfig::default()
+        });
+    fallback
+        .set_fallback_models(vec!["backup-model".to_string()])
+        .unwrap();
+    assert!(
+        fallback.record_failure(FailureKind::RateLimit).unwrap(),
+        "precondition: the threshold-1 breaker trips"
+    );
+    let managers = LoopManagers::new().with_fallback(fallback);
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(NoOverridesClient::default()),
+        ToolRegistry::new(),
+        SessionConfig::default(),
+        managers,
+    );
+
+    let outcome = agent.run("hello", &RunConfig::default()).await;
+    let err = outcome.expect_err("the reroute fails loud, not silent");
+    assert!(
+        err.to_string()
+            .contains("does not support per-request model overrides"),
+        "the error names the missing capability: {err}"
+    );
+}

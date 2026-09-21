@@ -208,6 +208,28 @@ pub struct CompactionOutcome {
     /// as a [`String`] because it surfaces to observers/logs, not to programmatic
     /// control flow (the loop treats any failed compaction uniformly).
     pub error: Option<String>,
+
+    /// Everything this pass removed from the history.
+    ///
+    /// Every input message with no surviving representative in
+    /// [`messages`](Self::messages), in conversation order — message-granular,
+    /// so a kept message with parts stripped during reconstruction is not
+    /// listed, while a message the pass dropped wholesale is. Empty on
+    /// genuinely-unchanged passes and on failures: nothing left the feed, so
+    /// nothing was evicted. The engine hands this slice to the configured
+    /// [`DemotionSink`](crate::compact::demote::DemotionSink) before adopting
+    /// the compacted history; hosts running compaction directly through
+    /// [`compact_manual`](super::ContextManager::compact_manual) receive it
+    /// here and own its demotion themselves.
+    ///
+    /// The field is the compactor's claim, not a verified measurement: the
+    /// manager classifies the pass by message count and measured tokens alone
+    /// and never diffs the field against the output. A compactor that lists a
+    /// message still present in [`messages`](Self::messages) double-presents
+    /// it — delivered to the sink once and retained in the history — so the
+    /// no-surviving-representative rule above is an obligation on compactors,
+    /// not something the machinery polices.
+    pub evicted: Vec<Message>,
 }
 
 impl CompactionOutcome {
@@ -224,13 +246,17 @@ impl CompactionOutcome {
             tokens_saved: 0,
             success: true,
             error: None,
+            evicted: Vec::new(),
         }
     }
 
     /// Create an outcome representing successful compaction.
     ///
     /// Computes [`tokens_saved`](Self::tokens_saved) automatically from the
-    /// difference between `tokens_before` and `tokens_after`.
+    /// difference between `tokens_before` and `tokens_after`. The outcome
+    /// starts with no [`evicted`](Self::evicted) content; a compactor that
+    /// removed messages attaches them with
+    /// [`with_evicted`](Self::with_evicted).
     #[must_use]
     pub fn compacted(messages: Vec<Message>, tokens_before: u64, tokens_after: u64) -> Self {
         Self {
@@ -239,6 +265,7 @@ impl CompactionOutcome {
             tokens_after,
             success: true,
             error: None,
+            evicted: Vec::new(),
         }
     }
 
@@ -248,6 +275,7 @@ impl CompactionOutcome {
     /// carried error explains why, and the message list passes through
     /// unchanged so the caller can compare real measurements. Token
     /// savings are zero: nothing was committed, so nothing was saved.
+    /// Nothing was evicted either — the feed keeps every message.
     #[must_use]
     pub fn failed(messages: Vec<Message>, tokens_after: u64, error: impl Into<String>) -> Self {
         Self {
@@ -256,7 +284,33 @@ impl CompactionOutcome {
             tokens_after,
             success: false,
             error: Some(error.into()),
+            evicted: Vec::new(),
         }
+    }
+
+    /// Attach the messages this pass removed, consuming `self`.
+    ///
+    /// The producer-side path for [`evicted`](Self::evicted): compactors
+    /// chain it over [`compacted`](Self::compacted) with every input
+    /// message that has no surviving representative in the output, in
+    /// conversation order. Leave it unset when the pass removed nothing.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::compact::CompactionOutcome;
+    /// use loopctl::message::Message;
+    ///
+    /// let kept = vec![Message::user("recent")];
+    /// let dropped = vec![Message::assistant("old")];
+    /// let outcome = CompactionOutcome::compacted(kept, 100, 20)
+    ///     .with_evicted(dropped);
+    /// assert_eq!(outcome.evicted.len(), 1);
+    /// ```
+    #[must_use]
+    pub fn with_evicted(mut self, evicted: Vec<Message>) -> Self {
+        self.evicted = evicted;
+        self
     }
 
     /// Estimate the token count for a slice of messages.

@@ -534,3 +534,65 @@ fn scrub_is_complete_survivor_preserving_and_idempotent() {
         assert_eq!(second, 0, "iter {iter}: second pass found work");
     }
 }
+
+#[test]
+fn a_space_free_multiline_listing_passes_through_verbatim() {
+    // An approved `ls` came back fully redacted (dch session 11e5eecc):
+    // one space-free multi-line listing collapsed into a single
+    // candidate whose ordinary mixed-case filenames cleared the entropy
+    // threshold, swallowing the listing plus the exit line.
+    let listing = "Desktop\nDocuments\nDownloads\nProjects\nShot_2026-09-21_10-34-56.png\nSomeReport_Final_v2.pdf\n[exit 0, 2ms]";
+    let mut scrubbed = listing.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "no substitution on an ordinary listing: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, listing,
+        "newline-bounded tokens never merge into one candidate"
+    );
+}
+
+#[test]
+fn known_secrets_inside_a_newline_listing_still_redact() {
+    let listing = "Desktop\nAKIAIOSFODNN7EXAMPLE\nShot_2026-09-21_10-34-56.png\nnote: api_key=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 trailing words\n[exit 0, 2ms]";
+    let mut scrubbed = listing.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(count, 2, "one redaction per secret line: {scrubbed}");
+    assert!(
+        scrubbed.contains("[REDACTED:aws_access_key]"),
+        "the AWS key line still redacts: {scrubbed}"
+    );
+    assert!(
+        scrubbed.contains("[REDACTED:api_key_kv]"),
+        "a key-value secret sharing its line with words still redacts: {scrubbed}"
+    );
+    assert!(
+        scrubbed.contains("Desktop")
+            && scrubbed.contains("Shot_2026-09-21_10-34-56.png")
+            && scrubbed.contains("[exit 0, 2ms]"),
+        "the ordinary lines around the secrets pass through: {scrubbed}"
+    );
+}
+
+#[test]
+fn tabs_and_carriage_returns_bound_tokens_like_spaces() {
+    let crlf = "Desktop\r\nDocuments\r\n[exit 0, 2ms]";
+    let mut scrubbed = crlf.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(count, 0, "a CRLF listing is ordinary output: {scrubbed}");
+    assert_eq!(
+        scrubbed, crlf,
+        "carriage returns and line feeds bound tokens"
+    );
+
+    let token = "qX7mZ2vQ9wL4nR8tY3uK5jH7gF6dS2aP1oI9bV3cX2z";
+    let mut tabbed = format!("blob\t{token}\tend");
+    let count = SecretPatternSet::default_common().scrub(&mut tabbed);
+    assert_eq!(count, 1, "the tab-bounded token is one candidate: {tabbed}");
+    assert_eq!(
+        tabbed, "blob\t[REDACTED:high_entropy]\tend",
+        "tabs bound tokens exactly as spaces do — and survive the rewrite"
+    );
+}

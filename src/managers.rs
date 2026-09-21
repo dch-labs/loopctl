@@ -66,6 +66,7 @@
 use std::sync::Arc;
 
 use crate::compact::ContextManager;
+use crate::compact::demote::DemotionSink;
 use crate::detection::DetectionManager;
 use crate::detection::{ConvergenceAction, DetectedPattern};
 
@@ -197,6 +198,16 @@ pub struct LoopManagers {
     /// successful run. Persists across manager resets — memory is meant to
     /// survive a `reset_all`.
     memory: Option<Arc<dyn crate::memory::LoopMemory>>,
+
+    /// The sink receiving messages a compaction pass removes.
+    ///
+    /// Always configured: the default is the no-op sink, so eviction is
+    /// discard until a host installs
+    /// [`MemoryDemotionSink`](crate::compact::demote::MemoryDemotionSink)
+    /// or a custom sink. Persists across manager resets, like the memory
+    /// backend — demoted history is meant to outlive the breaker and
+    /// detection state.
+    demotion_sink: Arc<dyn crate::compact::demote::DemotionSink>,
 }
 
 impl LoopManagers {
@@ -225,6 +236,7 @@ impl LoopManagers {
             #[cfg(feature = "tool_health")]
             health_registry: None,
             memory: None,
+            demotion_sink: Arc::new(crate::compact::demote::NoopDemotionSink),
         }
     }
 
@@ -459,13 +471,56 @@ impl LoopManagers {
         self.memory.as_ref()
     }
 
+    /// Set the demotion sink (builder-style).
+    ///
+    /// When set, every compaction pass hands the messages it removed to
+    /// this sink before the compacted history replaces the old one. The
+    /// default sink is a no-op — eviction is discard until a sink is
+    /// configured.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::compact::demote::{DemotionSink, MemoryDemotionSink};
+    /// use loopctl::memory::InMemoryStore;
+    /// use std::sync::Arc;
+    ///
+    /// let memory = Arc::new(InMemoryStore::new());
+    /// let managers = LoopManagers::new()
+    ///     .with_demotion_sink(Arc::new(MemoryDemotionSink::new(memory)));
+    /// ```
+    #[must_use]
+    pub fn with_demotion_sink(mut self, sink: Arc<dyn DemotionSink>) -> Self {
+        self.demotion_sink = sink;
+        self
+    }
+
+    /// Set the demotion sink.
+    ///
+    /// Non-consuming variant of
+    /// [`with_demotion_sink`](Self::with_demotion_sink).
+    pub fn set_demotion_sink(&mut self, sink: Arc<dyn DemotionSink>) {
+        self.demotion_sink = sink;
+    }
+
+    /// Borrow the demotion sink.
+    ///
+    /// Always configured — the default is the no-op sink, so a loop
+    /// without an explicit sink discards evicted content exactly as it
+    /// did before demotion existed.
+    #[must_use]
+    pub fn demotion_sink(&self) -> &Arc<dyn DemotionSink> {
+        &self.demotion_sink
+    }
+
     /// Reset the fallback, detection, and observer managers to their
     /// initial state.
     ///
     /// Clears the fallback circuit breaker, loop/convergence detection
     /// history, and per-observer accumulators. The compaction manager,
     /// hook executor, tool pipeline, stream handler, tool-health
-    /// registry, and memory store keep whatever they hold. Call this
+    /// registry, memory store, and demotion sink keep whatever they
+    /// hold. Call this
     /// when you want a clean slate mid-session — for example after a
     /// provider outage resolves (so the circuit breaker does not stay
     /// tripped) or when switching to an unrelated task (so stale
@@ -620,6 +675,79 @@ impl crate::capabilities::HealthTrackable for LoopManagers {
 mod tests {
     use super::*;
     use crate::detection::{DetectedPattern, DetectionManager};
+
+    /// A sink that counts deliveries — distinguishes the configured
+    /// sink from the default no-op, which cannot.
+    struct TallySink {
+        deliveries: Arc<std::sync::Mutex<usize>>,
+    }
+
+    impl crate::compact::demote::DemotionSink for TallySink {
+        fn demote<'a>(
+            &'a self,
+            _evicted: &'a [crate::message::Message],
+            _meta: crate::compact::demote::DemotionContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::error::LoopError>> + Send + 'a>,
+        > {
+            let deliveries = Arc::clone(&self.deliveries);
+            Box::pin(async move {
+                let mut count = deliveries
+                    .lock()
+                    .map_err(crate::error::from_poison("tally"))?;
+                *count = count.saturating_add(1);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn with_demotion_sink_installs_the_configured_sink() {
+        let deliveries = Arc::new(std::sync::Mutex::new(0usize));
+        let managers = LoopManagers::new().with_demotion_sink(Arc::new(TallySink {
+            deliveries: Arc::clone(&deliveries),
+        })
+            as Arc<dyn crate::compact::demote::DemotionSink>);
+        let meta = crate::compact::demote::DemotionContext {
+            reason: crate::compact::CompactReason::Manual,
+            turn: 0,
+            session_id: uuid::Uuid::new_v4(),
+        };
+        managers
+            .demotion_sink()
+            .demote(&[crate::message::Message::user("gone")], meta)
+            .await
+            .expect("the builder-installed sink accepts the delivery");
+        assert_eq!(
+            *deliveries.lock().expect("tally lock"),
+            1,
+            "the delivery reached the builder-configured sink, not a default"
+        );
+        let defaulted = LoopManagers::new();
+        assert!(
+            defaulted.demotion_sink().demote(&[], meta).await.is_ok(),
+            "the default sink is the no-op and accepts every delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_all_keeps_the_demotion_sink_and_set_replaces_it() {
+        let sink: Arc<dyn crate::compact::demote::DemotionSink> =
+            Arc::new(crate::compact::demote::NoopDemotionSink);
+        let mut managers = LoopManagers::new().with_demotion_sink(Arc::clone(&sink));
+        managers.reset_all().expect("reset succeeds");
+        assert!(
+            Arc::ptr_eq(managers.demotion_sink(), &sink),
+            "the sink survives a manager reset like the memory backend"
+        );
+        let replacement: Arc<dyn crate::compact::demote::DemotionSink> =
+            Arc::new(crate::compact::demote::NoopDemotionSink);
+        managers.set_demotion_sink(Arc::clone(&replacement));
+        assert!(
+            Arc::ptr_eq(managers.demotion_sink(), &replacement),
+            "set_demotion_sink replaces the configured sink"
+        );
+    }
 
     #[test]
     fn reset_all_clears_a_tripped_breaker_and_dirty_detection() {

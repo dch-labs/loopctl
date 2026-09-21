@@ -328,7 +328,7 @@ impl ContextCompactor for TruncatingCompactor {
             let total = messages.len();
             if total <= self.min_messages {
                 let pairing = ToolPairing::scan(&messages);
-                return Self::unchanged(messages, &pairing, &context);
+                return Self::unchanged(&messages, &pairing, &context);
             }
 
             let pairing = ToolPairing::scan(&messages);
@@ -343,7 +343,7 @@ impl ContextCompactor for TruncatingCompactor {
             }
 
             if split == 0 {
-                return Self::unchanged(messages, &pairing, &context);
+                return Self::unchanged(&messages, &pairing, &context);
             }
 
             let recent: Vec<Message> = messages.get(split..).unwrap_or_default().to_vec();
@@ -353,12 +353,14 @@ impl ContextCompactor for TruncatingCompactor {
                 preserved.push(first.clone());
             }
             preserved.extend(recent);
-            let preserved = Self::reattach_dropped_results(&messages, &pairing, split, preserved);
+            let (preserved, surviving) =
+                Self::reattach_dropped_results(&messages, &pairing, split, preserved);
 
             if preserved.is_empty() {
-                return Self::unchanged(messages, &pairing, &context);
+                return Self::unchanged(&messages, &pairing, &context);
             }
 
+            let evicted = Self::evicted_complement(&messages, &surviving);
             let tokens_after = context.counter.count(&preserved);
             CompactionOutcome {
                 messages: preserved,
@@ -366,6 +368,7 @@ impl ContextCompactor for TruncatingCompactor {
                 tokens_saved: context.tokens_before.saturating_sub(tokens_after),
                 success: true,
                 error: None,
+                evicted,
             }
         })
     }
@@ -418,12 +421,17 @@ impl TruncatingCompactor {
     /// only when it is the exact occurrence mated to a first-message
     /// call — a later pair reusing the same id neither satisfies that
     /// call nor gets pulled in its place.
+    ///
+    /// Returns the assembled output together with the original-message
+    /// indices that survived in it — the complement over `0..split`
+    /// region boundaries is what [`evicted_complement`](Self::evicted_complement)
+    /// turns into the outcome's evicted list.
     fn reattach_dropped_results(
         messages: &[Message],
         pairing: &ToolPairing,
         split: usize,
         kept: Vec<Message>,
-    ) -> Vec<Message> {
+    ) -> (Vec<Message>, Vec<usize>) {
         let pull_indices = pairing.first_message_dropped_result_indices(split);
 
         let pulled: Vec<Message> = pull_indices
@@ -432,7 +440,9 @@ impl TruncatingCompactor {
             .collect();
         let mut kept_iter = kept.into_iter();
         let Some(first) = kept_iter.next() else {
-            return pulled;
+            let mut out = pulled;
+            let surviving = Self::sanitize_tool_parts(&mut out, &pull_indices, pairing, 0);
+            return (out, surviving);
         };
         let pulled_len = pulled.len();
         let mut out =
@@ -444,8 +454,26 @@ impl TruncatingCompactor {
         origins.extend(pull_indices.iter().copied());
         origins.extend(split..messages.len());
         out.extend(kept_iter);
-        Self::sanitize_tool_parts(&mut out, &origins, pairing, pulled_len);
-        out
+        let surviving = Self::sanitize_tool_parts(&mut out, &origins, pairing, pulled_len);
+        (out, surviving)
+    }
+
+    /// Clone every input message with no surviving output representative.
+    ///
+    /// The message-granular eviction rule: `surviving` holds the
+    /// original-message indices still represented in the compacted
+    /// output, so the complement — dropped slice, orphan-emptied
+    /// messages, garbage removed by cleanup — is exactly what the pass
+    /// removed from the feed, in conversation order. A kept message
+    /// whose parts were stripped during reconstruction survives and is
+    /// not evicted.
+    fn evicted_complement(messages: &[Message], surviving: &[usize]) -> Vec<Message> {
+        messages
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !surviving.contains(index))
+            .map(|(_, msg)| msg.clone())
+            .collect()
     }
 
     /// Return the conversation as a no-change outcome with orphaned
@@ -459,19 +487,21 @@ impl TruncatingCompactor {
     /// messages are removed. When the filtering removes anything, the
     /// outcome reports the reduction with the caller's configured
     /// counter (`tokens_after`/`tokens_saved`), matching the assembled
-    /// path; when nothing was filtered, the plain no-change outcome
-    /// (zero savings) is returned. A conversation consisting solely of
+    /// path, and carries the removed messages in `evicted` — removed ⇒
+    /// demoted holds uniformly, not just on the split path. When nothing
+    /// was filtered, the plain no-change outcome (zero savings, empty
+    /// `evicted`) is returned. A conversation consisting solely of
     /// orphaned results is returned as received — filtering it would
     /// produce an empty history, which is never an outcome. The caller
     /// supplies the conversation's pairing — every path into here has
     /// either scanned one already or scans it fresh at the call site.
     fn unchanged(
-        messages: Vec<Message>,
+        messages: &[Message],
         pairing: &ToolPairing,
         context: &CompactionContext,
     ) -> CompactionOutcome {
         if pairing.all_parts_lone_results() {
-            return CompactionOutcome::no_change(messages);
+            return CompactionOutcome::no_change(messages.to_vec());
         }
         let input_len = messages.len();
         let input_parts = messages
@@ -479,8 +509,8 @@ impl TruncatingCompactor {
             .map(|msg| msg.parts.len())
             .fold(0usize, usize::saturating_add);
         let origins: Vec<usize> = (0..input_len).collect();
-        let mut out = messages;
-        Self::sanitize_tool_parts(&mut out, &origins, pairing, 0);
+        let mut out = messages.to_vec();
+        let surviving = Self::sanitize_tool_parts(&mut out, &origins, pairing, 0);
         let filtered_parts = out
             .iter()
             .map(|msg| msg.parts.len())
@@ -488,6 +518,7 @@ impl TruncatingCompactor {
         if out.len() == input_len && filtered_parts == input_parts {
             return CompactionOutcome::no_change(out);
         }
+        let evicted = Self::evicted_complement(messages, &surviving);
         let tokens_after = context.counter.count(&out);
         CompactionOutcome {
             messages: out,
@@ -495,6 +526,7 @@ impl TruncatingCompactor {
             tokens_saved: context.tokens_before.saturating_sub(tokens_after),
             success: true,
             error: None,
+            evicted,
         }
     }
 
@@ -516,12 +548,16 @@ impl TruncatingCompactor {
     /// between a response and its tool results, and stripping the call
     /// would orphan the result that arrives next. Messages left with
     /// no parts after filtering are dropped.
+    ///
+    /// Returns the original-message indices of the messages that
+    /// survive the filtering — the input set for
+    /// [`evicted_complement`](Self::evicted_complement).
     fn sanitize_tool_parts(
         out: &mut Vec<Message>,
         origins: &[usize],
         pairing: &ToolPairing,
         pulled_len: usize,
-    ) {
+    ) -> Vec<usize> {
         let live: HashSet<usize> = origins.iter().copied().collect();
         let pulled_end = pulled_len.saturating_add(1);
         for (slot, msg) in out.iter_mut().enumerate() {
@@ -552,7 +588,14 @@ impl TruncatingCompactor {
                 .map(|(part, _)| part.clone())
                 .collect();
         }
+        let survives: Vec<bool> = out.iter().map(|msg| !msg.parts.is_empty()).collect();
         out.retain(|msg| !msg.parts.is_empty());
+        origins
+            .iter()
+            .zip(&survives)
+            .filter(|(_, keep)| **keep)
+            .map(|(origin, _)| *origin)
+            .collect()
     }
 }
 
@@ -1942,6 +1985,240 @@ mod tests {
         }
     }
 
+    fn message_texts(messages: &[Message]) -> Vec<String> {
+        messages.iter().map(Message::text_content).collect()
+    }
+
+    #[tokio::test]
+    async fn evicted_populated_by_a_compacting_pass() {
+        let messages: Vec<Message> = (0..8)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(format!("marker-{i}"))
+                } else {
+                    Message::assistant(format!("marker-{i}"))
+                }
+            })
+            .collect();
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(4)
+            .with_preserve_recent(3);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+
+        assert_eq!(
+            message_texts(&outcome.messages),
+            vec!["marker-0", "marker-5", "marker-6", "marker-7"],
+            "the first message plus the recent slice survives"
+        );
+        assert_eq!(
+            message_texts(&outcome.evicted),
+            vec!["marker-1", "marker-2", "marker-3", "marker-4"],
+            "evicted holds exactly the dropped messages, in order"
+        );
+        for index in 0..8 {
+            let marker = format!("marker-{index}");
+            let in_output = message_texts(&outcome.messages).contains(&marker);
+            let in_evicted = message_texts(&outcome.evicted).contains(&marker);
+            assert!(
+                in_output ^ in_evicted,
+                "marker {marker:?} must appear in exactly one of output/evicted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_change_passes_evict_nothing() {
+        let clean_short = vec![
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(6)
+            .with_preserve_recent(3);
+        let context = make_context(&clean_short);
+        let outcome = compactor.compact(clean_short, 1, context).await;
+        assert!(outcome.success);
+        assert!(
+            outcome.evicted.is_empty(),
+            "a clean below-minimum pass removed nothing, so nothing was evicted"
+        );
+
+        // Split pulled to zero by the pair adjustment: the first
+        // message's call has its result inside the recent slice, so
+        // nothing can be dropped and nothing was filtered.
+        let split_zero = vec![
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "c1",
+                    "Read",
+                    json!({"path": "a.rs"}),
+                )],
+            ),
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "c1",
+                    "Read",
+                    tool_text("ok"),
+                    false,
+                )],
+            ),
+            Message::user("q2"),
+            Message::assistant("a2"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(4)
+            .with_preserve_recent(3);
+        let context = make_context(&split_zero);
+        let outcome = compactor.compact(split_zero, 1, context).await;
+        assert!(outcome.success);
+        assert!(
+            outcome.evicted.is_empty(),
+            "a split-zero pass with nothing to filter evicts nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_filtered_messages_are_demoted_not_vanished() {
+        // Assembled path: the garbage-only first message is emptied by
+        // filtering and removed — it must land in evicted, not vanish.
+        let messages = vec![
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "ghost",
+                    "Read",
+                    ToolContent::from_string("nowhere"),
+                    false,
+                )],
+            ),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+            Message::user("q3"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(2)
+            .with_preserve_recent(2);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+        assert!(
+            !outcome.messages.iter().any(|m| m.parts.iter().any(
+                |p| matches!(p, MessagePart::ToolResult { call_id, .. } if call_id == "ghost")
+            )),
+            "the orphaned result is dropped from the feed"
+        );
+        assert_eq!(
+            outcome.evicted.len(),
+            3,
+            "the emptied garbage message joins the dropped middle slice in evicted"
+        );
+        assert!(
+            outcome.evicted.first().is_some_and(|msg| {
+                msg.parts.iter().any(
+                    |p| matches!(p, MessagePart::ToolResult { call_id, .. } if call_id == "ghost"),
+                )
+            }),
+            "the evicted copy carries the removed content"
+        );
+        assert_eq!(
+            message_texts(&outcome.evicted[1..]),
+            vec!["a1", "q2"],
+            "the dropped middle is demoted alongside the garbage"
+        );
+
+        // Below-minimum sanitize-reduced pass: same rule on the other path.
+        let short = vec![
+            Message::user("a reasonably long first message"),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "ghost",
+                    "Read",
+                    ToolContent::from_string("a sizeable orphaned payload"),
+                    false,
+                )],
+            ),
+            Message::assistant("a1"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(6)
+            .with_preserve_recent(3);
+        let context = make_context(&short);
+        let outcome = compactor.compact(short, 1, context).await;
+        assert!(outcome.success);
+        assert_eq!(
+            message_texts(&outcome.evicted),
+            vec![""],
+            "the garbage message the below-minimum pass removed is demoted"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_message_and_pulled_messages_never_demoted() {
+        let messages = vec![
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "c1",
+                    "Read",
+                    json!({"path": "a.rs"}),
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "c1",
+                    "Read",
+                    tool_text("ok"),
+                    false,
+                )],
+            ),
+            Message::user("dropped-a"),
+            Message::assistant("dropped-b"),
+            Message::user("kept-q2"),
+            Message::assistant("kept-a2"),
+            Message::user("kept-q3"),
+            Message::assistant("kept-a3"),
+        ];
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(4)
+            .with_preserve_recent(4);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 1, context).await;
+        assert!(outcome.success);
+
+        assert!(
+            has_tool_call(&outcome.messages, "c1"),
+            "the first message's call stays in the feed"
+        );
+        assert!(
+            has_tool_result(&outcome.messages, "c1"),
+            "the pulled result stays in the feed"
+        );
+        assert_eq!(
+            message_texts(&outcome.evicted),
+            vec!["dropped-a", "dropped-b"],
+            "only the middle slice is demoted"
+        );
+        assert!(
+            outcome.evicted.iter().all(|msg| {
+                !msg.parts.iter().any(|p| {
+                    matches!(p, MessagePart::ToolCall { id, .. } if id == "c1")
+                        || matches!(p, MessagePart::ToolResult { call_id, .. } if call_id == "c1")
+                })
+            }),
+            "neither the first message nor its pulled result is evicted"
+        );
+    }
+
     #[tokio::test]
     async fn sanitized_no_change_passes_report_their_savings() {
         // A short conversation below min_messages loses its orphaned
@@ -2005,5 +2282,110 @@ mod tests {
             outcome.tokens_saved, 0,
             "nothing was filtered, so nothing is claimed as saved"
         );
+    }
+
+    #[test]
+    fn proptest_output_and_evicted_partition_every_message() {
+        use proptest::prelude::*;
+
+        proptest!(|(
+            seed in any::<u64>(),
+            message_count in 0usize..24,
+            tool_permille in 0u64..1000,
+            id_pool in 1u64..4,
+            min_messages in 2usize..8,
+            preserve_recent in 1usize..6,
+        )| {
+            // Deterministic generator: mixed roles, tool calls and
+            // results drawn from a small reused-id pool (orphals
+            // arise naturally), and a unique zero-padded text marker
+            // per message so partition identity is exact.
+            let mut rng = seed;
+            let mut next = move || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let mut messages = Vec::with_capacity(message_count);
+            for index in 0..message_count {
+                let marker = format!("marker{index:03}");
+                let mut parts = vec![MessagePart::text(marker.clone())];
+                if next() % 1000 < tool_permille {
+                    let id = format!(
+                        "t{}",
+                        next().checked_rem(id_pool).unwrap_or(0)
+                    );
+                    if next() % 2 == 0 {
+                        parts.push(MessagePart::tool_call(
+                            id,
+                            "Read",
+                            json!({"path": format!("p{index}")}),
+                        ));
+                        messages.push(Message::new(Role::Assistant, parts));
+                    } else {
+                        parts.push(MessagePart::tool_result(
+                            id,
+                            "Read",
+                            tool_text(&format!("r{index}")),
+                            next() % 4 == 0,
+                        ));
+                        messages.push(Message::new(Role::User, parts));
+                    }
+                } else if next() % 2 == 0 {
+                    messages.push(Message::user(marker));
+                } else {
+                    messages.push(Message::assistant(marker));
+                }
+            }
+
+            let compactor = TruncatingCompactor::new()
+                .with_min_messages(min_messages)
+                .with_preserve_recent(preserve_recent);
+            let context = make_context(&messages);
+            let input = messages.clone();
+            let outcome = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async { compactor.compact(input, 1, context).await });
+            prop_assert!(outcome.success);
+
+            let occurrences = |list: &[Message], marker: &str| {
+                list.iter()
+                    .filter(|msg| msg.text_content().contains(marker))
+                    .count()
+            };
+            for index in 0..message_count {
+                let marker = format!("marker{index:03}");
+                let in_output = occurrences(&outcome.messages, &marker);
+                let in_evicted = occurrences(&outcome.evicted, &marker);
+                prop_assert_eq!(
+                    in_output.saturating_add(in_evicted),
+                    1,
+                    "marker {:?} must appear exactly once across output/evicted",
+                    marker
+                );
+            }
+
+            let evicted_indices: Vec<usize> = outcome
+                .evicted
+                .iter()
+                .filter_map(|msg| {
+                    let text = msg.text_content();
+                    (0..message_count).find(|i| text.contains(&format!("marker{i:03}")))
+                })
+                .collect();
+            let mut sorted = evicted_indices.clone();
+            sorted.sort_unstable();
+            prop_assert_eq!(
+                evicted_indices,
+                sorted,
+                "evicted messages keep conversation order"
+            );
+
+            if !messages.is_empty() {
+                prop_assert!(!outcome.messages.is_empty(), "output never empties");
+            }
+        });
     }
 }

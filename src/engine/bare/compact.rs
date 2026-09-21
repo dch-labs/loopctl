@@ -132,6 +132,25 @@ impl<C: ApiClient> BareLoop<C> {
 
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
+                if !outcome.evicted.is_empty() {
+                    let meta = crate::compact::demote::DemotionContext {
+                        reason,
+                        turn,
+                        session_id: self.session.id,
+                    };
+                    if let Err(e) = self
+                        .managers
+                        .demotion_sink()
+                        .demote(&outcome.evicted, meta)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            count = outcome.evicted.len(),
+                            "demotion sink rejected evicted turns"
+                        );
+                    }
+                }
                 let tokens_after = outcome.tokens_after.saturating_add(self.overhead_tokens());
                 let tokens_saved = tokens_before.saturating_sub(tokens_after);
                 #[cfg(feature = "hooks")]

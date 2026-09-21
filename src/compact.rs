@@ -32,6 +32,8 @@
 //! - [`CompactTelemetry`] — telemetry data for compaction operations.
 //! - [`CompactionOutcome`] — result of a single compaction pass.
 //! - [`CompactionContext`] — input context passed to compactors.
+//! - [`DemotionSink`] — receives the messages a pass removed, so eviction
+//!   is a handoff rather than a discard (see [`demote`]).
 //!
 //! # Quick Start
 //!
@@ -65,9 +67,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
+pub mod demote;
 pub mod truncating;
 pub mod types;
 
+pub use demote::{
+    DemotionContext, DemotionSink, MemoryDemotionSink, NoopDemotionSink, render_evicted,
+};
 pub use truncating::{SplitResult, TokenSplitter, TruncatingCompactor};
 pub use types::{
     CompactReason, CompactTelemetry, CompactionContext, CompactionOutcome, ContextOverflow,
@@ -1710,6 +1716,86 @@ mod tests {
         }
     }
 
+    /// A compactor that claims evictions it did not make: the output list
+    /// keeps the input's length (texts optionally shortened in place) while
+    /// `evicted` names a message that never left the feed.
+    struct RogueCompactor {
+        shorten: bool,
+    }
+
+    impl ContextCompactor for RogueCompactor {
+        fn compact(
+            &self,
+            messages: Vec<Message>,
+            _target_tokens: u64,
+            _context: CompactionContext,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CompactionOutcome> + Send + '_>>
+        {
+            let shorten = self.shorten;
+            Box::pin(async move {
+                let input_tokens = CompactionOutcome::estimate_tokens(&messages);
+                let preserved: Vec<Message> = messages
+                    .into_iter()
+                    .map(|msg| {
+                        let text = if shorten {
+                            "short".to_string()
+                        } else {
+                            msg.text_content()
+                        };
+                        Message::new(msg.role, vec![MessagePart::text(text)])
+                    })
+                    .collect();
+                let tokens_after = CompactionOutcome::estimate_tokens(&preserved);
+                CompactionOutcome::compacted(preserved, input_tokens, tokens_after)
+                    .with_evicted(vec![Message::user("ghost")])
+            })
+        }
+    }
+
+    fn rogue_input() -> Vec<Message> {
+        (0..6)
+            .map(|i| Message::user(format!("message {i} with a sizeable body of text")))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn rogue_evicted_claims_ride_through_when_tokens_shrink() {
+        // Classification is by measured count and tokens alone: an
+        // equal-length list with cheaper texts is a real reduction, so the
+        // pass classifies Compacted and the unverified evicted claim rides
+        // through with it.
+        let manager = ContextManager::new(Arc::new(RogueCompactor { shorten: true }))
+            .with_context_window(1_000_000);
+        let result = manager.compact_manual(rogue_input(), 1).await;
+        match result {
+            Ok(EnsureContextResult::Compacted(outcome)) => {
+                assert_eq!(outcome.messages.len(), 6);
+                assert_eq!(
+                    outcome.evicted.len(),
+                    1,
+                    "the manager does not police the field — the claim rides through"
+                );
+            }
+            _ => panic!("a token-shrinking pass classifies Compacted"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rogue_evicted_claims_are_discarded_when_nothing_shrank() {
+        // The one branch that does drop the field: equal count and no token
+        // reduction classifies NoAction, and the outcome (claim included)
+        // never reaches the caller.
+        let manager = ContextManager::new(Arc::new(RogueCompactor { shorten: false }))
+            .with_context_window(1_000_000);
+        let result = manager.compact_manual(rogue_input(), 1).await;
+        match result {
+            Ok(EnsureContextResult::NoAction(messages)) => {
+                assert_eq!(messages.len(), 6);
+            }
+            _ => panic!("an equal-count, no-shrink pass classifies NoAction"),
+        }
+    }
+
     #[test]
     fn test_context_overflow_display() {
         let overflow = ContextOverflow {
@@ -1751,6 +1837,7 @@ mod tests {
             tokens_saved: 800,
             success: true,
             error: None,
+            evicted: Vec::new(),
         };
 
         let start = Instant::now();

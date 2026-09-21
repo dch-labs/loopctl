@@ -354,6 +354,32 @@ impl ApiClient for MockClient {
             assemble_response(events)
         })
     }
+
+    fn stream_messages_with_options(
+        &self,
+        request: &crate::api::StreamRequest,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        // Accepts a per-request model override (the engine routes one
+        // after every programmatic switch) by adopting it as the served
+        // model; other option fields are ignored by this mock.
+        if let Some(model) = options.model.as_deref() {
+            *crate::error::recover_guard(self.model_name.lock()) = model.to_string();
+        }
+        ApiClient::stream_messages(self, request)
+    }
+
+    fn create_message_with_options(
+        &self,
+        request: &crate::api::StreamRequest,
+        options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        if let Some(model) = options.model.as_deref() {
+            *crate::error::recover_guard(self.model_name.lock()) = model.to_string();
+        }
+        ApiClient::create_message(self, request)
+    }
 }
 
 trait PopFront<T> {
@@ -4320,6 +4346,221 @@ async fn switch_model_updates_config_and_client() {
 
     // The shared client handle sees the same update.
     assert_eq!(client_arc.model(), "model-b");
+}
+
+/// A tool whose result size the scripted input controls — the growth
+/// knob for context-window tests.
+struct SizedTool;
+
+impl Tool for SizedTool {
+    fn name(&self) -> &'static str {
+        "sized"
+    }
+
+    fn description(&self) -> &'static str {
+        "Returns a payload of the requested size"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            self.name().to_string(),
+            self.description().to_string(),
+            json!({
+                "type": "object",
+                "properties": { "chars": { "type": "integer" } },
+                "required": ["chars"]
+            }),
+        )
+    }
+
+    fn call(
+        &self,
+        input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        let chars = usize::try_from(
+            input
+                .get("chars")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        )
+        .unwrap_or(0);
+        Box::pin(async move { Ok(ToolOutput::text("x".repeat(chars))) })
+    }
+}
+
+/// Script `count` tool-only turns of the given result size, then a
+/// final text response that ends the run.
+fn script_sized_turns(client: &MockClient, count: usize, chars: usize) {
+    for i in 0..count {
+        client.add_tool_only_response(&format!("c{i}"), "sized", &json!({ "chars": chars }));
+    }
+    client.add_text_response("done");
+}
+
+#[tokio::test]
+async fn switch_model_with_context_window_resyncs_the_installed_manager() {
+    // The machine triggers on the session config's window; the manager
+    // targets and fit-checks its own copy. A switch that rewrites one
+    // without the other leaves the two halves of compaction on
+    // different windows, so apply re-syncs the installed manager the
+    // same way set_context_manager does at install.
+    let client = std::sync::Arc::new(MockClient::new("m"));
+    let config = SessionConfig::default()
+        .with_context_window(700)
+        .with_compact_threshold(80);
+    let mut loop_ = BareLoop::new(client, ToolRegistry::new(), config);
+    loop_.set_context_manager(std::sync::Arc::new(crate::compact::ContextManager::new(
+        std::sync::Arc::new(crate::compact::TruncatingCompactor::default()),
+    )));
+    let Some(installed) = loop_.managers.context_manager() else {
+        panic!("the manager must be installed");
+    };
+    assert_eq!(installed.context_window(), 700, "install-time sync");
+
+    loop_
+        .switch_model("m2")
+        .with_context_window(1_500)
+        .apply()
+        .unwrap();
+    let Some(installed) = loop_.managers.context_manager() else {
+        panic!("the manager must survive the switch");
+    };
+    assert_eq!(
+        installed.context_window(),
+        1_500,
+        "apply re-syncs the installed manager to the new window"
+    );
+
+    // A switch on a default-constructed loop re-syncs the seeded
+    // default manager the same way.
+    let mut bare = BareLoop::new(
+        std::sync::Arc::new(MockClient::new("m")),
+        ToolRegistry::new(),
+        SessionConfig::default(),
+    );
+    bare.switch_model("m2")
+        .with_context_window(999)
+        .apply()
+        .unwrap();
+    let Some(installed) = bare.managers.context_manager() else {
+        panic!("the default manager is always seeded");
+    };
+    assert_eq!(
+        installed.context_window(),
+        999,
+        "the seeded default manager re-syncs too"
+    );
+}
+
+#[tokio::test]
+async fn a_switch_to_a_larger_window_does_not_fail_history_between_the_windows() {
+    // History whose kept slice fits the new window but not the old one
+    // must pass the post-compaction fit check: before the re-sync, the
+    // manager kept the stale small window and the pass died
+    // ContextExceeded even though the conversation fit the model it now
+    // runs on.
+    let client = std::sync::Arc::new(MockClient::new("m"));
+    let mut registry = ToolRegistry::new();
+    registry.register(SizedTool);
+    let config = SessionConfig::default()
+        .with_context_window(800)
+        .with_compact_threshold(80);
+    let mut loop_ = BareLoop::new(Arc::clone(&client), registry, config);
+    loop_.set_context_manager(std::sync::Arc::new(
+        crate::compact::ContextManager::new(std::sync::Arc::new(
+            crate::compact::TruncatingCompactor::new()
+                .with_min_messages(2)
+                .with_preserve_recent(2),
+        ))
+        .with_context_window(800)
+        .with_threshold(80),
+    ));
+
+    // Two lean turns stay under the old trigger (640).
+    script_sized_turns(&client, 2, 400);
+    loop_
+        .run("start", &crate::engine::RunConfig::default())
+        .await
+        .expect("the small-history run completes");
+
+    loop_
+        .switch_model("m2")
+        .with_context_window(2_000)
+        .apply()
+        .unwrap();
+
+    // Three fat turns push the estimate past the new trigger (1600)
+    // while the kept slice (first + two fat results) can never fit the
+    // stale 800 window.
+    script_sized_turns(&client, 3, 2_000);
+    let outcome = loop_
+        .run(
+            "grow past the new trigger",
+            &crate::engine::RunConfig::default(),
+        )
+        .await;
+    assert!(
+        outcome.is_ok(),
+        "a pass over history that fits the new window must not fail on \
+         the stale old one: {:?}",
+        outcome.err()
+    );
+}
+
+#[tokio::test]
+async fn a_switch_to_a_smaller_window_keeps_compacting_under_the_new_one() {
+    // After shrinking the window mid-session, the next run's compaction
+    // engages and completes under the new, tighter budget.
+    let client = std::sync::Arc::new(MockClient::new("m"));
+    let mut registry = ToolRegistry::new();
+    registry.register(SizedTool);
+    let config = SessionConfig::default()
+        .with_context_window(2_000)
+        .with_compact_threshold(90);
+    let mut loop_ = BareLoop::new(Arc::clone(&client), registry, config);
+    loop_.set_context_manager(std::sync::Arc::new(
+        crate::compact::ContextManager::new(std::sync::Arc::new(
+            crate::compact::TruncatingCompactor::new()
+                .with_min_messages(2)
+                .with_preserve_recent(2),
+        ))
+        .with_context_window(2_000)
+        .with_threshold(90),
+    ));
+
+    // Two fat turns and a lean one stay under the old trigger (1800);
+    // the lean ending keeps the post-switch kept slice small enough to
+    // clear the new trigger (630) after compaction.
+    client.add_tool_only_response("c0", "sized", &json!({ "chars": 2_000 }));
+    client.add_tool_only_response("c1", "sized", &json!({ "chars": 2_000 }));
+    client.add_tool_only_response("c2", "sized", &json!({ "chars": 400 }));
+    client.add_text_response("done");
+    loop_
+        .run("start", &crate::engine::RunConfig::default())
+        .await
+        .expect("the pre-switch run completes");
+
+    let before = loop_.machine.full_history().len();
+    loop_
+        .switch_model("m2")
+        .with_context_window(700)
+        .apply()
+        .unwrap();
+    let Some(installed) = loop_.managers.context_manager() else {
+        panic!("the manager must be installed");
+    };
+    assert_eq!(installed.context_window(), 700);
+
+    script_sized_turns(&client, 1, 400);
+    loop_
+        .run("grow", &crate::engine::RunConfig::default())
+        .await
+        .expect("the post-shrink run completes under the new window");
+    assert!(
+        loop_.machine.full_history().len() < before,
+        "the tighter window drove a compaction that removed messages"
+    );
 }
 
 #[tokio::test]

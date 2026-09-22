@@ -37,6 +37,15 @@
             }
           ],
           "role": "user"
+        },
+        {
+          "parts": [
+            {
+              "text": "Route me to whichever model is healthy.",
+              "type": "text"
+            }
+          ],
+          "role": "user"
         }
       ],
       "system": null,

@@ -3,7 +3,7 @@
 //! Drives [`BareLoop`] against [`MockApiClient`] and a scripted slow
 //! stream to pin the contract edges the in-crate engine tests leave
 //! implicit: strict constraints through the mock, recovery after a hard
-//! failure, mid-stream cancellation committing nothing, and the
+//! failure, mid-stream cancellation salvaging the prompt, and the
 //! zero-timeout probe path through the tool-health gate.
 
 #![cfg(feature = "testing")]
@@ -73,9 +73,9 @@ async fn a_hard_failed_run_recovers_on_the_next_run() {
     let conversation = agent.conversation();
     assert_eq!(
         conversation.len(),
-        2,
-        "the failed run committed nothing; the second run's exchange is the \
-         whole history: {:?}",
+        3,
+        "the failed run's prompt survives and the second run's exchange \
+         follows it: {:?}",
         conversation.iter().map(|m| m.role).collect::<Vec<_>>()
     );
 }
@@ -118,7 +118,7 @@ impl ApiClient for StalledStreamClient {
 }
 
 #[tokio::test]
-async fn a_mid_stream_cancel_commits_nothing() {
+async fn a_mid_stream_cancel_salvages_the_prompt() {
     let mut agent = BareLoop::new(
         Arc::new(StalledStreamClient),
         ToolRegistry::new(),
@@ -135,10 +135,17 @@ async fn a_mid_stream_cancel_commits_nothing() {
         matches!(run, Err(loopctl::error::LoopError::Cancelled)),
         "the mid-stream cancel surfaces as a typed cancellation: {run:?}"
     );
-    assert!(
-        agent.conversation().is_empty(),
-        "a stream that never completed commits nothing — not the prompt, \
-         not a partial message"
+    assert_eq!(
+        agent.conversation().len(),
+        1,
+        "a cancel mid-model-call costs the in-flight turn, not the prompt: \
+         the salvaged conversation holds the user message"
+    );
+    assert_eq!(
+        agent.conversation()[0].text_content(),
+        "q",
+        "the salvaged message is the run's prompt — no partial assistant \
+         message exists, and nothing else was recorded"
     );
 }
 

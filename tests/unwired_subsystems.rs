@@ -3752,8 +3752,8 @@ mod cancellation_recovery {
     async fn a_cancel_during_an_in_flight_compact_ends_the_run_typed() {
         // The compactor hangs mid-pass; the cancel signal fires while
         // it is in flight. The run ends with the typed cancellation
-        // (not a hang), and its pending work is discarded whole — no
-        // partial turns, no half-compacted history lands.
+        // (not a hang), its completed exchanges are salvaged into
+        // history, and the half-compacted history never lands.
         let mut responses = Vec::new();
         for i in 0..8 {
             responses.push(MockResponse {
@@ -3809,10 +3809,44 @@ mod cancellation_recovery {
             1,
             "exactly one compaction pass began"
         );
+        let conversation = loop_.conversation();
         assert!(
-            loop_.conversation().is_empty(),
-            "the cancelled run commits nothing — no partial turns, no \
-             compaction summary"
+            conversation.len() >= 3 && conversation.len() % 2 == 1,
+            "the cancelled run salvages its prompt plus whole completed \
+             exchanges (an odd message count), got {} messages",
+            conversation.len()
+        );
+        let mut opened: Vec<String> = Vec::new();
+        let mut closed: Vec<String> = Vec::new();
+        for message in &conversation {
+            for part in &message.parts {
+                match part {
+                    loopctl::message::MessagePart::ToolCall { id, .. } => {
+                        opened.push(id.clone());
+                    }
+                    loopctl::message::MessagePart::ToolResult { call_id, .. } => {
+                        closed.push(call_id.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        opened.sort();
+        closed.sort();
+        assert_eq!(
+            opened, closed,
+            "every salvaged tool call is paired with its result — no \
+             orphaned exchange survived"
+        );
+        let last = conversation
+            .last()
+            .expect("the salvaged history is non-empty");
+        assert!(
+            last.parts
+                .iter()
+                .any(|p| matches!(p, loopctl::message::MessagePart::ToolResult { .. })),
+            "the salvaged history ends with the last completed exchange — \
+             the hanging compaction pass never landed as a summary"
         );
     }
 }

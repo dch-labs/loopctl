@@ -1637,8 +1637,10 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Propagates [`LoopError::ContextExceeded`] when compaction could not
     /// reduce the history enough, and [`LoopError::Cancelled`] when the
-    /// cancel signal fires while a pass is in flight — the machine stays
-    /// awaiting its compaction result and the uncompacted history survives.
+    /// cancel signal fires while a pass is in flight — the in-flight pass
+    /// is dropped and its result never lands, so the uncompacted history
+    /// survives; the run loop then drives the machine to its terminal
+    /// `Cancelled` state.
     async fn handle_compact(
         &mut self,
         reason: crate::compact::types::CompactReason,
@@ -1780,6 +1782,14 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
     /// arrived before the run: the run observes it and returns
     /// [`LoopError::Cancelled`], and only then is the signal cleared,
     /// so the agent is never left permanently dead after one cancel.
+    ///
+    /// History retention is three-way: a successful run commits its
+    /// whole pending buffer; a run that failed because the conversation
+    /// cannot fit the context window discards it (committing an
+    /// unshrinkable over-window history would wedge every future run);
+    /// every other interrupted run salvages the coherent prefix, so
+    /// cancellation and ordinary failure cost the in-flight turn, not
+    /// the entire conversation.
     fn finalize<'a>(
         &'a mut self,
         error: Option<&'a LoopError>,
@@ -1797,8 +1807,16 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 {
                     tracing::warn!(error = %e, "memory consolidate failed");
                 }
-            } else {
+            } else if matches!(error, Some(LoopError::ContextExceeded { .. })) {
                 self.machine.discard_pending();
+            } else {
+                let dropped = self.machine.salvage_pending();
+                if !dropped.is_empty() {
+                    tracing::debug!(
+                        count = dropped.len(),
+                        "salvage dropped the incomplete turn tail"
+                    );
+                }
             }
 
             self.managers.detection().consume_pending_loop_stop();

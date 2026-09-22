@@ -1721,11 +1721,12 @@ async fn compaction_then_failure_leaves_history_compacted() {
         "history must contain messages from the first successful run"
     );
     assert!(
-        !history.iter().any(|m| m.role == Role::User
+        history.iter().any(|m| m.role == Role::User
             && m.parts
                 .iter()
                 .any(|p| matches!(p, MessagePart::Text { text } if text == "will fail"))),
-        "failed run's user input must not persist in history"
+        "the cancelled run's prompt survives in history — cancellation costs \
+         the in-flight turn, not the run's input"
     );
 
     agent.run("third run", &RunConfig::default()).await.unwrap();
@@ -5253,6 +5254,291 @@ async fn run_cancel_during_dispatch_fires_turn_end() {
     );
 }
 
+#[cfg(feature = "streaming")]
+#[derive(Clone)]
+struct SalvageProbeClient {
+    scripted: MockClient,
+    requests: Arc<Mutex<Vec<crate::api::StreamRequest>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl SalvageProbeClient {
+    fn new(model: &str) -> Self {
+        Self {
+            scripted: MockClient::new(model),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn captured_requests(&self) -> Vec<crate::api::StreamRequest> {
+        crate::error::recover_guard(self.requests.lock()).clone()
+    }
+
+    fn next_scripted_events(&self) -> Option<Vec<StreamEvent>> {
+        crate::error::recover_guard(self.scripted.responses.lock()).pop_front()
+    }
+
+    fn record_request(&self, request: &crate::api::StreamRequest) {
+        crate::error::recover_guard(self.requests.lock()).push(request.clone());
+    }
+}
+
+#[cfg(feature = "streaming")]
+impl ApiClient for SalvageProbeClient {
+    fn model(&self) -> String {
+        self.scripted.model()
+    }
+
+    fn set_model(&self, model: &str) -> bool {
+        self.scripted.set_model(model)
+    }
+
+    fn stream_messages(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        self.record_request(request);
+        match self.next_scripted_events() {
+            Some(events) => {
+                let events: Vec<Result<StreamEvent, ApiError>> =
+                    events.into_iter().map(Ok).collect();
+                Box::pin(futures::stream::iter(events))
+            }
+            None => Box::pin(futures::stream::pending()),
+        }
+    }
+
+    fn create_message(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        Box::pin(async { Err(ApiError::api("not implemented")) })
+    }
+
+    fn stream_messages_with_options(
+        &self,
+        request: &crate::api::StreamRequest,
+        _options: crate::structured::RequestOptions,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        ApiClient::stream_messages(self, request)
+    }
+}
+
+#[cfg(feature = "streaming")]
+fn tool_call_ids(message: &crate::message::Message) -> Vec<String> {
+    message
+        .tool_call_parts()
+        .into_iter()
+        .map(|(id, _, _)| id.to_string())
+        .collect()
+}
+
+#[cfg(feature = "streaming")]
+fn tool_result_ids(message: &crate::message::Message) -> Vec<String> {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::ToolResult { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn a_cancelled_run_salvages_completed_turns_into_the_next_request() {
+    let client = SalvageProbeClient::new("test-model");
+    client
+        .scripted
+        .add_tool_only_response("call-1", "echo", &json!({"message": "hi"}));
+
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client.clone()), registry, make_config());
+    let signal = agent.cancel_signal();
+
+    let watcher = client.clone();
+    let canceller = tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while watcher.captured_requests().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the run never issued its second model call"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        signal.cancel();
+    });
+
+    let first = agent.run("first task", &RunConfig::default()).await;
+    canceller.await.unwrap();
+    match first {
+        Err(LoopError::Cancelled) => {}
+        other => panic!("expected Err(LoopError::Cancelled), got {other:?}"),
+    }
+
+    client.scripted.add_text_response("all done");
+    agent
+        .run("second task", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let requests = client.captured_requests();
+    let third = requests
+        .get(2)
+        .expect("the second run must have issued a model call");
+    assert_eq!(
+        third.messages.len(),
+        4,
+        "a cancelled run must salvage its completed turns: the next request \
+         carries [user, assistant tool-call, tool result, new user], got {} \
+         messages",
+        third.messages.len()
+    );
+    assert_eq!(
+        third.messages.first().map(Message::text_content),
+        Some("first task".to_string()),
+        "the cancelled run's prompt must survive into the next request"
+    );
+    assert_eq!(
+        third.messages.last().map(Message::text_content),
+        Some("second task".to_string()),
+        "the new run's input must follow the salvaged conversation"
+    );
+    let assistant_ids = third
+        .messages
+        .get(1)
+        .map(tool_call_ids)
+        .expect("the salvaged assistant turn must be present");
+    assert_eq!(
+        assistant_ids,
+        vec!["call-1".to_string()],
+        "the salvaged assistant turn is the completed tool-call message"
+    );
+    let result_ids = third
+        .messages
+        .get(2)
+        .map(tool_result_ids)
+        .expect("the salvaged tool results must be present");
+    assert_eq!(
+        result_ids,
+        vec!["call-1".to_string()],
+        "the completed tool round-trip is paired in the salvaged context"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn a_cancel_mid_dispatch_drops_only_the_unfinished_turn() {
+    struct BlockingTool {
+        entered: Arc<AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl Tool for BlockingTool {
+        fn name(&self) -> &'static str {
+            "blocker"
+        }
+        fn description(&self) -> &'static str {
+            "Blocks until released"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "blocker".into(),
+                description: "Blocks until released".into(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                entered.store(true, Ordering::SeqCst);
+                release.notified().await;
+                Ok(ToolOutput::text("done"))
+            })
+        }
+    }
+
+    let client = SalvageProbeClient::new("test-model");
+    client
+        .scripted
+        .add_tool_only_response("call-1", "echo", &json!({"message": "hi"}));
+    client
+        .scripted
+        .add_tool_only_response("call-2", "blocker", &json!({}));
+
+    let entered = Arc::new(AtomicBool::new(false));
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    registry.register(BlockingTool {
+        entered: Arc::clone(&entered),
+        release: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut agent = BareLoop::new(Arc::new(client.clone()), registry, make_config());
+    let signal = agent.cancel_signal();
+
+    let canceller = tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the blocking tool was never dispatched"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        signal.cancel();
+    });
+
+    let first = agent.run("first task", &RunConfig::default()).await;
+    canceller.await.unwrap();
+    match first {
+        Err(LoopError::Cancelled) => {}
+        other => panic!("expected Err(LoopError::Cancelled), got {other:?}"),
+    }
+
+    client.scripted.add_text_response("all done");
+    agent
+        .run("second task", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let requests = client.captured_requests();
+    let third = requests
+        .get(2)
+        .expect("the second run must have issued a model call");
+    assert_eq!(
+        third.messages.len(),
+        4,
+        "a cancel mid-dispatch must drop only the unfinished turn: the next \
+         request carries [user, assistant tool-call, tool result, new user], \
+         got {} messages",
+        third.messages.len()
+    );
+    for message in &third.messages {
+        assert!(
+            !tool_call_ids(message).iter().any(|id| id == "call-2"),
+            "the cancelled turn's tool-call message must not leak — an \
+             assistant tool-call without its results is unsendable"
+        );
+    }
+    assert_eq!(
+        third.messages.get(1).map(tool_call_ids),
+        Some(vec!["call-1".to_string()]),
+        "the completed tool round-trip survives the mid-dispatch cancel"
+    );
+    assert_eq!(
+        third.messages.get(2).map(tool_result_ids),
+        Some(vec!["call-1".to_string()]),
+        "the salvaged tool results stay paired with their tool call"
+    );
+}
+
 #[tokio::test]
 async fn run_cancel_during_recovery_backoff_returns_fast() {
     struct AlwaysRecoverable;
@@ -5771,7 +6057,7 @@ async fn test_no_contributors_no_change() {
 }
 
 #[tokio::test]
-async fn failed_run_leaves_history_clean() {
+async fn a_cancelled_run_keeps_its_prompt_in_history() {
     let client = MockClient::new("test-model");
     client.add_text_response("done");
 
@@ -5782,10 +6068,11 @@ async fn failed_run_leaves_history_clean() {
     assert!(result.is_err(), "run must fail");
 
     let history_after_fail = agent.conversation();
-    assert!(
-        history_after_fail.is_empty(),
-        "failed run must not leave messages in committed history; \
-         got {} messages",
+    assert_eq!(
+        history_after_fail.len(),
+        1,
+        "a run cancelled before its first turn still commits its prompt; got \
+         {} messages",
         history_after_fail.len()
     );
 

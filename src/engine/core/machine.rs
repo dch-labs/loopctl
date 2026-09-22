@@ -7,6 +7,8 @@
 //! budget and compaction thresholds are passed in fresh on each
 //! [`next_step`](LoopMachine::next_step) call via [`MachinePolicy`].
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use super::lifecycle::{StopReason, ToolCall};
@@ -190,8 +192,11 @@ pub enum MachineOutcome {
     /// A clean, cooperative termination caused by [`LoopMachine::cancel`] (the
     /// driver calls it when its cancellation signal fires). Distinct from
     /// [`Failed`](Self::Failed): cancellation is expected, not an error. The
-    /// driver discards the cancelled run's pending messages; only messages
-    /// a mid-run compaction already folded into the committed history
+    /// driver salvages the cancelled run's completed exchanges — the coherent
+    /// prefix of the pending buffer — into the committed history and drops
+    /// only the incomplete tail; the full discard is reserved for a
+    /// conversation that cannot fit the context window, and messages a
+    /// mid-run compaction already folded into the committed history always
     /// remain. Carries no extra fields because there is nothing further
     /// to report.
     Cancelled,
@@ -353,10 +358,13 @@ pub struct LoopMachine {
     ///
     /// Immutable during a run — the driver derives the LLM feed from
     /// `history + pending`. Only modified by compaction (which replaces it
-    /// wholesale with a compacted version) and by [`commit_pending`]
-    /// (which appends the current run's messages on success).
+    /// wholesale with a compacted version), by [`commit_pending`]
+    /// (which appends the current run's messages on success), and by
+    /// [`salvage_pending`] (which appends the coherent prefix of an
+    /// interrupted run).
     ///
     /// [`commit_pending`]: Self::commit_pending
+    /// [`salvage_pending`]: Self::salvage_pending
     history: Vec<Message>,
 
     /// Messages accumulated by the current run.
@@ -364,10 +372,15 @@ pub struct LoopMachine {
     /// The user input, assistant responses, and tool results from the
     /// in-flight run. Cleared by [`accept_input`] at the start of each
     /// run. On success, [`commit_pending`] moves these into `history`; on
-    /// failure they are discarded so `history` stays clean.
+    /// cancellation or ordinary failure, [`salvage_pending`] commits the
+    /// coherent prefix and drops only the incomplete tail; when the
+    /// conversation cannot fit the context window, [`discard_pending`]
+    /// clears the buffer instead.
     ///
     /// [`accept_input`]: Self::accept_input
     /// [`commit_pending`]: Self::commit_pending
+    /// [`salvage_pending`]: Self::salvage_pending
+    /// [`discard_pending`]: Self::discard_pending
     pending: Vec<Message>,
 
     /// Where the machine is in its request/respond cycle.
@@ -809,20 +822,111 @@ impl LoopMachine {
     ///
     /// Called by the driver on successful run completion. After this,
     /// the pending buffer is empty and the committed history contains the
-    /// full conversation. On failure the driver simply clears pending
-    /// via [`accept_input`](Self::accept_input) on the next run,
-    /// leaving the committed history untouched.
+    /// full conversation. Interrupted runs do not reach this method
+    /// whole: the driver either salvages the coherent prefix via
+    /// [`salvage_pending`](Self::salvage_pending) (cancellation and
+    /// ordinary failure) or clears the buffer via
+    /// [`discard_pending`](Self::discard_pending) (the conversation
+    /// cannot fit the context window).
     pub fn commit_pending(&mut self) {
         self.history.append(&mut self.pending);
     }
 
+    /// Salvage the current run's pending messages into committed history,
+    /// keeping only the coherent prefix.
+    ///
+    /// Truncates the pending buffer at the last coherent boundary — the
+    /// latest position where every assistant tool-call message so far is
+    /// followed by results for all of its calls — moves that prefix into
+    /// [`history`](Self::history) (the same move
+    /// [`commit_pending`](Self::commit_pending) performs), and returns
+    /// the dropped incomplete tail. An empty return means the whole run
+    /// was coherent: nothing partial was ever recorded, so everything is
+    /// kept. The driver calls this when a run ends in cancellation or
+    /// ordinary failure, so an interrupted run costs its in-flight turn
+    /// rather than its whole conversation;
+    /// [`discard_pending`](Self::discard_pending) remains the driver's
+    /// path when the conversation itself cannot fit the context window.
+    ///
+    /// The dropped tail is returned rather than dropped silently, so a
+    /// caller that needs to account for the lost turn can.
+    ///
+    /// ```
+    /// use loopctl::engine::core::LoopMachine;
+    /// use loopctl::message::{Message, MessagePart, Role};
+    ///
+    /// let mut machine = LoopMachine::from_history(Vec::new());
+    /// machine.accept_input("check the logs");
+    /// let call = MessagePart::tool_call(
+    ///     "call_1",
+    ///     "read",
+    ///     serde_json::json!({"path": "app.log"}),
+    /// );
+    /// machine.inject(Message::new(Role::Assistant, vec![call]));
+    ///
+    /// let dropped = machine.salvage_pending();
+    ///
+    /// assert_eq!(
+    ///     machine.history().len(),
+    ///     1,
+    ///     "the prompt survives the interrupted run"
+    /// );
+    /// assert_eq!(
+    ///     dropped.len(),
+    ///     1,
+    ///     "the unanswered tool-call turn is the dropped tail"
+    /// );
+    /// ```
+    pub fn salvage_pending(&mut self) -> Vec<Message> {
+        let keep = Self::last_coherent_len(&self.pending);
+        let dropped = self.pending.split_off(keep);
+        self.history.append(&mut self.pending);
+        dropped
+    }
+
+    /// The length of the longest coherent prefix of a pending buffer.
+    ///
+    /// A prefix is coherent when every assistant tool-call message within
+    /// it is followed, somewhere later in the prefix, by a
+    /// [`ToolResult`](MessagePart::ToolResult) part for each of its call
+    /// ids. The scan walks the buffer once, tracking the ids still
+    /// awaiting results; the boundary is the last position after which
+    /// none remain open. A trailing assistant message whose dispatch
+    /// never completed therefore falls outside the prefix, along with
+    /// everything after it.
+    fn last_coherent_len(pending: &[Message]) -> usize {
+        let mut open: HashSet<&str> = HashSet::new();
+        let mut boundary = 0;
+        for (idx, message) in pending.iter().enumerate() {
+            for part in &message.parts {
+                match part {
+                    MessagePart::ToolCall { id, .. } => {
+                        open.insert(id.as_str());
+                    }
+                    MessagePart::ToolResult { call_id, .. } => {
+                        open.remove(call_id.as_str());
+                    }
+                    _ => {}
+                }
+            }
+            if open.is_empty() {
+                boundary = idx.saturating_add(1);
+            }
+        }
+        boundary
+    }
+
     /// Discard the current run's pending messages without committing.
     ///
-    /// Called by the driver on run failure. The committed history stays
-    /// clean of the abandoned run's pending messages — no orphaned tool
-    /// calls, model responses, or tool results leak into the next run's
-    /// context. Messages a mid-run compaction already folded into the
-    /// committed history are the exception (see
+    /// Called by the driver when a run fails because the conversation
+    /// cannot fit the context window: committing it back would wedge
+    /// every future run against the same overflow, so the committed
+    /// history stays clean of the abandoned run's pending messages — no
+    /// orphaned tool calls, model responses, or tool results leak into
+    /// the next run's context. Cancellation and ordinary failure take
+    /// [`salvage_pending`](Self::salvage_pending) instead, which keeps
+    /// the completed turns. Messages a mid-run compaction already folded
+    /// into the committed history are the exception (see
     /// [`compaction_result`](Self::compaction_result)): a run that
     /// compacts and then fails leaves its compacted trace behind, the
     /// same commit-point property compaction has always had.
@@ -940,6 +1044,133 @@ mod tests {
             stop_reason: StopReason::ToolCall,
             available_tools: available.iter().map(|s| (*s).to_string()).collect(),
         }
+    }
+
+    fn tool_response_with_id(call_id: &str, tool: &str) -> ModelResponse {
+        let part = MessagePart::tool_call(call_id, tool, Value::Object(serde_json::Map::new()));
+        ModelResponse {
+            message: Message::new(Role::Assistant, vec![part]),
+            input_tokens: 10,
+            output_tokens: 10,
+            stop_reason: StopReason::ToolCall,
+            available_tools: vec![tool.to_string()],
+        }
+    }
+
+    fn feed_tool_result(machine: &mut LoopMachine, call_id: &str, tool: &str) {
+        machine.tool_results(vec![Message::new(
+            Role::User,
+            vec![MessagePart::tool_result(
+                call_id,
+                tool,
+                ToolContent::Text("ok".to_string()),
+                false,
+            )],
+        )]);
+    }
+
+    #[test]
+    fn a_coherent_pending_salvages_everything() {
+        let mut machine = small_machine();
+        machine.accept_input("task");
+        machine.model_response(tool_response("echo", &["echo"], 10), 0);
+        feed_tool_result(&mut machine, "call_1", "echo");
+        let dropped = machine.salvage_pending();
+        assert!(
+            dropped.is_empty(),
+            "a coherent buffer (a cancel mid-model-call shape) drops nothing, got {dropped:?}"
+        );
+        assert_eq!(
+            machine.history().len(),
+            4,
+            "seed + prompt + the completed tool exchange are committed"
+        );
+        assert_eq!(
+            machine.full_history().len(),
+            4,
+            "the pending buffer is empty after salvage"
+        );
+    }
+
+    #[test]
+    fn an_unanswered_trailing_tool_call_is_dropped() {
+        let mut machine = small_machine();
+        machine.accept_input("task");
+        machine.model_response(tool_response("echo", &["echo"], 10), 0);
+        feed_tool_result(&mut machine, "call_1", "echo");
+        machine.model_response(tool_response_with_id("call_2", "slow"), 0);
+        let dropped = machine.salvage_pending();
+        assert_eq!(
+            dropped.len(),
+            1,
+            "only the unanswered assistant turn is the dropped tail, got {dropped:?}"
+        );
+        assert_eq!(
+            tool_call_parts_of(&dropped[0]),
+            vec!["call_2".to_string()],
+            "the dropped message is the mid-dispatch tool-call turn"
+        );
+        assert_eq!(
+            machine.history().len(),
+            4,
+            "seed + prompt + the completed first exchange are committed"
+        );
+    }
+
+    #[test]
+    fn an_unanswered_first_assistant_turn_keeps_only_the_prompt() {
+        let mut machine = small_machine();
+        machine.accept_input("task");
+        machine.model_response(tool_response("echo", &["echo"], 10), 0);
+        let dropped = machine.salvage_pending();
+        assert_eq!(
+            dropped.len(),
+            1,
+            "the first, never-dispatched assistant turn is the dropped tail"
+        );
+        assert_eq!(
+            machine.history().len(),
+            2,
+            "only the seed and the prompt survive"
+        );
+    }
+
+    #[test]
+    fn a_text_only_trailing_assistant_message_is_coherent() {
+        let mut machine = small_machine();
+        machine.accept_input("task");
+        machine.model_response(tool_response("echo", &["echo"], 10), 0);
+        feed_tool_result(&mut machine, "call_1", "echo");
+        machine.model_response(text_response("done", 10, 5), 0);
+        let dropped = machine.salvage_pending();
+        assert!(
+            dropped.is_empty(),
+            "a text-only assistant message opens no tool calls, so nothing is dropped"
+        );
+        assert_eq!(
+            machine.history().len(),
+            5,
+            "seed + prompt + tool exchange + the final text turn are committed"
+        );
+    }
+
+    #[test]
+    fn an_empty_pending_salvages_nothing() {
+        let mut machine = LoopMachine::from_history(Vec::new());
+        let dropped = machine.salvage_pending();
+        assert!(dropped.is_empty(), "an empty buffer has nothing to drop");
+        assert!(
+            machine.history().is_empty(),
+            "an empty buffer commits nothing"
+        );
+    }
+
+    fn tool_call_parts_of(message: &Message) -> Vec<String> {
+        message
+            .tool_call_parts()
+            .into_iter()
+            .map(|(id, _, _)| id.to_string())
+            .collect()
     }
 
     /// A string long enough to exceed the compaction threshold in tests that

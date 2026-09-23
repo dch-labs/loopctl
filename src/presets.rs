@@ -59,6 +59,13 @@ const MEMOIZE_TTL_TURNS: u32 = 5;
 /// a turn's budget on repetition.
 const GOAL_REMINDER_EVERY_N_TURNS: usize = 5;
 
+/// The default goal-reminder cadence the engine's default wiring uses.
+///
+/// Re-exported for [`BareLoop`'s default profile
+/// wiring](crate::engine::BareLoop); the public tuning surface remains
+/// [`GoalReminder::new`](GoalReminder::new) with an explicit cadence.
+pub(crate) const DEFAULT_GOAL_REMINDER_EVERY_N_TURNS: usize = GOAL_REMINDER_EVERY_N_TURNS;
+
 /// Default write-class tool names the preset wires into its middleware. Advisory.
 ///
 /// The names cover the common coding-agent set; hosts with
@@ -186,9 +193,10 @@ impl ConstrainedProfile {
     /// [`WritePathExtractor`], so a write to a path evicts cached
     /// results for that path instead of waiting out the TTL.
     ///
-    /// The default [`pipeline_builder`](Self::pipeline_builder) keeps
-    /// the no-ops; wiring these builtins by default is planned for a
-    /// future release.
+    /// This is the stack default construction wires (since the P8
+    /// default flip); the plain [`pipeline_builder`](Self::pipeline_builder)
+    /// remains the bring-your-own-verifier recipe for hosts composing
+    /// their own pipeline.
     #[must_use]
     pub fn pipeline_builder_with_builtin_verification() -> crate::middleware::ToolPipelineBuilder {
         let verified: Vec<String> = WRITE_TOOLS
@@ -264,9 +272,13 @@ impl ConstrainedProfile {
 
 /// The frontier-opt-out profile.
 ///
-/// Produces default session/run configuration, no small-model
-/// middleware, no tool-call constraint. Named (rather than just "don't use
-/// [`ConstrainedProfile`]") so the opt-out is explicit and discoverable.
+/// Restores the bare, pre-profile loop: default session/run
+/// configuration, no small-model middleware, no tool-call constraint,
+/// no goal re-injection. Since the P8 default flip this is the explicit
+/// opt-out from default construction's machinery — apply it with
+/// [`apply`](FrontierProfile::apply), the chainable
+/// [`with_profile`](crate::engine::BareLoop::with_profile), or the
+/// [`Profile`] trait.
 pub struct FrontierProfile;
 
 impl FrontierProfile {
@@ -312,6 +324,70 @@ impl FrontierProfile {
     #[must_use]
     pub fn request_options() -> RequestOptions {
         RequestOptions::default()
+    }
+
+    /// Restore the bare, pre-profile loop — the default wiring, undone.
+    ///
+    /// The opt-out's one-call form: clears every turn-boundary contributor
+    /// (default construction's goal reminder), installs the empty
+    /// pipeline (no verify-on-write, no memoization, no output cap), and
+    /// resets the per-turn request options to unconstrained — the exact
+    /// tool-dispatch path and request shape a loop built before the
+    /// default profile existed produced. Call before the first
+    /// [`run`](crate::engine::core::Loop::run); the chainable spelling is
+    /// [`BareLoop::with_profile`](crate::engine::BareLoop::with_profile).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut agent = BareLoop::new(client, tools, config);
+    /// FrontierProfile::apply(&mut agent).unwrap();
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`set_pipeline`](crate::engine::BareLoop::set_pipeline)'s
+    /// validation error; the empty builder it installs cannot fail, so in
+    /// practice this returns `Ok(())`.
+    pub fn apply<C: crate::api::ApiClient>(loop_: &mut BareLoop<C>) -> Result<(), LoopError> {
+        loop_.clear_contributors();
+        loop_.set_pipeline(Self::pipeline_builder())?;
+        loop_.set_request_options(Self::request_options());
+        Ok(())
+    }
+}
+
+/// A named bundle of loop wiring.
+///
+/// The profile system's seam: a profile is anything that can wire a
+/// [`BareLoop`] — install middleware, contributors, request options —
+/// behind one call. The shipped implementations are
+/// [`ConstrainedProfile`] (the small-model bundle) and
+/// [`FrontierProfile`] (the bare-loop opt-out); default construction
+/// applies the constrained machinery itself, so the trait's main job for
+/// hosts is the explicit opt-out via
+/// [`BareLoop::with_profile`](crate::engine::BareLoop::with_profile).
+/// Call before the first [`run`](crate::engine::core::Loop::run).
+pub trait Profile: Send + Sync {
+    /// Wire the loop with this profile's bundle.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the wiring's own failure — a profile that installs a
+    /// middleware pipeline can have its composition rejected by
+    /// validation.
+    fn apply<C: crate::api::ApiClient>(&self, loop_: &mut BareLoop<C>) -> Result<(), LoopError>;
+}
+
+impl Profile for ConstrainedProfile {
+    fn apply<C: crate::api::ApiClient>(&self, loop_: &mut BareLoop<C>) -> Result<(), LoopError> {
+        ConstrainedProfile::apply(loop_)
+    }
+}
+
+impl Profile for FrontierProfile {
+    fn apply<C: crate::api::ApiClient>(&self, loop_: &mut BareLoop<C>) -> Result<(), LoopError> {
+        FrontierProfile::apply(loop_)
     }
 }
 

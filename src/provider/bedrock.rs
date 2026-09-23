@@ -1654,6 +1654,18 @@ impl ApiClient for BedrockClient {
         true
     }
 
+    /// This client does not yet forward tool-call constraints.
+    ///
+    /// The capability probe returns `false` on purpose: the Bedrock wire
+    /// paths take the trait-default `*_with_options` implementations,
+    /// which reject a `tool_constraint` loudly — declaring support here
+    /// would fail every default-built Bedrock turn at the options gate.
+    /// Flips to `true` when the Converse `toolConfig.toolChoice`
+    /// encoding lands.
+    fn supports_tool_constraints(&self) -> bool {
+        false
+    }
+
     fn base_url(&self) -> String {
         format!("https://{}", self.host())
     }
@@ -1871,8 +1883,12 @@ mod tests {
     use crate::message::{Message, MessagePart};
 
     /// The default budget body-builder tests exercise.
+    ///
+    /// The token budget the body-builder tests share so their assertions stay meaningful.
     const BUDGET: u32 = crate::provider::anthropic::DEFAULT_MAX_TOKENS;
     /// Build one event-stream frame (for tests).
+    ///
+    /// Encodes one frame of the event-stream wire so a decoder test can feed it exact bytes.
     #[allow(clippy::cast_possible_truncation, clippy::unreadable_literal)]
     fn build_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
         let mut headers = Vec::new();

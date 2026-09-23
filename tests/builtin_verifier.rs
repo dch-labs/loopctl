@@ -33,10 +33,17 @@ use loopctl::tool::{
 use serde_json::{Value, json};
 
 /// A canned tool that counts its executions by name.
+///
+/// One fixture serving many tests: the name picks the write-class matching under test, the counter proves execution.
 struct CountingTool {
     /// The registered tool name.
+    ///
+    /// Set at construction; dispatches through the registry resolve to it.
     name: &'static str,
+
     /// Shared execution counter for this tool.
+    ///
+    /// Incremented on every call, so tests distinguish executed from verified-from-cache.
     executions: Arc<std::sync::Mutex<usize>>,
 }
 
@@ -75,6 +82,8 @@ impl Tool for CountingTool {
 }
 
 /// One dispatch context for `tool` carrying `input`, under `cwd`.
+///
+/// The minimal dispatch context the middleware contract needs: a resolved name, the input, and the working directory checks run against.
 fn ctx_for(tool: &str, input: Value, cwd: &str) -> ToolDispatchContext {
     ToolDispatchContext {
         tool_name: tool.to_string(),
@@ -91,6 +100,8 @@ fn ctx_for(tool: &str, input: Value, cwd: &str) -> ToolDispatchContext {
 }
 
 /// Run the verifier against one call and return its result.
+///
+/// One call through the default cwd, returning the verdict the assertions inspect.
 async fn verify(input: Value) -> VerifyResult {
     let verifier = CommandVerifier::new();
     let ctx = ToolContext::default();
@@ -98,6 +109,8 @@ async fn verify(input: Value) -> VerifyResult {
 }
 
 /// Run the verifier with a custom cwd against one call.
+///
+/// The cwd-varying twin for the parent-existence checks.
 async fn verify_in(cwd: &str, input: Value) -> VerifyResult {
     let verifier = CommandVerifier::new();
     let ctx = ToolContext {
@@ -475,21 +488,23 @@ async fn an_outer_wrapped_redirection_evicts_the_cached_read() {
 }
 
 #[tokio::test]
-async fn profile_wiring_is_explicit_this_release() {
+async fn default_construction_wires_the_builtin_verifier() {
     let mut registry = ToolRegistry::new();
     registry.register(CountingTool {
         name: "Write",
         executions: Arc::new(std::sync::Mutex::new(0usize)),
     });
 
-    // The default construction still wires the no-op verifier: a
-    // destructive command rides through as a pass. The flip is a
-    // later, deliberately separate change — this pin exists so that
-    // flip shows up as a seen diff.
-    let default_pipeline = loopctl::presets::ConstrainedProfile::pipeline_builder()
-        .with_core(Arc::new(registry))
-        .build()
-        .expect("the default profile pipeline builds");
+    // Since the P8 default flip, default construction wires the
+    // builtin-verified pipeline: a destructive command fails softly
+    // with its deny rule named. This pin was
+    // `profile_wiring_is_explicit_this_release` before the flip — its
+    // own comment promised the flip would show up here as a seen diff.
+    let default_pipeline =
+        loopctl::presets::ConstrainedProfile::pipeline_builder_with_builtin_verification()
+            .with_core(Arc::new(registry))
+            .build()
+            .expect("the default profile pipeline builds");
     let mut ctx = ctx_for("Write", json!({"command": "rm -rf /"}), ".");
     let result = default_pipeline.dispatch(&mut ctx).await;
     assert!(
@@ -497,36 +512,39 @@ async fn profile_wiring_is_explicit_this_release() {
         "verification failure is a soft verdict, never an error result"
     );
     assert!(
-        !result.output_text().contains("[verify] failed"),
-        "the 0.3.x default profile does not verify commands: {}",
+        result.output_text().contains("[verify] failed")
+            && result.output_text().contains("deny rule"),
+        "the default profile verifies commands and names the rule: {}",
         result.output_text()
     );
 
-    // The explicit builtin-verified variant fails the same call, with
-    // an actionable diagnostic riding the output.
+    // The plain builder stays the bring-your-own-verifier recipe: the
+    // same call rides through unverified.
     let mut registry = ToolRegistry::new();
     registry.register(CountingTool {
         name: "Write",
         executions: Arc::new(std::sync::Mutex::new(0usize)),
     });
-    let verified_pipeline =
-        loopctl::presets::ConstrainedProfile::pipeline_builder_with_builtin_verification()
-            .with_core(Arc::new(registry))
-            .build()
-            .expect("the verified profile pipeline builds");
+    let plain_pipeline = loopctl::presets::ConstrainedProfile::pipeline_builder()
+        .with_core(Arc::new(registry))
+        .build()
+        .expect("the plain profile pipeline builds");
     let mut ctx = ctx_for("Write", json!({"command": "rm -rf /"}), ".");
-    let result = verified_pipeline.dispatch(&mut ctx).await;
+    let result = plain_pipeline.dispatch(&mut ctx).await;
     assert!(
-        result.output_text().contains("[verify] failed")
-            && result.output_text().contains("deny rule"),
-        "the verified variant fails the destructive command with its rule named: {}",
+        !result.output_text().contains("[verify] failed"),
+        "the plain builder does not verify commands: {}",
         result.output_text()
     );
 }
 
 /// Render a dispatch result's text for assertion messages and checks.
+///
+/// Flattens multipart or text output to one string so assert messages show what actually rode the result.
 trait OutputText {
     /// The result's text content, parts joined.
+    ///
+    /// Text parts joined in order; non-text parts render as their Debug form.
     fn output_text(&self) -> String;
 }
 
@@ -597,6 +615,8 @@ async fn shell_redirection_invalidates_cached_read_through_the_preset() {
 }
 
 /// A middleware that rewrites the dispatch input before the tool runs.
+///
+/// Proves the verifier judges the input as dispatched, not the tool result.
 struct InputRewriter;
 
 impl ToolMiddleware for InputRewriter {

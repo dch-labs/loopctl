@@ -347,6 +347,10 @@ impl ApiClient for GeminiClient {
         true
     }
 
+    fn supports_tool_constraints(&self) -> bool {
+        true
+    }
+
     fn stream_messages(
         &self,
         request: &crate::api::StreamRequest,

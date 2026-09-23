@@ -230,6 +230,24 @@ pub trait ApiClient: Send + Sync {
         false
     }
 
+    /// Whether this client can honor a tool-call constraint.
+    ///
+    /// The capability probe behind default construction's constrained
+    /// decoding: a loop built with defaults attaches
+    /// [`ToolConstraint::Strict`](crate::structured::ToolConstraint::Strict)
+    /// request options only when this returns `true`, so a client that
+    /// cannot forward the constraint keeps today's unconstrained request
+    /// shape instead of failing every request loudly. Returns `false` by
+    /// default; the shipped provider clients that forward constraints
+    /// (`openai`, `anthropic`, `gemini`) override it to `true`, the
+    /// testing mock ties it to its
+    /// [`with_tool_constraint_support`](crate::testing::MockApiClient::with_tool_constraint_support)
+    /// flag, and clients without the wire encoding (Bedrock, until its
+    /// `toolChoice` lands) keep the honest `false`.
+    fn supports_tool_constraints(&self) -> bool {
+        false
+    }
+
     /// The provider's base URL, used as the per-provider rate-limit bucket key.
     ///
     /// Provider implementations override this to return their configured

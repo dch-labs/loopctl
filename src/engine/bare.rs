@@ -494,7 +494,7 @@ impl<C: ApiClient> BareLoop<C> {
         }
         let session = Session::new(session_config);
         let session_temp_dir = Some(Self::session_temp_subdir(&std::env::temp_dir(), session.id));
-        Self {
+        let mut loop_ = Self {
             client,
             tools: Arc::new(tools),
             session,
@@ -514,7 +514,9 @@ impl<C: ApiClient> BareLoop<C> {
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
             turn_mode: default_turn_mode(),
-        }
+        };
+        Self::wire_default_profile(&mut loop_);
+        loop_
     }
 
     /// Get the conversation as the driving state machine currently holds it.
@@ -752,7 +754,7 @@ impl<C: ApiClient> BareLoop<C> {
         managers.set_context_manager(Arc::new(seeded));
         let session = Session::new(session_config);
         let session_temp_dir = Some(Self::session_temp_subdir(&std::env::temp_dir(), session.id));
-        Self {
+        let mut loop_ = Self {
             client,
             tools: Arc::new(tools),
             session,
@@ -772,7 +774,9 @@ impl<C: ApiClient> BareLoop<C> {
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
             turn_mode: default_turn_mode(),
-        }
+        };
+        Self::wire_default_profile(&mut loop_);
+        loop_
     }
 
     /// Build a loop around an existing state machine and caller-supplied
@@ -858,7 +862,7 @@ impl<C: ApiClient> BareLoop<C> {
         }
         let session = Session::new(session_config);
         let session_temp_dir = Some(Self::session_temp_subdir(&std::env::temp_dir(), session.id));
-        Self {
+        let mut loop_ = Self {
             client,
             tools: Arc::new(tools),
             session,
@@ -878,7 +882,9 @@ impl<C: ApiClient> BareLoop<C> {
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
             turn_mode: default_turn_mode(),
-        }
+        };
+        Self::wire_default_profile(&mut loop_);
+        loop_
     }
 
     /// Build the default context manager for a session config.

@@ -590,13 +590,19 @@ impl ApiError {
     /// `"exceeds maximum"`, or `"max tokens"`.
     ///
     /// The match is deliberately broad (substring on the lowercased
-    /// text) so that provider-specific phrasings — Anthropic's
-    /// `"prompt is too long"`, OpenAI's `"maximum context length"`,
-    /// and generic `"too many tokens"` renderings — all collapse to a
-    /// single signal. The trade-off is a small false-positive risk on
-    /// unrelated messages that happen to contain the word `"context"`,
-    /// which is acceptable given the downstream consumers retry
-    /// through compaction rather than aborting.
+    /// text) so that overflow renderings carrying the word `"context"`
+    /// — OpenAI's `"maximum context length"` and generic
+    /// `"too many tokens"` forms — collapse to a single signal for
+    /// error-code classification. The trade-off is a false-positive
+    /// risk on context-bearing transients that merely contain the
+    /// word `"context"` (gateway idioms like `"context deadline
+    /// exceeded"`); that breadth is tolerable for error-code
+    /// reporting, and the engine's failed-run retention decision
+    /// deliberately does not use this matcher — it matches a
+    /// stricter, overflow-specific phrase set, so a transient cannot
+    /// cost a run its salvaged history. Anthropic's
+    /// `"prompt is too long"` rendering contains none of the phrases
+    /// here and does not match; the stricter retention set covers it.
     fn is_context_overflow_internal(msg: &str) -> bool {
         let msg_lower = msg.to_lowercase();
         msg_lower.contains("context")

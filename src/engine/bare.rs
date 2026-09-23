@@ -1789,7 +1789,11 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
     /// unshrinkable over-window history would wedge every future run);
     /// every other interrupted run salvages the coherent prefix, so
     /// cancellation and ordinary failure cost the in-flight turn, not
-    /// the entire conversation.
+    /// the entire conversation. The cannot-fit signal is recognized
+    /// from both places it originates — the compactor's
+    /// [`LoopError::ContextExceeded`], and a provider rejection whose
+    /// error text classifies as context overflow (see the
+    /// `conversation_cannot_fit` predicate).
     fn finalize<'a>(
         &'a mut self,
         error: Option<&'a LoopError>,
@@ -1807,7 +1811,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 {
                     tracing::warn!(error = %e, "memory consolidate failed");
                 }
-            } else if matches!(error, Some(LoopError::ContextExceeded { .. })) {
+            } else if error.is_some_and(conversation_cannot_fit) {
                 self.machine.discard_pending();
             } else {
                 let dropped = self.machine.salvage_pending();
@@ -1849,4 +1853,47 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             _ => None,
         }
     }
+}
+
+/// Decide whether a failed run's conversation cannot fit the window.
+///
+/// Two signals mean the same thing — the request as built will keep
+/// being refused — and both take the full-discard arm of
+/// [`finalize`](BareLoop::finalize): the compactor-reported
+/// [`LoopError::ContextExceeded`], and a provider rejection whose
+/// error text reports an oversized prompt (see
+/// `message_reports_context_overflow` — a phrase set deliberately
+/// stricter than the error-code classification, so context-bearing
+/// transients keep the salvage guarantee). Salvaging on either would
+/// commit exactly the content the window cannot hold. Everything
+/// else — cancellation, ordinary provider failure, tool failure —
+/// salvages.
+fn conversation_cannot_fit(error: &LoopError) -> bool {
+    match error {
+        LoopError::ContextExceeded { .. } => true,
+        LoopError::Api(message) => message_reports_context_overflow(message),
+        _ => false,
+    }
+}
+
+/// Match the phrases providers use to reject an oversized prompt.
+///
+/// The retention decision's own phrase set, deliberately stricter
+/// than the broad matcher behind `ApiError::is_context_overflow_internal`
+/// (which feeds error-code classification): no bare `"context"`
+/// disjunct, so a context-bearing transient — the `"context deadline
+/// exceeded"` and `"context canceled"` idioms a gRPC or Go-based
+/// gateway returns — cannot cost a run its salvaged history, while
+/// every phrasing a provider uses to refuse an oversized request
+/// still lands in the discard arm: `"context length"` (OpenAI's
+/// `maximum context length`), `"too many tokens"`, `"exceeds
+/// maximum"`, `"max tokens"`, and `"prompt is too long"` (Anthropic's
+/// canonical `prompt is too long: 205225 tokens > 200000 maximum`).
+fn message_reports_context_overflow(message: &str) -> bool {
+    let message = message.to_lowercase();
+    message.contains("context length")
+        || message.contains("too many tokens")
+        || message.contains("exceeds maximum")
+        || message.contains("max tokens")
+        || message.contains("prompt is too long")
 }

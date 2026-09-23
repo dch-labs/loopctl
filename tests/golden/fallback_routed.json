@@ -32,7 +32,7 @@
         {
           "parts": [
             {
-              "text": "Route me to whichever model is healthy.",
+              "text": "Route me to whichever model is healthy.\nRoute me to whichever model is healthy.",
               "type": "text"
             }
           ],

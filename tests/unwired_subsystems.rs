@@ -52,8 +52,12 @@ use loopctl::tool::health::ToolHealthRegistry;
 use loopctl::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSchema};
 
 /// A tool that fails every execution and counts them.
+///
+/// Every `call` returns an execution error after recording the attempt, so a pin can assert both the failure surfacing and exactly how often the engine invoked the tool.
 struct FailingTool {
     /// One entry per actual execution.
+    ///
+    /// Length is the execution count; entries carry no payload because only the fact of the call matters to the pins.
     executions: Arc<Mutex<Vec<()>>>,
 }
 
@@ -222,6 +226,8 @@ mod hook_guidance {
     use loopctl::message::Message;
 
     /// One compaction pass's captured guidance.
+    ///
+    /// The `(instructions, additional_context)` pair a single pass received; the pins assert against it verbatim.
     type Guidance = (Option<String>, Vec<String>);
 
     /// Guidance the guiding hook supplies — asserted verbatim at the
@@ -233,6 +239,8 @@ mod hook_guidance {
     /// it was consulted under.
     struct GuidingHook {
         /// Triggers seen, one per consultation.
+        ///
+        /// Each `on_pre_compact` push records the trigger the pass ran under, so the pins can assert the emergency-versus-threshold routing.
         triggers: Arc<Mutex<Vec<CompactTrigger>>>,
     }
 
@@ -258,6 +266,8 @@ mod hook_guidance {
     /// records the guidance it received.
     struct CapturingCompactor {
         /// (instructions, additional_context) per compaction pass.
+        ///
+        /// One entry per executed pass in order, so the pins can verify the guidance each pass actually received.
         seen: Arc<Mutex<Vec<Guidance>>>,
     }
 
@@ -401,8 +411,12 @@ mod shield_enforcement {
     };
 
     /// A shield that allows everything and counts its invocations.
+    ///
+    /// Every evaluate returns allow after recording the call, giving the ordering pins an observer that cannot change any decision.
     struct RecordingShield {
         /// (tool, success) tuples, one per record_invocation call.
+        ///
+        /// Each entry mirrors one `record_invocation` call so the pins can assert the exact outcome sequence the shield was told about.
         recorded: Arc<Mutex<Vec<(String, bool)>>>,
     }
 
@@ -429,6 +443,8 @@ mod shield_enforcement {
     /// ordering pins install outside the shield.
     pub(super) struct RenamingMiddleware {
         /// The name every call is rewritten to.
+        ///
+        /// The middleware writes this into the dispatch context before the pipeline continues, so the resolved-name consumers all observe the alias.
         pub(super) new_name: String,
     }
 
@@ -447,8 +463,12 @@ mod shield_enforcement {
     }
 
     /// A tool that counts executions and always succeeds.
+    ///
+    /// The healthy baseline fixture: `call` always returns ok after recording the attempt, letting pins distinguish executed from skipped calls.
     struct CountingTool {
         /// One entry per execution.
+        ///
+        /// Length is the execution count; only the fact of the call matters to the pins.
         executions: Arc<Mutex<Vec<()>>>,
     }
 
@@ -486,8 +506,12 @@ mod shield_enforcement {
     /// always succeeds — the requested-name side of the aliasing pins.
     struct NamedTool {
         /// The name this tool answers to.
+        ///
+        /// A fixed name distinct from the alias the middleware rewrites to, so a pin can tell the requested name from the resolved one.
         name: &'static str,
         /// One entry per execution.
+        ///
+        /// Length is the execution count; only the fact of the call matters to the pins.
         executions: Arc<Mutex<Vec<()>>>,
     }
 
@@ -1124,6 +1148,8 @@ mod shield_enforcement {
     }
 
     /// Deterministic LCG for the matcher property.
+    ///
+    /// Seeded once per property case, it generates reproducible random inputs — a failing case re-runs with the same sequence.
     struct Lcg(u64);
 
     impl Lcg {
@@ -1140,6 +1166,8 @@ mod shield_enforcement {
     }
 
     /// An alphabet that cannot itself form any shield pattern.
+    ///
+    /// Padding drawn from these bytes never matches a pattern on its own, so any hit the matcher reports must come from the planted input.
     const NOISE: &[u8] = b"xqzv0123456789";
 
     /// Randomize the case and thicken or delete the whitespace of
@@ -1423,10 +1451,14 @@ mod shield_enforcement {
     /// context's recent_calls — the field's documented consumer.
     struct HistorylessShield {
         /// `recent_calls` snapshots seen at evaluate time.
+        ///
+        /// One snapshot per evaluate call, taken from the context the shield was handed — the observable side of the window the shield does not keep itself.
         saw: Arc<Mutex<Vec<Snapshot>>>,
     }
 
     /// One evaluate-time snapshot of `recent_calls`.
+    ///
+    /// A `(tool, count)` list cloned from the context at one evaluate call, so pins can assert what the window held at that moment.
     type Snapshot = Vec<(String, usize)>;
 
     impl ToolSafetyShield for HistorylessShield {
@@ -1728,10 +1760,16 @@ mod breaker_sequences {
     use loopctl::middleware::ToolPipeline;
 
     /// A tool whose outcome follows a script, counting executions.
+    ///
+    /// Each execution consumes the next script entry — fail or succeed — so a pin can drive an exact failure pattern through the breaker.
     struct ScriptedTool {
         /// One entry per execution.
+        ///
+        /// Length is the execution count, letting the pins assert exactly how many attempts the recovery loop made.
         executions: Arc<Mutex<Vec<()>>>,
         /// `true` marks a failing execution, in order.
+        ///
+        /// Entries are consumed front-first; the n-th execution fails exactly when the n-th entry is true.
         script: Vec<bool>,
     }
 
@@ -1769,6 +1807,8 @@ mod breaker_sequences {
     }
 
     /// A recovery strategy that always retries without delay.
+    ///
+    /// Every decision is an immediate retry, so the pins exercise retry-driven sequences without waiting on backoff.
     struct AlwaysRetry;
 
     impl loopctl::reflection::RecoveryStrategy for AlwaysRetry {
@@ -1826,8 +1866,12 @@ mod breaker_sequences {
     }
 
     /// A tool that always succeeds and counts executions.
+    ///
+    /// The success baseline for the recovery pins: every call records itself and returns ok.
     struct HealthyTool {
         /// One entry per execution.
+        ///
+        /// Length is the execution count of the successful path the pins assert against.
         executions: Arc<Mutex<Vec<()>>>,
     }
 
@@ -2124,6 +2168,8 @@ mod breaker_sequences {
     }
 
     /// A recovery strategy that never retries — one attempt per call.
+    ///
+    /// Every decision skips, giving the pins a single-attempt ladder where the first failure stands.
     struct NeverRetry;
 
     impl loopctl::reflection::RecoveryStrategy for NeverRetry {
@@ -2144,6 +2190,8 @@ mod breaker_sequences {
     /// only a middleware deadline can end the call.
     struct HangingTool {
         /// One entry per execution that began.
+        ///
+        /// The count is taken at call start, so a pin can prove an execution began even though only the deadline ended it.
         executions: Arc<Mutex<Vec<()>>>,
     }
 
@@ -2325,8 +2373,12 @@ mod shield_sequences {
     use loopctl::tool::shield::UnixShield;
 
     /// A tool that counts executions and always succeeds.
+    ///
+    /// The always-allowed Bash stand-in: execution is recorded and returns ok, so refusals can only come from the shield.
     struct CountingBash {
         /// One entry per execution.
+        ///
+        /// Length is the execution count the shield-sequencing pins assert against.
         executions: Arc<Mutex<Vec<()>>>,
     }
 
@@ -2427,8 +2479,12 @@ mod hook_sequences {
     const INSTRUCTIONS: &str = "focus on the most recent work";
 
     /// Aborts the first consultation, guides every later one.
+    ///
+    /// The first `on_pre_compact` aborts and each later one supplies instructions, driving the abort-then-proceed sequence the module pins.
     struct AbortOnceHook {
         /// Consultation count.
+        ///
+        /// The hook consults this counter to decide abort versus guide, and the pins read it to prove both consultations happened.
         consulted: Arc<Mutex<u32>>,
     }
 
@@ -2453,6 +2509,8 @@ mod hook_sequences {
     }
 
     /// Drops the oldest message; captures guidance.
+    ///
+    /// Each pass shrinks the conversation by one message and records the guidance it received, giving the pins both a reducing pass and its input.
     struct CapturingCompactor {
         /// (instructions) per executed pass — empty Vec means aborted
         /// before the compactor ran.
@@ -2511,6 +2569,8 @@ mod hook_sequences {
     /// `custom_instructions` and appends its own.
     struct ChainingHooks {
         /// What the second hook saw, if consulted.
+        ///
+        /// Empty until the executor consults the second hook; the pins read it to prove hook chaining reached the observer.
         second_saw: Arc<Mutex<Vec<Option<String>>>>,
     }
 
@@ -2580,6 +2640,8 @@ mod hook_sequences {
     }
 
     /// Returns one fixed result on every consultation.
+    ///
+    /// The same pre-built `CompactResult` every time, so merging pins can stack multiple identical contributions.
     struct FixedHook(CompactResult);
 
     impl Hook for FixedHook {
@@ -2715,6 +2777,8 @@ mod parallel_gate {
     /// concurrent gate check observes the probe in flight.
     struct SlowFailingTool {
         /// One entry per execution.
+        ///
+        /// Recorded after the delay, so an entry also proves the execution ran to its failure point.
         executions: Arc<Mutex<Vec<()>>>,
     }
 
@@ -2750,6 +2814,8 @@ mod parallel_gate {
     }
 
     /// One assistant message carrying `ids` tool calls to `slowfail`.
+    ///
+    /// Builds the raw stream events for one assistant turn of parallel `slowfail` calls, identified by `ids` in call order.
     fn message_with_calls(ids: &[&str]) -> Vec<Result<StreamEvent, ApiError>> {
         let mut events = vec![Ok(StreamEvent::MessageStart(MessageStart {
             message: MessageMetadata {
@@ -2819,6 +2885,8 @@ mod parallel_gate {
     /// terminal-only — a strict three-step script.
     struct ParallelClient {
         /// Remaining scripted event lists, in order.
+        ///
+        /// Each streamed turn pops the front list; an exhausted script is the hard failure the pins rely on to end a run.
         script: Mutex<Vec<Vec<Result<StreamEvent, ApiError>>>>,
     }
 
@@ -2929,8 +2997,12 @@ mod full_stack {
     use loopctl::tool::shield::UnixShield;
 
     /// Fails every execution.
+    ///
+    /// Every call records itself and returns an execution error — the failure source the breaker sequences trip on.
     struct FlakyTool {
         /// One entry per execution.
+        ///
+        /// Length is the execution count the breaker-sequence pins assert against.
         executions: Arc<Mutex<Vec<()>>>,
     }
 
@@ -2993,6 +3065,8 @@ mod full_stack {
     }
 
     /// Blocks `rm -rf` inputs via the reference shield.
+    ///
+    /// The tool itself always succeeds; the UnixShield middleware is what refuses the destructive input, isolating the refusal to the shield.
     struct DangerousBash;
 
     impl Tool for DangerousBash {
@@ -3022,6 +3096,8 @@ mod full_stack {
     }
 
     /// Supplies compaction guidance.
+    ///
+    /// Every consultation returns the same instructions with no additional context, giving the compactor a fixed guidance input.
     struct GuidingHook;
 
     impl Hook for GuidingHook {
@@ -3039,8 +3115,12 @@ mod full_stack {
     }
 
     /// Drops the oldest message; captures guidance.
+    ///
+    /// Each pass removes the oldest message and records the instructions it ran under; an aborted pass never reaches it.
     struct CapturingCompactor {
         /// Instructions per executed pass.
+        ///
+        /// One entry per pass that actually ran — an abort shows up as a missing entry, not an empty one.
         passes: Arc<Mutex<Vec<Option<String>>>>,
     }
 
@@ -3106,6 +3186,8 @@ mod full_stack {
         #[derive(Default)]
         struct OutcomeRecorder {
             /// (tool, is_error) per completed call, in order.
+            ///
+            /// Captured at tool-end before compaction can drop the turn, so the pins see every outcome the conversation no longer holds.
             outcomes: Mutex<Vec<(String, bool)>>,
         }
 
@@ -3234,8 +3316,12 @@ mod randomized_sweep {
     }
 
     /// Fails or succeeds per the script, indexed by execution.
+    ///
+    /// The n-th execution consumes the n-th script entry, letting a pin script an exact success and failure pattern for the gate sequences.
     pub(super) struct ScriptedTool {
         /// `true` marks a failing execution.
+        ///
+        /// Entries are consumed in order; the n-th execution fails exactly when the n-th entry is true.
         pub(super) script: Mutex<Vec<bool>>,
     }
 
@@ -3274,6 +3360,8 @@ mod randomized_sweep {
     }
 
     /// Succeeds; dangerous inputs are the shield's business.
+    ///
+    /// The tool never fails on its own, so any refusal observed in these pins must come from the safety middleware.
     pub(super) struct BashTool;
 
     impl Tool for BashTool {
@@ -3303,6 +3391,8 @@ mod randomized_sweep {
     }
 
     /// Always retry without delay.
+    ///
+    /// Every decision is an immediate retry, keeping the gate sequences free of backoff delay.
     pub(super) struct AlwaysRetry;
 
     impl loopctl::reflection::RecoveryStrategy for AlwaysRetry {
@@ -3455,10 +3545,16 @@ mod cancellation_recovery {
     use std::pin::Pin;
 
     /// Fails fast, then hangs (the cancelled probe), then fails fast.
+    ///
+    /// The three-step script that puts a probe in flight for a cancellation to cut: fail, hang, fail.
     struct HangingScriptTool {
         /// One entry per execution.
+        ///
+        /// Length is the execution count across the fail-hang-fail sequence the cancellation pins assert.
         executions: Arc<Mutex<Vec<()>>>,
         /// `true` marks a hanging execution, in order.
+        ///
+        /// Entries are consumed front-first; the n-th execution hangs exactly when the n-th entry is true.
         hangs: Mutex<Vec<bool>>,
     }
 
@@ -3566,6 +3662,8 @@ mod cancellation_recovery {
     /// turn or a terminal, in order.
     struct ScriptClient {
         /// Remaining responses, front first.
+        ///
+        /// Each streamed turn pops the front list; the pins script call turns and terminals in exact order.
         script: Mutex<Vec<Vec<Result<StreamEvent, ApiError>>>>,
     }
 
@@ -3622,6 +3720,8 @@ mod cancellation_recovery {
             ]),
         });
         /// Fail immediately — no retry interplay in this sequence.
+        ///
+        /// Every decision fails the call at once, so the sequence under test is the cancellation's, not recovery's.
         struct NeverRetry;
 
         impl loopctl::reflection::RecoveryStrategy for NeverRetry {
@@ -3729,6 +3829,8 @@ mod cancellation_recovery {
     /// cancellation has to beat.
     struct HangingCompactor {
         /// One entry per compaction pass that began.
+        ///
+        /// Incremented on entry and never completed — the count proves the pass started, which is all the cancellation pin needs.
         entered: Arc<Mutex<usize>>,
     }
 
@@ -3752,8 +3854,8 @@ mod cancellation_recovery {
     async fn a_cancel_during_an_in_flight_compact_ends_the_run_typed() {
         // The compactor hangs mid-pass; the cancel signal fires while
         // it is in flight. The run ends with the typed cancellation
-        // (not a hang), and its pending work is discarded whole — no
-        // partial turns, no half-compacted history lands.
+        // (not a hang), its completed exchanges are salvaged into
+        // history, and the half-compacted history never lands.
         let mut responses = Vec::new();
         for i in 0..8 {
             responses.push(MockResponse {
@@ -3809,10 +3911,44 @@ mod cancellation_recovery {
             1,
             "exactly one compaction pass began"
         );
+        let conversation = loop_.conversation();
         assert!(
-            loop_.conversation().is_empty(),
-            "the cancelled run commits nothing — no partial turns, no \
-             compaction summary"
+            conversation.len() >= 3 && conversation.len() % 2 == 1,
+            "the cancelled run salvages its prompt plus whole completed \
+             exchanges (an odd message count), got {} messages",
+            conversation.len()
+        );
+        let mut opened: Vec<String> = Vec::new();
+        let mut closed: Vec<String> = Vec::new();
+        for message in &conversation {
+            for part in &message.parts {
+                match part {
+                    loopctl::message::MessagePart::ToolCall { id, .. } => {
+                        opened.push(id.clone());
+                    }
+                    loopctl::message::MessagePart::ToolResult { call_id, .. } => {
+                        closed.push(call_id.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        opened.sort();
+        closed.sort();
+        assert_eq!(
+            opened, closed,
+            "every salvaged tool call is paired with its result — no \
+             orphaned exchange survived"
+        );
+        let last = conversation
+            .last()
+            .expect("the salvaged history is non-empty");
+        assert!(
+            last.parts
+                .iter()
+                .any(|p| matches!(p, loopctl::message::MessagePart::ToolResult { .. })),
+            "the salvaged history ends with the last completed exchange — \
+             the hanging compaction pass never landed as a summary"
         );
     }
 }
@@ -3854,6 +3990,8 @@ mod randomized_wave_sweep {
     }
 
     /// One multi-call assistant message as raw stream events.
+    ///
+    /// Assembles one assistant turn issuing several parallel calls from the given `(id, name, input)` triples.
     fn wave_events(
         calls: &[(String, String, serde_json::Value)],
     ) -> Vec<Result<StreamEvent, ApiError>> {
@@ -3921,6 +4059,8 @@ mod randomized_wave_sweep {
     /// terminal-only — front-first.
     struct WaveClient {
         /// Remaining streams, front first.
+        ///
+        /// Each streamed turn pops the front event list, in the wave order the pins script.
         script: Mutex<VecDeque<Vec<Result<StreamEvent, ApiError>>>>,
     }
 
@@ -4080,8 +4220,12 @@ mod memory_injection {
     /// shelf, respecting the limit it was handed.
     struct RecordingMemory {
         /// The shelf served to every retrieve, in order.
+        ///
+        /// Every retrieve returns this fixed list bounded by the requested limit, so the injected content is fully predictable.
         entries: Vec<MemoryEntry>,
         /// One (query, limit) pair per retrieve call.
+        ///
+        /// The pins read the query the continuation used and the limit it requested, in call order.
         queries: Arc<Mutex<Vec<(String, usize)>>>,
     }
 
@@ -4135,13 +4279,19 @@ mod memory_injection {
     /// request — the surface the memory message actually reaches.
     struct CapturingClient {
         /// Delegated response scripting.
+        ///
+        /// The mock serves the scripted responses; this wrapper only adds request capture around it.
         inner: MockApiClient,
         /// One entry per streamed request, oldest first.
+        ///
+        /// Every outbound request is cloned before delegation, giving the pins the exact wire surface in order.
         requests: Mutex<Vec<StreamRequest>>,
     }
 
     impl CapturingClient {
         /// Every text part of every recorded request, newline-joined.
+        ///
+        /// Flattens the captured requests into one searchable string for containment assertions over the injected memory framing.
         fn request_text(&self) -> String {
             self.requests
                 .lock()
@@ -4189,6 +4339,8 @@ mod memory_injection {
     }
 
     /// The fixed shelf: two trusted entries and one provider-derived.
+    ///
+    /// The retrieval fixture across these pins: two plain insights plus one tagged provider-derived entry for the inclusion-knob assertions.
     fn shelf() -> Vec<MemoryEntry> {
         vec![
             MemoryEntry::new(MemoryCategory::Insight, "trusted-alpha"),

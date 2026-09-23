@@ -21,6 +21,7 @@ use crate::api::StreamRequest;
 use crate::capabilities::StreamCapable;
 use crate::capabilities::{Detectable, FallbackCapable};
 use crate::detection::{ConvergenceAction, DetectedPattern};
+use crate::message::{MessagePart, Role};
 #[cfg(feature = "streaming")]
 use crate::observer::{TextDeltaContext, ThinkingDeltaContext};
 #[cfg(feature = "streaming")]
@@ -83,11 +84,14 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// Merges the transient contributor messages with the machine's full
     /// history, attaches the session system prompt and the current tool
-    /// schemas. Defined once here so the streaming and non-streaming paths
-    /// cannot drift on request shape.
+    /// schemas, and coalesces adjacent text-only user messages (the
+    /// `coalesce_adjacent_user_text` pass) so the request never carries
+    /// consecutive user turns. Defined once here so the streaming and
+    /// non-streaming paths cannot drift on request shape.
     pub(super) fn build_turn_request(&self, messages: Vec<Message>) -> StreamRequest {
         let mut messages = messages;
         messages.extend(self.machine.full_history());
+        let messages = coalesce_adjacent_user_text(messages);
         StreamRequest::new(messages)
             .with_system(self.session.config.system_prompt.clone())
             .with_tools(self.build_tool_schemas())
@@ -478,6 +482,79 @@ impl<C: ApiClient> BareLoop<C> {
     }
 }
 
+/// Fold runs of adjacent text-only user messages into one message.
+///
+/// Salvage commits a failed run's prompt ahead of the next run's input,
+/// and memory transients prepend a user-role message ahead of the
+/// prompt, so the outbound request can otherwise carry consecutive
+/// user turns. Providers differ in whether they accept that shape —
+/// OpenAI allows it, Anthropic merges it server-side, and Gemini
+/// documents multiturn requests as alternating roles — so the engine
+/// coalesces the run itself: any stretch of adjacent
+/// [`Role::User`](crate::message::Role::User) messages whose parts are
+/// all non-empty [`Text`](MessagePart::Text) becomes a single user
+/// message with one text part, the texts joined with `\n` in order.
+///
+/// A boundary next to anything else — a tool result, an image, an
+/// empty part list — never merges. Tool-result messages ride
+/// [`Role::User`](crate::message::Role::User) and their pairing with
+/// the assistant's tool calls is load-bearing, so the all-text guard
+/// is what keeps coalescing from corrupting a tool round-trip. The
+/// fold is a request-build view only: machine state, committed
+/// history, and serialized runs are untouched.
+fn coalesce_adjacent_user_text(messages: Vec<Message>) -> Vec<Message> {
+    let mut coalesced: Vec<Message> = Vec::with_capacity(messages.len());
+    for message in messages {
+        let merges_with_previous = matches!(coalesced.last(), Some(previous) if is_pure_user_text(previous))
+            && is_pure_user_text(&message);
+        if merges_with_previous {
+            if let Some(previous) = coalesced.last_mut() {
+                let mut texts = user_texts(previous);
+                texts.extend(user_texts(&message));
+                previous.parts = vec![MessagePart::Text {
+                    text: texts.join("\n"),
+                }];
+            }
+        } else {
+            coalesced.push(message);
+        }
+    }
+    coalesced
+}
+
+/// Check whether a message is a user message of nothing but text.
+///
+/// The coalescing guard behind
+/// [`coalesce_adjacent_user_text`]: `true` only for a
+/// [`Role::User`](crate::message::Role::User) message with a
+/// non-empty part list whose every part is
+/// [`Text`](MessagePart::Text). An empty part list never coalesces —
+/// a degenerate message must not weld itself onto a neighbor.
+fn is_pure_user_text(message: &Message) -> bool {
+    message.role == Role::User
+        && !message.parts.is_empty()
+        && message
+            .parts
+            .iter()
+            .all(|part| matches!(part, MessagePart::Text { .. }))
+}
+
+/// Collect the text parts of a message in order.
+///
+/// Companion to [`is_pure_user_text`]: on a message that passed the
+/// guard this yields every text payload for concatenation. Non-text
+/// parts, if any ever reach it, are skipped rather than stringified.
+fn user_texts(message: &Message) -> Vec<String> {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(all(test, feature = "streaming"))]
 mod tests {
     use super::*;
@@ -534,5 +611,120 @@ mod tests {
             }
             other => panic!("expected RateLimitEscalation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn adjacent_text_only_users_coalesce_newline_joined() {
+        let coalesced =
+            coalesce_adjacent_user_text(vec![Message::user("first"), Message::user("second")]);
+        assert_eq!(
+            coalesced.len(),
+            1,
+            "two adjacent text-only user messages must leave as one message"
+        );
+        assert_eq!(
+            coalesced[0].parts.len(),
+            1,
+            "the coalesced message carries a single text part"
+        );
+        assert_eq!(
+            coalesced[0].text_content(),
+            "first\nsecond",
+            "the coalesced message joins the texts with a newline in order"
+        );
+    }
+
+    #[test]
+    fn a_run_of_three_users_coalesces_in_order() {
+        let coalesced = coalesce_adjacent_user_text(vec![
+            Message::user("first"),
+            Message::user("second"),
+            Message::user("third"),
+        ]);
+        assert_eq!(
+            coalesced[0].text_content(),
+            "first\nsecond\nthird",
+            "a longer run folds progressively, preserving order"
+        );
+    }
+
+    #[test]
+    fn a_tool_result_bearing_user_blocks_coalescing() {
+        let coalesced = coalesce_adjacent_user_text(vec![
+            Message::user("prompt"),
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::ToolResult {
+                    call_id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    output: crate::message::ToolContent::from("ok"),
+                    is_error: None,
+                }],
+            },
+        ]);
+        assert_eq!(
+            coalesced.len(),
+            2,
+            "a tool-result boundary must never merge — the call/result pairing is load-bearing"
+        );
+        assert_eq!(
+            coalesced[0].text_content(),
+            "prompt",
+            "the text message before the boundary is unchanged"
+        );
+        assert!(
+            matches!(
+                coalesced[1].parts.first(),
+                Some(MessagePart::ToolResult { call_id, .. }) if call_id == "call-1"
+            ),
+            "the tool-result message survives intact"
+        );
+    }
+
+    #[test]
+    fn an_image_bearing_user_blocks_coalescing() {
+        let coalesced = coalesce_adjacent_user_text(vec![
+            Message::user("look at this"),
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Image {
+                    source: crate::message::ImageSource::new_base64("image/png", "aGk="),
+                }],
+            },
+        ]);
+        assert_eq!(
+            coalesced.len(),
+            2,
+            "an image-bearing user message must keep its boundary"
+        );
+    }
+
+    #[test]
+    fn non_user_roles_never_coalesce() {
+        let coalesced = coalesce_adjacent_user_text(vec![
+            Message::assistant("reply"),
+            Message::assistant("follow-up"),
+        ]);
+        assert_eq!(
+            coalesced.len(),
+            2,
+            "assistant messages must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn empty_parts_messages_never_coalesce() {
+        let coalesced = coalesce_adjacent_user_text(vec![
+            Message {
+                role: Role::User,
+                parts: Vec::new(),
+            },
+            Message::user("prompt"),
+        ]);
+        assert_eq!(
+            coalesced.len(),
+            2,
+            "a degenerate empty-parts message must not weld itself onto a neighbor"
+        );
     }
 }

@@ -44,9 +44,10 @@ pub mod context;
 
 pub use context::{
     CompactedContext, ConvergenceDetectedContext, FallbackContext, LoopDetectedContext,
-    ModelSwitchedContext, ResponseContext, RunEndContext, RunStartContext, StreamContext,
-    StreamFailureContext, TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext,
-    ToolPostContext, ToolPreContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
+    ModelSwitchedContext, PreCompactionContext, ResponseContext, RunEndContext, RunStartContext,
+    StreamContext, StreamFailureContext, TextDeltaContext, ThinkingDeltaContext,
+    ToolCallReceivedContext, ToolPostContext, ToolPreContext, TransportFallbackContext,
+    TurnEndContext, TurnStartContext,
 };
 
 /// A notification observer that receives typed callbacks at agent loop lifecycle points.
@@ -215,10 +216,49 @@ pub trait LoopObserver: Send + Sync {
     /// for loop-detection correlation.
     fn on_tool_post(&self, _ctx: &ToolPostContext) {}
 
+    /// Called before conversation compaction runs.
+    ///
+    /// Notification-only — fired when a compaction pass is starting,
+    /// before the pre-compact hooks are consulted. The outcome is not
+    /// yet known: a pass the hooks veto, a cancellation cuts short, or
+    /// the manager classifies as no action fires this event and never
+    /// fires the matching [`on_compaction`](Self::on_compaction). Use
+    /// the hook system (requires `hooks` feature) to control whether
+    /// compaction runs at all — observers cannot veto.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    /// use loopctl::observer::{LoopObserver, PreCompactionContext};
+    ///
+    /// struct PassCounter {
+    ///     started: AtomicUsize,
+    /// }
+    ///
+    /// impl LoopObserver for PassCounter {
+    ///     fn name(&self) -> &'static str {
+    ///         "pass_counter"
+    ///     }
+    ///
+    ///     fn on_pre_compaction(&self, _ctx: &PreCompactionContext) {
+    ///         self.started.fetch_add(1, Ordering::SeqCst);
+    ///     }
+    /// }
+    ///
+    /// let counter = PassCounter {
+    ///     started: AtomicUsize::new(0),
+    /// };
+    /// assert_eq!(counter.started.load(Ordering::SeqCst), 0);
+    /// ```
+    fn on_pre_compaction(&self, _ctx: &PreCompactionContext) {}
+
     /// Called after conversation compaction.
     ///
-    /// Reports token counts before and after compaction. Only fired when
-    /// compaction actually occurred — not on no-action passes.
+    /// Reports token counts before and after compaction, why the pass
+    /// ran (`reason`), how many messages it evicted, and the full pass
+    /// statistics (`telemetry`). Only fired when compaction actually
+    /// occurred — not on no-action passes.
     fn on_compaction(&self, _ctx: &CompactedContext) {}
 
     /// Called when a model fallback is triggered.
@@ -469,12 +509,26 @@ impl ObserverHost {
         self.dispatch(|obs| obs.on_tool_post(ctx));
     }
 
+    /// Dispatch [`LoopObserver::on_pre_compaction`] to all observers.
+    ///
+    /// Fired when a compaction pass is starting, before the pre-compact
+    /// hooks are consulted, carrying the pass's reason, turn, pre-pass
+    /// token estimate, window, message count, and session id. Iterates
+    /// registered observers in registration order. The matching
+    /// [`on_compaction`](Self::on_compaction) fires only when the pass
+    /// completes — vetoed, cancelled, and no-action passes show this
+    /// event without the post.
+    pub fn on_pre_compaction(&self, ctx: &PreCompactionContext) {
+        self.dispatch(|obs| obs.on_pre_compaction(ctx));
+    }
+
     /// Dispatch [`LoopObserver::on_compaction`] to all observers.
     ///
-    /// Fired after the context manager reduces the history, carrying the
-    /// before/after token counts. Iterates registered observers in
-    /// registration order; fired only when compaction actually occurred,
-    /// not on no-action passes.
+    /// Fired after the context manager reduces the history, carrying
+    /// the before/after token counts, the pass's reason, the evicted
+    /// message count, and the full pass telemetry. Iterates registered
+    /// observers in registration order; fired only when compaction
+    /// actually occurred, not on no-action passes.
     pub fn on_compaction(&self, ctx: &CompactedContext) {
         self.dispatch(|obs| obs.on_compaction(ctx));
     }
@@ -593,6 +647,68 @@ mod tests {
         });
         assert_eq!(obs1.stream_success.load(Ordering::SeqCst), 1);
         assert_eq!(obs2.stream_success.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn on_pre_compaction_default_is_noop() {
+        struct NoopObserver;
+        impl LoopObserver for NoopObserver {
+            fn name(&self) -> &'static str {
+                "noop"
+            }
+        }
+
+        let obs = NoopObserver;
+        obs.on_pre_compaction(&PreCompactionContext {
+            reason: crate::compact::CompactReason::ThresholdExceeded,
+            turn: 0,
+            tokens_before: 0,
+            context_window: 0,
+            message_count: 0,
+            session_id: uuid::Uuid::new_v4(),
+        });
+    }
+
+    #[test]
+    fn host_dispatches_on_pre_compaction_in_registration_order() {
+        struct RecordingObserver {
+            tag: &'static str,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+        impl LoopObserver for RecordingObserver {
+            fn name(&self) -> &'static str {
+                self.tag
+            }
+            fn on_pre_compaction(&self, _ctx: &PreCompactionContext) {
+                self.log.lock().expect("log lock").push(self.tag);
+            }
+        }
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut host = ObserverHost::new();
+        host.register(Arc::new(RecordingObserver {
+            tag: "first",
+            log: Arc::clone(&log),
+        }) as Arc<dyn LoopObserver>);
+        host.register(Arc::new(RecordingObserver {
+            tag: "second",
+            log: Arc::clone(&log),
+        }) as Arc<dyn LoopObserver>);
+        host.on_pre_compaction(&PreCompactionContext {
+            reason: crate::compact::CompactReason::Emergency,
+            turn: 3,
+            tokens_before: 1_000,
+            context_window: 2_000,
+            message_count: 12,
+            session_id: uuid::Uuid::new_v4(),
+        });
+
+        let recorded = log.lock().expect("log lock").clone();
+        assert_eq!(
+            recorded,
+            vec!["first", "second"],
+            "the pre-compaction event reaches every observer in registration order"
+        );
     }
 
     #[test]

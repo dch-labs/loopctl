@@ -331,8 +331,10 @@ impl CompactionOutcome {
 
 /// Telemetry data for a single compaction operation.
 ///
-/// Produced by [`ContextManager::ensure_context_fits`](super::ContextManager::ensure_context_fits)
-/// when compaction occurs. Observers receive this via
+/// Produced by [`ContextManager::build_telemetry`](super::ContextManager::build_telemetry),
+/// which the engine calls on every compacting pass (and hosts may call
+/// directly when they drive compaction themselves). Observers receive
+/// this via
 /// [`on_compaction`](crate::observer::LoopObserver::on_compaction).
 /// `#[non_exhaustive]` so fields can be added in minor
 /// releases; it is produced by the compaction machinery —
@@ -360,12 +362,50 @@ pub struct CompactTelemetry {
     /// measure the effect of the pass. See [`PostCompactStats`].
     pub post_compact: PostCompactStats,
 
-    /// Wall-clock duration of the compaction.
+    /// Wall-clock duration of the compaction pass.
     ///
-    /// Time spent inside the compactor's `compact` call for this pass, measured
-    /// from just before the call to just after. Excludes the token-estimate
-    /// bookkeeping done before and after the call itself.
+    /// The span the engine measures for the whole pass, opened just
+    /// before the history snapshot is taken and closed after the
+    /// demotion handoff completes: the snapshot clone, the token
+    /// estimates around the compactor call (the manager re-counts the
+    /// history before and the result after), the compactor's `compact`
+    /// call itself, and the demotion sink's delivery. Not the compactor
+    /// call in isolation — a slow sink or a large history is part of
+    /// what this number reports, matching the duration the post-compact
+    /// hook receives from the same start.
     pub duration: std::time::Duration,
+
+    /// Compression ratio achieved by the pass.
+    ///
+    /// The pre-compaction token estimate divided by the post-compaction
+    /// estimate: `4.0` means the pass shrank the conversation to a quarter.
+    /// Values below `1.0` are honest — a compactor whose summary outweighed
+    /// what it removed grew the conversation, and the ratio says so.
+    /// `f64::INFINITY` when the result is empty (`post == 0`), so dashboards
+    /// can rank compactors without dividing in the consumer.
+    pub compression_ratio: f64,
+
+    /// Fraction of the context window now free, post-compaction.
+    ///
+    /// `1.0 − post_tokens / context_window`, clamped to `0.0..=1.0` — the
+    /// headroom signal: roughly how much conversation can accrue before the
+    /// next pass fires. Computed against the manager's own window, so two
+    /// managers with different windows report different headroom for the
+    /// same compacted output. A window of `0` (unset, accepted by
+    /// [`with_context_window`](super::ContextManager::with_context_window))
+    /// reports `0.0` — a sentinel for "no window to measure against", not
+    /// a genuinely full window.
+    pub headroom_pct: f64,
+
+    /// Which compactor produced this outcome, if identifiable.
+    ///
+    /// The host's name for the configured compactor (for example
+    /// `"QaSummarizer"` or `"FallbackCompactor(QaSummarizer)"`), driving
+    /// per-strategy dashboards. `None` when the caller does not supply a
+    /// name — the engine itself always passes `None`, because the concrete
+    /// type behind its `Arc<dyn ContextCompactor>` is unrecoverable without
+    /// `Any` bounds the trait does not carry.
+    pub compactor_name: Option<String>,
 }
 
 /// Conversation statistics captured before compaction.
@@ -413,6 +453,31 @@ pub struct PreCompactStats {
     /// role. These are often worth preserving across compaction because they
     /// carry the intermediate state of the tool loop.
     pub tool_messages: usize,
+
+    /// Estimated tokens in user-role messages.
+    ///
+    /// The same 4-chars-per-token estimate as
+    /// [`estimated_tokens`](Self::estimated_tokens), scoped to the slice of
+    /// messages whose role is [`User`](crate::message::Role::User) — including
+    /// tool-result messages, which conventionally ride the user role.
+    /// `user_tokens + assistant_tokens` equals `estimated_tokens` on any
+    /// conversation built from the two roles.
+    pub user_tokens: u64,
+
+    /// Estimated tokens in assistant-role messages.
+    ///
+    /// The role-scoped counterpart of
+    /// [`user_tokens`](Self::user_tokens): the estimate over messages whose
+    /// role is [`Assistant`](crate::message::Role::Assistant).
+    pub assistant_tokens: u64,
+
+    /// Average tokens per message.
+    ///
+    /// `estimated_tokens / total_messages` — how dense the conversation is.
+    /// High density with high message count is the summarize-first signal;
+    /// low density means many small turns a truncator can drop wholesale.
+    /// `0.0` for an empty conversation.
+    pub density: f64,
 }
 
 /// Conversation statistics captured after compaction.
@@ -454,6 +519,48 @@ pub struct PostCompactStats {
     /// estimate, expressed as a whole-number percentage. Clamped to `0..=100`;
     /// `0` when nothing was saved or when the pre-compaction estimate was zero.
     pub percent_saved: u8,
+
+    /// Number of user-role messages after compaction.
+    ///
+    /// The role breakdown of the compacted list, mirroring
+    /// [`PreCompactStats::user_messages`](super::PreCompactStats::user_messages)
+    /// so a before/after diff shows which roles the compactor favored.
+    pub user_messages: usize,
+
+    /// Number of assistant-role messages after compaction.
+    ///
+    /// The assistant share of the compacted list — the role a summarizer
+    /// typically collapses hardest, since consecutive assistant turns merge
+    /// into one summary message.
+    pub assistant_messages: usize,
+
+    /// Number of tool-bearing messages after compaction.
+    ///
+    /// Messages with at least one tool-call or tool-result part in the
+    /// compacted list. Dropping these orphans the loop state, so a healthy
+    /// compactor preserves them — this count is the quick check that it did.
+    pub tool_messages: usize,
+
+    /// Estimated tokens in user-role messages after compaction.
+    ///
+    /// The role-scoped estimate over the compacted list, mirroring
+    /// [`PreCompactStats::user_tokens`](super::PreCompactStats::user_tokens).
+    pub user_tokens: u64,
+
+    /// Estimated tokens in assistant-role messages after compaction.
+    ///
+    /// The assistant share of the compacted list's token estimate, mirroring
+    /// [`PreCompactStats::assistant_tokens`](super::PreCompactStats::assistant_tokens).
+    pub assistant_tokens: u64,
+
+    /// Average tokens per message after compaction.
+    ///
+    /// The compacted list's
+    /// [`estimated_tokens`](Self::estimated_tokens) divided by its
+    /// [`total_messages`](Self::total_messages) — compare against the
+    /// pre-compaction density to see whether the pass thinned small turns
+    /// or condensed large ones. `0.0` for an empty result.
+    pub density: f64,
 }
 
 /// Error returned when compaction cannot bring the request payload

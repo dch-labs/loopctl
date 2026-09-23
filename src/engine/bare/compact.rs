@@ -12,12 +12,14 @@ use super::{ApiClient, BareLoop, LoopError};
 #[cfg(feature = "hooks")]
 use super::{CompactTrigger, Instant, PostCompactContext, PreCompactContext};
 use crate::compact::EnsureContextResult;
+#[cfg(not(feature = "hooks"))]
+use std::time::Instant;
 
 use crate::capabilities::Compactable;
 #[cfg(feature = "hooks")]
 use crate::capabilities::Hookable;
 use crate::message::Message;
-use crate::observer::CompactedContext;
+use crate::observer::{CompactedContext, PreCompactionContext};
 
 /// The result of servicing a [`MachineStep::Compact`](crate::engine::core::MachineStep::Compact),
 /// before it is fed back into the machine.
@@ -62,8 +64,12 @@ impl<C: ApiClient> BareLoop<C> {
     /// Reads the history from [`LoopMachine::history`](crate::engine::core::LoopMachine::history),
     /// measures its token size, asks the configured
     /// [`ContextManager`](crate::compact::ContextManager) to reduce it, fires
-    /// [`on_compaction`](crate::observer::LoopObserver::on_compaction) and the
-    /// post-compact hook when compaction occurred, and returns a
+    /// [`on_pre_compaction`](crate::observer::LoopObserver::on_pre_compaction)
+    /// before the pass starts (after the manager-exists check, before the
+    /// pre-compact hook veto) and
+    /// [`on_compaction`](crate::observer::LoopObserver::on_compaction) with
+    /// the full pass telemetry when compaction occurred, and the
+    /// post-compact hook; returns a
     /// [`CompactStepOutcome`] — the measured before/after pair plus the
     /// compacted list when one was produced — for the driver to feed back
     /// into the machine.
@@ -97,6 +103,18 @@ impl<C: ApiClient> BareLoop<C> {
             });
         };
 
+        let message_count = history.len();
+        self.managers
+            .observers()
+            .on_pre_compaction(&PreCompactionContext {
+                reason,
+                turn,
+                tokens_before,
+                context_window: ctx_manager.context_window(),
+                message_count,
+                session_id: self.session.id,
+            });
+
         #[cfg(feature = "hooks")]
         let hook = self.pre_compact_hook(&history, reason);
         #[cfg(feature = "hooks")]
@@ -112,8 +130,8 @@ impl<C: ApiClient> BareLoop<C> {
 
         #[cfg(feature = "hooks")]
         let messages_before = history.len();
-        #[cfg(feature = "hooks")]
         let compact_start = Instant::now();
+        let pre_snapshot = history.clone();
         #[cfg(feature = "hooks")]
         let (instructions, additional_context) = (hook.new_instructions, hook.additional_context);
         let reserved = self
@@ -155,10 +173,20 @@ impl<C: ApiClient> BareLoop<C> {
                 let tokens_saved = tokens_before.saturating_sub(tokens_after);
                 #[cfg(feature = "hooks")]
                 let messages_after = outcome.messages.len();
+                let telemetry = ctx_manager.build_telemetry(
+                    reason,
+                    &pre_snapshot,
+                    &outcome.messages,
+                    None,
+                    compact_start,
+                );
                 self.managers.observers().on_compaction(&CompactedContext {
                     tokens_before,
                     tokens_after,
                     tokens_saved,
+                    reason,
+                    evicted_messages: outcome.evicted.len(),
+                    telemetry,
                 });
                 #[cfg(feature = "hooks")]
                 self.notify_post_compact_hook(

@@ -1062,18 +1062,49 @@ impl ContextManager {
 
     /// Build telemetry for a compaction operation.
     ///
-    /// A standalone helper for hosts that run compaction themselves
-    /// (e.g. via [`compact_manual`](Self::compact_manual)) and want the
-    /// pre/post message-shape statistics. Takes the pre/post message
-    /// lists and the compaction trigger reason, along with the start
-    /// time of the operation. The token figures are history-only
-    /// heuristic estimates — per-request overhead and transients are
-    /// not part of them.
+    /// Called by the engine on every compacting pass and available to
+    /// hosts that run compaction themselves (for example via
+    /// [`compact_manual`](Self::compact_manual)). Takes the pre/post
+    /// message lists, the compaction trigger reason, the host's name
+    /// for the compactor (`None` when it does not identify one), and
+    /// the start time of the operation. An instance method on purpose:
+    /// [`headroom_pct`](crate::compact::CompactTelemetry::headroom_pct)
+    /// is computed against this manager's own
+    /// [`context_window`](Self::context_window), so two managers with
+    /// different windows report different headroom over the same
+    /// messages. The token figures are history-only heuristic
+    /// estimates — per-request overhead and transients are not part of
+    /// them.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use loopctl::compact::{CompactReason, ContextManager, TruncatingCompactor};
+    /// use loopctl::message::Message;
+    ///
+    /// let manager = ContextManager::new(Arc::new(TruncatingCompactor::new()))
+    ///     .with_context_window(200_000);
+    /// let pre = vec![Message::user("a long conversation now summarized")];
+    /// let post = vec![Message::user("summary")];
+    /// let start = std::time::Instant::now();
+    /// let telemetry = manager.build_telemetry(
+    ///     CompactReason::ThresholdExceeded,
+    ///     &pre,
+    ///     &post,
+    ///     Some("QaSummarizer"),
+    ///     start,
+    /// );
+    /// assert!(telemetry.compression_ratio >= 1.0);
+    /// assert_eq!(telemetry.compactor_name.as_deref(), Some("QaSummarizer"));
+    /// ```
     #[must_use]
     pub fn build_telemetry(
+        &self,
         trigger: CompactReason,
         pre_messages: &[Message],
         post_messages: &[Message],
+        compactor_name: Option<&str>,
         start: Instant,
     ) -> CompactTelemetry {
         let pre_tokens = CompactionOutcome::estimate_tokens(pre_messages);
@@ -1081,8 +1112,21 @@ impl ContextManager {
         let tokens_saved = pre_tokens.saturating_sub(post_tokens);
         let percent_saved: u8 = tokens_saved
             .checked_mul(100)
-            .and_then(|v| v.checked_div(pre_tokens))
+            .and_then(|value| value.checked_div(pre_tokens))
             .map_or(0, |ratio| ratio.min(100) as u8);
+        let compression_ratio = if post_tokens == 0 {
+            f64::INFINITY
+        } else {
+            crate::numeric::unit_ratio::<u64>(pre_tokens, post_tokens)
+        };
+        let headroom_pct = if self.context_window == 0 {
+            0.0
+        } else {
+            (1.0 - crate::numeric::unit_ratio::<u64>(post_tokens, self.context_window))
+                .clamp(0.0, 1.0)
+        };
+        let pre_user_tokens = estimate_role_tokens(pre_messages, Role::User);
+        let post_user_tokens = estimate_role_tokens(post_messages, Role::User);
 
         CompactTelemetry {
             trigger,
@@ -1103,16 +1147,72 @@ impl ContextManager {
                         })
                     })
                     .count(),
+                user_tokens: pre_user_tokens,
+                assistant_tokens: pre_tokens.saturating_sub(pre_user_tokens),
+                density: tokens_per_message(pre_tokens, pre_messages.len()),
             },
             post_compact: PostCompactStats {
                 total_messages: post_messages.len(),
                 estimated_tokens: post_tokens,
                 tokens_saved,
                 percent_saved,
+                user_messages: post_messages
+                    .iter()
+                    .filter(|m| m.role == Role::User)
+                    .count(),
+                assistant_messages: post_messages
+                    .iter()
+                    .filter(|m| m.role == Role::Assistant)
+                    .count(),
+                tool_messages: post_messages
+                    .iter()
+                    .filter(|m| {
+                        m.parts.iter().any(|p| {
+                            crate::message::MessagePart::is_tool_call(p)
+                                || crate::message::MessagePart::is_tool_result(p)
+                        })
+                    })
+                    .count(),
+                user_tokens: post_user_tokens,
+                assistant_tokens: post_tokens.saturating_sub(post_user_tokens),
+                density: tokens_per_message(post_tokens, post_messages.len()),
             },
             duration: start.elapsed(),
+            compression_ratio,
+            headroom_pct,
+            compactor_name: compactor_name.map(str::to_string),
         }
     }
+}
+
+/// Estimate tokens over only the messages carrying the given role.
+///
+/// One half of the telemetry's role distribution: filters the slice and
+/// runs the same [`CompactionOutcome::estimate_tokens`] heuristic over
+/// the filtered copy. The counter floors its chars-per-token division
+/// once per call, so per-role scopes floor independently of the
+/// whole-slice figure — the caller partitions the whole estimate
+/// across the roles (`assistant = whole − user`) rather than adding
+/// two independently floored scopes, which is what keeps the
+/// distribution summing to the whole on every input.
+fn estimate_role_tokens(messages: &[Message], role: Role) -> u64 {
+    let scoped: Vec<Message> = messages
+        .iter()
+        .filter(|message| message.role == role)
+        .cloned()
+        .collect();
+    CompactionOutcome::estimate_tokens(&scoped)
+}
+
+/// Tokens per message, zero for an empty list.
+///
+/// The density figure for both telemetry snapshots: the estimate divided
+/// by the message count, routed through [`unit_ratio`](crate::numeric::unit_ratio)
+/// so the count-to-float conversion stays lint-clean. An empty
+/// conversation is a zero denominator, which the ratio defines as `0.0`
+/// rather than `NaN`.
+fn tokens_per_message(tokens: u64, messages: usize) -> f64 {
+    crate::numeric::unit_ratio(tokens, messages as u64)
 }
 
 impl fmt::Debug for ContextManager {
@@ -1827,7 +1927,7 @@ mod tests {
     #[test]
     fn test_build_telemetry() {
         let compactor = TruncatingCompactor::new();
-        let _manager = ContextManager::new(Arc::new(compactor)).with_context_window(1_000);
+        let manager = ContextManager::new(Arc::new(compactor)).with_context_window(1_000);
 
         let pre = make_conversation(10);
         let post = make_conversation(2);
@@ -1842,12 +1942,263 @@ mod tests {
 
         let start = Instant::now();
         let telemetry =
-            ContextManager::build_telemetry(CompactReason::ThresholdExceeded, &pre, &post, start);
+            manager.build_telemetry(CompactReason::ThresholdExceeded, &pre, &post, None, start);
 
         assert_eq!(telemetry.trigger, CompactReason::ThresholdExceeded);
         assert_eq!(telemetry.pre_compact.total_messages, 20);
         assert_eq!(telemetry.post_compact.total_messages, 4);
         assert!(telemetry.post_compact.percent_saved > 0);
+    }
+
+    #[test]
+    fn compression_ratio_math() {
+        let manager = ContextManager::new(Arc::new(TruncatingCompactor::new()));
+        let start = Instant::now();
+
+        let pre = vec![Message::user("a".repeat(3980))];
+        let post = vec![Message::user("a".repeat(980))];
+        let telemetry =
+            manager.build_telemetry(CompactReason::ThresholdExceeded, &pre, &post, None, start);
+        assert_eq!(
+            telemetry.pre_compact.estimated_tokens, 1000,
+            "fixture setup: 3980 chars + 20 overhead = 4000 chars = 1000 tokens"
+        );
+        assert_eq!(telemetry.post_compact.estimated_tokens, 250);
+        assert!(
+            (telemetry.compression_ratio - 4.0).abs() < f64::EPSILON,
+            "1000 tokens shrunk to 250 reports a ratio of 4, got {}",
+            telemetry.compression_ratio
+        );
+
+        let emptied =
+            manager.build_telemetry(CompactReason::ThresholdExceeded, &pre, &[], None, start);
+        assert!(
+            emptied.compression_ratio.is_infinite(),
+            "an empty result reports INFINITY, got {}",
+            emptied.compression_ratio
+        );
+
+        let grew = manager.build_telemetry(
+            CompactReason::ThresholdExceeded,
+            &pre,
+            &[Message::user("a".repeat(7980))],
+            None,
+            start,
+        );
+        assert_eq!(grew.post_compact.estimated_tokens, 2000);
+        assert!(
+            grew.compression_ratio < 1.0,
+            "a compactor that grew the conversation reports an honest ratio below 1.0, got {}",
+            grew.compression_ratio
+        );
+    }
+
+    #[test]
+    fn headroom_clamps_to_the_unit_interval() {
+        let manager =
+            ContextManager::new(Arc::new(TruncatingCompactor::new())).with_context_window(200_000);
+        let start = Instant::now();
+        let pre = vec![Message::user("a".repeat(799_980))];
+
+        let roomy = manager.build_telemetry(
+            CompactReason::ThresholdExceeded,
+            &pre,
+            &[Message::user("a".repeat(79_980))],
+            None,
+            start,
+        );
+        assert_eq!(roomy.post_compact.estimated_tokens, 20_000);
+        assert!(
+            (roomy.headroom_pct - 0.9).abs() < f64::EPSILON,
+            "20 000 of a 200 000 window leaves 0.9 headroom, got {}",
+            roomy.headroom_pct
+        );
+
+        let full = manager.build_telemetry(
+            CompactReason::ThresholdExceeded,
+            &pre,
+            &[Message::user("a".repeat(799_980))],
+            None,
+            start,
+        );
+        assert_eq!(full.post_compact.estimated_tokens, 200_000);
+        assert!(
+            full.headroom_pct.abs() < f64::EPSILON,
+            "a result exactly at the window has zero headroom, got {}",
+            full.headroom_pct
+        );
+
+        let over = manager.build_telemetry(
+            CompactReason::ThresholdExceeded,
+            &pre,
+            &[Message::user("a".repeat(799_996))],
+            None,
+            start,
+        );
+        assert_eq!(over.post_compact.estimated_tokens, 200_004);
+        assert!(
+            over.headroom_pct.abs() < f64::EPSILON,
+            "a result past the window never escapes as a negative, got {}",
+            over.headroom_pct
+        );
+
+        let windowless =
+            ContextManager::new(Arc::new(TruncatingCompactor::new())).with_context_window(0);
+        let unset = windowless.build_telemetry(
+            CompactReason::ThresholdExceeded,
+            &pre,
+            &[Message::user("a".repeat(79_980))],
+            None,
+            start,
+        );
+        assert!(
+            unset.headroom_pct.abs() < f64::EPSILON,
+            "a zero window reports the 0.0 sentinel — no window to measure \
+             against — rather than the 1.0 a zero denominator would give, got {}",
+            unset.headroom_pct
+        );
+    }
+
+    #[test]
+    fn role_token_distribution_sums_to_the_estimate() {
+        let manager = ContextManager::new(Arc::new(TruncatingCompactor::new()));
+        let conversation = vec![
+            Message::user("u".repeat(80)),
+            Message::user("u".repeat(80)),
+            Message::assistant("a".repeat(60)),
+            Message {
+                role: crate::message::Role::User,
+                parts: vec![crate::message::MessagePart::ToolResult {
+                    call_id: "call-1".to_string(),
+                    name: "echo".to_string(),
+                    output: crate::message::ToolContent::from("r".repeat(80)),
+                    is_error: None,
+                }],
+            },
+            Message::assistant("a".repeat(60)),
+        ];
+        let start = Instant::now();
+        let telemetry = manager.build_telemetry(
+            CompactReason::ThresholdExceeded,
+            &conversation,
+            &conversation,
+            None,
+            start,
+        );
+        let stats = &telemetry.pre_compact;
+        assert_eq!(
+            stats.user_tokens.saturating_add(stats.assistant_tokens),
+            stats.estimated_tokens,
+            "the role-scoped estimates partition the whole-slice estimate"
+        );
+        assert_eq!(stats.user_tokens, 75);
+        assert_eq!(stats.assistant_tokens, 40);
+        assert_eq!(
+            stats.user_messages, 3,
+            "a tool-result message counts under its actual role, Role::User"
+        );
+        assert_eq!(stats.tool_messages, 1);
+
+        let uneven = vec![Message::user("abc"), Message::assistant("xyz")];
+        let uneven_stats = manager
+            .build_telemetry(
+                CompactReason::ThresholdExceeded,
+                &uneven,
+                &uneven,
+                None,
+                start,
+            )
+            .pre_compact;
+        assert_eq!(
+            uneven_stats
+                .user_tokens
+                .saturating_add(uneven_stats.assistant_tokens),
+            uneven_stats.estimated_tokens,
+            "the partition survives per-scope flooring when neither scope's \
+             char sum is divisible by 4"
+        );
+    }
+
+    #[test]
+    fn density_is_tokens_per_message() {
+        let manager = ContextManager::new(Arc::new(TruncatingCompactor::new()));
+        let start = Instant::now();
+        let messages: Vec<Message> = (0..8).map(|_| Message::user("d".repeat(180))).collect();
+        let telemetry = manager.build_telemetry(
+            CompactReason::ThresholdExceeded,
+            &messages,
+            &messages,
+            None,
+            start,
+        );
+        assert_eq!(telemetry.pre_compact.estimated_tokens, 400);
+        assert_eq!(telemetry.pre_compact.total_messages, 8);
+        assert!(
+            (telemetry.pre_compact.density - 50.0).abs() < f64::EPSILON,
+            "400 tokens over 8 messages is a density of 50, got {}",
+            telemetry.pre_compact.density
+        );
+
+        let empty =
+            manager.build_telemetry(CompactReason::ThresholdExceeded, &[], &[], None, start);
+        assert!(
+            empty.pre_compact.density.abs() < f64::EPSILON,
+            "an empty conversation defines density as zero, not NaN, got {}",
+            empty.pre_compact.density
+        );
+    }
+
+    #[test]
+    fn compactor_name_threads_through() {
+        let manager = ContextManager::new(Arc::new(TruncatingCompactor::new()));
+        let messages = vec![Message::user("hello")];
+        let start = Instant::now();
+
+        let named = manager.build_telemetry(
+            CompactReason::Manual,
+            &messages,
+            &messages,
+            Some("QaSummarizer"),
+            start,
+        );
+        assert_eq!(named.compactor_name.as_deref(), Some("QaSummarizer"));
+
+        let anonymous =
+            manager.build_telemetry(CompactReason::Manual, &messages, &messages, None, start);
+        assert_eq!(
+            anonymous.compactor_name, None,
+            "no supplied name stays None"
+        );
+    }
+
+    #[test]
+    fn build_telemetry_reads_the_instance_window() {
+        let wide =
+            ContextManager::new(Arc::new(TruncatingCompactor::new())).with_context_window(200_000);
+        let narrow =
+            ContextManager::new(Arc::new(TruncatingCompactor::new())).with_context_window(100_000);
+        let post = vec![Message::user("a".repeat(79_980))];
+        let pre = vec![Message::user("a".repeat(3980))];
+        let start = Instant::now();
+
+        let wide_headroom = wide
+            .build_telemetry(CompactReason::ThresholdExceeded, &pre, &post, None, start)
+            .headroom_pct;
+        let narrow_headroom = narrow
+            .build_telemetry(CompactReason::ThresholdExceeded, &pre, &post, None, start)
+            .headroom_pct;
+        assert!(
+            (wide_headroom - 0.9).abs() < f64::EPSILON,
+            "the wide window leaves 0.9 headroom, got {wide_headroom}"
+        );
+        assert!(
+            (narrow_headroom - 0.8).abs() < f64::EPSILON,
+            "the narrow window leaves 0.8 headroom, got {narrow_headroom}"
+        );
+        assert!(
+            (wide_headroom - narrow_headroom).abs() > f64::EPSILON,
+            "headroom is the &self signature's behavioral pin: it reads the manager's own window"
+        );
     }
 
     #[test]

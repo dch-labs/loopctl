@@ -470,6 +470,89 @@ pub struct CompactedContext {
     /// `tokens_before - tokens_after`, the net reduction achieved by
     /// the compactor.
     pub tokens_saved: u64,
+
+    /// Why this pass ran.
+    ///
+    /// The [`CompactReason`](crate::compact::CompactReason) that
+    /// triggered the pass — threshold, emergency, or manual — the same
+    /// value the pre-compaction event carried, so a start/end pair can
+    /// be matched without guessing.
+    pub reason: crate::compact::CompactReason,
+
+    /// How many messages this pass removed from the feed.
+    ///
+    /// The size of the evicted slice the engine handed to the demotion
+    /// sink before adopting the compacted history — message-granular,
+    /// in conversation order, empty on genuinely-unchanged passes.
+    /// Pairs with the sink's own delivery record to reconcile what
+    /// left the window against what memory received.
+    pub evicted_messages: usize,
+
+    /// The full pass statistics.
+    ///
+    /// Everything [`CompactTelemetry`](crate::compact::CompactTelemetry)
+    /// computes for this pass — pre/post message-shape breakdowns,
+    /// role-scoped token distribution, density, compression ratio,
+    /// headroom against the manager's window, duration, and the
+    /// compactor name when the host supplied one. The three flat
+    /// token fields above stay payload-comparable; this field is the
+    /// history-only deep view.
+    pub telemetry: crate::compact::CompactTelemetry,
+}
+
+/// Context for
+/// [`LoopObserver::on_pre_compaction`](crate::observer::LoopObserver::on_pre_compaction).
+///
+/// The pass-start notification: fired when a compaction pass is about
+/// to run, before the pre-compact hooks are consulted, so observers
+/// can pair start and end. The outcome is not yet known — a pass that
+/// the hooks veto, the run's cancellation cuts short, or the manager
+/// classifies as no action still fires this event and simply never
+/// fires the matching
+/// [`on_compaction`](crate::observer::LoopObserver::on_compaction).
+/// `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is constructed by the engine — external code
+/// reads it, never builds it.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PreCompactionContext {
+    /// Why the pass is starting.
+    ///
+    /// The [`CompactReason`](crate::compact::CompactReason) that
+    /// triggered the pass — threshold, emergency, or manual.
+    pub reason: crate::compact::CompactReason,
+
+    /// The turn the pass runs in.
+    ///
+    /// The engine's current turn number, matching the turn carried by
+    /// the surrounding turn-start/turn-end events.
+    pub turn: usize,
+
+    /// Estimated token count before compaction.
+    ///
+    /// The payload estimate the compaction decision was made against —
+    /// the history plus per-request overhead, the same figure the
+    /// post-event's `tokens_before` will report.
+    pub tokens_before: u64,
+
+    /// The context window the pass compacts toward.
+    ///
+    /// The configured [`ContextManager`](crate::compact::ContextManager)
+    /// window, so an observer can compute utilization at pass start
+    /// without holding the configuration itself.
+    pub context_window: u64,
+
+    /// How many messages the pass operates on.
+    ///
+    /// The history length at pass start — the input size, before any
+    /// reduction.
+    pub message_count: usize,
+
+    /// Unique session identifier.
+    ///
+    /// Correlates the event with the session's other lifecycle events;
+    /// stable across every `run()` call on the same loop.
+    pub session_id: uuid::Uuid,
 }
 
 /// Context for [`LoopObserver::on_fallback`](crate::observer::LoopObserver::on_fallback).

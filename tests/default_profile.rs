@@ -676,6 +676,102 @@ fn six_turn_read_script() -> Vec<MockResponse> {
 }
 
 #[tokio::test]
+async fn explicit_apply_keeps_the_default_pipeline_verifying() {
+    let read = CountingRead {
+        executions: Arc::new(Mutex::new(0usize)),
+        payload: "r".repeat(32),
+    };
+    let grep = CountingGrep {
+        executions: Arc::new(Mutex::new(0usize)),
+    };
+    let client = MockApiClient::new("m").with_responses(vec![
+        tool_call_response("c1", "Bash", serde_json::json!({"command": "rm -rf /"})),
+        tool_call_response("c2", "Grep", serde_json::json!({"query": "n"})),
+        tool_call_response("c3", "Grep", serde_json::json!({"query": "n"})),
+        done_response(),
+    ]);
+    let mut agent = BareLoop::new(
+        Arc::new(client),
+        registry_with(read, grep),
+        Default::default(),
+    );
+    loopctl::presets::ConstrainedProfile::apply(&mut agent).expect("the profile applies");
+    let _run = agent.run("keep verifying", &RunConfig::default()).await;
+
+    let texts = tool_result_texts(&agent.conversation());
+    assert_eq!(texts.len(), 3, "three tool results ride the conversation");
+    assert!(
+        texts[0].contains("[verify] failed:"),
+        "an explicit apply over a default-built loop must keep the builtin \
+         verifier — a deny-class command still fails softly, got {:?}",
+        texts[0]
+    );
+    assert!(
+        texts[2].ends_with("\n[cached]"),
+        "an explicit apply over a default-built loop must keep memoization — \
+         the repeat grep serves from cache, got {:?}",
+        texts[2]
+    );
+}
+
+#[tokio::test]
+async fn explicit_apply_keeps_a_host_supplied_pipeline() {
+    use loopctl::managers::LoopManagers;
+    use loopctl::middleware::ToolPipeline;
+    use loopctl::middleware::verify::{NoopVerifier, VerifyMiddleware};
+
+    let read = CountingRead {
+        executions: Arc::new(Mutex::new(0usize)),
+        payload: "r".repeat(32),
+    };
+    let grep = CountingGrep {
+        executions: Arc::new(Mutex::new(0usize)),
+    };
+    let client = MockApiClient::new("m").with_responses(vec![
+        tool_call_response("c1", "Write", serde_json::json!({"command": "rm -rf /"})),
+        done_response(),
+    ]);
+    let mut host_tools = registry_with(read, grep);
+    host_tools.register(HostWrite);
+    let mut loop_tools = registry_with(
+        CountingRead {
+            executions: Arc::new(Mutex::new(0usize)),
+            payload: "r".repeat(32),
+        },
+        CountingGrep {
+            executions: Arc::new(Mutex::new(0usize)),
+        },
+    );
+    loop_tools.register(HostWrite);
+    loop_tools.register(OkBash);
+    let host_pipeline = ToolPipeline::builder()
+        .with_middleware(VerifyMiddleware::new(
+            Arc::new(NoopVerifier),
+            vec!["Write".to_string()],
+        ))
+        .with_core(Arc::new(host_tools))
+        .build()
+        .expect("the host pipeline builds");
+    let managers = LoopManagers::new().with_pipeline(host_pipeline);
+    let mut agent =
+        BareLoop::new_with_managers(Arc::new(client), loop_tools, Default::default(), managers);
+    loopctl::presets::ConstrainedProfile::apply(&mut agent).expect("the profile applies");
+    let _run = agent
+        .run("host stack survives", &RunConfig::default())
+        .await;
+
+    let texts = tool_result_texts(&agent.conversation());
+    assert_eq!(texts.len(), 1, "one tool result rides the conversation");
+    assert!(
+        texts[0].contains("[verify] passed:"),
+        "an explicit apply must not replace a host-supplied pipeline — the \
+         noop verifier's pass, not the builtin stack's verdict, rides the \
+         result: {:?}",
+        texts[0]
+    );
+}
+
+#[tokio::test]
 async fn explicit_profile_apply_owns_the_goal_reminder_seam() {
     let goal = "the one goal text";
 

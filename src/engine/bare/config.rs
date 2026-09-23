@@ -629,6 +629,17 @@ impl<C: ApiClient> BareLoop<C> {
         Ok(self)
     }
 
+    /// Whether the loop carries a middleware pipeline.
+    ///
+    /// The vacancy probe the profile appliers share: an existing pipeline
+    /// — default-installed or host-supplied — is left untouched when a
+    /// profile applies, mirroring the default wiring's own guard.
+    #[must_use]
+    pub(crate) fn has_pipeline(&self) -> bool {
+        use crate::capabilities::PipelineAware;
+        self.managers.pipeline().is_some()
+    }
+
     /// Wire the small-model pieces default construction carries.
     ///
     /// Applied by every public constructor over a fresh machine: the

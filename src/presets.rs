@@ -235,12 +235,15 @@ impl ConstrainedProfile {
     /// window and threshold synced from the loop's session config, replacing
     /// whatever the constructor seeded, so the profile's context budgeting is
     /// enforced by machinery rather than left to the caller. Also sets the
-    /// small-model middleware stack (via [`Self::pipeline_builder`]) and
-    /// registers a [`GoalReminder`] firing every 5 turns. The apply owns
-    /// the contributor seam: contributors registered before the call are
-    /// cleared, so exactly one reminder rides each reminder turn (the
-    /// same seam-owning semantics
-    /// [`FrontierProfile::apply`](FrontierProfile::apply) carries). Does
+    /// small-model middleware stack and registers a [`GoalReminder`]
+    /// firing every 5 turns. The apply owns both seams: contributors
+    /// registered before the call are cleared, so exactly one reminder
+    /// rides each reminder turn (the same seam-owning semantics
+    /// [`FrontierProfile::apply`](FrontierProfile::apply) carries), and
+    /// the middleware stack installs only on a loop carrying no
+    /// pipeline — an existing stack, default-installed or host-supplied,
+    /// is left untouched, so verification and memoization survive the
+    /// apply. Does
     /// **not** set the loop's config or request options — those are set
     /// separately at construction (`BareLoop::new`) and via
     /// [`BareLoop::set_request_options`].
@@ -268,7 +271,9 @@ impl ConstrainedProfile {
         .with_context_window(loop_.session_config().context_window)
         .with_threshold(loop_.session_config().compact_threshold);
         loop_.set_context_manager(Arc::new(manager));
-        loop_.set_pipeline(Self::pipeline_builder())?;
+        if !loop_.has_pipeline() {
+            loop_.set_pipeline(Self::pipeline_builder_with_builtin_verification())?;
+        }
         loop_.clear_contributors();
         loop_.add_contributor(Box::new(GoalReminder::new(GOAL_REMINDER_EVERY_N_TURNS)));
         Ok(())

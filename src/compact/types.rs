@@ -391,7 +391,7 @@ pub struct CompactTelemetry {
     /// headroom signal: roughly how much conversation can accrue before the
     /// next pass fires. Computed against the manager's own window, so two
     /// managers with different windows report different headroom for the
-    /// same compacted output. A window of `0` (unset, accepted by
+    /// same compacted output. A window explicitly set to `0` (accepted by
     /// [`with_context_window`](super::ContextManager::with_context_window))
     /// reports `0.0` — a sentinel for "no window to measure against", not
     /// a genuinely full window.
@@ -466,9 +466,11 @@ pub struct PreCompactStats {
 
     /// Estimated tokens in assistant-role messages.
     ///
-    /// The role-scoped counterpart of
-    /// [`user_tokens`](Self::user_tokens): the estimate over messages whose
-    /// role is [`Assistant`](crate::message::Role::Assistant).
+    /// `estimated_tokens − user_tokens` — the partition's other half, so
+    /// the two role figures sum to the whole-slice estimate exactly. The
+    /// subtraction carries the whole-slice flooring remainder into this
+    /// figure (up to one token on two-role lists) and, on lists with
+    /// more than the two roles, their tokens as well.
     pub assistant_tokens: u64,
 
     /// Average tokens per message.
@@ -547,10 +549,13 @@ pub struct PostCompactStats {
     /// [`PreCompactStats::user_tokens`](super::PreCompactStats::user_tokens).
     pub user_tokens: u64,
 
-    /// Estimated tokens in assistant-role messages after compaction.
+    /// The assistant half of the compacted estimate, by partition.
     ///
-    /// The assistant share of the compacted list's token estimate, mirroring
-    /// [`PreCompactStats::assistant_tokens`](super::PreCompactStats::assistant_tokens).
+    /// `estimated_tokens − user_tokens` over the compacted list — the
+    /// same partition semantics as
+    /// [`PreCompactStats::assistant_tokens`](super::PreCompactStats::assistant_tokens):
+    /// it carries the flooring remainder and any third-role tokens, so
+    /// the two role figures sum to the whole exactly.
     pub assistant_tokens: u64,
 
     /// Average tokens per message after compaction.

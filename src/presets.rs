@@ -193,8 +193,8 @@ impl ConstrainedProfile {
     /// [`WritePathExtractor`], so a write to a path evicts cached
     /// results for that path instead of waiting out the TTL.
     ///
-    /// This is the stack default construction wires (since the P8
-    /// default flip); the plain [`pipeline_builder`](Self::pipeline_builder)
+    /// This is the stack default construction wires; the plain
+    /// [`pipeline_builder`](Self::pipeline_builder)
     /// remains the bring-your-own-verifier recipe for hosts composing
     /// their own pipeline.
     #[must_use]
@@ -236,9 +236,13 @@ impl ConstrainedProfile {
     /// whatever the constructor seeded, so the profile's context budgeting is
     /// enforced by machinery rather than left to the caller. Also sets the
     /// small-model middleware stack (via [`Self::pipeline_builder`]) and
-    /// registers a [`GoalReminder`] firing every 5 turns. Does **not** set
-    /// the loop's config or request options — those are set separately at
-    /// construction (`BareLoop::new`) and via
+    /// registers a [`GoalReminder`] firing every 5 turns. The apply owns
+    /// the contributor seam: contributors registered before the call are
+    /// cleared, so exactly one reminder rides each reminder turn (the
+    /// same seam-owning semantics
+    /// [`FrontierProfile::apply`](FrontierProfile::apply) carries). Does
+    /// **not** set the loop's config or request options — those are set
+    /// separately at construction (`BareLoop::new`) and via
     /// [`BareLoop::set_request_options`].
     ///
     /// # Errors
@@ -265,6 +269,7 @@ impl ConstrainedProfile {
         .with_threshold(loop_.session_config().compact_threshold);
         loop_.set_context_manager(Arc::new(manager));
         loop_.set_pipeline(Self::pipeline_builder())?;
+        loop_.clear_contributors();
         loop_.add_contributor(Box::new(GoalReminder::new(GOAL_REMINDER_EVERY_N_TURNS)));
         Ok(())
     }
@@ -274,8 +279,8 @@ impl ConstrainedProfile {
 ///
 /// Restores the bare, pre-profile loop: default session/run
 /// configuration, no small-model middleware, no tool-call constraint,
-/// no goal re-injection. Since the P8 default flip this is the explicit
-/// opt-out from default construction's machinery — apply it with
+/// no goal re-injection. This is the explicit opt-out from the machinery
+/// default construction installs — apply it with
 /// [`apply`](FrontierProfile::apply), the chainable
 /// [`with_profile`](crate::engine::BareLoop::with_profile), or the
 /// [`Profile`] trait.

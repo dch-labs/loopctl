@@ -1,12 +1,13 @@
-//! The P8 default-flip pins: default construction wires the small-model
-//! machinery.
+//! Default-construction profile pins: the machinery a default-built
+//! loop carries and the profiles that own it.
 //!
 //! Pins: a default-built loop verifies deny-class writes (the builtin
 //! `CommandVerifier`), memoizes repeat reads, caps oversized tool output,
 //! and re-injects the goal from turn five; a client that declares
 //! tool-constraint support gets `Strict` request options by default while
-//! a plain client keeps `None`. All fail on the pre-flip tree — today's
-//! default wires none of it.
+//! a plain client keeps `None`; the explicit profiles own their seams
+//! (the constrained apply replaces the reminder, the frontier opt-out
+//! removes it, a bundle-carried pipeline survives).
 //!
 //! Requires the `testing` feature.
 
@@ -29,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use loopctl::api::ApiClient;
 use loopctl::engine::{BareLoop, Loop, RunConfig};
 use loopctl::message::{Message, MessagePart, Role, ToolContent};
+use loopctl::structured::RequestOptions;
 use loopctl::testing::{MockApiClient, MockResponse, MockToolCall};
 use loopctl::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolRegistry, ToolSchema};
 
@@ -133,6 +135,10 @@ impl Tool for OkBash {
     }
 }
 
+/// One scripted model turn that calls a tool, by call id and input.
+///
+/// The response carries the call with a `tool_use` stop reason, so the
+/// engine dispatches the named tool on the next turn of the script.
 fn tool_call_response(id: &str, name: &str, input: serde_json::Value) -> MockResponse {
     MockResponse {
         text: "go".to_string(),
@@ -145,6 +151,10 @@ fn tool_call_response(id: &str, name: &str, input: serde_json::Value) -> MockRes
     }
 }
 
+/// The scripted terminal turn that ends a run.
+///
+/// Plain text with an `end_turn` stop reason — the engine completes the
+/// run after serving it, so scripts finish deterministically.
 fn done_response() -> MockResponse {
     MockResponse {
         text: "done".to_string(),
@@ -153,6 +163,12 @@ fn done_response() -> MockResponse {
     }
 }
 
+/// The standard registry for these pins: both counting fixtures plus
+/// the shell stand-in.
+///
+/// Every tool-dispatching test registers through this so the fixtures'
+/// counters and the verifier's shell-class matching see one consistent
+/// tool surface.
 fn registry_with(read: CountingRead, grep: CountingGrep) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(read);
@@ -161,6 +177,11 @@ fn registry_with(read: CountingRead, grep: CountingGrep) -> ToolRegistry {
     registry
 }
 
+/// Flatten every tool-result message's text parts, oldest first.
+///
+/// The dispatch-path oracle: verify blocks, cache markers, and
+/// truncation all ride tool results, so the joined texts are what the
+/// middleware-contract assertions inspect.
 fn tool_result_texts(history: &[Message]) -> Vec<String> {
     history
         .iter()
@@ -345,6 +366,11 @@ fn supports_tool_constraints_defaults_false() {
     );
 }
 
+/// Render the captured requests as comparable signatures.
+///
+/// The Debug render covers every field deterministically within one
+/// build, so two loops' request streams compare for equality without a
+/// byte-level harness.
 fn request_signatures(client: &MockApiClient) -> Vec<String> {
     client
         .captured_stream_requests()
@@ -435,7 +461,7 @@ async fn frontier_profile_restores_the_bare_loop() {
     let apply_signatures = request_signatures(&apply_client);
     assert_eq!(
         builder_signatures, apply_signatures,
-        "both opt-out spellings produce byte-identical request streams"
+        "both opt-out spellings produce identical request streams"
     );
     assert_eq!(builder_signatures.len(), 4);
     for signature in &builder_signatures {
@@ -614,4 +640,218 @@ fn bedrock_declares_no_constraint_support_it_cannot_forward() {
          a true here fails every default-built Bedrock turn at the \
          options gate"
     );
+}
+
+/// A contributor that always emits one fixed system message — the
+/// marker `clear_contributors` must remove.
+struct TagContributor;
+
+impl loopctl::contributor::ContextContributor for TagContributor {
+    fn contribute(&self, _context: &loopctl::contributor::ContributorContext) -> Option<Message> {
+        let mut message = Message::assistant("tag-contributor marker");
+        message.role = Role::System;
+        Some(message)
+    }
+}
+
+fn goal_message_count(request: &loopctl::api::StreamRequest, goal: &str) -> usize {
+    request
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::System && m.text_content() == goal)
+        .count()
+}
+
+fn six_turn_read_script() -> Vec<MockResponse> {
+    let mut responses = Vec::new();
+    for i in 0..5 {
+        responses.push(tool_call_response(
+            &format!("c{i}"),
+            "Read",
+            serde_json::json!({"path": format!("/tmp/{i}.txt")}),
+        ));
+    }
+    responses.push(done_response());
+    responses
+}
+
+#[tokio::test]
+async fn explicit_profile_apply_owns_the_goal_reminder_seam() {
+    let goal = "the one goal text";
+
+    let read = CountingRead {
+        executions: Arc::new(Mutex::new(0usize)),
+        payload: "y".repeat(64),
+    };
+    let grep = CountingGrep {
+        executions: Arc::new(Mutex::new(0usize)),
+    };
+    let client = MockApiClient::new("m").with_responses(six_turn_read_script());
+    let mut agent = BareLoop::new(
+        Arc::new(client.clone()),
+        registry_with(read, grep),
+        Default::default(),
+    );
+    loopctl::presets::ConstrainedProfile::apply(&mut agent).expect("the profile applies");
+    let _run = agent.run(goal, &RunConfig::default()).await;
+
+    let doubled = client
+        .captured_stream_requests()
+        .iter()
+        .map(|request| goal_message_count(request, goal))
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        doubled, 1,
+        "a default-built loop that then applies the constrained profile sends \
+         the original request exactly once per reminder turn, got {doubled}"
+    );
+
+    let read = CountingRead {
+        executions: Arc::new(Mutex::new(0usize)),
+        payload: "y".repeat(64),
+    };
+    let grep = CountingGrep {
+        executions: Arc::new(Mutex::new(0usize)),
+    };
+    let client = MockApiClient::new("m").with_responses(six_turn_read_script());
+    let mut agent = BareLoop::new(
+        Arc::new(client.clone()),
+        registry_with(read, grep),
+        Default::default(),
+    );
+    loopctl::presets::FrontierProfile::apply(&mut agent).expect("the opt-out applies");
+    let _run = agent.run(goal, &RunConfig::default()).await;
+
+    let frontier_max = client
+        .captured_stream_requests()
+        .iter()
+        .map(|request| goal_message_count(request, goal))
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        frontier_max, 0,
+        "the frontier opt-out sends no goal reminder at all, got {frontier_max}"
+    );
+
+    let read = CountingRead {
+        executions: Arc::new(Mutex::new(0usize)),
+        payload: "y".repeat(64),
+    };
+    let grep = CountingGrep {
+        executions: Arc::new(Mutex::new(0usize)),
+    };
+    let client = MockApiClient::new("m").with_responses(vec![done_response()]);
+    let mut agent = BareLoop::new(
+        Arc::new(client.clone()),
+        registry_with(read, grep),
+        Default::default(),
+    );
+    agent.add_contributor(Box::new(TagContributor));
+    agent.clear_contributors();
+    let _run = agent.run("clear the seam", &RunConfig::default()).await;
+
+    assert!(
+        client
+            .captured_stream_requests()
+            .iter()
+            .all(|request| !request.messages.iter().any(|m| {
+                m.role == Role::System && m.text_content().contains("tag-contributor marker")
+            })),
+        "clear_contributors removes every registered contributor — the tag \
+         marker must never ride a request"
+    );
+}
+struct RecordingConstraintClient {
+    declares_support: bool,
+    seen_constraints: Arc<Mutex<Vec<loopctl::structured::ToolConstraint>>>,
+}
+
+impl ApiClient for RecordingConstraintClient {
+    fn model(&self) -> String {
+        "recording".to_string()
+    }
+    fn stream_messages(
+        &self,
+        _request: &loopctl::api::StreamRequest,
+    ) -> Pin<
+        Box<
+            dyn futures::Stream<
+                    Item = Result<loopctl::stream::StreamEvent, loopctl::api::error::ApiError>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        Box::pin(futures::stream::empty())
+    }
+    fn create_message(
+        &self,
+        _request: &loopctl::api::StreamRequest,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        loopctl::api::NonStreamingResponse,
+                        loopctl::api::error::ApiError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async {
+            Ok(loopctl::api::NonStreamingResponse {
+                message: Message::assistant(""),
+                stop_reason: loopctl::stream::StreamStopReason::EndTurn,
+                usage: None,
+            })
+        })
+    }
+    fn supports_tool_constraints(&self) -> bool {
+        self.declares_support
+    }
+    fn stream_messages_with_options(
+        &self,
+        _request: &loopctl::api::StreamRequest,
+        options: RequestOptions,
+    ) -> Pin<
+        Box<
+            dyn futures::Stream<
+                    Item = Result<loopctl::stream::StreamEvent, loopctl::api::error::ApiError>,
+                > + Send
+                + 'static,
+        >,
+    > {
+        self.seen_constraints
+            .lock()
+            .expect("constraints lock")
+            .push(options.tool_constraint.clone());
+        Box::pin(futures::stream::empty())
+    }
+}
+
+#[tokio::test]
+async fn default_construction_attaches_strict_options_only_when_the_client_declares_support() {
+    for (declares_support, expect_strict) in [(true, true), (false, false)] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let client = RecordingConstraintClient {
+            declares_support,
+            seen_constraints: Arc::clone(&seen),
+        };
+        let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), Default::default());
+        let _run = agent.run("probe arm", &RunConfig::default()).await;
+
+        let recorded = seen.lock().expect("constraints lock").clone();
+        assert!(
+            !recorded.is_empty(),
+            "the run must issue at least one model call"
+        );
+        assert!(
+            recorded.iter().all(|constraint| {
+                matches!(constraint, loopctl::structured::ToolConstraint::Strict) == expect_strict
+            }),
+            "a client declaring {declares_support} must get {} on every \
+             request, got {recorded:?}",
+            if expect_strict { "Strict" } else { "None" }
+        );
+    }
 }

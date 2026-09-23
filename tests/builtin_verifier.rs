@@ -488,18 +488,13 @@ async fn an_outer_wrapped_redirection_evicts_the_cached_read() {
 }
 
 #[tokio::test]
-async fn default_construction_wires_the_builtin_verifier() {
+async fn builtin_verified_builder_fails_destructive_commands_softly() {
     let mut registry = ToolRegistry::new();
     registry.register(CountingTool {
         name: "Write",
         executions: Arc::new(std::sync::Mutex::new(0usize)),
     });
 
-    // Since the P8 default flip, default construction wires the
-    // builtin-verified pipeline: a destructive command fails softly
-    // with its deny rule named. This pin was
-    // `profile_wiring_is_explicit_this_release` before the flip — its
-    // own comment promised the flip would show up here as a seen diff.
     let default_pipeline =
         loopctl::presets::ConstrainedProfile::pipeline_builder_with_builtin_verification()
             .with_core(Arc::new(registry))

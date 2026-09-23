@@ -1660,8 +1660,7 @@ impl ApiClient for BedrockClient {
     /// paths take the trait-default `*_with_options` implementations,
     /// which reject a `tool_constraint` loudly — declaring support here
     /// would fail every default-built Bedrock turn at the options gate.
-    /// Flips to `true` when the Converse `toolConfig.toolChoice`
-    /// encoding lands.
+    /// The client does not encode tool-call constraints on the wire.
     fn supports_tool_constraints(&self) -> bool {
         false
     }

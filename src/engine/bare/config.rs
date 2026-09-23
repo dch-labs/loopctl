@@ -631,7 +631,7 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Wire the small-model pieces default construction carries.
     ///
-    /// The P8 default, applied by every public constructor: the
+    /// Applied by every public constructor over a fresh machine: the
     /// builtin-verified pipeline (output cap, verify-on-write, memoize
     /// with path-aware invalidation), the goal reminder re-injecting the
     /// original request past the cadence, and — only when the client's
@@ -662,7 +662,8 @@ impl<C: ApiClient> BareLoop<C> {
         {
             tracing::warn!(
                 error = %error,
-                "default profile pipeline rejected; the loop runs bare"
+                "default middleware rejected; the goal reminder and request \
+                 options are still installed"
             );
         }
         self.add_contributor(Box::new(crate::presets::GoalReminder::new(

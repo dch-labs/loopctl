@@ -242,8 +242,8 @@ pub trait ApiClient: Send + Sync {
     /// (`openai`, `anthropic`, `gemini`) override it to `true`, the
     /// testing mock ties it to its
     /// [`with_tool_constraint_support`](crate::testing::MockApiClient::with_tool_constraint_support)
-    /// flag, and clients without the wire encoding (Bedrock, until its
-    /// `toolChoice` lands) keep the honest `false`.
+    /// flag, and clients that do not encode the constraint on the wire
+    /// (Bedrock) keep the honest `false`.
     fn supports_tool_constraints(&self) -> bool {
         false
     }

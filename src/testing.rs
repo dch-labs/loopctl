@@ -987,6 +987,19 @@ impl ApiClient for MockApiClient {
         true
     }
 
+    /// Whether the mock honors tool-call constraints.
+    ///
+    /// The capability probe's testing twin: tied to the
+    /// [`with_tool_constraint_support`](Self::with_tool_constraint_support)
+    /// flag, so a default-built loop over the plain mock keeps
+    /// unconstrained requests while one over the opted-in mock receives
+    /// `Strict` — both directions of the default-construction decision
+    /// are drivable from tests.
+    fn supports_tool_constraints(&self) -> bool {
+        self.accept_tool_constraints
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Stream a canned sequence of [`StreamEvent`]s for the next response.
     ///
     /// Called by the agent loop to obtain the model's reply. The mock

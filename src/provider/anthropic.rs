@@ -303,6 +303,10 @@ impl ApiClient for AnthropicClient {
         true
     }
 
+    fn supports_tool_constraints(&self) -> bool {
+        true
+    }
+
     fn stream_messages(
         &self,
         request: &crate::api::StreamRequest,
@@ -3598,6 +3602,8 @@ mod tests {
     }
 
     /// Drain a message stream to `(saw_message_start, terminal_usage)`.
+    ///
+    /// A helper for the wire tests: collects a stream to the pair the emitter invariants are asserted against.
     async fn collect_stream_telemetry(
         mut stream: Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send>>,
     ) -> (bool, Option<Usage>) {

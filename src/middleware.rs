@@ -443,6 +443,17 @@ impl std::fmt::Debug for ToolPipeline {
 }
 
 impl ToolPipeline {
+    /// Whether this pipeline carries any middleware layers.
+    ///
+    /// The introspection behind middleware-aware vacancy: a pipeline
+    /// built with no layers wraps only the core dispatch, so a profile
+    /// installing its stack may treat the slot as effectively empty
+    /// without disturbing the registry binding the core carries.
+    #[must_use]
+    pub fn has_middleware(&self) -> bool {
+        !self.middlewares.is_empty()
+    }
+
     /// Create a new pipeline builder for fluent configuration.
     ///
     /// Returns a [`ToolPipelineBuilder`] starting with no middleware layers.

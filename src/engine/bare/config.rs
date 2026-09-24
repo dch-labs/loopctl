@@ -7,6 +7,7 @@
 
 #[cfg(feature = "hooks")]
 use super::HookExecutor;
+
 #[cfg(feature = "streaming")]
 use super::StreamHandler;
 #[cfg(feature = "tool_health")]
@@ -16,6 +17,7 @@ use super::{
     ApiClient, Arc, BareLoop, ContextContributor, ContextManager, LoopError, RecoveryStrategy,
     Reflector, RequestOptions, TurnMode,
 };
+use crate::capabilities::PipelineAware;
 use std::path::PathBuf;
 
 /// Shared callback invoked once per text delta during streaming.
@@ -508,6 +510,185 @@ impl<C: ApiClient> BareLoop<C> {
     pub fn add_contributor(&mut self, contributor: Box<dyn ContextContributor>) {
         self.debug_assert_idle();
         self.contributors.push(contributor);
+    }
+
+    /// Remove every registered turn-boundary contributor.
+    ///
+    /// The opt-out seam for contributor wiring: [`FrontierProfile`](crate::presets::FrontierProfile)
+    /// calls this to strip default construction's goal reminder, and a
+    /// host can use it to reset contributor state before installing its
+    /// own. Same pre-first-`run` rule as
+    /// [`add_contributor`](Self::add_contributor): a no-op on an empty
+    /// list, a debug-asserted boundary violation once the session has
+    /// started.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// In debug builds, panics if called after the session has started
+    /// (i.e., once the machine has advanced past [`MachineState::Start`](crate::engine::core::MachineState::Start)).
+    pub fn clear_contributors(&mut self) {
+        self.debug_assert_idle();
+        self.contributors.clear();
+    }
+
+    /// Apply a [`Profile`](crate::presets::Profile) to this loop, chainably.
+    ///
+    /// The convenience spelling of the profile system: delegates to the
+    /// trait's [`apply`](crate::presets::Profile::apply) and returns the
+    /// loop on success, so a host writes
+    /// `BareLoop::new(..).with_profile(&FrontierProfile)?` — or applies
+    /// the same profile mutably with
+    /// [`FrontierProfile::apply`](crate::presets::FrontierProfile::apply).
+    /// Must be called before the first
+    /// [`run`](crate::engine::core::Loop::run).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// use std::pin::Pin;
+    /// use std::sync::Arc;
+    /// use loopctl::api::{ApiClient, StreamRequest};
+    /// use loopctl::engine::{BareLoop, Loop};
+    /// use loopctl::presets::FrontierProfile;
+    /// use loopctl::tool::ToolRegistry;
+    ///
+    /// struct DocClient;
+    ///
+    /// impl ApiClient for DocClient {
+    ///     fn model(&self) -> String {
+    ///         "doc".to_string()
+    ///     }
+    ///     fn stream_messages(
+    ///         &self,
+    ///         _request: &StreamRequest,
+    ///     ) -> Pin<Box<dyn futures::Stream<Item = Result<loopctl::stream::StreamEvent, loopctl::api::error::ApiError>> + Send + 'static>> {
+    ///         let events = vec![
+    ///             Ok(loopctl::stream::StreamEvent::MessageStart(
+    ///                 loopctl::stream::MessageStart {
+    ///                     message: loopctl::stream::MessageMetadata {
+    ///                         id: "doc".to_string(),
+    ///                         role: "assistant".to_string(),
+    ///                         model: "doc".to_string(),
+    ///                     },
+    ///                 },
+    ///             )),
+    ///             Ok(loopctl::stream::StreamEvent::PartStart(loopctl::stream::PartStart {
+    ///                 index: 0,
+    ///                 part: Some(loopctl::message::MessagePart::text("hi")),
+    ///             })),
+    ///             Ok(loopctl::stream::StreamEvent::PartStop { index: None }),
+    ///             Ok(loopctl::stream::StreamEvent::MessageDelta(
+    ///                 loopctl::stream::MessageDelta {
+    ///                     delta: loopctl::stream::MessageDeltaPayload {
+    ///                         stop_reason: Some("end_turn".to_string()),
+    ///                     },
+    ///                     usage: None,
+    ///                 },
+    ///             )),
+    ///             Ok(loopctl::stream::StreamEvent::MessageStop),
+    ///         ];
+    ///         Box::pin(futures::stream::iter(events))
+    ///     }
+    ///     fn create_message(
+    ///         &self,
+    ///         _request: &StreamRequest,
+    ///     ) -> Pin<Box<dyn std::future::Future<Output = Result<loopctl::api::NonStreamingResponse, loopctl::api::error::ApiError>> + Send + '_>> {
+    ///         Box::pin(async {
+    ///             Ok(loopctl::api::NonStreamingResponse {
+    ///                 message: loopctl::message::Message::assistant("hi"),
+    ///                 stop_reason: loopctl::stream::StreamStopReason::EndTurn,
+    ///                 usage: None,
+    ///             })
+    ///         })
+    ///     }
+    /// }
+    ///
+    /// let mut agent = BareLoop::new(
+    ///     Arc::new(DocClient),
+    ///     ToolRegistry::new(),
+    ///     Default::default(),
+    /// )
+    /// .with_profile(&FrontierProfile)
+    /// .expect("the frontier profile applies");
+    /// let run = agent.run("hello", &Default::default()).await;
+    /// assert!(run.is_ok());
+    /// # });
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Propagates the profile's own error — the constrained arm installs
+    /// a middleware pipeline and its validation can reject the
+    /// composition; the frontier arm cannot fail.
+    pub fn with_profile(
+        mut self,
+        profile: &impl crate::presets::Profile,
+    ) -> Result<Self, crate::error::LoopError> {
+        profile.apply(&mut self)?;
+        Ok(self)
+    }
+
+    /// Whether the loop carries middleware layers.
+    ///
+    /// The middleware-aware vacancy probe the profile appliers share: a
+    /// loop with no pipeline, or with a pipeline that wraps only the
+    /// core dispatch, is treated as vacant — so an existing middleware
+    /// stack, default-installed or host-supplied, survives a profile
+    /// apply, while a middleware-free pipeline (the frontier opt-out's
+    /// shape) does not block a later constrained apply from installing
+    /// its stack.
+    #[must_use]
+    pub(crate) fn carries_middleware(&self) -> bool {
+        use crate::capabilities::PipelineAware;
+        self.managers
+            .pipeline()
+            .is_some_and(crate::middleware::ToolPipeline::has_middleware)
+    }
+
+    /// Wire the small-model pieces default construction carries.
+    ///
+    /// Applied by every public constructor over a fresh machine: the
+    /// builtin-verified pipeline (output cap, verify-on-write, memoize
+    /// with path-aware invalidation), the goal reminder re-injecting the
+    /// original request past the cadence, and — only when the client's
+    /// [`supports_tool_constraints`](crate::api::ApiClient::supports_tool_constraints)
+    /// probe agrees — the strict tool-call constraint. Every seam is the
+    /// public one a host would call, so a later host call replaces or
+    /// composes on top exactly as before; the explicit opt-out is
+    /// [`FrontierProfile`](crate::presets::FrontierProfile). The
+    /// pipeline install fills only the vacant seam: a pipeline the
+    /// managers bundle already carries is kept untouched, so
+    /// [`LoopManagers::with_pipeline`] composes with the default
+    /// instead of being clobbered by it. A resumed
+    /// machine past [`Start`](crate::engine::core::MachineState::Start)
+    /// is left untouched — the checkpoint's loop was configured before
+    /// serialization, and re-wiring it would change the resumed run's
+    /// shape.
+    pub(crate) fn wire_default_profile(&mut self) {
+        if !matches!(
+            self.machine.state(),
+            crate::engine::core::MachineState::Start
+        ) {
+            return;
+        }
+        if self.managers.pipeline().is_none()
+            && let Err(error) = self.set_pipeline(
+                crate::presets::ConstrainedProfile::pipeline_builder_with_builtin_verification(),
+            )
+        {
+            tracing::warn!(
+                error = %error,
+                "default middleware rejected; the goal reminder and request \
+                 options are still installed"
+            );
+        }
+        self.add_contributor(Box::new(crate::presets::GoalReminder::new(
+            crate::presets::DEFAULT_GOAL_REMINDER_EVERY_N_TURNS,
+        )));
+        if self.client.supports_tool_constraints() {
+            self.set_request_options(crate::presets::ConstrainedProfile::request_options());
+        }
     }
 
     /// Set the per-turn [`RequestOptions`] applied to every provider call.

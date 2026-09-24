@@ -271,7 +271,7 @@ impl ConstrainedProfile {
         .with_context_window(loop_.session_config().context_window)
         .with_threshold(loop_.session_config().compact_threshold);
         loop_.set_context_manager(Arc::new(manager));
-        if !loop_.has_pipeline() {
+        if !loop_.carries_middleware() {
             loop_.set_pipeline(Self::pipeline_builder_with_builtin_verification())?;
         }
         loop_.clear_contributors();

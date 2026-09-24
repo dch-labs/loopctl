@@ -741,7 +741,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`Self::new_with_managers`]); hosts whose observers and pipeline live
     /// in their own bundle should use
     /// [`Self::from_machine_with_managers`] instead, which keeps that bundle
-    /// intact.
+    /// intact. A machine still **at**
+    /// [`Start`](crate::engine::core::MachineState::Start) — a fresh one or
+    /// a checkpoint returned to it — is wired like a fresh loop (the
+    /// default machinery below applies); a machine past `Start` is left
+    /// untouched and keeps the wiring its host supplies.
     #[must_use]
     pub fn from_machine(
         machine: LoopMachine,

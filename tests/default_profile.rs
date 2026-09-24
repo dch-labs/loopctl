@@ -11,7 +11,7 @@
 //!
 //! Requires the `testing` feature.
 
-#![cfg(feature = "testing")]
+#![cfg(all(feature = "testing", feature = "streaming"))]
 #![allow(
     dead_code,
     clippy::pedantic,
@@ -767,6 +767,89 @@ async fn explicit_apply_keeps_a_host_supplied_pipeline() {
         "an explicit apply must not replace a host-supplied pipeline — the \
          noop verifier's pass, not the builtin stack's verdict, rides the \
          result: {:?}",
+        texts[0]
+    );
+}
+
+#[tokio::test]
+async fn frontier_then_constrained_chain_installs_the_verified_stack() {
+    let read = CountingRead {
+        executions: Arc::new(Mutex::new(0usize)),
+        payload: "r".repeat(32),
+    };
+    let grep = CountingGrep {
+        executions: Arc::new(Mutex::new(0usize)),
+    };
+    let client = MockApiClient::new("m").with_responses(vec![
+        tool_call_response("c1", "Bash", serde_json::json!({"command": "rm -rf /"})),
+        tool_call_response("c2", "Grep", serde_json::json!({"query": "n"})),
+        tool_call_response("c3", "Grep", serde_json::json!({"query": "n"})),
+        done_response(),
+    ]);
+    let mut agent = BareLoop::new(
+        Arc::new(client),
+        registry_with(read, grep),
+        Default::default(),
+    )
+    .with_profile(&loopctl::presets::FrontierProfile)
+    .and_then(|agent| agent.with_profile(&loopctl::presets::ConstrainedProfile))
+    .expect("both profiles apply");
+    let _run = agent
+        .run("chain into constrained", &RunConfig::default())
+        .await;
+
+    let texts = tool_result_texts(&agent.conversation());
+    assert_eq!(texts.len(), 3, "three tool results ride the conversation");
+    assert!(
+        texts[0].contains("[verify] failed:"),
+        "the last-stated intent wins: after a frontier opt-out, a constrained \
+         apply installs the verified stack — the deny-class command fails \
+         softly, got {:?}",
+        texts[0]
+    );
+    assert!(
+        texts[2].ends_with("\n[cached]"),
+        "the chained constrained apply restores memoization — the repeat grep \
+         serves from cache, got {:?}",
+        texts[2]
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_at_start_checkpoint_gets_the_default_wiring() {
+    use loopctl::engine::core::LoopMachine;
+    use loopctl::message::Message as _Message;
+
+    let read = CountingRead {
+        executions: Arc::new(Mutex::new(0usize)),
+        payload: "r".repeat(32),
+    };
+    let grep = CountingGrep {
+        executions: Arc::new(Mutex::new(0usize)),
+    };
+    let client = MockApiClient::new("m").with_responses(vec![
+        tool_call_response("c1", "Bash", serde_json::json!({"command": "rm -rf /"})),
+        done_response(),
+    ]);
+    let machine = LoopMachine::from_history(vec![
+        _Message::user("earlier work"),
+        _Message::assistant("earlier answer"),
+    ]);
+    let mut agent = loopctl::engine::BareLoop::from_machine(
+        machine,
+        Default::default(),
+        Arc::new(client),
+        registry_with(read, grep),
+    );
+    let _run = agent.run("resume and verify", &RunConfig::default()).await;
+
+    let texts = tool_result_texts(&agent.conversation());
+    assert_eq!(texts.len(), 1, "one tool result rides the conversation");
+    assert!(
+        texts[0].contains("[verify] failed:"),
+        "an at-Start machine with history — a checkpoint returned to Start — \
+         is wired like a fresh loop: the deny-class command fails softly, \
+         got {:?}",
         texts[0]
     );
 }

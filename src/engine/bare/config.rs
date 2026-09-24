@@ -536,7 +536,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// The convenience spelling of the profile system: delegates to the
     /// trait's [`apply`](crate::presets::Profile::apply) and returns the
     /// loop on success, so a host writes
-    /// `BareLoop::new(..)?.with_profile(&FrontierProfile)?` — or applies
+    /// `BareLoop::new(..).with_profile(&FrontierProfile)?` — or applies
     /// the same profile mutably with
     /// [`FrontierProfile::apply`](crate::presets::FrontierProfile::apply).
     /// Must be called before the first
@@ -629,15 +629,21 @@ impl<C: ApiClient> BareLoop<C> {
         Ok(self)
     }
 
-    /// Whether the loop carries a middleware pipeline.
+    /// Whether the loop carries middleware layers.
     ///
-    /// The vacancy probe the profile appliers share: an existing pipeline
-    /// — default-installed or host-supplied — is left untouched when a
-    /// profile applies, mirroring the default wiring's own guard.
+    /// The middleware-aware vacancy probe the profile appliers share: a
+    /// loop with no pipeline, or with a pipeline that wraps only the
+    /// core dispatch, is treated as vacant — so an existing middleware
+    /// stack, default-installed or host-supplied, survives a profile
+    /// apply, while a middleware-free pipeline (the frontier opt-out's
+    /// shape) does not block a later constrained apply from installing
+    /// its stack.
     #[must_use]
-    pub(crate) fn has_pipeline(&self) -> bool {
+    pub(crate) fn carries_middleware(&self) -> bool {
         use crate::capabilities::PipelineAware;
-        self.managers.pipeline().is_some()
+        self.managers
+            .pipeline()
+            .is_some_and(crate::middleware::ToolPipeline::has_middleware)
     }
 
     /// Wire the small-model pieces default construction carries.

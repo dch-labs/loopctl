@@ -11,6 +11,8 @@
 //! # Available tools
 //!
 //! - [`ThinkTool`] — a scratchpad the model reasons into before acting.
+//! - [`ReadTool`] — line-aware reading over a pluggable
+//!   [`ContentSource`], with loud truncation.
 //!
 //! # Example
 //!
@@ -23,6 +25,8 @@
 //! assert!(registry.contains("think"));
 //! ```
 
+pub mod read;
 pub mod think;
 
+pub use read::{ContentSource, ReadTool};
 pub use think::ThinkTool;

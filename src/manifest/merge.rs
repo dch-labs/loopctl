@@ -41,7 +41,7 @@ fn merge_node(base: &Value, overlay: &Value, path: &str) -> Result<Value, Manife
     match overlay {
         Value::Mapping(overlay_map) => match base {
             Value::Mapping(base_map) => merge_mappings(base_map, overlay_map, path),
-            _ => Ok(overlay.clone()),
+            _ => merge_mappings(&Mapping::new(), overlay_map, path),
         },
         Value::Tagged(tagged) => append_tagged(base, tagged, path),
         _ => Ok(overlay.clone()),
@@ -84,6 +84,7 @@ fn merge_mappings(base: &Mapping, overlay: &Mapping, path: &str) -> Result<Value
 fn insert_new_key(overlay_value: &Value, child_path: &str) -> Result<Value, ManifestError> {
     match overlay_value {
         Value::Tagged(tagged) => append_tagged(&Value::Null, tagged, child_path),
+        Value::Mapping(map) => merge_mappings(&Mapping::new(), map, child_path),
         _ => Ok(overlay_value.clone()),
     }
 }
@@ -195,6 +196,31 @@ mod tests {
         assert!(
             matches!(error, ManifestError::OverlayRule { ref path, .. } if path == "fresh"),
             "the error names the offending key, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn tags_below_a_new_section_are_checked() {
+        let base = yaml("version: 1\n");
+        let overlay = yaml("permissions:\n  rules:\n    deny: !append [x]\n");
+        let error = merged(&base, &overlay)
+            .expect_err("appending below a section the base never declared is still an error");
+        assert!(
+            matches!(error, ManifestError::OverlayRule { ref path, .. }
+                if path == "permissions.rules.deny"),
+            "the error names the nested offending key, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn tags_below_a_non_mapping_base_are_checked() {
+        let base = yaml("permissions: 5\n");
+        let overlay = yaml("permissions:\n  rules:\n    deny: !merge [x]\n");
+        let error = merged(&base, &overlay)
+            .expect_err("an unknown tag below a replaced scalar is still an error");
+        assert!(
+            matches!(error, ManifestError::OverlayRule { .. }),
+            "unknown tags are rejected at every depth, got: {error:?}"
         );
     }
 

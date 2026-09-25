@@ -32,24 +32,45 @@ const SECRET_SHAPES: &[(&str, usize)] = &[
     ("xoxb-", 20),
 ];
 
-/// Validate the merged manifest.
+/// Validate the merged manifest before interpolation.
+///
+/// These checks read the document as written: the version gate (no
+/// reference can appear in a number), the tool-entry exclusive-or
+/// (defaulting a reference cannot change `Some`-ness), finite numbers, and
+/// the literal-secret scan — which must see the written form, including
+/// keys hiding in `${VAR:-sk-…}` defaults that expansion would carry into
+/// the runtime document verbatim.
 ///
 /// # Errors
 ///
 /// [`ManifestError::UnsupportedVersion`] for any version other than the
-/// supported one; [`ManifestError::UnresolvedReference`] for dangling model,
-/// tool, or MCP-server names; [`ManifestError::InvalidToolEntry`] for tool
-/// entries without exactly one implementation source;
-/// [`ManifestError::LiteralSecret`] for key-shaped literals;
-/// [`ManifestError::Type`] for malformed rule strings and non-finite
-/// numbers.
-pub(crate) fn validate(manifest: &Manifest) -> Result<(), ManifestError> {
+/// supported one; [`ManifestError::InvalidToolEntry`] for tool entries
+/// without exactly one implementation source; [`ManifestError::Type`] for
+/// non-finite numbers; [`ManifestError::LiteralSecret`] for key-shaped
+/// literals.
+pub(crate) fn validate_pre_expansion(manifest: &Manifest) -> Result<(), ManifestError> {
     check_version(manifest)?;
     check_tool_entries(manifest)?;
-    check_cross_references(manifest)?;
-    check_rule_shapes(manifest)?;
     check_finite_numbers(manifest)?;
     check_literal_secrets(manifest)
+}
+
+/// Validate the expanded manifest after interpolation.
+///
+/// These checks read what the run will actually use: names resolve (or
+/// fail) against their expanded values, so a defaulted
+/// `tools[].mcp: ${SERVER:-github}` checks `github`, not the reference
+/// syntax — and a rule that only had its shape before expansion (`${BAD:-x}`
+/// expanding to a shapeless string) is rejected here, where the gate
+/// engine would otherwise receive it malformed.
+///
+/// # Errors
+///
+/// [`ManifestError::UnresolvedReference`] for dangling model, tool, or
+/// MCP-server names; [`ManifestError::Type`] for malformed rule strings.
+pub(crate) fn validate_post_expansion(manifest: &Manifest) -> Result<(), ManifestError> {
+    check_cross_references(manifest)?;
+    check_rule_shapes(manifest)
 }
 
 /// Enforce the version gate.
@@ -244,13 +265,23 @@ fn check_literal_secrets(manifest: &Manifest) -> Result<(), ManifestError> {
 
 /// The key family a string matches, if any.
 ///
-/// First match wins; the families are mutually exclusive by prefix so
-/// order among them does not matter.
+/// Keys are matched per token — a run of identifier-ish characters — so a
+/// literal key is caught after any separator (`Bearer sk-…`, `?key=AKIA…`),
+/// and the token is matched with any leading dashes trimmed, which is what
+/// a reference default's `:-` operator leaves in front of the value
+/// (`${VAR:-sk-…}`). First match wins; the families are mutually exclusive
+/// by prefix so order among them does not matter.
 fn matched_secret_shape(text: &str) -> Option<&'static str> {
-    SECRET_SHAPES
-        .iter()
-        .find(|(prefix, minimum)| text.starts_with(prefix) && text.len() >= *minimum)
-        .map(|(prefix, _)| *prefix)
+    text.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    })
+    .find_map(|token| {
+        let candidate = token.trim_start_matches('-');
+        SECRET_SHAPES
+            .iter()
+            .find(|(prefix, minimum)| candidate.starts_with(prefix) && candidate.len() >= *minimum)
+            .map(|(prefix, _)| *prefix)
+    })
 }
 
 /// Visit every string in the JSON projection with its dotted path.
@@ -305,6 +336,25 @@ mod tests {
             matched_secret_shape("sha256:9f2a7c1e5b8d3a6f0c4e2d1b7a9f3e5c8d2b1a4f6e0c3d5b7a9f1e3c"),
             None,
             "legitimate high-entropy config values never match"
+        );
+    }
+
+    #[test]
+    fn keys_after_a_separator_match_their_family() {
+        assert_eq!(
+            matched_secret_shape("Authorization: Bearer sk-proj-abcdefghijklmnop"),
+            Some("sk-"),
+            "a key after a separator is still a key"
+        );
+        assert_eq!(
+            matched_secret_shape("postgres://user:ghp_abcdefghijklmnopqrstuvwxyz@host/db"),
+            Some("ghp_"),
+            "a key inside a connection string is still a key"
+        );
+        assert_eq!(
+            matched_secret_shape("${OPENAI_KEY:-sk-proj-abcdefghijklmnop}"),
+            Some("sk-"),
+            "a literal key hiding in a reference default is still a key"
         );
     }
 }

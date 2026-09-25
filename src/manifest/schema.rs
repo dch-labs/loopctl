@@ -1,8 +1,8 @@
 //! The JSON Schema export for the v1 manifest.
 //!
 //! One function, generated from the same serde types that parse the
-//! document, so the schema can never drift from the parser. The
-//! `loopctl schema` verb that prints it ships with the CLI.
+//! document, so the schema can never drift from the parser. Consumers
+//! print it, validate against it, or feed it to editor tooling.
 
 use super::error::ManifestError;
 use super::types::Manifest;

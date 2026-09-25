@@ -3,8 +3,8 @@
 //! The declarative center of a loopctl-driven agent: strict serde types for
 //! every section, named profile overlays with documented merge semantics,
 //! compose-style environment interpolation, span-bearing validation errors,
-//! and the JSON Schema export that keeps editors and the `loopctl schema`
-//! verb in sync with the parser.
+//! and the JSON Schema export that keeps editor tooling and validators in
+//! sync with the parser.
 //!
 //! The entry point is [`ManifestDocument::parse`], which runs the strict
 //! typed pass (unknown keys fail with file position and a did-you-mean
@@ -38,9 +38,10 @@ pub use error::{ManifestError, Span};
 pub use schema::manifest_json_schema;
 pub use types::{
     AgentSection, Budgets, CassettesSection, CompactionSettings, ContextSection, Manifest,
-    McpServer, MemorySection, Metadata, MissedFire, ModelEntry, ModelsSection, Overlap,
-    PermissionMode, PermissionRules, Permissions, Profile, RecordMode, ReplayMode, SandboxSection,
-    ScheduleSection, ToolEntry, TriggersSection,
+    McpServer, McpServerOverlay, MemorySection, Metadata, MissedFire, ModelEntry,
+    ModelEntryOverlay, ModelsOverlay, ModelsSection, Overlap, PermissionMode, PermissionRules,
+    Permissions, Profile, RecordMode, ReplayMode, SandboxSection, ScheduleSection, ToolEntry,
+    TriggersSection,
 };
 
 use std::collections::BTreeMap;
@@ -199,11 +200,12 @@ impl ManifestDocument {
         let merged_value = self.merged_value(profile)?;
         let merged: Manifest = serde_yaml_ng::from_value(merged_value)
             .map_err(|error| ManifestError::from_merged(&error))?;
-        validate::validate(&merged)?;
+        validate::validate_pre_expansion(&merged)?;
         let source = serde_json::to_value(&merged).map_err(|error| projection_failure(&error))?;
         let mut expanded = source.clone();
         interpolate::expand_document(&mut expanded, env)?;
         let mut runtime = Self::typed_manifest(expanded.clone())?;
+        validate::validate_post_expansion(&runtime)?;
         runtime.profiles.clear();
         let mut pinned =
             Self::typed_manifest(interpolate::restore_secret_references(expanded, &source))?;

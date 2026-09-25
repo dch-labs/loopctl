@@ -24,7 +24,10 @@ pub struct Manifest {
     /// A newer version hard-errors
     /// ([`UnsupportedVersion`][crate::manifest::ManifestError::UnsupportedVersion]);
     /// there is no older version to migrate. Enforced at parse time so an
-    /// unreadable document never reaches profile merging.
+    /// unreadable document never reaches profile merging, and exported as
+    /// a `"const": 1` constraint so schema validators reject other values
+    /// exactly like the parser does.
+    #[schemars(extend("const" = 1))]
     pub version: u32,
 
     /// Distribution metadata for the agent-as-artifact flow.
@@ -748,6 +751,120 @@ pub struct SandboxSection {
     pub network_allow: Vec<String>,
 }
 
+/// Overlay counterpart of [`McpServer`] for profile stanzas.
+///
+/// Every field is optional so a profile can retarget one aspect of a
+/// server (a pin, an env entry) without re-declaring the rest; the merged
+/// document deserializes as [`McpServer`], where `command` is required —
+/// so a profile patching an entry the base never declared fails the merge
+/// with the missing-field error, exactly as a base document would.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct McpServerOverlay {
+    /// The server launch command as an argv array, when the overlay
+    /// retargets it.
+    ///
+    /// Replaces the base command wholesale; an array, never a shell
+    /// string, for the same reason as [`McpServer::command`].
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+
+    /// Environment entries merged over the base map by key.
+    ///
+    /// Interpolation and the pinning rules are identical to
+    /// [`McpServer::env`].
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+
+    /// The advertised-tool filter, when the overlay narrows or widens it.
+    ///
+    /// Replaces the base filter wholesale; `None` leaves the base filter
+    /// (or its absence) untouched.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+
+    /// The supply-chain pin, when the overlay pins or re-pins the server.
+    ///
+    /// A content hash like [`McpServer::pin`]; the literal-secret scan
+    /// leaves hashes alone for the same reason.
+    #[serde(default)]
+    pub pin: Option<String>,
+}
+
+/// Overlay counterpart of [`ModelEntry`] for profile stanzas.
+///
+/// Every field is optional so a profile can retune one knob of one model
+/// (the generation budget, a base URL) without re-declaring the entry; the
+/// merged document deserializes as [`ModelEntry`], where `provider` and
+/// `model` are required — so a profile patching an entry the base never
+/// declared fails the merge with the missing-field error.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ModelEntryOverlay {
+    /// The provider id, when the overlay switches providers.
+    ///
+    /// Switching providers usually pairs with switching `model` and
+    /// `token_key`; nothing enforces the pairing, the provider's own
+    /// client construction will.
+    #[serde(default)]
+    pub provider: Option<String>,
+
+    /// The provider-native model string, when the overlay switches models.
+    ///
+    /// Verbatim like [`ModelEntry::model`] — the overlay carries the
+    /// provider's own spelling, not an alias.
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// A base-URL override, when the overlay retargets the endpoint.
+    ///
+    /// The natural place for a profile to point a named model at a local
+    /// gateway; interpolation and pinning behave exactly as in
+    /// [`ModelEntry::base_url`].
+    #[serde(default)]
+    pub base_url: Option<String>,
+
+    /// The per-request generation budget, when the overlay retunes it.
+    ///
+    /// The one-field patch this overlay type exists for: a profile that
+    /// trades answer length for cost sets exactly this field and nothing
+    /// else.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+
+    /// The API-key environment-variable name, when the overlay switches
+    /// auth.
+    ///
+    /// Still a name, never a value; the literal-secret scan applies inside
+    /// overlays exactly as it does in the base document.
+    #[serde(default)]
+    pub token_key: Option<String>,
+}
+
+/// Overlay counterpart of [`ModelsSection`] for profile stanzas.
+///
+/// Named entries deep-merge field by field via [`ModelEntryOverlay`];
+/// `fallbacks` follows the list rules (replace unless `!append`ed).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ModelsOverlay {
+    /// The named-model patches, keyed like [`ModelsSection::entries`].
+    ///
+    /// A key the base never declared is a new entry, and the merged
+    /// document then enforces the base-required fields on it.
+    #[serde(default)]
+    pub entries: BTreeMap<String, ModelEntryOverlay>,
+
+    /// The fallback chain overlay as model names, outermost first.
+    ///
+    /// Replaces the base chain unless tagged `!append`.
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
+}
+
 /// A named in-file overlay merged over the base document.
 ///
 /// Shaped exactly like [`Manifest`] minus `version` (fixed) and `profiles`
@@ -771,13 +888,14 @@ pub struct Profile {
     #[serde(default)]
     pub agent: AgentSection,
 
-    /// Models overlay; named entries deep-merge, `fallbacks` replaces
-    /// unless `!append`ed.
+    /// Models overlay; named entries deep-merge field by field through
+    /// [`ModelEntryOverlay`], `fallbacks` replaces unless `!append`ed.
     ///
-    /// Named-entry deep-merging is what lets a profile retune one field of
-    /// one model without re-declaring the rest.
+    /// A profile can retune one knob of one model — the generation budget,
+    /// a base URL — without re-declaring the entry; required fields are
+    /// enforced on the merged document, not the overlay.
     #[serde(default)]
-    pub models: ModelsSection,
+    pub models: ModelsOverlay,
 
     /// Tool-surface overlay; the list replaces unless `!append`ed.
     ///
@@ -786,12 +904,13 @@ pub struct Profile {
     #[serde(default)]
     pub tools: Vec<ToolEntry>,
 
-    /// MCP server declarations overlay; named servers deep-merge.
+    /// MCP server declarations overlay; named servers deep-merge field by
+    /// field through [`McpServerOverlay`].
     ///
     /// A profile can retarget a server's command or add a pin without
     /// re-declaring its whole stanza.
     #[serde(default)]
-    pub mcp: BTreeMap<String, McpServer>,
+    pub mcp: BTreeMap<String, McpServerOverlay>,
 
     /// Permissions overlay.
     ///

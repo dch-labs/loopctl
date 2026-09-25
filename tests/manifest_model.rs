@@ -341,6 +341,105 @@ fn non_finite_compaction_triggers_fail_validation() {
 }
 
 #[test]
+fn defaulted_references_in_names_and_rules_validate_on_the_expanded_document() {
+    let text = "\
+version: 1
+mcp:
+  github:
+    command: [npx]
+tools:
+  - id: gh
+    mcp: ${SERVER:-github}
+permissions:
+  rules:
+    deny:
+      - ${RULE:-shell:rm}
+";
+    let document = ManifestDocument::parse(text).expect("the fixture parses");
+    let resolved = document
+        .resolve(None, &EnvMap::default())
+        .expect("references must be checked against their expanded values, not their syntax");
+    let tools = resolved
+        .manifest()
+        .tools
+        .first()
+        .expect("the tool survives");
+    assert_eq!(
+        tools.mcp.as_deref(),
+        Some("github"),
+        "a defaulted server reference resolves before cross-reference checking"
+    );
+    assert_eq!(
+        resolved
+            .manifest()
+            .permissions
+            .rules
+            .deny
+            .first()
+            .map(String::as_str),
+        Some("shell:rm"),
+        "a defaulted rule resolves to its runtime shape"
+    );
+}
+
+#[test]
+fn rules_without_a_shape_after_expansion_fail_validation() {
+    let text = "\
+version: 1
+permissions:
+  rules:
+    deny:
+      - ${BAD:-colonless}
+";
+    let document = ManifestDocument::parse(text).expect("the fixture parses");
+    let error = document
+        .resolve(None, &EnvMap::default())
+        .expect_err("an expanded rule without the tool:pattern shape must be rejected");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("tool:pattern"),
+        "the shape check must run on the expanded rule text, got: {rendered}"
+    );
+}
+
+#[test]
+fn a_profile_retunes_one_field_of_a_model_entry() {
+    let text = "\
+version: 1
+models:
+  entries:
+    primary:
+      provider: anthropic
+      model: claude-sonnet-4-6
+profiles:
+  fast:
+    models:
+      entries:
+        primary:
+          max_tokens: 100
+";
+    let document = ManifestDocument::parse(text).expect("the fixture parses");
+    let resolved = document
+        .resolve(Some("fast"), &EnvMap::default())
+        .expect("a profile overlays one field without re-declaring the entry");
+    let entry = resolved
+        .manifest()
+        .models
+        .entries
+        .get("primary")
+        .expect("the patched entry survives the merge");
+    assert_eq!(entry.max_tokens, Some(100), "the overlay's field lands");
+    assert_eq!(
+        entry.provider, "anthropic",
+        "fields the overlay omits keep the base values"
+    );
+    assert_eq!(
+        entry.model, "claude-sonnet-4-6",
+        "required fields are not re-declared by a partial overlay"
+    );
+}
+
+#[test]
 fn schema_export_round_trips_every_type() {
     let schema = manifest_json_schema().expect("the schema export never fails");
     let reparsed: serde_json::Value =
@@ -354,6 +453,9 @@ fn schema_export_round_trips_every_type() {
         "AgentSection",
         "ModelsSection",
         "ModelEntry",
+        "ModelsOverlay",
+        "ModelEntryOverlay",
+        "McpServerOverlay",
         "ToolEntry",
         "McpServer",
         "Permissions",
@@ -413,6 +515,15 @@ fn schema_export_round_trips_every_type() {
         reparsed.get("$schema").and_then(|s| s.as_str()),
         Some("https://json-schema.org/draft/2020-12/schema"),
         "the schema declares its draft so validators know which rules apply"
+    );
+    let version_constraint = reparsed
+        .pointer("/properties/version/const")
+        .and_then(serde_json::Value::as_u64);
+    assert_eq!(
+        version_constraint,
+        Some(1),
+        "the schema pins `version` to the one value the parser accepts — a validator must \
+         reject any other version exactly like `ManifestDocument::parse` does"
     );
     for (name, definition) in definitions {
         let is_object_schema = definition.get("properties").is_some();

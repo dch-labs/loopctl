@@ -42,6 +42,7 @@ async-stream = { version = "0.3", optional = true }
 httpdate = { version = "1", optional = true }
 jsonschema = { version = "0.56", optional = true }
 regex = { version = "1", optional = true, default-features = false, features = ["std"] }
+base64 = { version = "0.22", optional = true }
 serde_yaml_ng = { version = "0.10", optional = true }
 schemars = { version = "1.2", optional = true }
 rmcp = { version = "3.4", optional = true, default-features = false, features = ["client", "server", "macros", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-io"] }
@@ -54,7 +55,7 @@ serde_yaml = "0.9"
 
 [features]
 default = []
-builtin_tools = []
+builtin_tools = ["dep:base64"]
 vector_index = []
 derive = ["dep:loopctl-derive"]
 hooks = []
@@ -62,9 +63,11 @@ testing = []
 file_memory = []
 tool_health = []
 tool_shield = ["tool_health"]
-
-# Streaming engine path (StreamHandler, per-delta callbacks, async-stream codegen).
 streaming = ["dep:async-stream"]
+schema_validation = ["dep:jsonschema"]
+redaction = ["dep:regex", "regex/unicode-case", "regex/unicode-perl"]
+manifest = ["dep:serde_yaml_ng", "dep:schemars"]
+mcp = ["dep:rmcp", "streaming", "dep:reqwest", "dep:jsonschema"]
 
 # Providers
 providers = ["dep:reqwest", "dep:httpdate", "dep:bytes"]
@@ -80,22 +83,6 @@ xai = ["grok"]
 gemini = ["providers", "streaming"]
 zai = ["providers", "anthropic"]
 grammar = ["providers"]
-schema_validation = ["dep:jsonschema"]
-# The curated redaction literals match with `(?i)` (unicode-case) and
-# `\s` (unicode-perl); a future literal outgrowing these two features
-# fails the redaction-minimal CI gate loudly.
-redaction = ["dep:regex", "regex/unicode-case", "regex/unicode-perl"]
-
-# The v1 `loop.yaml` manifest model: strict serde types, profile deep-merge,
-# compose-style interpolation, span-bearing validation, and the JSON Schema
-# export for editor tooling and validators.
-manifest = ["dep:serde_yaml_ng", "dep:schemars"]
-
-# MCP client adapter + transports (stdio, Streamable HTTP/SSE). Enables
-# `streaming` for `StreamRetryConfig` (reconnect backoff), `reqwest` for the
-# HTTP transport's caller-supplied client, and `jsonschema` to validate served
-# tools' input schemas before advertising them.
-mcp = ["dep:rmcp", "streaming", "dep:reqwest", "dep:jsonschema"]
 
 [[example]]
 name = "hello-cli"

@@ -10,11 +10,11 @@
 //! every output line is numbered `cat -n` style, and a truncated view
 //! always says so — naming the returned lines and where reading
 //! continues — so a partial read can never masquerade as a complete
-//! one. Raw bytes get kind detection: an
-//! image extension returns a native multipart image part plus a summary,
-//! anything else is refused as binary by name and size; and a source that
-//! can report sizes enables a refuse-before-read guard at a `10 MiB`
-//! default.
+//! one. Raw bytes get kind detection: an image extension returns a
+//! native multipart image part plus a summary, refused when the encoded
+//! payload exceeds a `5 MiB` default; anything else is refused as binary
+//! by name and size; and a source that can report sizes enables a
+//! refuse-before-read guard at a `10 MiB` default.
 //!
 //! Registering [`ReadTool`] is the only way it enters a session; the
 //! `builtin_tools` feature is the only way it compiles.
@@ -60,6 +60,15 @@ const DEFAULT_OFFSET_LIMIT: usize = 200;
 /// a size — the windowing ceilings trim views, but an unbounded read into
 /// memory is a failure no marker can frame.
 const DEFAULT_MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Default ceiling on the encoded image payload, in bytes.
+///
+/// Base64 output is four thirds the input, and providers cap images per
+/// request (Anthropic at 5 MB) — an oversized image would fail on the
+/// provider request, outside the tool, poisoning every later turn of the
+/// session. The tool refuses first, in its own output, where the model
+/// can read why.
+const DEFAULT_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 /// The content a [`ContentSource`] can return for one address.
 ///
@@ -196,14 +205,23 @@ pub struct ReadTool<S: ContentSource> {
     ///
     /// Overridable via [`ReadTool::with_max_size_bytes`].
     max_size_bytes: u64,
+
+    /// Ceiling on the encoded image payload, in bytes.
+    ///
+    /// Checked against the base64 length before encoding leaves the tool,
+    /// regardless of the size probe — a provider rejecting an oversized
+    /// image fails the whole turn, outside the tool's honest-marker
+    /// machinery. Overridable via [`ReadTool::with_max_image_bytes`].
+    max_image_bytes: usize,
 }
 
 impl<S: ContentSource> ReadTool<S> {
     /// Build a read tool over `source` with the default ceilings.
     ///
     /// 200 lines, 400 000 bytes of joined output, a 200-line default
-    /// window for offset-only reads, and a `10 MiB` outright-refusal
-    /// threshold when the source reports sizes.
+    /// window for offset-only reads, a `10 MiB` outright-refusal
+    /// threshold when the source reports sizes, and a `5 MiB` ceiling on
+    /// encoded image payloads.
     #[must_use]
     pub fn new(source: S) -> Self {
         Self {
@@ -212,6 +230,7 @@ impl<S: ContentSource> ReadTool<S> {
             max_bytes: DEFAULT_MAX_BYTES,
             default_offset_limit: DEFAULT_OFFSET_LIMIT,
             max_size_bytes: DEFAULT_MAX_SIZE_BYTES,
+            max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
         }
     }
 
@@ -256,6 +275,17 @@ impl<S: ContentSource> ReadTool<S> {
     #[must_use]
     pub fn with_max_size_bytes(mut self, bytes: u64) -> Self {
         self.max_size_bytes = bytes.max(1);
+        self
+    }
+
+    /// Override the encoded-image payload ceiling, in bytes.
+    ///
+    /// Compared against the base64 length (four thirds the raw size)
+    /// before an image part is emitted, regardless of the size probe.
+    /// Values below 1 clamp to 1.
+    #[must_use]
+    pub fn with_max_image_bytes(mut self, bytes: usize) -> Self {
+        self.max_image_bytes = bytes.max(1);
         self
     }
 }
@@ -510,8 +540,10 @@ fn format_window(content: &str, offset: usize, limit: usize, max_bytes: usize) -
 /// so the cut lands on the last complete numbered line and the footer
 /// names the returned range, the next offset, and the remedy — a
 /// smaller window drops bytes along with lines. When not even one
-/// complete line fits, the message points at the first line that does —
-/// within the window or beyond it — so the advice always advances.
+/// complete line fits, the message points at the first window line
+/// verified to fit, or just past the window when none does — the advice
+/// always advances, and the line past the window is only verified by
+/// the read it advises.
 fn byte_capped_view(numbered: &str, offset: usize, total_lines: usize, max_bytes: usize) -> String {
     let mut cut = max_bytes.min(numbered.len());
     while !numbered.is_char_boundary(cut) && cut > 0 {
@@ -556,11 +588,13 @@ fn byte_capped_view(numbered: &str, offset: usize, total_lines: usize, max_bytes
 /// fits and the message points at its offset — always past the current
 /// one, because a window line that fit would have been framed instead.
 /// When no line of the window fits, the message points past the window.
-/// Every outcome advances, so the advice can never loop.
+/// Every outcome advances, so the advice can never loop. A view starting
+/// past line 1 opens with the same omission header every other view
+/// carries.
 fn no_complete_line_view(numbered: &str, offset: usize, max_bytes: usize) -> String {
     let segments: Vec<&str> = numbered.split('\n').collect();
     let window_end = offset.saturating_add(segments.len()).saturating_sub(1);
-    if let Some(idx) = segments.iter().position(|line| line.len() < max_bytes) {
+    let mut message = if let Some(idx) = segments.iter().position(|line| line.len() < max_bytes) {
         let resume = offset.saturating_add(idx);
         format!(
             "[FILE TRUNCATED: line {offset} alone does not fit the {max_bytes}-byte output \
@@ -573,7 +607,18 @@ fn no_complete_line_view(numbered: &str, offset: usize, max_bytes: usize) -> Str
              output limit — the content has very long lines. Use offset={past_window} to \
              read past this window.]"
         )
+    };
+    if offset > 1 {
+        let mut framed = String::new();
+        write!(
+            framed,
+            "[Lines before offset {offset} omitted — use offset=1 to read from the start]\n\n"
+        )
+        .ok();
+        framed.push_str(&message);
+        message = framed;
     }
+    message
 }
 
 /// The image MIME an address extension selects, if any.
@@ -614,10 +659,22 @@ fn too_large(path: &str, size: u64, cap: u64) -> ToolOutput {
 /// An image extension yields native multipart output — the image part
 /// (base64 through [`ImageSource`], the same standard table the message
 /// format defines) plus a one-line text summary naming the address and
-/// byte count; anything else is refused as binary with a soft error:
-/// the model gets a readable explanation, not an opaque failure.
-fn bytes_output(path: &str, bytes: &[u8]) -> ToolOutput {
+/// byte count — unless the encoded payload exceeds the configured
+/// ceiling, in which case a soft error names the address, both sizes,
+/// and the limit: the refusal lands in the tool output, not on a later
+/// provider request. Anything else is refused as binary with a soft
+/// error: the model gets a readable explanation, not an opaque failure.
+fn bytes_output(path: &str, bytes: &[u8], max_image_bytes: usize) -> ToolOutput {
     if let Some(mime) = image_mime(path) {
+        let encoded_len = bytes.len().div_ceil(3).saturating_mul(4);
+        if encoded_len > max_image_bytes {
+            return ToolOutput::error(format!(
+                "Image at {path} is {} bytes ({} bytes encoded), over the \
+                 {max_image_bytes}-byte image limit.",
+                bytes.len(),
+                encoded_len
+            ));
+        }
         let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
         let summary = format!("Image at {path} ({} bytes, {mime})", bytes.len());
         return ToolOutput::success(ToolContent::from_multipart(vec![
@@ -707,7 +764,9 @@ impl<S: ContentSource> Tool for ReadTool<S> {
                     limit,
                     self.max_bytes,
                 ))),
-                SourceContent::Bytes(bytes) => Ok(bytes_output(&parsed.path, &bytes)),
+                SourceContent::Bytes(bytes) => {
+                    Ok(bytes_output(&parsed.path, &bytes, self.max_image_bytes))
+                }
             }
         })
     }
@@ -1278,6 +1337,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_oversized_image_is_refused_naming_both_sizes() {
+        let tool = ReadTool::new(
+            FakeSource::with(&[("doc", "irrelevant")]).with_bytes("shot.png", &[1, 2, 3, 4]),
+        )
+        .with_max_image_bytes(4);
+        let output = tool
+            .call(input("shot.png"), &ToolContext::default())
+            .await
+            .expect("an over-ceiling image resolves to a refusal, not an error");
+        assert!(
+            output.is_error,
+            "the image ceiling refuses in the tool output, not on a later provider request: {output:?}"
+        );
+        let text = output.payload.to_string();
+        assert!(
+            text.contains("shot.png")
+                && text.contains("4 bytes")
+                && text.contains("8 bytes encoded")
+                && text.contains("4-byte image limit"),
+            "the refusal names the address, the raw size, the encoded size, and the limit: {text}"
+        );
+        let clamped = ReadTool::new(
+            FakeSource::with(&[("doc", "irrelevant")]).with_bytes("shot.png", &[1, 2, 3, 4]),
+        )
+        .with_max_image_bytes(0);
+        let output = clamped
+            .call(input("shot.png"), &ToolContext::default())
+            .await
+            .expect("a zero image ceiling clamps to one byte");
+        assert!(
+            output.payload.to_string().contains("1-byte image limit"),
+            "the clamped ceiling refuses by its configured value: {:?}",
+            output.payload
+        );
+    }
+
+    #[tokio::test]
     async fn binary_content_is_refused_with_a_soft_error_naming_the_address() {
         let tool = ReadTool::new(
             FakeSource::with(&[("doc", "irrelevant")]).with_bytes("blob.bin", &[0, 255, 128]),
@@ -1294,6 +1390,27 @@ mod tests {
         assert!(
             text.contains("blob.bin") && text.contains("binary") && text.contains("3 bytes"),
             "the refusal names the address, the kind, and the size: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_fit_view_mid_content_still_opens_with_the_omission_header() {
+        let content = format!("short\n{}\ntail", "x".repeat(1000));
+        let tool = ReadTool::new(FakeSource::with(&[("doc", &content)])).with_max_bytes(100);
+        let output = read(
+            &tool,
+            with_range("doc", &serde_json::json!({ "offset": 2 })),
+        )
+        .await
+        .expect("a mid-content no-fit view resolves");
+        assert!(
+            output.starts_with("[Lines before offset 2 omitted"),
+            "every view starting past line 1 opens with the omission header: {output}"
+        );
+        assert!(
+            output.contains("line 2 alone does not fit the 100-byte output limit")
+                && output.contains("Use offset=3 to read past it"),
+            "the header carries the same advice the top-of-file view would: {output}"
         );
     }
 
@@ -1379,6 +1496,143 @@ mod tests {
         assert!(
             offset_only.contains("Use offset=4 to see the remaining 7 lines"),
             "a cut tail names the continuation offset: {offset_only}"
+        );
+    }
+
+    #[test]
+    fn schema_advertises_the_documented_fields() {
+        let schema = ReadTool::new(FakeSource::with(&[])).schema();
+        assert_eq!(schema.tool, "read", "the registered name is lowercase read");
+        let properties = schema
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("the schema carries properties");
+        for field in ["path", "offset", "limit", "line_range"] {
+            assert!(
+                properties.contains_key(field),
+                "the schema advertises {field}: {properties:?}"
+            );
+        }
+        let required = schema
+            .input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("the schema carries required fields");
+        assert!(
+            required.len() == 1 && required[0] == "path",
+            "only path is required: {required:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_ceilings_are_the_documented_ones() {
+        let content = (1..=300)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tool = ReadTool::new(FakeSource::with(&[("doc", &content)]));
+        let head = read(&tool, input("doc"))
+            .await
+            .expect("the default window resolves");
+        assert!(
+            head.contains("Showing lines 1-200 of 300"),
+            "the default line ceiling is 200: {head}"
+        );
+        let page = read(
+            &tool,
+            with_range("doc", &serde_json::json!({ "offset": 6 })),
+        )
+        .await
+        .expect("the default offset-only window resolves");
+        assert!(
+            page.contains("Showing lines 6-205 of 300"),
+            "the default offset-only window is 200 lines: {page}"
+        );
+        let wide_line = "x".repeat(3000);
+        let wide = (0..300)
+            .map(|_| wide_line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wide_tool = ReadTool::new(FakeSource::with(&[("wide", &wide)]));
+        let output = read(&wide_tool, input("wide"))
+            .await
+            .expect("the default byte cap resolves");
+        assert!(
+            output.contains("400000-byte output limit"),
+            "the default byte ceiling is 400 000: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_image_ceiling_is_five_mebibytes_encoded() {
+        let exact = "a".repeat(3_932_160);
+        let tool = ReadTool::new(
+            FakeSource::with(&[("doc", "irrelevant")]).with_bytes("ok.png", exact.as_bytes()),
+        );
+        let output = tool
+            .call(input("ok.png"), &ToolContext::default())
+            .await
+            .expect("an image encoding to exactly 5 MiB resolves");
+        assert!(
+            !output.is_error,
+            "the ceiling refuses only beyond the limit, not at it: {output:?}"
+        );
+        let over = "a".repeat(3_932_161);
+        let tool = ReadTool::new(
+            FakeSource::with(&[("doc", "irrelevant")]).with_bytes("big.png", over.as_bytes()),
+        );
+        let output = tool
+            .call(input("big.png"), &ToolContext::default())
+            .await
+            .expect("one raw byte over resolves to a refusal");
+        let text = output.payload.to_string();
+        assert!(
+            output.is_error
+                && text.contains("5242884 bytes encoded")
+                && text.contains("5242880-byte image limit"),
+            "the default image ceiling is 5 MiB encoded, named exactly: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_kind_selection_covers_the_documented_extension_set() {
+        for (name, mime) in [
+            ("shot.png", "image/png"),
+            ("shot.jpg", "image/jpeg"),
+            ("shot.jpeg", "image/jpeg"),
+            ("shot.gif", "image/gif"),
+            ("shot.webp", "image/webp"),
+            ("shot.PNG", "image/png"),
+        ] {
+            let tool = ReadTool::new(
+                FakeSource::with(&[("doc", "irrelevant")]).with_bytes(name, &[9, 9, 9]),
+            );
+            let output = tool
+                .call(input(name), &ToolContext::default())
+                .await
+                .unwrap_or_else(|error| panic!("{name} resolves, got: {error}"));
+            let crate::message::ToolContent::Multipart(parts) = &output.payload else {
+                panic!("{name} is served as multipart, got: {:?}", output.payload)
+            };
+            assert!(
+                matches!(&parts[0], crate::message::ToolContentPart::Image { source }
+                    if source.media_type == mime),
+                "{name} selects {mime}: {:?}",
+                parts[0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_byte_cap_cut_inside_a_multibyte_character_is_honest_not_panicking() {
+        let tool = ReadTool::new(FakeSource::with(&[("doc", "αααα\nββββ")])).with_max_bytes(4);
+        let output = read(&tool, input("doc"))
+            .await
+            .expect("the multibyte cut resolves without panicking");
+        assert!(
+            output.contains("no line from 1 to 2 fits the 4-byte output limit"),
+            "the cut walks back to a char boundary before any complete line: {output}"
         );
     }
 

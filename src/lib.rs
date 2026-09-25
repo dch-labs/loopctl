@@ -26,6 +26,7 @@
 //! - **[`tool`]** — Tool trait, registry, and supporting types.
 //! - **`tool::health`** — Per-tool health monitoring, circuit breakers, and self-healing routing. *Requires `tool_health` feature.*
 //! - **[`mcp`]** — MCP client + server adapters ([`McpToolProvider`](mcp::McpToolProvider) adapts foreign MCP servers; [`McpServerAdapter`](mcp::McpServerAdapter) serves a `ToolRegistry` over MCP). *Requires `mcp` feature.*
+//! - **[`manifest`]** — The v1 `loop.yaml` manifest model: strict serde types, profile deep-merge, compose-style interpolation, span-bearing validation, and the JSON Schema export ([`ManifestDocument`](manifest::ManifestDocument) is the entry point). *Requires `manifest` feature.*
 //!
 //! ## API Layer
 //!
@@ -103,6 +104,8 @@ pub mod fallback;
 #[cfg(feature = "hooks")]
 pub mod hooks;
 pub mod managers;
+#[cfg(feature = "manifest")]
+pub mod manifest;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod memory;

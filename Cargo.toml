@@ -42,6 +42,8 @@ async-stream = { version = "0.3", optional = true }
 httpdate = { version = "1", optional = true }
 jsonschema = { version = "0.56", optional = true }
 regex = { version = "1", optional = true, default-features = false, features = ["std"] }
+serde_yaml_ng = { version = "0.10", optional = true }
+schemars = { version = "1.2", optional = true }
 rmcp = { version = "3.4", optional = true, default-features = false, features = ["client", "server", "macros", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-io"] }
 
 [dev-dependencies]
@@ -83,6 +85,11 @@ schema_validation = ["dep:jsonschema"]
 # `\s` (unicode-perl); a future literal outgrowing these two features
 # fails the redaction-minimal CI gate loudly.
 redaction = ["dep:regex", "regex/unicode-case", "regex/unicode-perl"]
+
+# The v1 `loop.yaml` manifest model: strict serde types, profile deep-merge,
+# compose-style interpolation, span-bearing validation, and the JSON Schema
+# export for editor tooling and validators.
+manifest = ["dep:serde_yaml_ng", "dep:schemars"]
 
 # MCP client adapter + transports (stdio, Streamable HTTP/SSE). Enables
 # `streaming` for `StreamRetryConfig` (reconnect backoff), `reqwest` for the

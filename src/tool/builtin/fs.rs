@@ -574,6 +574,40 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_swapped_workspace_spelling_cannot_redirect_contained_reads() {
+        use std::os::unix::fs::symlink;
+
+        use crate::tool::Tool;
+        use crate::tool::builtin::read::ReadTool;
+
+        let parent = tempfile::TempDir::new().unwrap();
+        let ws = parent.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "SECRET\n").unwrap();
+        let session = FileSession::new(ws.clone());
+        let mut ctx = ToolContext::default();
+        ctx.cwd = ws.to_string_lossy().into_owned();
+        session.attach(&mut ctx);
+
+        std::fs::remove_dir(&ws).unwrap();
+        symlink(outside.path(), &ws).unwrap();
+
+        let err = ReadTool::new(FileSource::new(session))
+            .call(
+                serde_json::json!({"path": ws.join("secret.txt").to_str().unwrap()}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "the read must judge against the pinned root, not the swapped spelling: {err}"
+        );
+    }
+
     #[test]
     fn clones_share_one_baseline_map() {
         let session = FileSession::new(Path::new(".").to_path_buf());

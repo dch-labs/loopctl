@@ -164,10 +164,11 @@ async fn read_addressed(session: &FileSession, address: &str) -> Result<SourceCo
 ///
 /// The cap bounds the allocation even when the file grows between the
 /// metadata check and the read. Under the contained policy the opened
-/// handle is verified against the session's pinned workspace anchor,
-/// so a symlink swapped onto the workspace spelling after the session
-/// was constructed cannot turn the read into a byte source outside
-/// the pinned workspace.
+/// handle is verified against the session's pinned workspace root —
+/// descriptor-pinned on Linux, the anchor's captured canonical root
+/// elsewhere — so a symlink swapped onto the workspace spelling after
+/// the session was constructed cannot turn the read into a byte
+/// source outside the pinned workspace.
 ///
 /// # Errors
 ///

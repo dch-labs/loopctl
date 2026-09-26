@@ -739,6 +739,39 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_swapped_workspace_spelling_cannot_redirect_contained_writes() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::TempDir::new().unwrap();
+        let ws = parent.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE\n").unwrap();
+        let ctx = ctx_in(ws.to_str().unwrap());
+
+        std::fs::remove_dir(&ws).unwrap();
+        symlink(outside.path(), &ws).unwrap();
+
+        let err = WriteTool::new()
+            .call(
+                json!({"file_path": "secret.txt", "content": "ours\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "the write must judge against the pinned root, not the swapped spelling: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "OUTSIDE\n",
+            "nothing may land in the swapped-in tree"
+        );
+    }
+
     #[tokio::test]
     async fn flags_advertise_write_semantics() {
         let tool = WriteTool::new();

@@ -1,0 +1,4 @@
+Changed: existing.rs (modified)
+│ 1 line removed, 1 line added
+- old content
++ fn main() {}

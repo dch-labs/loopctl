@@ -13,6 +13,12 @@
 //! - [`ThinkTool`] — a scratchpad the model reasons into before acting.
 //! - [`ReadTool`] — line-aware reading over a pluggable
 //!   [`ContentSource`], with loud truncation.
+//! - With the `fs_tools` feature: the filesystem family —
+//!   [`WriteTool`](fs::WriteTool), [`EditTool`](fs::EditTool),
+//!   [`MultiEditTool`](fs::MultiEditTool),
+//!   [`FileViewerTool`](fs::FileViewerTool), and the
+//!   [`FileSource`](fs::FileSource) filesystem content source — over
+//!   one shared [`FileSession`](fs::FileSession).
 //!
 //! # Example
 //!
@@ -27,6 +33,9 @@
 
 pub mod read;
 pub mod think;
+
+#[cfg(feature = "fs_tools")]
+pub mod fs;
 
 pub use read::{ContentSource, ReadTool};
 pub use think::ThinkTool;

@@ -1,0 +1,6 @@
+Edit conflict detected — the following edits overlap in the same file:
+  - File 'a.rs': edit #1 and edit #2 target overlapping text regions
+    Edit #1 old_text: "hello wo"...
+    Edit #2 old_text: "world"...
+
+Resolve by: (1) splitting into separate calls, or (2) use dry_run=true to preview first.

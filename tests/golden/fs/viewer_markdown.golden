@@ -1,0 +1,7 @@
+File: code.rs (Page 1/1)
+Lines 1-2 of 2
+
+```rust
+     1 │ fn a() {}
+     2 │ fn b() {}
+```

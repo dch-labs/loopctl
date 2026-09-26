@@ -1,0 +1,4 @@
+Syntax validation failed for <WORKSPACE>/bad.rs:
+  expected an expression
+Blocked to prevent file corruption.
+To bypass this check, use skip_linter: true (not recommended).

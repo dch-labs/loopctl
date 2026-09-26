@@ -45,6 +45,8 @@ regex = { version = "1", optional = true, default-features = false, features = [
 base64 = { version = "0.22", optional = true }
 serde_yaml_ng = { version = "0.10", optional = true }
 schemars = { version = "1.2", optional = true }
+libc = { version = "0.2", optional = true }
+tempfile = { version = "3", optional = true }
 rmcp = { version = "3.4", optional = true, default-features = false, features = ["client", "server", "macros", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-io"] }
 
 [dev-dependencies]
@@ -52,10 +54,12 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "
 proptest = "1"
 httpmock = { version = "0.8.3", default-features = false, features = ["record"] }
 serde_yaml = "0.9"
+tempfile = "3"
 
 [features]
 default = []
 builtin_tools = ["dep:base64"]
+fs_tools = ["builtin_tools", "dep:libc", "dep:tempfile", "tokio/fs", "tokio/io-util"]
 vector_index = []
 derive = ["dep:loopctl-derive"]
 hooks = []

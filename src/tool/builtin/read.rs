@@ -58,8 +58,9 @@ const DEFAULT_OFFSET_LIMIT: usize = 200;
 ///
 /// Past this size the tool refuses before reading when the source reports
 /// a size — the windowing ceilings trim views, but an unbounded read into
-/// memory is a failure no marker can frame.
-const DEFAULT_MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+/// memory is a failure no marker can frame. Shared with the filesystem
+/// family's resume re-arm, whose bounded reads hold to the same cap.
+pub(crate) const DEFAULT_MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Default ceiling on the encoded image payload, in bytes.
 ///

@@ -157,6 +157,26 @@ pub(crate) fn changed_message(path: &Path) -> String {
     )
 }
 
+/// Format the soft-error message for a write held against a resume-armed
+/// baseline.
+///
+/// The path's only recorded observation came from re-arming on resume —
+/// the model never saw the file's bytes in this session — so a hash
+/// compare cannot honestly clear the write: changes made while the
+/// session was inactive would pass it unseen. The text states that and
+/// directs the model to the same recovery path as a staleness
+/// refusal. Shared by every writing tool, so Write, Edit, and
+/// `MultiEdit` hold a resume-armed target with one uniform message.
+pub(crate) fn resumed_baseline_message(path: &Path) -> String {
+    format!(
+        "{path} was last read in a previous session, so its current bytes \
+         are not part of this session's context; not writing until it has \
+         been read here.\n\nRead the file with Read, then re-issue the write \
+         against the content it returns.",
+        path = path.display()
+    )
+}
+
 /// Re-read `path` and compare its bytes against `baseline`.
 ///
 /// Returns the identity of the file the compared bytes came from; the

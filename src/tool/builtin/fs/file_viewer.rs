@@ -4,9 +4,14 @@
 //! lines for quick lookups, `FileViewer` navigates large files in
 //! chunks via `page`/`page_size` (sequential) or `offset`/`limit`
 //! (direct seek), with a header naming the current window and a
-//! `[Navigate: …]` hint. Windows are read with a single-pass buffered
-//! scan that never holds more than the window in memory, so a huge
-//! file costs its window, not its size.
+//! `[Navigate: …]` hint. Only regular files are viewable — a missing
+//! or non-regular target (a directory, a FIFO, a device) is a soft
+//! error, so a special file can never hang the viewer on an open that
+//! never completes or a stream that never ends. Windows are read with
+//! a single-pass buffered scan that never holds more than the window
+//! and the per-line byte cap in memory, so a huge file costs its
+//! window, not its size — and a pathological single-line file costs at
+//! most one capped line.
 
 use std::future::Future;
 use std::path::Path;
@@ -42,6 +47,17 @@ const DEFAULT_PAGE_SIZE: usize = 100;
 /// for ten thousand lines gets five hundred and a header that says what
 /// it received.
 const MAX_PAGE_SIZE: usize = 500;
+
+/// Per-line byte cap the window scan retains for display.
+///
+/// A line at or under the cap is kept verbatim; a longer line is cut
+/// back to the last character boundary at or under the cap and ends
+/// with a `… [+N bytes truncated]` marker naming the omitted byte
+/// count. The cap keeps the documented window bound honest on files
+/// whose lines are pathological — a minified bundle or a one-line
+/// JSON dump — where an uncapped line would otherwise cost its whole
+/// length in memory and output.
+const MAX_LINE_BYTES: usize = 16 * 1024;
 
 /// The paginated file viewer over the session's workspace.
 ///
@@ -123,33 +139,54 @@ impl Tool for FileViewerTool {
 
 /// Body of [`Tool::call`].
 ///
-/// Orchestrates parse → resolve → count → bounds → window → render.
-/// Recoverable conditions (missing file, offset/page beyond EOF) are
-/// soft [`ToolOutput`] errors; bad args and OS faults become
-/// [`ToolError`]. The line count and the window each come from a
-/// streaming scan that retains no more than the window's lines.
+/// Orchestrates parse → resolve → regular-file gate → count → bounds →
+/// window → render. Recoverable conditions (missing file, non-regular
+/// target, offset/page beyond EOF) are soft [`ToolOutput`] errors; bad
+/// args and OS faults become [`ToolError`]. A target that swaps to a
+/// non-regular file between the pre-open gate and the opened handle's
+/// own stat fails closed as a hard error rather than scan. The line
+/// count and the window each come from a streaming scan that retains
+/// no more than the window's capped lines.
 ///
 /// # Errors
 ///
 /// Returns `ToolError::InvalidInput` for a missing `file_path`, a
 /// URL, a zero `page`/`offset`, or malformed numeric fields, and
-/// `ToolError::Execution` on a genuine I/O fault or when the
-/// contained handle check fails.
+/// `ToolError::Execution` on a genuine I/O fault, on a target that
+/// opened as a non-regular file, or when the contained handle check
+/// fails.
 async fn view_inner(input: Value, session: &FileSession) -> Result<ToolOutput, ToolError> {
     let parsed = parse_input(&input)?;
     let full_path =
         resolve::resolve_path(parsed.file_path, session.cwd(), session.resolve_policy())?;
 
-    if !tokio::fs::try_exists(&full_path)
+    match tokio::fs::metadata(&full_path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ToolOutput::error_text(format!(
+                "File not found: {}",
+                parsed.file_path
+            )));
+        }
+        Err(e) => return Err(ToolError::Execution(e.to_string())),
+        Ok(meta) if !meta.is_file() => {
+            return Ok(ToolOutput::error_text(format!(
+                "{} is not a regular file.",
+                parsed.file_path
+            )));
+        }
+        Ok(_) => {}
+    }
+    let mut file = open_verified(session, &full_path).await?;
+    let handle_meta = file
+        .metadata()
         .await
-        .map_err(|e| ToolError::Execution(e.to_string()))?
-    {
-        return Ok(ToolOutput::error_text(format!(
-            "File not found: {}",
+        .map_err(|e| ToolError::Execution(e.to_string()))?;
+    if !handle_meta.is_file() {
+        return Err(ToolError::Execution(format!(
+            "cannot view {}: not a regular file",
             parsed.file_path
         )));
     }
-    let mut file = open_verified(session, &full_path).await?;
     let total_lines = count_lines(&mut file).await?;
     let bounds = calculate_bounds(&input, total_lines)?;
 
@@ -242,14 +279,17 @@ async fn count_lines(file: &mut tokio::fs::File) -> Result<usize, ToolError> {
 /// Collect lines `start..start+count` (1-indexed, inclusive) in one streaming
 /// pass, holding only the window.
 ///
-/// Rewinds first, skips the lines before the window, and collects
-/// exactly the window — nothing before or after is retained, so the
-/// memory cost is the window's lines, never the file's.
+/// Rewinds first, skips the lines before the window byte-wise — the
+/// skipped span is counted, never decoded or retained — and collects
+/// exactly the window, each line capped at [`MAX_LINE_BYTES`] with the
+/// truncation marker naming any omitted bytes. Nothing before or after
+/// the window is retained, so the memory cost is the window's capped
+/// lines, never the file's size or a single line's full length.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::Execution`] on any read fault, including
-/// content that is not UTF-8.
+/// Returns [`ToolError::Execution`] on any seek fault, or any read
+/// fault, including window content that is not UTF-8.
 async fn read_window(
     file: &mut tokio::fs::File,
     start: usize,
@@ -258,21 +298,158 @@ async fn read_window(
     file.seek(SeekFrom::Start(0))
         .await
         .map_err(|e| ToolError::Execution(e.to_string()))?;
-    let reader = tokio::io::BufReader::new(file);
-    let mut lines = reader.lines();
+    let mut reader = tokio::io::BufReader::new(file);
+    if !skip_lines(&mut reader, start.saturating_sub(1)).await? {
+        return Ok(Vec::new());
+    }
     let mut window = Vec::new();
-    let mut number = 0usize;
-    while let Some(line) = lines.next_line().await.map_err(|e| read_fault(&e))? {
-        number = number.saturating_add(1);
-        if number < start {
-            continue;
+    for _ in 0..count {
+        match read_capped_line(&mut reader).await? {
+            Some(line) => window.push(line),
+            None => break,
         }
-        if window.len() >= count {
-            break;
-        }
-        window.push(line);
     }
     Ok(window)
+}
+
+/// Advance the reader past `count` complete lines, decoding nothing.
+///
+/// Consumes bytes through the `count`-th newline without retaining
+/// them, the same buffered scan [`count_lines`](fn@count_lines) uses,
+/// so a window deep in a huge file costs buffer reads, not skipped
+/// text. Returns `false` when EOF arrives before the last newline to
+/// skip — the caller's window is empty then — and `true` with the
+/// reader positioned at the first byte of line `count + 1`.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] on any read fault.
+async fn skip_lines(
+    reader: &mut tokio::io::BufReader<&mut tokio::fs::File>,
+    count: usize,
+) -> Result<bool, ToolError> {
+    let mut remaining = count;
+    loop {
+        if remaining == 0 {
+            return Ok(true);
+        }
+        let chunk = reader.fill_buf().await.map_err(|e| read_fault(&e))?;
+        if chunk.is_empty() {
+            return Ok(false);
+        }
+        let len = chunk.len();
+        let mut stop_at = None;
+        for (offset, byte) in chunk.iter().enumerate() {
+            if *byte == b'\n' {
+                remaining = remaining.saturating_sub(1);
+                if remaining == 0 {
+                    stop_at = Some(offset.saturating_add(1));
+                    break;
+                }
+            }
+        }
+        match stop_at {
+            Some(consumed) => reader.consume(consumed),
+            None => reader.consume(len),
+        }
+    }
+}
+
+/// Read one display line, capped at [`MAX_LINE_BYTES`].
+///
+/// Reads through the line's terminating newline (or EOF) in buffered
+/// chunks, so an over-long line's tail is consumed without being
+/// stored; the retained prefix is cut at the last character boundary
+/// at or under the cap and, when anything was omitted, suffixed with
+/// the `… [+N bytes truncated]` marker naming the omitted byte count.
+/// A carriage return before the terminating newline is stripped, the
+/// same `str::lines`-compatible split the line count uses. `None`
+/// marks EOF before the line's first byte, matching `str::lines`
+/// end-of-input semantics.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] on any read fault, including
+/// retained content that is not UTF-8.
+async fn read_capped_line(
+    reader: &mut tokio::io::BufReader<&mut tokio::fs::File>,
+) -> Result<Option<String>, ToolError> {
+    let mut retained: Vec<u8> = Vec::new();
+    let mut omitted = 0usize;
+    let mut saw_bytes = false;
+    let mut complete = false;
+    while !complete {
+        let chunk = reader.fill_buf().await.map_err(|e| read_fault(&e))?;
+        if chunk.is_empty() {
+            break;
+        }
+        saw_bytes = true;
+        if let Some(index) = chunk.iter().position(|b| *b == b'\n') {
+            if let Some(part) = chunk.get(..index) {
+                retain_within_cap(part, &mut retained, &mut omitted);
+            }
+            reader.consume(index.saturating_add(1));
+            complete = true;
+        } else {
+            retain_within_cap(chunk, &mut retained, &mut omitted);
+            let len = chunk.len();
+            reader.consume(len);
+        }
+    }
+    if !saw_bytes {
+        return Ok(None);
+    }
+    let mut line = if omitted == 0 {
+        String::from_utf8(retained).map_err(|_| utf8_fault())?
+    } else {
+        let boundary = last_char_boundary(&retained);
+        let text = String::from_utf8(retained.get(..boundary).unwrap_or(&[]).to_vec())
+            .map_err(|_| utf8_fault())?;
+        format!("{text} … [+{omitted} bytes truncated]")
+    };
+    if complete && line.ends_with('\r') {
+        line.pop();
+    }
+    Ok(Some(line))
+}
+
+/// Append `part` to `retained` up to [`MAX_LINE_BYTES`], counting the
+/// rest as omitted.
+///
+/// Pure bookkeeping for [`read_capped_line`]: fills the retained buffer
+/// to the cap exactly and accumulates every byte past it into `omitted`
+/// instead, so the caller's marker can name the true remainder.
+fn retain_within_cap(part: &[u8], retained: &mut Vec<u8>, omitted: &mut usize) {
+    let room = MAX_LINE_BYTES.saturating_sub(retained.len());
+    let kept = part.len().min(room);
+    if let Some(slice) = part.get(..kept) {
+        retained.extend_from_slice(slice);
+    }
+    *omitted = omitted.saturating_add(part.len().saturating_sub(kept));
+}
+
+/// The largest prefix length of `bytes` that ends on a character boundary.
+///
+/// Backs off continuation bytes (`10xxxxxx`) from the cut point, so the
+/// per-line cap never splits a multi-byte character; the answer is never
+/// past the input's end.
+fn last_char_boundary(bytes: &[u8]) -> usize {
+    let mut boundary = bytes.len();
+    while boundary > 0 && bytes.get(boundary).is_some_and(|b| b & 0xC0 == 0x80) {
+        boundary = boundary.saturating_sub(1);
+    }
+    boundary
+}
+
+/// The read fault for window content that does not decode.
+///
+/// Reproduces the message the line-oriented scan raised for undecodable
+/// content, so the fault shape is unchanged by the capped reader.
+fn utf8_fault() -> ToolError {
+    read_fault(&std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "stream did not contain valid UTF-8",
+    ))
 }
 
 /// Map a streaming read fault, naming the operation.
@@ -1143,6 +1320,88 @@ mod tests {
         assert_eq!(
             window,
             vec!["L4".to_string(), "L5".to_string(), "L6".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_target_is_a_soft_refusal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        let out = FileViewerTool
+            .call(
+                json!({"file_path": "sub"}),
+                &ctx_in(tmp.path().to_str().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.text_content().contains("sub is not a regular file."),
+            "{}",
+            out.text_content()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_target_is_a_soft_refusal_without_hanging() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fifo = tmp.path().join("pipe");
+        let spelled = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `spelled` names a fresh path in a temp dir this test owns; mkfifo writes no memory.
+        let created = unsafe { libc::mkfifo(spelled.as_ptr(), 0o600) };
+        assert_eq!(
+            created,
+            0,
+            "mkfifo must succeed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let out = FileViewerTool
+            .call(
+                json!({"file_path": "pipe"}),
+                &ctx_in(tmp.path().to_str().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.text_content().contains("pipe is not a regular file."),
+            "{}",
+            out.text_content()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_over_long_line_is_capped_with_a_truncation_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let long_line = "a".repeat(100 * 1024);
+        let content = format!("short one\n{long_line}\nshort three\n");
+        std::fs::write(tmp.path().join("bundle.txt"), content).unwrap();
+        let out = FileViewerTool
+            .call(
+                json!({"file_path": "bundle.txt"}),
+                &ctx_in(tmp.path().to_str().unwrap()),
+            )
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(
+            text.contains("Lines 1-3 of 3"),
+            "an over-long line still counts as one line: {text}"
+        );
+        assert!(
+            text.contains(" … [+86016 bytes truncated]"),
+            "the omitted byte count must be named: {text}"
+        );
+        assert!(
+            text.contains(&"a".repeat(16 * 1024)),
+            "the retained prefix fills the cap exactly: {text}"
+        );
+        assert!(
+            !text.contains(&"a".repeat(16 * 1024 + 1)),
+            "nothing beyond the cap may be retained: {text}"
         );
     }
 

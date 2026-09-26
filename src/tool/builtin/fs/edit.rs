@@ -27,6 +27,7 @@ use super::FileSession;
 use super::atomic;
 use super::conflict;
 use super::conflict::CheckFailure;
+use super::diff::OldContent;
 use super::diff::format_file_change;
 use super::require_session;
 use super::resolve;
@@ -158,9 +159,11 @@ impl Tool for EditTool {
 /// Recoverable conditions (text not found, ambiguous match, a
 /// validator rejection, a file changed on disk since this call read
 /// it) are surfaced as soft [`ToolOutput`] errors; hard failures (bad
-/// args, missing file, I/O fault) become [`ToolError`]. A successful
-/// write refreshes the path's recorded baseline, so the model's own
-/// edit never registers as a later external change.
+/// args, missing file, I/O fault) become [`ToolError`]. A baseline
+/// whose only observation is resume-armed holds the edit — the same
+/// refusal Write applies — until a live read re-records the bytes. A
+/// successful write refreshes the path's recorded baseline, so the
+/// model's own edit never registers as a later external change.
 ///
 /// # Errors
 ///
@@ -188,6 +191,14 @@ async fn edit_inner(
         Some(session.anchor()),
     )
     .await?;
+    if session
+        .baseline_for(&full_path)
+        .is_some_and(|baseline| baseline.resumed)
+    {
+        return Ok(ToolOutput::error_text(conflict::resumed_baseline_message(
+            &full_path,
+        )));
+    }
     let new_content = match apply_edit(&old_content, parsed.old_text, parsed.new_text) {
         Ok(content) => content,
         Err(reason) => return Ok(reason.into_output()),
@@ -226,7 +237,11 @@ async fn edit_inner(
 
     session.record_baseline(&full_path, state::observe_bytes(new_content.as_bytes()));
 
-    let message = format_file_change(parsed.file_path, Some(&old_content), &new_content);
+    let message = format_file_change(
+        parsed.file_path,
+        OldContent::Text(&old_content),
+        &new_content,
+    );
     Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
 }
 
@@ -795,6 +810,53 @@ mod tests {
     fn splice_replaces_only_the_matched_range() {
         assert_eq!(splice("hello world", 6..11, "there"), "hello there");
         assert_eq!(splice("abc", 1..2, ""), "ac");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_baseline_holds_the_edit_until_a_live_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("held.rs");
+        std::fs::write(&target, "v1\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let session = super::super::FileSession::new(PathBuf::from(cwd));
+        let mut ctx = ToolContext::default();
+        ctx.cwd = cwd.to_string();
+        session.attach(&mut ctx);
+        session.record_baseline(&target, state::observe_resumed_bytes(b"v1\n"));
+
+        let held = EditTool::new()
+            .call(
+                json!({"file_path": "held.rs", "old_text": "v1", "new_text": "v2"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(held.is_error, "a resume-armed baseline must hold the edit");
+        assert!(
+            held.text_content().contains("previous session"),
+            "{}",
+            held.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "v1\n",
+            "nothing may be written while held"
+        );
+
+        session.record_baseline(&target, state::observe_bytes(b"v1\n"));
+        let after = EditTool::new()
+            .call(
+                json!({"file_path": "held.rs", "old_text": "v1", "new_text": "v2"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !after.is_error,
+            "a live read must release the guard: {}",
+            after.text_content()
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2\n");
     }
 
     #[tokio::test]

@@ -1,13 +1,14 @@
-//! Golden parity against dch v1's file tools.
+//! Golden corpus pinning the file tool family's model-facing output.
 //!
-//! The goldens under `tests/golden/fs/` were captured by running the
-//! dch v1 tools (published `loopctl` 0.3.2 + `dch-tools`) over this
-//! exact scenario corpus; this test replays the corpus against the
-//! ported family and diffs byte-for-byte. Regeneration is deliberate:
-//! re-run the capture harness against dch v1 and re-copy the files —
-//! never hand-edit a golden. Absolute workspace paths normalize to
-//! `<WORKSPACE>/` on both sides; dch's linter behavior on this corpus
-//! is reproduced by the table validator below, keyed by file name and
+//! The goldens under `tests/golden/fs/` freeze the bytes every tool
+//! renders for this scenario corpus — success previews and diff
+//! bodies, conflict, staleness, and resumed refusals, viewer headers
+//! and navigation hints, and the four input schemas — so any change
+//! to the family's output shape fails a golden diff instead of
+//! passing silently. Regeneration is a deliberate, reviewed act, and
+//! goldens are never hand-edited. Absolute workspace paths normalize
+//! to `<WORKSPACE>` on both sides; the corpus's lint findings are
+//! reproduced by the table validator below, keyed by file name and
 //! candidate content, so the gate's ordering and rendering are part
 //! of the pin. Struct field order is never a contract (objects
 //! canonicalize sorted); array order — `required`, `edits` — is.
@@ -41,17 +42,19 @@ use loopctl::tool::builtin::read::ReadTool;
 use loopctl::tool::{Tool, ToolContext};
 use serde_json::json;
 
-/// The dch linter's findings for this corpus, keyed by file name then
-/// candidate content.
+/// The corpus's lint findings, keyed by file name then candidate
+/// content.
+///
+/// The table pins the gate's ordering: a finding blocks the write
+/// before it happens, and the refusal text it produces is part of the
+/// pinned output.
 struct CorpusLinter;
 
 impl CorpusLinter {
     fn findings(path: &Path, content: &str) -> Vec<ValidationDiagnostic> {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let known: &[(&str, &str)] = match name {
-            "watched.rs" | "resumed.rs" => &[("ours\n", "expected `!`"), ("v2\n", "expected `!`")],
             "bad.rs" => &[("fn main() { let x = ; }", "expected an expression")],
-            "a.rs" => &[("ALPHA\n", "expected `!`")],
             _ => &[],
         };
         known
@@ -138,7 +141,7 @@ fn assert_scenario(fixture: &Fixture, name: &str, produced: &str, workspace: &Pa
     let normalized = normalize(produced, workspace);
     assert_eq!(
         normalized, golden,
-        "scenario {name} drifted from the dch v1 golden"
+        "scenario {name} drifted from the golden"
     );
 }
 
@@ -203,18 +206,6 @@ async fn write_scenarios(fixture: &Fixture) {
         .unwrap();
     assert_scenario(fixture, "write_conflict_txt", &out.text_content(), &dir);
 
-    let dir = fixture.workdir("write-conflict");
-    std::fs::write(dir.join("watched.rs"), "v1\n").unwrap();
-    let ctx = ctx_with(&dir);
-    let out = write_tool()
-        .call(
-            json!({"file_path": "watched.rs", "content": "ours\n"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-    assert_scenario(fixture, "write_conflict", &out.text_content(), &dir);
-
     let dir = fixture.workdir("resumed-txt");
     std::fs::write(dir.join("resumed.txt"), "v1\n").unwrap();
     let session = FileSession::new(dir.clone());
@@ -227,19 +218,6 @@ async fn write_scenarios(fixture: &Fixture) {
         .await
         .unwrap();
     assert_scenario(fixture, "write_resumed_txt", &out.text_content(), &dir);
-
-    let dir = fixture.workdir("write-resumed");
-    std::fs::write(dir.join("resumed.rs"), "v1\n").unwrap();
-    let session = FileSession::new(dir.clone());
-    assert!(session.record_resumed_read("resumed.rs").await);
-    let mut ctx = ToolContext::default();
-    ctx.cwd = dir.to_string_lossy().into_owned();
-    session.attach(&mut ctx);
-    let out = write_tool()
-        .call(json!({"file_path": "resumed.rs", "content": "v2\n"}), &ctx)
-        .await
-        .unwrap();
-    assert_scenario(fixture, "write_resumed", &out.text_content(), &dir);
 
     let dir = fixture.workdir("write-lint-block");
     let ctx = ctx_with(&dir);
@@ -333,36 +311,6 @@ async fn multiedit_scenarios(fixture: &Fixture) {
         .unwrap();
     assert_scenario(fixture, "multiedit_dry_run_txt", &out.text_content(), &dir);
 
-    let dir = fixture.workdir("multiedit-ok");
-    std::fs::write(dir.join("a.rs"), "alpha\n").unwrap();
-    std::fs::write(dir.join("b.rs"), "beta\n").unwrap();
-    let ctx = ctx_with(&dir);
-    let out = multi_edit_tool()
-        .call(
-            json!({"edits": [
-                {"file_path": "a.rs", "old_text": "alpha", "new_text": "ALPHA"},
-                {"file_path": "b.rs", "old_text": "beta", "new_text": "BETA"}
-            ]}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-    assert_scenario(fixture, "multiedit_ok", &out.text_content(), &dir);
-
-    let dir = fixture.workdir("multiedit-dry-run");
-    std::fs::write(dir.join("a.rs"), "alpha\n").unwrap();
-    let ctx = ctx_with(&dir);
-    let out = multi_edit_tool()
-        .call(
-            json!({"edits": [
-                {"file_path": "a.rs", "old_text": "alpha", "new_text": "ALPHA"}
-            ], "dry_run": true}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-    assert_scenario(fixture, "multiedit_dry_run", &out.text_content(), &dir);
-
     let dir = fixture.workdir("multiedit-abort");
     std::fs::write(dir.join("a.rs"), "hello world\n").unwrap();
     let ctx = ctx_with(&dir);
@@ -424,7 +372,7 @@ fn ctx_with(dir: &Path) -> ToolContext {
 }
 
 #[tokio::test]
-async fn ported_tool_behavior_matches_dch_v1_goldens() {
+async fn tool_behavior_matches_the_golden_corpus() {
     let fixture = Fixture::load();
     schema_scenarios(&fixture);
     write_scenarios(&fixture).await;

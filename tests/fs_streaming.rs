@@ -4,9 +4,11 @@
 //! The viewer's two streaming scans exist so a giant file costs its
 //! window, not its size. The small-fixture pins hold the window math
 //! (including `str::lines` semantics for unterminated final lines and
-//! CRLF), and the Linux-gated big-file pin holds the actual memory
-//! bound: a `1 GiB` sparse fixture serves a window while the process's
-//! resident set grows by far less than the file.
+//! CRLF), and the Linux-gated big-file pins hold the actual memory
+//! bounds: a `1 GiB` sparse fixture serves a window while the process's
+//! resident set grows by far less than the file, and a one-line sibling
+//! holds the per-line cap — a single `256 MiB` line is served without
+//! ever being loaded whole.
 
 #![cfg(feature = "fs_tools")]
 #![allow(
@@ -132,5 +134,45 @@ async fn streaming_read_memory_is_bounded_by_window() {
     assert!(
         grew_mib < 256,
         "a 1 GiB sparse file must cost its window, not its size; RSS grew {grew_mib} MiB"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_single_giant_line_is_capped_not_loaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let oneline = tmp.path().join("oneline.txt");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&oneline)
+        .unwrap();
+    file.set_len(256 * 1024 * 1024).unwrap();
+    drop(file);
+
+    let before = peak_rss_kib();
+    let out = FileViewerTool
+        .call(
+            json!({"file_path": "oneline.txt", "offset": 1, "limit": 100}),
+            &ctx_in(tmp.path().to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+    let after = peak_rss_kib();
+    let text = out.text_content();
+    assert!(
+        !out.is_error && text.contains("Lines 1-1 of 1"),
+        "the capped line must still be served and counted as one line: {text}"
+    );
+    assert!(
+        text.contains("bytes truncated]"),
+        "the marker must name the omitted tail: {text}"
+    );
+
+    let grew_mib = after.saturating_sub(before) / 1024;
+    assert!(
+        grew_mib < 256,
+        "a single 256 MiB line must cost its per-line cap, not its length; RSS grew {grew_mib} MiB"
     );
 }

@@ -23,6 +23,7 @@ use super::ValidationDiagnostic;
 use super::atomic;
 use super::conflict;
 use super::conflict::CheckFailure;
+use super::diff::OldContent;
 use super::diff::format_file_change;
 use super::require_session;
 use super::resolve;
@@ -201,24 +202,26 @@ async fn write_inner(
         }
     }
 
+    let mut old_buffer = String::new();
     let old_content = match tokio::fs::File::open(&full_path).await.ok() {
         Some(mut file) => {
             if policy == ResolvePolicy::Contained {
                 resolve::verify_handle_inside(&file, &cwd, Some(session.anchor()))?;
             }
-            let mut buffer = String::new();
-            match file.read_to_string(&mut buffer).await {
-                Ok(_) => Some(buffer),
-                Err(_) => None,
+            match file.read_to_string(&mut old_buffer).await {
+                Ok(_) => OldContent::Text(&old_buffer),
+                Err(_) => OldContent::NotUtf8,
             }
         }
-        None => None,
+        None => OldContent::Absent,
     };
 
     let mut expected = None;
     if let Some(baseline) = session.baseline_for(&full_path) {
         if baseline.resumed {
-            return Ok(ToolOutput::error_text(resumed_baseline_message(&full_path)));
+            return Ok(ToolOutput::error_text(conflict::resumed_baseline_message(
+                &full_path,
+            )));
         }
         match conflict::check_content_hash_unchanged(baseline.hash, &full_path).await {
             Ok(identity) => expected = Some(identity),
@@ -250,27 +253,9 @@ async fn write_inner(
 
     session.record_baseline(&full_path, state::observe_bytes(content.as_bytes()));
 
-    let message = format_file_change(file_path, old_content.as_deref(), content);
+    let message = format_file_change(file_path, old_content, content);
 
     Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
-}
-
-/// Format the soft-error message for a write held against a resume-armed
-/// baseline.
-///
-/// The path's only recorded observation came from re-arming on resume —
-/// the model never saw the file's bytes in this session — so a hash
-/// compare cannot honestly clear the write: changes made while the
-/// session was inactive would pass it unseen. The text states that and
-/// directs the model to the same recovery path as a staleness refusal.
-fn resumed_baseline_message(path: &Path) -> String {
-    format!(
-        "{path} was last read in a previous session, so its current bytes \
-         are not part of this session's context; not writing until it has \
-         been read here.\n\nRead the file with Read, then re-issue the write \
-         against the content it returns.",
-        path = path.display()
-    )
 }
 
 /// Format a validator's findings as the message that blocks the write.
@@ -657,6 +642,34 @@ mod tests {
             .await
             .unwrap();
         assert!(!after.is_error, "a live read must release the guard");
+    }
+
+    #[tokio::test]
+    async fn overwriting_a_non_utf8_file_is_labeled_not_created() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("blob.bin");
+        std::fs::write(&target, [0xFF, 0xFE]).unwrap();
+        let ctx = ctx_in(tmp.path().to_str().unwrap());
+        let out = WriteTool::new()
+            .call(json!({"file_path": "blob.bin", "content": "text\n"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(
+            out.text_content().starts_with("Changed: blob.bin"),
+            "an existing file must never render as created: {}",
+            out.text_content()
+        );
+        assert!(
+            out.text_content().contains("previous content not UTF-8"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "text\n",
+            "the new content must still land"
+        );
     }
 
     #[tokio::test]

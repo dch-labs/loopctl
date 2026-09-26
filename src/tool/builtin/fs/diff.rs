@@ -48,56 +48,100 @@ enum LineDiff {
     Inserted(String),
 }
 
+/// What a success message renders against: the previous state of the
+/// written target.
+///
+/// Composed by the writing tools when they report a completed write.
+/// The variants exist so that a file with no prior entry, a file with
+/// readable prior text, and a file that existed but did not decode
+/// each render distinctly — conflating the last with either of the
+/// others would mislabel an overwrite as a creation or silently drop
+/// the fact that the replaced bytes were never readable text.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OldContent<'a> {
+    /// The target had no existing filesystem entry.
+    ///
+    /// The message renders the `Created:` block: the new content's
+    /// first lines as an addition preview.
+    Absent,
+
+    /// The target's previous content, decoded as text.
+    ///
+    /// The message renders the `Changed:` block: a line diff (or the
+    /// large-file preview) computed against this text.
+    Text(&'a str),
+
+    /// The target existed, but its bytes were not valid UTF-8.
+    ///
+    /// Nothing can be diffed line-wise against undecodable content,
+    /// so the message renders the `Changed:` header labeled as
+    /// modified with the previous content not UTF-8, and no diff
+    /// body. The write itself is not a creation and must not be
+    /// reported as one.
+    NotUtf8,
+}
+
 /// Format a file change for the tool's success message.
 ///
-/// The output differs by change type:
+/// The output differs by what [`OldContent`] says the target held:
 ///
-/// - **New file** (`old_content` is `None`): prints a `Created:` header
+/// - **New file** ([`OldContent::Absent`]): prints a `Created:` header
 ///   followed by the first 10 lines, each prefixed with `+ `. If the file
 ///   exceeds 10 lines, a `... +N more lines` summary is appended.
-/// - **Edit** (`old_content` is `Some`): prints a `Changed:` header followed
-///   by an LCS-based line diff with 3 lines of context around each change
-///   region. Unchanged context lines are prefixed with two spaces; inserted
-///   lines with `+ `; deleted lines with `- `.
+/// - **Modified, readable text** ([`OldContent::Text`]): prints a
+///   `Changed:` header followed by an LCS-based line diff with 3 lines
+///   of context around each change region. Unchanged context lines are
+///   prefixed with two spaces; inserted lines with `+ `; deleted lines
+///   with `- `.
+/// - **Modified, undecodable bytes** ([`OldContent::NotUtf8`]): prints
+///   the `Changed:` header labeled `previous content not UTF-8` with no
+///   diff body — there is no text to diff against, and an overwrite
+///   must not be reported as a creation.
 ///
 /// The diff format is plain text (no ANSI color codes) so it renders cleanly
 /// in any consumer.
 #[must_use]
 pub(crate) fn format_file_change(
     file_path: &str,
-    old_content: Option<&str>,
+    old_content: OldContent<'_>,
     new_content: &str,
 ) -> String {
-    if let Some(old) = old_content {
-        let old_lines: Vec<&str> = old.lines().collect();
-        let new_lines: Vec<&str> = new_content.lines().collect();
+    match old_content {
+        OldContent::Absent => {
+            let lines: Vec<&str> = new_content.lines().collect();
+            let preview_count = lines.len().min(10);
+            let mut result = format!("Created: {file_path} (new file)\n");
+            for line in lines.iter().take(preview_count) {
+                writeln!(result, "+ {line}").ok();
+            }
+            if lines.len() > preview_count {
+                let more = lines.len().saturating_sub(preview_count);
+                writeln!(result, "... +{more} more lines").ok();
+            }
+            result
+        }
+        OldContent::NotUtf8 => {
+            format!("Changed: {file_path} (modified, previous content not UTF-8)\n")
+        }
+        OldContent::Text(old) => {
+            let old_lines: Vec<&str> = old.lines().collect();
+            let new_lines: Vec<&str> = new_content.lines().collect();
 
-        if old_lines.len().saturating_mul(new_lines.len()) > MAX_LCS_PRODUCT {
-            return format_large_diff(file_path, &old_lines, &new_lines);
-        }
+            if old_lines.len().saturating_mul(new_lines.len()) > MAX_LCS_PRODUCT {
+                return format_large_diff(file_path, &old_lines, &new_lines);
+            }
 
-        let diff = compute_lcs_diff(&old_lines, &new_lines);
-        let mut result = format!("Changed: {file_path} (modified)\n");
-        if let Some(summary) = change_summary(&diff) {
-            result.push_str(&summary);
+            let diff = compute_lcs_diff(&old_lines, &new_lines);
+            let mut result = format!("Changed: {file_path} (modified)\n");
+            if let Some(summary) = change_summary(&diff) {
+                result.push_str(&summary);
+            }
+            if let Some(note) = eof_change_note(old, new_content) {
+                result.push_str(&note);
+            }
+            result.push_str(&format_diff_with_context(&diff, 3));
+            result
         }
-        if let Some(note) = eof_change_note(old, new_content) {
-            result.push_str(&note);
-        }
-        result.push_str(&format_diff_with_context(&diff, 3));
-        result
-    } else {
-        let lines: Vec<&str> = new_content.lines().collect();
-        let preview_count = lines.len().min(10);
-        let mut result = format!("Created: {file_path} (new file)\n");
-        for line in lines.iter().take(preview_count) {
-            writeln!(result, "+ {line}").ok();
-        }
-        if lines.len() > preview_count {
-            let more = lines.len().saturating_sub(preview_count);
-            writeln!(result, "... +{more} more lines").ok();
-        }
-        result
     }
 }
 
@@ -354,7 +398,10 @@ fn is_new_line_inserted(dp: &[usize], stride: usize, i: usize, j: usize) -> bool
 /// `+ `; deleted lines with `- `. To keep the output readable for large
 /// changes, only `context` unchanged lines are shown before and after each
 /// run of insertions/deletions. Runs of unchanged lines longer than
-/// `context` are elided.
+/// `context` are elided — including at end of input, where only an open
+/// change region's pending context is flushed (its trailing context), so
+/// unchanged tail lines distant from the last change never render as if
+/// contiguous with it.
 fn format_diff_with_context(line_diff: &[LineDiff], context: usize) -> String {
     let mut result = String::new();
     let mut pending_context: Vec<String> = Vec::new();
@@ -402,8 +449,10 @@ fn format_diff_with_context(line_diff: &[LineDiff], context: usize) -> String {
             }
         }
     }
-    for ctx_line in &pending_context {
-        writeln!(result, "  {ctx_line}").ok();
+    if in_change {
+        for ctx_line in &pending_context {
+            writeln!(result, "  {ctx_line}").ok();
+        }
     }
     result
 }
@@ -416,7 +465,7 @@ mod tests {
     #[test]
     fn new_file_preview() {
         let content = "line 1\nline 2\nline 3\n";
-        let result = format_file_change("test.rs", None, content);
+        let result = format_file_change("test.rs", OldContent::Absent, content);
         assert!(result.contains("Created: test.rs (new file)"));
         assert!(result.contains("+ line 1"));
         assert!(result.contains("+ line 2"));
@@ -426,7 +475,7 @@ mod tests {
     #[test]
     fn new_file_truncates_long_preview() {
         let content: String = (1..=20).map(|i| format!("line {i}\n")).collect();
-        let result = format_file_change("test.rs", None, &content);
+        let result = format_file_change("test.rs", OldContent::Absent, &content);
         assert!(result.contains("... +10 more lines"));
         assert!(!result.contains("+ line 11"));
     }
@@ -435,7 +484,7 @@ mod tests {
     fn edit_shows_inserted_lines() {
         let old = "a\nb\nc\n";
         let new = "a\nb\nNEW\nc\n";
-        let result = format_file_change("test.rs", Some(old), new);
+        let result = format_file_change("test.rs", OldContent::Text(old), new);
         assert!(result.contains("Changed: test.rs (modified)"));
         assert!(result.contains("+ NEW"));
         assert!(result.contains("  a"));
@@ -446,7 +495,7 @@ mod tests {
     fn edit_shows_deleted_lines() {
         let old = "a\nOLD\nb\nc\n";
         let new = "a\nb\nc\n";
-        let result = format_file_change("test.rs", Some(old), new);
+        let result = format_file_change("test.rs", OldContent::Text(old), new);
         assert!(result.contains("- OLD"));
     }
 
@@ -462,7 +511,7 @@ mod tests {
             .chain(std::iter::once("NEW\n".to_string()))
             .chain((1..=10).map(|i| format!("tail {i}\n")))
             .collect();
-        let result = format_file_change("test.rs", Some(&old), &new);
+        let result = format_file_change("test.rs", OldContent::Text(&old), &new);
         assert!(result.contains("- OLD"));
         assert!(result.contains("+ NEW"));
         assert!(
@@ -481,8 +530,17 @@ mod tests {
         assert!(result.contains("tail 3"), "{result}");
         assert!(!result.contains("tail 4"), "{result}");
         assert!(
-            result.contains("tail 10"),
-            "trailing context closes the tail run: {result}"
+            !result.contains("tail 10"),
+            "distant trailing lines after a closed region must not render: {result}"
+        );
+    }
+
+    #[test]
+    fn non_utf8_previous_content_renders_a_labeled_header_only() {
+        let result = format_file_change("f.bin", OldContent::NotUtf8, "new\n");
+        assert_eq!(
+            result, "Changed: f.bin (modified, previous content not UTF-8)\n",
+            "no summary, no diff body — there is nothing to diff against"
         );
     }
 
@@ -493,7 +551,7 @@ mod tests {
             .map(|i| format!("line {i}\n"))
             .chain(std::iter::once("APPENDED\n".to_string()))
             .collect();
-        let result = format_file_change("big.rs", Some(&old), &new);
+        let result = format_file_change("big.rs", OldContent::Text(&old), &new);
         assert!(
             result.contains("Changed: big.rs (modified, large file)"),
             "{result}"
@@ -510,7 +568,7 @@ mod tests {
             .map(|i| format!("line {i}\n"))
             .chain(std::iter::once("CHANGED\n".to_string()))
             .collect();
-        let result = format_file_change("small.rs", Some(&old), &new);
+        let result = format_file_change("small.rs", OldContent::Text(&old), &new);
         assert!(result.contains("Changed: small.rs (modified)"));
         assert!(!result.contains("large file"));
         assert!(result.contains("- line 100"));
@@ -521,7 +579,7 @@ mod tests {
     fn summary_line_present_for_mixed_edit() {
         let old = "a\nb\nc\n";
         let new = "a\nX\nY\nc\n";
-        let result = format_file_change("f.rs", Some(old), new);
+        let result = format_file_change("f.rs", OldContent::Text(old), new);
         assert!(result.contains("1 line removed"), "{result}");
         assert!(result.contains("2 lines added"), "{result}");
         assert!(result.contains("- b"));
@@ -531,7 +589,7 @@ mod tests {
     #[test]
     fn summary_line_absent_for_noop_edit() {
         let content = "a\nb\nc\n";
-        let result = format_file_change("f.rs", Some(content), content);
+        let result = format_file_change("f.rs", OldContent::Text(content), content);
         assert!(result.starts_with("Changed: f.rs (modified)\n"));
         assert!(!result.contains("line removed"));
         assert!(!result.contains("line added"));
@@ -543,14 +601,14 @@ mod tests {
     fn summary_line_pure_deletion() {
         let old = "a\nb\nc\n";
         let new = "a\nc\n";
-        let result = format_file_change("f.rs", Some(old), new);
+        let result = format_file_change("f.rs", OldContent::Text(old), new);
         assert!(result.contains("1 line removed"), "{result}");
         assert!(!result.contains("added"));
     }
 
     #[test]
     fn summary_line_empty_old_content_render_without_panic() {
-        let result = format_file_change("f.rs", Some(""), "x\n");
+        let result = format_file_change("f.rs", OldContent::Text(""), "x\n");
         assert!(result.contains("Changed: f.rs (modified)"));
         assert!(result.contains("1 line added"));
         assert!(result.contains("+ x"));
@@ -558,7 +616,7 @@ mod tests {
 
     #[test]
     fn trailing_newline_removed_is_visible() {
-        let result = format_file_change("f.txt", Some("a\n"), "a");
+        let result = format_file_change("f.txt", OldContent::Text("a\n"), "a");
         assert!(result.contains("Changed: f.txt (modified)"));
         assert!(result.contains("No newline at end of file"), "{result}");
         assert!(!result.contains("\n+ "));
@@ -567,19 +625,19 @@ mod tests {
 
     #[test]
     fn trailing_newline_added_is_visible() {
-        let result = format_file_change("f.txt", Some("a"), "a\n");
+        let result = format_file_change("f.txt", OldContent::Text("a"), "a\n");
         assert!(result.contains("Newline added at end of file"), "{result}");
     }
 
     #[test]
     fn unchanged_trailing_newline_emits_no_eof_note() {
-        let result = format_file_change("f.txt", Some("a\n"), "a\n");
+        let result = format_file_change("f.txt", OldContent::Text("a\n"), "a\n");
         assert!(!result.contains("end of file"), "{result}");
     }
 
     #[test]
     fn real_line_change_does_not_trigger_eof_note() {
-        let result = format_file_change("f.txt", Some("a\n"), "b\n");
+        let result = format_file_change("f.txt", OldContent::Text("a\n"), "b\n");
         assert!(result.contains("- a"));
         assert!(result.contains("+ b"));
         assert!(!result.contains("end of file"), "{result}");

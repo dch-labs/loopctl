@@ -43,6 +43,8 @@ use super::atomic;
 use super::conflict::CheckFailure;
 use super::conflict::changed_message;
 use super::conflict::check_content_unchanged;
+use super::conflict::resumed_baseline_message;
+use super::diff::OldContent;
 use super::diff::format_file_change;
 use super::edit::FindResult;
 use super::edit::locate_unique;
@@ -174,13 +176,14 @@ impl Tool for MultiEditTool {
 /// Body of [`Tool::call`].
 ///
 /// Orchestrates the pipeline: parse → dup-path → alias → read → symlink →
-/// overlap-detect → locate+merge → validate → preview, then a per-file
-/// staleness check immediately before each write. Recoverable conditions
-/// (text not found, ambiguous match, overlap, symlink target, a
-/// validator rejection, a file changed on disk since the batch read it)
-/// are surfaced as soft [`ToolOutput`] errors; hard failures (bad args,
-/// missing file, I/O fault) become [`ToolError`]. Each successful write
-/// refreshes the path's recorded baseline.
+/// resumed-hold → overlap-detect → locate+merge → validate → preview, then
+/// a per-file staleness check immediately before each write. Recoverable
+/// conditions (text not found, ambiguous match, overlap, symlink target,
+/// a validator rejection, a file changed on disk since the batch read it,
+/// a target whose only recorded observation is resume-armed) are surfaced
+/// as soft [`ToolOutput`] errors; hard failures (bad args, missing file,
+/// I/O fault) become [`ToolError`]. Each successful write refreshes the
+/// path's recorded baseline.
 ///
 /// # Atomicity scope
 ///
@@ -222,6 +225,9 @@ async fn multi_edit_inner(
         honor_symlink_targets(&mut operations)?;
     }
     let originals = read_files(&operations, session).await?;
+    if let Some(held) = resumed_target(&operations, session) {
+        return Ok(ToolOutput::error_text(resumed_baseline_message(held)));
+    }
     if policy == ResolvePolicy::Contained
         && let Some(reason) = symlink_check(&operations, &cwd)
     {
@@ -666,6 +672,26 @@ fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
         }
     }
     None
+}
+
+/// The first batch target whose only recorded observation is resume-armed,
+/// if any.
+///
+/// Write holds such a target for a live read; the batch applies the same
+/// rule to every distinct target before anything is written, so an edit
+/// can never land on bytes the model never saw in this session. Distinct
+/// physical paths are each checked once.
+fn resumed_target<'a>(operations: &'a [EditOperation], session: &FileSession) -> Option<&'a Path> {
+    let mut seen = std::collections::HashSet::new();
+    operations
+        .iter()
+        .map(|op| op.full_path.as_path())
+        .filter(|path| seen.insert(*path))
+        .find(|path| {
+            session
+                .baseline_for(path)
+                .is_some_and(|baseline| baseline.resumed)
+        })
 }
 
 /// Reject the batch if any target — or any of its in-workspace ancestor
@@ -1128,7 +1154,7 @@ fn build_preview(
         lines.push(format!("File {index}: {}", op.file_path));
         let original = originals.get(&op.file_path).map_or("", String::as_str);
         let final_content = finals.get(&op.file_path).map_or("", String::as_str);
-        let diff = format_file_change(&op.file_path, Some(original), final_content);
+        let diff = format_file_change(&op.file_path, OldContent::Text(original), final_content);
         for line in diff.lines() {
             lines.push(format!("  {line}"));
         }
@@ -1550,6 +1576,56 @@ mod tests {
         assert!(str.contains("minItems"), "{str}");
         assert!(str.contains("maxItems"), "{str}");
         assert!(str.contains("old_text"), "{str}");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_baseline_holds_the_batch_until_a_live_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let held_file = tmp.path().join("held.rs");
+        let free_file = tmp.path().join("free.rs");
+        std::fs::write(&held_file, "alpha\n").unwrap();
+        std::fs::write(&free_file, "beta\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let session = super::super::FileSession::new(PathBuf::from(cwd));
+        let mut ctx = ToolContext::default();
+        ctx.cwd = cwd.to_string();
+        session.attach(&mut ctx);
+        session.record_baseline(&held_file, state::observe_resumed_bytes(b"alpha\n"));
+
+        let batch = json!({"edits": [
+            {"file_path": "held.rs", "old_text": "alpha", "new_text": "ALPHA"},
+            {"file_path": "free.rs", "old_text": "beta", "new_text": "BETA"}
+        ]});
+        let held = MultiEditTool::new()
+            .call(batch.clone(), &ctx)
+            .await
+            .unwrap();
+        assert!(held.is_error, "a resume-armed baseline must hold the batch");
+        assert!(
+            held.text_content().contains("previous session"),
+            "{}",
+            held.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&held_file).unwrap(),
+            "alpha\n",
+            "nothing may be written while held"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&free_file).unwrap(),
+            "beta\n",
+            "the whole batch is refused, not just the held file"
+        );
+
+        session.record_baseline(&held_file, state::observe_bytes(b"alpha\n"));
+        let after = MultiEditTool::new().call(batch, &ctx).await.unwrap();
+        assert!(
+            !after.is_error,
+            "a live read must release the guard: {}",
+            after.text_content()
+        );
+        assert_eq!(std::fs::read_to_string(&held_file).unwrap(), "ALPHA\n");
+        assert_eq!(std::fs::read_to_string(&free_file).unwrap(), "BETA\n");
     }
 
     #[tokio::test]

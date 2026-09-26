@@ -271,7 +271,7 @@ type Scenario = &'static str;
 type ScenarioFn = for<'a> fn(&'a Path) -> Pin<Box<dyn Future<Output = ()> + 'a>>;
 
 #[tokio::test]
-async fn conflict_stress_suite_passes_at_new_home() {
+async fn conflict_stress_suite_passes() {
     let scenarios: Vec<(Scenario, ScenarioFn)> = vec![
         ("read then two writes", |tmp| {
             Box::pin(read_then_two_writes_both_succeed_without_an_external_change(tmp))

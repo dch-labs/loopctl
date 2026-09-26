@@ -1,6 +1,0 @@
-Syntax validation failed for <WORKSPACE>/a.rs:
-  expected `!`
-Blocked to prevent file corruption.
-To bypass this check, use skip_linter: true (not recommended).
-
-No files were modified.

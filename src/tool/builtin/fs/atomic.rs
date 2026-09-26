@@ -3,18 +3,20 @@
 //! Every write lands through one entry point, [`atomic_write`], which
 //! dispatches on the session's resolve policy: the unrestricted
 //! policy takes the plain path-based write, the contained policy
-//! takes the descriptor-pinned walk on Linux and the portable
-//! temp-and-rename arm elsewhere. All arms create the new content in
-//! a co-located temporary file and rename it into place, so the
-//! switch is a single filesystem operation with no torn-write
-//! window, and all arms re-check a conflict-check identity on the
-//! target's entry immediately before the rename.
+//! takes the descriptor-pinned walk on unix — and refuses contained
+//! writes outright on platforms without descriptor-relative
+//! operations, deliberately offering no pathname-based fallback. Both
+//! performing arms create the new content in a co-located temporary
+//! file and rename it into place, so the switch is a single
+//! filesystem operation with no torn-write window, and both re-check
+//! a conflict-check identity on the target's entry immediately
+//! before the rename.
 
 use std::fmt;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::sync::Mutex;
 
 use crate::tool::ToolError;
@@ -28,28 +30,20 @@ use super::resolve::ResolvePolicy;
 /// the switch is a single filesystem operation with no torn-write window.
 /// The two policies differ in how much of the filesystem is trusted:
 ///
-/// Under [`ResolvePolicy::Contained`] the write is *pinned* on Linux:
-/// the parent chain is walked from the workspace anchor one component
-/// at a time with `O_NOFOLLOW` — creating missing directories through
-/// that same link-free chain — the temp file is created inside the
-/// pinned directory with `openat`, and the persist is a `renameat`
-/// within that one descriptor. Nothing after validation re-resolves a
-/// path component, so a concurrent swap cannot relocate the write:
+/// Under [`ResolvePolicy::Contained`] the write is *pinned* on unix —
+/// Linux and macOS alike: the parent chain is walked from the
+/// workspace anchor one component at a time with `O_NOFOLLOW` —
+/// creating missing directories through that same link-free chain —
+/// the temp file is created inside the pinned directory with
+/// `openat`, and the persist is a `renameat` within that one
+/// descriptor. Nothing after validation re-resolves a path
+/// component, so a concurrent swap cannot relocate the write:
 /// placement outside the workspace is impossible by construction. A
 /// symbolic link anywhere in the parent chain, or as the final entry,
-/// is refused — resolve it and pass the real path. On other platforms
-/// the contained write takes the portable arm: the same symlink
-/// refusal over the existing prefix — judging only components below
-/// the workspace, so a workspace the operator spells through an alias
-/// writes through that spelling — placement judged against the root
-/// pinned at session construction, then a plain temp-and-rename. That
-/// arm verifies every component by name before writing, so a
-/// component swapped for another entry in the residual window between
-/// the check and the rename is not caught by a descriptor pin and can
-/// redirect the write inside the pinned root. Linux closes that window
-/// with the pinned walk; hosts that need the guarantee on a platform
-/// without descriptor-relative opens should not enable contained
-/// writes there.
+/// is refused — resolve it and pass the real path. On platforms
+/// without descriptor-relative operations contained writes are
+/// refused outright: a pathname-based fallback could not hold this
+/// guarantee, so none is offered.
 ///
 /// Under [`ResolvePolicy::Unrestricted`] the write is the plain
 /// path-based counterpart: temp file in the target's directory,
@@ -92,13 +86,20 @@ pub(crate) fn atomic_write(
     match policy {
         ResolvePolicy::Unrestricted => path_write(target, content, expected),
         ResolvePolicy::Contained => {
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             {
                 pinned_write(target, content, workspace, expected, anchor)
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(unix))]
             {
-                atomic_write_portable(target, content, workspace, anchor, expected)
+                let _ = (target, content, workspace, expected, anchor);
+                Err(ToolError::Execution(
+                    "contained writes require descriptor-relative filesystem \
+                     operations, which this platform does not provide; refuse \
+                     the write or reconstruct the session with an unrestricted \
+                     policy"
+                        .to_string(),
+                ))
             }
         }
     }
@@ -180,14 +181,17 @@ fn swap_abort(target: &Path) -> ToolError {
 ///
 /// Captured once when the session is constructed — following the
 /// anchor spelling's links at that moment — and held until the session
-/// is dropped. On Linux the pin is an open descriptor: contained walks
+/// is dropped. On unix the pin is an open descriptor: contained writes
 /// start from a duplicate of it rather than reopening the anchor
-/// path, and contained reads verify opened handles against its true
-/// location. Elsewhere the pin is the root's canonical path, captured
-/// at the same moment: portable contained checks judge every opened
-/// or written path against it. Either way a symlink swapped onto the
-/// anchor after construction cannot redirect a contained operation:
-/// the root a path is judged against is the one the operator's
+/// path, descending to the target without following links; on Linux,
+/// contained reads also verify opened handles against that
+/// descriptor's true location. On unix platforms other than Linux the
+/// pin additionally carries the root's canonical path — the
+/// comparison root for the name-based read check — and on platforms
+/// without descriptors the canonical path is the pin itself. Either
+/// way a symlink swapped onto the anchor after construction cannot
+/// redirect a contained operation: the root a path is judged against,
+/// and the directory a walk starts from, are the ones the operator's
 /// spelling resolved to at construction time.
 pub(crate) struct WorkspaceAnchor {
     /// The pinned root descriptor, once the workspace root could be
@@ -199,16 +203,19 @@ pub(crate) struct WorkspaceAnchor {
     /// operator's configuration never validated — so contained
     /// operations fail closed until the session is reconstructed with
     /// an openable workspace.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     resolved: Mutex<Option<AnchorFd>>,
 
     /// The workspace root's canonical path, captured at construction.
     ///
-    /// `None` means the root could not be resolved at construction
-    /// time. The anchor never re-resolves the spelling lazily — a
-    /// swap during the gap would capture whatever it then resolved
-    /// to, a directory the operator's configuration never validated —
-    /// so contained operations fail closed until the session is
+    /// The comparison root for the name-based contained-read check on
+    /// platforms without `/proc/self/fd`, and the only pin on
+    /// platforms without descriptors at all. `None` means the root
+    /// could not be resolved at construction time. The anchor never
+    /// re-resolves the spelling lazily — a swap during the gap would
+    /// capture whatever it then resolved to, a directory the
+    /// operator's configuration never validated — so the reads that
+    /// judge against it fail closed until the session is
     /// reconstructed with a resolvable workspace.
     #[cfg(not(target_os = "linux"))]
     pinned_root: Option<PathBuf>,
@@ -224,18 +231,11 @@ impl WorkspaceAnchor {
     /// the workspace spelling resolves to later; reconstructing the
     /// session once the workspace can be pinned is the recovery.
     pub(crate) fn pin(workspace: &Path) -> Self {
-        #[cfg(target_os = "linux")]
-        {
-            let resolved = AnchorFd::open(workspace).ok();
-            Self {
-                resolved: Mutex::new(resolved),
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Self {
-                pinned_root: std::fs::canonicalize(workspace).ok(),
-            }
+        Self {
+            #[cfg(unix)]
+            resolved: Mutex::new(AnchorFd::open(workspace).ok()),
+            #[cfg(not(target_os = "linux"))]
+            pinned_root: std::fs::canonicalize(workspace).ok(),
         }
     }
 
@@ -254,7 +254,7 @@ impl WorkspaceAnchor {
     ///
     /// Returns [`ToolError::Execution`] when no descriptor was pinned
     /// at construction time, or when the duplicate cannot be created.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) fn dup_fd(&self, workspace: &Path) -> Result<i32, ToolError> {
         let slot = self
             .resolved
@@ -354,10 +354,10 @@ impl fmt::Debug for WorkspaceAnchor {
 ///
 /// Wraps a raw descriptor so the walk can hold the anchor root without
 /// reopening it; the drop closes it exactly once on every path.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 struct AnchorFd(i32);
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl AnchorFd {
     /// Open `workspace` as a directory descriptor.
     ///
@@ -377,7 +377,7 @@ impl AnchorFd {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl Drop for AnchorFd {
     fn drop(&mut self) {
         // SAFETY: the descriptor is closed exactly once, here.
@@ -387,7 +387,7 @@ impl Drop for AnchorFd {
 
 /// Unique-name counter for contained temp files, alongside the creating
 /// process's id in the name.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A directory reached through the no-follow contained walk.
@@ -399,7 +399,7 @@ static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// made as the index of their parent's descriptor in
 /// [`walked`](Self::walked) plus the entry name, so a failed walk can
 /// unlink them through still-open descriptors before anything is closed.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[derive(Debug)]
 struct PinnedDir {
     /// The final walked directory — the parent the write targets.
@@ -421,7 +421,7 @@ struct PinnedDir {
     created: Vec<(usize, std::ffi::CString)>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl PinnedDir {
     /// Remove the directories this walk created, deepest first.
     ///
@@ -440,7 +440,7 @@ impl PinnedDir {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl Drop for PinnedDir {
     fn drop(&mut self) {
         for fd in self.walked.drain(..) {
@@ -482,7 +482,7 @@ impl Drop for PinnedDir {
 /// `create_missing` — when a component does not exist. On any error the
 /// walk's own creations are rolled back and every descriptor is closed
 /// before the error is returned.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn open_contained_dir(
     parent: &Path,
     workspace: &Path,
@@ -574,7 +574,42 @@ fn open_contained_dir(
     failure.map(|()| pinned)
 }
 
-/// The contained write on Linux: everything happens through the pinned
+/// Widen a stat mode to the `u32` the permissions API takes.
+///
+/// libc's `mode_t` is `u32` on some unices and `u16` on others; the
+/// widening is an identity where the widths already match, so the walk
+/// compiles against whichever width the platform's libc chose.
+#[cfg(unix)]
+fn stat_mode_u32(mode: libc::mode_t) -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        mode
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        u32::from(mode)
+    }
+}
+
+/// Widen a stat device id to the `u64` identity comparisons use.
+///
+/// libc's `dev_t` is `u64` on some unices and a narrower signed type
+/// on others; the widening is an identity where the widths already
+/// match, and an impossible id when a platform could produce a
+/// negative one, so no real identity ever false-matches.
+#[cfg(unix)]
+fn stat_dev_u64(dev: libc::dev_t) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        dev
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        u64::try_from(dev).unwrap_or(u64::MAX)
+    }
+}
+
+/// The contained write on unix: everything happens through the pinned
 /// directory.
 ///
 /// The parent chain is walked no-follow (creating missing directories),
@@ -593,7 +628,7 @@ fn open_contained_dir(
 /// (missing included), and [`ToolError::Execution`] for temp-file,
 /// write, or rename failures. A temp file that cannot be written is
 /// unlinked before returning.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn pinned_write(
     target: &Path,
     content: &str,
@@ -633,7 +668,7 @@ fn pinned_write(
     let (tmp_name, mut tmp_file) = create_temp_in(pinned.dir_fd)?;
     if let Some(existing) = &existing {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(existing.st_mode & 0o7777);
+        let perms = std::fs::Permissions::from_mode(stat_mode_u32(existing.st_mode) & 0o7777);
         if let Err(e) = tmp_file.set_permissions(perms) {
             drop(tmp_file);
             pinned_discard(pinned.dir_fd, &tmp_name);
@@ -656,7 +691,7 @@ fn pinned_write(
 
     if let Some(identity) = expected {
         match fstatat_entry(pinned.dir_fd, &name, libc::AT_SYMLINK_NOFOLLOW) {
-            Ok(entry) if identity.matches_parts(entry.st_dev, entry.st_ino) => {}
+            Ok(entry) if identity.matches_parts(stat_dev_u64(entry.st_dev), entry.st_ino) => {}
             Ok(_) => {
                 pinned_discard(pinned.dir_fd, &tmp_name);
                 return Err(swap_abort(target));
@@ -699,7 +734,7 @@ fn pinned_write(
 /// Best-effort by contract: the result is discarded and the write's error
 /// is returned regardless, so a cleanup failure leaves a temp file behind
 /// rather than a wrongly deleted target.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn pinned_discard(dir_fd: i32, tmp_name: &std::ffi::CString) {
     // SAFETY: `dir_fd` is the pinned directory and `tmp_name` names a temp file created there.
     let _ = unsafe { libc::unlinkat(dir_fd, tmp_name.as_ptr(), 0) };
@@ -718,7 +753,7 @@ fn pinned_discard(dir_fd: i32, tmp_name: &std::ffi::CString) {
 /// Returns [`ToolError::Execution`] when a temp file cannot be created
 /// for any reason other than a name collision, or when the collision
 /// retry budget is exhausted.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn create_temp_in(dir_fd: i32) -> Result<(std::ffi::CString, std::fs::File), ToolError> {
     use std::ffi::CString;
     use std::os::unix::io::FromRawFd;
@@ -763,7 +798,7 @@ fn create_temp_in(dir_fd: i32) -> Result<(std::ffi::CString, std::fs::File), Too
 ///
 /// Returns the OS error when the entry cannot be stated — including
 /// `ENOENT` for a missing entry.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn fstatat_entry(dir: i32, name: &std::ffi::CString, flags: i32) -> std::io::Result<libc::stat> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `dir` is a valid open descriptor, `name` outlives the call, and the stat buffer is writable.
@@ -784,7 +819,7 @@ fn fstatat_entry(dir: i32, name: &std::ffi::CString, flags: i32) -> std::io::Res
 /// the failed open used — separates the two, so the walk can refuse links
 /// with a precise message. An entry that cannot itself be stated is
 /// reported as not-a-link and lands in the caller's generic error path.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn is_symlink_entry(dir: i32, name: &std::ffi::CString) -> bool {
     fstatat_entry(dir, name, libc::AT_SYMLINK_NOFOLLOW)
         .is_ok_and(|stat| (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK)
@@ -802,7 +837,7 @@ fn is_symlink_entry(dir: i32, name: &std::ffi::CString) -> bool {
 ///
 /// Returns [`ToolError::Execution`] when the path cannot be opened as a
 /// directory, carrying the OS error.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn open_dir_fd(path: &Path, flags: i32) -> Result<i32, ToolError> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -837,7 +872,7 @@ fn open_dir_fd(path: &Path, flags: i32) -> Result<i32, ToolError> {
 /// Returns the OS error when the entry cannot be opened as a directory,
 /// including the failure a symbolic-link component produces under
 /// `O_NOFOLLOW`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn openat_dir(dir: i32, name: &std::ffi::CString) -> std::io::Result<i32> {
     // SAFETY: `dir` is a valid open descriptor and `name` outlives the call; `O_NOFOLLOW` refuses links.
     let fd = unsafe {
@@ -852,114 +887,6 @@ fn openat_dir(dir: i32, name: &std::ffi::CString) -> std::io::Result<i32> {
     } else {
         Ok(fd)
     }
-}
-
-/// The contained write on platforms without descriptor-relative opens:
-/// verify every existing component by name, judge placement against
-/// the pinned root, then temp-and-rename.
-///
-/// The walk refuses a symbolic link anywhere in the target's existing
-/// ancestor prefix below `workspace` or as the final entry — the same
-/// below-workspace judgment the pinned arm enforces. Components at or
-/// above `workspace` are skipped: the anchor's own spelling is the
-/// operator's choice and may cross symlinks by design, so a workspace
-/// spelled through an alias (or on a host whose system directories
-/// are links) writes through that spelling instead of being refused
-/// outright. Placement is then judged against the root pinned at
-/// session construction ([`pinned_containment_root`]): the target's
-/// deepest existing ancestor is canonicalized and must fall inside
-/// that root, so replacing the workspace spelling with a link to an
-/// outside tree mid-session cannot redirect the write outside the
-/// session's root. Persistence stays pathname-based — without
-/// descriptor-relative renames the check-to-rename window remains,
-/// the documented, weaker guarantee this arm offers in exchange for
-/// contained writes existing at all off Linux. Hosts that need the
-/// pinned guarantee should not enable contained writes on platforms
-/// without descriptor-relative opens.
-///
-/// # Errors
-///
-/// Returns [`ToolError::InvalidInput`] when an existing component
-/// below the workspace is a symbolic link, [`ToolError::Execution`]
-/// when placement falls outside the pinned root or the root cannot be
-/// resolved, and every error of the underlying path-based write
-/// otherwise.
-#[cfg(any(not(target_os = "linux"), test))]
-fn atomic_write_portable(
-    target: &Path,
-    content: &str,
-    workspace: &Path,
-    anchor: Option<&WorkspaceAnchor>,
-    expected: Option<&TargetIdentity>,
-) -> Result<(), ToolError> {
-    refuse_symlinked_path(target, workspace)?;
-    let root = pinned_containment_root(workspace, anchor)?;
-    let mut probe = target.to_path_buf();
-    let resolved = loop {
-        match std::fs::canonicalize(&probe) {
-            Ok(path) => break path,
-            Err(_) => match probe.parent() {
-                Some(parent) => probe = parent.to_path_buf(),
-                None => {
-                    return Err(ToolError::Execution(format!(
-                        "cannot verify path containment: no existing ancestor of {}",
-                        target.display()
-                    )));
-                }
-            },
-        }
-    };
-    if !resolved.starts_with(&root) {
-        return Err(ToolError::Execution(format!(
-            "Path escaped the working directory: {}",
-            resolved.display()
-        )));
-    }
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            ToolError::Execution(format!("cannot create directory {}: {e}", parent.display()))
-        })?;
-    }
-    path_write(target, content, expected)
-}
-
-/// Refuse a contained write whose target path crosses a symbolic link
-/// below the workspace.
-///
-/// Walks the target's ancestor prefix from the filesystem root,
-/// statting each accumulated component without following; components
-/// at or above `workspace` are skipped — the anchor's own spelling is
-/// the operator's choice and may cross symlinks by design, the same
-/// below-anchor judgment the pinned write's walk applies — the first
-/// missing component ends the walk (everything below it is about to
-/// be created), and any symbolic link found before that point —
-/// including as the final entry — is refused with the family's shared
-/// link refusal message.
-///
-/// # Errors
-///
-/// Returns [`ToolError::InvalidInput`] naming the offending component
-/// when an existing component of the path below the workspace is a
-/// symbolic link.
-#[cfg(any(not(target_os = "linux"), test))]
-fn refuse_symlinked_path(target: &Path, workspace: &Path) -> Result<(), ToolError> {
-    let mut acc = PathBuf::new();
-    for component in target.components() {
-        acc.push(component.as_os_str());
-        if workspace.starts_with(&acc) {
-            continue;
-        }
-        let Some(meta) = std::fs::symlink_metadata(&acc).ok() else {
-            return Ok(());
-        };
-        if meta.file_type().is_symlink() {
-            return Err(ToolError::InvalidInput(format!(
-                "Refusing to write: {} is a symbolic link. Resolve it and pass the real path.",
-                acc.display()
-            )));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1011,7 +938,7 @@ mod tests {
         assert_eq!(entries, vec!["clean.rs"]);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn atomic_write_preserves_permissions() {
         use std::os::unix::fs::PermissionsExt;
@@ -1037,7 +964,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn atomic_write_creates_missing_parents_under_containment() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1058,7 +985,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn atomic_write_rejects_symlink_target_without_clobbering() {
         use std::os::unix::fs::symlink;
@@ -1170,28 +1097,92 @@ mod tests {
         );
     }
 
+    #[cfg(not(unix))]
     #[test]
-    fn portable_write_creates_and_overwrites() {
+    fn contained_writes_refuse_without_descriptor_operations() {
+        let err = atomic_write(
+            Path::new("x.txt"),
+            "x\n",
+            Path::new("."),
+            ResolvePolicy::Contained,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::Execution(msg) if msg.contains("descriptor-relative")),
+            "contained writes must fail closed naming the platform limitation: {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_write_creates_and_overwrites() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let anchor = WorkspaceAnchor::pin(tmp.path());
         let target = tmp.path().join("note.txt");
-        atomic_write_portable(&target, "v1\n", tmp.path(), None, None).unwrap();
-        atomic_write_portable(&target, "v2\n", tmp.path(), None, None).unwrap();
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2\n");
+        atomic_write(
+            &target,
+            "v1\n",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            None,
+            Some(&anchor),
+        )
+        .unwrap();
+        atomic_write(
+            &target,
+            "v2\n",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            None,
+            Some(&anchor),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "v2\n",
+            "the pinned walk must create and then overwrite through one anchor"
+        );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn portable_write_creates_missing_parents() {
+    fn contained_write_creates_missing_parents() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let anchor = WorkspaceAnchor::pin(tmp.path());
         let target = tmp.path().join("a/b/c/new.txt");
-        atomic_write_portable(&target, "x\n", tmp.path(), None, None).unwrap();
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "x\n");
+        atomic_write(
+            &target,
+            "x\n",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            None,
+            Some(&anchor),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "x\n",
+            "the pinned walk must create the missing chain and land the write"
+        );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn portable_write_leaves_no_temp_residue() {
+    fn contained_write_leaves_no_temp_residue() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let anchor = WorkspaceAnchor::pin(tmp.path());
         let target = tmp.path().join("clean.txt");
-        atomic_write_portable(&target, "x\n", tmp.path(), None, None).unwrap();
+        atomic_write(
+            &target,
+            "x\n",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            None,
+            Some(&anchor),
+        )
+        .unwrap();
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1201,29 +1192,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn portable_write_preserves_permissions() {
+    fn contained_write_preserves_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::TempDir::new().unwrap();
+        let anchor = WorkspaceAnchor::pin(tmp.path());
         let target = tmp.path().join("script.sh");
         std::fs::write(&target, "#!/bin/sh\necho old\n").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o750)).unwrap();
-        atomic_write_portable(&target, "#!/bin/sh\necho new\n", tmp.path(), None, None).unwrap();
+        atomic_write(
+            &target,
+            "#!/bin/sh\necho new\n",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            None,
+            Some(&anchor),
+        )
+        .unwrap();
         let mode = std::fs::metadata(&target).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o750, "got 0o{:o}", mode & 0o777);
     }
 
     #[cfg(unix)]
     #[test]
-    fn portable_write_accepts_a_workspace_spelled_through_an_alias() {
+    fn contained_write_accepts_a_workspace_spelled_through_an_alias() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::TempDir::new().unwrap();
         let real_ws = tmp.path().join("real_ws");
         std::fs::create_dir(&real_ws).unwrap();
         let alias = tmp.path().join("alias_ws");
         symlink(&real_ws, &alias).unwrap();
+        let anchor = WorkspaceAnchor::pin(&alias);
 
         let target = alias.join("note.txt");
-        atomic_write_portable(&target, "ours\n", &alias, None, None).unwrap();
+        atomic_write(
+            &target,
+            "ours\n",
+            &alias,
+            ResolvePolicy::Contained,
+            None,
+            Some(&anchor),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(real_ws.join("note.txt")).unwrap(),
             "ours\n",
@@ -1233,17 +1242,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn portable_write_still_refuses_a_symlink_below_the_workspace() {
+    fn contained_write_refuses_a_symlink_below_the_workspace() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::TempDir::new().unwrap();
+        let anchor = WorkspaceAnchor::pin(tmp.path());
         let outside = tempfile::TempDir::new().unwrap();
         let link = tmp.path().join("escape");
         symlink(outside.path(), &link).unwrap();
 
         let target = link.join("file.txt");
-        let err = atomic_write_portable(&target, "ours\n", tmp.path(), None, None).unwrap_err();
+        let err = atomic_write(
+            &target,
+            "ours\n",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            None,
+            Some(&anchor),
+        )
+        .unwrap_err();
         assert!(
-            matches!(err, ToolError::InvalidInput(ref s) if s.contains("symbolic link")),
+            matches!(err, ToolError::Execution(ref s) if s.contains("symbolic link")),
             "{err:?}"
         );
         assert!(
@@ -1254,41 +1272,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn portable_write_refuses_a_swapped_workspace_spelling() {
-        use std::os::unix::fs::symlink;
-
-        let parent = tempfile::TempDir::new().unwrap();
-        let ws = parent.path().join("ws");
-        std::fs::create_dir(&ws).unwrap();
-        let anchor = WorkspaceAnchor::pin(&ws);
-        let outside = tempfile::TempDir::new().unwrap();
-
-        std::fs::remove_dir(&ws).unwrap();
-        symlink(outside.path(), &ws).unwrap();
-
-        let target = ws.join("escape.txt");
-        let err = atomic_write_portable(&target, "ours\n", &ws, Some(&anchor), None).unwrap_err();
-        assert!(
-            matches!(err, ToolError::Execution(ref s) if s.contains("escaped")),
-            "placement must be judged against the pinned root, not the swapped spelling: {err:?}"
-        );
-        assert!(
-            !outside.path().join("escape.txt").exists(),
-            "nothing may land in the swapped-in tree"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn portable_write_refuses_a_symlinked_final_entry_without_clobbering() {
+    fn contained_write_refuses_a_symlinked_final_entry_without_clobbering() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::TempDir::new().unwrap();
+        let anchor = WorkspaceAnchor::pin(tmp.path());
         let real = tmp.path().join("real.txt");
         std::fs::write(&real, "original\n").unwrap();
         let link = tmp.path().join("link.txt");
         symlink(&real, &link).unwrap();
 
-        let err = atomic_write_portable(&link, "ours\n", tmp.path(), None, None).unwrap_err();
+        let err = atomic_write(
+            &link,
+            "ours\n",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            None,
+            Some(&anchor),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ToolError::InvalidInput(ref s) if s.contains("symbolic link")),
             "{err:?}"
@@ -1309,17 +1310,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn portable_write_refuses_a_symlinked_parent_component() {
+    fn contained_write_refuses_a_symlinked_parent_component() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::TempDir::new().unwrap();
+        let anchor = WorkspaceAnchor::pin(tmp.path());
         let outside = tempfile::TempDir::new().unwrap();
         let link_dir = tmp.path().join("linked");
         symlink(outside.path(), &link_dir).unwrap();
 
         let target = link_dir.join("escape.txt");
-        let err = atomic_write_portable(&target, "ours\n", tmp.path(), None, None).unwrap_err();
+        let err = atomic_write(
+            &target,
+            "ours\n",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            None,
+            Some(&anchor),
+        )
+        .unwrap_err();
         assert!(
-            matches!(err, ToolError::InvalidInput(ref s) if s.contains("symbolic link")),
+            matches!(err, ToolError::Execution(ref s) if s.contains("symbolic link")),
             "{err:?}"
         );
         assert!(
@@ -1328,9 +1338,11 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn portable_write_aborts_on_a_swapped_identity() {
+    async fn contained_write_aborts_on_a_swapped_identity() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let anchor = WorkspaceAnchor::pin(tmp.path());
         let target = tmp.path().join("watched.txt");
         std::fs::write(&target, "checked\n").unwrap();
         let identity = check_content_unchanged("checked\n", &target).await.unwrap();
@@ -1338,8 +1350,15 @@ mod tests {
         std::fs::write(&newcomer, "swapped in\n").unwrap();
         std::fs::rename(&newcomer, &target).unwrap();
 
-        let err = atomic_write_portable(&target, "ours\n", tmp.path(), None, Some(&identity))
-            .unwrap_err();
+        let err = atomic_write(
+            &target,
+            "ours\n",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            Some(&identity),
+            Some(&anchor),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("changed while the write was being prepared"),
@@ -1349,6 +1368,40 @@ mod tests {
             std::fs::read_to_string(&target).unwrap(),
             "swapped in\n",
             "the swapped-in file must be untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_write_refuses_a_swapped_workspace_spelling() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::TempDir::new().unwrap();
+        let ws = parent.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        let anchor = WorkspaceAnchor::pin(&ws);
+        let outside = tempfile::TempDir::new().unwrap();
+
+        std::fs::remove_dir(&ws).unwrap();
+        symlink(outside.path(), &ws).unwrap();
+
+        let target = ws.join("escape.txt");
+        let err = atomic_write(
+            &target,
+            "ours\n",
+            &ws,
+            ResolvePolicy::Contained,
+            None,
+            Some(&anchor),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(_)),
+            "the walk must refuse to persist through a swapped spelling: {err:?}"
+        );
+        assert!(
+            !outside.path().join("escape.txt").exists(),
+            "nothing may land in the swapped-in tree"
         );
     }
 }

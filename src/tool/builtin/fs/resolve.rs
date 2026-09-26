@@ -90,9 +90,10 @@ pub enum ResolvePolicy {
     /// Linux checks the opened handle's real location through its
     /// descriptor, other platforms check the opened path by name
     /// against the root pinned at session construction (the weaker,
-    /// documented residual the portable arms carry), and contained
-    /// writes take the pinned walk on Linux and judge placement
-    /// against that same pinned root elsewhere.
+    /// documented residual the name-based check carries). Contained
+    /// writes persist through the descriptor-pinned walk on unix —
+    /// refused outright on platforms without descriptor-relative
+    /// operations.
     #[default]
     Contained,
 
@@ -139,12 +140,13 @@ pub enum ResolvePolicy {
 /// This is the shared path-resolution primitive used by every
 /// file-touching tool in the family, so they cannot drift apart. A
 /// TOCTOU window remains between this check and the caller's open: on
-/// Linux, file tools close it by verifying the opened handle against
-/// the session's pinned workspace anchor and by writing through a
-/// descriptor-pinned, no-follow walk; on other platforms the handle
-/// check is name-based after the open, judged against the root pinned
-/// at session construction (see [`verify_handle_inside`]), the same
-/// weaker residual the portable write arm documents.
+/// unix, file tools write through a descriptor-pinned, no-follow walk
+/// and verify the opened handle against the session's pinned
+/// workspace anchor — by the descriptor's true location on Linux, by
+/// name against the root pinned at session construction elsewhere
+/// (see [`verify_handle_inside`]), where the read-side check carries
+/// its documented residual; on platforms without descriptor-relative
+/// operations, contained writes are refused outright.
 ///
 /// # Errors
 ///
@@ -283,11 +285,11 @@ pub(crate) fn verify_handle_inside<F: std::os::unix::io::AsRawFd>(
 /// landed against the session's root, not the spelling that produced
 /// it nor wherever the workspace spelling points now. Unrestricted
 /// dispatches skip this check: outside paths are permitted there by
-/// policy. The residual is the one the portable write arm documents:
-/// the answer is derived from the path, not pinned into the handle,
-/// so a component swapped between the open and this check is not
-/// caught — though a swapped path still has to land inside the pinned
-/// root to pass.
+/// policy. The residual is the name-based check's documented weaker
+/// posture: the answer is derived from the path, not pinned into the
+/// handle, so a component swapped between the open and this check is
+/// not caught — though a swapped path still has to land inside the
+/// pinned root to pass.
 ///
 /// # Errors
 ///
@@ -366,11 +368,11 @@ fn verify_handle_pinned<F: std::os::unix::io::AsRawFd>(
 /// link spelled inside the workspace that lands outside is refused by
 /// where it lands, and a workspace spelling swapped mid-session cannot
 /// relocate the root the file is judged against. The residual is the
-/// one the portable write arm documents: the answer is derived from
-/// the path, not pinned into the handle, so a component swapped
-/// between the open and this check is not caught. A canonicalization
-/// failure is a genuine fault, not a policy refusal, and fails
-/// closed.
+/// name-based check's documented weaker posture: the answer is
+/// derived from the path, not pinned into the handle, so a component
+/// swapped between the open and this check is not caught. A
+/// canonicalization failure is a genuine fault, not a policy
+/// refusal, and fails closed.
 ///
 /// # Errors
 ///

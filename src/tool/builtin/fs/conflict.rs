@@ -130,6 +130,7 @@ impl TargetIdentity {
     /// descriptor, which yields raw fields rather than a
     /// [`std::fs::Metadata`], and compares them here. Exact on platforms
     /// with a stable file identity; always true without one.
+    #[cfg(unix)]
     pub(crate) fn matches_parts(self, dev: u64, ino: u64) -> bool {
         #[cfg(unix)]
         {

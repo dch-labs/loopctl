@@ -185,9 +185,11 @@ fn swap_abort(target: &Path) -> ToolError {
 /// start from a duplicate of it rather than reopening the anchor
 /// path, descending to the target without following links; on Linux,
 /// contained reads also verify opened handles against that
-/// descriptor's true location. On unix platforms other than Linux the
-/// pin additionally carries the root's canonical path — the
-/// comparison root for the name-based read check — and on platforms
+/// descriptor's true location. On unix platforms other than Linux,
+/// contained reads grade the opened handle's identity against the
+/// entry its spelling names, stated through that same descriptor,
+/// with the canonical path the pin additionally carries as the
+/// containment root the spelling is judged against; on platforms
 /// without descriptors the canonical path is the pin itself. Either
 /// way a symlink swapped onto the anchor after construction cannot
 /// redirect a contained operation: the root a path is judged against,
@@ -208,15 +210,16 @@ pub(crate) struct WorkspaceAnchor {
 
     /// The workspace root's canonical path, captured at construction.
     ///
-    /// The comparison root for the name-based contained-read check on
-    /// platforms without `/proc/self/fd`, and the only pin on
-    /// platforms without descriptors at all. `None` means the root
-    /// could not be resolved at construction time. The anchor never
-    /// re-resolves the spelling lazily — a swap during the gap would
-    /// capture whatever it then resolved to, a directory the
-    /// operator's configuration never validated — so the reads that
-    /// judge against it fail closed until the session is
-    /// reconstructed with a resolvable workspace.
+    /// The containment root the non-Linux unix read check judges the
+    /// opened spelling's landing against before its handle-identity
+    /// comparison, and the only pin on platforms without descriptors
+    /// at all. `None` means the root could not be resolved at
+    /// construction time. The anchor never re-resolves the spelling
+    /// lazily — a swap during the gap would capture whatever it then
+    /// resolved to, a directory the operator's configuration never
+    /// validated — so the reads that judge against it fail closed
+    /// until the session is reconstructed with a resolvable
+    /// workspace.
     #[cfg(not(target_os = "linux"))]
     pinned_root: Option<PathBuf>,
 }
@@ -341,6 +344,113 @@ pub(crate) fn pinned_containment_root(
         None => std::fs::canonicalize(workspace).map_err(|error| {
             ToolError::Execution(format!("cannot verify path containment: {error}"))
         }),
+    }
+}
+
+/// Verify an opened read handle against the entry its contained spelling
+/// now names, under the pinned anchor (non-Linux unix).
+///
+/// The non-Linux twin of the Linux descriptor check, grading the opened
+/// handle instead of the current pathname. Two prongs, both anchored at
+/// the pinned `root`: the spelling's canonical landing must still fall
+/// under it — the name-based posture, refusing a link left pointing
+/// outside — and the entry at that landing's anchor-relative name, stated
+/// through the anchor's own descriptor with `fstatat` and
+/// `AT_SYMLINK_NOFOLLOW`, must be the same file the handle opened,
+/// compared by device and inode through
+/// [`TargetIdentity::matches_parts`](super::conflict::TargetIdentity::matches_parts).
+/// A path pointed outside at open and restored inside before this check
+/// therefore fails: the restored entry's identity differs from the
+/// outside handle's. The residual is the hardlink case — an outside file
+/// already hardlinked inside shares the opened file's identity and
+/// passes, outside the path-swap threat model — plus the
+/// stat-then-compare window: the handful of syscalls between the
+/// landing judgment and the entry stat, the shape of residual every
+/// stat-then-act check carries.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when the spelling cannot be
+/// canonicalized (fail closed), when the landing falls outside `root`,
+/// when the entry cannot be stated under the anchor (fail closed — an
+/// entry that vanished mid-check included), when the handle cannot be
+/// stated, or when the identities differ.
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+pub(crate) fn verify_read_under_anchor<F: std::os::unix::io::AsRawFd>(
+    handle: &F,
+    path: &Path,
+    root: &Path,
+    workspace: &Path,
+    anchor: &WorkspaceAnchor,
+) -> Result<(), ToolError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let landing = std::fs::canonicalize(path).map_err(|error| {
+        ToolError::Execution(format!("cannot verify path containment: {error}"))
+    })?;
+    if !landing.starts_with(root) {
+        return Err(ToolError::Execution(format!(
+            "Path escaped the working directory: {}",
+            landing.display()
+        )));
+    }
+    let relative = landing.strip_prefix(root).map_err(|_| {
+        ToolError::Execution(format!(
+            "cannot verify path containment: {} is not inside {}",
+            landing.display(),
+            root.display()
+        ))
+    })?;
+    let name = CString::new(relative.as_os_str().as_bytes())
+        .map_err(|_| ToolError::Execution("path contains a NUL byte".to_string()))?;
+    let dir = anchor.dup_fd(workspace)?;
+    let verdict = read_identity_verdict(handle, dir, &name, &landing);
+    // SAFETY: the descriptor `dup_fd` duplicated for this check is closed exactly once, here.
+    unsafe { libc::close(dir) };
+    verdict
+}
+
+/// The identity half of the anchored read check: the entry `name` under
+/// the open anchor directory `dir`, against the file `handle` opened.
+///
+/// Both sides are stated by descriptor — the entry through `fstatat`
+/// with `AT_SYMLINK_NOFOLLOW` under the pinned directory, the opened
+/// file through [`fstat_handle`] on its own descriptor — so neither
+/// side re-resolves a pathname from the ground; the verdict belongs to
+/// the entry and the handle themselves, compared by device and inode.
+/// An entry that cannot be stated is a refusal, not a pass: the landing
+/// the name graded against is gone, so nothing vouches for the handle.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when the entry cannot be stated,
+/// when the handle cannot be stated (both fail closed), or when the
+/// identities differ.
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+fn read_identity_verdict<F: std::os::unix::io::AsRawFd>(
+    handle: &F,
+    dir: i32,
+    name: &std::ffi::CString,
+    landing: &Path,
+) -> Result<(), ToolError> {
+    let entry = fstatat_entry(dir, name, libc::AT_SYMLINK_NOFOLLOW).map_err(|_| {
+        ToolError::Execution(format!(
+            "Path escaped the working directory: {}",
+            landing.display()
+        ))
+    })?;
+    let opened = fstat_handle(handle.as_raw_fd()).map_err(|error| {
+        ToolError::Execution(format!("cannot verify path containment: {error}"))
+    })?;
+    let identity = TargetIdentity::from_parts(stat_dev_u64(opened.st_dev), opened.st_ino);
+    if identity.matches_parts(stat_dev_u64(entry.st_dev), entry.st_ino) {
+        Ok(())
+    } else {
+        Err(ToolError::Execution(format!(
+            "Path escaped the working directory: {}",
+            landing.display()
+        )))
     }
 }
 
@@ -807,6 +917,28 @@ fn fstatat_entry(dir: i32, name: &std::ffi::CString, flags: i32) -> std::io::Res
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: `fstatat` fully initialized the buffer on success.
+    Ok(unsafe { stat.assume_init() })
+}
+
+/// Stat the open descriptor `fd` itself.
+///
+/// The handle-side twin of [`fstatat_entry`]: the stat is taken through
+/// the descriptor the file was opened on, so the identity belongs to the
+/// inode the read will stream from — never to whatever a fresh path
+/// lookup would reach.
+///
+/// # Errors
+///
+/// Returns the OS error when the descriptor cannot be stated.
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+fn fstat_handle(fd: i32) -> std::io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fd` is a valid open descriptor for the call and the stat buffer is writable.
+    let filled = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if filled != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fstat` fully initialized the buffer on success.
     Ok(unsafe { stat.assume_init() })
 }
 

@@ -557,7 +557,7 @@ async fn read_files(
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         if policy == ResolvePolicy::Contained {
-            resolve::verify_handle_inside(&file, workspace, Some(session.anchor()))?;
+            resolve::verify_handle_inside(&file, &op.full_path, workspace, Some(session.anchor()))?;
         }
         let mut content = String::new();
         file.read_to_string(&mut content)

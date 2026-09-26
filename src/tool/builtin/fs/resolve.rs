@@ -86,9 +86,12 @@ pub enum ResolvePolicy {
     /// and through symlinks.
     ///
     /// The default, so every caller that does not name a policy gets
-    /// containment. On platforms where post-open verification is
-    /// unavailable, contained reads fail closed; contained writes use
-    /// the portable arm of the write path.
+    /// containment. Post-open verification runs on every platform:
+    /// Linux checks the opened handle's real location through its
+    /// descriptor, other platforms check the opened path by name —
+    /// the weaker, documented residual the portable arms carry — and
+    /// contained writes take the pinned walk on Linux, the portable
+    /// temp-and-rename arm elsewhere.
     #[default]
     Contained,
 
@@ -137,8 +140,9 @@ pub enum ResolvePolicy {
 /// TOCTOU window remains between this check and the caller's open: on
 /// Linux, file tools close it by verifying the opened handle against
 /// the session's pinned workspace anchor and by writing through a
-/// descriptor-pinned, no-follow walk; on other platforms contained
-/// reads fail closed rather than proceed unverified.
+/// descriptor-pinned, no-follow walk; on other platforms the handle
+/// check is name-based after the open (see [`verify_handle_inside`]),
+/// the same weaker residual the portable write arm documents.
 ///
 /// # Errors
 ///
@@ -228,7 +232,8 @@ fn dangling_link_error(path: &Path) -> ToolError {
     }
 }
 
-/// Verify an opened handle actually resolved inside the workspace (Linux).
+/// Verify an opened handle actually resolved inside the workspace
+/// (Linux).
 ///
 /// Closes the check-to-use race the symlink walk cannot: a concurrent
 /// process may swap a path component between validation and the open,
@@ -236,7 +241,10 @@ fn dangling_link_error(path: &Path) -> ToolError {
 /// produced into the handle, and `/proc/self/fd` reveals its true
 /// location — a handle resolving outside the workspace is rejected
 /// before any bytes move. Unrestricted dispatches skip this check:
-/// outside paths are permitted there by policy.
+/// outside paths are permitted there by policy. The check is
+/// descriptor-based; platforms without `/proc/self/fd` verify the
+/// opened path by name instead, with the weaker residual that arm
+/// documents.
 ///
 /// The comparison anchors at the caller's retained
 /// [`WorkspaceAnchor`](super::atomic::WorkspaceAnchor) when one is
@@ -254,6 +262,61 @@ fn dangling_link_error(path: &Path) -> ToolError {
 /// or when the check cannot be performed (fail closed).
 #[cfg(target_os = "linux")]
 pub(crate) fn verify_handle_inside<F: std::os::unix::io::AsRawFd>(
+    handle: &F,
+    _path: &Path,
+    workspace: &Path,
+    anchor: Option<&super::atomic::WorkspaceAnchor>,
+) -> Result<(), ToolError> {
+    verify_handle_pinned(handle, workspace, anchor)
+}
+
+/// Verify an opened handle actually resolved inside the workspace
+/// (non-Linux).
+///
+/// The name-based twin of the Linux descriptor check: the opened
+/// file's path is canonicalized post-open and compared against the
+/// canonicalized workspace, so the check judges where the path
+/// actually landed rather than the spelling that produced it.
+/// Unrestricted dispatches skip this check: outside paths are
+/// permitted there by policy. The residual is the one the portable
+/// write arm documents: the answer is derived from the path, not
+/// pinned into the handle, so a component swapped between the open
+/// and this check is not caught.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when the opened location is
+/// outside the workspace, or when either canonicalization faults
+/// (fail closed on a genuine fault, not by policy).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn verify_handle_inside<F>(
+    _handle: &F,
+    path: &Path,
+    workspace: &Path,
+    _anchor: Option<&super::atomic::WorkspaceAnchor>,
+) -> Result<(), ToolError> {
+    verify_handle_portable(path, workspace)
+}
+
+/// The descriptor-based containment check behind
+/// [`verify_handle_inside`] on Linux.
+///
+/// The comparison anchors at the caller's retained
+/// [`WorkspaceAnchor`](super::atomic::WorkspaceAnchor) when one is
+/// supplied: the check reads the pinned root's true location from the
+/// descriptor itself, so a symlink swapped onto the workspace
+/// spelling after the session was constructed cannot make the
+/// post-swap location pass — the read is judged against the directory
+/// the operator's spelling resolved to at construction time. Without
+/// an anchor the workspace path is canonicalized at check time.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when the handle's real location
+/// is outside the workspace, when the anchor retained no pinned root,
+/// or when the check cannot be performed (fail closed).
+#[cfg(target_os = "linux")]
+fn verify_handle_pinned<F: std::os::unix::io::AsRawFd>(
     handle: &F,
     workspace: &Path,
     anchor: Option<&super::atomic::WorkspaceAnchor>,
@@ -285,24 +348,39 @@ pub(crate) fn verify_handle_inside<F: std::os::unix::io::AsRawFd>(
     }
 }
 
-/// Non-Linux fallback: fail closed.
+/// The name-based containment check behind [`verify_handle_inside`]
+/// on platforms without `/proc/self/fd`.
 ///
-/// The post-open verification the contained policy relies on is
-/// Linux-only; contained reads must not proceed unverified, so they
-/// return an error on platforms where the check cannot run.
+/// Canonicalizes the opened file's path and the workspace after the
+/// open and accepts when the former starts with the latter —
+/// canonicalization resolves symlinks, so a link spelled inside the
+/// workspace that lands outside is refused by where it lands. The
+/// residual is the one the portable write arm documents: the answer
+/// is derived from the path, not pinned into the handle, so a
+/// component swapped between the open and this check is not caught.
+/// A canonicalization failure on either side is a genuine fault, not
+/// a policy refusal, and fails closed.
 ///
 /// # Errors
 ///
-/// Always returns [`ToolError::Execution`].
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn verify_handle_inside<F>(
-    _handle: &F,
-    _workspace: &Path,
-    _anchor: Option<&super::atomic::WorkspaceAnchor>,
-) -> Result<(), ToolError> {
-    Err(ToolError::Execution(
-        "path containment cannot be verified on this platform".to_string(),
-    ))
+/// Returns [`ToolError::Execution`] when the opened location is
+/// outside the workspace, or when either canonicalization faults.
+#[cfg(any(not(target_os = "linux"), test))]
+fn verify_handle_portable(path: &Path, workspace: &Path) -> Result<(), ToolError> {
+    let actual = std::fs::canonicalize(path).map_err(|error| {
+        ToolError::Execution(format!("cannot verify path containment: {error}"))
+    })?;
+    let root = std::fs::canonicalize(workspace).map_err(|error| {
+        ToolError::Execution(format!("cannot verify path containment: {error}"))
+    })?;
+    if actual.starts_with(&root) {
+        Ok(())
+    } else {
+        Err(ToolError::Execution(format!(
+            "Path escaped the working directory: {}",
+            actual.display()
+        )))
+    }
 }
 
 /// Lexically normalize `path`, collapsing `.` and `..` without touching the
@@ -886,7 +964,7 @@ mod verify_tests {
         let inside = workspace.path().join("inside.txt");
         std::fs::write(&inside, "x").unwrap();
         let handle = std::fs::File::open(&inside).unwrap();
-        assert!(verify_handle_inside(&handle, workspace.path(), None).is_ok());
+        assert!(verify_handle_inside(&handle, &inside, workspace.path(), None).is_ok());
     }
 
     #[test]
@@ -896,7 +974,7 @@ mod verify_tests {
         let file = outside.path().join("outside.txt");
         std::fs::write(&file, "x").unwrap();
         let handle = std::fs::File::open(&file).unwrap();
-        let err = verify_handle_inside(&handle, workspace.path(), None).unwrap_err();
+        let err = verify_handle_inside(&handle, &file, workspace.path(), None).unwrap_err();
         assert!(
             matches!(err, ToolError::Execution(ref s) if s.contains("escaped")),
             "{err:?}"
@@ -915,7 +993,49 @@ mod verify_tests {
         symlink(&secret, &link).unwrap();
 
         let handle = std::fs::File::open(&link).unwrap();
-        let err = verify_handle_inside(&handle, workspace.path(), None).unwrap_err();
+        let err = verify_handle_inside(&handle, &link, workspace.path(), None).unwrap_err();
         assert!(err.to_string().contains("escaped"), "{err}");
+    }
+
+    #[test]
+    fn portable_verify_accepts_a_path_inside_the_workspace() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let inside = workspace.path().join("inside.txt");
+        std::fs::write(&inside, "x").unwrap();
+        assert!(
+            verify_handle_portable(&inside, workspace.path()).is_ok(),
+            "a file inside the workspace must verify"
+        );
+    }
+
+    #[test]
+    fn portable_verify_rejects_a_path_outside_the_workspace() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let file = outside.path().join("outside.txt");
+        std::fs::write(&file, "x").unwrap();
+        let err = verify_handle_portable(&file, workspace.path()).unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref s) if s.contains("escaped")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn portable_verify_sees_through_a_symlink_pointing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "x").unwrap();
+        let link = workspace.path().join("link.txt");
+        symlink(&secret, &link).unwrap();
+
+        let err = verify_handle_portable(&link, workspace.path()).unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref s) if s.contains("escaped")),
+            "the check must judge where the link lands, not its spelling: {err:?}"
+        );
     }
 }

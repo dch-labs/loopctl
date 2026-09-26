@@ -432,7 +432,7 @@ async fn read_existing(
         .await
         .map_err(|e| ToolError::Execution(e.to_string()))?;
     if policy == ResolvePolicy::Contained {
-        resolve::verify_handle_inside(&file, workspace, anchor)?;
+        resolve::verify_handle_inside(&file, full_path, workspace, anchor)?;
     }
     let mut content = String::new();
     file.read_to_string(&mut content)

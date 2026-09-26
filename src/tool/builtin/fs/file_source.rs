@@ -179,7 +179,7 @@ async fn read_capped(session: &FileSession, full: &Path) -> Result<Vec<u8>, Tool
         .await
         .map_err(|e| ToolError::Execution(format!("Failed to open file: {e}")))?;
     if session.resolve_policy() == ResolvePolicy::Contained {
-        resolve::verify_handle_inside(&file, session.cwd(), Some(session.anchor()))?;
+        resolve::verify_handle_inside(&file, full, session.cwd(), Some(session.anchor()))?;
     }
     let cap = super::super::read::DEFAULT_MAX_SIZE_BYTES.saturating_add(1);
     let mut buf = Vec::with_capacity(usize::try_from(cap.min(8192)).unwrap_or(8192));

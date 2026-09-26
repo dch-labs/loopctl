@@ -230,7 +230,7 @@ async fn open_verified(
         .await
         .map_err(|e| ToolError::Execution(e.to_string()))?;
     if session.resolve_policy() == ResolvePolicy::Contained {
-        resolve::verify_handle_inside(&file, session.cwd(), Some(session.anchor()))?;
+        resolve::verify_handle_inside(&file, full_path, session.cwd(), Some(session.anchor()))?;
     }
     Ok(file)
 }

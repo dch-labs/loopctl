@@ -207,7 +207,7 @@ async fn write_inner(
     let old_content = match tokio::fs::File::open(&full_path).await {
         Ok(mut file) => {
             if policy == ResolvePolicy::Contained {
-                resolve::verify_handle_inside(&file, &cwd, Some(session.anchor()))?;
+                resolve::verify_handle_inside(&file, &full_path, &cwd, Some(session.anchor()))?;
             }
             match file.read_to_string(&mut old_buffer).await {
                 Ok(_) => OldContent::Text(&old_buffer),

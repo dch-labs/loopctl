@@ -492,7 +492,7 @@ fn read_resumable(
     }
     let file = std::fs::File::open(&full_path).ok()?;
     if policy == Policy::Contained {
-        resolve::verify_handle_inside(&file, cwd, anchor).ok()?;
+        resolve::verify_handle_inside(&file, &full_path, cwd, anchor).ok()?;
     }
     let cap = super::read::DEFAULT_MAX_SIZE_BYTES.saturating_add(1);
     let mut bytes = Vec::new();
@@ -525,8 +525,9 @@ fn identity_of(path: &Path) -> Option<(u64, u64)> {
 /// Always `None`: there is nothing to key the identity index with, so
 /// records and lookups degrade to path keys alone and the hard-link
 /// alias guard is absent — consistent with this platform's other
-/// degraded checks, which fail closed where containment is at stake and
-/// merely narrow protection where it is not.
+/// degraded checks, which narrow protection where a descriptor or a
+/// stable identity is unavailable (the name-based containment check
+/// among them) rather than refuse the operation outright.
 #[cfg(not(unix))]
 fn identity_of(path: &Path) -> Option<(u64, u64)> {
     let _ = path;

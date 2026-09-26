@@ -163,9 +163,10 @@ impl Tool for WriteTool {
 ///
 /// Returns [`ToolError`] for a missing `FileSession`, a missing
 /// `file_path`, a missing `content`, a URL `file_path` or a path
-/// escaping the working directory, a target whose only recorded
-/// baseline is resume-armed, a target that changed while the write was
-/// being prepared, or a file-system error during parent creation or the
+/// escaping the working directory, an existing target that cannot be
+/// opened or read, a target whose only recorded baseline is
+/// resume-armed, a target that changed while the write was being
+/// prepared, or a file-system error during parent creation or the
 /// atomic write.
 async fn write_inner(
     tool: &WriteTool,
@@ -203,17 +204,29 @@ async fn write_inner(
     }
 
     let mut old_buffer = String::new();
-    let old_content = match tokio::fs::File::open(&full_path).await.ok() {
-        Some(mut file) => {
+    let old_content = match tokio::fs::File::open(&full_path).await {
+        Ok(mut file) => {
             if policy == ResolvePolicy::Contained {
                 resolve::verify_handle_inside(&file, &cwd, Some(session.anchor()))?;
             }
             match file.read_to_string(&mut old_buffer).await {
                 Ok(_) => OldContent::Text(&old_buffer),
-                Err(_) => OldContent::NotUtf8,
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidData => OldContent::NotUtf8,
+                Err(err) => {
+                    return Err(ToolError::Execution(format!(
+                        "cannot read existing file {}: {err}",
+                        full_path.display()
+                    )));
+                }
             }
         }
-        None => OldContent::Absent,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => OldContent::Absent,
+        Err(err) => {
+            return Err(ToolError::Execution(format!(
+                "cannot open existing target {}: {err}",
+                full_path.display()
+            )));
+        }
     };
 
     let mut expected = None;
@@ -669,6 +682,60 @@ mod tests {
             std::fs::read_to_string(&target).unwrap(),
             "text\n",
             "the new content must still land"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_existing_target_refuses_the_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("blocked.d")).unwrap();
+        let ctx = ctx_in(tmp.path().to_str().unwrap());
+        let err = WriteTool::new()
+            .call(json!({"file_path": "blocked.d", "content": "x\n"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::Execution(msg)
+                if msg.starts_with("cannot read existing file") && msg.contains("blocked.d")),
+            "a read fault must refuse the write naming the file: {err}"
+        );
+        let entries: Vec<_> = std::fs::read_dir(tmp.path().join("blocked.d"))
+            .unwrap()
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "the unreadable target must survive untouched, with no temp file inside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unopenable_existing_target_refuses_the_write() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` reads process state and touches no memory.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("secret.txt");
+        std::fs::write(&target, "secrets\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let ctx = ctx_in(tmp.path().to_str().unwrap());
+        let err = WriteTool::new()
+            .call(json!({"file_path": "secret.txt", "content": "x\n"}), &ctx)
+            .await
+            .unwrap_err();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            matches!(&err, ToolError::Execution(msg)
+                if msg.starts_with("cannot open existing target") && msg.contains("secret.txt")),
+            "an open fault must refuse the write naming the file: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "secrets\n",
+            "the unopenable file's bytes must be untouched"
         );
     }
 

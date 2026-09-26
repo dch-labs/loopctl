@@ -5,8 +5,11 @@
 //! can drift apart on what a relative path means or on which escapes
 //! are refused. Containment is checked in two layers — lexical
 //! normalization against the workspace, then a walk of the existing
-//! symlink prefix — and the write path closes the remaining
-//! check-to-open race with descriptor-pinned operations on Linux.
+//! symlink prefix — the write path closes the remaining check-to-open
+//! race with descriptor-pinned operations on unix, and the post-open
+//! read check grades the opened handle itself: the descriptor's true
+//! location on Linux, the handle's identity against the entry its
+//! spelling names under the pinned anchor elsewhere on unix.
 
 use std::path::Component;
 use std::path::Path;
@@ -88,12 +91,14 @@ pub enum ResolvePolicy {
     /// The default, so every caller that does not name a policy gets
     /// containment. Post-open verification runs on every platform:
     /// Linux checks the opened handle's real location through its
-    /// descriptor, other platforms check the opened path by name
-    /// against the root pinned at session construction (the weaker,
-    /// documented residual the name-based check carries). Contained
-    /// writes persist through the descriptor-pinned walk on unix —
-    /// refused outright on platforms without descriptor-relative
-    /// operations.
+    /// descriptor, other unix platforms grade the opened handle's
+    /// identity against the entry its spelling names under the pinned
+    /// anchor (the hardlink residual that check documents), and
+    /// platforms without descriptor-relative operations check the
+    /// opened path by name against the pinned root (their documented
+    /// residual). Contained writes persist through the
+    /// descriptor-pinned walk on unix — refused outright on platforms
+    /// without descriptor-relative operations.
     #[default]
     Contained,
 
@@ -143,10 +148,11 @@ pub enum ResolvePolicy {
 /// unix, file tools write through a descriptor-pinned, no-follow walk
 /// and verify the opened handle against the session's pinned
 /// workspace anchor — by the descriptor's true location on Linux, by
-/// name against the root pinned at session construction elsewhere
-/// (see [`verify_handle_inside`]), where the read-side check carries
-/// its documented residual; on platforms without descriptor-relative
-/// operations, contained writes are refused outright.
+/// the opened handle's identity against the entry its spelling names
+/// under the pinned anchor on other unix platforms, and by name
+/// against the pinned root on platforms without descriptor-relative
+/// operations (see [`verify_handle_inside`] for each arm's residual);
+/// there, contained writes are refused outright.
 ///
 /// # Errors
 ///
@@ -246,9 +252,10 @@ fn dangling_link_error(path: &Path) -> ToolError {
 /// location — a handle resolving outside the workspace is rejected
 /// before any bytes move. Unrestricted dispatches skip this check:
 /// outside paths are permitted there by policy. The check is
-/// descriptor-based; platforms without `/proc/self/fd` verify the
-/// opened path by name instead, with the weaker residual that arm
-/// documents.
+/// descriptor-based; other unix platforms grade the opened handle's
+/// identity against the pinned anchor instead, and platforms without
+/// descriptors verify the opened path by name — each with the
+/// residual its arm documents.
 ///
 /// The comparison anchors at the caller's retained
 /// [`WorkspaceAnchor`](super::atomic::WorkspaceAnchor) when one is
@@ -275,29 +282,61 @@ pub(crate) fn verify_handle_inside<F: std::os::unix::io::AsRawFd>(
 }
 
 /// Verify an opened handle actually resolved inside the workspace
-/// (non-Linux).
+/// (non-Linux unix).
 ///
-/// The name-based twin of the Linux descriptor check: the comparison
-/// root is resolved once — the root pinned at session construction
-/// when an anchor is supplied, fail-closed when the anchor retained
-/// none — and the opened file's path is canonicalized post-open and
-/// judged against it, so the check grades where the path actually
-/// landed against the session's root, not the spelling that produced
-/// it nor wherever the workspace spelling points now. Unrestricted
-/// dispatches skip this check: outside paths are permitted there by
-/// policy. The residual is the name-based check's documented weaker
-/// posture: the answer is derived from the path, not pinned into the
-/// handle, so a component swapped between the open and this check is
-/// not caught — though a swapped path still has to land inside the
-/// pinned root to pass.
+/// Off Linux on unix the check grades the opened handle, not the current
+/// pathname: with an anchor, the root comes from
+/// [`pinned_containment_root`](super::atomic::pinned_containment_root)
+/// and the verdict from
+/// [`verify_read_under_anchor`](super::atomic::verify_read_under_anchor)
+/// — the handle's identity against the entry its spelling now names
+/// under the pinned anchor — so a path pointed outside at open and
+/// restored inside before the check is refused (the hardlink residual
+/// that check documents aside). Anchor-less direct callers keep the
+/// name-based [`verify_handle_portable`], documented as such: without a
+/// pinned root there is no descriptor to state the entry against.
+/// Unrestricted dispatches skip this check: outside paths are permitted
+/// there by policy.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::Execution`] when the opened location is
-/// outside the pinned root, when the anchor retained no pinned root,
-/// or when the canonicalizations fault (fail closed on a genuine
-/// fault, not by policy).
-#[cfg(not(target_os = "linux"))]
+/// Returns [`ToolError::Execution`] when the opened file is not the
+/// entry the contained spelling names under the pinned root, when the
+/// anchor retained no pinned root, or when the check cannot be performed
+/// (fail closed).
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn verify_handle_inside<F: std::os::unix::io::AsRawFd>(
+    handle: &F,
+    path: &Path,
+    workspace: &Path,
+    anchor: Option<&super::atomic::WorkspaceAnchor>,
+) -> Result<(), ToolError> {
+    let root = super::atomic::pinned_containment_root(workspace, anchor)?;
+    match anchor {
+        Some(anchor) => {
+            super::atomic::verify_read_under_anchor(handle, path, &root, workspace, anchor)
+        }
+        None => verify_handle_portable(path, &root),
+    }
+}
+
+/// Verify an opened handle actually resolved inside the workspace
+/// (non-unix platforms).
+///
+/// The name-based fallback for platforms without descriptor-relative
+/// operations: the opened file's path is canonicalized post-open and
+/// judged against the root pinned at session construction. The residual
+/// is the documented open-to-verify window — the answer is derived from
+/// the path, not pinned into the handle, so a component swapped between
+/// the open and this check is not caught.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when the opened location is outside
+/// the pinned root, when the anchor retained no pinned root, or when the
+/// canonicalizations fault (fail closed on a genuine fault, not by
+/// policy).
+#[cfg(not(unix))]
 pub(crate) fn verify_handle_inside<F>(
     _handle: &F,
     path: &Path,
@@ -358,21 +397,24 @@ fn verify_handle_pinned<F: std::os::unix::io::AsRawFd>(
     }
 }
 
-/// The name-based containment check behind [`verify_handle_inside`]
-/// on platforms without `/proc/self/fd`.
+/// The name-based containment judgment: where the opened file's
+/// spelling lands, against the root it is judged by.
 ///
-/// Canonicalizes the opened file's path and judges it against the
-/// caller-resolved `root` — the root pinned at session construction
-/// when the dispatcher supplied an anchor — accepting when the former
-/// falls under the latter. Canonicalization resolves symlinks, so a
-/// link spelled inside the workspace that lands outside is refused by
+/// Serves the anchor-less direct-caller path on unix and every
+/// platform without descriptor operations, behind
+/// [`verify_handle_inside`]; an anchored session off Linux on unix is
+/// graded by the handle-identity check instead. Canonicalizes the
+/// opened file's path and judges it against the caller-resolved
+/// `root` — the root pinned at session construction when the
+/// dispatcher supplied an anchor — accepting when the former falls
+/// under the latter. Canonicalization resolves symlinks, so a link
+/// spelled inside the workspace that lands outside is refused by
 /// where it lands, and a workspace spelling swapped mid-session cannot
-/// relocate the root the file is judged against. The residual is the
-/// name-based check's documented weaker posture: the answer is
-/// derived from the path, not pinned into the handle, so a component
-/// swapped between the open and this check is not caught. A
-/// canonicalization failure is a genuine fault, not a policy
-/// refusal, and fails closed.
+/// relocate the root the file is judged against. The residual is this
+/// flavor's documented posture: the answer is derived from the path,
+/// not pinned into the handle, so a component swapped between the
+/// open and this check is not caught. A canonicalization failure is a
+/// genuine fault, not a policy refusal, and fails closed.
 ///
 /// # Errors
 ///
@@ -1074,6 +1116,82 @@ mod verify_tests {
         assert!(
             matches!(err, ToolError::Execution(ref s) if s.contains("escaped")),
             "the check must judge against the pinned root, not the swapped spelling: {err:?}"
+        );
+    }
+
+    #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+    #[test]
+    fn portable_verify_refuses_a_read_opened_outside_and_restored_inside() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::TempDir::new().unwrap();
+        let ws = parent.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "SECRET").unwrap();
+        let anchor = super::super::atomic::WorkspaceAnchor::pin(&ws);
+
+        let bait = ws.join("bait.txt");
+        symlink(outside.path().join("secret.txt"), &bait).unwrap();
+        let handle = std::fs::File::open(&bait).unwrap();
+        std::fs::remove_file(&bait).unwrap();
+        std::fs::write(&bait, "innocent").unwrap();
+
+        let root = super::super::atomic::pinned_containment_root(&ws, Some(&anchor)).unwrap();
+        let err =
+            super::super::atomic::verify_read_under_anchor(&handle, &bait, &root, &ws, &anchor)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "a handle opened outside and restored inside must be graded by its identity, not the restored name: {err}"
+        );
+    }
+
+    #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+    #[test]
+    fn portable_verify_accepts_a_read_whose_entry_unchanged_under_the_anchor() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let inside = ws.path().join("inside.txt");
+        std::fs::write(&inside, "x").unwrap();
+        let anchor = super::super::atomic::WorkspaceAnchor::pin(ws.path());
+        let handle = std::fs::File::open(&inside).unwrap();
+
+        let root = super::super::atomic::pinned_containment_root(ws.path(), Some(&anchor)).unwrap();
+        assert!(
+            super::super::atomic::verify_read_under_anchor(
+                &handle,
+                &inside,
+                &root,
+                ws.path(),
+                &anchor
+            )
+            .is_ok(),
+            "an unchanged entry under the anchor must verify against its own opened handle"
+        );
+    }
+
+    #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+    #[test]
+    fn portable_verify_accepts_a_read_through_an_inside_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("real.txt"), "x").unwrap();
+        symlink("real.txt", ws.path().join("alias.txt")).unwrap();
+        let anchor = super::super::atomic::WorkspaceAnchor::pin(ws.path());
+        let handle = std::fs::File::open(ws.path().join("alias.txt")).unwrap();
+
+        let root = super::super::atomic::pinned_containment_root(ws.path(), Some(&anchor)).unwrap();
+        assert!(
+            super::super::atomic::verify_read_under_anchor(
+                &handle,
+                &ws.path().join("alias.txt"),
+                &root,
+                ws.path(),
+                &anchor
+            )
+            .is_ok(),
+            "a read through an inside symlink lands on its target; the check must grade the landing, not the link entry"
         );
     }
 }

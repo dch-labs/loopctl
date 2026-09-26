@@ -102,6 +102,19 @@ impl TargetIdentity {
         }
     }
 
+    /// Build the identity from raw stat fields.
+    ///
+    /// The counterpart of [`from_metadata`](Self::from_metadata) for
+    /// descriptor-relative stats, which yield raw fields rather than a
+    /// [`std::fs::Metadata`]: the non-Linux contained-read check builds
+    /// the opened handle's identity this way and compares it, through
+    /// [`matches_parts`](Self::matches_parts), against the entry stated
+    /// under the pinned workspace anchor.
+    #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+    pub(crate) fn from_parts(dev: u64, ino: u64) -> Self {
+        Self { dev, ino }
+    }
+
     /// Whether the path entry `meta` describes is still the checked file.
     ///
     /// The comparison is exact on platforms with a stable file identity: a

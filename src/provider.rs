@@ -1475,9 +1475,10 @@ mod tests {
     fn grok_builder_seeds_the_documented_facts() {
         use crate::api::ApiClient as _;
 
-        let env = EnvGuard::acquire(&["XAI_API_KEY", "GROK_MODEL"]);
+        let env = EnvGuard::acquire(&["XAI_API_KEY", "GROK_MODEL", "XAI_MODEL"]);
         env.set("XAI_API_KEY", "key");
         env.remove("GROK_MODEL");
+        env.remove("XAI_MODEL");
         let client = grok_builder().build().unwrap();
         assert_eq!(client.base_url(), GROK_BASE_URL);
         assert_eq!(client.model(), GROK_DEFAULT_MODEL);

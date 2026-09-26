@@ -1,0 +1,3 @@
+<WORKSPACE>/resumed.txt was last read in a previous session, so its current bytes are not part of this session's context; not writing until it has been read here.
+
+Read the file with Read, then re-issue the write against the content it returns.

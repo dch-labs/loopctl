@@ -1,0 +1,3 @@
+<WORKSPACE>/watched.txt changed on disk since it was read; not writing to avoid clobbering the newer content.
+
+Re-read the file with Read, then re-issue the write against the current content.

@@ -200,8 +200,10 @@ pub struct ObservedEvent {
 /// [`RunEnd`](LoopEvent::RunEnd). The hub holds no per-session state,
 /// so the observer trait's `reset` stays the default no-op. A hub
 /// also hands every subscriber the full content of every callback —
-/// user text, model output, tool inputs and outputs — so keep it
-/// within one trust scope.
+/// user text, model output, tool inputs, and tool results (a result's
+/// text rides the following turn's [`TurnStart`](LoopEvent::TurnStart)
+/// query; its [`ToolPost`](LoopEvent::ToolPost) event carries hash
+/// metadata only) — so keep it within one trust scope.
 ///
 /// ```
 /// use loopctl::observer::EventHub;
@@ -312,7 +314,9 @@ impl LoopObserver for EventHub {
     /// Forwards [`on_turn_start`](LoopObserver::on_turn_start) as a
     /// [`TurnStart`](LoopEvent::TurnStart) event.
     ///
-    /// One per model call the run makes.
+    /// One per model call the run makes; on a turn that follows tool
+    /// dispatch, the context's `query` carries the prior tool result's
+    /// text — the channel by which tool output reaches subscribers.
     fn on_turn_start(&self, ctx: &TurnStartContext) {
         self.publish(LoopEvent::TurnStart(ctx.clone()));
     }
@@ -389,7 +393,10 @@ impl LoopObserver for EventHub {
     /// Forwards [`on_tool_post`](LoopObserver::on_tool_post) as a
     /// [`ToolPost`](LoopEvent::ToolPost) event.
     ///
-    /// Carries the dispatch outcome once the tool call has finished.
+    /// Carries the dispatch outcome — result hash, error flag,
+    /// duration — once the tool call has finished. The tool's output
+    /// text is never carried here; it rides the following turn's
+    /// [`TurnStart`](LoopEvent::TurnStart) query instead.
     fn on_tool_post(&self, ctx: &ToolPostContext) {
         self.publish(LoopEvent::ToolPost(ctx.clone()));
     }

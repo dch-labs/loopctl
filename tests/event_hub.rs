@@ -203,6 +203,47 @@ async fn event_hub_forwards_every_observer_callback() {
 }
 
 #[tokio::test]
+async fn a_tool_results_text_rides_the_next_turn_start_not_the_tool_post_event() {
+    let hub = Arc::new(EventHub::new(256));
+    let mut receiver = hub.subscribe();
+    let mut loop_ = scripted_loop(Arc::clone(&hub), tool_then_finish());
+
+    loop_
+        .run("fix the bug", &RunConfig::default())
+        .await
+        .expect("the scripted run completes");
+
+    let events = drain(&mut receiver);
+    let tool_post_index = events
+        .iter()
+        .position(|e| matches!(e.event, LoopEvent::ToolPost(_)))
+        .expect("the tool_post event is forwarded, so the pin gets its chance to observe a leak");
+    let LoopEvent::ToolPost(tool_post) = &events[tool_post_index].event else {
+        panic!("the located tool_post event must pattern-bind its context");
+    };
+    assert!(
+        tool_post.result_hash.is_some(),
+        "the tool_post event must carry the result hash — its metadata side"
+    );
+    assert!(
+        !format!("{tool_post:?}").contains("done"),
+        "the tool_post event must never carry the tool's output text — it forwards metadata only"
+    );
+    let next_turn_start = events[tool_post_index + 1..]
+        .iter()
+        .find_map(|e| match &e.event {
+            LoopEvent::TurnStart(ctx) => Some(ctx),
+            _ => None,
+        })
+        .expect("the post-tool turn start is forwarded after the tool_post event");
+    assert!(
+        next_turn_start.query.contains("done"),
+        "the tool result text must ride the following turn's start query — the documented \
+         channel by which tool output reaches hub subscribers"
+    );
+}
+
+#[tokio::test]
 async fn slow_subscriber_is_lagged_not_blocking() {
     let hub = Arc::new(EventHub::new(2));
     let mut receiver = hub.subscribe();

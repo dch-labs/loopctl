@@ -76,14 +76,20 @@
 //! The ledger is appended one complete line per record under a
 //! truncate-back repair, so a torn line can only be the file's last. A
 //! consumer treats an unparseable trailing line as end-of-record and
-//! keeps everything before it; no loader ships with this module.
+//! keeps everything before it; no loader ships with this module. An
+//! unknown `kind` from a newer release deserializes to
+//! [`Unknown`](TrajectoryEventKind::Unknown) rather than failing the
+//! line, so an older reader keeps the envelope and `data`.
 //!
 //! # Trust scope
 //!
 //! Every event line carries its callback's content — user text (a
 //! post-tool turn's `query` includes the prior tool result's text),
 //! model output, tool inputs and tool-result metadata — so an events
-//! ledger belongs to the same trust scope as the run it records.
+//! ledger belongs to the same trust scope as the run it records. The
+//! file is created owner-only (`0600`) on unix, matching the hardened
+//! per-run ledger — defense in depth, not a trust boundary; the
+//! permissions of an existing file remain the host's.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -179,6 +185,17 @@ pub enum TrajectoryEventKind {
     /// output text.
     #[serde(rename = "tool.result")]
     ToolResult,
+
+    /// A kind this version does not know.
+    ///
+    /// Deserialization-only: a ledger written by a newer release may
+    /// carry kinds this version has never heard of, and the fallback
+    /// keeps the line parseable — envelope and `data` survive —
+    /// instead of rejecting mid-file. The observer never emits it;
+    /// serializing a hand-constructed `Unknown` is not part of the
+    /// interchange.
+    #[serde(other)]
+    Unknown,
 }
 
 impl TrajectoryEventKind {
@@ -200,6 +217,7 @@ impl TrajectoryEventKind {
             Self::Detection => "detection",
             Self::ToolCall => "tool.call",
             Self::ToolResult => "tool.result",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -1070,6 +1088,99 @@ mod tests {
             serde_json::json!({"query": "a query fa"}),
             "the query must truncate at the observer's configured capture limit — ten \
              characters here"
+        );
+    }
+
+    #[test]
+    fn an_unknown_future_kind_still_parses_with_its_envelope_intact() {
+        let line = concat!(
+            r#"{"seq":3,"ts":"2026-09-28T00:00:00Z","run_id":1,"session_id":"s-1","#,
+            r#""turn":null,"kind":"gate.decision","data":{"rule":"budget"}}"#
+        );
+        let event: TrajectoryEvent = serde_json::from_str(line).expect(
+            "an unknown kind from a newer release must not reject the whole line — the \
+             envelope and data survive for an older reader",
+        );
+        assert_eq!(
+            event.kind,
+            TrajectoryEventKind::Unknown,
+            "the unrecognized kind label must land in the fallback variant"
+        );
+        assert_eq!(event.seq, 3, "the envelope's other fields must survive");
+        assert_eq!(
+            event.data,
+            serde_json::json!({"rule": "budget"}),
+            "the kind's payload must survive for a reader that does know the kind"
+        );
+    }
+
+    #[test]
+    fn the_observer_never_emits_the_unknown_kind() {
+        let observer = EventLedgerObserver::writing_to(temp_dir("never-unknown"));
+        let telemetry = compaction_telemetry();
+
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_turn_start(&TurnStartContext {
+            turn: 0,
+            query: "fix the bug".to_string(),
+        });
+        observer.on_tool_pre(&ToolPreContext {
+            turn: 0,
+            tool: "echo".to_string(),
+            tool_call_id: "call_a".to_string(),
+        });
+        observer.on_tool_post(&ToolPostContext {
+            tool_call_id: "call_a".to_string(),
+            turn: 0,
+            tool: "echo".to_string(),
+            result_hash: None,
+            is_error: false,
+            duration: std::time::Duration::from_millis(1),
+            display_hint: None,
+        });
+        observer.on_compaction(&CompactedContext {
+            tokens_before: 10,
+            tokens_after: 5,
+            tokens_saved: 5,
+            reason: crate::compact::CompactReason::ThresholdExceeded,
+            evicted_messages: 0,
+            telemetry,
+        });
+        observer.on_fallback(&FallbackContext {
+            from: "primary".to_string(),
+            to: "backup".to_string(),
+        });
+        observer.on_model_switched(&ModelSwitchedContext {
+            from: "primary".to_string(),
+            to: "backup".to_string(),
+        });
+        observer.on_loop_detected(&LoopDetectedContext {
+            pattern: "echo".to_string(),
+            repetitions: 2,
+        });
+        observer.on_convergence_detected(&ConvergenceDetectedContext {
+            action: "stop".to_string(),
+        });
+        observer.on_turn_end(&TurnEndContext {
+            turn: 0,
+            success: true,
+            error: None,
+            duration_ms: 1,
+            input_tokens: 1,
+            output_tokens: 1,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
+        });
+        observer.on_run_end(&RunEndContext::new(true, None, 1, 1));
+
+        let events = read_events(&observer);
+        assert_eq!(events.len(), 11, "every mapped kind must have fired");
+        assert!(
+            events
+                .iter()
+                .all(|e| e.kind != TrajectoryEventKind::Unknown),
+            "the fallback variant is deserialization-only — no callback may produce it"
         );
     }
 

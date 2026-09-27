@@ -569,9 +569,11 @@ struct OpenCall {
 /// inverts the dependency). The in-memory record survives either way and is
 /// reachable via [`records`](Self::records). Captured records contain
 /// prompt, response, and tool text; the records and any ledger directory
-/// are to be treated as sensitive data. Ledger writes run on a bounded
-/// background worker: run completion serializes the record and enqueues
-/// it, and never waits on filesystem I/O.
+/// are to be treated as sensitive data. On unix the ledger file is
+/// created owner-only (`0600`) — defense in depth, not a trust boundary;
+/// an existing file's permissions remain the host's. Ledger writes run on
+/// a bounded background worker: run completion serializes the record and
+/// enqueues it, and never waits on filesystem I/O.
 ///
 /// # Thread Safety
 ///

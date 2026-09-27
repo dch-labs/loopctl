@@ -137,12 +137,7 @@ fn append_line(dir: &Path, file: &str, line: &str) {
     }
     let path = dir.join(file);
     let _append_guard = recover_guard(LEDGER_APPEND_LOCK.lock());
-    let write = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .and_then(|mut file| {
+    let write = open_ledger(&path).and_then(|mut file| {
             use std::io::{Seek, SeekFrom, Write as _};
             let start = file.seek(SeekFrom::End(0))?;
             let mut out = String::with_capacity(line.len().saturating_add(1));
@@ -186,6 +181,47 @@ fn append_line(dir: &Path, file: &str, line: &str) {
             );
         }
     }
+}
+
+/// Open (or create) a ledger file for appending.
+///
+/// On unix the file is created owner-only (`0600`): both ledger files
+/// carry user-derived text, and restricting creation costs nothing.
+/// The mode applies only at creation — an existing file's permissions
+/// are the host's to manage.
+///
+/// # Errors
+///
+/// The open failure itself, unchanged; the caller's append path turns
+/// it into the ledger's single warn.
+#[cfg(unix)]
+fn open_ledger(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Open (or create) a ledger file for appending.
+///
+/// The non-unix arm of the owner-only open: plain create-and-append,
+/// with platform-default permissions — restricting creation is a unix
+/// affordance; elsewhere file access stays the host's responsibility.
+///
+/// # Errors
+///
+/// The open failure itself, unchanged; the caller's append path turns
+/// it into the ledger's single warn.
+#[cfg(not(unix))]
+fn open_ledger(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
 }
 
 impl WriterShared {
@@ -423,6 +459,33 @@ mod tests {
         drop(state);
         drop(writer);
         std::fs::remove_dir_all(&dir).expect("cleanup succeeds");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_created_ledger_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = temp_dir("mode");
+        let run_writer = LedgerWriter::new(dir.clone());
+        let event_writer = LedgerWriter::with_file(dir.clone(), "events-probe.jsonl", 4, true);
+        run_writer.enqueue("{}".to_string());
+        event_writer.enqueue("{}".to_string());
+        run_writer.flush();
+        event_writer.flush();
+
+        for file in ["trajectory.jsonl", "events-probe.jsonl"] {
+            let mode = std::fs::metadata(dir.join(file))
+                .unwrap_or_else(|_| panic!("the {file} ledger exists after a flush"))
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "a freshly created {file} must be owner-only — both ledgers carry user-derived \
+                 text"
+            );
+        }
     }
 
     #[test]

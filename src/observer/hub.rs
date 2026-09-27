@@ -37,7 +37,8 @@ pub enum LoopEvent {
     /// A run began.
     ///
     /// The first event of every `run()` call; its sequence number is
-    /// always `1`, because the hub resets its counter here.
+    /// always `1`, because the hub resets its counter here, and it is
+    /// the first event stamped with the run's id.
     RunStart(RunStartContext),
 
     /// A run ended.
@@ -138,21 +139,34 @@ pub enum LoopEvent {
     ConvergenceDetected(ConvergenceDetectedContext),
 }
 
-/// A [`LoopEvent`] stamped with its per-run sequence number.
+/// A [`LoopEvent`] stamped with the run it belongs to and that run's
+/// sequence number.
 ///
-/// The payload [`EventHub`] broadcasts. The sequence number starts at
-/// `1` for each run's [`RunStart`](LoopEvent::RunStart) event and
-/// increases by one per event, so a consumer can order what it received
-/// and detect gaps the channel's lag dropping introduced. The struct is
+/// The payload [`EventHub`] broadcasts. The run id distinguishes the
+/// runs flowing through one hub — it moves up by one at each
+/// [`RunStart`](LoopEvent::RunStart) — and the sequence number starts
+/// at `1` for each run's first event and increases by one per event,
+/// so a consumer can order what it received within a run and detect
+/// gaps the channel's lag dropping introduced. The struct is
 /// `#[non_exhaustive]` so later widening stays additive.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ObservedEvent {
+    /// The id of the run this event belongs to.
+    ///
+    /// Assigned by the hub: `1` for the first run observed through it,
+    /// one higher for each later run. Under the hub's one-active-run
+    /// contract every event of a run carries the same id; a second
+    /// [`RunStart`](LoopEvent::RunStart) arriving before the previous
+    /// run's [`RunEnd`](LoopEvent::RunEnd) is the visible signature of
+    /// that contract being broken.
+    pub run_id: u64,
+
     /// The event's per-run sequence number.
     ///
-    /// `1` for the run's first event; strictly increasing within a run.
-    /// Two runs observed through one hub each restart at `1` —
-    /// cross-run ordering is the consumer's concern, not the hub's.
+    /// `1` for the run's first event; strictly increasing within a
+    /// run. Each run restarts at `1` — order runs by
+    /// [`run_id`](Self::run_id) and events within a run by `seq`.
     pub seq: u64,
 
     /// The observed lifecycle moment.
@@ -174,8 +188,20 @@ pub struct ObservedEvent {
 /// receive. That error is the documented lag report — the hub itself
 /// cannot see receiver state and deliberately logs nothing.
 ///
-/// One hub instance per engine; the hub holds no per-session state, so
-/// the observer trait's `reset` stays the default no-op.
+/// One hub instance per engine, and at most one active run per hub.
+/// Do not share one hub across concurrently running engines: the
+/// sequence counter is shared and resets at each
+/// [`on_run_start`](LoopObserver::on_run_start), and a callback
+/// carries no run-scoped signal the hub could attribute it by, so
+/// interleaved events would stamp overlapping, non-monotonic
+/// sequences. Use a separate hub for each concurrently running
+/// engine; a shared hub's misuse is at least visible — the run id
+/// restamps mid-flight with no intervening
+/// [`RunEnd`](LoopEvent::RunEnd). The hub holds no per-session state,
+/// so the observer trait's `reset` stays the default no-op. A hub
+/// also hands every subscriber the full content of every callback —
+/// user text, model output, tool inputs and outputs — so keep it
+/// within one trust scope.
 ///
 /// ```
 /// use loopctl::observer::EventHub;
@@ -198,6 +224,14 @@ pub struct EventHub {
     /// Reset to zero in `on_run_start` and incremented once per
     /// forwarded event, so each run's events number from `1`.
     seq: AtomicU64,
+
+    /// The run id stamped onto forwarded events.
+    ///
+    /// Incremented at each `on_run_start`, so the first run is `1`; the
+    /// value `0` only reaches an event when a callback fires before
+    /// any run start — direct trait misuse, since the engine always
+    /// opens a run before firing callbacks.
+    current_run_id: AtomicU64,
 }
 
 impl EventHub {
@@ -217,6 +251,7 @@ impl EventHub {
         Self {
             sender,
             seq: AtomicU64::new(0),
+            current_run_id: AtomicU64::new(0),
         }
     }
 
@@ -230,7 +265,8 @@ impl EventHub {
         self.sender.subscribe()
     }
 
-    /// Stamp the next sequence number onto `event` and forward it.
+    /// Stamp the current run id and the next per-run sequence number
+    /// onto `event` and forward it.
     ///
     /// Best-effort by design: the send is synchronous and its failure
     /// is discarded, because both failure modes are benign — no
@@ -238,89 +274,184 @@ impl EventHub {
     /// channel has already dropped the oldest events for those
     /// receivers. Either way the engine must never wait on a consumer.
     fn publish(&self, event: LoopEvent) {
+        let run_id = self.current_run_id.load(Ordering::Relaxed);
         let seq = self.seq.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-        drop(self.sender.send(ObservedEvent { seq, event }));
+        drop(self.sender.send(ObservedEvent { run_id, seq, event }));
     }
 }
 
 impl LoopObserver for EventHub {
+    /// Returns the hub's diagnostic name, `"event_hub"`.
+    ///
+    /// Identifies the adapter in engine diagnostics when the hub is the
+    /// registered observer.
     fn name(&self) -> &'static str {
         "event_hub"
     }
 
+    /// Forwards [`on_run_start`](LoopObserver::on_run_start) as a
+    /// [`RunStart`](LoopEvent::RunStart) event.
+    ///
+    /// Also opens the run: the hub's run id moves to the next value
+    /// and the per-run sequence counter resets, so this event carries
+    /// `seq = 1`.
     fn on_run_start(&self, ctx: &RunStartContext) {
+        self.current_run_id.fetch_add(1, Ordering::Relaxed);
         self.seq.store(0, Ordering::Relaxed);
         self.publish(LoopEvent::RunStart(ctx.clone()));
     }
 
+    /// Forwards [`on_run_end`](LoopObserver::on_run_end) as a
+    /// [`RunEnd`](LoopEvent::RunEnd) event.
+    ///
+    /// The last event of a run, whatever its completion status.
     fn on_run_end(&self, ctx: &RunEndContext) {
         self.publish(LoopEvent::RunEnd(ctx.clone()));
     }
 
+    /// Forwards [`on_turn_start`](LoopObserver::on_turn_start) as a
+    /// [`TurnStart`](LoopEvent::TurnStart) event.
+    ///
+    /// One per model call the run makes.
     fn on_turn_start(&self, ctx: &TurnStartContext) {
         self.publish(LoopEvent::TurnStart(ctx.clone()));
     }
 
+    /// Forwards [`on_turn_end`](LoopObserver::on_turn_end) as a
+    /// [`TurnEnd`](LoopEvent::TurnEnd) event.
+    ///
+    /// Carries the turn's stop reason and per-turn totals.
     fn on_turn_end(&self, ctx: &TurnEndContext) {
         self.publish(LoopEvent::TurnEnd(ctx.clone()));
     }
 
+    /// Forwards [`on_stream_success`](LoopObserver::on_stream_success)
+    /// as a [`StreamSuccess`](LoopEvent::StreamSuccess) event.
+    ///
+    /// Fired when a provider stream completes without transport error.
     fn on_stream_success(&self, ctx: &StreamContext) {
         self.publish(LoopEvent::StreamSuccess(ctx.clone()));
     }
 
+    /// Forwards [`on_stream_failure`](LoopObserver::on_stream_failure)
+    /// as a [`StreamFailure`](LoopEvent::StreamFailure) event.
+    ///
+    /// Fired on transport-level stream failures, before any retry or
+    /// fallback decision is applied.
     fn on_stream_failure(&self, ctx: &StreamFailureContext) {
         self.publish(LoopEvent::StreamFailure(ctx.clone()));
     }
 
+    /// Forwards [`on_response`](LoopObserver::on_response) as a
+    /// [`Response`](LoopEvent::Response) event.
+    ///
+    /// Carries the assembled response text and token usage.
     fn on_response(&self, ctx: &ResponseContext) {
         self.publish(LoopEvent::Response(ctx.clone()));
     }
 
+    /// Forwards [`on_text_delta`](LoopObserver::on_text_delta) as a
+    /// [`TextDelta`](LoopEvent::TextDelta) event.
+    ///
+    /// One per streamed text delta; ordering within a turn follows the
+    /// stream.
     fn on_text_delta(&self, ctx: &TextDeltaContext) {
         self.publish(LoopEvent::TextDelta(ctx.clone()));
     }
 
+    /// Forwards [`on_thinking_delta`](LoopObserver::on_thinking_delta)
+    /// as a [`ThinkingDelta`](LoopEvent::ThinkingDelta) event.
+    ///
+    /// One per streamed thinking delta, ahead of the text deltas of
+    /// the same stream.
     fn on_thinking_delta(&self, ctx: &ThinkingDeltaContext) {
         self.publish(LoopEvent::ThinkingDelta(ctx.clone()));
     }
 
+    /// Forwards
+    /// [`on_tool_call_received`](LoopObserver::on_tool_call_received)
+    /// as a [`ToolCallReceived`](LoopEvent::ToolCallReceived) event.
+    ///
+    /// Fired when the model's tool call is parsed, before the tool
+    /// runs.
     fn on_tool_call_received(&self, ctx: &ToolCallReceivedContext) {
         self.publish(LoopEvent::ToolCallReceived(ctx.clone()));
     }
 
+    /// Forwards [`on_tool_pre`](LoopObserver::on_tool_pre) as a
+    /// [`ToolPre`](LoopEvent::ToolPre) event.
+    ///
+    /// The last event before the tool executes.
     fn on_tool_pre(&self, ctx: &ToolPreContext) {
         self.publish(LoopEvent::ToolPre(ctx.clone()));
     }
 
+    /// Forwards [`on_tool_post`](LoopObserver::on_tool_post) as a
+    /// [`ToolPost`](LoopEvent::ToolPost) event.
+    ///
+    /// Carries the dispatch outcome once the tool call has finished.
     fn on_tool_post(&self, ctx: &ToolPostContext) {
         self.publish(LoopEvent::ToolPost(ctx.clone()));
     }
 
+    /// Forwards [`on_pre_compaction`](LoopObserver::on_pre_compaction)
+    /// as a [`PreCompaction`](LoopEvent::PreCompaction) event.
+    ///
+    /// Fired before a compaction pass runs, with the token counts that
+    /// triggered it.
     fn on_pre_compaction(&self, ctx: &PreCompactionContext) {
         self.publish(LoopEvent::PreCompaction(ctx.clone()));
     }
 
+    /// Forwards [`on_compaction`](LoopObserver::on_compaction) as a
+    /// [`Compaction`](LoopEvent::Compaction) event.
+    ///
+    /// Fired after the pass, with the before and after token counts
+    /// and what the compactor saved.
     fn on_compaction(&self, ctx: &CompactedContext) {
         self.publish(LoopEvent::Compaction(ctx.clone()));
     }
 
+    /// Forwards [`on_fallback`](LoopObserver::on_fallback) as a
+    /// [`Fallback`](LoopEvent::Fallback) event.
+    ///
+    /// Names the model the run fell back from and to.
     fn on_fallback(&self, ctx: &FallbackContext) {
         self.publish(LoopEvent::Fallback(ctx.clone()));
     }
 
+    /// Forwards
+    /// [`on_transport_fallback`](LoopObserver::on_transport_fallback)
+    /// as a [`TransportFallback`](LoopEvent::TransportFallback) event.
+    ///
+    /// Fired when a failed streaming turn is retried over the
+    /// non-streaming transport.
     fn on_transport_fallback(&self, ctx: &TransportFallbackContext) {
         self.publish(LoopEvent::TransportFallback(ctx.clone()));
     }
 
+    /// Forwards [`on_model_switched`](LoopObserver::on_model_switched)
+    /// as a [`ModelSwitched`](LoopEvent::ModelSwitched) event.
+    ///
+    /// Names the model the run switched from and to.
     fn on_model_switched(&self, ctx: &ModelSwitchedContext) {
         self.publish(LoopEvent::ModelSwitched(ctx.clone()));
     }
 
+    /// Forwards [`on_loop_detected`](LoopObserver::on_loop_detected) as
+    /// a [`LoopDetected`](LoopEvent::LoopDetected) event.
+    ///
+    /// Carries the detected pattern and its repetition count.
     fn on_loop_detected(&self, ctx: &LoopDetectedContext) {
         self.publish(LoopEvent::LoopDetected(ctx.clone()));
     }
 
+    /// Forwards
+    /// [`on_convergence_detected`](LoopObserver::on_convergence_detected)
+    /// as a [`ConvergenceDetected`](LoopEvent::ConvergenceDetected)
+    /// event.
+    ///
+    /// Carries the action the detection triggered.
     fn on_convergence_detected(&self, ctx: &ConvergenceDetectedContext) {
         self.publish(LoopEvent::ConvergenceDetected(ctx.clone()));
     }
@@ -530,6 +661,50 @@ mod tests {
         assert_eq!(
             second.seq, 2,
             "a drained floored ring must hold the next event"
+        );
+    }
+
+    #[test]
+    fn each_run_on_a_shared_hub_carries_its_own_run_id_and_sequence() {
+        let hub = EventHub::new(64);
+        let mut receiver = hub.subscribe();
+        let session_id = uuid::Uuid::new_v4();
+
+        hub.on_run_start(&RunStartContext { session_id });
+        hub.on_run_end(&RunEndContext::new(true, None, 0, 0));
+        hub.on_run_start(&RunStartContext { session_id });
+        hub.on_run_end(&RunEndContext::new(false, None, 1, 5));
+
+        let mut observed = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            observed.push((event.run_id, event.seq));
+        }
+        assert_eq!(
+            observed,
+            vec![(1, 1), (1, 2), (2, 1), (2, 2)],
+            "each run's events must carry that run's id and number its sequence from 1"
+        );
+    }
+
+    #[test]
+    fn a_mid_flight_run_start_restamps_subsequent_events_with_the_newer_run_id() {
+        let hub = EventHub::new(64);
+        let mut receiver = hub.subscribe();
+        let session_id = uuid::Uuid::new_v4();
+
+        hub.on_run_start(&RunStartContext { session_id });
+        hub.on_run_start(&RunStartContext { session_id });
+        hub.on_run_end(&RunEndContext::new(true, None, 0, 0));
+
+        let mut observed = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            observed.push((event.run_id, event.seq, kind_of(&event.event)));
+        }
+        assert_eq!(
+            observed,
+            vec![(1, 1, "run_start"), (2, 1, "run_start"), (2, 2, "run_end"),],
+            "a run starting before the previous one ended must restamp subsequent events with \
+             the newer run id — the visible signature of the unsupported concurrent share"
         );
     }
 }

@@ -178,6 +178,14 @@ async fn event_hub_forwards_every_observer_callback() {
         seqs, expected_seqs,
         "the run's sequence numbers must run from 1 in call order"
     );
+    assert!(
+        events.iter().all(|e| e.run_id == 1),
+        "every event of the first run must carry run id 1: {:?}",
+        events
+            .iter()
+            .map(|e| (e.run_id, e.seq, kind_of(&e.event)))
+            .collect::<Vec<_>>()
+    );
 
     let mut second = scripted_loop(Arc::clone(&hub), vec![terminal()]);
     second
@@ -186,9 +194,11 @@ async fn event_hub_forwards_every_observer_callback() {
         .expect("the second scripted run completes");
     let second_events = drain(&mut receiver);
     assert_eq!(
-        second_events.first().map(|e| (e.seq, kind_of(&e.event))),
-        Some((1, "run_start")),
-        "a second run through the same hub must restart its sequence at 1"
+        second_events
+            .first()
+            .map(|e| (e.run_id, e.seq, kind_of(&e.event))),
+        Some((2, 1, "run_start")),
+        "a second run through the same hub must carry the next run id and restart its sequence at 1"
     );
 }
 

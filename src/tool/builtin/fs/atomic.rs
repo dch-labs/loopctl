@@ -581,7 +581,11 @@ fn handle_currently_under_root<F: std::os::unix::io::AsRawFd>(
         }
         let location = match buffer.iter().position(|byte| *byte == 0) {
             Some(length) if length > 0 => {
-                let bytes: Vec<u8> = buffer[..length].iter().map(|byte| *byte as u8).collect();
+                let bytes: Vec<u8> = buffer
+                    .iter()
+                    .take(length)
+                    .map(|byte| byte.cast_unsigned())
+                    .collect();
                 PathBuf::from(OsStr::from_bytes(&bytes))
             }
             _ => {

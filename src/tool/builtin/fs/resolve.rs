@@ -94,9 +94,13 @@ pub enum ResolvePolicy {
     /// containment. Post-open verification runs on every platform:
     /// Linux checks the opened handle's real location through its
     /// descriptor, other unix platforms grade the opened handle's
-    /// identity against the entry its spelling names under the pinned
-    /// anchor (the hardlink residual that check documents), and
-    /// platforms without descriptor-relative operations check the
+    /// identity against the entry its spelling's landing names under
+    /// that landing's pinned parent directory and then re-judge the
+    /// handle's current location against the pinned root at verdict
+    /// time (the hardlink and post-check relocation residuals that
+    /// check documents) — contained reads refuse outright on unix
+    /// platforms with no way to read an open file's current location —
+    /// and platforms without descriptor-relative operations check the
     /// opened path by name against the pinned root (their documented
     /// residual). Contained writes persist through the
     /// descriptor-pinned walk on unix — refused outright on platforms

@@ -1,6 +1,6 @@
-.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal derive-consumer
+.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal derive-consumer darwin-clippy
 
-ci: fmt check check-default clippy test docs examples redaction-minimal derive-consumer
+ci: fmt check check-default clippy test docs examples redaction-minimal derive-consumer darwin-clippy
 
 check:
 	cargo check --all-features
@@ -18,6 +18,9 @@ test:
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo clippy --all-targets -p loopctl-sqlite -- -D warnings
+
+darwin-clippy:
+	cargo clippy --target aarch64-apple-darwin --features fs_tools -- -D warnings
 
 fmt:
 	cargo fmt --all -- --check

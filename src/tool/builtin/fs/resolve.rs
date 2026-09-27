@@ -10,7 +10,8 @@
 //! read check grades the opened handle itself: the descriptor's true
 //! location on Linux, the handle's identity against the entry its
 //! spelling's landing names under that landing's pinned parent
-//! directory elsewhere on unix.
+//! directory — plus the handle's current location re-judged against
+//! the pinned root at verdict time — elsewhere on unix.
 
 use std::path::Component;
 use std::path::Path;
@@ -292,9 +293,11 @@ pub(crate) fn verify_handle_inside<F: std::os::unix::io::AsRawFd>(
 /// and the verdict from
 /// [`verify_read_under_anchor`](super::atomic::verify_read_under_anchor)
 /// — the handle's identity against the entry its spelling's landing
-/// names under that landing's pinned parent directory — so a path
-/// pointed outside at open and restored inside before the check is
-/// refused (the hardlink residual
+/// names under that landing's pinned parent directory, and the handle's
+/// current location against the pinned root at verdict time — so a
+/// path pointed outside at open and restored inside before the check
+/// is refused, and so is a directory relocated out from under the
+/// anchor after the walk pinned it (the hardlink residual
 /// that check documents aside). Anchor-less direct callers keep the
 /// name-based [`verify_handle_portable`], documented as such: without a
 /// pinned root there is no descriptor to state the entry against.

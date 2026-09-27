@@ -166,7 +166,8 @@ async fn read_addressed(session: &FileSession, address: &str) -> Result<SourceCo
 /// metadata check and the read. Under the contained policy the opened
 /// handle is verified against the session's pinned workspace root —
 /// descriptor-pinned on Linux, graded by the handle's identity against
-/// the entry its spelling names under the pinned anchor elsewhere on
+/// the entry its spelling's landing names under that landing's pinned
+/// parent directory elsewhere on
 /// unix, judged by name against the captured canonical root on
 /// platforms without descriptors — so on every platform a symlink
 /// swapped onto the workspace spelling after the session was

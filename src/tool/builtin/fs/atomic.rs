@@ -187,9 +187,11 @@ fn swap_abort(target: &Path) -> ToolError {
 /// contained reads also verify opened handles against that
 /// descriptor's true location. On unix platforms other than Linux,
 /// contained reads grade the opened handle's identity against the
-/// entry its spelling names, stated through that same descriptor,
-/// with the canonical path the pin additionally carries as the
-/// containment root the spelling is judged against; on platforms
+/// entry its spelling's landing names, stated through that landing's
+/// pinned parent directory — reached by the no-follow walk that
+/// descends from a duplicate of that descriptor — with the canonical
+/// path the pin additionally carries as the containment root the
+/// spelling is judged against; on platforms
 /// without descriptors the canonical path is the pin itself. Either
 /// way a symlink swapped onto the anchor after construction cannot
 /// redirect a contained operation: the root a path is judged against,
@@ -219,7 +221,11 @@ pub(crate) struct WorkspaceAnchor {
     /// resolved to, a directory the operator's configuration never
     /// validated — so the reads that judge against it fail closed
     /// until the session is reconstructed with a resolvable
-    /// workspace.
+    /// workspace. The capture is the second of
+    /// [`pin`](WorkspaceAnchor::pin)'s two non-atomic captures
+    /// (descriptor first, canonical path second): a spelling swapped
+    /// in the gap can leave it naming a different directory than the
+    /// pinned descriptor, a divergence that fails closed the same way.
     #[cfg(not(target_os = "linux"))]
     pinned_root: Option<PathBuf>,
 }
@@ -233,6 +239,18 @@ impl WorkspaceAnchor {
     /// and contained operations fail closed rather than pin whatever
     /// the workspace spelling resolves to later; reconstructing the
     /// session once the workspace can be pinned is the recovery.
+    ///
+    /// The pin is two separate captures, not one atomic act: the root
+    /// descriptor is opened first, the canonical path resolved second,
+    /// with a gap between them. A workspace spelling swapped in that
+    /// gap can leave the two naming different directories — the
+    /// descriptor the pre-swap root, the canonical path the post-swap
+    /// one — and such divergence fails closed: the landing judgment
+    /// (against the canonical path) and the walk descent (from the
+    /// descriptor) then disagree, so contained operations refuse until
+    /// the session is reconstructed. Only the documented hardlink
+    /// residual could bridge two different roots; no ordering of two
+    /// captures closes that class.
     pub(crate) fn pin(workspace: &Path) -> Self {
         Self {
             #[cfg(unix)]
@@ -347,23 +365,29 @@ pub(crate) fn pinned_containment_root(
     }
 }
 
-/// Verify an opened read handle against the entry its contained spelling
-/// now names, under the pinned anchor (non-Linux unix).
+/// Verify an opened read handle against the entry its contained spelling's
+/// landing names, through the pinned anchor (non-Linux unix).
 ///
 /// The non-Linux twin of the Linux descriptor check, grading the opened
 /// handle instead of the current pathname. Two prongs, both anchored at
 /// the pinned `root`: the spelling's canonical landing must still fall
 /// under it — the name-based posture, refusing a link left pointing
-/// outside — and the entry at that landing's anchor-relative name, stated
-/// through the anchor's own descriptor with `fstatat` and
-/// `AT_SYMLINK_NOFOLLOW`, must be the same file the handle opened,
-/// compared by device and inode through
+/// outside — and the entry at that landing's file name, stated with
+/// `fstatat` and `AT_SYMLINK_NOFOLLOW` under the landing's pinned
+/// parent directory, must be the same file the handle opened, compared
+/// by device and inode through
 /// [`TargetIdentity::matches_parts`](super::conflict::TargetIdentity::matches_parts).
-/// A path pointed outside at open and restored inside before this check
-/// therefore fails: the restored entry's identity differs from the
-/// outside handle's. The residual is the hardlink case — an outside file
-/// already hardlinked inside shares the opened file's identity and
-/// passes, outside the path-swap threat model — plus the
+/// The parent is itself reached by the no-follow [`open_contained_dir`]
+/// walk from the anchor root, so a directory component swapped for a
+/// symbolic link between the landing judgment and the entry stat cannot
+/// redirect the graded entry — the walk refuses to traverse it. Because
+/// the landing is canonical, legitimate in-workspace directory symlinks
+/// were already resolved away by the first prong; no legitimate read
+/// tightens. A path pointed outside at open and restored inside before
+/// this check therefore fails: the restored entry's identity differs
+/// from the outside handle's. The residual is the hardlink case — an
+/// outside file already hardlinked inside shares the opened file's
+/// identity and passes, outside the path-swap threat model — plus the
 /// stat-then-compare window: the handful of syscalls between the
 /// landing judgment and the entry stat, the shape of residual every
 /// stat-then-act check carries.
@@ -372,9 +396,12 @@ pub(crate) fn pinned_containment_root(
 ///
 /// Returns [`ToolError::Execution`] when the spelling cannot be
 /// canonicalized (fail closed), when the landing falls outside `root`,
-/// when the entry cannot be stated under the anchor (fail closed — an
-/// entry that vanished mid-check included), when the handle cannot be
-/// stated, or when the identities differ.
+/// when the landing has no parent directory or entry name to grade,
+/// when the landing's parent cannot be pinned by the no-follow walk
+/// (fail closed — a component swapped for a symbolic link included),
+/// when the entry cannot be stated under the pinned parent (fail
+/// closed — an entry that vanished mid-check included), when the
+/// handle cannot be stated, or when the identities differ.
 #[cfg(all(unix, any(not(target_os = "linux"), test)))]
 pub(crate) fn verify_read_under_anchor<F: std::os::unix::io::AsRawFd>(
     handle: &F,
@@ -395,38 +422,48 @@ pub(crate) fn verify_read_under_anchor<F: std::os::unix::io::AsRawFd>(
             landing.display()
         )));
     }
-    let relative = landing.strip_prefix(root).map_err(|_| {
+    let parent = landing.parent().ok_or_else(|| {
         ToolError::Execution(format!(
-            "cannot verify path containment: {} is not inside {}",
-            landing.display(),
-            root.display()
+            "cannot verify path containment: {} has no parent directory",
+            landing.display()
         ))
     })?;
-    let name = CString::new(relative.as_os_str().as_bytes())
+    let entry = landing.file_name().ok_or_else(|| {
+        ToolError::Execution(format!(
+            "cannot verify path containment: {} has no entry name",
+            landing.display()
+        ))
+    })?;
+    let name = CString::new(entry.as_bytes())
         .map_err(|_| ToolError::Execution("path contains a NUL byte".to_string()))?;
-    let dir = anchor.dup_fd(workspace)?;
-    let verdict = read_identity_verdict(handle, dir, &name, &landing);
-    // SAFETY: the descriptor `dup_fd` duplicated for this check is closed exactly once, here.
-    unsafe { libc::close(dir) };
-    verdict
+    let pinned = open_contained_dir(parent, workspace, false, Some(anchor)).map_err(|error| {
+        ToolError::Execution(format!("cannot verify path containment: {error}"))
+    })?;
+    read_identity_verdict(handle, pinned.dir_fd, &name, &landing)
 }
 
-/// The identity half of the anchored read check: the entry `name` under
-/// the open anchor directory `dir`, against the file `handle` opened.
+/// The identity half of the anchored read check: the single entry `name`
+/// under the open parent directory `dir`, against the file `handle`
+/// opened.
 ///
-/// Both sides are stated by descriptor — the entry through `fstatat`
-/// with `AT_SYMLINK_NOFOLLOW` under the pinned directory, the opened
-/// file through [`fstat_handle`] on its own descriptor — so neither
-/// side re-resolves a pathname from the ground; the verdict belongs to
-/// the entry and the handle themselves, compared by device and inode.
-/// An entry that cannot be stated is a refusal, not a pass: the landing
+/// The contract is one entry name under one open directory: a `name`
+/// carrying a path separator is refused outright, because `fstatat`
+/// resolves intermediate components following links, so a
+/// multi-component name would re-walk the filesystem by name instead of
+/// grading one pinned entry. Within that contract both sides are stated
+/// by descriptor — the entry through `fstatat` with
+/// `AT_SYMLINK_NOFOLLOW` under the pinned directory, the opened file
+/// through [`fstat_handle`] on its own descriptor — so neither side
+/// re-resolves a pathname from the ground; the verdict belongs to the
+/// entry and the handle themselves, compared by device and inode. An
+/// entry that cannot be stated is a refusal, not a pass: the landing
 /// the name graded against is gone, so nothing vouches for the handle.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::Execution`] when the entry cannot be stated,
-/// when the handle cannot be stated (both fail closed), or when the
-/// identities differ.
+/// Returns [`ToolError::Execution`] when `name` is not a single entry
+/// name, when the entry cannot be stated, when the handle cannot be
+/// stated (both fail closed), or when the identities differ.
 #[cfg(all(unix, any(not(target_os = "linux"), test)))]
 fn read_identity_verdict<F: std::os::unix::io::AsRawFd>(
     handle: &F,
@@ -434,6 +471,12 @@ fn read_identity_verdict<F: std::os::unix::io::AsRawFd>(
     name: &std::ffi::CString,
     landing: &Path,
 ) -> Result<(), ToolError> {
+    if name.to_bytes().contains(&b'/') {
+        return Err(ToolError::Execution(format!(
+            "cannot verify path containment: {} is not a single entry name",
+            name.to_string_lossy()
+        )));
+    }
     let entry = fstatat_entry(dir, name, libc::AT_SYMLINK_NOFOLLOW).map_err(|_| {
         ToolError::Execution(format!(
             "Path escaped the working directory: {}",
@@ -1534,6 +1577,31 @@ mod tests {
         assert!(
             !outside.path().join("escape.txt").exists(),
             "nothing may land in the swapped-in tree"
+        );
+    }
+
+    #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+    #[test]
+    fn a_multi_component_name_is_refused_by_the_entry_stat() {
+        use std::ffi::CString;
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("file.txt"), "SECRET").unwrap();
+        symlink(outside.path(), ws.path().join("sub")).unwrap();
+        let anchor = WorkspaceAnchor::pin(ws.path());
+        let handle = std::fs::File::open(ws.path().join("sub/file.txt")).unwrap();
+        let landing = std::fs::canonicalize(outside.path().join("file.txt")).unwrap();
+
+        let name = CString::new("sub/file.txt").unwrap();
+        let dir = anchor.dup_fd(ws.path()).unwrap();
+        let err = read_identity_verdict(&handle, dir, &name, &landing).unwrap_err();
+        // SAFETY: the duplicated anchor descriptor is closed exactly once, here.
+        unsafe { libc::close(dir) };
+        assert!(
+            err.to_string().contains("cannot verify path containment"),
+            "a multi-component name makes the entry stat re-walk the path by name, so it must be refused: {err}"
         );
     }
 }

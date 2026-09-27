@@ -9,7 +9,8 @@
 //! race with descriptor-pinned operations on unix, and the post-open
 //! read check grades the opened handle itself: the descriptor's true
 //! location on Linux, the handle's identity against the entry its
-//! spelling names under the pinned anchor elsewhere on unix.
+//! spelling's landing names under that landing's pinned parent
+//! directory elsewhere on unix.
 
 use std::path::Component;
 use std::path::Path;
@@ -148,8 +149,9 @@ pub enum ResolvePolicy {
 /// unix, file tools write through a descriptor-pinned, no-follow walk
 /// and verify the opened handle against the session's pinned
 /// workspace anchor — by the descriptor's true location on Linux, by
-/// the opened handle's identity against the entry its spelling names
-/// under the pinned anchor on other unix platforms, and by name
+/// the opened handle's identity against the entry its spelling's
+/// landing names under that landing's pinned parent directory on
+/// other unix platforms, and by name
 /// against the pinned root on platforms without descriptor-relative
 /// operations (see [`verify_handle_inside`] for each arm's residual);
 /// there, contained writes are refused outright.
@@ -289,9 +291,10 @@ pub(crate) fn verify_handle_inside<F: std::os::unix::io::AsRawFd>(
 /// [`pinned_containment_root`](super::atomic::pinned_containment_root)
 /// and the verdict from
 /// [`verify_read_under_anchor`](super::atomic::verify_read_under_anchor)
-/// — the handle's identity against the entry its spelling now names
-/// under the pinned anchor — so a path pointed outside at open and
-/// restored inside before the check is refused (the hardlink residual
+/// — the handle's identity against the entry its spelling's landing
+/// names under that landing's pinned parent directory — so a path
+/// pointed outside at open and restored inside before the check is
+/// refused (the hardlink residual
 /// that check documents aside). Anchor-less direct callers keep the
 /// name-based [`verify_handle_portable`], documented as such: without a
 /// pinned root there is no descriptor to state the entry against.
@@ -1192,6 +1195,59 @@ mod verify_tests {
             )
             .is_ok(),
             "a read through an inside symlink lands on its target; the check must grade the landing, not the link entry"
+        );
+    }
+
+    #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+    #[test]
+    fn portable_verify_accepts_a_depth_two_read_whose_entry_unchanged_under_the_anchor() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("a/b")).unwrap();
+        let deep = ws.path().join("a/b/file.txt");
+        std::fs::write(&deep, "x").unwrap();
+        let anchor = super::super::atomic::WorkspaceAnchor::pin(ws.path());
+        let handle = std::fs::File::open(&deep).unwrap();
+
+        let root = super::super::atomic::pinned_containment_root(ws.path(), Some(&anchor)).unwrap();
+        assert!(
+            super::super::atomic::verify_read_under_anchor(
+                &handle,
+                &deep,
+                &root,
+                ws.path(),
+                &anchor
+            )
+            .is_ok(),
+            "a depth-two read whose entry is unchanged must verify through the pinned-parent walk"
+        );
+    }
+
+    #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+    #[test]
+    fn portable_verify_refuses_a_depth_two_read_opened_outside_and_restored_inside() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::TempDir::new().unwrap();
+        let ws = parent.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        std::fs::create_dir(ws.join("a")).unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "SECRET").unwrap();
+        let anchor = super::super::atomic::WorkspaceAnchor::pin(&ws);
+
+        let bait = ws.join("a/bait.txt");
+        symlink(outside.path().join("secret.txt"), &bait).unwrap();
+        let handle = std::fs::File::open(&bait).unwrap();
+        std::fs::remove_file(&bait).unwrap();
+        std::fs::write(&bait, "innocent").unwrap();
+
+        let root = super::super::atomic::pinned_containment_root(&ws, Some(&anchor)).unwrap();
+        let err =
+            super::super::atomic::verify_read_under_anchor(&handle, &bait, &root, &ws, &anchor)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "a depth-two handle opened outside and restored inside must be graded by its identity, not the restored name: {err}"
         );
     }
 }

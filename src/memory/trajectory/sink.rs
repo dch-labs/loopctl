@@ -24,8 +24,9 @@ const LEDGER_FILE: &str = "trajectory.jsonl";
 /// Default bound on records waiting to be written.
 ///
 /// Sized so that a burst of run completions queues without loss while
-/// bounding memory retained on behalf of a stalled sink.
-const DEFAULT_QUEUE_CAPACITY: usize = 128;
+/// bounding memory retained on behalf of a stalled sink. Shared by the
+/// per-run and per-event writers.
+pub(crate) const DEFAULT_QUEUE_CAPACITY: usize = 128;
 
 /// Serializes ledger appends process-wide.
 ///
@@ -46,8 +47,15 @@ struct WriterShared {
     /// Directory the ledger is appended to.
     ///
     /// Fixed when the writer is constructed; the ledger file inside it
-    /// is [`LEDGER_FILE`], created on first write.
+    /// is the writer's [`file`](Self::file), created on first write.
     dir: PathBuf,
+
+    /// File name of this writer's ledger inside `dir`.
+    ///
+    /// The per-run writer owns `trajectory.jsonl` ([`LEDGER_FILE`]);
+    /// the per-event writer names its sibling stream. Fixed at
+    /// construction so the worker never learns it mid-flight.
+    file: &'static str,
 
     /// Maximum records kept waiting to be written.
     ///
@@ -117,7 +125,7 @@ struct QueueState {
 /// set the file length), the torn line is sealed with a newline so the
 /// damage is bounded to one corrupt line, and the failure is warned.
 /// Best-effort overall: any failure emits exactly one warning.
-fn append_line(dir: &Path, line: &str) {
+fn append_line(dir: &Path, file: &str, line: &str) {
     if std::fs::create_dir_all(dir).is_err() {
         tracing::warn!(
             target: "loopctl::trajectory",
@@ -127,7 +135,7 @@ fn append_line(dir: &Path, line: &str) {
         );
         return;
     }
-    let path = dir.join(LEDGER_FILE);
+    let path = dir.join(file);
     let _append_guard = recover_guard(LEDGER_APPEND_LOCK.lock());
     let write = std::fs::OpenOptions::new()
         .create(true)
@@ -199,7 +207,7 @@ impl WriterShared {
             drop(state);
 
             for line in &batch {
-                append_line(&self.dir, line);
+                append_line(&self.dir, self.file, line);
             }
 
             let mut state = recover_guard(self.state.lock());
@@ -247,18 +255,27 @@ impl LedgerWriter {
     /// [`DEFAULT_QUEUE_CAPACITY`], sized to absorb bursts of run
     /// completions without loss.
     pub(crate) fn new(dir: PathBuf) -> Self {
-        Self::with_capacity(dir, DEFAULT_QUEUE_CAPACITY, true)
+        Self::with_file(dir, LEDGER_FILE, DEFAULT_QUEUE_CAPACITY, true)
     }
 
-    /// A writer with an explicit queue capacity.
+    /// A writer for one named ledger file with an explicit queue capacity.
     ///
-    /// `spawn` starts the worker thread; when spawning fails the writer
-    /// drops every record with a warning rather than writing inline, so
+    /// `file` names the JSON Lines file inside `dir`: the per-run and
+    /// per-event streams point two writers at the same directory under
+    /// different names, keeping each file one pure schema. `spawn`
+    /// starts the worker thread; when spawning fails the writer drops
+    /// every record with a warning rather than writing inline, so
     /// observer callbacks never perform filesystem work regardless of
     /// the worker's fate.
-    fn with_capacity(dir: PathBuf, capacity: usize, spawn: bool) -> Self {
+    pub(crate) fn with_file(
+        dir: PathBuf,
+        file: &'static str,
+        capacity: usize,
+        spawn: bool,
+    ) -> Self {
         let inner = Arc::new(WriterShared {
             dir,
+            file,
             capacity: capacity.max(1),
             state: Mutex::new(QueueState::default()),
             idle: Condvar::new(),
@@ -392,7 +409,7 @@ mod tests {
     #[test]
     fn a_full_queue_drops_the_oldest_record() {
         let dir = temp_dir("overflow");
-        let writer = LedgerWriter::with_capacity(dir.clone(), 1, false);
+        let writer = LedgerWriter::with_file(dir.clone(), LEDGER_FILE, 1, false);
         writer.enqueue("first".to_string());
         writer.enqueue("second".to_string());
         writer.enqueue("third".to_string());
@@ -411,7 +428,7 @@ mod tests {
     #[test]
     fn a_zero_capacity_is_clamped_to_keep_the_newest_record() {
         let dir = temp_dir("zero-cap");
-        let writer = LedgerWriter::with_capacity(dir.clone(), 0, false);
+        let writer = LedgerWriter::with_file(dir.clone(), LEDGER_FILE, 0, false);
         writer.enqueue("first".to_string());
         writer.enqueue("second".to_string());
 
@@ -432,7 +449,7 @@ mod tests {
         // Capacity above the full burst keeps the documented drop-oldest
         // policy out of the picture; the burst behavior *with* the
         // default cap is the overflow test above.
-        let writer = LedgerWriter::with_capacity(dir.clone(), 1024, true);
+        let writer = LedgerWriter::with_file(dir.clone(), LEDGER_FILE, 1024, true);
         let writer = std::sync::Arc::new(writer);
         let mut handles = Vec::new();
         for thread_index in 0..4 {

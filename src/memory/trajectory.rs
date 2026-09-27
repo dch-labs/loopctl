@@ -98,6 +98,10 @@ mod sink;
 use sink::LedgerWriter;
 use std::sync::Arc as StdArc;
 
+mod events;
+
+pub use events::{EventLedgerObserver, TrajectoryEvent, TrajectoryEventKind};
+
 /// Default bound on the response text captured per turn, in characters.
 ///
 /// Keeps one verbose model answer from dominating the record's size;

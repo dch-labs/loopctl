@@ -185,9 +185,14 @@ fn swap_abort(target: &Path) -> ToolError {
 /// start from a duplicate of it rather than reopening the anchor
 /// path, descending to the target without following links; on Linux,
 /// contained reads also verify opened handles against that
-/// descriptor's true location. On unix platforms other than Linux the
-/// pin additionally carries the root's canonical path — the
-/// comparison root for the name-based read check — and on platforms
+/// descriptor's true location. On unix platforms other than Linux,
+/// contained reads grade the opened handle's identity against the
+/// entry its spelling's landing names, stated through that landing's
+/// pinned parent directory — reached by the no-follow walk that
+/// descends from a duplicate of that descriptor — and re-judge the
+/// handle's current location against the pinned root at verdict time,
+/// with the canonical path the pin additionally carries as the
+/// containment root the spelling is judged against; on platforms
 /// without descriptors the canonical path is the pin itself. Either
 /// way a symlink swapped onto the anchor after construction cannot
 /// redirect a contained operation: the root a path is judged against,
@@ -208,15 +213,20 @@ pub(crate) struct WorkspaceAnchor {
 
     /// The workspace root's canonical path, captured at construction.
     ///
-    /// The comparison root for the name-based contained-read check on
-    /// platforms without `/proc/self/fd`, and the only pin on
-    /// platforms without descriptors at all. `None` means the root
-    /// could not be resolved at construction time. The anchor never
-    /// re-resolves the spelling lazily — a swap during the gap would
-    /// capture whatever it then resolved to, a directory the
-    /// operator's configuration never validated — so the reads that
-    /// judge against it fail closed until the session is
-    /// reconstructed with a resolvable workspace.
+    /// The containment root the non-Linux unix read check judges the
+    /// opened spelling's landing against before its handle-identity
+    /// comparison, and the only pin on platforms without descriptors
+    /// at all. `None` means the root could not be resolved at
+    /// construction time. The anchor never re-resolves the spelling
+    /// lazily — a swap during the gap would capture whatever it then
+    /// resolved to, a directory the operator's configuration never
+    /// validated — so the reads that judge against it fail closed
+    /// until the session is reconstructed with a resolvable
+    /// workspace. The capture is the second of
+    /// [`pin`](WorkspaceAnchor::pin)'s two non-atomic captures
+    /// (descriptor first, canonical path second): a spelling swapped
+    /// in the gap can leave it naming a different directory than the
+    /// pinned descriptor, a divergence that fails closed the same way.
     #[cfg(not(target_os = "linux"))]
     pinned_root: Option<PathBuf>,
 }
@@ -230,6 +240,18 @@ impl WorkspaceAnchor {
     /// and contained operations fail closed rather than pin whatever
     /// the workspace spelling resolves to later; reconstructing the
     /// session once the workspace can be pinned is the recovery.
+    ///
+    /// The pin is two separate captures, not one atomic act: the root
+    /// descriptor is opened first, the canonical path resolved second,
+    /// with a gap between them. A workspace spelling swapped in that
+    /// gap can leave the two naming different directories — the
+    /// descriptor the pre-swap root, the canonical path the post-swap
+    /// one — and such divergence fails closed: the landing judgment
+    /// (against the canonical path) and the walk descent (from the
+    /// descriptor) then disagree, so contained operations refuse until
+    /// the session is reconstructed. Only the documented hardlink
+    /// residual could bridge two different roots; no ordering of two
+    /// captures closes that class.
     pub(crate) fn pin(workspace: &Path) -> Self {
         Self {
             #[cfg(unix)]
@@ -344,9 +366,253 @@ pub(crate) fn pinned_containment_root(
     }
 }
 
+/// Verify an opened read handle against the entry its contained spelling's
+/// landing names, through the pinned anchor (non-Linux unix).
+///
+/// The non-Linux twin of the Linux descriptor check, grading the opened
+/// handle instead of the current pathname. Three prongs, the first two
+/// anchored at the pinned `root`: the spelling's canonical landing must
+/// still fall under it — the name-based posture, refusing a link left
+/// pointing outside; the entry at that landing's file name, stated with
+/// `fstatat` and `AT_SYMLINK_NOFOLLOW` under the landing's pinned
+/// parent directory, must be the same file the handle opened, compared
+/// by device and inode through
+/// [`TargetIdentity::matches_parts`](super::conflict::TargetIdentity::matches_parts);
+/// and the handle itself must still live under `root` when the verdict
+/// is reached — [`handle_currently_under_root`] asks the kernel the
+/// descriptor's current location, because descriptors survive renames
+/// and a directory the walk proved inside can be relocated out from
+/// under it afterwards. The parent is itself reached by the no-follow
+/// [`open_contained_dir`] walk from the anchor root, so a directory
+/// component swapped for a symbolic link between the landing judgment
+/// and the entry stat cannot redirect the graded entry — the walk
+/// refuses to traverse it. Because the landing is canonical, legitimate
+/// in-workspace directory symlinks were already resolved away by the
+/// first prong; no legitimate read tightens. A path pointed outside at
+/// open and restored inside before this check therefore fails: the
+/// restored entry's identity differs from the outside handle's, and a
+/// directory moved out from under the anchor fails the third prong
+/// even though its descriptor is the same object the walk pinned. The
+/// residual is the hardlink case — an outside file already hardlinked
+/// inside shares the opened file's identity and passes, outside the
+/// path-swap threat model — plus the relocation window after the check
+/// returns: a component moved in the interval before the read syscall
+/// is the check-then-act residual every such pair carries, the same
+/// class the Linux arm documents.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when the spelling cannot be
+/// canonicalized (fail closed), when the landing falls outside `root`,
+/// when the landing has no parent directory or entry name to grade,
+/// when the landing's parent cannot be pinned by the no-follow walk
+/// (fail closed — a component swapped for a symbolic link included),
+/// when the entry cannot be stated under the pinned parent (fail
+/// closed — an entry that vanished mid-check included), when the
+/// handle cannot be stated, when the identities differ, or when the
+/// handle's current location falls outside `root` or cannot be read
+/// (fail closed).
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+pub(crate) fn verify_read_under_anchor<F: std::os::unix::io::AsRawFd>(
+    handle: &F,
+    path: &Path,
+    root: &Path,
+    workspace: &Path,
+    anchor: &WorkspaceAnchor,
+) -> Result<(), ToolError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let landing = std::fs::canonicalize(path).map_err(|error| {
+        ToolError::Execution(format!("cannot verify path containment: {error}"))
+    })?;
+    if !landing.starts_with(root) {
+        return Err(ToolError::Execution(format!(
+            "Path escaped the working directory: {}",
+            landing.display()
+        )));
+    }
+    let parent = landing.parent().ok_or_else(|| {
+        ToolError::Execution(format!(
+            "cannot verify path containment: {} has no parent directory",
+            landing.display()
+        ))
+    })?;
+    let entry = landing.file_name().ok_or_else(|| {
+        ToolError::Execution(format!(
+            "cannot verify path containment: {} has no entry name",
+            landing.display()
+        ))
+    })?;
+    let name = CString::new(entry.as_bytes())
+        .map_err(|_| ToolError::Execution("path contains a NUL byte".to_string()))?;
+    let pinned = open_contained_dir(parent, workspace, false, Some(anchor)).map_err(|error| {
+        ToolError::Execution(format!("cannot verify path containment: {error}"))
+    })?;
+    read_identity_verdict(handle, pinned.dir_fd, &name, &landing)?;
+    handle_currently_under_root(handle, root)
+}
+
+/// The identity half of the anchored read check: the single entry `name`
+/// under the open parent directory `dir`, against the file `handle`
+/// opened.
+///
+/// The contract is one entry name under one open directory: a `name`
+/// carrying a path separator is refused outright, because `fstatat`
+/// resolves intermediate components following links, so a
+/// multi-component name would re-walk the filesystem by name instead of
+/// grading one pinned entry. Within that contract both sides are stated
+/// by descriptor — the entry through `fstatat` with
+/// `AT_SYMLINK_NOFOLLOW` under the pinned directory, the opened file
+/// through [`fstat_handle`] on its own descriptor — so neither side
+/// re-resolves a pathname from the ground; the verdict belongs to the
+/// entry and the handle themselves, compared by device and inode. An
+/// entry that cannot be stated is a refusal, not a pass: the landing
+/// the name graded against is gone, so nothing vouches for the handle.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when `name` is not a single entry
+/// name, when the entry cannot be stated, when the handle cannot be
+/// stated (both fail closed), or when the identities differ.
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+fn read_identity_verdict<F: std::os::unix::io::AsRawFd>(
+    handle: &F,
+    dir: i32,
+    name: &std::ffi::CString,
+    landing: &Path,
+) -> Result<(), ToolError> {
+    if name.to_bytes().contains(&b'/') {
+        return Err(ToolError::Execution(format!(
+            "cannot verify path containment: {} is not a single entry name",
+            name.to_string_lossy()
+        )));
+    }
+    let entry = fstatat_entry(dir, name, libc::AT_SYMLINK_NOFOLLOW).map_err(|_| {
+        ToolError::Execution(format!(
+            "Path escaped the working directory: {}",
+            landing.display()
+        ))
+    })?;
+    let opened = fstat_handle(handle.as_raw_fd()).map_err(|error| {
+        ToolError::Execution(format!("cannot verify path containment: {error}"))
+    })?;
+    let identity = TargetIdentity::from_parts(stat_dev_u64(opened.st_dev), opened.st_ino);
+    if identity.matches_parts(stat_dev_u64(entry.st_dev), entry.st_ino) {
+        Ok(())
+    } else {
+        Err(ToolError::Execution(format!(
+            "Path escaped the working directory: {}",
+            landing.display()
+        )))
+    }
+}
+
 impl fmt::Debug for WorkspaceAnchor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("WorkspaceAnchor")
+    }
+}
+
+/// Refuse unless `location` falls under `root`.
+///
+/// The component-wise containment judgment the current-location gate
+/// arrives at, against the pinned canonical `root` — the same shape the
+/// landing judgment uses, so an escaped location refuses with the
+/// family's escape message.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when `location` does not fall under
+/// `root`.
+#[cfg(all(
+    any(target_vendor = "apple", target_os = "linux"),
+    any(not(target_os = "linux"), test)
+))]
+fn refuse_unless_under_root(location: &Path, root: &Path) -> Result<(), ToolError> {
+    if location.starts_with(root) {
+        Ok(())
+    } else {
+        Err(ToolError::Execution(format!(
+            "Path escaped the working directory: {}",
+            location.display()
+        )))
+    }
+}
+
+/// Whether the opened handle's descriptor still lives under `root` right
+/// now.
+///
+/// The verdict-time half of the anchored read check: descriptors survive
+/// renames, so a directory the walk proved inside can be relocated
+/// afterwards — this asks the kernel where the handle itself currently
+/// lives and refuses unless that location falls under the pinned `root`,
+/// collapsing the exploitable window to the relocation interval after
+/// the check returns. The facility is platform-native: the descriptor's
+/// resolved path through `fcntl` with `F_GETPATH` on Apple platforms,
+/// `/proc/self/fd` on Linux; a unix platform with no way to read an
+/// open file's current location refuses outright, so contained reads
+/// fail closed there rather than trust a location nobody can check.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when the current location cannot be
+/// read (fail closed — an unreadable or empty answer included), and
+/// when it falls outside `root`.
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+fn handle_currently_under_root<F: std::os::unix::io::AsRawFd>(
+    handle: &F,
+    root: &Path,
+) -> Result<(), ToolError> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut buffer = [0 as libc::c_char; 1024];
+        // SAFETY: the descriptor is valid and open, and `buffer` is writable and large enough for a resolved path.
+        let filled =
+            unsafe { libc::fcntl(handle.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) };
+        if filled < 0 {
+            return Err(ToolError::Execution(format!(
+                "cannot verify path containment: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let location = match buffer.iter().position(|byte| *byte == 0) {
+            Some(length) if length > 0 => {
+                let bytes: Vec<u8> = buffer
+                    .iter()
+                    .take(length)
+                    .map(|byte| byte.cast_unsigned())
+                    .collect();
+                PathBuf::from(OsStr::from_bytes(&bytes))
+            }
+            _ => {
+                return Err(ToolError::Execution(
+                    "cannot verify path containment: the open file's current location could \
+                     not be read"
+                        .to_string(),
+                ));
+            }
+        };
+        refuse_unless_under_root(&location, root)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let location = std::fs::read_link(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+            .map_err(|error| {
+                ToolError::Execution(format!("cannot verify path containment: {error}"))
+            })?;
+        refuse_unless_under_root(&location, root)
+    }
+    #[cfg(all(unix, not(target_os = "linux"), not(target_vendor = "apple")))]
+    {
+        Err(ToolError::Execution(
+            "cannot verify path containment: this platform cannot read an open file's \
+             current location, so contained reads are refused here"
+                .to_string(),
+        ))
     }
 }
 
@@ -807,6 +1073,28 @@ fn fstatat_entry(dir: i32, name: &std::ffi::CString, flags: i32) -> std::io::Res
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: `fstatat` fully initialized the buffer on success.
+    Ok(unsafe { stat.assume_init() })
+}
+
+/// Stat the open descriptor `fd` itself.
+///
+/// The handle-side twin of [`fstatat_entry`]: the stat is taken through
+/// the descriptor the file was opened on, so the identity belongs to the
+/// inode the read will stream from — never to whatever a fresh path
+/// lookup would reach.
+///
+/// # Errors
+///
+/// Returns the OS error when the descriptor cannot be stated.
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+fn fstat_handle(fd: i32) -> std::io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fd` is a valid open descriptor for the call and the stat buffer is writable.
+    let filled = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if filled != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fstat` fully initialized the buffer on success.
     Ok(unsafe { stat.assume_init() })
 }
 
@@ -1402,6 +1690,99 @@ mod tests {
         assert!(
             !outside.path().join("escape.txt").exists(),
             "nothing may land in the swapped-in tree"
+        );
+    }
+
+    #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+    #[test]
+    fn a_multi_component_name_is_refused_by_the_entry_stat() {
+        use std::ffi::CString;
+        use std::os::unix::fs::symlink;
+
+        let ws = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("file.txt"), "SECRET").unwrap();
+        symlink(outside.path(), ws.path().join("sub")).unwrap();
+        let anchor = WorkspaceAnchor::pin(ws.path());
+        let handle = std::fs::File::open(ws.path().join("sub/file.txt")).unwrap();
+        let landing = std::fs::canonicalize(outside.path().join("file.txt")).unwrap();
+
+        let name = CString::new("sub/file.txt").unwrap();
+        let dir = anchor.dup_fd(ws.path()).unwrap();
+        let err = read_identity_verdict(&handle, dir, &name, &landing).unwrap_err();
+        // SAFETY: the duplicated anchor descriptor is closed exactly once, here.
+        unsafe { libc::close(dir) };
+        assert!(
+            err.to_string().contains("cannot verify path containment"),
+            "a multi-component name makes the entry stat re-walk the path by name, so it must be refused: {err}"
+        );
+    }
+
+    #[cfg(all(unix, test, any(target_os = "linux", target_vendor = "apple")))]
+    #[test]
+    fn an_inside_handle_passes_the_current_location_gate() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let inside = ws.path().join("inside.txt");
+        std::fs::write(&inside, "x").unwrap();
+        let handle = std::fs::File::open(&inside).unwrap();
+        let root = std::fs::canonicalize(ws.path()).unwrap();
+
+        assert!(
+            handle_currently_under_root(&handle, &root).is_ok(),
+            "an inside handle's current location is under the root and must pass the gate"
+        );
+    }
+
+    #[cfg(all(unix, test, any(target_os = "linux", target_vendor = "apple")))]
+    #[test]
+    fn an_outside_handle_is_refused_by_the_current_location_gate() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let file = outside.path().join("outside.txt");
+        std::fs::write(&file, "x").unwrap();
+        let handle = std::fs::File::open(&file).unwrap();
+        let root = std::fs::canonicalize(ws.path()).unwrap();
+
+        let err = handle_currently_under_root(&handle, &root).unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "an outside handle's current location is not under the root and must be refused: {err}"
+        );
+    }
+
+    #[cfg(all(unix, test, any(target_os = "linux", target_vendor = "apple")))]
+    #[test]
+    fn a_relocated_handle_is_refused_by_the_current_location_gate() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let sibling = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(ws.path().join("a/b")).unwrap();
+        let file = ws.path().join("a/b/file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let handle = std::fs::File::open(&file).unwrap();
+        std::fs::rename(ws.path().join("a"), sibling.path().join("a")).unwrap();
+        let root = std::fs::canonicalize(ws.path()).unwrap();
+
+        let err = handle_currently_under_root(&handle, &root).unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "a handle whose directory was relocated outside must be graded by its current location, not the walk-time one: {err}"
+        );
+    }
+
+    #[cfg(all(test, unix, not(target_os = "linux"), not(target_vendor = "apple")))]
+    #[test]
+    fn a_handle_on_a_platform_without_a_location_lookup_fails_closed() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let inside = ws.path().join("inside.txt");
+        std::fs::write(&inside, "x").unwrap();
+        let handle = std::fs::File::open(&inside).unwrap();
+        let root = std::fs::canonicalize(ws.path()).unwrap();
+
+        let err = handle_currently_under_root(&handle, &root).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("this platform cannot read an open file's current location"),
+            "a platform with no open-file location lookup must fail closed instead of guessing: {err}"
         );
     }
 }

@@ -41,6 +41,7 @@
 use std::sync::Arc;
 
 pub mod context;
+pub mod hub;
 
 pub use context::{
     CompactedContext, ConvergenceDetectedContext, FallbackContext, LoopDetectedContext,
@@ -49,6 +50,7 @@ pub use context::{
     ToolCallReceivedContext, ToolPostContext, ToolPreContext, TransportFallbackContext,
     TurnEndContext, TurnStartContext,
 };
+pub use hub::{EventHub, LoopEvent, ObservedEvent};
 
 /// A notification observer that receives typed callbacks at agent loop lifecycle points.
 ///

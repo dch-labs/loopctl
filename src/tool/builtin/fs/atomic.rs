@@ -1718,7 +1718,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+    #[cfg(all(unix, test, any(target_os = "linux", target_vendor = "apple")))]
     #[test]
     fn an_inside_handle_passes_the_current_location_gate() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -1733,7 +1733,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+    #[cfg(all(unix, test, any(target_os = "linux", target_vendor = "apple")))]
     #[test]
     fn an_outside_handle_is_refused_by_the_current_location_gate() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -1750,7 +1750,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, any(not(target_os = "linux"), test)))]
+    #[cfg(all(unix, test, any(target_os = "linux", target_vendor = "apple")))]
     #[test]
     fn a_relocated_handle_is_refused_by_the_current_location_gate() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -1766,6 +1766,23 @@ mod tests {
         assert!(
             err.to_string().contains("escaped"),
             "a handle whose directory was relocated outside must be graded by its current location, not the walk-time one: {err}"
+        );
+    }
+
+    #[cfg(all(test, unix, not(target_os = "linux"), not(target_vendor = "apple")))]
+    #[test]
+    fn a_handle_on_a_platform_without_a_location_lookup_fails_closed() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let inside = ws.path().join("inside.txt");
+        std::fs::write(&inside, "x").unwrap();
+        let handle = std::fs::File::open(&inside).unwrap();
+        let root = std::fs::canonicalize(ws.path()).unwrap();
+
+        let err = handle_currently_under_root(&handle, &root).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("this platform cannot read an open file's current location"),
+            "a platform with no open-file location lookup must fail closed instead of guessing: {err}"
         );
     }
 }

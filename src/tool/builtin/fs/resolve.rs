@@ -1010,7 +1010,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix, any(target_os = "linux", target_vendor = "apple")))]
 #[allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -1147,10 +1147,7 @@ mod verify_tests {
         std::fs::remove_file(&bait).unwrap();
         std::fs::write(&bait, "innocent").unwrap();
 
-        let root = super::super::atomic::pinned_containment_root(&ws, Some(&anchor)).unwrap();
-        let err =
-            super::super::atomic::verify_read_under_anchor(&handle, &bait, &root, &ws, &anchor)
-                .unwrap_err();
+        let err = verify_handle_inside(&handle, &bait, &ws, Some(&anchor)).unwrap_err();
         assert!(
             err.to_string().contains("escaped"),
             "a handle opened outside and restored inside must be graded by its identity, not the restored name: {err}"

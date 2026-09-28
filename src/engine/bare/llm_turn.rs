@@ -362,7 +362,7 @@ impl<C: ApiClient> BareLoop<C> {
             });
         }
         if let StreamEvent::IndexedDelta(d) = event
-            && let crate::stream::DeltaPart::Thinking { text } = &d.delta
+            && let crate::stream::DeltaPart::Thinking { text, .. } = &d.delta
         {
             self.managers
                 .observers()

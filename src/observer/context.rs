@@ -311,7 +311,10 @@ pub struct ThinkingDeltaContext {
 ///
 /// Fired once before the first event of each retried stream attempt — never
 /// before the first attempt — telling delta-buffering observers to discard
-/// the failed attempt's partial text/thinking for the same turn.
+/// the failed attempt's partial text/thinking for the same turn. The cue
+/// covers retries only: it never fires after a final stream failure or for
+/// a non-streaming fallback, which surface through `on_stream_failure` /
+/// `on_response` instead.
 ///
 /// # Examples
 ///

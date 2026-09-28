@@ -297,7 +297,7 @@ fn render_message(msg: &Message) -> String {
     }
     for part in &msg.parts {
         match part {
-            MessagePart::Thinking { text } => {
+            MessagePart::Thinking { text, .. } => {
                 let rendered: String = text.chars().take(PART_CHARS).collect();
                 line.push_str(" thought: ");
                 line.push_str(&rendered);

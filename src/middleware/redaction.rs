@@ -14,10 +14,11 @@
 //! (compaction, loop-detection hashing, turn counting) are unaffected,
 //! and a redacted output is still a successful tool result.
 //!
-//! The entropy heuristic measures maximal runs of token characters and
-//! skips path-shaped runs — [`SecretPatternSet::scrub`] states the exact
-//! rule, and [`SecretPatternSet::with_entropy_heuristic`] toggles the
-//! lane.
+//! The entropy heuristic measures maximal runs of token characters;
+//! path-shaped runs are measured per segment, so word-like structure
+//! passes while a dense segment still masks —
+//! [`SecretPatternSet::scrub`] states the exact rule, and
+//! [`SecretPatternSet::with_entropy_heuristic`] toggles the lane.
 //!
 //! # Example
 //!
@@ -228,9 +229,10 @@ impl SecretPatternSet {
     /// host-added) scrub — zero false positives from novel-run
     /// detection, at the cost of missing formats no literal covers.
     /// With it on, dense runs of at least 32 token characters are
-    /// masked, except path-shaped runs (two or more `/` separators
-    /// carrying at least two word-like segments), which pass through
-    /// as locations.
+    /// masked, except inside path-shaped runs (two or more `/`
+    /// separators carrying at least two word-like segments), where
+    /// each segment is measured on its own and only the dense
+    /// segments mask.
     #[must_use]
     pub fn with_entropy_heuristic(mut self, enabled: bool) -> Self {
         self.entropy_heuristic = enabled;
@@ -250,9 +252,12 @@ impl SecretPatternSet {
     /// statement's syntax intact. When the entropy heuristic is
     /// enabled, any remaining run of at least 32 token characters
     /// whose byte entropy reaches 4.5 bits per byte becomes
-    /// `[REDACTED:high_entropy]`, unless the run is path-shaped — two
+    /// `[REDACTED:high_entropy]` — except that a path-shaped run (two
     /// or more `/` separators carrying at least two word-like
-    /// lowercase-letter segments.
+    /// lowercase-letter segments) is measured per segment: each
+    /// `/`-segment that alone clears both gates masks, while the
+    /// separators and word-like segments survive, so a dense segment
+    /// cannot hide behind the path exemption.
     pub fn scrub(&self, text: &mut String) -> usize {
         let mut rewritten = std::mem::take(text);
         let mut count = 0usize;
@@ -480,20 +485,49 @@ fn redact_piece_if_high_entropy(piece: &str) -> (String, usize) {
 
 /// Append `run`'s disposition to `out` and reset it.
 ///
-/// A qualifying run becomes the placeholder; a short, low-entropy, or
-/// path-shaped run is appended verbatim. `count` advances only on a
-/// substitution.
+/// A qualifying run becomes the placeholder; a path-shaped run is
+/// measured per segment (see [`redact_dense_path_segments`]) so a
+/// dense segment cannot hide behind the path exemption; any other
+/// run is appended verbatim. `count` advances only on a substitution.
 fn flush_run(run: &mut String, out: &mut String, count: &mut usize) {
     if run.is_empty() {
         return;
     }
-    if run_qualifies(run) {
+    if run_is_path_shaped(run) {
+        redact_dense_path_segments(run.as_str(), out, count);
+    } else if run_qualifies(run) {
         out.push_str("[REDACTED:high_entropy]");
         *count = count.saturating_add(1);
     } else {
         out.push_str(run);
     }
     run.clear();
+}
+
+/// Redact the dense segments of one path-shaped run into `out`.
+///
+/// Each `/`-segment is measured exactly as a slash-free run would be
+/// ([`run_qualifies`] — its path guard is inert on a single segment):
+/// a segment that alone clears the length and entropy gates masks to
+/// the placeholder while the separators and the word-like segments
+/// survive, so a secret riding at the end of a path-shaped run
+/// (`…/tokens/<secret>`) no longer passes unmeasured. Pinned paths
+/// keep passing because their segments stay under the gates —
+/// `target/debug/deps/…`'s trailing build-artifact segment is 30
+/// characters, below the 32-character length gate.
+fn redact_dense_path_segments(run: &str, out: &mut String, count: &mut usize) {
+    for piece in run.split_inclusive('/') {
+        let segment = piece.strip_suffix('/').unwrap_or(piece);
+        if run_qualifies(segment) {
+            out.push_str("[REDACTED:high_entropy]");
+            if piece.len() > segment.len() {
+                out.push('/');
+            }
+            *count = count.saturating_add(1);
+        } else {
+            out.push_str(piece);
+        }
+    }
 }
 
 /// Whether `run` is measured as a credential candidate.

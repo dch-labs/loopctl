@@ -1076,7 +1076,7 @@ fn convert_message(m: &Message, replay_reasoning: bool) -> Vec<Value> {
     for p in &m.parts {
         match p {
             MessagePart::Text { text } => text_parts.push(text.as_str()),
-            MessagePart::Thinking { text } if replay_reasoning && !text.is_empty() => {
+            MessagePart::Thinking { text, .. } if replay_reasoning && !text.is_empty() => {
                 reasoning_parts.push(super::anthropic::replay_reasoning_tail(text));
             }
             MessagePart::ToolCall { id, name, input } => {
@@ -1807,6 +1807,8 @@ impl StreamEmitter {
                 index: THINKING_PART_INDEX,
                 delta: DeltaPart::Thinking {
                     text: reasoning.clone(),
+                    signature: None,
+                    redacted: None,
                 },
             }));
         }
@@ -2848,7 +2850,7 @@ mod tests {
         let msg = acc.build();
         assert_eq!(msg.parts.len(), 3, "thinking plus both tool calls flush");
         match &msg.parts[0] {
-            MessagePart::Thinking { text } => {
+            MessagePart::Thinking { text, .. } => {
                 assert_eq!(
                     text, "thinking hard",
                     "the reasoning flushes as its own part"
@@ -3934,7 +3936,7 @@ mod tests {
         // Expect at least one IndexedDelta carrying Thinking.
         let thinking = events.iter().find_map(|e| match e {
             StreamEvent::IndexedDelta(d) => match &d.delta {
-                DeltaPart::Thinking { text } => Some(text.clone()),
+                DeltaPart::Thinking { text, .. } => Some(text.clone()),
                 _ => None,
             },
             _ => None,
@@ -3960,7 +3962,7 @@ mod tests {
 
         let thinking = events.iter().find_map(|e| match e {
             StreamEvent::IndexedDelta(d) => match &d.delta {
-                DeltaPart::Thinking { text } => Some(text.clone()),
+                DeltaPart::Thinking { text, .. } => Some(text.clone()),
                 _ => None,
             },
             _ => None,
@@ -4068,7 +4070,7 @@ mod tests {
         let has_thinking = events.iter().any(|e| {
             matches!(
                 e,
-                StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Thinking { ref text } if text == "why")
+                StreamEvent::IndexedDelta(d) if matches!(d.delta, DeltaPart::Thinking { ref text, .. } if text == "why")
             )
         });
         assert!(has_text, "text delta must fire");
@@ -4253,6 +4255,8 @@ mod tests {
             .iter()
             .map(|text| crate::message::MessagePart::Thinking {
                 text: (*text).to_string(),
+                signature: None,
+                redacted: None,
             })
             .collect();
         parts.push(crate::message::MessagePart::text("the answer"));

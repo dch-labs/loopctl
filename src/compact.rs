@@ -183,7 +183,7 @@ fn rendered_message_chars(message: &Message) -> u64 {
         .parts
         .iter()
         .map(|p| match p {
-            MessagePart::Text { text } | MessagePart::Thinking { text } => {
+            MessagePart::Text { text } | MessagePart::Thinking { text, .. } => {
                 text.chars().count() as u64
             }
             MessagePart::Image { .. } => 256,

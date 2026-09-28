@@ -1253,6 +1253,8 @@ impl StreamEmitter {
                     index: THINKING_PART_INDEX,
                     delta: DeltaPart::Thinking {
                         text: text.to_string(),
+                        signature: None,
+                        redacted: None,
                     },
                 }));
             } else {
@@ -1953,7 +1955,7 @@ mod tests {
             "thought:true part must route to Thinking, got {:?}",
             delta.delta
         );
-        if let DeltaPart::Thinking { text } = delta.delta {
+        if let DeltaPart::Thinking { text, .. } = delta.delta {
             assert_eq!(text, "reasoning here");
         }
     }
@@ -2079,7 +2081,7 @@ mod tests {
             .collect();
         assert_eq!(deltas.len(), 2);
         assert!(
-            matches!(deltas[0].delta, DeltaPart::Thinking { ref text } if text == "step 1"),
+            matches!(deltas[0].delta, DeltaPart::Thinking { ref text, .. } if text == "step 1"),
             "first delta must be the thinking fragment, got {:?}",
             deltas[0].delta
         );

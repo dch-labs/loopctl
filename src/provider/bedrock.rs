@@ -1004,7 +1004,7 @@ fn anthropic_body(request: &StreamRequest, max_tokens: u32) -> serde_json::Value
     let converted: Vec<serde_json::Value> = messages
         .iter()
         .filter(|m| !m.parts.is_empty())
-        .map(|m| crate::provider::anthropic::convert_message(m, false))
+        .map(|m| crate::provider::anthropic::convert_message(m, false, false))
         .collect();
     let mut body = serde_json::json!({
         "anthropic_version": "bedrock-2023-05-31",
@@ -1292,6 +1292,8 @@ impl ConverseStreamEmitter {
                     index,
                     delta: crate::stream::DeltaPart::Thinking {
                         text: reasoning.to_string(),
+                        signature: None,
+                        redacted: None,
                     },
                 }));
             }
@@ -2712,7 +2714,7 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(e,
                 StreamEvent::IndexedDelta(d) if matches!(&d.delta,
-                    crate::stream::DeltaPart::Thinking { text } if text == "pondering"))),
+                    crate::stream::DeltaPart::Thinking { text, .. } if text == "pondering"))),
             "reasoning deltas arrive as Thinking, not dropped: {events:?}"
         );
 

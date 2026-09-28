@@ -842,6 +842,22 @@ fn a_slash_bearing_credential_run_still_redacts() {
 }
 
 #[test]
+fn a_dense_segment_inside_a_path_shaped_run_masks_alone() {
+    let secret = ["J8kL2mN4pQ6rS8tUv1Wx", "9zQ4wE7rT5yU6iO3pA8b"].concat();
+    let url = format!("https://host/repos/tokens/{secret}");
+    let mut scrubbed = url.clone();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "a secret riding inside a path-shaped run masks as its own segment: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "https://host/repos/tokens/[REDACTED:high_entropy]",
+        "the path structure and word segments survive while only the dense segment masks"
+    );
+}
+
+#[test]
 fn a_digit_bearing_segment_run_is_not_path_shaped() {
     let token = ["38gO/rqh", "/l3wyX8KX/", "62sp/JoazycZ9FcQS1fDTK"].concat();
     let mut scrubbed = format!("blob {token} end");

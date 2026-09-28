@@ -233,10 +233,11 @@ impl AnthropicClient {
     ///
     /// Anthropic's native response already carries a `content` array of typed
     /// blocks, so this reads them directly into [`MessagePart`]s: `text` blocks
-    /// become [`MessagePart::Text`] parts and `tool_use` blocks become
-    /// [`MessagePart::ToolCall`] parts, preserving their original order. Other
-    /// block types (`thinking`, `redacted_thinking`) are skipped — reasoning is
-    /// stream-only in this crate and is not accumulated into the message.
+    /// become [`MessagePart::Text`] parts, `tool_use` blocks become
+    /// [`MessagePart::ToolCall`] parts, and `thinking` / `redacted_thinking`
+    /// blocks become [`MessagePart::Thinking`] parts carrying their signature
+    /// or opaque payload, preserving their original order — a continuation
+    /// under extended thinking must return those blocks verbatim.
     /// Maps `stop_reason` via [`StreamStopReason::from_api_str`] (Anthropic
     /// reports tool invocations as `"tool_use"`, aliased to `ToolCall`),
     /// defaulting to `EndTurn` on an unrecognized or missing value. Reads
@@ -250,6 +251,26 @@ impl AnthropicClient {
                     Some("text") => {
                         if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                             parts.push(MessagePart::text(text));
+                        }
+                    }
+                    Some("thinking") => {
+                        let text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                        let signature = block.get("signature").and_then(|s| s.as_str());
+                        if !text.is_empty() || signature.is_some() {
+                            parts.push(MessagePart::Thinking {
+                                text: text.to_string(),
+                                signature: signature.map(str::to_string),
+                                redacted: None,
+                            });
+                        }
+                    }
+                    Some("redacted_thinking") => {
+                        if let Some(data) = block.get("data").and_then(|d| d.as_str()) {
+                            parts.push(MessagePart::Thinking {
+                                text: String::new(),
+                                signature: None,
+                                redacted: Some(data.to_string()),
+                            });
                         }
                     }
                     Some("tool_use") => {
@@ -913,7 +934,7 @@ fn build_request_body(
     let (non_system, effective_system) = super::fold_system_messages(messages, *system);
     let msgs: Vec<Value> = non_system
         .iter()
-        .map(|m| convert_message(m, replay_reasoning))
+        .map(|m| convert_message(m, replay_reasoning, effort.is_some()))
         .collect();
     let effective_system = effective_system.unwrap_or_default();
     let (tools_val, tool_choice) = if let Some(rf) = response_format {
@@ -982,16 +1003,43 @@ fn anthropic_thinking_budget(effort: crate::structured::ThinkingEffort) -> u32 {
     }
 }
 
+/// The wire form of one thinking part replayed natively.
+///
+/// Extended thinking signs each reasoning block, and the Messages API
+/// demands the original block — signature or redacted payload intact —
+/// ahead of `tool_use` on continuation requests, so a signed or
+/// redacted part is returned exactly as it arrived rather than
+/// rendered as plain text.
+fn native_thinking_block(text: &str, signature: Option<&str>, redacted: Option<&str>) -> Value {
+    if let Some(data) = redacted {
+        serde_json::json!({ "type": "redacted_thinking", "data": data })
+    } else {
+        serde_json::json!({
+            "type": "thinking",
+            "thinking": text,
+            "signature": signature.unwrap_or_default(),
+        })
+    }
+}
+
 /// Convert a single framework [`Message`] into the Anthropic JSON shape.
 ///
 /// - Messages with only a single text part use a plain string for `content`
 ///   (Anthropic's recommended optimization).
 /// - Messages with tool calls or tool results use the full `content` array.
-/// - Thinking parts render only when `replay_reasoning` is set — one
-///   capped `<thinking>` text block each, in part order, ahead of the
-///   other content; image parts are skipped, as this wire carries no
-///   images in conversation history.
-pub(super) fn convert_message(m: &Message, replay_reasoning: bool) -> Value {
+/// - Thinking parts render as one capped `<thinking>` text block
+///   each, in part order, ahead of the other content when
+///   `replay_reasoning` is set — except that a signed or redacted
+///   part rides back natively while `thinking_enabled` (an effective
+///   thinking-effort level) is set, because Anthropic requires the
+///   original block ahead of tool use on continuation requests;
+///   image parts are skipped, as this wire carries no images in
+///   conversation history.
+pub(super) fn convert_message(
+    m: &Message,
+    replay_reasoning: bool,
+    thinking_enabled: bool,
+) -> Value {
     let role = match m.role {
         Role::User | Role::System => "user",
         Role::Assistant => "assistant",
@@ -1005,7 +1053,18 @@ pub(super) fn convert_message(m: &Message, replay_reasoning: bool) -> Value {
     for p in &m.parts {
         match p {
             MessagePart::Text { text } => text_parts.push(text.as_str()),
-            MessagePart::Thinking { text } if replay_reasoning && !text.is_empty() => {
+            MessagePart::Thinking {
+                text,
+                signature,
+                redacted,
+            } if thinking_enabled && (signature.is_some() || redacted.is_some()) => {
+                thinking_blocks.push(native_thinking_block(
+                    text,
+                    signature.as_deref(),
+                    redacted.as_deref(),
+                ));
+            }
+            MessagePart::Thinking { text, .. } if replay_reasoning && !text.is_empty() => {
                 let tail = replay_reasoning_tail(text);
                 thinking_blocks.push(serde_json::json!({
                     "type": "text",
@@ -1450,10 +1509,17 @@ impl StreamEmitter {
                 self.push(StreamEvent::PartStart(PartStart { index, part: None }));
 
                 if matches!(block_type, Some("redacted_thinking")) {
+                    let data = v
+                        .pointer("/content_block/data")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     self.push(StreamEvent::IndexedDelta(IndexedDelta {
                         index,
                         delta: DeltaPart::Thinking {
                             text: String::new(),
+                            signature: None,
+                            redacted: (!data.is_empty()).then_some(data),
                         },
                     }));
                 }
@@ -1519,7 +1585,29 @@ impl StreamEmitter {
                     let thinking_index = self.thinking_index.unwrap_or(0);
                     self.push(StreamEvent::IndexedDelta(IndexedDelta {
                         index: thinking_index,
-                        delta: DeltaPart::Thinking { text },
+                        delta: DeltaPart::Thinking {
+                            text,
+                            signature: None,
+                            redacted: None,
+                        },
+                    }));
+                }
+            }
+            Some("signature_delta") => {
+                let signature = v
+                    .pointer("/delta/signature")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !signature.is_empty() {
+                    let thinking_index = self.thinking_index.unwrap_or(0);
+                    self.push(StreamEvent::IndexedDelta(IndexedDelta {
+                        index: thinking_index,
+                        delta: DeltaPart::Thinking {
+                            text: String::new(),
+                            signature: Some(signature),
+                            redacted: None,
+                        },
                     }));
                 }
             }
@@ -1938,6 +2026,8 @@ mod tests {
             .iter()
             .map(|text| MessagePart::Thinking {
                 text: (*text).to_string(),
+                signature: None,
+                redacted: None,
             })
             .collect();
         parts.push(MessagePart::text("the answer"));
@@ -1945,8 +2035,13 @@ mod tests {
     }
 
     /// Capture the streaming body a client puts on the wire for one
-    /// history, with replay on or off.
-    async fn captured_replay_body(replay: bool, history: Vec<Message>) -> String {
+    /// history, with replay and an effective thinking-effort level on
+    /// or off.
+    async fn captured_replay_body(
+        replay: bool,
+        effort: Option<crate::structured::ThinkingEffort>,
+        history: Vec<Message>,
+    ) -> String {
         use futures::StreamExt;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1968,6 +2063,9 @@ mod tests {
         if replay {
             builder = builder.replay_reasoning(true);
         }
+        if let Some(effort) = effort {
+            builder = builder.thinking_effort(effort);
+        }
         let client = builder.build().unwrap();
         let mut stream = client.stream_messages_with_options(
             &crate::api::StreamRequest::new(history),
@@ -1979,14 +2077,22 @@ mod tests {
 
     #[tokio::test]
     async fn replayed_reasoning_rides_the_wire_only_when_enabled() {
-        let on =
-            captured_replay_body(true, vec![assistant_with_thinking(&["first dedup pass"])]).await;
+        let on = captured_replay_body(
+            true,
+            None,
+            vec![assistant_with_thinking(&["first dedup pass"])],
+        )
+        .await;
         assert!(
             on.contains("<thinking>\\nfirst dedup pass\\n</thinking>"),
             "an enabled client renders history thinking as a text block: {on}"
         );
-        let off =
-            captured_replay_body(false, vec![assistant_with_thinking(&["first dedup pass"])]).await;
+        let off = captured_replay_body(
+            false,
+            None,
+            vec![assistant_with_thinking(&["first dedup pass"])],
+        )
+        .await;
         assert!(
             !off.contains("<thinking>"),
             "off by default — requests stay byte-identical to a client that never saw reasoning: {off}"
@@ -1997,6 +2103,7 @@ mod tests {
     async fn every_history_thinking_part_rides_the_replay_in_order() {
         let body = captured_replay_body(
             true,
+            None,
             vec![assistant_with_thinking(&["alpha pass", "beta pass"])],
         )
         .await;
@@ -2005,6 +2112,85 @@ mod tests {
         assert!(
             first.is_some_and(|at| second.is_some_and(|other| at < other)),
             "each history thinking part renders as its own block, in part order: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_thinking_blocks_ride_continuations_when_effort_is_enabled() {
+        let history = vec![Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: "alpha pass".to_string(),
+                    signature: Some("sig-blob".to_string()),
+                    redacted: None,
+                },
+                MessagePart::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                },
+            ],
+        )];
+        let body = captured_replay_body(
+            false,
+            Some(crate::structured::ThinkingEffort::High),
+            history,
+        )
+        .await;
+        assert!(
+            body.contains("\"signature\":\"sig-blob\"")
+                && body.contains("\"thinking\":\"alpha pass\"")
+                && body.contains("\"type\":\"thinking\""),
+            "an effective effort returns the signed thinking block natively, ahead of the tool use: {body}"
+        );
+        assert!(
+            !body.contains("<thinking>"),
+            "the signed block rides as the native block, not the plain-text replay: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redacted_thinking_blocks_ride_continuations_verbatim() {
+        let history = vec![Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: String::new(),
+                    signature: None,
+                    redacted: Some("opaque-data".to_string()),
+                },
+                MessagePart::ToolCall {
+                    id: "call_2".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                },
+            ],
+        )];
+        let body = captured_replay_body(
+            false,
+            Some(crate::structured::ThinkingEffort::High),
+            history,
+        )
+        .await;
+        assert!(
+            body.contains("\"type\":\"redacted_thinking\"")
+                && body.contains("\"data\":\"opaque-data\""),
+            "a redacted block returns its opaque payload verbatim on continuations: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_blocks_stay_text_replay_when_thinking_is_disabled() {
+        let history = vec![assistant_with_thinking(&["alpha pass"])];
+        let body = captured_replay_body(true, None, history).await;
+        assert!(
+            body.contains("<thinking>\\nalpha pass\\n</thinking>"),
+            "without an effective effort the reasoning renders as the plain-text replay: {body}"
+        );
+        assert!(
+            !body.contains("\"signature\""),
+            "no native thinking block rides a request that did not enable thinking: {body}"
         );
     }
 
@@ -3091,17 +3277,45 @@ mod tests {
     }
 
     #[test]
-    fn build_response_skips_thinking_blocks() {
+    fn build_response_captures_thinking_blocks_with_their_signatures() {
         let raw = serde_json::json!({
             "content": [
-                {"type": "thinking", "thinking": "internal reasoning"},
+                {"type": "thinking", "thinking": "internal reasoning", "signature": "sig-blob"},
+                {"type": "redacted_thinking", "data": "opaque-data"},
                 {"type": "text", "text": "visible answer"}
             ],
             "stop_reason": "end_turn"
         });
         let response = AnthropicClient::build_response(&raw);
-        assert_eq!(response.message.parts.len(), 1);
+        assert_eq!(
+            response.message.parts.len(),
+            3,
+            "thinking and redacted blocks survive as parts in order: {:?}",
+            response.message.parts
+        );
         assert_eq!(response.message.text_content(), "visible answer");
+        assert!(
+            matches!(
+                response.message.parts.first(),
+                Some(MessagePart::Thinking { text, signature, redacted })
+                    if text == "internal reasoning"
+                        && signature.as_deref() == Some("sig-blob")
+                        && redacted.is_none()
+            ),
+            "a signed thinking block keeps its signature for native replay: {:?}",
+            response.message.parts
+        );
+        assert!(
+            matches!(
+                response.message.parts.get(1),
+                Some(MessagePart::Thinking { text, signature, redacted })
+                    if text.is_empty()
+                        && signature.is_none()
+                        && redacted.as_deref() == Some("opaque-data")
+            ),
+            "a redacted block keeps its opaque payload verbatim: {:?}",
+            response.message.parts
+        );
     }
 
     #[test]
@@ -3479,7 +3693,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamEvent::IndexedDelta(d) => match &d.delta {
-                DeltaPart::Thinking { text } => assert_eq!(text, "reasoning here"),
+                DeltaPart::Thinking { text, .. } => assert_eq!(text, "reasoning here"),
                 other => panic!("expected Thinking, got {other:?}"),
             },
             other => panic!("expected IndexedDelta, got {other:?}"),
@@ -3487,10 +3701,9 @@ mod tests {
     }
 
     #[test]
-    fn emitter_signature_delta_is_ignored() {
+    fn signature_delta_rides_the_thinking_lane_as_its_own_delta() {
         let mut em = StreamEmitter::default();
 
-        // Start a thinking block + emit a thinking delta.
         em.on_block_start(Some(serde_json::json!({
             "index": 0,
             "content_block": {"type": "thinking"}
@@ -3500,15 +3713,46 @@ mod tests {
         })));
         em.drain();
 
-        // Now send a signature_delta — must NOT emit any additional event.
         em.on_block_delta(Some(serde_json::json!({
             "delta": {"type": "signature_delta", "signature": "opaque_base64_blob"}
         })));
         let events = em.drain();
 
-        assert!(
-            events.is_empty(),
-            "signature_delta must not emit any events: got {events:?}"
+        let carried = events.iter().find_map(|e| match e {
+            StreamEvent::IndexedDelta(d) => match &d.delta {
+                DeltaPart::Thinking { signature, .. } => signature.clone(),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(
+            carried.as_deref(),
+            Some("opaque_base64_blob"),
+            "the block's signature rides a thinking-lane delta so continuations can replay it: {events:?}"
+        );
+    }
+
+    #[test]
+    fn redacted_thinking_data_rides_the_thinking_lane() {
+        let mut em = StreamEmitter::default();
+
+        em.on_block_start(Some(serde_json::json!({
+            "index": 0,
+            "content_block": {"type": "redacted_thinking", "data": "opaque_payload"}
+        })));
+        let events = em.drain();
+
+        let carried = events.iter().find_map(|e| match e {
+            StreamEvent::IndexedDelta(d) => match &d.delta {
+                DeltaPart::Thinking { redacted, .. } => redacted.clone(),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(
+            carried.as_deref(),
+            Some("opaque_payload"),
+            "the redacted block's payload rides its delta verbatim so continuations can return it: {events:?}"
         );
     }
 
@@ -3529,7 +3773,7 @@ mod tests {
         assert!(matches!(events[0], StreamEvent::PartStart(_)));
         match &events[1] {
             StreamEvent::IndexedDelta(d) => match &d.delta {
-                DeltaPart::Thinking { text } => {
+                DeltaPart::Thinking { text, .. } => {
                     assert!(text.is_empty(), "redacted thinking → empty text");
                 }
                 other => panic!("expected Thinking, got {other:?}"),
@@ -3654,7 +3898,7 @@ mod tests {
                 true,
             )],
         );
-        let json = convert_message(&msg, false);
+        let json = convert_message(&msg, false, false);
         assert_eq!(
             json.pointer("/content/0/is_error"),
             Some(&serde_json::json!(true)),
@@ -3669,7 +3913,7 @@ mod tests {
                 false,
             )],
         );
-        let ok_json = convert_message(&ok, false);
+        let ok_json = convert_message(&ok, false, false);
         assert!(
             ok_json.pointer("/content/0/is_error").is_none(),
             "successful results carry no is_error (the wire default is false): {ok_json}"

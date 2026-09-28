@@ -2445,6 +2445,8 @@ impl ApiClient for RetryConcatClient {
                 index: 0,
                 delta: crate::stream::DeltaPart::Thinking {
                     text: format!("attempt {seen} reasoning"),
+                    signature: None,
+                    redacted: None,
                 },
             })),
         ];
@@ -2559,6 +2561,8 @@ impl ApiClient for DoubleRetryConcatClient {
                 index: 0,
                 delta: crate::stream::DeltaPart::Thinking {
                     text: format!("attempt {seen} reasoning"),
+                    signature: None,
+                    redacted: None,
                 },
             })),
         ];
@@ -6823,12 +6827,16 @@ async fn test_on_thinking_delta_fires_per_thinking_delta() {
             index: 1,
             delta: DeltaPart::Thinking {
                 text: "First reasoning".into(),
+                signature: None,
+                redacted: None,
             },
         }),
         StreamEvent::IndexedDelta(IndexedDelta {
             index: 1,
             delta: DeltaPart::Thinking {
                 text: " chunk".into(),
+                signature: None,
+                redacted: None,
             },
         }),
         StreamEvent::PartStop { index: Some(1) },
@@ -6905,6 +6913,8 @@ async fn test_on_thinking_delta_independent_of_text_delta() {
             index: 1,
             delta: DeltaPart::Thinking {
                 text: "reasoning".into(),
+                signature: None,
+                redacted: None,
             },
         }),
         StreamEvent::IndexedDelta(IndexedDelta {

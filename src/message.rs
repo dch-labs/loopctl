@@ -409,10 +409,12 @@ pub enum MessagePart {
     /// Accumulated from [`DeltaPart::Thinking`] fragments by the
     /// stream accumulator so the reasoning survives in conversation
     /// history. Providers decide at request-build time whether it is
-    /// replayed: adapters render it only when the client's
-    /// reasoning-replay flag is set, and otherwise skip it — a turn's
-    /// thinking is metadata about how the answer was reached, not part
-    /// of the answer itself.
+    /// replayed: a signed part rides back natively when the provider's
+    /// thinking mode is enabled (Anthropic requires the original block
+    /// ahead of tool use on continuations), an unsigned part renders
+    /// only when the client's reasoning-replay flag is set, and
+    /// otherwise it is skipped — a turn's thinking is metadata about
+    /// how the answer was reached, not part of the answer itself.
     ///
     /// [`DeltaPart::Thinking`]: crate::stream::DeltaPart::Thinking
     #[serde(rename = "thinking")]
@@ -422,6 +424,20 @@ pub enum MessagePart {
         /// Concatenated fragments in arrival order; empty when the
         /// provider redacted the reasoning.
         text: String,
+        /// The provider's signature over the reasoning block.
+        ///
+        /// Latched from the delta that carries it and returned
+        /// verbatim on continuation requests that replay this turn's
+        /// thinking natively. `None` when the provider signs nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        /// The opaque payload of a redacted reasoning block.
+        ///
+        /// Set when the provider withheld the reasoning but demands
+        /// its placeholder back on continuations; replayed verbatim.
+        /// `None` for visible reasoning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redacted: Option<String>,
     },
 
     /// The result of a tool-call invocation.

@@ -148,7 +148,10 @@ pub trait LoopObserver: Send + Sync {
     /// [`on_turn_end`](Self::on_turn_end)); consumers that want live output
     /// discard the turn's buffered deltas on
     /// [`on_attempt_reset`](Self::on_attempt_reset), which fires before each
-    /// retried attempt's first event.
+    /// retried attempt's first event — that cue covers retries only, so a
+    /// final stream failure or a non-streaming fallback is reconciled
+    /// through [`on_stream_failure`](Self::on_stream_failure) or
+    /// [`on_response`](Self::on_response), not the reset.
     ///
     /// # Examples
     ///
@@ -183,7 +186,10 @@ pub trait LoopObserver: Send + Sync {
     /// [`on_turn_end`](Self::on_turn_end) if you need only committed
     /// reasoning, or discard the turn's buffer on
     /// [`on_attempt_reset`](Self::on_attempt_reset) — which fires before
-    /// each retried attempt's first event — to display reasoning live.
+    /// each retried attempt's first event — to display reasoning live
+    /// across retries; a final stream failure or a non-streaming
+    /// fallback is reconciled through [`on_stream_failure`](Self::on_stream_failure)
+    /// or [`on_response`](Self::on_response), not the reset.
     fn on_thinking_delta(&self, _ctx: &ThinkingDeltaContext) {}
 
     /// Called when a retrying stream discards a failed attempt's events.
@@ -198,8 +204,15 @@ pub trait LoopObserver: Send + Sync {
     /// entering (2 for the first retry).
     ///
     /// This is the reset point the delta callbacks' retry caveat names:
-    /// an observer that resets here can display live deltas safely,
-    /// without buffering until [`on_turn_end`](Self::on_turn_end).
+    /// an observer that resets here can display live deltas safely
+    /// across retries, without buffering until
+    /// [`on_turn_end`](Self::on_turn_end). The cue covers retries
+    /// only: it never fires after a final stream failure or when the
+    /// handler serves a non-streaming fallback, so a terminal outcome
+    /// is reconciled through [`on_stream_failure`](Self::on_stream_failure),
+    /// [`on_response`](Self::on_response) (whose text replaces the
+    /// buffered deltas), or
+    /// [`on_turn_end`](Self::on_turn_end).
     fn on_attempt_reset(&self, _ctx: &AttemptResetContext) {}
 
     /// Called when the engine has accumulated a tool call and is about to dispatch it.

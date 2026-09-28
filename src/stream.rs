@@ -1186,6 +1186,11 @@ impl StreamAccumulator {
                     OpenPartKind::Text if !slot.text.is_empty() => {
                         Some(MessagePart::text(slot.text))
                     }
+                    OpenPartKind::Thinking if !slot.thinking.is_empty() => {
+                        Some(MessagePart::Thinking {
+                            text: slot.thinking,
+                        })
+                    }
                     OpenPartKind::Tool if !slot.tool_name.is_empty() => {
                         let input: Value = if slot.tool_input.is_empty() {
                             Value::Object(serde_json::Map::new())

@@ -307,6 +307,37 @@ pub struct ThinkingDeltaContext {
     pub delta: String,
 }
 
+/// Context for [`LoopObserver::on_attempt_reset`](crate::observer::LoopObserver::on_attempt_reset).
+///
+/// Fired once before the first event of each retried stream attempt — never
+/// before the first attempt — telling delta-buffering observers to discard
+/// the failed attempt's partial text/thinking for the same turn.
+///
+/// # Examples
+///
+/// ```
+/// use loopctl::observer::AttemptResetContext;
+///
+/// let ctx = AttemptResetContext { turn: 0, attempt: 2 };
+/// assert_eq!(ctx.turn, 0);
+/// assert_eq!(ctx.attempt, 2);
+/// ```
+#[derive(Debug, Clone)]
+pub struct AttemptResetContext {
+    /// Turn number (0-indexed), matching `on_turn_start` / `on_turn_end`.
+    ///
+    /// Same value [`ThinkingDeltaContext::turn`] carries for the same
+    /// turn, so an observer can key its per-turn delta buffer by it.
+    pub turn: usize,
+
+    /// The attempt the stream is entering, 1-indexed.
+    ///
+    /// The first attempt never fires a reset; the first retry carries
+    /// `2`. A turn's resets are consecutive from the handler's retry
+    /// ladder.
+    pub attempt: usize,
+}
+
 /// Context for [`LoopObserver::on_tool_call_received`](crate::observer::LoopObserver::on_tool_call_received).
 ///
 /// Fired once per tool call after the streaming response has been accumulated

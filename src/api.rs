@@ -313,14 +313,15 @@ pub trait ApiClient: Send + Sync {
     /// When `options` is empty (the default), delegates to
     /// [`stream_messages`](ApiClient::stream_messages). When `options`
     /// contains fields the client does not support (`response_format`,
-    /// `tool_constraint`, or a per-request `model` override on a client
-    /// that has not overridden this method), yields an
+    /// `tool_constraint`, a per-request `model` override, or a
+    /// thinking-effort level, on a client that has not overridden this
+    /// method), yields an
     /// [`ApiError::config`] error as the first stream item — a field the
     /// client cannot forward must fail loudly rather than be silently
     /// dropped: a dropped `model` override would serve a different model
     /// than the one the fallback machinery routed and reported.
     /// `OpenAiClient`, `AnthropicClient`, and `GeminiClient` override
-    /// this to honor all three fields.
+    /// this to honor all four fields.
     fn stream_messages_with_options(
         &self,
         request: &StreamRequest,
@@ -383,9 +384,10 @@ pub trait ApiClient: Send + Sync {
 /// Used by the trait's default `*_with_options` implementations. An
 /// unsupported field must fail loudly: silently dropping `model` would
 /// serve a different model than the one the fallback machinery routed and
-/// reported, and silently dropping `tool_constraint` or `response_format`
+/// reported, silently dropping `tool_constraint` or `response_format`
 /// would degrade a constrained request to an unconstrained one with no
-/// signal to the caller.
+/// signal to the caller, and silently dropping `effort` would serve a
+/// turn the caller asked to think harder on at the provider's default.
 pub(crate) fn unsupported_options_error(
     options: &crate::structured::RequestOptions,
 ) -> Option<ApiError> {
@@ -395,6 +397,11 @@ pub(crate) fn unsupported_options_error(
     if options.model.is_some() {
         return Some(ApiError::config(
             "this client does not support per-request model overrides (model)",
+        ));
+    }
+    if options.effort.is_some() {
+        return Some(ApiError::config(
+            "this client does not support thinking-effort requests (effort)",
         ));
     }
     None
@@ -621,6 +628,21 @@ mod tests {
         assert!(
             result.is_err(),
             "the non-streaming default must reject an unsupported response format"
+        );
+
+        let effort = crate::structured::RequestOptions::default()
+            .with_effort(crate::structured::ThinkingEffort::High);
+        let mut stream = client.stream_messages_with_options(&req, effort.clone());
+        let first = stream.next().await;
+        drop(stream);
+        assert!(
+            matches!(&first, Some(Err(err)) if err.to_string().contains("effort")),
+            "a thinking effort the default impl cannot forward must fail loudly, got: {first:?}"
+        );
+        let result = client.create_message_with_options(&req, effort).await;
+        assert!(
+            result.is_err(),
+            "the non-streaming default must reject the same effort level"
         );
 
         let plain = crate::structured::RequestOptions::default();

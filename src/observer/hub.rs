@@ -16,11 +16,11 @@ use tokio::sync::broadcast;
 
 use super::LoopObserver;
 use super::context::{
-    CompactedContext, ConvergenceDetectedContext, FallbackContext, LoopDetectedContext,
-    ModelSwitchedContext, PreCompactionContext, ResponseContext, RunEndContext, RunStartContext,
-    StreamContext, StreamFailureContext, TextDeltaContext, ThinkingDeltaContext,
-    ToolCallReceivedContext, ToolPostContext, ToolPreContext, TransportFallbackContext,
-    TurnEndContext, TurnStartContext,
+    AttemptResetContext, CompactedContext, ConvergenceDetectedContext, FallbackContext,
+    LoopDetectedContext, ModelSwitchedContext, PreCompactionContext, ResponseContext,
+    RunEndContext, RunStartContext, StreamContext, StreamFailureContext, TextDeltaContext,
+    ThinkingDeltaContext, ToolCallReceivedContext, ToolPostContext, ToolPreContext,
+    TransportFallbackContext, TurnEndContext, TurnStartContext,
 };
 
 /// One observed lifecycle moment of a run, as forwarded by [`EventHub`].
@@ -84,6 +84,12 @@ pub enum LoopEvent {
     /// One per streamed thinking delta, ahead of the text deltas of the
     /// same stream.
     ThinkingDelta(ThinkingDeltaContext),
+
+    /// A retried stream attempt discarded the failed attempt's events.
+    ///
+    /// One per retry, before the retried attempt's first delta — the cue
+    /// to drop buffered text/thinking deltas of the same turn.
+    AttemptReset(AttemptResetContext),
 
     /// A tool call was accumulated, before dispatch.
     ///
@@ -372,6 +378,14 @@ impl LoopObserver for EventHub {
         self.publish(LoopEvent::ThinkingDelta(ctx.clone()));
     }
 
+    /// Forwards [`on_attempt_reset`](LoopObserver::on_attempt_reset)
+    /// as an [`AttemptReset`](LoopEvent::AttemptReset) event.
+    ///
+    /// One per retry, before the retried attempt's first delta.
+    fn on_attempt_reset(&self, ctx: &AttemptResetContext) {
+        self.publish(LoopEvent::AttemptReset(ctx.clone()));
+    }
+
     /// Forwards
     /// [`on_tool_call_received`](LoopObserver::on_tool_call_received)
     /// as a [`ToolCallReceived`](LoopEvent::ToolCallReceived) event.
@@ -486,6 +500,7 @@ mod tests {
             LoopEvent::Response(_) => "response",
             LoopEvent::TextDelta(_) => "text_delta",
             LoopEvent::ThinkingDelta(_) => "thinking_delta",
+            LoopEvent::AttemptReset(_) => "attempt_reset",
             LoopEvent::ToolCallReceived(_) => "tool_call_received",
             LoopEvent::ToolPre(_) => "tool_pre",
             LoopEvent::ToolPost(_) => "tool_post",
@@ -539,6 +554,10 @@ mod tests {
         hub.on_thinking_delta(&ThinkingDeltaContext {
             turn: 0,
             delta: "considering".to_string(),
+        });
+        hub.on_attempt_reset(&AttemptResetContext {
+            turn: 0,
+            attempt: 2,
         });
         hub.on_text_delta(&TextDeltaContext {
             turn: 0,
@@ -621,6 +640,7 @@ mod tests {
             "stream_success",
             "stream_failure",
             "thinking_delta",
+            "attempt_reset",
             "text_delta",
             "response",
             "tool_call_received",
@@ -636,6 +656,16 @@ mod tests {
             "turn_end",
             "run_end",
         ];
+        drain_and_assert_kinds(&mut receiver, &expected, 20);
+    }
+
+    /// Drain a hub receiver and pin both the event-kind order and the
+    /// sequence numbering of a full `count`-event run.
+    fn drain_and_assert_kinds(
+        receiver: &mut tokio::sync::broadcast::Receiver<ObservedEvent>,
+        expected: &[&str],
+        count: u64,
+    ) {
         let mut actual = Vec::new();
         let mut seqs = Vec::new();
         while let Ok(observed) = receiver.try_recv() {
@@ -646,10 +676,10 @@ mod tests {
             actual, expected,
             "every observer callback must forward as its own event kind, in call order"
         );
-        let expected_seqs: Vec<u64> = (1..=19).collect();
+        let expected_seqs: Vec<u64> = (1..=count).collect();
         assert_eq!(
             seqs, expected_seqs,
-            "the run's events must number 1 through 19 in call order"
+            "the run's events must number 1 through {count} in call order"
         );
     }
 

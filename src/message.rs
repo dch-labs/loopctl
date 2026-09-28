@@ -231,6 +231,7 @@ impl fmt::Display for Message {
                 MessagePart::Text { text } => {
                     chunks.push(text.clone());
                 }
+                MessagePart::Thinking { .. } => {}
                 MessagePart::ToolCall { name, input, .. } => {
                     if let Ok(input_str) = serde_json::to_string(input) {
                         chunks.push(format!("[Tool: {name} with input: {input_str}]"));
@@ -401,6 +402,26 @@ pub enum MessagePart {
         /// Structure depends on the tool's input schema. May be
         /// any JSON value (`Object`, `Array`, `String`, etc.).
         input: Value,
+    },
+
+    /// The model's reasoning trace for an assistant turn.
+    ///
+    /// Accumulated from [`DeltaPart::Thinking`] fragments by the
+    /// stream accumulator so the reasoning survives in conversation
+    /// history. Providers decide at request-build time whether it is
+    /// replayed: adapters render it only when the client's
+    /// reasoning-replay flag is set, and otherwise skip it — a turn's
+    /// thinking is metadata about how the answer was reached, not part
+    /// of the answer itself.
+    ///
+    /// [`DeltaPart::Thinking`]: crate::stream::DeltaPart::Thinking
+    #[serde(rename = "thinking")]
+    Thinking {
+        /// The reasoning text, as streamed.
+        ///
+        /// Concatenated fragments in arrival order; empty when the
+        /// provider redacted the reasoning.
+        text: String,
     },
 
     /// The result of a tool-call invocation.

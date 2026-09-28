@@ -172,10 +172,10 @@ impl TokenCounter for HeuristicTokenCounter {
 /// Render one message's content to the character count every token
 /// counter estimates over.
 ///
-/// Text parts count their `char`s, image parts a flat 256 (the
-/// vision-token ballpark), tool calls their name plus the JSON-rendered
-/// input, tool results their text or multipart content. Both
-/// [`HeuristicTokenCounter`] and [`RatioTokenCounter`] share this
+/// Text and thinking parts count their `char`s, image parts a flat 256
+/// (the vision-token ballpark), tool calls their name plus the
+/// JSON-rendered input, tool results their text or multipart content.
+/// Both [`HeuristicTokenCounter`] and [`RatioTokenCounter`] share this
 /// rendering so the counters cannot drift in *what* they count — only
 /// in how they divide it.
 fn rendered_message_chars(message: &Message) -> u64 {
@@ -183,7 +183,9 @@ fn rendered_message_chars(message: &Message) -> u64 {
         .parts
         .iter()
         .map(|p| match p {
-            MessagePart::Text { text } => text.chars().count() as u64,
+            MessagePart::Text { text } | MessagePart::Thinking { text } => {
+                text.chars().count() as u64
+            }
             MessagePart::Image { .. } => 256,
             MessagePart::ToolCall { name, input, .. } => (name.chars().count() as u64)
                 .saturating_add(input.to_string().chars().count() as u64),

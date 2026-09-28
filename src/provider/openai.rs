@@ -114,6 +114,27 @@ pub struct OpenAiClient {
     /// OpenAI-compatible servers that reject the parameter via
     /// [`OpenAiClientBuilder::with_stream_usage`].
     stream_usage: bool,
+
+    /// The client-level thinking-effort default.
+    ///
+    /// `None` (the default) sends no reasoning parameter; when set, the
+    /// level rides every request's `reasoning_effort` unless the request
+    /// carries its own
+    /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort).
+    /// Set via [`OpenAiClientBuilder::thinking_effort`].
+    thinking_effort: Option<crate::structured::ThinkingEffort>,
+
+    /// Whether prior-turn reasoning is replayed on outgoing requests.
+    ///
+    /// Off by default: requests are byte-identical to a client that
+    /// never saw reasoning. When on, each history
+    /// [`MessagePart::Thinking`] rides back joined, in part order, as
+    /// the assistant message's `reasoning_content` field — the field
+    /// `GLM` round-trips natively; `DeepSeek` documents the input lane
+    /// only as a Beta prefix-completion feature (`prefix: true` on the
+    /// last assistant message), so the field reaches it best-effort,
+    /// not as a guaranteed round-trip.
+    replay_reasoning: bool,
 }
 
 impl OpenAiClient {
@@ -314,8 +335,10 @@ impl ApiClient for OpenAiClient {
             tools.as_deref(),
             None,
             &ToolConstraint::None,
+            self.replay_reasoning,
         )
-        .with_stream_usage(self.stream_usage);
+        .with_stream_usage(self.stream_usage)
+        .with_reasoning_effort(self.thinking_effort);
         let url = self.completions_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
@@ -363,7 +386,9 @@ impl ApiClient for OpenAiClient {
             tools.as_deref(),
             None,
             &ToolConstraint::None,
-        );
+            self.replay_reasoning,
+        )
+        .with_reasoning_effort(self.thinking_effort);
         let url = self.completions_url();
 
         Box::pin(async move {
@@ -396,8 +421,10 @@ impl ApiClient for OpenAiClient {
             tools.as_deref(),
             rf,
             &options.tool_constraint,
+            self.replay_reasoning,
         )
-        .with_stream_usage(self.stream_usage);
+        .with_stream_usage(self.stream_usage)
+        .with_reasoning_effort(options.effort.or(self.thinking_effort));
         let url = self.completions_url();
         let api_key = self.api_key.clone();
         let http = self.http.clone();
@@ -450,7 +477,9 @@ impl ApiClient for OpenAiClient {
             tools.as_deref(),
             rf,
             &options.tool_constraint,
-        );
+            self.replay_reasoning,
+        )
+        .with_reasoning_effort(options.effort.or(self.thinking_effort));
         let url = self.completions_url();
 
         Box::pin(async move {
@@ -502,6 +531,22 @@ pub struct OpenAiClientBuilder {
     /// [`build`](Self::build) and stored on [`OpenAiClient`].
     stream_usage: bool,
 
+    /// The client-level thinking-effort default.
+    ///
+    /// `None` (the default) sends every request without a reasoning
+    /// parameter. When set, the level rides each request's
+    /// `reasoning_effort` unless a per-request
+    /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort)
+    /// names another. Read by [`build`](Self::build) and stored on
+    /// [`OpenAiClient`].
+    thinking_effort: Option<crate::structured::ThinkingEffort>,
+
+    /// Whether prior-turn reasoning is replayed on outgoing requests.
+    ///
+    /// Set via [`OpenAiClientBuilder::replay_reasoning`]; see the
+    /// client field's docs for the wire shape.
+    replay_reasoning: bool,
+
     /// Error-reporting state for values seeded by the provider-profile
     /// builders.
     ///
@@ -519,6 +564,8 @@ impl Default for OpenAiClientBuilder {
             model: DEFAULT_MODEL.into(),
             http: super::HttpClientConfig::default(),
             stream_usage: true,
+            thinking_effort: None,
+            replay_reasoning: false,
             seed: super::ProfileSeed::default(),
         }
     }
@@ -676,6 +723,32 @@ impl OpenAiClientBuilder {
         self
     }
 
+    /// Set the client-level thinking-effort default.
+    ///
+    /// The level rides every request's `reasoning_effort` field (mapped
+    /// per [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table), unless the request carries its
+    /// own [`RequestOptions::effort`](crate::structured::RequestOptions::effort)
+    /// — the per-request value always wins, and an unset client default
+    /// leaves unconfigured requests byte-identical to prior versions.
+    #[must_use]
+    pub fn thinking_effort(mut self, effort: crate::structured::ThinkingEffort) -> Self {
+        self.thinking_effort = Some(effort);
+        self
+    }
+
+    /// Replay prior-turn reasoning on outgoing requests.
+    ///
+    /// Off by default. When enabled, each history
+    /// [`MessagePart::Thinking`] rides back joined, in part order, as
+    /// the assistant message's `reasoning_content` field — the native
+    /// round-trip lane of reasoning-capable OpenAI-compatible
+    /// providers (the client field's docs state per-provider support).
+    #[must_use]
+    pub fn replay_reasoning(mut self, enabled: bool) -> Self {
+        self.replay_reasoning = enabled;
+        self
+    }
+
     /// Set the maximum idle connections kept alive per host.
     ///
     /// Defaults to reqwest's built-in default (unlimited). Ignored when a
@@ -745,6 +818,8 @@ impl OpenAiClientBuilder {
             base_url: self.base_url,
             model: std::sync::Mutex::new(self.model),
             stream_usage: self.stream_usage,
+            thinking_effort: self.thinking_effort,
+            replay_reasoning: self.replay_reasoning,
         })
     }
 }
@@ -792,6 +867,14 @@ struct RequestBody {
     /// is serializable without re-borrowing the trait object.
     guided_json: Option<String>,
 
+    /// The top-level `reasoning_effort` for reasoning-capable models.
+    ///
+    /// `None` omits the parameter entirely — the byte-identical default.
+    /// Carries the level's wire label with `Max` already clamped to
+    /// `"high"` per [`ThinkingEffort`](crate::structured::ThinkingEffort)'s
+    /// table.
+    reasoning_effort: Option<&'static str>,
+
     /// Whether to request `stream_options.include_usage` when streaming.
     ///
     /// Defaults to `true` (real OpenAI supports it). Disabled for providers
@@ -824,6 +907,7 @@ impl RequestBody {
         tools: Option<&[ToolSchema]>,
         response_format: Option<&crate::structured::ResponseFormat>,
         tool_constraint: &ToolConstraint,
+        replay_reasoning: bool,
     ) -> Self {
         let tools = tools.filter(|t| !t.is_empty());
         let mut msgs = Vec::with_capacity(messages.len().saturating_add(1));
@@ -833,7 +917,7 @@ impl RequestBody {
         }
 
         for m in messages {
-            msgs.extend(convert_message(m));
+            msgs.extend(convert_message(m, replay_reasoning));
         }
 
         let (tools, guided_json) = if response_format.is_some() {
@@ -877,16 +961,30 @@ impl RequestBody {
             response_format: rf,
             guided_json,
             stream_usage: true,
+            reasoning_effort: None,
         }
     }
 
-    /// Control whether streaming requests include `stream_options.include_usage`.
+    /// Set the `reasoning_effort` label for a thinking-effort level.
     ///
-    /// Defaults to `true` after [`build`](Self::build). Pass `false` for
-    /// OpenAI-compatible servers that reject the parameter (older Ollama, some
-    /// self-hosted deployments). The flag is read by [`to_json`](Self::to_json)
-    /// and ignored on non-streaming requests.
+    /// The level is mapped by [`reasoning_effort_label`] and emitted by
+    /// [`to_json`](Self::to_json) whenever it is set, on both the
+    /// streaming and non-streaming bodies. The client-level default and
+    /// any per-request
+    /// [`effort`](crate::structured::RequestOptions::effort) reach this
+    /// seam already resolved — the request's value wins over the
+    /// client's.
     #[must_use]
+    fn with_reasoning_effort(mut self, effort: Option<crate::structured::ThinkingEffort>) -> Self {
+        self.reasoning_effort = effort.map(reasoning_effort_label);
+        self
+    }
+
+    /// Control whether the streaming body sets `stream_options.include_usage`.
+    ///
+    /// The flag is read by [`to_json`](Self::to_json) and ignored on
+    /// non-streaming requests — a body built for `create_message` never
+    /// carries `stream_options`.
     fn with_stream_usage(mut self, enabled: bool) -> Self {
         self.stream_usage = enabled;
         self
@@ -899,7 +997,9 @@ impl RequestBody {
     /// is enabled, sets `stream_options.include_usage` so the server appends a
     /// final usage chunk. When `response_format` is set, appends the
     /// `response_format` key; otherwise omits it entirely (not `null`). When a
-    /// grammar was captured, appends `guided_json`.
+    /// grammar was captured, appends `guided_json`. When a thinking-effort
+    /// level was resolved in, appends `reasoning_effort`; otherwise omits
+    /// it entirely.
     fn to_json(&self, stream: bool) -> Value {
         let mut body = serde_json::json!({
             "model": self.model,
@@ -922,8 +1022,29 @@ impl RequestBody {
             if let Some(grammar) = &self.guided_json {
                 obj.insert("guided_json".to_string(), Value::String(grammar.clone()));
             }
+            if let Some(effort) = self.reasoning_effort {
+                obj.insert(
+                    "reasoning_effort".to_string(),
+                    Value::String(effort.to_owned()),
+                );
+            }
         }
         body
+    }
+}
+
+/// The Chat Completions `reasoning_effort` label for one effort level.
+///
+/// The fixed mapping from [`ThinkingEffort`](crate::structured::ThinkingEffort)'s
+/// table: `Low` and `Medium` pass through as `"low"`/`"medium"`, while
+/// `High` and `Max` both send `"high"` — the parameter tops out there,
+/// so the ladder's top step clamps instead of inventing a value the API
+/// rejects.
+fn reasoning_effort_label(effort: crate::structured::ThinkingEffort) -> &'static str {
+    match effort {
+        crate::structured::ThinkingEffort::Low => "low",
+        crate::structured::ThinkingEffort::Medium => "medium",
+        crate::structured::ThinkingEffort::High | crate::structured::ThinkingEffort::Max => "high",
     }
 }
 
@@ -938,7 +1059,10 @@ impl RequestBody {
 /// result's `is_error` flag is not forwarded — the Chat Completions `tool`
 /// message has no error field; the output text itself conveys failures
 /// (Anthropic's wire format is the one that carries an explicit flag).
-fn convert_message(m: &Message) -> Vec<Value> {
+/// Thinking parts ride only when `replay_reasoning` is set, joined in
+/// part order into the assistant's `reasoning_content`; image parts are
+/// skipped, as this wire carries no images in conversation history.
+fn convert_message(m: &Message, replay_reasoning: bool) -> Vec<Value> {
     let role = match m.role {
         Role::User => "user",
         Role::Assistant => "assistant",
@@ -947,10 +1071,14 @@ fn convert_message(m: &Message) -> Vec<Value> {
     let mut text_parts: Vec<&str> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
 
     for p in &m.parts {
         match p {
             MessagePart::Text { text } => text_parts.push(text.as_str()),
+            MessagePart::Thinking { text } if replay_reasoning && !text.is_empty() => {
+                reasoning_parts.push(super::anthropic::replay_reasoning_tail(text));
+            }
             MessagePart::ToolCall { id, name, input } => {
                 tool_calls.push(serde_json::json!({
                     "id": id,
@@ -970,12 +1098,21 @@ fn convert_message(m: &Message) -> Vec<Value> {
                     "content": output.to_string(),
                 }));
             }
-            MessagePart::Image { .. } => {} // not supported in this path
+            MessagePart::Thinking { .. } | MessagePart::Image { .. } => {}
         }
     }
 
+    let reasoning = (!reasoning_parts.is_empty()).then(|| reasoning_parts.join("\n"));
+
     if !tool_calls.is_empty() {
-        vec![build_assistant_message(role, &tool_calls, &text_parts)]
+        let mut message = build_assistant_message(role, &tool_calls, &text_parts);
+        if let (Some(reasoning), Some(obj)) = (reasoning.as_deref(), message.as_object_mut()) {
+            obj.insert(
+                "reasoning_content".to_string(),
+                Value::String(reasoning.to_string()),
+            );
+        }
+        vec![message]
     } else if !tool_results.is_empty() {
         if !text_parts.is_empty() {
             tool_results.push(serde_json::json!({
@@ -983,9 +1120,25 @@ fn convert_message(m: &Message) -> Vec<Value> {
                 "content": text_parts.join(""),
             }));
         }
+        if let Some(reasoning) = reasoning.as_deref() {
+            tool_results.push(serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "[prior assistant reasoning]
+            {reasoning}"
+                ),
+            }));
+        }
         tool_results
     } else {
-        vec![serde_json::json!({ "role": role, "content": text_parts.join("") })]
+        let mut message = serde_json::json!({ "role": role, "content": text_parts.join("") });
+        if let (Some(reasoning), Some(obj)) = (reasoning.as_deref(), message.as_object_mut()) {
+            obj.insert(
+                "reasoning_content".to_string(),
+                Value::String(reasoning.to_string()),
+            );
+        }
+        vec![message]
     }
 }
 
@@ -1886,6 +2039,7 @@ mod tests {
             None,
             None,
             &ToolConstraint::None,
+            false,
         );
         let json = body.to_json(true);
 
@@ -1899,7 +2053,15 @@ mod tests {
     #[test]
     fn request_body_without_system() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None);
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            None,
+            None,
+            &ToolConstraint::None,
+            false,
+        );
         let json = body.to_json(false);
 
         let messages = json["messages"].as_array().unwrap();
@@ -1910,7 +2072,15 @@ mod tests {
     #[test]
     fn request_body_stream_flag_toggles() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None);
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            None,
+            None,
+            &ToolConstraint::None,
+            false,
+        );
 
         assert_eq!(body.to_json(true)["stream"], true);
         assert_eq!(body.to_json(false)["stream"], false);
@@ -1919,7 +2089,15 @@ mod tests {
     #[test]
     fn request_body_streaming_includes_usage_option() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None);
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            None,
+            None,
+            &ToolConstraint::None,
+            false,
+        );
 
         assert_eq!(body.to_json(true)["stream_options"]["include_usage"], true);
     }
@@ -1927,7 +2105,15 @@ mod tests {
     #[test]
     fn request_body_non_streaming_omits_usage_option() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None);
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            None,
+            None,
+            &ToolConstraint::None,
+            false,
+        );
 
         assert!(
             body.to_json(false).get("stream_options").is_none(),
@@ -1938,8 +2124,16 @@ mod tests {
     #[test]
     fn request_body_stream_usage_disabled_omits_stream_options() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None)
-            .with_stream_usage(false);
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            None,
+            None,
+            &ToolConstraint::None,
+            false,
+        )
+        .with_stream_usage(false);
 
         assert!(
             body.to_json(true).get("stream_options").is_none(),
@@ -2048,6 +2242,7 @@ mod tests {
             Some(&tools),
             None,
             &ToolConstraint::None,
+            false,
         );
         let json = body.to_json(true);
 
@@ -2061,7 +2256,15 @@ mod tests {
     #[test]
     fn request_body_tools_absent_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None);
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            None,
+            None,
+            &ToolConstraint::None,
+            false,
+        );
         let json = body.to_json(false);
         assert!(
             json.get("tools").is_none(),
@@ -2072,7 +2275,7 @@ mod tests {
     #[test]
     fn convert_message_user_text() {
         let m = Message::user("hello world");
-        let v = convert_message(&m).remove(0);
+        let v = convert_message(&m, false).remove(0);
         assert_eq!(v["role"], "user");
         assert_eq!(v["content"], "hello world");
     }
@@ -2080,7 +2283,7 @@ mod tests {
     #[test]
     fn convert_message_assistant_text() {
         let m = Message::new(Role::Assistant, vec![MessagePart::text("hi there")]);
-        let v = convert_message(&m).remove(0);
+        let v = convert_message(&m, false).remove(0);
         assert_eq!(v["role"], "assistant");
         assert_eq!(v["content"], "hi there");
     }
@@ -2095,7 +2298,7 @@ mod tests {
                 input: serde_json::json!({"message": "hi"}),
             }],
         );
-        let v = convert_message(&m).remove(0);
+        let v = convert_message(&m, false).remove(0);
         assert_eq!(v["role"], "assistant");
         assert!(v["content"].is_null());
         let calls = v["tool_calls"].as_array().unwrap();
@@ -2120,7 +2323,7 @@ mod tests {
                 is_error: None,
             }],
         );
-        let v = convert_message(&m).remove(0);
+        let v = convert_message(&m, false).remove(0);
         assert_eq!(v["role"], "tool");
         assert_eq!(v["tool_call_id"], "call_1");
         assert!(v["content"].is_string());
@@ -2145,7 +2348,7 @@ mod tests {
                 },
             ],
         );
-        let vs = convert_message(&m);
+        let vs = convert_message(&m, false);
         assert_eq!(vs.len(), 2, "two tool results expand to two messages");
         assert_eq!(vs[0]["role"], "tool");
         assert_eq!(vs[0]["tool_call_id"], "call_1");
@@ -2643,15 +2846,24 @@ mod tests {
         }
 
         let msg = acc.build();
-        assert_eq!(msg.parts.len(), 2, "both tool calls flush");
+        assert_eq!(msg.parts.len(), 3, "thinking plus both tool calls flush");
         match &msg.parts[0] {
+            MessagePart::Thinking { text } => {
+                assert_eq!(
+                    text, "thinking hard",
+                    "the reasoning flushes as its own part"
+                );
+            }
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+        match &msg.parts[1] {
             MessagePart::ToolCall { name, input, .. } => {
                 assert_eq!(name, "echo");
                 assert_eq!(input, &serde_json::json!({"a": 1}));
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
-        match &msg.parts[1] {
+        match &msg.parts[2] {
             MessagePart::ToolCall { name, input, .. } => {
                 assert_eq!(name, "search");
                 assert_eq!(
@@ -3183,6 +3395,7 @@ mod tests {
             None,
             Some(&rf),
             &ToolConstraint::None,
+            false,
         );
         let json = body.to_json(false);
 
@@ -3198,7 +3411,15 @@ mod tests {
     #[test]
     fn request_body_response_format_absent_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &ToolConstraint::None);
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            None,
+            None,
+            &ToolConstraint::None,
+            false,
+        );
         let json = body.to_json(false);
         assert!(
             json.get("response_format").is_none(),
@@ -3223,6 +3444,7 @@ mod tests {
             Some(&[caller_tool]),
             Some(&rf),
             &ToolConstraint::None,
+            false,
         );
         let json = body.to_json(false);
 
@@ -3527,6 +3749,7 @@ mod tests {
             Some(&tools),
             None,
             &ToolConstraint::Strict,
+            false,
         );
         let json = body.to_json(false);
 
@@ -3558,6 +3781,7 @@ mod tests {
             Some(&tools),
             None,
             &ToolConstraint::None,
+            false,
         );
         let json = body.to_json(false);
 
@@ -3596,6 +3820,7 @@ mod tests {
             Some(&[caller_tool]),
             Some(&rf),
             &ToolConstraint::Strict,
+            false,
         );
         let json = body.to_json(false);
 
@@ -3626,7 +3851,15 @@ mod tests {
             JsonSchemaGrammar::from_schemas(&tools).expect("well-formed test schemas compile"),
         );
         let constraint = ToolConstraint::Grammar(grammar);
-        let body = RequestBody::build("gpt-4o", &msgs, None, Some(&tools), None, &constraint);
+        let body = RequestBody::build(
+            "gpt-4o",
+            &msgs,
+            None,
+            Some(&tools),
+            None,
+            &constraint,
+            false,
+        );
         let json = body.to_json(false);
 
         // guided_json carries the compiled grammar string.
@@ -3657,7 +3890,7 @@ mod tests {
 
         // No tools registered: guided_json must be absent so the model's
         // free-text output is not forced into the (empty) tool grammar.
-        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &constraint);
+        let body = RequestBody::build("gpt-4o", &msgs, None, None, None, &constraint, false);
         let json = body.to_json(false);
         assert!(
             json.get("guided_json").is_none(),
@@ -3669,7 +3902,7 @@ mod tests {
         );
 
         // Empty tool slice: same outcome — no guided_json, no tools.
-        let body = RequestBody::build("gpt-4o", &msgs, None, Some(&[]), None, &constraint);
+        let body = RequestBody::build("gpt-4o", &msgs, None, Some(&[]), None, &constraint, false);
         let json = body.to_json(false);
         assert!(
             json.get("guided_json").is_none(),
@@ -3683,7 +3916,7 @@ mod tests {
         // Role::System message is emitted verbatim (not folded into a
         // top-level field).
         let msg = Message::new(Role::System, vec![MessagePart::text("stay on task")]);
-        let value = convert_message(&msg).remove(0);
+        let value = convert_message(&msg, false).remove(0);
         assert_eq!(value["role"], "system");
         assert_eq!(value["content"], "stay on task");
     }
@@ -3885,6 +4118,7 @@ mod tests {
             Some(&[]),
             None,
             &ToolConstraint::None,
+            false,
         )
         .to_json(false);
         assert!(
@@ -3927,12 +4161,12 @@ mod tests {
                 ),
             ],
         );
-        let json = serde_json::to_string(&convert_message(&msg)).unwrap_or_default();
+        let json = serde_json::to_string(&convert_message(&msg, false)).unwrap_or_default();
         assert!(
             json.contains("stale results, search again"),
             "text parts accompanying tool results must reach the model; got {json}"
         );
-        let messages = convert_message(&msg);
+        let messages = convert_message(&msg, false);
         assert_eq!(
             messages.len(),
             2,
@@ -3945,6 +4179,170 @@ mod tests {
             "the preserved text rides as a trailing user message"
         );
         assert_eq!(messages[1]["content"], "stale results, search again");
+    }
+
+    async fn captured_effort_body(
+        default: Option<crate::structured::ThinkingEffort>,
+        options: crate::structured::RequestOptions,
+    ) -> String {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let mut builder = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"));
+        if let Some(effort) = default {
+            builder = builder.thinking_effort(effort);
+        }
+        let client = builder.build().unwrap();
+        let mut stream =
+            client.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), options);
+        let _ = stream.next().await;
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_client_effort_default_is_overridden_per_request() {
+        let default_alone = captured_effort_body(
+            Some(crate::structured::ThinkingEffort::Medium),
+            crate::structured::RequestOptions::new(),
+        )
+        .await;
+        assert!(
+            default_alone.contains("\"reasoning_effort\":\"medium\""),
+            "an unset per-request effort leaves the client default on the wire: {default_alone}"
+        );
+        let overridden = captured_effort_body(
+            Some(crate::structured::ThinkingEffort::Medium),
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::High),
+        )
+        .await;
+        assert!(
+            overridden.contains("\"reasoning_effort\":\"high\"")
+                && !overridden.contains("\"medium\""),
+            "the per-request effort wins over the client default: {overridden}"
+        );
+        let no_default = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::High),
+        )
+        .await;
+        assert!(
+            no_default.contains("\"reasoning_effort\":\"high\""),
+            "a request effort reaches the wire without any client default: {no_default}"
+        );
+    }
+
+    /// An assistant message whose history carries one thinking part per
+    /// entry plus a trailing text part.
+    fn assistant_with_thinking(traces: &[&str]) -> crate::message::Message {
+        let mut parts: Vec<crate::message::MessagePart> = traces
+            .iter()
+            .map(|text| crate::message::MessagePart::Thinking {
+                text: (*text).to_string(),
+            })
+            .collect();
+        parts.push(crate::message::MessagePart::text("the answer"));
+        crate::message::Message::new(crate::message::Role::Assistant, parts)
+    }
+
+    /// Capture the streaming body a client puts on the wire for one
+    /// history, with replay on or off.
+    async fn captured_replay_body(replay: bool, history: Vec<crate::message::Message>) -> String {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let mut builder = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"));
+        if replay {
+            builder = builder.replay_reasoning(true);
+        }
+        let client = builder.build().unwrap();
+        let mut stream = client.stream_messages_with_options(
+            &crate::api::StreamRequest::new(history),
+            crate::structured::RequestOptions::default(),
+        );
+        let _ = stream.next().await;
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn replayed_reasoning_rides_the_wire_only_when_enabled() {
+        let on =
+            captured_replay_body(true, vec![assistant_with_thinking(&["first dedup pass"])]).await;
+        assert!(
+            on.contains("\"reasoning_content\":\"first dedup pass\""),
+            "an enabled client replays history thinking as the assistant's reasoning_content: {on}"
+        );
+        let off =
+            captured_replay_body(false, vec![assistant_with_thinking(&["first dedup pass"])]).await;
+        assert!(
+            !off.contains("reasoning_content"),
+            "off by default — requests stay byte-identical to a client that never saw reasoning: {off}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_history_thinking_part_rides_the_replay_in_order() {
+        let body = captured_replay_body(
+            true,
+            vec![assistant_with_thinking(&["alpha pass", "beta pass"])],
+        )
+        .await;
+        assert!(
+            body.contains("\"reasoning_content\":\"alpha pass\\nbeta pass\""),
+            "each history thinking part rides back joined in part order: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ladder_s_outer_rungs_reach_the_openai_wire() {
+        let low = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Low),
+        )
+        .await;
+        assert!(
+            low.contains("\"reasoning_effort\":\"low\""),
+            "the Low rung maps to the provider's low label: {low}"
+        );
+        let max = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Max),
+        )
+        .await;
+        assert!(
+            max.contains("\"reasoning_effort\":\"high\"")
+                && !max.contains("\"reasoning_effort\":\"max\""),
+            "Max clamps to the parameter's high ceiling, never a literal max label: {max}"
+        );
     }
 
     #[tokio::test]
@@ -3976,6 +4374,75 @@ mod tests {
         assert!(
             request.contains("\"model\":\"override-model\""),
             "the streaming path must honor the per-request model override: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_effort_default_reaches_the_non_streaming_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .thinking_effort(crate::structured::ThinkingEffort::Medium)
+            .build()
+            .unwrap();
+        drop(
+            client
+                .create_message(&crate::api::StreamRequest::new(vec![]))
+                .await,
+        );
+        let request = server.await.unwrap();
+        assert!(
+            request.contains("\"reasoning_effort\":\"medium\""),
+            "the client-level effort default must reach the plain non-streaming wire too: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_request_unset_inherits_the_client_default() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let client = OpenAiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .thinking_effort(crate::structured::ThinkingEffort::Medium)
+            .build()
+            .unwrap();
+        drop(
+            client
+                .create_message_with_options(
+                    &crate::api::StreamRequest::new(vec![]),
+                    crate::structured::RequestOptions::new(),
+                )
+                .await,
+        );
+        let request = server.await.unwrap();
+        assert!(
+            request.contains("\"reasoning_effort\":\"medium\""),
+            "an unset per-request effort inherits the client default — there is no per-request off: {request}"
         );
     }
 

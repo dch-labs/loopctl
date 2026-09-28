@@ -2397,6 +2397,270 @@ impl crate::observer::LoopObserver for TransportEventCapture {
     }
 }
 
+/// A client whose first stream attempt dies mid-stream with a retryable
+/// transport error after emitting a thinking delta, and whose second
+/// attempt serves a healthy thinking-then-text stream — the exact shape
+/// that fires `AttemptReset` between one attempt's dead prefix and the
+/// retry's live events.
+#[cfg(feature = "streaming")]
+struct RetryConcatClient {
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The double-retry twin: attempts one and two both die mid-stream with
+/// retryable transport errors after a thinking delta, and the third
+/// serves the healthy stream — two resets, numbered consecutively.
+#[cfg(feature = "streaming")]
+struct DoubleRetryConcatClient {
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "streaming")]
+impl ApiClient for RetryConcatClient {
+    fn model(&self) -> String {
+        "test-model".to_string()
+    }
+
+    fn set_model(&self, _model: &str) -> bool {
+        false
+    }
+
+    fn stream_messages(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let seen = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        let mut events = vec![
+            Ok(StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: format!("msg_{seen}"),
+                    role: "assistant".into(),
+                    model: "test-model".into(),
+                },
+            })),
+            Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: crate::stream::DeltaPart::Thinking {
+                    text: format!("attempt {seen} reasoning"),
+                },
+            })),
+        ];
+        if seen == 1 {
+            events.push(Err(ApiError::api("stream transport broke")));
+        } else {
+            events.push(Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: crate::stream::DeltaPart::Text {
+                    text: "final answer".into(),
+                },
+            })));
+            events.push(Ok(StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".into()),
+                },
+                usage: Some(Usage::new(4, 6)),
+            })));
+            events.push(Ok(StreamEvent::MessageStop));
+        }
+        Box::pin(futures::stream::iter(events))
+    }
+
+    fn create_message(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        Box::pin(async { Err(ApiError::api("no fallback in this fixture")) })
+    }
+}
+
+/// Records attempt resets and thinking deltas in arrival order, tagged
+/// with their turn and (for resets) the attempt the stream is entering.
+#[cfg(feature = "streaming")]
+struct ResetCapture {
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::observer::LoopObserver for ResetCapture {
+    fn name(&self) -> &'static str {
+        "reset-capture"
+    }
+    fn on_attempt_reset(&self, ctx: &crate::observer::AttemptResetContext) {
+        crate::error::recover_guard(self.log.lock())
+            .push(format!("reset t{} a{}", ctx.turn, ctx.attempt));
+    }
+    fn on_thinking_delta(&self, ctx: &crate::observer::ThinkingDeltaContext) {
+        crate::error::recover_guard(self.log.lock()).push(format!("thinking t{}", ctx.turn));
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn a_retry_fires_attempt_reset_before_the_retry_s_deltas() {
+    let capture = Arc::new(ResetCapture {
+        log: Arc::new(Mutex::new(Vec::new())),
+    });
+    let managers = LoopManagers::new()
+        .with_observer(Arc::clone(&capture) as Arc<dyn LoopObserver>)
+        .with_stream_handler(fast_exhausting_handler(false));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(RetryConcatClient {
+            attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    let result = agent.run("Hi", &RunConfig::default()).await.unwrap();
+    assert_eq!(result.turn_count(), 1, "the retry served the turn");
+    let log = crate::error::recover_guard(capture.log.lock()).clone();
+    assert_eq!(
+        log,
+        vec![
+            "thinking t0".to_string(),
+            "reset t0 a2".to_string(),
+            "thinking t0".to_string(),
+        ],
+        "the reset fires exactly once, after the dead attempt's deltas and before the retry's: {log:?}"
+    );
+}
+
+#[cfg(feature = "streaming")]
+impl ApiClient for DoubleRetryConcatClient {
+    fn model(&self) -> String {
+        "test-model".to_string()
+    }
+
+    fn set_model(&self, _model: &str) -> bool {
+        false
+    }
+
+    fn stream_messages(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        let seen = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        let mut events = vec![
+            Ok(StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: format!("msg_{seen}"),
+                    role: "assistant".into(),
+                    model: "test-model".into(),
+                },
+            })),
+            Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: crate::stream::DeltaPart::Thinking {
+                    text: format!("attempt {seen} reasoning"),
+                },
+            })),
+        ];
+        if seen <= 2 {
+            events.push(Err(ApiError::api("stream transport broke")));
+        } else {
+            events.push(Ok(StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: crate::stream::DeltaPart::Text {
+                    text: "final answer".into(),
+                },
+            })));
+            events.push(Ok(StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".into()),
+                },
+                usage: Some(Usage::new(4, 6)),
+            })));
+            events.push(Ok(StreamEvent::MessageStop));
+        }
+        Box::pin(futures::stream::iter(events))
+    }
+
+    fn create_message(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        Box::pin(async { Err(ApiError::api("no fallback in this fixture")) })
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn a_double_retry_numbers_attempts_consecutively() {
+    let capture = Arc::new(ResetCapture {
+        log: Arc::new(Mutex::new(Vec::new())),
+    });
+    let managers = LoopManagers::new()
+        .with_observer(Arc::clone(&capture) as Arc<dyn LoopObserver>)
+        .with_stream_handler(two_retry_handler());
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(DoubleRetryConcatClient {
+            attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    let result = agent.run("Hi", &RunConfig::default()).await.unwrap();
+    assert_eq!(result.turn_count(), 1, "the third attempt served the turn");
+    let log = crate::error::recover_guard(capture.log.lock()).clone();
+    assert_eq!(
+        log,
+        vec![
+            "thinking t0".to_string(),
+            "reset t0 a2".to_string(),
+            "thinking t0".to_string(),
+            "reset t0 a3".to_string(),
+            "thinking t0".to_string(),
+        ],
+        "two resets number consecutively from the retry ladder, each before its attempt's deltas: {log:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "streaming")]
+async fn a_clean_stream_fires_no_attempt_reset() {
+    let capture = Arc::new(ResetCapture {
+        log: Arc::new(Mutex::new(Vec::new())),
+    });
+    let managers = LoopManagers::new().with_observer(Arc::clone(&capture) as Arc<dyn LoopObserver>);
+    let client =
+        crate::testing::MockApiClient::new("test-model").with_text_response("clean answer");
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+    let result = agent.run("Hi", &RunConfig::default()).await.unwrap();
+    assert_eq!(result.turn_count(), 1);
+    let log = crate::error::recover_guard(capture.log.lock()).clone();
+    assert!(
+        log.is_empty(),
+        "a stream that never retried fires no reset and (text-only mock) no thinking: {log:?}"
+    );
+}
+
+/// A handler whose retry ladder allows two fast retries, for pinning
+/// consecutive attempt numbering across a second reset.
+#[cfg(feature = "streaming")]
+fn two_retry_handler() -> crate::stream::handler::StreamHandler {
+    use crate::stream::handler::{StreamHandler, StreamRetryConfig};
+    StreamHandler::new().with_retry_config(StreamRetryConfig {
+        max_retries: 2,
+        base_delay_ms: 1,
+        max_delay_ms: 1,
+        jitter_factor: 0.0,
+    })
+}
+
 /// A handler whose retry ladder exhausts after one fast retry, leaving the
 /// non-streaming fallback as the configured last chance.
 #[cfg(feature = "streaming")]

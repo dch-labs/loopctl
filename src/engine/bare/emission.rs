@@ -304,6 +304,21 @@ impl<C: ApiClient> BareLoop<C> {
         );
     }
 
+    /// Fire [`on_attempt_reset`](crate::observer::LoopObserver::on_attempt_reset)
+    /// for the retried stream attempt the engine is entering.
+    ///
+    /// Called right after the engine discarded the failed attempt's
+    /// accumulator — the observer's cue to discard its own per-turn delta
+    /// buffer for the same turn. Streaming-only: only the stream-handler
+    /// retry path resets attempts.
+    #[cfg(feature = "streaming")]
+    pub(super) fn notify_attempt_reset(&self, attempt: usize) {
+        let turn = self.session.current_run().map_or(0, Run::turn_count);
+        self.managers
+            .observers()
+            .on_attempt_reset(&crate::observer::AttemptResetContext { turn, attempt });
+    }
+
     /// Record a successful LLM turn: tells the fallback manager the model is
     /// healthy and fires
     /// [`on_stream_success`](crate::observer::LoopObserver::on_stream_success).

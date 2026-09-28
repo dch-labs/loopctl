@@ -299,6 +299,7 @@ impl<C: ApiClient> BareLoop<C> {
 
         let mut accumulator = StreamAccumulator::new();
         let mut stop_reason = StreamStopReason::EndTurn;
+        let mut attempt = 1usize;
 
         while let Some(result) = stream.next().await {
             match result.map_err(Self::map_handler_error)? {
@@ -308,6 +309,8 @@ impl<C: ApiClient> BareLoop<C> {
                 HandlerEvent::AttemptReset => {
                     accumulator = StreamAccumulator::new();
                     stop_reason = StreamStopReason::EndTurn;
+                    attempt = attempt.saturating_add(1);
+                    self.notify_attempt_reset(attempt);
                 }
                 HandlerEvent::Fallback {
                     message,

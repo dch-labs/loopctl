@@ -1056,6 +1056,10 @@ impl ApiClient for MockApiClient {
     /// so the canned text is the structured answer, well-formed or
     /// deliberately malformed. Rejects `tool_constraint` loudly (a
     /// constraint shapes the tool-calling path the mock scripts).
+    /// Accepts `effort` the same way `response_format` is accepted: the
+    /// mock puts nothing on a wire, so the level changes no scripted
+    /// output — engine-level effort tests can drive the option through
+    /// the mock without opting in.
     /// Serves the response under
     /// `options.model` when set — the mock's stand-in for the wire-level
     /// model switch real clients perform, so fallback-routing tests
@@ -1150,8 +1154,10 @@ impl ApiClient for MockApiClient {
     /// Non-streaming variant that accepts the per-request model override.
     ///
     /// Accepts a `response_format` by serving the canned response
-    /// unchanged (see the streaming twin for why), and rejects
-    /// `tool_constraint` loudly. The per-request `model` is accepted without
+    /// unchanged (see the streaming twin for why), rejects
+    /// `tool_constraint` loudly, and accepts `effort` like the streaming
+    /// twin does — the level reaches no wire and changes no scripted
+    /// output. The per-request `model` is accepted without
     /// changing the response: a [`NonStreamingResponse`](crate::api::NonStreamingResponse)
     /// carries no model field, so there is nothing to vary — accepting
     /// the override keeps fallback-routing tests on the non-streaming
@@ -1876,6 +1882,21 @@ mod tests {
         assert!(
             !events.is_empty() && events.iter().all(Result::is_ok),
             "the canned stream is served under a response_format, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_effort_carrying_request_is_served_by_the_mock() {
+        let client = MockApiClient::new("test-model").with_text_response("hi");
+        let opts = crate::structured::RequestOptions::new()
+            .with_effort(crate::structured::ThinkingEffort::High);
+        let served = client
+            .create_message_with_options(&crate::api::StreamRequest::new(vec![]), opts)
+            .await
+            .is_ok_and(|resp| resp.message.text_content() == "hi");
+        assert!(
+            served,
+            "the mock serves the canned response under an effort level, like a response_format"
         );
     }
 

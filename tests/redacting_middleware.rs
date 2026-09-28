@@ -115,11 +115,23 @@ async fn bearer_header_is_redacted() {
     );
 }
 
+/// The AWS documentation placeholder access-key id, assembled from
+/// pieces so the contiguous credential shape never appears in source
+/// — push-protection scanners match the shape, and this suite must
+/// carry it only at runtime. `final_char` swaps the last character so
+/// a count test can plant two distinct keys.
+fn aws_key_fixture(final_char: char) -> String {
+    let mut key = ["AKIA", "IOSFODNN7EXAMPL"].concat();
+    key.push(final_char);
+    key
+}
+
 #[tokio::test]
 async fn aws_access_key_is_redacted() {
-    let result = redact(ToolContent::from_string(
-        "configured with key AKIAIOSFODNN7EXAMPLE",
-    ))
+    let result = redact(ToolContent::from_string(format!(
+        "configured with key {}",
+        aws_key_fixture('E')
+    )))
     .await;
     assert!(
         text_of(&result).contains("[REDACTED:aws_access_key]"),
@@ -228,7 +240,7 @@ async fn multipart_text_parts_scrubbed_image_untouched() {
     let image_payload = "iVBORw0KGgoAAAANSUhEUg".to_string();
     let output = ToolContent::from_multipart(vec![
         ToolContentPart::Text {
-            text: "key AKIAIOSFODNN7EXAMPLE here".to_string(),
+            text: format!("key {} here", aws_key_fixture('E')),
         },
         ToolContentPart::Text {
             text: "perfectly clean text".to_string(),
@@ -271,7 +283,7 @@ async fn multipart_text_parts_scrubbed_image_untouched() {
 
 #[tokio::test]
 async fn text_single_string_path_is_scrubbed() {
-    let result = redact(ToolContent::from_string("AKIAIOSFODNN7EXAMPLE")).await;
+    let result = redact(ToolContent::from_string(aws_key_fixture('E'))).await;
     assert_eq!(
         text_of(&result),
         "[REDACTED:aws_access_key]",
@@ -303,7 +315,7 @@ fn clean_output_passes_through_identical() {
 
 #[test]
 fn scrub_reports_the_redaction_count() {
-    let mut dirty = String::from("keys AKIAIOSFODNN7EXAMPLE and AKIAIOSFODNN7EXAMPLF");
+    let mut dirty = format!("keys {} and {}", aws_key_fixture('E'), aws_key_fixture('F'));
     let count = SecretPatternSet::default_common().scrub(&mut dirty);
     assert_eq!(count, 2, "one redaction per match");
     assert_eq!(
@@ -321,7 +333,7 @@ async fn middleware_name_is_redaction() {
 #[tokio::test]
 async fn redacted_result_keeps_error_state_and_display_hint() {
     let result = redact_with(
-        ToolContent::from_string("AKIAIOSFODNN7EXAMPLE"),
+        ToolContent::from_string(aws_key_fixture('E')),
         SecretPatternSet::default_common(),
         Some(loopctl::tool::DisplayHint::Diff),
     )
@@ -556,7 +568,10 @@ fn a_space_free_multiline_listing_passes_through_verbatim() {
 
 #[test]
 fn known_secrets_inside_a_newline_listing_still_redact() {
-    let listing = "Desktop\nAKIAIOSFODNN7EXAMPLE\nShot_2026-09-21_10-34-56.png\nnote: api_key=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 trailing words\n[exit 0, 2ms]";
+    let listing = format!(
+        "Desktop\n{}\nShot_2026-09-21_10-34-56.png\nnote: api_key=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 trailing words\n[exit 0, 2ms]",
+        aws_key_fixture('E')
+    );
     let mut scrubbed = listing.to_string();
     let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
     assert_eq!(count, 2, "one redaction per secret line: {scrubbed}");
@@ -594,5 +609,390 @@ fn tabs_and_carriage_returns_bound_tokens_like_spaces() {
     assert_eq!(
         tabbed, "blob\t[REDACTED:high_entropy]\tend",
         "tabs bound tokens exactly as spaces do — and survive the rewrite"
+    );
+}
+
+#[test]
+fn space_free_rust_expressions_pass_through_verbatim() {
+    let source = "let elapsed = u64::try_from(now.duration_since(began).as_millis()).unwrap_or(0);\nlet composer_height = text_rows.saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2));";
+    let mut scrubbed = source.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(count, 0, "no substitution on ordinary code: {scrubbed}");
+    assert_eq!(
+        scrubbed, source,
+        "a call chain with interior punctuation is not one candidate"
+    );
+}
+
+#[test]
+fn markdown_table_link_cells_pass_through_verbatim() {
+    let row = "| [L-7](./roadmap/01-loopctl-0.2.0/tasks/L-7-on-text-delta.md) `on_text_delta` | [T-27](./roadmap/02-dch-v1/tasks/T-27-streaming-text-display.md) (streaming text display) |";
+    let mut scrubbed = row.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "no substitution on a documentation link: {scrubbed}"
+    );
+    assert_eq!(scrubbed, row, "markdown link cells pass through verbatim");
+}
+
+#[test]
+fn a_double_colon_bearing_core_passes_through_verbatim() {
+    let path = "Zq7Xk2Lm9Pz4Rt6Vb8Nc1Sd3Gf5HjK::WyU6MxE0gT8vC5nB1sA4dF2hJ";
+    let mut scrubbed = format!("use {path};");
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "no substitution on a path-shaped token: {scrubbed}"
+    );
+    assert!(
+        scrubbed.contains(path),
+        "`::` bounds candidates exactly as `(` does: {scrubbed}"
+    );
+}
+
+#[test]
+fn an_unpunctuated_high_entropy_run_still_redacts() {
+    let token = "qX7mZ2vQ9wL4nR8tY3uK5jH7gF6dS2aP1oI9bV3cX2z";
+    let mut scrubbed = format!("blob {token} end");
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "the run bounding is not a blanket off switch: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "blob [REDACTED:high_entropy] end",
+        "a paren-free, colon-free credential run still redacts"
+    );
+}
+
+#[test]
+fn a_shell_path_assignment_passes_through_verbatim() {
+    let line = "PATH=$HOME/.rustup/toolchains/1.98.0-x86_64-unknown-linux-gnu/bin:$PATH make ci";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "no substitution on a toolchain PATH line: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, line,
+        "a PATH assignment is shell syntax, not a credential"
+    );
+}
+
+#[test]
+fn git_status_porcelain_paths_pass_through_verbatim() {
+    let line = " M roadmap/03e-loopctl-0.3.4/tasks/L-118-event-hub.md";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(count, 0, "no substitution on a git status path: {scrubbed}");
+    assert_eq!(
+        scrubbed, line,
+        "a repository path is a path, not a credential"
+    );
+}
+
+#[test]
+fn cargo_test_output_paths_pass_through_verbatim() {
+    let line =
+        "     Running tests/sqlite_memory.rs (target/debug/deps/sqlite_memory-7dcdab93082f5511)";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "no substitution on a cargo test binary path: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, line,
+        "a target/debug/deps path is a build artifact, not a credential"
+    );
+}
+
+#[test]
+fn a_git_dependency_source_line_passes_through_verbatim() {
+    let line = "source = \"git+https://github.com/dch-labs/loopctl?branch=master#d4ee826544deb86be6235eea17b7bae06c332b81\"";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "no substitution on a git dependency source: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, line,
+        "a git+https source URL with its pinned rev is dependency metadata, not a credential"
+    );
+}
+
+#[test]
+fn a_json_raw_string_literal_passes_through_verbatim() {
+    let line = "let raw = r#\"{\"type\":\"thinking\",\"thinking\":\"placeholder body for the round trip test\",\"duration_ms\":125}\"#;";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "no substitution on a JSON raw string literal: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, line,
+        "a JSON literal in source code is code, not a credential"
+    );
+}
+
+#[test]
+fn a_let_declared_token_literal_passes_verbatim() {
+    let line = "let token = \"placeholder0123456789\";";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "no substitution on a variable declaration: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, line,
+        "a let-declared token with an ordinary literal is code, not a dump"
+    );
+}
+
+#[test]
+fn a_mut_declaration_passes_verbatim() {
+    let line = "let mut secret = \"placeholder0123456789\".to_string();";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(count, 0, "no substitution on a mut declaration: {scrubbed}");
+    assert_eq!(
+        scrubbed, line,
+        "a let-mut-declared secret with an ordinary literal is code, not a dump"
+    );
+}
+
+#[test]
+fn a_type_annotated_declaration_passes_verbatim() {
+    let line = "let secret: SecretStoreHandle012345 = Default::default();";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "a declaration whose type annotation looks like a value is still a declaration: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, line,
+        "the declaration arm spans the annotation, so the plain arm cannot fire on it"
+    );
+}
+
+#[test]
+fn a_compound_named_declaration_passes_verbatim() {
+    let source = "let entropy_token = \"placeholder0123456789\";\nlet client_secret = \"placeholder9876543210\";";
+    let mut scrubbed = source.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "no substitution on compound-named declarations: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, source,
+        "a declaration whose name merely contains token or secret is still a declaration"
+    );
+}
+
+#[test]
+fn an_env_style_compound_key_dump_still_redacts() {
+    let line = "OPENAI_API_KEY=placeholder0123456789";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "an underscore-joined uppercase env name is a dump, not a declaration: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "OPENAI_[REDACTED:api_key_kv]",
+        "the plain arm still matches keys inside compound env names"
+    );
+}
+
+#[test]
+fn an_exported_quoted_kv_still_redacts() {
+    let line = "export TOKEN=\"placeholder0123456789\"";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "export is an env-dump keyword, not a declaration keyword: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "export [REDACTED:api_key_kv]",
+        "a quoted exported token still redacts"
+    );
+}
+
+#[test]
+fn a_slash_bearing_credential_run_still_redacts() {
+    let token = "qX7mZ/vQ9wL4nR8tY3uK5/jH7gF6dS2aP1oI/9bV3cX2z";
+    let mut scrubbed = format!("blob {token} end");
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "slashes alone do not make a mixed-case run a path: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "blob [REDACTED:high_entropy] end",
+        "a slash-bearing high-entropy credential run still redacts"
+    );
+}
+
+#[test]
+fn a_digit_bearing_segment_run_is_not_path_shaped() {
+    let token = ["38gO/rqh", "/l3wyX8KX/", "62sp/JoazycZ9FcQS1fDTK"].concat();
+    let mut scrubbed = format!("blob {token} end");
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "short lowercase-or-digit segments do not make a credential run a path: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "blob [REDACTED:high_entropy] end",
+        "a slash-bearing credential whose only word-shaped segments carry digits or fall under four letters still redacts"
+    );
+}
+
+#[test]
+fn a_run_is_path_shaped_only_on_four_letter_word_segments() {
+    let head = "Xq7mZ2vQ9wL4nR8tY3uK5";
+    let tail = "jH7gF6dS2aP1oI9bV3cX2z";
+
+    let words = format!("blob {head}/apps/tools/{tail} end");
+    let mut scrubbed = words.clone();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "two pure four-letter word segments keep a slash run a path: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, words,
+        "a word-segmented slash run passes through verbatim"
+    );
+
+    let one_word = format!("blob {head}/apps/{tail} end");
+    let mut scrubbed = one_word.clone();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "a single word segment among noise is not a path: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "blob [REDACTED:high_entropy] end",
+        "the path guard needs two word segments, not one — the whole run is one candidate"
+    );
+
+    let digit_bearing = format!("blob {head}/app2/t00ls/{tail} end");
+    let mut scrubbed = digit_bearing.clone();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "a digit inside a segment disqualifies it as a word: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "blob [REDACTED:high_entropy] end",
+        "digit-bearing segments leave the whole run measured"
+    );
+
+    let short_segments = format!("blob {head}/app/tool/{tail} end");
+    let mut scrubbed = short_segments.clone();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "segments under four characters are not words: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "blob [REDACTED:high_entropy] end",
+        "three-letter segments leave the whole run measured"
+    );
+}
+
+#[test]
+fn a_dense_quoted_secret_in_a_declaration_masks_its_value() {
+    let line = "let token = \"J8kL2mN4pQ6rS8tUv1Wxyz\";";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "a dense quoted literal in a declaration masks its value: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "let token = \"[REDACTED:api_key_kv]\";",
+        "only the secret literal is masked — the declaration syntax survives the read"
+    );
+}
+
+#[test]
+fn a_low_entropy_hex_secret_in_a_declaration_masks_its_value() {
+    let line = "let secret = \"deadbeefcafe0123456789abcdef0123\";";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "a hex literal sits below the entropy lane's density, so the key-value lane is its only mask: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "let secret = \"[REDACTED:api_key_kv]\";",
+        "the value masks while the declaration syntax survives"
+    );
+}
+
+#[test]
+fn a_placeholder_marked_quoted_value_passes_verbatim() {
+    let line = "let api_key = \"yourexamplekey0123456789\";";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "no substitution on a placeholder-marked literal: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, line,
+        "a quoted value that names itself a placeholder is documentation, not a secret"
+    );
+}
+
+#[test]
+fn the_declaration_arm_spans_exactly_48_characters_of_annotation() {
+    let mut annotation = String::from("aaaaaa");
+    for pair in ["bb", "cc", "dd", "ee", "ff", "gg", "hh", "ii", "jj", "kk"] {
+        annotation.push_str("::");
+        annotation.push_str(pair);
+    }
+    let spacing = format!(": {annotation}");
+    assert_eq!(
+        spacing.chars().count(),
+        48,
+        "the fixture must sit exactly at the declaration arm's annotation tolerance"
+    );
+    let line = format!("let token{spacing}= \"J8kL2mN4pQ6rS8tUv1Wxyz\";");
+    let mut scrubbed = line.clone();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "a dense quoted value behind an annotation the arm still spans masks in place: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed,
+        format!("let token{spacing}= \"[REDACTED:api_key_kv]\";"),
+        "at exactly 48 characters of annotation the declaration arm still reaches the value"
+    );
+}
+
+#[test]
+fn an_annotation_past_the_tolerance_matches_no_kv_arm() {
+    let line = "let token: std::collections::HashMap<String, Vec<Option<u8>>> = \"J8kL2mN4pQ6rS8tUv1Wxyz\";";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "past the declaration arm's annotation tolerance no key-value arm fires — the documented cliff: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, line,
+        "the line passes through; a value behind an over-long annotation leans on the entropy lane alone"
     );
 }

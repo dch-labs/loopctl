@@ -1004,7 +1004,7 @@ fn anthropic_body(request: &StreamRequest, max_tokens: u32) -> serde_json::Value
     let converted: Vec<serde_json::Value> = messages
         .iter()
         .filter(|m| !m.parts.is_empty())
-        .map(|m| crate::provider::anthropic::convert_message(m))
+        .map(|m| crate::provider::anthropic::convert_message(m, false))
         .collect();
     let mut body = serde_json::json!({
         "anthropic_version": "bedrock-2023-05-31",
@@ -1110,7 +1110,8 @@ fn converse_message(message: &crate::message::Message) -> serde_json::Value {
                     }
                 }));
             }
-            crate::message::MessagePart::Image { .. } => {}
+            crate::message::MessagePart::Thinking { .. }
+            | crate::message::MessagePart::Image { .. } => {}
         }
     }
     serde_json::json!({"role": role, "content": content})

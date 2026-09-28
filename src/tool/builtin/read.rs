@@ -36,8 +36,10 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 ///
 /// Pagination-by-default would multiply turns and bet on the model's
 /// diligence; larger views page via `offset`/`limit`, each page
-/// self-describing.
-const DEFAULT_MAX_LINES: usize = 200;
+/// self-describing. The byte ceiling below is the real bound — this
+/// line budget just keeps the numbering window generous enough that a
+/// typical source file lands in one read.
+const DEFAULT_MAX_LINES: usize = 2_000;
 
 /// Default output ceiling in bytes, guarding long-line content.
 ///
@@ -52,7 +54,7 @@ const DEFAULT_MAX_BYTES: usize = 400_000;
 /// Reads that start mid-content get the same window size as a read from
 /// the top: the model is navigating, not skimming, and a stable page size
 /// keeps successive windows predictable.
-const DEFAULT_OFFSET_LIMIT: usize = 200;
+const DEFAULT_OFFSET_LIMIT: usize = 2_000;
 
 /// Default outright-refusal threshold, in bytes.
 ///
@@ -219,8 +221,8 @@ pub struct ReadTool<S: ContentSource> {
 impl<S: ContentSource> ReadTool<S> {
     /// Build a read tool over `source` with the default ceilings.
     ///
-    /// 200 lines, 400 000 bytes of joined output, a 200-line default
-    /// window for offset-only reads, a `10 MiB` outright-refusal
+    /// 2 000 lines, 400 000 bytes of joined output, a 2 000-line
+    /// default window for offset-only reads, a `10 MiB` outright-refusal
     /// threshold when the source reports sizes, and a `5 MiB` ceiling on
     /// encoded image payloads.
     #[must_use]
@@ -1528,7 +1530,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_default_ceilings_are_the_documented_ones() {
-        let content = (1..=300)
+        let content = (1..=2500)
             .map(|n| format!("line{n}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -1537,8 +1539,9 @@ mod tests {
             .await
             .expect("the default window resolves");
         assert!(
-            head.contains("Showing lines 1-200 of 300"),
-            "the default line ceiling is 200: {head}"
+            head.contains("Showing lines 1-2000 of 2500")
+                && head.contains("Use offset=2001 to see the remaining 500 lines"),
+            "the default line ceiling is 2000 and its cut names the continuation: {head}"
         );
         let page = read(
             &tool,
@@ -1547,8 +1550,8 @@ mod tests {
         .await
         .expect("the default offset-only window resolves");
         assert!(
-            page.contains("Showing lines 6-205 of 300"),
-            "the default offset-only window is 200 lines: {page}"
+            page.contains("Showing lines 6-2005 of 2500"),
+            "the default offset-only window is 2000 lines: {page}"
         );
         let wide_line = "x".repeat(3000);
         let wide = (0..300)

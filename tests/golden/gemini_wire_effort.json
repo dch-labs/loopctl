@@ -1,0 +1,73 @@
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Check the weather in Paris with the weather tool."
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "parts": [
+        {
+          "functionCall": {
+            "args": {
+              "city": "Paris"
+            },
+            "id": "call_gold_weather",
+            "name": "get_weather"
+          }
+        }
+      ],
+      "role": "model"
+    },
+    {
+      "parts": [
+        {
+          "functionResponse": {
+            "id": "call_gold_weather",
+            "name": "get_weather",
+            "response": {
+              "result": "18 degrees, clear sky"
+            }
+          }
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "thinkingConfig": {
+      "thinkingBudget": 16384
+    }
+  },
+  "systemInstruction": {
+    "parts": [
+      {
+        "text": "You are a concise weather agent."
+      }
+    ]
+  },
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "description": "Look up the current weather for a city",
+          "name": "get_weather",
+          "parameters": {
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ]
+}

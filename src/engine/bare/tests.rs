@@ -1686,6 +1686,47 @@ async fn a_cancelled_turn_s_turn_end_carries_the_engine_s_context_estimate() {
 }
 
 #[tokio::test]
+async fn the_last_turn_end_figure_survives_the_max_turns_edge() {
+    let client = MockClient::new("test-model");
+    client.add_tool_only_response("call_1", "echo", &json!({"message": "hi"}));
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    let figures = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(ContextSizeRecorder {
+        figures: figures.clone(),
+    }));
+
+    let run_config = RunConfig {
+        max_turns: 1,
+        ..RunConfig::default()
+    };
+    let result = agent.run("echo hi", &run_config).await;
+    match result {
+        Err(LoopError::MaxTurnsExceeded { max }) => assert_eq!(
+            max, 1,
+            "the one-turn budget ends the run right after the tool turn"
+        ),
+        other => {
+            panic!("the one-turn budget must end the run right after the tool turn: {other:?}")
+        }
+    }
+
+    let recorded = crate::error::recover_guard(figures.lock()).clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the tool turn fires exactly one turn-end before the budget ends the run: {recorded:?}"
+    );
+    let figure = recorded.first().copied().unwrap_or(0);
+    assert_eq!(
+        figure,
+        agent.context_tokens(),
+        "the run's last turn-end carries the post-results figure — no later event fires, so the live lane's last word must equal the at-rest accessor"
+    );
+}
+
+#[tokio::test]
 async fn observer_sequence_multi_tool_turn() {
     let client = MockClient::new("test-model");
     // Two tool calls in one turn, then a final text turn.

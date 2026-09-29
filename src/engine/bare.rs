@@ -1058,16 +1058,20 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Dispatch a batch of tool calls and return their aggregated result parts.
     ///
-    /// Runs the calls through the configured dispatch path, fires `on_turn_end`
-    /// (on both success and error paths, with the matching `success` flag), and
-    /// returns the assembled tool-result [`MessagePart`]s for the caller to
-    /// feed into the driving machine via [`LoopMachine::tool_results`]. The
-    /// message is *not* pushed to the history here — history is owned by the
+    /// Runs the calls through the configured dispatch path and returns the
+    /// assembled tool-result [`MessagePart`]s for the caller to feed into
+    /// the driving machine via [`LoopMachine::tool_results`]. The message
+    /// is *not* pushed to the history here — history is owned by the
     /// machine, so the caller decides when to record it (alongside any
-    /// preresolved results).
+    /// preresolved results). On a dispatch failure it fires `on_turn_end`
+    /// with `success: false` before propagating the error; the success
+    /// event is the caller's to fire, after the results land in machine
+    /// history so the context-size figure observers receive already
+    /// includes them (see [`handle_call_tools`](Self::handle_call_tools)).
     ///
     /// `accounting` carries the turn's start instant and provider-reported
-    /// token pair, forwarded into the `on_turn_end` notification.
+    /// token pair, forwarded into the failure notification; the caller
+    /// reuses the same fields for the success event.
     ///
     /// # Errors
     ///
@@ -1087,20 +1091,7 @@ impl<C: ApiClient> BareLoop<C> {
         let result = self.dispatch_tools(tool_calls, turn).await;
         let turn_duration = accounting.start.elapsed();
         match result {
-            Ok(results) => {
-                let parts = Self::build_tool_result_parts(results);
-                self.notify_turn_end(&TurnEnd {
-                    turn,
-                    success: true,
-                    error: None,
-                    duration: turn_duration,
-                    input_tokens: accounting.input_tokens,
-                    output_tokens: accounting.output_tokens,
-                    stop_reason: accounting.stop_reason,
-                    context_tokens: self.machine.context_tokens(),
-                });
-                Ok(parts)
-            }
+            Ok(results) => Ok(Self::build_tool_result_parts(results)),
             Err(e) => {
                 let err_str = e.to_string();
                 self.notify_turn_end(&TurnEnd {
@@ -1575,7 +1566,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// single user [`Message`] — in the order the model requested the calls —
     /// and feeds it back to the machine. One turn yields one user message
     /// regardless of how the results were produced, which is the shape
-    /// providers expect. Keeps the run budget in sync.
+    /// providers expect. The turn's success `on_turn_end` fires after the
+    /// results are recorded and the context-size estimate refreshed, so the
+    /// event's figure includes this turn's tool results even when the turn
+    /// budget ends the run immediately after. Keeps the run budget in sync.
     ///
     /// Cancellation is honoured at tool-call granularity: the in-flight call
     /// is raced against the cancel signal in
@@ -1652,6 +1646,16 @@ impl<C: ApiClient> BareLoop<C> {
             .count_context(&self.machine.full_history())
             .saturating_add(self.overhead_tokens());
         self.machine.set_context_tokens(estimate);
+        self.notify_turn_end(&TurnEnd {
+            turn,
+            success: true,
+            error: None,
+            duration: accounting.start.elapsed(),
+            input_tokens: accounting.input_tokens,
+            output_tokens: accounting.output_tokens,
+            stop_reason: accounting.stop_reason,
+            context_tokens: self.machine.context_tokens(),
+        });
         Ok(())
     }
 

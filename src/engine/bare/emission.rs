@@ -119,10 +119,11 @@ pub(super) struct TurnEnd<'a> {
     /// Read from the machine's
     /// [`context_tokens`](crate::engine::core::LoopMachine::context_tokens)
     /// at each call site — the figure the compaction trigger
-    /// evaluates, reported to observers without a re-estimate. On the
-    /// tool phase it predates this turn's tool results (the driver
-    /// refreshes the estimate after dispatch records the event); the
-    /// next turn's event carries the grown figure.
+    /// evaluates, reported to observers without a re-estimate. The
+    /// tool-turn success event fires after this turn's tool results
+    /// are recorded and the estimate refreshed, so its figure already
+    /// includes them — including on the run's final tool turn, where
+    /// no later event would otherwise report the growth.
     pub context_tokens: u64,
 }
 

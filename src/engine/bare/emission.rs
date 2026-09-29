@@ -113,6 +113,18 @@ pub(super) struct TurnEnd<'a> {
     /// stream error) carry the [`EndTurn`](StreamStopReason::EndTurn)
     /// default — the `success`/`error` fields carry that story.
     pub stop_reason: StreamStopReason,
+
+    /// The engine's context-size estimate at the moment of the event.
+    ///
+    /// Read from the machine's
+    /// [`context_tokens`](crate::engine::core::LoopMachine::context_tokens)
+    /// at each call site — the figure the compaction trigger
+    /// evaluates, reported to observers without a re-estimate. The
+    /// tool-turn success event fires after this turn's tool results
+    /// are recorded and the estimate refreshed, so its figure already
+    /// includes them — including on the run's final tool turn, where
+    /// no later event would otherwise report the growth.
+    pub context_tokens: u64,
 }
 
 impl<C: ApiClient> BareLoop<C> {
@@ -193,6 +205,7 @@ impl<C: ApiClient> BareLoop<C> {
             input_tokens: data.input_tokens,
             output_tokens: data.output_tokens,
             stop_reason: data.stop_reason,
+            context_tokens: data.context_tokens,
         });
     }
 

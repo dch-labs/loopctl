@@ -357,13 +357,17 @@ pub struct BareLoop<C: ApiClient> {
 struct TurnAccounting {
     /// Wall-clock instant the `CallTools` arm began.
     ///
-    /// Captured before any tool dispatch starts. Subtracted from the current
-    /// instant when the turn-end observer event fires after dispatch,
-    /// producing the `duration_ms` reported on
+    /// Captured before any tool dispatch starts. Elapsed is taken when
+    /// dispatch completes — on the success path as
+    /// [`dispatch_and_record`](BareLoop::dispatch_and_record) returns, before
+    /// the results land in machine history and the context-size estimate is
+    /// refreshed; on the failure path inside that same helper — producing the
+    /// `duration_ms` reported on
     /// [`TurnEndContext`](crate::observer::TurnEndContext). The reported
-    /// duration covers the tool-dispatch phase only — the preceding model
-    /// call is timed separately in `handle_call_llm`, so the two phases never
-    /// double-count.
+    /// duration covers the tool-dispatch phase only: the preceding model call
+    /// is timed separately in `handle_call_llm`, and the post-dispatch
+    /// O(history) context recount stays outside the measured span, so the
+    /// success and failure events report the same measure.
     start: Instant,
 
     /// Prompt-side token count reported by the provider.
@@ -560,6 +564,25 @@ impl<C: ApiClient> BareLoop<C> {
     #[must_use]
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// The engine's current context-size estimate, in tokens.
+    ///
+    /// Passthrough to [`LoopMachine::context_tokens`]: the figure the
+    /// compaction trigger and the 95% emergency line evaluate — the
+    /// estimated payload the provider would receive, refreshed by the
+    /// driver at every growth and shrink point of the conversation.
+    /// Read it between or after runs; during a run the same number
+    /// arrives per turn through
+    /// [`on_turn_end`](crate::observer::LoopObserver::on_turn_end)'s
+    /// [`TurnEndContext::context_tokens`](crate::observer::TurnEndContext::context_tokens),
+    /// since `run()` holds the loop mutably. Compare against
+    /// [`session_config`](Self::session_config)'s
+    /// [`context_window`](crate::config::SessionConfig::context_window)
+    /// for a utilization view.
+    #[must_use]
+    pub fn context_tokens(&self) -> u64 {
+        self.machine.context_tokens()
     }
 
     /// Get the run configuration for the current run, if a run has started.
@@ -1039,16 +1062,20 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Dispatch a batch of tool calls and return their aggregated result parts.
     ///
-    /// Runs the calls through the configured dispatch path, fires `on_turn_end`
-    /// (on both success and error paths, with the matching `success` flag), and
-    /// returns the assembled tool-result [`MessagePart`]s for the caller to
-    /// feed into the driving machine via [`LoopMachine::tool_results`]. The
-    /// message is *not* pushed to the history here — history is owned by the
+    /// Runs the calls through the configured dispatch path and returns the
+    /// assembled tool-result [`MessagePart`]s for the caller to feed into
+    /// the driving machine via [`LoopMachine::tool_results`]. The message
+    /// is *not* pushed to the history here — history is owned by the
     /// machine, so the caller decides when to record it (alongside any
-    /// preresolved results).
+    /// preresolved results). On a dispatch failure it fires `on_turn_end`
+    /// with `success: false` before propagating the error; the success
+    /// event is the caller's to fire, after the results land in machine
+    /// history so the context-size figure observers receive already
+    /// includes them (see [`handle_call_tools`](Self::handle_call_tools)).
     ///
     /// `accounting` carries the turn's start instant and provider-reported
-    /// token pair, forwarded into the `on_turn_end` notification.
+    /// token pair, forwarded into the failure notification; the caller
+    /// reuses the same fields for the success event.
     ///
     /// # Errors
     ///
@@ -1068,19 +1095,7 @@ impl<C: ApiClient> BareLoop<C> {
         let result = self.dispatch_tools(tool_calls, turn).await;
         let turn_duration = accounting.start.elapsed();
         match result {
-            Ok(results) => {
-                let parts = Self::build_tool_result_parts(results);
-                self.notify_turn_end(&TurnEnd {
-                    turn,
-                    success: true,
-                    error: None,
-                    duration: turn_duration,
-                    input_tokens: accounting.input_tokens,
-                    output_tokens: accounting.output_tokens,
-                    stop_reason: accounting.stop_reason,
-                });
-                Ok(parts)
-            }
+            Ok(results) => Ok(Self::build_tool_result_parts(results)),
             Err(e) => {
                 let err_str = e.to_string();
                 self.notify_turn_end(&TurnEnd {
@@ -1091,6 +1106,7 @@ impl<C: ApiClient> BareLoop<C> {
                     input_tokens: accounting.input_tokens,
                     output_tokens: accounting.output_tokens,
                     stop_reason: accounting.stop_reason,
+                    context_tokens: self.machine.context_tokens(),
                 });
                 Err(e)
             }
@@ -1253,6 +1269,7 @@ impl<C: ApiClient> BareLoop<C> {
                     input_tokens: 0,
                     output_tokens: 0,
                     stop_reason: StreamStopReason::EndTurn,
+                    context_tokens: self.machine.context_tokens(),
                 });
                 return Err(LoopError::Cancelled);
             }
@@ -1266,6 +1283,7 @@ impl<C: ApiClient> BareLoop<C> {
                     input_tokens: 0,
                     output_tokens: 0,
                     stop_reason: StreamStopReason::EndTurn,
+                    context_tokens: self.machine.context_tokens(),
                 });
                 return Err(e);
             }
@@ -1316,6 +1334,7 @@ impl<C: ApiClient> BareLoop<C> {
                 input_tokens: turn_in,
                 output_tokens: turn_out,
                 stop_reason: stream_stop,
+                context_tokens: self.machine.context_tokens(),
             });
             return Err(e);
         }
@@ -1359,6 +1378,7 @@ impl<C: ApiClient> BareLoop<C> {
                 input_tokens: turn_in,
                 output_tokens: turn_out,
                 stop_reason: stream_stop,
+                context_tokens: self.machine.context_tokens(),
             });
         }
         Ok(())
@@ -1550,7 +1570,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// single user [`Message`] — in the order the model requested the calls —
     /// and feeds it back to the machine. One turn yields one user message
     /// regardless of how the results were produced, which is the shape
-    /// providers expect. Keeps the run budget in sync.
+    /// providers expect. The turn's success `on_turn_end` fires after the
+    /// results are recorded and the context-size estimate refreshed, so the
+    /// event's figure includes this turn's tool results even when the turn
+    /// budget ends the run immediately after; the event's `duration` is
+    /// captured when dispatch completes, ahead of that recording and
+    /// refresh, so the O(history) context recount never inflates the
+    /// reported tool-phase timing. Keeps the run budget in sync.
     ///
     /// Cancellation is honoured at tool-call granularity: the in-flight call
     /// is raced against the cancel signal in
@@ -1607,6 +1633,7 @@ impl<C: ApiClient> BareLoop<C> {
         let dispatched_parts: Vec<MessagePart> = self
             .dispatch_and_record(&dispatch_calls, turn, &accounting)
             .await?;
+        let turn_duration = accounting.start.elapsed();
 
         debug_assert_eq!(
             dispatch_calls.len(),
@@ -1627,6 +1654,16 @@ impl<C: ApiClient> BareLoop<C> {
             .count_context(&self.machine.full_history())
             .saturating_add(self.overhead_tokens());
         self.machine.set_context_tokens(estimate);
+        self.notify_turn_end(&TurnEnd {
+            turn,
+            success: true,
+            error: None,
+            duration: turn_duration,
+            input_tokens: accounting.input_tokens,
+            output_tokens: accounting.output_tokens,
+            stop_reason: accounting.stop_reason,
+            context_tokens: self.machine.context_tokens(),
+        });
         Ok(())
     }
 

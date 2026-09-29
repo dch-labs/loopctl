@@ -1527,6 +1527,292 @@ async fn observer_sequence_tool_call_turn() {
     );
 }
 
+/// Records the context-size estimate every `on_turn_end` carries.
+///
+/// One `u64` per turn-end event, shared with the test body, which reads
+/// the figures once the run ends and compares them against the at-rest
+/// accessor.
+struct ContextSizeRecorder {
+    /// The engine's context estimate at each turn end, in turn order.
+    ///
+    /// Shared with the test body, which drains it after the run and
+    /// compares the figures against the at-rest accessor.
+    figures: Arc<Mutex<Vec<u64>>>,
+}
+
+impl crate::observer::LoopObserver for ContextSizeRecorder {
+    fn name(&self) -> &'static str {
+        "context-size-recorder"
+    }
+    fn on_turn_end(&self, ctx: &crate::observer::TurnEndContext) {
+        crate::error::recover_guard(self.figures.lock()).push(ctx.context_tokens);
+    }
+}
+
+/// Per-count delay charged by [`SlowRecountCounter`]; the tool-phase
+/// duration must stay under half of it.
+const SLOW_RECOUNT_DELAY_MS: u64 = 150;
+
+/// Token counter that charges a fixed wall-clock delay on every count.
+///
+/// Gives the post-dispatch context recount a deterministic, measurable cost
+/// — without building a huge history — so the turn-end duration pin can
+/// prove the recount stays outside the reported tool-phase span.
+struct SlowRecountCounter {
+    /// Delay charged by each `count` call.
+    delay: Duration,
+    /// Consultations recorded so far.
+    calls: AtomicUsize,
+}
+
+impl crate::compact::TokenCounter for SlowRecountCounter {
+    fn count(&self, _messages: &[Message]) -> u64 {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        1
+    }
+}
+
+/// Records each turn-end event's turn, outcome, and reported duration.
+///
+/// Shared with the test body, which drains it after the run and checks the
+/// tool-phase success event's duration against the injected recount cost.
+struct TurnDurationRecorder {
+    /// `(turn, success, duration_ms)` per turn-end event, in event order.
+    ends: Arc<Mutex<Vec<(usize, bool, u64)>>>,
+}
+
+impl crate::observer::LoopObserver for TurnDurationRecorder {
+    fn name(&self) -> &'static str {
+        "turn-duration-recorder"
+    }
+    fn on_turn_end(&self, ctx: &crate::observer::TurnEndContext) {
+        let entry = (ctx.turn, ctx.success, ctx.duration_ms);
+        crate::error::recover_guard(self.ends.lock()).push(entry);
+    }
+}
+
+#[tokio::test]
+async fn the_context_size_accessor_exposes_the_engine_estimate_after_a_run() {
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    agent.run("echo hi", &RunConfig::default()).await.unwrap();
+    assert!(
+        agent.context_tokens() > 0,
+        "after a two-turn run the accessor reports the engine's non-zero estimate: {}",
+        agent.context_tokens()
+    );
+    assert_eq!(
+        agent.context_tokens(),
+        agent.machine().context_tokens(),
+        "the BareLoop passthrough and the machine getter report one number"
+    );
+}
+
+#[tokio::test]
+async fn turn_end_carries_the_engine_s_context_estimate() {
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    let figures = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(ContextSizeRecorder {
+        figures: figures.clone(),
+    }));
+    agent.run("echo hi", &RunConfig::default()).await.unwrap();
+
+    let recorded = crate::error::recover_guard(figures.lock()).clone();
+    assert_eq!(
+        recorded.len(),
+        2,
+        "one turn-end figure per turn of the two-turn run: {recorded:?}"
+    );
+    assert!(
+        recorded.iter().all(|figure| *figure > 0),
+        "every turn-end carries the engine's non-zero estimate: {recorded:?}"
+    );
+    let final_figure = recorded.last().copied().unwrap_or(0);
+    assert!(
+        recorded.first().is_some_and(|first| *first <= final_figure),
+        "the tool results grow the payload before the second turn ends: {recorded:?}"
+    );
+    assert_eq!(
+        final_figure,
+        agent.context_tokens(),
+        "the live turn-end lane and the at-rest accessor report one number: {recorded:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_turn_s_turn_end_carries_the_engine_s_context_estimate() {
+    let client = MockClient::new("test-model");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let figures = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(ContextSizeRecorder {
+        figures: figures.clone(),
+    }));
+    let result = agent.run("Hi", &RunConfig::default()).await;
+    assert!(result.is_err(), "the scripted empty queue fails the turn");
+
+    let recorded = crate::error::recover_guard(figures.lock()).clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the failed turn fires exactly one turn-end: {recorded:?}"
+    );
+    let figure = recorded.first().copied().unwrap_or(0);
+    assert!(
+        figure > 0,
+        "the error-path turn-end carries the engine's non-zero run-start estimate: {figure}"
+    );
+    assert_eq!(
+        figure,
+        agent.context_tokens(),
+        "the error-path figure equals the frozen at-rest accessor figure"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_turn_s_turn_end_carries_the_engine_s_context_estimate() {
+    let client = BlockingClient {
+        started: Arc::new(AtomicBool::new(false)),
+    };
+    let started = Arc::clone(&client.started);
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let figures = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(ContextSizeRecorder {
+        figures: figures.clone(),
+    }));
+
+    let cancel_signal = Arc::clone(&agent.cancel_signal());
+    let run_handle = tokio::spawn(async move {
+        let result = agent.run("Hi", &RunConfig::default()).await;
+        (result, agent)
+    });
+    let mut waits = 0u32;
+    while !started.load(Ordering::SeqCst) {
+        waits += 1;
+        assert!(
+            waits <= 1000,
+            "stream_messages was never entered — test setup is broken"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    cancel_signal.cancel();
+    let (run_result, agent) = run_handle.await.unwrap();
+
+    assert!(
+        matches!(run_result, Err(LoopError::Cancelled)),
+        "run must return Err(Cancelled): {run_result:?}"
+    );
+    let recorded = crate::error::recover_guard(figures.lock()).clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the cancelled turn fires exactly one turn-end, from the stream's cancelled arm: {recorded:?}"
+    );
+    let figure = recorded.first().copied().unwrap_or(0);
+    assert!(
+        figure > 0,
+        "the cancelled-path turn-end carries the engine's non-zero run-start estimate: {figure}"
+    );
+    assert_eq!(
+        figure,
+        agent.context_tokens(),
+        "the cancelled-path figure equals the frozen at-rest accessor figure"
+    );
+}
+
+#[tokio::test]
+async fn the_last_turn_end_figure_survives_the_max_turns_edge() {
+    let client = MockClient::new("test-model");
+    client.add_tool_only_response("call_1", "echo", &json!({"message": "hi"}));
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    let figures = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(ContextSizeRecorder {
+        figures: figures.clone(),
+    }));
+
+    let run_config = RunConfig {
+        max_turns: 1,
+        ..RunConfig::default()
+    };
+    let result = agent.run("echo hi", &run_config).await;
+    match result {
+        Err(LoopError::MaxTurnsExceeded { max }) => assert_eq!(
+            max, 1,
+            "the one-turn budget ends the run right after the tool turn"
+        ),
+        other => {
+            panic!("the one-turn budget must end the run right after the tool turn: {other:?}")
+        }
+    }
+
+    let recorded = crate::error::recover_guard(figures.lock()).clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the tool turn fires exactly one turn-end before the budget ends the run: {recorded:?}"
+    );
+    let figure = recorded.first().copied().unwrap_or(0);
+    assert_eq!(
+        figure,
+        agent.context_tokens(),
+        "the run's last turn-end carries the post-results figure — no later event fires, so the live lane's last word must equal the at-rest accessor"
+    );
+}
+
+#[tokio::test]
+async fn the_success_turn_end_duration_excludes_the_context_recount() {
+    let counter = Arc::new(SlowRecountCounter {
+        delay: Duration::from_millis(SLOW_RECOUNT_DELAY_MS),
+        calls: AtomicUsize::new(0),
+    });
+    let manager = ContextManager::new(Arc::new(TruncatingCompactor::new()))
+        .with_token_counter(counter.clone());
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        registry,
+        make_config(),
+        LoopManagers::new().with_context_manager(Arc::new(manager)),
+    );
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(TurnDurationRecorder { ends: ends.clone() }));
+    agent.run("echo hi", &RunConfig::default()).await.unwrap();
+
+    let recorded = crate::error::recover_guard(ends.lock()).clone();
+    let tool_phase: Vec<(usize, bool, u64)> = recorded
+        .iter()
+        .filter(|(turn, success, _)| *turn == 0 && *success)
+        .copied()
+        .collect();
+    assert_eq!(
+        tool_phase.len(),
+        1,
+        "the tool turn fires exactly one success turn-end: {recorded:?}"
+    );
+    let duration_ms = tool_phase.first().map_or(0, |(_, _, ms)| *ms);
+    assert!(
+        counter.calls.load(Ordering::SeqCst) >= 1,
+        "the engine must consult the injected counter, or this pin proves nothing"
+    );
+    assert!(
+        duration_ms < SLOW_RECOUNT_DELAY_MS / 2,
+        "the tool-phase duration must exclude the {SLOW_RECOUNT_DELAY_MS}ms context recount: {duration_ms}ms"
+    );
+}
+
 #[tokio::test]
 async fn observer_sequence_multi_tool_turn() {
     let client = MockClient::new("test-model");

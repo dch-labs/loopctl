@@ -1535,15 +1535,63 @@ mod tests {
         bare
     }
 
+    /// A `slow` tool that records when each execution started and finished.
+    ///
+    /// Used by [`parallel_latency_independent_calls_overlap`] to prove the
+    /// three calls were in flight *simultaneously* — the property parallel
+    /// dispatch exists to provide — without measuring wall-clock latency.
+    /// `MockTool` cannot report execution spans, hence this local fixture.
+    struct SpanRecordingTool {
+        /// One `(start, end)` pair per completed call.
+        spans: Arc<Mutex<Vec<(Instant, Instant)>>>,
+        /// Artificial per-call delay: the span's in-flight window.
+        delay: std::time::Duration,
+    }
+
+    impl Tool for SpanRecordingTool {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn description(&self) -> &'static str {
+            "Sleeps, recording its execution span"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "slow".into(),
+                description: "Sleeps, recording its execution span".into(),
+                input_schema: Value::Object(serde_json::Map::new()),
+            }
+        }
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let spans = Arc::clone(&self.spans);
+            let delay = self.delay;
+            Box::pin(async move {
+                let start = Instant::now();
+                tokio::time::sleep(delay).await;
+                // Sample `end` before taking the lock so contention among
+                // the overlapping calls cannot inflate the span.
+                let end = Instant::now();
+                spans.lock().expect("span lock poisoned").push((start, end));
+                Ok(ToolOutput::text("done"))
+            })
+        }
+        fn is_concurrency_safe(&self) -> bool {
+            true
+        }
+    }
+
     #[tokio::test]
     async fn parallel_latency_independent_calls_overlap() {
-        use crate::testing::MockTool;
+        let spans: Arc<Mutex<Vec<(Instant, Instant)>>> = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
-        registry.register(
-            MockTool::new("slow", "slow")
-                .with_concurrency_safe(true)
-                .with_delay(std::time::Duration::from_millis(100)),
-        );
+        registry.register(SpanRecordingTool {
+            spans: Arc::clone(&spans),
+            delay: std::time::Duration::from_millis(100),
+        });
         let bare = make_parallel_loop(registry);
 
         let calls = vec![
@@ -1551,20 +1599,31 @@ mod tests {
             make_call("2", "slow", Value::Null),
             make_call("3", "slow", Value::Null),
         ];
-        let start = Instant::now();
         let results = bare
             .dispatch_tools(&calls, 0)
             .await
             .expect("should succeed");
-        let elapsed = start.elapsed();
-
-        // Sequential would be ~300ms; parallel should be ~100ms. Assert <290ms
-        // (proves overlap with CI scheduling headroom) and all 3 results present.
-        assert!(
-            elapsed < std::time::Duration::from_millis(290),
-            "parallel should overlap 3×100ms calls; elapsed {elapsed:?}"
-        );
         assert_eq!(results.len(), 3);
+
+        // Assert overlap, not latency: the latest start must strictly precede
+        // the earliest finish, i.e. all three 100ms calls were in flight at
+        // the same instant. All three futures reach their sleep in one
+        // `join_all` poll pass, so their starts are microseconds apart —
+        // a serialized dispatch (separate waves or a 1-permit semaphore)
+        // instead starts each call only after the previous finished, putting
+        // the latest start after the earliest end. Unlike a wall-clock
+        // budget (this test previously flaked at 318ms against a 290ms
+        // ceiling on a loaded runner), delayed timer wakeups on a busy CI
+        // box push every end time back together and cannot flip the
+        // comparison.
+        let spans = spans.lock().expect("span lock poisoned");
+        assert_eq!(spans.len(), 3, "every call should execute exactly once");
+        let latest_start = spans.iter().map(|(s, _)| *s).max().expect("3 spans");
+        let earliest_end = spans.iter().map(|(_, e)| *e).min().expect("3 spans");
+        assert!(
+            latest_start < earliest_end,
+            "3 independent 100ms calls should overlap; spans: {spans:?}"
+        );
     }
 
     #[tokio::test]

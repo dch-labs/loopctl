@@ -297,10 +297,14 @@ fn render_message(msg: &Message) -> String {
     }
     for part in &msg.parts {
         match part {
-            MessagePart::Thinking { text, .. } => {
-                let rendered: String = text.chars().take(PART_CHARS).collect();
-                line.push_str(" thought: ");
-                line.push_str(&rendered);
+            MessagePart::Thinking { text, redacted, .. } => {
+                if redacted.is_some() {
+                    line.push_str(" thought: [redacted]");
+                } else if !text.is_empty() {
+                    let rendered: String = text.chars().take(PART_CHARS).collect();
+                    line.push_str(" thought: ");
+                    line.push_str(&rendered);
+                }
             }
             MessagePart::ToolCall { name, input, .. } => {
                 let rendered_input: String = input.to_string().chars().take(PART_CHARS).collect();
@@ -373,6 +377,44 @@ mod tests {
             .retrieve("", usize::MAX)
             .await
             .expect("retrieve over the store")
+    }
+
+    #[test]
+    fn render_names_a_thinking_part_as_a_thought_line() {
+        let messages = vec![Message::new(
+            Role::Assistant,
+            vec![MessagePart::Thinking {
+                text: "weighed two options".to_string(),
+                signature: None,
+                redacted: None,
+            }],
+        )];
+        let rendered = render_evicted(&messages, 4_096);
+        assert!(
+            rendered.contains(" thought: weighed two options"),
+            "a demoted thinking part renders behind the thought marker: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_marks_a_redacted_thinking_part_without_dangling_the_marker() {
+        let messages = vec![Message::new(
+            Role::Assistant,
+            vec![MessagePart::Thinking {
+                text: String::new(),
+                signature: None,
+                redacted: Some("opaque-data".to_string()),
+            }],
+        )];
+        let rendered = render_evicted(&messages, 4_096);
+        assert!(
+            rendered.contains(" thought: [redacted]"),
+            "a redacted thinking part renders behind the thought marker with a redacted label: {rendered}"
+        );
+        assert!(
+            !rendered.contains(" thought: \n"),
+            "the thought marker never dangles with nothing behind it: {rendered}"
+        );
     }
 
     #[test]

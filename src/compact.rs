@@ -1270,6 +1270,33 @@ mod tests {
     }
 
     #[test]
+    fn thinking_text_counts_like_text_in_both_counters() {
+        let as_text = vec![Message::new(
+            Role::Assistant,
+            vec![MessagePart::text("weighed two options, then answered")],
+        )];
+        let as_thinking = vec![Message::new(
+            Role::Assistant,
+            vec![MessagePart::Thinking {
+                text: "weighed two options, then answered".to_string(),
+                signature: None,
+                redacted: None,
+            }],
+        )];
+        assert_eq!(
+            HeuristicTokenCounter.count(&as_text),
+            HeuristicTokenCounter.count(&as_thinking),
+            "the heuristic counter counts a thinking part's text like a text part's"
+        );
+        let counter = RatioTokenCounter::new(4.0, 4);
+        assert_eq!(
+            counter.count(&as_text),
+            counter.count(&as_thinking),
+            "the ratio counter shares the rendering, so it counts thinking text like text too"
+        );
+    }
+
+    #[test]
     fn count_is_chars_over_ratio_plus_overhead() {
         let counter = RatioTokenCounter::new(4.0, 4);
         let messages = vec![Message::user("a".repeat(40))];

@@ -462,6 +462,37 @@ fn hex_body(rng: &mut Lcg, len: usize) -> String {
         .collect()
 }
 
+/// A strict UpperCamel identifier of 4-5 short humps — the shape a
+/// bare type or constant reference takes, which must survive
+/// scrubbing. Capped under the entropy lane's 32-character gate, so
+/// the identifier rule is the only lane that ever sees it.
+fn camel_body(rng: &mut Lcg) -> String {
+    const LOWER: &str = "abcdefghijklmnopqrstuvwxyz";
+    const UPPER: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut token = String::new();
+    for _ in 0..4 + rng.below(2) {
+        token.push(UPPER.chars().nth(rng.below(26) as usize).unwrap_or('A'));
+        for _ in 0..3 + rng.below(2) {
+            token.push(LOWER.chars().nth(rng.below(26) as usize).unwrap_or('a'));
+        }
+    }
+    token
+}
+
+/// A lowercase-led body carrying one guaranteed `Xqwz` hump — real
+/// base64 shape, which must never survive a bare declaration.
+fn hump_body(rng: &mut Lcg) -> String {
+    const MIXED: &str = "abcdefghijkmnopqrstuvwxyz023456789";
+    let head = 8 + rng.below(6) as usize;
+    let tail = 6 + rng.below(6) as usize;
+    let mut body: String = (0..head)
+        .map(|_| MIXED.chars().nth(rng.below(33) as usize).unwrap_or('a'))
+        .collect();
+    body.push_str("Xqwz");
+    body.extend((0..tail).map(|_| MIXED.chars().nth(rng.below(33) as usize).unwrap_or('a')));
+    body
+}
+
 /// Generate one output: `(text, planted secret bodies, benign survivors)`.
 fn gen_output(rng: &mut Lcg) -> (String, Vec<String>, Vec<String>) {
     let mut text = String::from("log line\n");
@@ -471,7 +502,7 @@ fn gen_output(rng: &mut Lcg) -> (String, Vec<String>, Vec<String>) {
     for i in 0..pieces {
         let extra = rng.below(10) as usize;
         let body = distinct_body(rng, 32 + extra);
-        match rng.below(4) {
+        match rng.below(5) {
             0 => {
                 let secret = match i % 6 {
                     0 => format!("Authorization: Bearer {body}"),
@@ -496,6 +527,17 @@ fn gen_output(rng: &mut Lcg) -> (String, Vec<String>, Vec<String>) {
                 let sha = hex_body(rng, 40);
                 survivors.push(format!("sha1:{sha}"));
                 text.push_str(&format!("sha1:{sha}"));
+            }
+            2 => {
+                let line = format!("let secret = {}; ", camel_body(rng));
+                survivors.push(line.clone());
+                text.push_str(&line);
+            }
+            3 => {
+                let body = hump_body(rng);
+                let line = format!("const token = {body}; ");
+                secrets.push(body);
+                text.push_str(&line);
             }
             _ => {
                 let word = match rng.below(3) {
@@ -854,6 +896,179 @@ fn a_dense_segment_inside_a_path_shaped_run_masks_alone() {
     assert_eq!(
         scrubbed, "https://host/repos/tokens/[REDACTED:high_entropy]",
         "the path structure and word segments survive while only the dense segment masks"
+    );
+}
+
+#[test]
+fn a_bare_credential_shaped_declaration_value_masks_in_place() {
+    let line = "const api_key = Ab3dEf5gHi7jKl9mNo1pQr2s;";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "a credential-shaped bare value in a declaration masks in place: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "const api_key = [REDACTED:api_key_kv];",
+        "the declaration keyword and identifier survive; only the secret-shaped initializer masks"
+    );
+}
+
+#[test]
+fn a_bare_type_initializer_passes_verbatim() {
+    let line = "let token = SecretStoreHandle012345::new();";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "no substitution on a CamelCase bare initializer: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, line,
+        "a bare initializer that reads as a type or constant reference is code, not a credential"
+    );
+}
+
+#[test]
+fn a_hump_bearing_bare_base64_initializer_masks_in_place() {
+    let cases = [
+        (
+            "const api_key = dGhpc0lzTXlDcmVkaXQ7ab;",
+            "const api_key = [REDACTED:api_key_kv];",
+        ),
+        (
+            "const secret = c2VjcmV0X2tleV9oZXJlMTIz;",
+            "const secret = [REDACTED:api_key_kv];",
+        ),
+        (
+            "let token = Z2l0aHViX3BhdF90b2tlbl94eXo7;",
+            "let token = [REDACTED:api_key_kv];",
+        ),
+        (
+            "const apiKey = dGhpc0lzTXlDcmVkaXQ7ab;",
+            "const apiKey = [REDACTED:api_key_kv];",
+        ),
+    ];
+    for (line, expected) in cases {
+        let mut scrubbed = line.to_string();
+        let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+        assert_eq!(
+            count, 1,
+            "a hump-bearing bare base64 initializer is a credential, not an identifier: {line} -> {scrubbed}"
+        );
+        assert_eq!(
+            scrubbed, expected,
+            "only the initializer masks; the declaration syntax survives: {line}"
+        );
+    }
+}
+
+#[test]
+fn a_text_derived_base64_bare_initializer_masks_via_the_key_value_lane() {
+    let line = "const api_key = dGhpc0lzQW5vdGhlckxvbmdlclNlY3JldFRvUGx1Z2lu;";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "a 44-character text-derived base64 value sits under the entropy lane's density, so the key-value lane is its only mask: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "const api_key = [REDACTED:api_key_kv];",
+        "the value masks while the declaration syntax survives"
+    );
+}
+
+#[test]
+fn a_uniformly_lowercase_bare_initializer_passes_verbatim() {
+    let line = "let secret = defaultconfigurationvalue;";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "a uniformly lowercase bare initializer is an identifier, not a credential: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, line,
+        "a lowercase word-led initializer survives the read verbatim"
+    );
+}
+
+#[test]
+fn a_strict_camel_by_digit_resets_initializer_masks_in_place() {
+    let cases = [
+        (
+            "const api_key = P7XougXTEwqES301BAt8ljr5;",
+            "const api_key = [REDACTED:api_key_kv];",
+        ),
+        (
+            "let token = Pq7Ou2Xy5Wz9Cb4Df6G;",
+            "let token = [REDACTED:api_key_kv];",
+        ),
+    ];
+    for (line, expected) in cases {
+        let mut scrubbed = line.to_string();
+        let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+        assert_eq!(
+            count, 1,
+            "a lone lowercase letter terminated by a digit is credential material: {line} -> {scrubbed}"
+        );
+        assert_eq!(
+            scrubbed, expected,
+            "only the initializer masks; the declaration syntax survives: {line}"
+        );
+    }
+}
+
+#[test]
+fn a_single_letter_hump_before_digits_masks_like_a_credential() {
+    let line = "let secret = Ed25519PrivateKey::new();";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "a single-letter hump before digits is chance camel, not a type name: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "let secret = [REDACTED:api_key_kv]::new();",
+        "the initializer masks while the path call and declaration syntax survive"
+    );
+}
+
+#[test]
+fn a_long_crate_name_test_binary_segment_passes_verbatim() {
+    let masking = "     Running tests/golden_requests.rs (target/debug/deps/golden_requests-9f3c1b7e5a2d4f68)";
+    let mut scrubbed = masking.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "a cargo test-binary artifact is a path whatever the crate-name length: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, masking,
+        "a long crate name pushes the artifact segment past the length gate — it still passes"
+    );
+
+    let passing = "     Running tests/golden_requests.rs (target/debug/deps/golden_requests-77e0e51a2c4b9d31)";
+    let mut scrubbed = passing.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 0,
+        "the twin-hash direction keeps passing: {scrubbed}"
+    );
+}
+
+#[test]
+fn an_artifact_shaped_segment_after_a_foreign_parent_still_masks() {
+    let line = "fetch failed: https://host/tokens/golden_requests-9f3c1b7e5a2d4f68";
+    let mut scrubbed = line.to_string();
+    let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+    assert_eq!(
+        count, 1,
+        "the artifact-tail exemption is scoped to cargo's own directories: {scrubbed}"
+    );
+    assert_eq!(
+        scrubbed, "fetch failed: https://host/tokens/[REDACTED:high_entropy]",
+        "a dense segment after a non-artifact parent stays measured"
     );
 }
 

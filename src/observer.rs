@@ -177,8 +177,10 @@ pub trait LoopObserver: Send + Sync {
     /// Fired per `DeltaPart::Thinking` during streaming, symmetric to
     /// [`on_text_delta`](Self::on_text_delta). Reasoning is distinct from
     /// visible assistant text; do not concatenate it with `on_text_delta` /
-    /// [`on_response`](Self::on_response) output. Redacted reasoning arrives
-    /// as an empty `delta` (render a placeholder, not the empty string).
+    /// [`on_response`](Self::on_response) output. An empty `delta` arrives
+    /// when the event carries something other than displayable reasoning —
+    /// a redacted block's opaque payload or a block signature; render a
+    /// placeholder, not the empty string.
     ///
     /// Inherits the same retry caveat as [`on_text_delta`](Self::on_text_delta):
     /// under a configured `StreamHandler`,

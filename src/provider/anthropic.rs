@@ -638,7 +638,13 @@ impl AnthropicClientBuilder {
     /// request under a default set here is rejected up front — extended
     /// thinking cannot combine with the forced tool choice a response
     /// format synthesizes — so configure effort per request when both
-    /// are needed on other calls.
+    /// are needed on other calls. Extended thinking also demands the
+    /// assistant's original signed thinking blocks on continuations: a
+    /// history whose tool-use message carries an unsigned thinking part
+    /// (recorded before this version, cross-provider, or hand-built)
+    /// still sends `tool_use` alone, which the Messages API rejects —
+    /// clear the effort for such histories or re-record them against
+    /// this version, whose response path captures signatures.
     #[must_use]
     pub fn thinking_effort(mut self, effort: crate::structured::ThinkingEffort) -> Self {
         self.thinking_effort = Some(effort);
@@ -1460,7 +1466,10 @@ impl StreamEmitter {
     /// until the deltas arrive), records the block's index as the current
     /// tool index, and increments the open-tool counter. For a `text`
     /// block, marks the text part open and emits a `PartStart` at the text
-    /// index. Other block types are ignored.
+    /// index. A `thinking` or `redacted_thinking` block opens the
+    /// thinking lane with a `PartStart`, and a redacted block's
+    /// `/content_block/data` payload rides the lane's first delta. Other
+    /// block types are ignored.
     ///
     /// [`MessagePart::ToolCall`]: crate::message::MessagePart::ToolCall
     fn on_block_start(&mut self, data: Option<Value>) {
@@ -1536,7 +1545,12 @@ impl StreamEmitter {
     /// [`DeltaPart::InputJson`] at the current tool index carrying the
     /// `/delta/partial_json` fragment, so the caller can accumulate the
     /// full tool-call arguments across deltas. Empty fragments are
-    /// skipped. Other delta types are ignored.
+    /// skipped. A `thinking_delta` emits a
+    /// [`DeltaPart::Thinking`](crate::stream::DeltaPart::Thinking) text
+    /// fragment on the thinking lane, a `signature_delta` emits a
+    /// thinking delta carrying only the `/delta/signature`, and a
+    /// redacted block's payload arrives via its block start. Other delta
+    /// types are ignored.
     ///
     /// [`DeltaPart::Text`]: crate::stream::DeltaPart::Text
     /// [`DeltaPart::InputJson`]: crate::stream::DeltaPart::InputJson
@@ -2191,6 +2205,45 @@ mod tests {
         assert!(
             !body.contains("\"signature\""),
             "no native thinking block rides a request that did not enable thinking: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_thinking_part_leaves_tool_use_alone_under_effort() {
+        let history = vec![Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: "legacy pass".to_string(),
+                    signature: None,
+                    redacted: None,
+                },
+                MessagePart::ToolCall {
+                    id: "call_3".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                },
+            ],
+        )];
+        let body = captured_replay_body(
+            false,
+            Some(crate::structured::ThinkingEffort::High),
+            history,
+        )
+        .await;
+        assert!(
+            body.contains("\"type\":\"tool_use\""),
+            "the tool call still rides the continuation request: {body}"
+        );
+        assert!(
+            !body.contains("\"type\":\"thinking\"")
+                && !body.contains("\"type\":\"redacted_thinking\"")
+                && !body.contains("\"signature\""),
+            "an unsigned part cannot ride natively — it carries no signature to return: {body}"
+        );
+        assert!(
+            !body.contains("<thinking>"),
+            "with replay off an unsigned part renders no text replay either — tool_use rides alone, the rejection the thinking_effort builder doc names: {body}"
         );
     }
 
@@ -3760,27 +3813,72 @@ mod tests {
     fn emitter_redacted_thinking_emits_empty_delta() {
         let mut em = StreamEmitter::default();
 
-        // Start a redacted_thinking block — should emit PartStart + one
-        // empty Thinking delta (the placeholder convention).
         em.on_block_start(Some(serde_json::json!({
             "index": 0,
             "content_block": {"type": "redacted_thinking"}
         })));
         let events = em.drain();
 
-        // PartStart + one empty Thinking delta.
-        assert_eq!(events.len(), 2, "expected PartStart + empty Thinking delta");
+        assert_eq!(
+            events.len(),
+            2,
+            "expected PartStart + one empty-text Thinking delta"
+        );
         assert!(matches!(events[0], StreamEvent::PartStart(_)));
         match &events[1] {
             StreamEvent::IndexedDelta(d) => match &d.delta {
                 DeltaPart::Thinking { text, .. } => {
-                    assert!(text.is_empty(), "redacted thinking → empty text");
+                    assert!(
+                        text.is_empty(),
+                        "redacted thinking arrives with empty text — its payload rides the same delta's redacted field"
+                    );
                 }
                 other => panic!("expected Thinking, got {other:?}"),
             },
             other => panic!("expected IndexedDelta, got {other:?}"),
         }
         assert!(em.thinking_part_open, "thinking_part_open set");
+    }
+
+    #[test]
+    fn replay_reasoning_tail_keeps_exactly_the_last_32_768_chars() {
+        let at_cap = "a".repeat(32_768);
+        assert_eq!(
+            replay_reasoning_tail(&at_cap),
+            at_cap,
+            "a trace at the cap passes through whole"
+        );
+
+        let over_cap = format!("{}{}", 'b', "c".repeat(32_768));
+        let tail = replay_reasoning_tail(&over_cap);
+        assert_eq!(
+            tail.chars().count(),
+            32_768,
+            "a trace one char over the cap drops exactly its head: {tail}"
+        );
+        assert!(
+            tail.starts_with('c') && !tail.starts_with('b'),
+            "the head is dropped, the tail kept"
+        );
+
+        let multibyte_at_cap = format!("{}{}", "é".repeat(16_385), "x".repeat(16_383));
+        assert_eq!(
+            replay_reasoning_tail(&multibyte_at_cap),
+            multibyte_at_cap,
+            "the cap counts chars, not bytes — a 49 153-byte trace of 32 768 chars stays whole"
+        );
+
+        let multibyte_over = format!("{}{}", "é".repeat(16_386), "x".repeat(16_383));
+        let tail = replay_reasoning_tail(&multibyte_over);
+        assert_eq!(
+            tail.chars().count(),
+            32_768,
+            "a one-char overflow drops one whole multi-byte char, never half of one"
+        );
+        assert!(
+            tail.starts_with('é'),
+            "the surviving head is a complete character"
+        );
     }
 
     #[test]

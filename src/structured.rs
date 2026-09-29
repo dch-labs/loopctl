@@ -330,7 +330,14 @@ pub struct RequestOptions {
     /// parameter entirely, so unconfigured requests are byte-identical.
     /// A set value always wins over the client default. There is no
     /// per-request way to turn off a client-level default — build the
-    /// client without one. Set via
+    /// client without one. On the Anthropic client, an effective
+    /// effort — set here or inherited from a client default — also
+    /// demands the assistant's original signed thinking blocks on
+    /// tool-use continuations: a history whose tool-use message
+    /// carries an unsigned thinking part still sends `tool_use`
+    /// alone, which the Messages API rejects; the Anthropic
+    /// builder's `thinking_effort` documentation states the full
+    /// caveat. Set via
     /// [`with_effort`](Self::with_effort).
     pub effort: Option<ThinkingEffort>,
 }

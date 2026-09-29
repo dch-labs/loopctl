@@ -499,9 +499,10 @@ pub enum DeltaPart {
     /// [`Message`] (visible text stays separate); live consumption goes
     /// through
     /// [`on_thinking_delta`](crate::observer::LoopObserver::on_thinking_delta).
-    /// An empty `text` signals redacted reasoning (e.g. Anthropic
-    /// `redacted_thinking`, whose opaque payload arrives in `redacted`);
-    /// render a placeholder rather than the empty string.
+    /// An empty `text` arrives when the delta carries something other
+    /// than displayable reasoning — a redacted block's opaque payload
+    /// (e.g. Anthropic `redacted_thinking`, in `redacted`) or a block
+    /// signature; render a placeholder rather than the empty string.
     ///
     /// Serialized as `"type":"thinking_delta"` with a `"text"` field, plus
     /// `"signature"`/`"redacted"` fields only when carried.
@@ -514,6 +515,7 @@ pub enum DeltaPart {
         /// (the provider withheld the content); consumers should render a
         /// placeholder, not the empty string.
         text: String,
+
         /// The provider's signature over the finished reasoning block.
         ///
         /// Anthropic attaches one `signature_delta` at the end of a
@@ -523,6 +525,7 @@ pub enum DeltaPart {
         /// text fragment.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+
         /// The opaque payload of a redacted reasoning block.
         ///
         /// Anthropic delivers `redacted_thinking` blocks complete in the
@@ -1212,8 +1215,12 @@ impl StreamAccumulator {
                         redacted,
                     } => {
                         slot.thinking.push_str(text);
-                        slot.thinking_signature.clone_from(signature);
-                        slot.thinking_redacted.clone_from(redacted);
+                        if signature.is_some() {
+                            slot.thinking_signature.clone_from(signature);
+                        }
+                        if redacted.is_some() {
+                            slot.thinking_redacted.clone_from(redacted);
+                        }
                     }
                 }
                 Ok(())
@@ -1917,6 +1924,48 @@ mod tests {
                         && redacted.as_deref() == Some("opaque-data")
             ),
             "a redacted lane flushes on its payload alone: {:?}",
+            msg.parts
+        );
+    }
+
+    #[test]
+    fn a_text_fragment_after_the_signature_keeps_the_latched_signature() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: None,
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Thinking {
+                text: "visible reasoning".into(),
+                signature: Some("sig-blob".into()),
+                redacted: None,
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Thinking {
+                text: " continued".into(),
+                signature: None,
+                redacted: None,
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop { index: Some(0) })
+            .unwrap();
+        let msg = acc.build();
+        assert!(
+            matches!(
+                msg.parts.first(),
+                Some(MessagePart::Thinking { text, signature, redacted })
+                    if text == "visible reasoning continued"
+                        && signature.as_deref() == Some("sig-blob")
+                        && redacted.is_none()
+            ),
+            "a later text fragment must not erase the latched signature: {:?}",
             msg.parts
         );
     }

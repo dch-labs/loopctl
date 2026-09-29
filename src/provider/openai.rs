@@ -208,10 +208,13 @@ impl OpenAiClient {
 
     /// Build a typed [`NonStreamingResponse`] from OpenAI's native JSON.
     ///
-    /// Reads `choices[0].message` into [`MessagePart`]s: the `content`
-    /// string becomes a [`MessagePart::Text`] part (skipped when `null`),
-    /// and each entry in `tool_calls` becomes a [`MessagePart::ToolCall`]
-    /// with its `function.arguments` JSON-string parsed into a [`Value`].
+    /// Reads `choices[0].message` into [`MessagePart`]s: a non-empty
+    /// `reasoning_content` string becomes a [`MessagePart::Thinking`]
+    /// part ahead of the visible text (the non-streaming capture half
+    /// of reasoning replay), the `content` string becomes a
+    /// [`MessagePart::Text`] part (skipped when `null`), and each entry
+    /// in `tool_calls` becomes a [`MessagePart::ToolCall`] with its
+    /// `function.arguments` JSON-string parsed into a [`Value`].
     /// Maps `choices[0].finish_reason` to a [`StreamStopReason`] using the
     /// same mapping the streaming emitter applies (`"tool_calls"` →
     /// `ToolCall`, `"length"` → `MaxTokens`, anything else via
@@ -230,6 +233,15 @@ impl OpenAiClient {
         let message = choice.and_then(|c| c.get("message"));
         let mut parts: Vec<MessagePart> = Vec::new();
         if let Some(msg) = message {
+            if let Some(reasoning) = msg.get("reasoning_content").and_then(|r| r.as_str())
+                && !reasoning.is_empty()
+            {
+                parts.push(MessagePart::Thinking {
+                    text: reasoning.to_string(),
+                    signature: None,
+                    redacted: None,
+                });
+            }
             if let Some(text) = msg.get("content").and_then(|t| t.as_str()) {
                 parts.push(MessagePart::text(text));
             }
@@ -1123,10 +1135,7 @@ fn convert_message(m: &Message, replay_reasoning: bool) -> Vec<Value> {
         if let Some(reasoning) = reasoning.as_deref() {
             tool_results.push(serde_json::json!({
                 "role": "user",
-                "content": format!(
-                    "[prior assistant reasoning]
-            {reasoning}"
-                ),
+                "content": format!("[prior assistant reasoning]\n{reasoning}"),
             }));
         }
         tool_results
@@ -3498,6 +3507,42 @@ mod tests {
     }
 
     #[test]
+    fn build_response_captures_reasoning_content_as_a_thinking_part() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "visible answer",
+                    "reasoning_content": "internal reasoning"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let response = OpenAiClient::build_response(&raw).expect("a well-formed body parses");
+        assert_eq!(
+            response.message.parts.len(),
+            2,
+            "reasoning and visible text flush as two parts, reasoning first: {:?}",
+            response.message.parts
+        );
+        assert!(
+            matches!(
+                response.message.parts.first(),
+                Some(MessagePart::Thinking { text, signature, redacted })
+                    if text == "internal reasoning"
+                        && signature.is_none()
+                        && redacted.is_none()
+            ),
+            "the non-streaming reader captures reasoning_content as a thinking part: {:?}",
+            response.message.parts
+        );
+        assert_eq!(
+            response.message.text_content(),
+            "visible answer",
+            "the visible text still arrives as the message's text content"
+        );
+    }
+
+    #[test]
     fn build_response_maps_text_and_stop_finish_reason() {
         let raw = serde_json::json!({
             "choices": [{
@@ -4321,6 +4366,32 @@ mod tests {
         assert!(
             body.contains("\"reasoning_content\":\"alpha pass\\nbeta pass\""),
             "each history thinking part rides back joined in part order: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tool_result_reasoning_payload_carries_no_source_indentation() {
+        let history = vec![Message::new(
+            Role::User,
+            vec![
+                MessagePart::ToolResult {
+                    call_id: "call_1".to_string(),
+                    name: "search".to_string(),
+                    output: ToolContent::from_string("42"),
+                    is_error: None,
+                },
+                MessagePart::Thinking {
+                    text: "first pass".to_string(),
+                    signature: None,
+                    redacted: None,
+                },
+            ],
+        )];
+        let body = captured_replay_body(true, history).await;
+        assert!(
+            body.contains("[prior assistant reasoning]\\nfirst pass")
+                && !body.contains("[prior assistant reasoning]\\n "),
+            "the replayed reasoning payload is the marker line plus the trace, with no source indentation: {body}"
         );
     }
 

@@ -277,11 +277,12 @@ pub struct TextDeltaContext {
 /// is distinct from the assistant's visible text and is never included in
 /// [`ResponseContext`].
 ///
-/// # Redacted reasoning
+/// # Empty deltas
 ///
-/// An empty `delta` signals redacted reasoning (e.g. Anthropic
-/// `redacted_thinking`) — the provider withheld the content. Consumers should
-/// render a placeholder ("reasoning redacted"), not the empty string.
+/// An empty `delta` arrives when the event carries something other
+/// than displayable reasoning — a redacted block's opaque payload
+/// (e.g. Anthropic `redacted_thinking`) or a block signature.
+/// Consumers should render a placeholder, not the empty string.
 ///
 /// # Example
 ///
@@ -302,8 +303,9 @@ pub struct ThinkingDeltaContext {
 
     /// The incremental reasoning chunk. Concatenate in arrival order per turn.
     ///
-    /// Empty string for redacted/encrypted reasoning (e.g. Anthropic
-    /// `redacted_thinking`) — render a placeholder, not the empty string.
+    /// Empty when the delta carries something other than displayable
+    /// reasoning — a redacted block's opaque payload or a block
+    /// signature; render a placeholder, not the empty string.
     pub delta: String,
 }
 

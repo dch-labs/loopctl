@@ -223,11 +223,18 @@ fn options_to_value(options: &RequestOptions) -> Value {
             "strict": format.strict,
         })
     });
-    json!({
+    let mut value = json!({
         "model": options.model,
         "response_format": response_format,
         "tool_constraint": format!("{:?}", options.tool_constraint),
-    })
+    });
+    if let Some(effort) = &options.effort {
+        let object = value
+            .as_object_mut()
+            .expect("the options value is an object");
+        object.insert("effort".to_string(), json!(format!("{:?}", effort)));
+    }
+    value
 }
 
 /// The committed golden directory, resolved against the crate root.
@@ -511,6 +518,79 @@ fn first_recorded_request_body(export: &str) -> String {
     panic!("the recording holds no textual request body");
 }
 
+#[test]
+fn the_effort_key_appears_only_where_a_scenario_set_it() {
+    let mut swept = 0usize;
+    for entry in std::fs::read_dir(golden_dir()).expect("the golden directory lists") {
+        let path = entry.expect("each golden entry reads").path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        swept = swept.saturating_add(1);
+        let carries_effort = path
+            .file_stem()
+            .is_some_and(|stem| stem == "effort_injected");
+        let text = std::fs::read_to_string(&path).expect("the golden file reads");
+        let golden: serde_json::Value =
+            serde_json::from_str(&text).expect("the golden parses as canonical JSON");
+        let has_key = match &golden {
+            serde_json::Value::Array(interactions) => interactions.iter().any(|interaction| {
+                interaction
+                    .get("options")
+                    .is_some_and(|options| options.get("effort").is_some())
+            }),
+            serde_json::Value::Object(wire_body) => wire_body.contains_key("effort"),
+            _ => false,
+        };
+        assert_eq!(
+            carries_effort,
+            has_key,
+            "default inertness: {} must carry the \"effort\" options key exactly when its scenario set one — engine goldens carry it inside the options object, wire bodies carry no options-level key",
+            path.display()
+        );
+    }
+    assert!(
+        swept > 0,
+        "the sweep must have examined at least one golden to prove inertness"
+    );
+}
+
+/// Capture the exact body a provider client puts on the wire for the
+/// shared conversation under explicit per-request options, and golden it
+/// under `scenario`.
+///
+/// The options-bearing sibling of [`golden_wire_body`]: the request goes
+/// out through `stream_messages_with_options`, so the golden pins how a
+/// per-request knob reaches each provider's native wire shape on top of
+/// the shared conversation's conversion.
+async fn golden_wire_body_with_options<C: ApiClient>(
+    scenario: &str,
+    build_client: impl FnOnce(&str) -> C,
+    options: RequestOptions,
+) {
+    let server = httpmock::MockServer::start_async().await;
+    let recording = server
+        .record_async(|rule| {
+            rule.filter(|when| {
+                when.any_request();
+            });
+        })
+        .await;
+    let client = build_client(&server.base_url());
+    let request = shared_conversation();
+    let mut stream = client.stream_messages_with_options(&request, options);
+    while stream.next().await.is_some() {}
+    let bytes = recording
+        .export_async()
+        .await
+        .expect("the recording exports")
+        .expect("the provider client sent its request");
+    let body = first_recorded_request_body(&String::from_utf8_lossy(&bytes));
+    let value: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("golden {scenario}: the wire body is not JSON: {error}"));
+    assert_golden(scenario, &value);
+}
+
 #[tokio::test]
 async fn minimal_chat_request_is_golden() {
     let client = Arc::new(RecordingClient::new(
@@ -768,6 +848,86 @@ async fn gemini_wire_body_is_golden() {
             .expect("the gemini client builds")
     })
     .await;
+}
+
+#[tokio::test]
+#[cfg(feature = "openai")]
+async fn a_high_effort_reaches_the_openai_wire() {
+    golden_wire_body_with_options(
+        "openai_wire_effort",
+        |base| {
+            loopctl::provider::OpenAiClient::builder()
+                .with_api_key("golden-key")
+                .with_base_url(format!("{base}/v1"))
+                .with_model("golden-model")
+                .build()
+                .expect("the openai client builds")
+        },
+        RequestOptions::new().with_effort(loopctl::structured::ThinkingEffort::High),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[cfg(feature = "anthropic")]
+async fn a_high_effort_reaches_the_anthropic_wire() {
+    golden_wire_body_with_options(
+        "anthropic_wire_effort",
+        |base| {
+            loopctl::provider::AnthropicClient::builder()
+                .with_api_key("golden-key")
+                .with_base_url(base.to_string())
+                .with_model("golden-model")
+                .build()
+                .expect("the anthropic client builds")
+        },
+        RequestOptions::new().with_effort(loopctl::structured::ThinkingEffort::High),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[cfg(feature = "gemini")]
+async fn a_high_effort_reaches_the_gemini_wire() {
+    golden_wire_body_with_options(
+        "gemini_wire_effort",
+        |base| {
+            loopctl::provider::GeminiClient::builder()
+                .with_api_key("golden-key")
+                .with_base_url(format!("{base}/v1beta"))
+                .with_model("golden-model")
+                .build()
+                .expect("the gemini client builds")
+        },
+        RequestOptions::new().with_effort(loopctl::structured::ThinkingEffort::High),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn effort_rides_the_model_override_seam() {
+    let client = Arc::new(RecordingClient::new(
+        MockApiClient::new("golden-model").with_text_response("done"),
+        Vec::new(),
+    ));
+    let mut agent = BareLoop::new(
+        Arc::clone(&client),
+        ToolRegistry::new(),
+        SessionConfig::default(),
+    );
+    agent.set_request_options(
+        RequestOptions::new()
+            .with_model("golden-effort-model")
+            .with_effort(loopctl::structured::ThinkingEffort::High),
+    );
+    let run = agent
+        .run("Reply with the single word: done.", &RunConfig::default())
+        .await;
+    assert!(
+        run.is_ok(),
+        "golden effort_injected: the scripted run must complete: {run:?}"
+    );
+    golden_calls("effort_injected", &client.calls());
 }
 
 /// A fresh scratch directory unique to this test process.

@@ -344,8 +344,9 @@ pub struct PartStart {
     /// available immediately) and for text parts (an empty text
     /// part — the lane's kind is fixed here, not inferred from
     /// later deltas). `None` marks a reasoning lane, which
-    /// accumulates [`Thinking`] fragments that flush nothing on
-    /// close. The [`StreamAccumulator`] uses this to pick the
+    /// accumulates [`Thinking`] fragments and flushes them as a
+    /// thinking [`MessagePart`] on close. The
+    /// [`StreamAccumulator`] uses this to pick the
     /// slot's kind and to seed the tool ID and name before deltas
     /// arrive.
     ///
@@ -427,7 +428,8 @@ pub struct IndexedDelta {
 ///         }
 ///     }
 ///     DeltaPart::Thinking { .. } => {
-///         // Reasoning is delivered via on_thinking_delta; not accumulated here.
+///         // Reasoning deltas accumulate into the message's Thinking part;
+///         // live display goes through on_thinking_delta.
 ///     }
 ///     _ => {}
 /// }
@@ -492,23 +494,47 @@ pub enum DeltaPart {
     /// display. NOT part of the assistant's visible text.
     ///
     /// Emitted by reasoning models (Claude extended-thinking, DeepSeek-R1,
-    /// OpenAI o-series). Stream-only: the [`StreamAccumulator`] does NOT carry
-    /// reasoning into the built [`Message`]; consume
-    /// it via
+    /// OpenAI o-series). The [`StreamAccumulator`] carries a non-empty
+    /// thinking lane into a [`MessagePart::Thinking`] on the built
+    /// [`Message`] (visible text stays separate); live consumption goes
+    /// through
     /// [`on_thinking_delta`](crate::observer::LoopObserver::on_thinking_delta).
-    /// An empty `text` signals redacted reasoning (e.g. Anthropic
-    /// `redacted_thinking`); render a placeholder rather than the empty string.
+    /// An empty `text` arrives when the delta carries something other
+    /// than displayable reasoning — a redacted block's opaque payload
+    /// (e.g. Anthropic `redacted_thinking`, in `redacted`) or a block
+    /// signature; render a placeholder rather than the empty string.
     ///
-    /// Serialized as `"type":"thinking_delta"` with a `"text"` field.
+    /// Serialized as `"type":"thinking_delta"` with a `"text"` field, plus
+    /// `"signature"`/`"redacted"` fields only when carried.
     #[serde(rename = "thinking_delta")]
     Thinking {
         /// The reasoning text fragment to append.
         ///
         /// Concatenate in arrival order per turn to reconstruct the full
-        /// reasoning trace. Empty string when the reasoning is redacted
-        /// (the provider withheld the content); consumers should render a
-        /// placeholder, not the empty string.
+        /// reasoning trace. Empty string when the delta carries something
+        /// other than displayable reasoning — a redacted block's opaque
+        /// payload (in `redacted`) or a block signature; consumers should
+        /// render a placeholder, not the empty string.
         text: String,
+
+        /// The provider's signature over the finished reasoning block.
+        ///
+        /// Anthropic attaches one `signature_delta` at the end of a
+        /// thinking block; it rides a delta of its own with empty `text`,
+        /// the accumulator latches it, and replaying the turn's thinking
+        /// natively requires sending it back unchanged. `None` on every
+        /// text fragment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+
+        /// The opaque payload of a redacted reasoning block.
+        ///
+        /// Anthropic delivers `redacted_thinking` blocks complete in the
+        /// block start; the payload rides a delta of its own with empty
+        /// `text`, and continuation requests must return it verbatim.
+        /// `None` everywhere else.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redacted: Option<String>,
     },
 }
 
@@ -954,12 +980,12 @@ enum OpenPartKind {
     /// A reasoning lane, opened by a [`PartStart`](StreamEvent::PartStart)
     /// that carries no part.
     ///
-    /// Reasoning is stream-only in this crate — there is no thinking
-    /// [`MessagePart`] — so the slot accumulates its fragments and flushes
-    /// nothing on close. The kind exists so [`Thinking`] deltas have a lane
-    /// of their own: without it, providers that index the reasoning lane
-    /// alongside tool-call wire indices would let one lane's deltas land in
-    /// the other's buffers.
+    /// The slot accumulates its fragments and flushes a
+    /// [`MessagePart::Thinking`] on close when anything was accumulated.
+    /// The kind exists so [`Thinking`] deltas have a lane of their own:
+    /// without it, providers that index the reasoning lane alongside
+    /// tool-call wire indices would let one lane's deltas land in the
+    /// other's buffers.
     ///
     /// [`Thinking`]: crate::stream::DeltaPart::Thinking
     Thinking,
@@ -997,14 +1023,31 @@ struct OpenPart {
     /// for tool-call slots.
     text: String,
 
-    /// Buffered reasoning text for a thinking-lane slot.
+    /// Buffered reasoning state for a thinking-lane slot.
     ///
-    /// Grown one fragment at a time by [`DeltaPart::Thinking`] deltas.
-    /// Reasoning is stream-only in this crate — there is no thinking
-    /// [`MessagePart`] — so the buffer is discarded on close; it exists so
-    /// the fragments have somewhere kind-correct to land. Empty and unused
-    /// for text and tool-call slots.
+    /// `thinking` grows one fragment at a time from
+    /// [`DeltaPart::Thinking`] text; `signature` and `redacted` latch
+    /// once from the delta that carries them. All three flush into a
+    /// [`MessagePart::Thinking`] on close. Unused for text and
+    /// tool-call slots.
     thinking: String,
+
+    /// The latched provider signature for a thinking-lane slot.
+    ///
+    /// Written by the single [`DeltaPart::Thinking`] delta that carries
+    /// `signature`, read once at close, and carried onto the built
+    /// [`MessagePart::Thinking`] so the turn's reasoning can be
+    /// replayed natively. `None` for text and tool-call slots and for
+    /// unsigned reasoning.
+    thinking_signature: Option<String>,
+
+    /// The latched redacted payload for a thinking-lane slot.
+    ///
+    /// Written by the single [`DeltaPart::Thinking`] delta that carries
+    /// `redacted`, read once at close, and carried onto the built
+    /// [`MessagePart::Thinking`] so a redacted block can be returned
+    /// verbatim on continuation requests. `None` for every other slot.
+    thinking_redacted: Option<String>,
 
     /// Server-assigned identifier of the tool call.
     ///
@@ -1167,8 +1210,18 @@ impl StreamAccumulator {
                             slot.tool_input.push_str(s);
                         }
                     }
-                    DeltaPart::Thinking { text } => {
+                    DeltaPart::Thinking {
+                        text,
+                        signature,
+                        redacted,
+                    } => {
                         slot.thinking.push_str(text);
+                        if signature.is_some() {
+                            slot.thinking_signature.clone_from(signature);
+                        }
+                        if redacted.is_some() {
+                            slot.thinking_redacted.clone_from(redacted);
+                        }
                     }
                 }
                 Ok(())
@@ -1185,6 +1238,17 @@ impl StreamAccumulator {
                 let flushed = match slot.kind {
                     OpenPartKind::Text if !slot.text.is_empty() => {
                         Some(MessagePart::text(slot.text))
+                    }
+                    OpenPartKind::Thinking
+                        if !slot.thinking.is_empty()
+                            || slot.thinking_signature.is_some()
+                            || slot.thinking_redacted.is_some() =>
+                    {
+                        Some(MessagePart::Thinking {
+                            text: slot.thinking,
+                            signature: slot.thinking_signature,
+                            redacted: slot.thinking_redacted,
+                        })
                     }
                     OpenPartKind::Tool if !slot.tool_name.is_empty() => {
                         let input: Value = if slot.tool_input.is_empty() {
@@ -1761,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn accumulator_drops_thinking_not_into_text() {
+    fn thinking_flushes_as_its_own_part_not_into_text() {
         let mut acc = StreamAccumulator::new();
         acc.process(&StreamEvent::PartStart(PartStart {
             index: 1,
@@ -1772,6 +1836,8 @@ mod tests {
             index: 1,
             delta: DeltaPart::Thinking {
                 text: "reasoning here".into(),
+                signature: None,
+                redacted: None,
             },
         }))
         .unwrap();
@@ -1784,6 +1850,124 @@ mod tests {
         assert!(
             !text.unwrap_or("").contains("reasoning here"),
             "reasoning must not leak into the message text: {text:?}"
+        );
+        let thinking = msg.parts.iter().find_map(|p| match p {
+            MessagePart::Thinking { text, .. } => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(
+            thinking,
+            Some("reasoning here"),
+            "a non-empty thinking lane flushes as its own part: {:?}",
+            msg.parts
+        );
+    }
+
+    #[test]
+    fn signature_and_redacted_payload_survive_into_the_built_message() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: None,
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Thinking {
+                text: "visible reasoning".into(),
+                signature: Some("sig-blob".into()),
+                redacted: None,
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop { index: Some(0) })
+            .unwrap();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 1,
+            part: None,
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 1,
+            delta: DeltaPart::Thinking {
+                text: String::new(),
+                signature: None,
+                redacted: Some("opaque-data".into()),
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop { index: Some(1) })
+            .unwrap();
+        let msg = acc.build();
+        assert_eq!(
+            msg.parts.len(),
+            2,
+            "both thinking lanes flush: {:?}",
+            msg.parts
+        );
+        assert!(
+            matches!(
+                msg.parts.first(),
+                Some(MessagePart::Thinking { text, signature, redacted })
+                    if text == "visible reasoning"
+                        && signature.as_deref() == Some("sig-blob")
+                        && redacted.is_none()
+            ),
+            "the signature latches onto the signed thinking part: {:?}",
+            msg.parts
+        );
+        assert!(
+            matches!(
+                msg.parts.get(1),
+                Some(MessagePart::Thinking { text, signature, redacted })
+                    if text.is_empty()
+                        && signature.is_none()
+                        && redacted.as_deref() == Some("opaque-data")
+            ),
+            "a redacted lane flushes on its payload alone: {:?}",
+            msg.parts
+        );
+    }
+
+    #[test]
+    fn a_text_fragment_after_the_signature_keeps_the_latched_signature() {
+        let mut acc = StreamAccumulator::new();
+        acc.process(&StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: None,
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Thinking {
+                text: "visible reasoning".into(),
+                signature: Some("sig-blob".into()),
+                redacted: None,
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Thinking {
+                text: " continued".into(),
+                signature: None,
+                redacted: None,
+            },
+        }))
+        .unwrap();
+        acc.process(&StreamEvent::PartStop { index: Some(0) })
+            .unwrap();
+        let msg = acc.build();
+        assert!(
+            matches!(
+                msg.parts.first(),
+                Some(MessagePart::Thinking { text, signature, redacted })
+                    if text == "visible reasoning continued"
+                        && signature.as_deref() == Some("sig-blob")
+                        && redacted.is_none()
+            ),
+            "a later text fragment must not erase the latched signature: {:?}",
+            msg.parts
         );
     }
 
@@ -2025,12 +2209,16 @@ mod tests {
 
     #[test]
     fn deltapart_thinking_serde_roundtrip() {
-        let delta = DeltaPart::Thinking { text: "hmm".into() };
+        let delta = DeltaPart::Thinking {
+            text: "hmm".into(),
+            signature: None,
+            redacted: None,
+        };
         let json = serde_json::to_string(&delta).unwrap();
         assert_eq!(json, r#"{"type":"thinking_delta","text":"hmm"}"#);
         let parsed: DeltaPart = serde_json::from_str(&json).unwrap();
         match &parsed {
-            DeltaPart::Thinking { text } => assert_eq!(text, "hmm"),
+            DeltaPart::Thinking { text, .. } => assert_eq!(text, "hmm"),
             other => panic!("expected Thinking, got {other:?}"),
         }
     }
@@ -2039,21 +2227,27 @@ mod tests {
     fn deltapart_thinking_empty_text_roundtrip() {
         let delta = DeltaPart::Thinking {
             text: String::new(),
+            signature: None,
+            redacted: None,
         };
         let json = serde_json::to_string(&delta).unwrap();
         let parsed: DeltaPart = serde_json::from_str(&json).unwrap();
         match &parsed {
-            DeltaPart::Thinking { text } => assert_eq!(text, ""),
+            DeltaPart::Thinking { text, .. } => assert_eq!(text, ""),
             other => panic!("expected Thinking with empty text, got {other:?}"),
         }
     }
 
     #[test]
     fn deltapart_thinking_match_compiles() {
-        let delta = DeltaPart::Thinking { text: "x".into() };
+        let delta = DeltaPart::Thinking {
+            text: "x".into(),
+            signature: None,
+            redacted: None,
+        };
         let result = match &delta {
             DeltaPart::Text { text } => format!("text:{text}"),
-            DeltaPart::Thinking { text } => format!("thinking:{text}"),
+            DeltaPart::Thinking { text, .. } => format!("thinking:{text}"),
             DeltaPart::ToolCall { .. } | DeltaPart::InputJson { .. } => "other".into(),
         };
         assert_eq!(result, "thinking:x");

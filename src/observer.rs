@@ -14,6 +14,7 @@
 //! - [`ResponseContext`] — model response text and usage
 //! - [`TextDeltaContext`] — incremental text chunk while streaming
 //! - [`ThinkingDeltaContext`] — incremental reasoning chunk while streaming
+//! - [`AttemptResetContext`] — reset cue before a retried stream attempt's first event
 //! - [`ToolCallReceivedContext`] — tool call accumulated, before dispatch
 //! - [`ToolPreContext`] / [`ToolPostContext`] — tool dispatch lifecycle
 //! - [`CompactedContext`] — context window compaction
@@ -44,11 +45,11 @@ pub mod context;
 pub mod hub;
 
 pub use context::{
-    CompactedContext, ConvergenceDetectedContext, FallbackContext, LoopDetectedContext,
-    ModelSwitchedContext, PreCompactionContext, ResponseContext, RunEndContext, RunStartContext,
-    StreamContext, StreamFailureContext, TextDeltaContext, ThinkingDeltaContext,
-    ToolCallReceivedContext, ToolPostContext, ToolPreContext, TransportFallbackContext,
-    TurnEndContext, TurnStartContext,
+    AttemptResetContext, CompactedContext, ConvergenceDetectedContext, FallbackContext,
+    LoopDetectedContext, ModelSwitchedContext, PreCompactionContext, ResponseContext,
+    RunEndContext, RunStartContext, StreamContext, StreamFailureContext, TextDeltaContext,
+    ThinkingDeltaContext, ToolCallReceivedContext, ToolPostContext, ToolPreContext,
+    TransportFallbackContext, TurnEndContext, TurnStartContext,
 };
 pub use hub::{EventHub, LoopEvent, ObservedEvent};
 
@@ -144,7 +145,13 @@ pub trait LoopObserver: Send + Sync {
     /// under the handler path only, see duplicated or truncated-then-restarted
     /// fragments after a retry. Consumers that need only committed output must
     /// buffer until [`on_response`](Self::on_response) (or
-    /// [`on_turn_end`](Self::on_turn_end)).
+    /// [`on_turn_end`](Self::on_turn_end)); consumers that want live output
+    /// discard the turn's buffered deltas on
+    /// [`on_attempt_reset`](Self::on_attempt_reset), which fires before each
+    /// retried attempt's first event — that cue covers retries only, so a
+    /// final stream failure or a non-streaming fallback is reconciled
+    /// through [`on_stream_failure`](Self::on_stream_failure) or
+    /// [`on_response`](Self::on_response), not the reset.
     ///
     /// # Examples
     ///
@@ -170,14 +177,45 @@ pub trait LoopObserver: Send + Sync {
     /// Fired per `DeltaPart::Thinking` during streaming, symmetric to
     /// [`on_text_delta`](Self::on_text_delta). Reasoning is distinct from
     /// visible assistant text; do not concatenate it with `on_text_delta` /
-    /// [`on_response`](Self::on_response) output. Redacted reasoning arrives
-    /// as an empty `delta` (render a placeholder, not the empty string).
+    /// [`on_response`](Self::on_response) output. An empty `delta` arrives
+    /// when the event carries something other than displayable reasoning —
+    /// a redacted block's opaque payload or a block signature; render a
+    /// placeholder, not the empty string.
     ///
     /// Inherits the same retry caveat as [`on_text_delta`](Self::on_text_delta):
     /// under a configured `StreamHandler`,
     /// partial events from a failed attempt fire here too. Buffer until
-    /// [`on_turn_end`](Self::on_turn_end) if you need only committed reasoning.
+    /// [`on_turn_end`](Self::on_turn_end) if you need only committed
+    /// reasoning, or discard the turn's buffer on
+    /// [`on_attempt_reset`](Self::on_attempt_reset) — which fires before
+    /// each retried attempt's first event — to display reasoning live
+    /// across retries; a final stream failure or a non-streaming
+    /// fallback is reconciled through [`on_stream_failure`](Self::on_stream_failure)
+    /// or [`on_response`](Self::on_response), not the reset.
     fn on_thinking_delta(&self, _ctx: &ThinkingDeltaContext) {}
+
+    /// Called when a retrying stream discards a failed attempt's events.
+    ///
+    /// Fired exactly once before the first event of each retried attempt
+    /// (never before the first attempt), symmetric to the engine's own
+    /// reset: the engine discards the failed attempt's accumulated turn
+    /// here, and an observer that buffers per-attempt deltas — text or
+    /// thinking — must discard its buffer for the same turn here too, or
+    /// the retry's events concatenate onto the dead attempt's prefix.
+    /// The context names the `turn` and the `attempt` the stream is now
+    /// entering (2 for the first retry).
+    ///
+    /// This is the reset point the delta callbacks' retry caveat names:
+    /// an observer that resets here can display live deltas safely
+    /// across retries, without buffering until
+    /// [`on_turn_end`](Self::on_turn_end). The cue covers retries
+    /// only: it never fires after a final stream failure or when the
+    /// handler serves a non-streaming fallback, so a terminal outcome
+    /// is reconciled through [`on_stream_failure`](Self::on_stream_failure),
+    /// [`on_response`](Self::on_response) (whose text replaces the
+    /// buffered deltas), or
+    /// [`on_turn_end`](Self::on_turn_end).
+    fn on_attempt_reset(&self, _ctx: &AttemptResetContext) {}
 
     /// Called when the engine has accumulated a tool call and is about to dispatch it.
     ///
@@ -481,6 +519,16 @@ impl ObserverHost {
     /// be cheap.
     pub fn on_thinking_delta(&self, ctx: &ThinkingDeltaContext) {
         self.dispatch(|obs| obs.on_thinking_delta(ctx));
+    }
+
+    /// Dispatch [`LoopObserver::on_attempt_reset`] to all observers.
+    ///
+    /// Fired once before the first event of each retried stream attempt
+    /// (never before the first attempt). Iterates registered observers in
+    /// registration order; observers that buffer per-attempt deltas
+    /// discard their buffers here.
+    pub fn on_attempt_reset(&self, ctx: &AttemptResetContext) {
+        self.dispatch(|obs| obs.on_attempt_reset(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_tool_pre`] to all observers.
@@ -876,6 +924,48 @@ mod tests {
             tool: "echo".into(),
             call_id: "c1".into(),
             input: serde_json::Value::Null,
+        });
+    }
+
+    #[test]
+    fn host_dispatches_on_attempt_reset_to_all_observers() {
+        struct ResetRecorder {
+            calls: std::sync::Mutex<Vec<(usize, usize)>>,
+        }
+        impl LoopObserver for ResetRecorder {
+            fn name(&self) -> &'static str {
+                "reset-recorder"
+            }
+            fn on_attempt_reset(&self, ctx: &AttemptResetContext) {
+                crate::error::recover_guard(self.calls.lock()).push((ctx.turn, ctx.attempt));
+            }
+        }
+        let mut host = ObserverHost::new();
+        let obs = Arc::new(ResetRecorder {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        host.register(Arc::clone(&obs) as Arc<dyn LoopObserver>);
+        host.on_attempt_reset(&AttemptResetContext {
+            turn: 3,
+            attempt: 2,
+        });
+        assert_eq!(
+            crate::error::recover_guard(obs.calls.lock()).clone(),
+            vec![(3, 2)],
+            "every registered observer sees the reset with its turn and attempt"
+        );
+    }
+
+    #[test]
+    fn host_dispatches_on_attempt_reset_with_no_observers() {
+        let host = ObserverHost::new();
+        assert!(
+            host.is_empty(),
+            "the dispatch-with-no-observers pin must actually run against an empty host"
+        );
+        host.on_attempt_reset(&AttemptResetContext {
+            turn: 0,
+            attempt: 2,
         });
     }
 

@@ -277,11 +277,12 @@ pub struct TextDeltaContext {
 /// is distinct from the assistant's visible text and is never included in
 /// [`ResponseContext`].
 ///
-/// # Redacted reasoning
+/// # Empty deltas
 ///
-/// An empty `delta` signals redacted reasoning (e.g. Anthropic
-/// `redacted_thinking`) — the provider withheld the content. Consumers should
-/// render a placeholder ("reasoning redacted"), not the empty string.
+/// An empty `delta` arrives when the event carries something other
+/// than displayable reasoning — a redacted block's opaque payload
+/// (e.g. Anthropic `redacted_thinking`) or a block signature.
+/// Consumers should render a placeholder, not the empty string.
 ///
 /// # Example
 ///
@@ -302,9 +303,44 @@ pub struct ThinkingDeltaContext {
 
     /// The incremental reasoning chunk. Concatenate in arrival order per turn.
     ///
-    /// Empty string for redacted/encrypted reasoning (e.g. Anthropic
-    /// `redacted_thinking`) — render a placeholder, not the empty string.
+    /// Empty when the delta carries something other than displayable
+    /// reasoning — a redacted block's opaque payload or a block
+    /// signature; render a placeholder, not the empty string.
     pub delta: String,
+}
+
+/// Context for [`LoopObserver::on_attempt_reset`](crate::observer::LoopObserver::on_attempt_reset).
+///
+/// Fired once before the first event of each retried stream attempt — never
+/// before the first attempt — telling delta-buffering observers to discard
+/// the failed attempt's partial text/thinking for the same turn. The cue
+/// covers retries only: it never fires after a final stream failure or for
+/// a non-streaming fallback, which surface through `on_stream_failure` /
+/// `on_response` instead.
+///
+/// # Examples
+///
+/// ```
+/// use loopctl::observer::AttemptResetContext;
+///
+/// let ctx = AttemptResetContext { turn: 0, attempt: 2 };
+/// assert_eq!(ctx.turn, 0);
+/// assert_eq!(ctx.attempt, 2);
+/// ```
+#[derive(Debug, Clone)]
+pub struct AttemptResetContext {
+    /// Turn number (0-indexed), matching `on_turn_start` / `on_turn_end`.
+    ///
+    /// Same value [`ThinkingDeltaContext::turn`] carries for the same
+    /// turn, so an observer can key its per-turn delta buffer by it.
+    pub turn: usize,
+
+    /// The attempt the stream is entering, 1-indexed.
+    ///
+    /// The first attempt never fires a reset; the first retry carries
+    /// `2`. A turn's resets are consecutive from the handler's retry
+    /// ladder.
+    pub attempt: usize,
 }
 
 /// Context for [`LoopObserver::on_tool_call_received`](crate::observer::LoopObserver::on_tool_call_received).

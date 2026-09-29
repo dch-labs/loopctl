@@ -2453,7 +2453,9 @@ pub enum HandlerEvent {
     /// the first attempt). The engine must reset any per-attempt state —
     /// including its [`StreamAccumulator`] — so events from the failed
     /// attempt are discarded rather than concatenated with the retry's
-    /// events. Observers that concatenate deltas per turn must reset too.
+    /// events. The engine fires
+    /// [`LoopObserver::on_attempt_reset`](crate::observer::LoopObserver::on_attempt_reset)
+    /// here so observers that concatenate deltas per turn can reset too.
     AttemptReset,
 
     /// Streaming retries are exhausted and the non-streaming fallback

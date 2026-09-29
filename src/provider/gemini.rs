@@ -108,6 +108,17 @@ pub struct GeminiClient {
     /// before enabling it. Defaults to `false`. Set via
     /// [`GeminiClientBuilder::include_thoughts`].
     include_thoughts: bool,
+
+    /// The client-level thinking-effort default.
+    ///
+    /// `None` (the default) sends no `thinkingBudget`; when set, every
+    /// request carries the level's budget in
+    /// `generationConfig.thinkingConfig` (per
+    /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table)
+    /// unless the request carries its own
+    /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort).
+    /// Set via [`GeminiClientBuilder::thinking_effort`].
+    thinking_effort: Option<crate::structured::ThinkingEffort>,
 }
 
 impl GeminiClient {
@@ -372,6 +383,7 @@ impl ApiClient for GeminiClient {
             None,
             &ToolConstraint::None,
             self.include_thoughts,
+            self.thinking_effort,
         );
         let url = self.generate_url();
 
@@ -410,6 +422,7 @@ impl ApiClient for GeminiClient {
             rf,
             &options.tool_constraint,
             self.include_thoughts,
+            options.effort.or(self.thinking_effort),
         );
         let model = options
             .model
@@ -463,6 +476,7 @@ impl ApiClient for GeminiClient {
             response_format,
             &options.tool_constraint,
             self.include_thoughts,
+            options.effort.or(self.thinking_effort),
         );
         let model = options
             .model
@@ -510,6 +524,15 @@ pub struct GeminiClientBuilder {
     /// must opt in once they know their model supports thinking.
     include_thoughts: bool,
 
+    /// The client-level thinking-effort default.
+    ///
+    /// `None` (the default) sends no `thinkingBudget`. When set, every
+    /// request carries the level's budget in
+    /// `generationConfig.thinkingConfig` (see
+    /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table).
+    /// Read by [`build`](Self::build) and stored on [`GeminiClient`].
+    thinking_effort: Option<crate::structured::ThinkingEffort>,
+
     /// Shared HTTP client configuration (timeouts, pool, TCP).
     ///
     /// Holds the timeout, connection-pool, and TCP knobs that apply to the
@@ -525,6 +548,7 @@ impl Default for GeminiClientBuilder {
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
             include_thoughts: false,
+            thinking_effort: None,
             http: super::HttpClientConfig::default(),
         }
     }
@@ -609,6 +633,21 @@ impl GeminiClientBuilder {
         self
     }
 
+    /// Set the client-level thinking-effort default.
+    ///
+    /// Every request then carries the level's budget as
+    /// `generationConfig.thinkingConfig.thinkingBudget` (per
+    /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table). A
+    /// per-request
+    /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort)
+    /// always wins; an unset client default leaves unconfigured requests
+    /// byte-identical to prior versions.
+    #[must_use]
+    pub fn thinking_effort(mut self, effort: crate::structured::ThinkingEffort) -> Self {
+        self.thinking_effort = Some(effort);
+        self
+    }
+
     /// Inject a pre-built, shared `reqwest::Client`.
     ///
     /// When set, the client's connection pool is shared with every other
@@ -678,6 +717,7 @@ impl GeminiClientBuilder {
             base_url: self.base_url,
             model: std::sync::Mutex::new(self.model),
             include_thoughts: self.include_thoughts,
+            thinking_effort: self.thinking_effort,
         })
     }
 }
@@ -689,8 +729,9 @@ impl GeminiClientBuilder {
 ///
 /// `generationConfig` is injected only when it has something to carry:
 /// `thinkingConfig.includeThoughts = true` when `include_thoughts` is set,
+/// `thinkingConfig.thinkingBudget` when an effort level was resolved in,
 /// and/or `responseMimeType` + `responseJsonSchema` when `response_format`
-/// is set. When neither applies, `generationConfig` is omitted entirely.
+/// is set. When none applies, `generationConfig` is omitted entirely.
 ///
 /// Tool-call constraint:
 /// - When `response_format` is set, suppresses `tools`; `tool_constraint`
@@ -707,6 +748,7 @@ fn build_request_body(
     response_format: Option<&crate::structured::ResponseFormat>,
     tool_constraint: &ToolConstraint,
     include_thoughts: bool,
+    effort: Option<crate::structured::ThinkingEffort>,
 ) -> Value {
     let (non_system, effective_system) = super::fold_system_messages(messages, system);
     let contents: Vec<Value> = non_system.iter().map(|m| convert_message(m)).collect();
@@ -731,11 +773,16 @@ fn build_request_body(
         }
 
         let mut generation_config = serde_json::Map::new();
-        if include_thoughts {
-            generation_config.insert(
-                "thinkingConfig".into(),
-                serde_json::json!({ "includeThoughts": true }),
-            );
+        let budget = effort.map(gemini_thinking_budget);
+        if include_thoughts || budget.is_some() {
+            let mut thinking_config = serde_json::Map::new();
+            if include_thoughts {
+                thinking_config.insert("includeThoughts".into(), Value::Bool(true));
+            }
+            if let Some(budget) = budget {
+                thinking_config.insert("thinkingBudget".into(), serde_json::json!(budget));
+            }
+            generation_config.insert("thinkingConfig".into(), Value::Object(thinking_config));
         }
         if let Some(rf) = response_format {
             generation_config.insert("responseMimeType".into(), "application/json".into());
@@ -747,6 +794,22 @@ fn build_request_body(
     }
 
     body
+}
+
+/// The `thinkingConfig.thinkingBudget` value for one effort level.
+///
+/// The fixed ladder from [`ThinkingEffort`](crate::structured::ThinkingEffort)'s
+/// table: `Low` budgets `1024` tokens, `Medium` `8192`, `High` `16384`,
+/// and `Max` `24576`. The provider's dynamic sentinels (`0`, `-1`) are
+/// deliberately not on the ladder — a set level always names a real
+/// budget.
+fn gemini_thinking_budget(effort: crate::structured::ThinkingEffort) -> u32 {
+    match effort {
+        crate::structured::ThinkingEffort::Low => 1024,
+        crate::structured::ThinkingEffort::Medium => 8192,
+        crate::structured::ThinkingEffort::High => 16384,
+        crate::structured::ThinkingEffort::Max => 24576,
+    }
 }
 
 /// The config error for grammar constraints on the Gemini API.
@@ -827,7 +890,7 @@ fn convert_part(p: &MessagePart) -> Option<Value> {
             );
             Some(serde_json::json!({"functionResponse": fr}))
         }
-        MessagePart::Image { .. } => None,
+        MessagePart::Thinking { .. } | MessagePart::Image { .. } => None,
     }
 }
 
@@ -1190,6 +1253,8 @@ impl StreamEmitter {
                     index: THINKING_PART_INDEX,
                     delta: DeltaPart::Thinking {
                         text: text.to_string(),
+                        signature: None,
+                        redacted: None,
                     },
                 }));
             } else {
@@ -1438,7 +1503,7 @@ mod tests {
     #[test]
     fn request_body_user_text() {
         let msgs = vec![Message::user("hello")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
 
         let contents = body["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 1);
@@ -1457,6 +1522,7 @@ mod tests {
             None,
             &ToolConstraint::None,
             false,
+            None,
         );
 
         let sys = &body["systemInstruction"];
@@ -1467,7 +1533,7 @@ mod tests {
     #[test]
     fn request_body_no_system_instruction_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
         assert!(body.get("systemInstruction").is_none());
     }
 
@@ -1477,14 +1543,14 @@ mod tests {
             Role::Assistant,
             vec![MessagePart::text("hello")],
         )];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
         assert_eq!(body["contents"][0]["role"], "model");
     }
 
     #[test]
     fn request_body_user_role() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
         assert_eq!(body["contents"][0]["role"], "user");
     }
 
@@ -1498,7 +1564,7 @@ mod tests {
                 input: serde_json::json!({"msg": "hi"}),
             }],
         )];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
 
         let parts = body["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["functionCall"]["name"], "echo");
@@ -1517,7 +1583,7 @@ mod tests {
                 is_error: None,
             }],
         )];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
 
         let parts = body["contents"][0]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["functionResponse"]["name"], "echo");
@@ -1539,7 +1605,7 @@ mod tests {
                 is_error: None,
             }],
         )];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
 
         let fr = &body["contents"][0]["parts"][0]["functionResponse"];
         assert_eq!(fr["name"], "search");
@@ -1558,7 +1624,7 @@ mod tests {
                 is_error: None,
             }],
         )];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
 
         let fr = &body["contents"][0]["parts"][0]["functionResponse"];
         assert_eq!(fr["name"], "search");
@@ -1574,7 +1640,7 @@ mod tests {
             Role::Assistant,
             vec![MessagePart::tool_call("", "search", serde_json::json!({}))],
         )];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
 
         let fc = &body["contents"][0]["parts"][0]["functionCall"];
         assert_eq!(fc["name"], "search");
@@ -1599,6 +1665,7 @@ mod tests {
             None,
             &ToolConstraint::None,
             false,
+            None,
         );
 
         let tools_arr = body["tools"].as_array().unwrap();
@@ -1612,7 +1679,7 @@ mod tests {
     #[test]
     fn request_body_no_tools_when_none() {
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
         assert!(body.get("tools").is_none());
     }
 
@@ -1623,7 +1690,7 @@ mod tests {
             Message::new(Role::Assistant, vec![MessagePart::text("hi")]),
             Message::user("bye"),
         ];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
 
         let contents = body["contents"].as_array().unwrap();
         assert_eq!(contents.len(), 3);
@@ -1888,7 +1955,7 @@ mod tests {
             "thought:true part must route to Thinking, got {:?}",
             delta.delta
         );
-        if let DeltaPart::Thinking { text } = delta.delta {
+        if let DeltaPart::Thinking { text, .. } = delta.delta {
             assert_eq!(text, "reasoning here");
         }
     }
@@ -2014,7 +2081,7 @@ mod tests {
             .collect();
         assert_eq!(deltas.len(), 2);
         assert!(
-            matches!(deltas[0].delta, DeltaPart::Thinking { ref text } if text == "step 1"),
+            matches!(deltas[0].delta, DeltaPart::Thinking { ref text, .. } if text == "step 1"),
             "first delta must be the thinking fragment, got {:?}",
             deltas[0].delta
         );
@@ -2091,7 +2158,7 @@ mod tests {
     fn request_body_includes_thinking_config_when_opted_in() {
         // Opt-in: includeThoughts injected only when the caller asked for it.
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, true);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, true, None);
 
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["includeThoughts"], true,
@@ -2105,7 +2172,7 @@ mod tests {
         // it with 400 INVALID_ARGUMENT). generationConfig should be absent
         // entirely when there's nothing else to put in it either.
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
 
         assert!(
             body.get("generationConfig").is_none(),
@@ -2121,7 +2188,15 @@ mod tests {
             "result",
             serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
         );
-        let body = build_request_body(&msgs, None, None, Some(&rf), &ToolConstraint::None, true);
+        let body = build_request_body(
+            &msgs,
+            None,
+            None,
+            Some(&rf),
+            &ToolConstraint::None,
+            true,
+            None,
+        );
 
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["includeThoughts"],
@@ -2720,7 +2795,15 @@ mod tests {
             "result",
             serde_json::json!({"type": "object", "properties": {"x": {"type": "string"}}}),
         );
-        let body = build_request_body(&msgs, None, None, Some(&rf), &ToolConstraint::None, false);
+        let body = build_request_body(
+            &msgs,
+            None,
+            None,
+            Some(&rf),
+            &ToolConstraint::None,
+            false,
+            None,
+        );
 
         assert_eq!(
             body["generationConfig"]["responseMimeType"],
@@ -2737,7 +2820,7 @@ mod tests {
         // Without response_format AND include_thoughts=false, generationConfig
         // has nothing to carry, so it must be absent entirely.
         let msgs = vec![Message::user("hi")];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
 
         assert!(
             body.get("generationConfig").is_none(),
@@ -2762,6 +2845,7 @@ mod tests {
             Some(&rf),
             &ToolConstraint::None,
             false,
+            None,
         );
 
         assert!(
@@ -3065,6 +3149,7 @@ mod tests {
             None,
             &ToolConstraint::Strict,
             false,
+            None,
         );
 
         let decls = body["tools"][0]["functionDeclarations"].as_array().unwrap();
@@ -3092,6 +3177,7 @@ mod tests {
             None,
             &ToolConstraint::None,
             false,
+            None,
         );
 
         let decls = body["tools"][0]["functionDeclarations"].as_array().unwrap();
@@ -3121,6 +3207,7 @@ mod tests {
             Some(&rf),
             &ToolConstraint::Strict,
             false,
+            None,
         );
 
         assert!(
@@ -3145,6 +3232,7 @@ mod tests {
             None,
             &ToolConstraint::Strict,
             false,
+            None,
         );
 
         assert!(
@@ -3166,7 +3254,7 @@ mod tests {
             system_role_msg("stay on task"),
             Message::assistant("working"),
         ];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
 
         let contents = body["contents"].as_array().expect("contents is an array");
         assert_eq!(contents.len(), 2, "system-role message is filtered out");
@@ -3193,6 +3281,7 @@ mod tests {
             None,
             &ToolConstraint::None,
             false,
+            None,
         );
 
         let sys_text = body["systemInstruction"]["parts"][0]["text"]
@@ -3220,7 +3309,7 @@ mod tests {
             Message::assistant("second"),
             Message::user("third"),
         ];
-        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false);
+        let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
         let contents = body["contents"].as_array().expect("contents is an array");
         let roles: Vec<&str> = contents
             .iter()
@@ -3415,6 +3504,7 @@ mod tests {
             None,
             &ToolConstraint::None,
             false,
+            None,
         );
         assert!(
             body.get("tools").is_none(),
@@ -3460,6 +3550,95 @@ mod tests {
             response.message.text_content(),
             "answer",
             "thought parts must not surface as visible text on the non-streaming path"
+        );
+    }
+
+    async fn captured_effort_body(
+        default: Option<crate::structured::ThinkingEffort>,
+        options: crate::structured::RequestOptions,
+    ) -> String {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let mut builder = GeminiClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"));
+        if let Some(effort) = default {
+            builder = builder.thinking_effort(effort);
+        }
+        let client = builder.build().unwrap();
+        let mut stream =
+            client.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), options);
+        let _ = stream.next().await;
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_client_effort_default_is_overridden_per_request() {
+        let default_alone = captured_effort_body(
+            Some(crate::structured::ThinkingEffort::Medium),
+            crate::structured::RequestOptions::new(),
+        )
+        .await;
+        assert!(
+            default_alone.contains("\"thinkingBudget\":8192"),
+            "an unset per-request effort leaves the client default budget on the wire: {default_alone}"
+        );
+        let overridden = captured_effort_body(
+            Some(crate::structured::ThinkingEffort::Medium),
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::High),
+        )
+        .await;
+        assert!(
+            overridden.contains("\"thinkingBudget\":16384")
+                && !overridden.contains("\"thinkingBudget\":8192"),
+            "the per-request effort wins over the client default budget: {overridden}"
+        );
+        let no_default = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::High),
+        )
+        .await;
+        assert!(
+            no_default.contains("\"thinkingBudget\":16384"),
+            "a request effort reaches the wire without any client default: {no_default}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ladder_s_outer_rungs_reach_the_gemini_wire() {
+        let low = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Low),
+        )
+        .await;
+        assert!(
+            low.contains("\"thinkingBudget\":1024"),
+            "the Low rung maps to the ladder's 1024 budget: {low}"
+        );
+        let max = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Max),
+        )
+        .await;
+        assert!(
+            max.contains("\"thinkingBudget\":24576"),
+            "the Max rung maps to the ladder's 24576 budget: {max}"
         );
     }
 

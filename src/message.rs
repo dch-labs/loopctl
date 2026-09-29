@@ -231,6 +231,7 @@ impl fmt::Display for Message {
                 MessagePart::Text { text } => {
                     chunks.push(text.clone());
                 }
+                MessagePart::Thinking { .. } => {}
                 MessagePart::ToolCall { name, input, .. } => {
                     if let Ok(input_str) = serde_json::to_string(input) {
                         chunks.push(format!("[Tool: {name} with input: {input_str}]"));
@@ -401,6 +402,46 @@ pub enum MessagePart {
         /// Structure depends on the tool's input schema. May be
         /// any JSON value (`Object`, `Array`, `String`, etc.).
         input: Value,
+    },
+
+    /// The model's reasoning trace for an assistant turn.
+    ///
+    /// Accumulated from [`DeltaPart::Thinking`] fragments by the
+    /// stream accumulator so the reasoning survives in conversation
+    /// history. Providers decide at request-build time whether it is
+    /// replayed: a signed part rides back natively when the provider's
+    /// thinking mode is enabled (Anthropic requires the original block
+    /// ahead of tool use on continuations), an unsigned part renders
+    /// only when the client's reasoning-replay flag is set, and
+    /// otherwise it is skipped — a turn's thinking is metadata about
+    /// how the answer was reached, not part of the answer itself.
+    ///
+    /// [`DeltaPart::Thinking`]: crate::stream::DeltaPart::Thinking
+    #[serde(rename = "thinking")]
+    Thinking {
+        /// The reasoning text, as streamed.
+        ///
+        /// Concatenated fragments in arrival order; empty when the
+        /// turn's thinking carried something other than displayable
+        /// reasoning — a redacted block (its opaque payload rides
+        /// `redacted`) or a signature-only block.
+        text: String,
+
+        /// The provider's signature over the reasoning block.
+        ///
+        /// Latched from the delta that carries it and returned
+        /// verbatim on continuation requests that replay this turn's
+        /// thinking natively. `None` when the provider signs nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+
+        /// The opaque payload of a redacted reasoning block.
+        ///
+        /// Set when the provider withheld the reasoning but demands
+        /// its placeholder back on continuations; replayed verbatim.
+        /// `None` for visible reasoning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redacted: Option<String>,
     },
 
     /// The result of a tool-call invocation.

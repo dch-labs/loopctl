@@ -280,8 +280,10 @@ pub enum ToolConstraint {
 /// [`response_format`](Self::response_format) (constrain the model's
 /// free-text output to a schema),
 /// [`tool_constraint`](Self::tool_constraint) (constrain the model's tool
-/// calls to the registered schemas), and [`model`](Self::model) (serve
-/// this one request with a different model).
+/// calls to the registered schemas), [`model`](Self::model) (serve
+/// this one request with a different model), and
+/// [`effort`](Self::effort) (ask for a thinking-effort level the
+/// provider maps onto its native parameter).
 ///
 /// The two paths are independent: setting `response_format` suppresses
 /// `tools` (and therefore makes `tool_constraint` a no-op for that
@@ -292,6 +294,7 @@ pub enum ToolConstraint {
 /// max response tokens) are deliberately out of scope: requests
 /// without them are served with the provider-side defaults.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RequestOptions {
     /// If set, ask the model to return JSON conforming to this schema.
     ///
@@ -316,6 +319,92 @@ pub struct RequestOptions {
     /// seam to route requests to the active fallback model without
     /// mutating shared client state.
     pub model: Option<String>,
+
+    /// The thinking effort to ask the model for, as
+    /// [`ThinkingEffort`] maps it onto the provider's native
+    /// parameter.
+    ///
+    /// `None` — the default — leaves the level to the serving client:
+    /// a client with its own effort default (see each builder's
+    /// `thinking_effort`) inherits it, a client without one omits the
+    /// parameter entirely, so unconfigured requests are byte-identical.
+    /// A set value always wins over the client default. There is no
+    /// per-request way to turn off a client-level default — build the
+    /// client without one. On the Anthropic client, an effective
+    /// effort — set here or inherited from a client default — also
+    /// demands the assistant's original signed thinking blocks on
+    /// tool-use continuations: a history whose tool-use message
+    /// carries an unsigned thinking part still sends `tool_use`
+    /// alone, which the Messages API rejects; the Anthropic
+    /// builder's `thinking_effort` documentation states the full
+    /// caveat. Set via
+    /// [`with_effort`](Self::with_effort).
+    pub effort: Option<ThinkingEffort>,
+}
+
+/// The thinking effort a request asks the model for.
+///
+/// A four-step vocabulary, `None`-means-unset: every built-in provider
+/// maps each level onto its native parameter, and a request that sets
+/// none leaves the wire exactly as before. The ladder is fixed and
+/// documented — the numbers are loopctl's chosen defaults, not the
+/// providers' only valid values:
+///
+/// | level | OpenAI `reasoning_effort` | Anthropic `thinking.budget_tokens` | Gemini `thinkingConfig.thinkingBudget` |
+/// |-------|---------------------------|-------------------------------------|----------------------------------------|
+/// | `Low` | `"low"` | `2048` | `1024` |
+/// | `Medium` | `"medium"` | `8192` | `8192` |
+/// | `High` | `"high"` | `16384` | `16384` |
+/// | `Max` | `"high"` (clamped — the parameter has no higher step) | `32768` | `24576` |
+///
+/// Anthropic requests enforce headroom: when the budget plus one
+/// exceeds the request's `max_tokens`, `max_tokens` rises to
+/// `budget + 1`, so a set effort never produces a self-rejecting
+/// `max_tokens` pair. A set effort is also never combined with the
+/// forced tool choice a
+/// [`response_format`](RequestOptions::response_format) synthesizes —
+/// the Messages API rejects that pair, so the Anthropic entry points
+/// reject it up front. Turning effort off is a client-level concern:
+/// not setting an effort (and building the client without a default)
+/// omits the parameter and the provider's own defaults apply — with a
+/// client default set, no per-request value expresses off.
+///
+/// The enum is `#[non_exhaustive]`: a later level widens it in a minor
+/// release, so out-of-crate consumers match with a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ThinkingEffort {
+    /// The smallest thinking allocation the ladder offers.
+    ///
+    /// Maps to OpenAI `"low"`, an Anthropic `budget_tokens` of
+    /// `2048`, and a Gemini `thinkingBudget` of `1024` — enough for a
+    /// model to check itself without spending a long deliberation.
+    Low,
+
+    /// The balanced middle of the ladder.
+    ///
+    /// Maps to OpenAI `"medium"`, an Anthropic `budget_tokens` of
+    /// `8192`, and a Gemini `thinkingBudget` of `8192` — the default
+    /// register a host reaches for when a task benefits from visible
+    /// reasoning without dominating latency.
+    Medium,
+
+    /// A generous thinking allocation.
+    ///
+    /// Maps to OpenAI `"high"`, an Anthropic `budget_tokens` of
+    /// `16384`, and a Gemini `thinkingBudget` of `16384` — for hard
+    /// tasks where the model's deliberation is the point of the
+    /// request.
+    High,
+
+    /// The ladder's top step, clamped where a provider has no higher
+    /// setting.
+    ///
+    /// OpenAI's `reasoning_effort` stops at `"high"`, so the level
+    /// clamps there; Anthropic budgets `32768` tokens and Gemini
+    /// `24576`. Providers may also cap below a model's ceiling — the
+    /// wire value is always the table's, never invented per model.
+    Max,
 }
 
 impl RequestOptions {
@@ -344,6 +433,19 @@ impl RequestOptions {
             return self;
         }
         self.model = Some(model);
+        self
+    }
+
+    /// Set the thinking effort, builder-style.
+    ///
+    /// When set, the provider maps the level onto its native thinking
+    /// parameter (see [`ThinkingEffort`]'s table). When left `None`
+    /// (the default), the serving client decides: its own effort
+    /// default applies when one is configured, and the parameter is
+    /// omitted otherwise — `None` is inheritance, not off.
+    #[must_use]
+    pub fn with_effort(mut self, effort: ThinkingEffort) -> Self {
+        self.effort = Some(effort);
         self
     }
 

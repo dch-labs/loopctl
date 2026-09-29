@@ -14,6 +14,12 @@
 //! (compaction, loop-detection hashing, turn counting) are unaffected,
 //! and a redacted output is still a successful tool result.
 //!
+//! The entropy heuristic measures maximal runs of token characters;
+//! path-shaped runs are measured per segment, so word-like structure
+//! passes while a dense segment still masks —
+//! [`SecretPatternSet::scrub`] states the exact rule, and
+//! [`SecretPatternSet::with_entropy_heuristic`] toggles the lane.
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -44,8 +50,51 @@ const BEARER: &str = r#"(?i)authorization:\s*bearer\s+[A-Za-z0-9\-._~+/=]+"#;
 ///
 /// Covers `.env` dumps and config prints: the key with `_`/`-`
 /// separators, either `=` or `:` as the separator, and an optionally
-/// quoted value of at least 16 alphanumerics.
-const API_KEY_KV: &str = r#"(?i)(?:api[_-]?key|token|secret)\s*[=:]\s*["']?[A-Za-z0-9]{16,}["']?"#;
+/// quoted value of at least 16 alphanumerics, captured as the `value`
+/// group. A leading `decl` group (see [`is_code_declaration`]) marks
+/// variable declarations — `let token = "…"`, `const secret: Type =
+/// …`, and compound names (`let entropy_token = …`, `let client_secret
+/// = …`) where the key sits anywhere inside the declared identifier.
+/// The declaration keywords cover Rust (`let`/`const`/`static`/`fn`),
+/// `JavaScript` and `TypeScript` (`let`/`const`/`var`/`function`),
+/// Python (`def`), and `final` in its adjacent-name shapes;
+/// type-prefixed declarations (Java, C, Go) are not covered. The `[^=\n]{0,48}`
+/// tolerance spans the optional type annotation — a declaration whose
+/// annotation plus spacing exceeds 48 characters matches neither arm,
+/// and its value then leans on the entropy heuristic alone.
+///
+/// A declaration passes through verbatim when its initializer is a
+/// bare identifier-shaped token — strict `UpperCamel` humps or a
+/// uniformly lowercase letters-only word (`let token =
+/// SecureHandle::new();`, or the annotation itself standing in as
+/// the matched value) — or its
+/// quoted value carries a placeholder marker ([`PLACEHOLDER_MARKERS`]); any other
+/// value — quoted or bare — masks in place through the `value`
+/// group, keeping the statement's syntax intact. `export` is
+/// deliberately not a declaration keyword:
+/// `export TOKEN="…"` is the env-dump shape and must keep firing, and
+/// the plain arm keeps matching keys inside compound dump names
+/// (`OPENAI_API_KEY=…`) — the underscore env convention — because no
+/// declaration keyword precedes them.
+const API_KEY_KV: &str = r#"(?i)(?:(?P<decl>\b(?:let|const|var|static|final|fn|def|function)(?:\s+mut)?\s+[A-Za-z0-9_]*(?:api[_-]?key|token|secret)[A-Za-z0-9_]*\b[^=\n]{0,48})|(?:api[_-]?key|token|secret))\s*[=:]\s*(?P<value>["']?[A-Za-z0-9]{16,}["']?)"#;
+
+/// Marker words that mark a quoted declaration value as documentation.
+///
+/// A quoted value containing any of these substrings (compared
+/// case-insensitively) passes through verbatim inside a declaration —
+/// the shape fixtures and examples spell (`placeholder0123456789`,
+/// `yourexamplekey…`) — while a dense literal (`J8kL2mN4pQ…`) carries
+/// none of them and masks in place.
+const PLACEHOLDER_MARKERS: [&str; 8] = [
+    "placeholder",
+    "example",
+    "sample",
+    "dummy",
+    "changeme",
+    "your",
+    "xxxx",
+    "redacted",
+];
 
 /// Matches AWS access-key IDs (`AKIA`, `ASIA`, `AGPA` prefixes).
 ///
@@ -180,8 +229,13 @@ impl SecretPatternSet {
     /// Toggle the high-entropy heuristic. Returns `self` for chaining.
     ///
     /// With the heuristic off, only the explicit patterns (curated plus
-    /// host-added) scrub — zero false positives from novel-token
+    /// host-added) scrub — zero false positives from novel-run
     /// detection, at the cost of missing formats no literal covers.
+    /// With it on, dense runs of at least 32 token characters are
+    /// masked, except inside path-shaped runs (two or more `/`
+    /// separators carrying at least two word-like segments), where
+    /// each segment is measured on its own and only the dense
+    /// segments mask.
     #[must_use]
     pub fn with_entropy_heuristic(mut self, enabled: bool) -> Self {
         self.entropy_heuristic = enabled;
@@ -192,20 +246,41 @@ impl SecretPatternSet {
     /// `[REDACTED:<kind>]` placeholder.
     ///
     /// Returns the count of redactions made, for observability (a
-    /// host can log it). Explicit patterns run first; when the entropy
-    /// heuristic is enabled, any remaining token of at least 32
-    /// characters whose byte entropy reaches 4.5 bits per byte becomes
-    /// `[REDACTED:high_entropy]`.
+    /// host can log it). Explicit patterns run first; a match whose
+    /// pattern carries a participating `decl` capture group is a
+    /// variable declaration, which shares the key-value shape with a
+    /// credential dump but is code: it passes through verbatim when
+    /// its initializer is a bare identifier-shaped token (a strict
+    /// `UpperCamel` type reference or a uniformly lowercase
+    /// letters-only word) or its quoted value names itself a
+    /// placeholder, and otherwise masks only the value, leaving the
+    /// statement's syntax intact. When the entropy heuristic is
+    /// enabled, any remaining run of at least 32 token characters
+    /// whose byte entropy reaches 4.5 bits per byte becomes
+    /// `[REDACTED:high_entropy]` — except that a path-shaped run (two
+    /// or more `/` separators carrying at least two word-like
+    /// lowercase-letter segments) is measured per segment: each
+    /// `/`-segment that alone clears both gates masks, while the
+    /// separators and word-like segments survive, so a dense segment
+    /// cannot hide behind the path exemption.
     pub fn scrub(&self, text: &mut String) -> usize {
         let mut rewritten = std::mem::take(text);
         let mut count = 0usize;
         for pattern in &self.patterns {
-            let hits = pattern.pattern.find_iter(&rewritten).count();
+            let hits = pattern
+                .pattern
+                .captures_iter(&rewritten)
+                .filter(|caps| {
+                    !matches!(declaration_rewrite(caps), DeclarationRewrite::PassThrough)
+                })
+                .count();
             if hits > 0 {
                 let placeholder = format!("[REDACTED:{}]", pattern.kind);
                 rewritten = pattern
                     .pattern
-                    .replace_all(&rewritten, placeholder.as_str())
+                    .replace_all(&rewritten, |caps: &regex::Captures<'_>| {
+                        rewrite_match(caps, &placeholder)
+                    })
                     .into_owned();
             }
             count = count.saturating_add(hits);
@@ -216,6 +291,214 @@ impl SecretPatternSet {
         *text = rewritten;
         count
     }
+}
+
+/// How one pattern match is rewritten by [`SecretPatternSet::scrub`].
+///
+/// A credential dump replaces the whole match; a declaration either
+/// passes through or masks only its value substring, per
+/// [`declaration_rewrite`].
+enum DeclarationRewrite {
+    /// The whole match is a dump — replace it with the placeholder.
+    ///
+    /// Nothing of the match survives, not even the key: a dump is
+    /// configuration or environment text, not code a reader needs.
+    Dump,
+
+    /// The match is a declaration with a benign value — keep it
+    /// verbatim.
+    PassThrough,
+
+    /// The match is a declaration with a secret-shaped value — mask
+    /// the value substring, keeping the declaration syntax.
+    MaskValue,
+}
+
+/// Decide one match's disposition under [`SecretPatternSet::scrub`].
+///
+/// A match without a participating `decl` group is a dump; a
+/// declaration masks its value only when the value is quoted and
+/// carries no placeholder marker.
+fn declaration_rewrite(caps: &regex::Captures<'_>) -> DeclarationRewrite {
+    if !is_code_declaration(caps) {
+        return DeclarationRewrite::Dump;
+    }
+    if declaration_value_is_masked(caps) {
+        DeclarationRewrite::MaskValue
+    } else {
+        DeclarationRewrite::PassThrough
+    }
+}
+
+/// Render one match's replacement under its pattern's `placeholder`.
+///
+/// Consults [`declaration_rewrite`] for the disposition and renders
+/// it — the placeholder for a dump, the untouched match for a benign
+/// declaration, the value-masked splice otherwise.
+fn rewrite_match(caps: &regex::Captures<'_>, placeholder: &str) -> String {
+    match declaration_rewrite(caps) {
+        DeclarationRewrite::Dump => placeholder.to_string(),
+        DeclarationRewrite::PassThrough => caps
+            .get(0)
+            .map_or_else(String::new, |whole| whole.as_str().to_owned()),
+        DeclarationRewrite::MaskValue => masked_replacement(caps, placeholder),
+    }
+}
+
+/// Whether a declaration match's value must be masked in place.
+///
+/// A quoted literal masks unless it names itself a placeholder
+/// ([`PLACEHOLDER_MARKERS`]); a bare initializer masks unless it
+/// reads as an identifier ([`value_is_identifier_shaped`]) — strict
+/// `UpperCamel` humps or a uniformly lowercase letters-only word are
+/// code, while a lowercase letter followed anywhere by an uppercase,
+/// a camel look-alike whose humps never reach two letters, or a
+/// lowercase token carrying a digit (hex and base36 material), is
+/// credential material.
+fn declaration_value_is_masked(caps: &regex::Captures<'_>) -> bool {
+    caps.name("value").is_some_and(|value| {
+        let text = value.as_str();
+        let bare = text.trim_matches(['"', '\'']);
+        if text.starts_with('"') || text.starts_with('\'') {
+            !looks_like_placeholder(bare)
+        } else {
+            !value_is_identifier_shaped(bare)
+        }
+    })
+}
+
+/// Whether a bare initializer token reads as an identifier, not a
+/// secret.
+///
+/// Structural, not statistical: a token is code when it is uniformly
+/// lowercase letters (a word-led identifier) or strict `UpperCamel`
+/// — every maximal lowercase run spans at least two letters
+/// (`SecretStoreHandle012345`). Anything else is credential
+/// material: a lowercase letter followed anywhere by an uppercase
+/// (`dGhpc0lz…`, real base64), a camel look-alike whose humps never
+/// reach two letters (`Ab3dEf5g…`), a lone lowercase letter that a
+/// digit terminates (`At8` — chance camel by digit resets), a
+/// digit-led token, and a lowercase token carrying any digit — hex
+/// and base36 material, disqualified the same way a path word
+/// segment is ([`is_dictionary_segment`]). One chance band remains
+/// and is disclosed rather than claimed away: a strict-camel token,
+/// measured at roughly 0.9% of random 24-character values, an order
+/// of magnitude lower at 44; the uniformly lowercase band is by
+/// design — a word-led identifier, letters only — and uniform-random
+/// credential material essentially never lands in it, because it
+/// carries digits.
+fn value_is_identifier_shaped(bare: &str) -> bool {
+    is_uniformly_lowercase(bare) || is_strict_upper_camel(bare)
+}
+
+/// Whether a bare initializer token is a word-led lowercase
+/// identifier.
+///
+/// A lowercase letter first and only lowercase letters after — the
+/// shape single-word identifiers take (`defaultconfiguration`). A
+/// digit disqualifies the token exactly as it disqualifies a path
+/// segment in [`is_dictionary_segment`]: uniform-random credential
+/// material — hex and base36 keys — mixes digits into lowercase,
+/// while a word-led identifier is letters only. A token carrying any
+/// uppercase fails here and must answer to [`is_strict_upper_camel`]
+/// instead.
+fn is_uniformly_lowercase(token: &str) -> bool {
+    let mut chars = token.chars();
+    chars.next().is_some_and(|first| first.is_ascii_lowercase())
+        && chars.all(|ch| ch.is_ascii_lowercase())
+}
+
+/// Whether a bare initializer token is strict `UpperCamel` code.
+///
+/// Uppercase-led, with every maximal run of lowercase letters
+/// spanning at least two characters (`Secret`, `Store`, `Handle`);
+/// a digit ends a run exactly like an uppercase letter does, so an
+/// isolated lowercase letter (`At8`, the `d` of `Ed25519PrivateKey`)
+/// is credential material even when a digit follows it — the
+/// digit-absorbed lone letter was this lane's likeliest chance pass
+/// band. A chance band remains and is disclosed: an uppercase-led
+/// token whose lowercase runs all span two or more letters measures
+/// at roughly 0.9% of random 24-character values, an order of
+/// magnitude lower at 44.
+fn is_strict_upper_camel(token: &str) -> bool {
+    if !token.starts_with(|ch: char| ch.is_ascii_uppercase()) {
+        return false;
+    }
+    let mut run = 0usize;
+    for ch in token.chars() {
+        if ch.is_ascii_lowercase() {
+            run = run.saturating_add(1);
+        } else {
+            if run == 1 {
+                return false;
+            }
+            run = 0;
+        }
+    }
+    run != 1
+}
+
+/// Whether `value` names itself a placeholder rather than a secret.
+///
+/// Case-insensitive, so `PlaceHolder0123` qualifies exactly like its
+/// lowercase spelling.
+fn looks_like_placeholder(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    PLACEHOLDER_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+/// The whole match with only its `value` group masked.
+///
+/// The value's own quote characters survive, so the statement still
+/// parses; only the secret literal is gone.
+fn masked_replacement(caps: &regex::Captures<'_>, placeholder: &str) -> String {
+    let Some((whole, value)) = caps.get(0).zip(caps.name("value")) else {
+        return String::new();
+    };
+    let start = value.start().saturating_sub(whole.start());
+    let end = value.end().saturating_sub(whole.start());
+    let source = whole.as_str();
+    [
+        source.get(..start).map_or_else(String::new, str::to_string),
+        quote_preserving_mask(value.as_str(), placeholder),
+        source.get(end..).map_or_else(String::new, str::to_string),
+    ]
+    .concat()
+}
+
+/// The value span's replacement: the placeholder wrapped in whichever
+/// quote characters the value itself carried.
+///
+/// An opening quote without a closing one (or the reverse) keeps
+/// exactly the quotes that were there — masking never invents syntax.
+fn quote_preserving_mask(value: &str, placeholder: &str) -> String {
+    let opening = value.chars().next().filter(|ch| matches!(ch, '"' | '\''));
+    let closing = value.chars().last().filter(|ch| matches!(ch, '"' | '\''));
+    let mut masked = String::with_capacity(placeholder.len().saturating_add(2));
+    if let Some(ch) = opening {
+        masked.push(ch);
+    }
+    masked.push_str(placeholder);
+    if let Some(ch) = closing {
+        masked.push(ch);
+    }
+    masked
+}
+
+/// Whether `caps` marks a code declaration rather than a credential
+/// dump.
+///
+/// A pattern opts in by naming its declaration arm `decl`; for every
+/// pattern without such a group — all host patterns and every other
+/// curated shape — the group never participates and this returns
+/// `false`, so the declaration pass-through is inert for them. Within
+/// a declaration, a `value` group is consulted for in-place masking
+/// (see [`declaration_value_is_masked`]); a declaration match without
+/// one passes through verbatim.
+fn is_code_declaration(caps: &regex::Captures<'_>) -> bool {
+    caps.name("decl").is_some()
 }
 
 /// Compile one curated literal, returning `None` if it fails to compile.
@@ -232,44 +515,158 @@ fn curated(kind: &'static str, literal: &'static str) -> Option<SecretPattern> {
 /// Redact high-entropy tokens no explicit pattern matched.
 ///
 /// Splits on whitespace — spaces, tabs, carriage returns, newlines —
-/// preserving every separator, and replaces any resulting core of
+/// preserving every separator, and within each piece measures the
+/// maximal runs of token characters, replacing any run of
 /// [`MIN_ENTROPY_TOKEN_LEN`] or more characters whose Shannon entropy
-/// reaches [`ENTROPY_THRESHOLD`]. Whitespace bounding is the contract:
+/// reaches [`ENTROPY_THRESHOLD`], unless the run is path-shaped
+/// ([`run_is_path_shaped`]). Whitespace bounding is the contract:
 /// a credential never spans a newline, while space-free multi-line
 /// tool output (a piped `ls` listing, CRLF logs) must not merge into
-/// one giant candidate. Returns the number of tokens redacted.
+/// one giant candidate. Run bounding is the same contract one level
+/// down: a credential never carries dots, colons, brackets, or
+/// variable interpolation, while shell lines, paths, URLs, and JSON
+/// literals are built from exactly those. Returns the number of runs
+/// redacted.
 fn scrub_high_entropy(text: &mut String) -> usize {
     let mut count = 0usize;
     let mut out = String::new();
-    for (piece, changed) in std::mem::take(text)
+    for (piece, redacted) in std::mem::take(text)
         .split_inclusive(char::is_whitespace)
         .map(redact_piece_if_high_entropy)
     {
-        if changed {
-            count = count.saturating_add(1);
-        }
+        count = count.saturating_add(redacted);
         out.push_str(&piece);
     }
     *text = out;
     count
 }
 
-/// Redact the token core of one whitespace-delimited piece, if it
-/// qualifies.
+/// Redact the qualifying token runs of one whitespace-delimited piece.
 ///
-/// A piece is a token plus its trailing separator run; the edge trim
-/// below strips the separator (and any quotes or brackets) so only the
-/// interior core is measured. Returns the (possibly rewritten) piece
-/// and whether a substitution happened — the flag, not marker
-/// sniffing, is what counts, so a piece already carrying a placeholder
-/// (an echoed earlier redaction) is passed through without being
-/// counted again.
-fn redact_piece_if_high_entropy(piece: &str) -> (String, bool) {
-    let core = piece.trim_matches(|c: char| !is_token_char(c));
-    if core.len() < MIN_ENTROPY_TOKEN_LEN || shannon_entropy(core) < ENTROPY_THRESHOLD {
-        return (piece.to_string(), false);
+/// A piece is one or more maximal runs of token characters separated
+/// by non-token punctuation; each run is measured on its own, because
+/// a credential is a dense run of credential-alphabet characters —
+/// never a dotted, bracketed, or interpolated structure. Returns the
+/// (possibly rewritten) piece and how many of its runs were
+/// substituted — the count, not marker sniffing, is what tallies, so
+/// an echoed placeholder's own runs (`REDACTED`, `high_entropy`) are
+/// both far below the length gate and never counted again.
+fn redact_piece_if_high_entropy(piece: &str) -> (String, usize) {
+    let mut out = String::new();
+    let mut run = String::new();
+    let mut count = 0usize;
+    for ch in piece.chars() {
+        if is_token_char(ch) {
+            run.push(ch);
+        } else {
+            flush_run(&mut run, &mut out, &mut count);
+            out.push(ch);
+        }
     }
-    (piece.replace(core, "[REDACTED:high_entropy]"), true)
+    flush_run(&mut run, &mut out, &mut count);
+    (out, count)
+}
+
+/// Append `run`'s disposition to `out` and reset it.
+///
+/// A run under the length gate is appended verbatim before any
+/// allocation — nearly every scrubbed word lands here. A longer
+/// path-shaped run is measured per segment (see
+/// [`redact_dense_path_segments`]); any other long run that clears
+/// the entropy gate becomes the placeholder. `count` advances only
+/// on a substitution.
+fn flush_run(run: &mut String, out: &mut String, count: &mut usize) {
+    if run.len() < MIN_ENTROPY_TOKEN_LEN {
+        out.push_str(run);
+    } else if run_is_path_shaped(run) {
+        redact_dense_path_segments(run.as_str(), out, count);
+    } else if shannon_entropy(run) >= ENTROPY_THRESHOLD {
+        out.push_str("[REDACTED:high_entropy]");
+        *count = count.saturating_add(1);
+    } else {
+        out.push_str(run);
+    }
+    run.clear();
+}
+
+/// Redact the dense segments of one path-shaped run into `out`.
+///
+/// Each `/`-segment faces the length gate before anything else and
+/// then the entropy gate — no path guard, because a single segment
+/// has no slashes: a segment that alone clears both masks to the
+/// placeholder while the separators and the word-like segments
+/// survive, so a secret riding at the end of a path-shaped run
+/// (`…/tokens/<secret>`) no longer passes unmeasured. A segment that
+/// is cargo's own `<crate>-<16-hex>` artifact tail under a
+/// `deps`/`build`/`.cargo` parent ([`is_build_artifact_tail`])
+/// passes however long the crate name — hash-dependent entropy must
+/// not decide whether ordinary `cargo test` output redacts.
+fn redact_dense_path_segments(run: &str, out: &mut String, count: &mut usize) {
+    let mut parent = "";
+    for piece in run.split_inclusive('/') {
+        let segment = piece.strip_suffix('/').unwrap_or(piece);
+        if segment.len() >= MIN_ENTROPY_TOKEN_LEN
+            && shannon_entropy(segment) >= ENTROPY_THRESHOLD
+            && !is_build_artifact_tail(segment, parent)
+        {
+            out.push_str("[REDACTED:high_entropy]");
+            if piece.len() > segment.len() {
+                out.push('/');
+            }
+            *count = count.saturating_add(1);
+        } else {
+            out.push_str(piece);
+        }
+        if !segment.is_empty() {
+            parent = segment;
+        }
+    }
+}
+
+/// Whether `segment` is cargo's `<crate>-<16-hex>` artifact tail
+/// under one of cargo's own directories.
+///
+/// A trailing segment that splits on its last `-` into a non-empty
+/// prefix and exactly sixteen hex characters — the shape cargo gives
+/// every test binary and build artifact — riding directly after a
+/// `deps`, `build`, or `.cargo` parent is a path component, not a
+/// credential: a long crate name pushes it past the length gate, and
+/// a hash that clears the entropy threshold must not redact ordinary
+/// build output. Any other parent keeps the segment measured, so a
+/// secret that merely looks like an artifact still masks.
+fn is_build_artifact_tail(segment: &str, parent: &str) -> bool {
+    matches!(parent, "deps" | "build" | ".cargo")
+        && segment.rsplit_once('-').is_some_and(|(prefix, tail)| {
+            !prefix.is_empty() && tail.len() == 16 && tail.chars().all(|ch| ch.is_ascii_hexdigit())
+        })
+}
+
+/// Whether `run` is a slash-separated path, not a credential.
+///
+/// Two or more `/` separators with at least two word segments (see
+/// [`is_dictionary_segment`]) — `target/debug/deps/…` — is how build
+/// systems, repositories, and shells spell locations. A random base64
+/// run may carry slashes, but its slash-segments are mixed-case or
+/// digit-bearing noise rather than words, so a slash-bearing secret
+/// stays measured.
+fn run_is_path_shaped(run: &str) -> bool {
+    let segments: Vec<&str> = run.split('/').collect();
+    segments.len() >= 3
+        && segments
+            .iter()
+            .filter(|segment| is_dictionary_segment(segment))
+            .count()
+            >= 2
+}
+
+/// Whether `segment` reads as a word, not random material.
+///
+/// Four or more ASCII lowercase letters — digits disqualify the
+/// segment — the shape dictionary words, crate names, and directory
+/// names take, and a uniform-random credential segment almost never
+/// does.
+fn is_dictionary_segment(segment: &str) -> bool {
+    segment.len() >= 4 && segment.chars().all(|ch| ch.is_ascii_lowercase())
 }
 
 /// Whether `c` appears in the token alphabet the heuristic scans.

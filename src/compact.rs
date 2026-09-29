@@ -172,10 +172,10 @@ impl TokenCounter for HeuristicTokenCounter {
 /// Render one message's content to the character count every token
 /// counter estimates over.
 ///
-/// Text parts count their `char`s, image parts a flat 256 (the
-/// vision-token ballpark), tool calls their name plus the JSON-rendered
-/// input, tool results their text or multipart content. Both
-/// [`HeuristicTokenCounter`] and [`RatioTokenCounter`] share this
+/// Text and thinking parts count their `char`s, image parts a flat 256
+/// (the vision-token ballpark), tool calls their name plus the
+/// JSON-rendered input, tool results their text or multipart content.
+/// Both [`HeuristicTokenCounter`] and [`RatioTokenCounter`] share this
 /// rendering so the counters cannot drift in *what* they count — only
 /// in how they divide it.
 fn rendered_message_chars(message: &Message) -> u64 {
@@ -183,7 +183,9 @@ fn rendered_message_chars(message: &Message) -> u64 {
         .parts
         .iter()
         .map(|p| match p {
-            MessagePart::Text { text } => text.chars().count() as u64,
+            MessagePart::Text { text } | MessagePart::Thinking { text, .. } => {
+                text.chars().count() as u64
+            }
             MessagePart::Image { .. } => 256,
             MessagePart::ToolCall { name, input, .. } => (name.chars().count() as u64)
                 .saturating_add(input.to_string().chars().count() as u64),
@@ -1265,6 +1267,33 @@ mod tests {
         );
         assert_eq!(local.chars_den, 10);
         assert_eq!(local.per_message, 4);
+    }
+
+    #[test]
+    fn thinking_text_counts_like_text_in_both_counters() {
+        let as_text = vec![Message::new(
+            Role::Assistant,
+            vec![MessagePart::text("weighed two options, then answered")],
+        )];
+        let as_thinking = vec![Message::new(
+            Role::Assistant,
+            vec![MessagePart::Thinking {
+                text: "weighed two options, then answered".to_string(),
+                signature: None,
+                redacted: None,
+            }],
+        )];
+        assert_eq!(
+            HeuristicTokenCounter.count(&as_text),
+            HeuristicTokenCounter.count(&as_thinking),
+            "the heuristic counter counts a thinking part's text like a text part's"
+        );
+        let counter = RatioTokenCounter::new(4.0, 4);
+        assert_eq!(
+            counter.count(&as_text),
+            counter.count(&as_thinking),
+            "the ratio counter shares the rendering, so it counts thinking text like text too"
+        );
     }
 
     #[test]

@@ -103,6 +103,26 @@ pub struct AnthropicClient {
     /// Anthropic requires this field on every request. Defaults to 8192.
     /// Set via [`AnthropicClientBuilder::max_tokens`].
     max_tokens: u32,
+
+    /// The client-level thinking-effort default.
+    ///
+    /// `None` (the default) sends no `thinking` block; when set, every
+    /// request carries the level's `budget_tokens` (per
+    /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table)
+    /// unless the request carries its own
+    /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort).
+    /// Set via [`AnthropicClientBuilder::thinking_effort`].
+    thinking_effort: Option<crate::structured::ThinkingEffort>,
+
+    /// Whether prior-turn reasoning is replayed on outgoing requests.
+    ///
+    /// Off by default: requests are byte-identical to a client that
+    /// never saw reasoning. When on, each history
+    /// [`MessagePart::Thinking`] renders as its own capped
+    /// `<thinking>` text block ahead of the turn's other content, in
+    /// part order — wire-legal on every Messages-compatible endpoint,
+    /// unlike an unsigned native thinking block.
+    replay_reasoning: bool,
 }
 
 impl AnthropicClient {
@@ -213,10 +233,11 @@ impl AnthropicClient {
     ///
     /// Anthropic's native response already carries a `content` array of typed
     /// blocks, so this reads them directly into [`MessagePart`]s: `text` blocks
-    /// become [`MessagePart::Text`] parts and `tool_use` blocks become
-    /// [`MessagePart::ToolCall`] parts, preserving their original order. Other
-    /// block types (`thinking`, `redacted_thinking`) are skipped — reasoning is
-    /// stream-only in this crate and is not accumulated into the message.
+    /// become [`MessagePart::Text`] parts, `tool_use` blocks become
+    /// [`MessagePart::ToolCall`] parts, and `thinking` / `redacted_thinking`
+    /// blocks become [`MessagePart::Thinking`] parts carrying their signature
+    /// or opaque payload, preserving their original order — a continuation
+    /// under extended thinking must return those blocks verbatim.
     /// Maps `stop_reason` via [`StreamStopReason::from_api_str`] (Anthropic
     /// reports tool invocations as `"tool_use"`, aliased to `ToolCall`),
     /// defaulting to `EndTurn` on an unrecognized or missing value. Reads
@@ -230,6 +251,26 @@ impl AnthropicClient {
                     Some("text") => {
                         if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                             parts.push(MessagePart::text(text));
+                        }
+                    }
+                    Some("thinking") => {
+                        let text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                        let signature = block.get("signature").and_then(|s| s.as_str());
+                        if !text.is_empty() || signature.is_some() {
+                            parts.push(MessagePart::Thinking {
+                                text: text.to_string(),
+                                signature: signature.map(str::to_string),
+                                redacted: None,
+                            });
+                        }
+                    }
+                    Some("redacted_thinking") => {
+                        if let Some(data) = block.get("data").and_then(|d| d.as_str()) {
+                            parts.push(MessagePart::Thinking {
+                                text: String::new(),
+                                signature: None,
+                                redacted: Some(data.to_string()),
+                            });
                         }
                     }
                     Some("tool_use") => {
@@ -338,6 +379,12 @@ impl ApiClient for AnthropicClient {
                 Err(strict_unsupported_error("Anthropic"))
             }));
         }
+        let effort = options.effort.or(self.thinking_effort);
+        if options.response_format.is_some() && effort.is_some() {
+            return Box::pin(futures::stream::once(async move {
+                Err(effort_tool_choice_conflict_error())
+            }));
+        }
         let system = request.system.clone();
         let tools = request.tools.clone();
         let model = options
@@ -356,6 +403,8 @@ impl ApiClient for AnthropicClient {
             },
             true,
             self.max_tokens,
+            effort,
+            self.replay_reasoning,
         );
         let url = self.messages_url();
         let api_key = self.api_key.clone();
@@ -395,6 +444,10 @@ impl ApiClient for AnthropicClient {
         if options.response_format.as_ref().is_some_and(|rf| rf.strict) {
             return Box::pin(async move { Err(strict_unsupported_error("Anthropic")) });
         }
+        let effort = options.effort.or(self.thinking_effort);
+        if options.response_format.is_some() && effort.is_some() {
+            return Box::pin(async move { Err(effort_tool_choice_conflict_error()) });
+        }
         let system = request.system.clone();
         let tools = request.tools.clone();
         let model = options
@@ -413,6 +466,8 @@ impl ApiClient for AnthropicClient {
             },
             false,
             self.max_tokens,
+            effort,
+            self.replay_reasoning,
         );
         let url = self.messages_url();
         Box::pin(async move {
@@ -455,6 +510,21 @@ pub struct AnthropicClientBuilder {
     /// Anthropic requires this field on every request. Defaults to 8192.
     max_tokens: u32,
 
+    /// The client-level thinking-effort default.
+    ///
+    /// `None` (the default) sends no `thinking` block. When set, every
+    /// request carries the level's `budget_tokens` and a `max_tokens`
+    /// raised to fit it (see
+    /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table).
+    /// Read by [`build`](Self::build) and stored on [`AnthropicClient`].
+    thinking_effort: Option<crate::structured::ThinkingEffort>,
+
+    /// Whether prior-turn reasoning is replayed on outgoing requests.
+    ///
+    /// Set via [`AnthropicClientBuilder::replay_reasoning`]; see the
+    /// client field's docs for the wire shape.
+    replay_reasoning: bool,
+
     /// Shared HTTP client configuration (timeouts, pool, TCP).
     ///
     /// Holds the timeout, connection-pool, and TCP knobs that apply to the
@@ -477,6 +547,8 @@ impl Default for AnthropicClientBuilder {
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            thinking_effort: None,
+            replay_reasoning: false,
             http: super::HttpClientConfig::default(),
             seed: super::ProfileSeed::default(),
         }
@@ -549,6 +621,48 @@ impl AnthropicClientBuilder {
     #[must_use]
     pub fn with_max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = tokens;
+        self
+    }
+
+    /// Set the client-level thinking-effort default.
+    ///
+    /// Every request then carries a `thinking` block with the level's
+    /// `budget_tokens` (per
+    /// [`ThinkingEffort`](crate::structured::ThinkingEffort)'s table),
+    /// and a `max_tokens` below `budget_tokens + 1` rises to fit the
+    /// budget. A per-request
+    /// [`RequestOptions::effort`](crate::structured::RequestOptions::effort)
+    /// always wins; an unset client default leaves unconfigured requests
+    /// byte-identical to prior versions. A
+    /// [`response_format`](crate::structured::RequestOptions::response_format)
+    /// request under a default set here is rejected up front — extended
+    /// thinking cannot combine with the forced tool choice a response
+    /// format synthesizes — so configure effort per request when both
+    /// are needed on other calls. Extended thinking also demands the
+    /// assistant's original signed thinking blocks on continuations: a
+    /// history whose tool-use message carries an unsigned thinking part
+    /// (recorded before this version, cross-provider, or hand-built)
+    /// still sends `tool_use` alone, which the Messages API rejects —
+    /// clear the effort for such histories or re-record them against
+    /// this version, whose response path captures signatures.
+    #[must_use]
+    pub fn thinking_effort(mut self, effort: crate::structured::ThinkingEffort) -> Self {
+        self.thinking_effort = Some(effort);
+        self
+    }
+
+    /// Replay prior-turn reasoning on outgoing requests.
+    ///
+    /// Off by default. When enabled, each history
+    /// [`MessagePart::Thinking`] renders as its own capped
+    /// `<thinking>` text block ahead of the turn's other content, in
+    /// part order, so reasoning-capable models keep their working
+    /// memory across turns. The blocks are plain text — every
+    /// Messages-compatible endpoint accepts them, including gateways
+    /// that reject unsigned native thinking blocks.
+    #[must_use]
+    pub fn replay_reasoning(mut self, enabled: bool) -> Self {
+        self.replay_reasoning = enabled;
         self
     }
 
@@ -659,6 +773,8 @@ impl AnthropicClientBuilder {
             base_url: self.base_url,
             model: std::sync::Mutex::new(self.model),
             max_tokens: self.max_tokens,
+            thinking_effort: self.thinking_effort,
+            replay_reasoning: self.replay_reasoning,
         })
     }
 }
@@ -666,9 +782,9 @@ impl AnthropicClientBuilder {
 /// The per-request inputs to [`build_request_body`].
 ///
 /// Carries the request-shape knobs: the model, conversation, tools, and
-/// the structured-output / tool-call constraints. `stream` and `max_tokens`
-/// are passed separately because they are per-call / per-client rather
-/// than per-request-shape.
+/// the structured-output / tool-call constraints. `stream`, `max_tokens`,
+/// and the resolved thinking `effort` are passed separately because they
+/// are per-call / per-client rather than per-request-shape.
 struct RequestBodySpec<'a> {
     /// The model identifier sent as the top-level `model` field of the
     /// Messages API request body.
@@ -753,6 +869,22 @@ fn grammar_unsupported_error() -> ApiError {
     )
 }
 
+/// The error for a thinking-effort request the Messages API cannot
+/// combine with a forced tool choice.
+///
+/// Extended thinking requires `tool_choice: "auto"`, and a
+/// `response_format` synthesizes a forced tool choice — so a request
+/// carrying both would be rejected by the API with a 400 after leaving
+/// the client. Rejected up front instead, naming the effective effort
+/// (the request's own level or the client-level default it inherits).
+fn effort_tool_choice_conflict_error() -> ApiError {
+    ApiError::config_validation(
+        "the Anthropic Messages API rejects extended thinking combined \
+         with a forced tool choice; drop the effort (request-level or \
+         client default) or the response format",
+    )
+}
+
 /// The error for a `strict` request the Anthropic Messages API cannot
 /// express.
 ///
@@ -769,7 +901,9 @@ fn strict_unsupported_error(provider: &str) -> ApiError {
 /// Build the JSON request body for the Anthropic Messages API.
 ///
 /// Each [`Message`] is serialized via [`convert_message`], then assembled
-/// with the model, `max_tokens`, system prompt, and optional tools.
+/// with the model, `max_tokens`, system prompt, and optional tools. A set
+/// `effort` emits the `thinking` block with the level's `budget_tokens`
+/// and raises `max_tokens` for headroom (see [`anthropic_thinking_budget`]).
 ///
 /// Tool-call constraint:
 /// - When `response_format` is set, synthesizes a single forced tool
@@ -781,7 +915,18 @@ fn strict_unsupported_error(provider: &str) -> ApiError {
 /// - A `response_format` with `strict: true` never reaches this builder:
 ///   the `*_with_options` entry points reject it up front with
 ///   `ApiError::config_validation`.
-fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32) -> Value {
+fn build_request_body(
+    spec: &RequestBodySpec<'_>,
+    stream: bool,
+    max_tokens: u32,
+    effort: Option<crate::structured::ThinkingEffort>,
+    replay_reasoning: bool,
+) -> Value {
+    let budget = effort.map(anthropic_thinking_budget);
+    let max_tokens = match budget {
+        Some(budget) => max_tokens.max(budget.saturating_add(1)),
+        None => max_tokens,
+    };
     let RequestBodySpec {
         model,
         messages,
@@ -793,7 +938,10 @@ fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32)
 
     let tools = tools.filter(|t| !t.is_empty());
     let (non_system, effective_system) = super::fold_system_messages(messages, *system);
-    let msgs: Vec<Value> = non_system.iter().map(|m| convert_message(m)).collect();
+    let msgs: Vec<Value> = non_system
+        .iter()
+        .map(|m| convert_message(m, replay_reasoning, effort.is_some()))
+        .collect();
     let effective_system = effective_system.unwrap_or_default();
     let (tools_val, tool_choice) = if let Some(rf) = response_format {
         let forced_tool = serde_json::json!({
@@ -832,7 +980,52 @@ fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32)
         obj.insert("tool_choice".to_string(), choice);
     }
 
+    if let Some(budget) = budget
+        && let Some(obj) = body.as_object_mut()
+    {
+        obj.insert(
+            "thinking".to_string(),
+            serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            }),
+        );
+    }
+
     body
+}
+
+/// The Messages API `thinking.budget_tokens` for one effort level.
+///
+/// The fixed ladder from [`ThinkingEffort`]'s table: `Low` budgets `2048`
+/// tokens, `Medium` `8192`, `High` `16384`, and `Max` `32768`. Provider-
+/// native numbers, never invented per model.
+fn anthropic_thinking_budget(effort: crate::structured::ThinkingEffort) -> u32 {
+    match effort {
+        crate::structured::ThinkingEffort::Low => 2048,
+        crate::structured::ThinkingEffort::Medium => 8192,
+        crate::structured::ThinkingEffort::High => 16384,
+        crate::structured::ThinkingEffort::Max => 32768,
+    }
+}
+
+/// The wire form of one thinking part replayed natively.
+///
+/// Extended thinking signs each reasoning block, and the Messages API
+/// demands the original block — signature or redacted payload intact —
+/// ahead of `tool_use` on continuation requests, so a signed or
+/// redacted part is returned exactly as it arrived rather than
+/// rendered as plain text.
+fn native_thinking_block(text: &str, signature: Option<&str>, redacted: Option<&str>) -> Value {
+    if let Some(data) = redacted {
+        serde_json::json!({ "type": "redacted_thinking", "data": data })
+    } else {
+        serde_json::json!({
+            "type": "thinking",
+            "thinking": text,
+            "signature": signature.unwrap_or_default(),
+        })
+    }
 }
 
 /// Convert a single framework [`Message`] into the Anthropic JSON shape.
@@ -840,11 +1033,19 @@ fn build_request_body(spec: &RequestBodySpec<'_>, stream: bool, max_tokens: u32)
 /// - Messages with only a single text part use a plain string for `content`
 ///   (Anthropic's recommended optimization).
 /// - Messages with tool calls or tool results use the full `content` array.
-pub(super) fn convert_message(m: &Message) -> Value {
-    // System messages are folded into the top-level `system` field by
-    // `build_request_body` before this function is reached, so the `System`
-    // pattern below is defensive: if one ever reaches here, route it to `user`
-    // so the text renders rather than being dropped silently.
+/// - Thinking parts render as one capped `<thinking>` text block
+///   each, in part order, ahead of the other content when
+///   `replay_reasoning` is set — except that a signed or redacted
+///   part rides back natively while `thinking_enabled` (an effective
+///   thinking-effort level) is set, because Anthropic requires the
+///   original block ahead of tool use on continuation requests;
+///   image parts are skipped, as this wire carries no images in
+///   conversation history.
+pub(super) fn convert_message(
+    m: &Message,
+    replay_reasoning: bool,
+    thinking_enabled: bool,
+) -> Value {
     let role = match m.role {
         Role::User | Role::System => "user",
         Role::Assistant => "assistant",
@@ -853,10 +1054,29 @@ pub(super) fn convert_message(m: &Message) -> Value {
     let mut text_parts: Vec<&str> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
+    let mut thinking_blocks: Vec<Value> = Vec::new();
 
     for p in &m.parts {
         match p {
             MessagePart::Text { text } => text_parts.push(text.as_str()),
+            MessagePart::Thinking {
+                text,
+                signature,
+                redacted,
+            } if thinking_enabled && (signature.is_some() || redacted.is_some()) => {
+                thinking_blocks.push(native_thinking_block(
+                    text,
+                    signature.as_deref(),
+                    redacted.as_deref(),
+                ));
+            }
+            MessagePart::Thinking { text, .. } if replay_reasoning && !text.is_empty() => {
+                let tail = replay_reasoning_tail(text);
+                thinking_blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": format!("<thinking>\n{tail}\n</thinking>"),
+                }));
+            }
             MessagePart::ToolCall { id, name, input } => {
                 tool_calls.push(serde_json::json!({
                     "type": "tool_use",
@@ -883,36 +1103,58 @@ pub(super) fn convert_message(m: &Message) -> Value {
                 }
                 tool_results.push(block);
             }
-            MessagePart::Image { .. } => {}
+            MessagePart::Thinking { .. } | MessagePart::Image { .. } => {}
         }
     }
 
     let has_tool_content = !(tool_calls.is_empty() && tool_results.is_empty());
 
-    if !has_tool_content && text_parts.len() == 1 {
+    if !has_tool_content && text_parts.len() == 1 && !thinking_blocks.is_empty() {
+        let text = text_parts.first().copied().unwrap_or_default();
+        let mut blocks = thinking_blocks;
+        blocks.push(serde_json::json!({ "type": "text", "text": text }));
+        serde_json::json!({ "role": role, "content": blocks })
+    } else if !has_tool_content && text_parts.len() == 1 {
         // Single text — Anthropic allows plain string content.
         let text = text_parts.first().copied().unwrap_or_default();
         serde_json::json!({ "role": role, "content": text })
     } else if !has_tool_content {
         // Multiple text parts — array of text blocks.
-        let blocks: Vec<Value> = text_parts
-            .iter()
-            .map(|t| serde_json::json!({"type": "text", "text": t}))
-            .collect();
+        let mut blocks = thinking_blocks;
+        blocks.extend(
+            text_parts
+                .iter()
+                .map(|t| serde_json::json!({ "type": "text", "text": t })),
+        );
         serde_json::json!({ "role": role, "content": blocks })
     } else {
         // Mixed content — combine text + tool blocks in a single array.
-        let mut blocks: Vec<Value> = Vec::new();
-
+        let mut blocks = thinking_blocks;
         if !text_parts.is_empty() {
             let text = text_parts.join("");
-            blocks.push(serde_json::json!({"type": "text", "text": text}));
+            blocks.push(serde_json::json!({ "type": "text", "text": text }));
         }
         blocks.extend(tool_calls);
         blocks.extend(tool_results);
 
         serde_json::json!({ "role": role, "content": blocks })
     }
+}
+
+/// The replayable tail of a reasoning trace.
+///
+/// Conclusions arrive last, so an over-long trace keeps its tail and
+/// drops its head; the cap bounds a pathological turn's replay size
+/// without losing the part the next turn needs most.
+pub(super) fn replay_reasoning_tail(text: &str) -> String {
+    const MAX_REPLAY_REASONING_CHARS: usize = 32_768;
+    let count = text.chars().count();
+    if count <= MAX_REPLAY_REASONING_CHARS {
+        return text.to_string();
+    }
+    text.chars()
+        .skip(count.saturating_sub(MAX_REPLAY_REASONING_CHARS))
+        .collect()
 }
 
 /// Convert framework tool schemas into the Anthropic `tools` array shape.
@@ -1224,7 +1466,10 @@ impl StreamEmitter {
     /// until the deltas arrive), records the block's index as the current
     /// tool index, and increments the open-tool counter. For a `text`
     /// block, marks the text part open and emits a `PartStart` at the text
-    /// index. Other block types are ignored.
+    /// index. A `thinking` or `redacted_thinking` block opens the
+    /// thinking lane with a `PartStart`, and a redacted block's
+    /// `/content_block/data` payload rides the lane's first delta. Other
+    /// block types are ignored.
     ///
     /// [`MessagePart::ToolCall`]: crate::message::MessagePart::ToolCall
     fn on_block_start(&mut self, data: Option<Value>) {
@@ -1273,10 +1518,17 @@ impl StreamEmitter {
                 self.push(StreamEvent::PartStart(PartStart { index, part: None }));
 
                 if matches!(block_type, Some("redacted_thinking")) {
+                    let data = v
+                        .pointer("/content_block/data")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     self.push(StreamEvent::IndexedDelta(IndexedDelta {
                         index,
                         delta: DeltaPart::Thinking {
                             text: String::new(),
+                            signature: None,
+                            redacted: (!data.is_empty()).then_some(data),
                         },
                     }));
                 }
@@ -1293,7 +1545,12 @@ impl StreamEmitter {
     /// [`DeltaPart::InputJson`] at the current tool index carrying the
     /// `/delta/partial_json` fragment, so the caller can accumulate the
     /// full tool-call arguments across deltas. Empty fragments are
-    /// skipped. Other delta types are ignored.
+    /// skipped. A `thinking_delta` emits a
+    /// [`DeltaPart::Thinking`](crate::stream::DeltaPart::Thinking) text
+    /// fragment on the thinking lane, a `signature_delta` emits a
+    /// thinking delta carrying only the `/delta/signature`, and a
+    /// redacted block's payload arrives via its block start. Other delta
+    /// types are ignored.
     ///
     /// [`DeltaPart::Text`]: crate::stream::DeltaPart::Text
     /// [`DeltaPart::InputJson`]: crate::stream::DeltaPart::InputJson
@@ -1342,7 +1599,29 @@ impl StreamEmitter {
                     let thinking_index = self.thinking_index.unwrap_or(0);
                     self.push(StreamEvent::IndexedDelta(IndexedDelta {
                         index: thinking_index,
-                        delta: DeltaPart::Thinking { text },
+                        delta: DeltaPart::Thinking {
+                            text,
+                            signature: None,
+                            redacted: None,
+                        },
+                    }));
+                }
+            }
+            Some("signature_delta") => {
+                let signature = v
+                    .pointer("/delta/signature")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !signature.is_empty() {
+                    let thinking_index = self.thinking_index.unwrap_or(0);
+                    self.push(StreamEvent::IndexedDelta(IndexedDelta {
+                        index: thinking_index,
+                        delta: DeltaPart::Thinking {
+                            text: String::new(),
+                            signature: Some(signature),
+                            redacted: None,
+                        },
                     }));
                 }
             }
@@ -1642,6 +1921,332 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn effort_with_response_format_is_rejected_loudly() {
+        use crate::structured::{RequestOptions, ResponseFormat};
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url("http://localhost:1".to_string())
+            .build()
+            .unwrap();
+        let rf = ResponseFormat {
+            name: "out".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: false,
+        };
+        let err = client
+            .create_message_with_options(
+                &crate::api::StreamRequest::new(vec![]),
+                RequestOptions::default()
+                    .with_response_format(rf)
+                    .with_effort(crate::structured::ThinkingEffort::High),
+            )
+            .await
+            .expect_err("effort plus a forced tool_choice must fail fast, not be sent");
+        assert!(
+            err.to_string().contains("effort"),
+            "the error names the rejected combination: {err}"
+        );
+        assert_eq!(
+            err.code(),
+            crate::api::error::ErrorCode::ConfigValidationError,
+            "a semantic capability rejection classifies as a validation failure"
+        );
+
+        let mut stream = client.stream_messages_with_options(
+            &crate::api::StreamRequest::new(vec![]),
+            RequestOptions::default()
+                .with_response_format(ResponseFormat {
+                    name: "out".to_string(),
+                    schema: serde_json::json!({"type": "object"}),
+                    strict: false,
+                })
+                .with_effort(crate::structured::ThinkingEffort::High),
+        );
+        let stream_err = futures::StreamExt::next(&mut stream)
+            .await
+            .expect("the streaming rejection fires before any request is sent")
+            .expect_err("the streaming path must reject the same combination");
+        assert!(
+            stream_err.to_string().contains("effort"),
+            "the streaming error names the rejected combination: {stream_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_effort_default_under_a_response_format_is_rejected_loudly() {
+        use crate::structured::{RequestOptions, ResponseFormat};
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url("http://localhost:1".to_string())
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        let err = client
+            .create_message_with_options(
+                &crate::api::StreamRequest::new(vec![]),
+                RequestOptions::default().with_response_format(ResponseFormat {
+                    name: "out".to_string(),
+                    schema: serde_json::json!({"type": "object"}),
+                    strict: false,
+                }),
+            )
+            .await
+            .expect_err("a client-level effort default must not hide under a response format");
+        assert!(
+            err.to_string().contains("effort"),
+            "the error names the effective-effort rejection: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_effort_default_under_a_response_format_is_rejected_loudly_on_stream() {
+        use crate::structured::{RequestOptions, ResponseFormat};
+        use futures::StreamExt;
+        let client = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url("http://localhost:1".to_string())
+            .thinking_effort(crate::structured::ThinkingEffort::High)
+            .build()
+            .unwrap();
+        let mut stream = client.stream_messages_with_options(
+            &crate::api::StreamRequest::new(vec![]),
+            RequestOptions::default().with_response_format(ResponseFormat {
+                name: "out".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+                strict: false,
+            }),
+        );
+        let err = stream
+            .next()
+            .await
+            .expect("the streaming rejection fires before any request is sent")
+            .expect_err("a client-level effort default must not hide under a response format");
+        assert!(
+            err.to_string().contains("effort"),
+            "the streaming error names the effective-effort rejection: {err}"
+        );
+        assert_eq!(
+            err.code(),
+            crate::api::error::ErrorCode::ConfigValidationError,
+            "a semantic capability rejection classifies as a validation failure"
+        );
+    }
+
+    /// An assistant message whose history carries one thinking part per
+    /// entry plus a trailing text part.
+    fn assistant_with_thinking(traces: &[&str]) -> Message {
+        let mut parts: Vec<MessagePart> = traces
+            .iter()
+            .map(|text| MessagePart::Thinking {
+                text: (*text).to_string(),
+                signature: None,
+                redacted: None,
+            })
+            .collect();
+        parts.push(MessagePart::text("the answer"));
+        Message::new(Role::Assistant, parts)
+    }
+
+    /// Capture the streaming body a client puts on the wire for one
+    /// history, with replay and an effective thinking-effort level on
+    /// or off.
+    async fn captured_replay_body(
+        replay: bool,
+        effort: Option<crate::structured::ThinkingEffort>,
+        history: Vec<Message>,
+    ) -> String {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let mut builder = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .with_max_tokens(1024);
+        if replay {
+            builder = builder.replay_reasoning(true);
+        }
+        if let Some(effort) = effort {
+            builder = builder.thinking_effort(effort);
+        }
+        let client = builder.build().unwrap();
+        let mut stream = client.stream_messages_with_options(
+            &crate::api::StreamRequest::new(history),
+            crate::structured::RequestOptions::default(),
+        );
+        let _ = stream.next().await;
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn replayed_reasoning_rides_the_wire_only_when_enabled() {
+        let on = captured_replay_body(
+            true,
+            None,
+            vec![assistant_with_thinking(&["first dedup pass"])],
+        )
+        .await;
+        assert!(
+            on.contains("<thinking>\\nfirst dedup pass\\n</thinking>"),
+            "an enabled client renders history thinking as a text block: {on}"
+        );
+        let off = captured_replay_body(
+            false,
+            None,
+            vec![assistant_with_thinking(&["first dedup pass"])],
+        )
+        .await;
+        assert!(
+            !off.contains("<thinking>"),
+            "off by default — requests stay byte-identical to a client that never saw reasoning: {off}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_history_thinking_part_rides_the_replay_in_order() {
+        let body = captured_replay_body(
+            true,
+            None,
+            vec![assistant_with_thinking(&["alpha pass", "beta pass"])],
+        )
+        .await;
+        let first = body.find("<thinking>\\nalpha pass\\n</thinking>");
+        let second = body.find("<thinking>\\nbeta pass\\n</thinking>");
+        assert!(
+            first.is_some_and(|at| second.is_some_and(|other| at < other)),
+            "each history thinking part renders as its own block, in part order: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_thinking_blocks_ride_continuations_when_effort_is_enabled() {
+        let history = vec![Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: "alpha pass".to_string(),
+                    signature: Some("sig-blob".to_string()),
+                    redacted: None,
+                },
+                MessagePart::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                },
+            ],
+        )];
+        let body = captured_replay_body(
+            false,
+            Some(crate::structured::ThinkingEffort::High),
+            history,
+        )
+        .await;
+        assert!(
+            body.contains("\"signature\":\"sig-blob\"")
+                && body.contains("\"thinking\":\"alpha pass\"")
+                && body.contains("\"type\":\"thinking\""),
+            "an effective effort returns the signed thinking block natively, ahead of the tool use: {body}"
+        );
+        assert!(
+            !body.contains("<thinking>"),
+            "the signed block rides as the native block, not the plain-text replay: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redacted_thinking_blocks_ride_continuations_verbatim() {
+        let history = vec![Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: String::new(),
+                    signature: None,
+                    redacted: Some("opaque-data".to_string()),
+                },
+                MessagePart::ToolCall {
+                    id: "call_2".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                },
+            ],
+        )];
+        let body = captured_replay_body(
+            false,
+            Some(crate::structured::ThinkingEffort::High),
+            history,
+        )
+        .await;
+        assert!(
+            body.contains("\"type\":\"redacted_thinking\"")
+                && body.contains("\"data\":\"opaque-data\""),
+            "a redacted block returns its opaque payload verbatim on continuations: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_blocks_stay_text_replay_when_thinking_is_disabled() {
+        let history = vec![assistant_with_thinking(&["alpha pass"])];
+        let body = captured_replay_body(true, None, history).await;
+        assert!(
+            body.contains("<thinking>\\nalpha pass\\n</thinking>"),
+            "without an effective effort the reasoning renders as the plain-text replay: {body}"
+        );
+        assert!(
+            !body.contains("\"signature\""),
+            "no native thinking block rides a request that did not enable thinking: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_thinking_part_leaves_tool_use_alone_under_effort() {
+        let history = vec![Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: "legacy pass".to_string(),
+                    signature: None,
+                    redacted: None,
+                },
+                MessagePart::ToolCall {
+                    id: "call_3".to_string(),
+                    name: "search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                },
+            ],
+        )];
+        let body = captured_replay_body(
+            false,
+            Some(crate::structured::ThinkingEffort::High),
+            history,
+        )
+        .await;
+        assert!(
+            body.contains("\"type\":\"tool_use\""),
+            "the tool call still rides the continuation request: {body}"
+        );
+        assert!(
+            !body.contains("\"type\":\"thinking\"")
+                && !body.contains("\"type\":\"redacted_thinking\"")
+                && !body.contains("\"signature\""),
+            "an unsigned part cannot ride natively — it carries no signature to return: {body}"
+        );
+        assert!(
+            !body.contains("<thinking>"),
+            "with replay off an unsigned part renders no text replay either — tool_use rides alone, the rejection the thinking_effort builder doc names: {body}"
+        );
+    }
+
     #[test]
     fn request_body_user_text_single_string() {
         let msgs = vec![Message::user("hello")];
@@ -1656,6 +2261,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         let messages = body["messages"].as_array().unwrap();
@@ -1678,6 +2285,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
         assert_eq!(body["system"], "be brief");
     }
@@ -1696,6 +2305,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
         assert_eq!(body["system"], "");
     }
@@ -1711,12 +2322,12 @@ mod tests {
             response_format: None,
             tool_constraint: &ToolConstraint::None,
         };
-        let body = build_request_body(&spec, false, 1_024);
+        let body = build_request_body(&spec, false, 1_024, None, false);
         assert_eq!(
             body["max_tokens"], 1_024,
             "a non-default budget rides the wire verbatim"
         );
-        let body = build_request_body(&spec, false, DEFAULT_MAX_TOKENS);
+        let body = build_request_body(&spec, false, DEFAULT_MAX_TOKENS, None, false);
         assert_eq!(
             body["max_tokens"], DEFAULT_MAX_TOKENS,
             "and the default is what the builder sends when nothing is set"
@@ -1737,6 +2348,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
         assert_eq!(body["model"], "claude-sonnet-4");
     }
@@ -1755,6 +2368,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
     }
@@ -1773,6 +2388,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
         assert_eq!(body["messages"][0]["role"], "user");
     }
@@ -1794,6 +2411,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
         assert_eq!(body["messages"][0]["role"], "assistant");
         assert_eq!(body["messages"][0]["content"], "hello");
@@ -1820,6 +2439,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         let msg = &body["messages"][0];
@@ -1853,6 +2474,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         let msg = &body["messages"][0];
@@ -1882,6 +2505,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         let tools_arr = body["tools"].as_array().unwrap();
@@ -1905,6 +2530,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
         assert!(body.get("tools").is_none());
     }
@@ -1933,6 +2560,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         let msg = &body["messages"][0];
@@ -1961,6 +2590,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         let messages = body["messages"].as_array().unwrap();
@@ -2544,6 +3175,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         // Exactly one forced tool with the schema's name + input_schema.
@@ -2578,6 +3211,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         // The forced tool replaces the caller's tools — not appended.
@@ -2603,6 +3238,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
         assert!(
             body.get("tool_choice").is_none(),
@@ -2693,17 +3330,45 @@ mod tests {
     }
 
     #[test]
-    fn build_response_skips_thinking_blocks() {
+    fn build_response_captures_thinking_blocks_with_their_signatures() {
         let raw = serde_json::json!({
             "content": [
-                {"type": "thinking", "thinking": "internal reasoning"},
+                {"type": "thinking", "thinking": "internal reasoning", "signature": "sig-blob"},
+                {"type": "redacted_thinking", "data": "opaque-data"},
                 {"type": "text", "text": "visible answer"}
             ],
             "stop_reason": "end_turn"
         });
         let response = AnthropicClient::build_response(&raw);
-        assert_eq!(response.message.parts.len(), 1);
+        assert_eq!(
+            response.message.parts.len(),
+            3,
+            "thinking and redacted blocks survive as parts in order: {:?}",
+            response.message.parts
+        );
         assert_eq!(response.message.text_content(), "visible answer");
+        assert!(
+            matches!(
+                response.message.parts.first(),
+                Some(MessagePart::Thinking { text, signature, redacted })
+                    if text == "internal reasoning"
+                        && signature.as_deref() == Some("sig-blob")
+                        && redacted.is_none()
+            ),
+            "a signed thinking block keeps its signature for native replay: {:?}",
+            response.message.parts
+        );
+        assert!(
+            matches!(
+                response.message.parts.get(1),
+                Some(MessagePart::Thinking { text, signature, redacted })
+                    if text.is_empty()
+                        && signature.is_none()
+                        && redacted.as_deref() == Some("opaque-data")
+            ),
+            "a redacted block keeps its opaque payload verbatim: {:?}",
+            response.message.parts
+        );
     }
 
     #[test]
@@ -2834,6 +3499,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         let tools_arr = body["tools"].as_array().unwrap();
@@ -2865,6 +3532,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         let tools_arr = body["tools"].as_array().unwrap();
@@ -2901,6 +3570,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         assert!(
@@ -2932,6 +3603,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         // The forced tool replaces the caller's tools — exactly one tool
@@ -2968,6 +3641,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
 
         let messages = body["messages"].as_array().expect("messages is an array");
@@ -2999,6 +3674,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
         let system = body["system"].as_str().expect("system is a string");
         assert!(
@@ -3035,6 +3712,8 @@ mod tests {
             },
             false,
             DEFAULT_MAX_TOKENS,
+            None,
+            false,
         );
         let messages = body["messages"].as_array().expect("messages is an array");
         let roles: Vec<&str> = messages
@@ -3067,7 +3746,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             StreamEvent::IndexedDelta(d) => match &d.delta {
-                DeltaPart::Thinking { text } => assert_eq!(text, "reasoning here"),
+                DeltaPart::Thinking { text, .. } => assert_eq!(text, "reasoning here"),
                 other => panic!("expected Thinking, got {other:?}"),
             },
             other => panic!("expected IndexedDelta, got {other:?}"),
@@ -3075,10 +3754,9 @@ mod tests {
     }
 
     #[test]
-    fn emitter_signature_delta_is_ignored() {
+    fn signature_delta_rides_the_thinking_lane_as_its_own_delta() {
         let mut em = StreamEmitter::default();
 
-        // Start a thinking block + emit a thinking delta.
         em.on_block_start(Some(serde_json::json!({
             "index": 0,
             "content_block": {"type": "thinking"}
@@ -3088,15 +3766,46 @@ mod tests {
         })));
         em.drain();
 
-        // Now send a signature_delta — must NOT emit any additional event.
         em.on_block_delta(Some(serde_json::json!({
             "delta": {"type": "signature_delta", "signature": "opaque_base64_blob"}
         })));
         let events = em.drain();
 
-        assert!(
-            events.is_empty(),
-            "signature_delta must not emit any events: got {events:?}"
+        let carried = events.iter().find_map(|e| match e {
+            StreamEvent::IndexedDelta(d) => match &d.delta {
+                DeltaPart::Thinking { signature, .. } => signature.clone(),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(
+            carried.as_deref(),
+            Some("opaque_base64_blob"),
+            "the block's signature rides a thinking-lane delta so continuations can replay it: {events:?}"
+        );
+    }
+
+    #[test]
+    fn redacted_thinking_data_rides_the_thinking_lane() {
+        let mut em = StreamEmitter::default();
+
+        em.on_block_start(Some(serde_json::json!({
+            "index": 0,
+            "content_block": {"type": "redacted_thinking", "data": "opaque_payload"}
+        })));
+        let events = em.drain();
+
+        let carried = events.iter().find_map(|e| match e {
+            StreamEvent::IndexedDelta(d) => match &d.delta {
+                DeltaPart::Thinking { redacted, .. } => redacted.clone(),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(
+            carried.as_deref(),
+            Some("opaque_payload"),
+            "the redacted block's payload rides its delta verbatim so continuations can return it: {events:?}"
         );
     }
 
@@ -3104,27 +3813,72 @@ mod tests {
     fn emitter_redacted_thinking_emits_empty_delta() {
         let mut em = StreamEmitter::default();
 
-        // Start a redacted_thinking block — should emit PartStart + one
-        // empty Thinking delta (the placeholder convention).
         em.on_block_start(Some(serde_json::json!({
             "index": 0,
             "content_block": {"type": "redacted_thinking"}
         })));
         let events = em.drain();
 
-        // PartStart + one empty Thinking delta.
-        assert_eq!(events.len(), 2, "expected PartStart + empty Thinking delta");
+        assert_eq!(
+            events.len(),
+            2,
+            "expected PartStart + one empty-text Thinking delta"
+        );
         assert!(matches!(events[0], StreamEvent::PartStart(_)));
         match &events[1] {
             StreamEvent::IndexedDelta(d) => match &d.delta {
-                DeltaPart::Thinking { text } => {
-                    assert!(text.is_empty(), "redacted thinking → empty text");
+                DeltaPart::Thinking { text, .. } => {
+                    assert!(
+                        text.is_empty(),
+                        "redacted thinking arrives with empty text — its payload rides the same delta's redacted field"
+                    );
                 }
                 other => panic!("expected Thinking, got {other:?}"),
             },
             other => panic!("expected IndexedDelta, got {other:?}"),
         }
         assert!(em.thinking_part_open, "thinking_part_open set");
+    }
+
+    #[test]
+    fn replay_reasoning_tail_keeps_exactly_the_last_32_768_chars() {
+        let at_cap = "a".repeat(32_768);
+        assert_eq!(
+            replay_reasoning_tail(&at_cap),
+            at_cap,
+            "a trace at the cap passes through whole"
+        );
+
+        let over_cap = format!("{}{}", 'b', "c".repeat(32_768));
+        let tail = replay_reasoning_tail(&over_cap);
+        assert_eq!(
+            tail.chars().count(),
+            32_768,
+            "a trace one char over the cap drops exactly its head: {tail}"
+        );
+        assert!(
+            tail.starts_with('c') && !tail.starts_with('b'),
+            "the head is dropped, the tail kept"
+        );
+
+        let multibyte_at_cap = format!("{}{}", "é".repeat(16_385), "x".repeat(16_383));
+        assert_eq!(
+            replay_reasoning_tail(&multibyte_at_cap),
+            multibyte_at_cap,
+            "the cap counts chars, not bytes — a 49 153-byte trace of 32 768 chars stays whole"
+        );
+
+        let multibyte_over = format!("{}{}", "é".repeat(16_386), "x".repeat(16_383));
+        let tail = replay_reasoning_tail(&multibyte_over);
+        assert_eq!(
+            tail.chars().count(),
+            32_768,
+            "a one-char overflow drops one whole multi-byte char, never half of one"
+        );
+        assert!(
+            tail.starts_with('é'),
+            "the surviving head is a complete character"
+        );
     }
 
     #[test]
@@ -3221,6 +3975,8 @@ mod tests {
             },
             false,
             1024,
+            None,
+            false,
         );
         assert!(
             body.get("tools").is_none(),
@@ -3240,7 +3996,7 @@ mod tests {
                 true,
             )],
         );
-        let json = convert_message(&msg);
+        let json = convert_message(&msg, false, false);
         assert_eq!(
             json.pointer("/content/0/is_error"),
             Some(&serde_json::json!(true)),
@@ -3255,7 +4011,7 @@ mod tests {
                 false,
             )],
         );
-        let ok_json = convert_message(&ok);
+        let ok_json = convert_message(&ok, false, false);
         assert!(
             ok_json.pointer("/content/0/is_error").is_none(),
             "successful results carry no is_error (the wire default is false): {ok_json}"
@@ -3361,6 +4117,128 @@ mod tests {
         assert!(
             payload.is_some(),
             "spec-legal 'data:' line must carry the payload, not be dropped"
+        );
+    }
+
+    async fn captured_effort_body(
+        default: Option<crate::structured::ThinkingEffort>,
+        options: crate::structured::RequestOptions,
+        max_tokens: u32,
+    ) -> String {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let head = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+            drop(sock.write_all(head.as_bytes()).await);
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let mut builder = AnthropicClient::builder()
+            .with_api_key("k")
+            .with_base_url(format!("http://{addr}"))
+            .with_max_tokens(max_tokens);
+        if let Some(effort) = default {
+            builder = builder.thinking_effort(effort);
+        }
+        let client = builder.build().unwrap();
+        let mut stream =
+            client.stream_messages_with_options(&crate::api::StreamRequest::new(vec![]), options);
+        let _ = stream.next().await;
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_client_effort_default_is_overridden_per_request() {
+        let default_alone = captured_effort_body(
+            Some(crate::structured::ThinkingEffort::Medium),
+            crate::structured::RequestOptions::new(),
+            8192,
+        )
+        .await;
+        assert!(
+            default_alone.contains("\"budget_tokens\":8192"),
+            "an unset per-request effort leaves the client default budget on the wire: {default_alone}"
+        );
+        let overridden = captured_effort_body(
+            Some(crate::structured::ThinkingEffort::Medium),
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::High),
+            8192,
+        )
+        .await;
+        assert!(
+            overridden.contains("\"budget_tokens\":16384")
+                && !overridden.contains("\"budget_tokens\":8192"),
+            "the per-request effort wins over the client default budget: {overridden}"
+        );
+        let no_default = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::High),
+            8192,
+        )
+        .await;
+        assert!(
+            no_default.contains("\"budget_tokens\":16384"),
+            "a request effort reaches the wire without any client default: {no_default}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_high_effort_enlarges_max_tokens_for_headroom() {
+        let raised = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::High),
+            1024,
+        )
+        .await;
+        assert!(
+            raised.contains("\"max_tokens\":16385") && raised.contains("\"budget_tokens\":16384"),
+            "a budget above max_tokens raises max_tokens to budget + 1 so the body is never self-rejecting: {raised}"
+        );
+        let kept = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::High),
+            32768,
+        )
+        .await;
+        assert!(
+            kept.contains("\"max_tokens\":32768"),
+            "a max_tokens already above budget + 1 is left untouched: {kept}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ladder_s_outer_rungs_reach_the_anthropic_wire() {
+        let low = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Low),
+            8192,
+        )
+        .await;
+        assert!(
+            low.contains("\"budget_tokens\":2048"),
+            "the Low rung maps to the ladder's 2048 budget: {low}"
+        );
+        let max = captured_effort_body(
+            None,
+            crate::structured::RequestOptions::new()
+                .with_effort(crate::structured::ThinkingEffort::Max),
+            8192,
+        )
+        .await;
+        assert!(
+            max.contains("\"budget_tokens\":32768") && max.contains("\"max_tokens\":32769"),
+            "Max maps to the ladder's 32768 budget and the headroom rule raises max_tokens to budget + 1: {max}"
         );
     }
 

@@ -511,9 +511,10 @@ pub enum DeltaPart {
         /// The reasoning text fragment to append.
         ///
         /// Concatenate in arrival order per turn to reconstruct the full
-        /// reasoning trace. Empty string when the reasoning is redacted
-        /// (the provider withheld the content); consumers should render a
-        /// placeholder, not the empty string.
+        /// reasoning trace. Empty string when the delta carries something
+        /// other than displayable reasoning — a redacted block's opaque
+        /// payload (in `redacted`) or a block signature; consumers should
+        /// render a placeholder, not the empty string.
         text: String,
 
         /// The provider's signature over the finished reasoning block.

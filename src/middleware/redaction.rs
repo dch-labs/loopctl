@@ -65,8 +65,9 @@ const BEARER: &str = r#"(?i)authorization:\s*bearer\s+[A-Za-z0-9\-._~+/=]+"#;
 ///
 /// A declaration passes through verbatim when its initializer is a
 /// bare identifier-shaped token — strict `UpperCamel` humps or a
-/// uniformly lowercase word (`let token = SecureHandle::new();`, or
-/// the annotation itself standing in as the matched value) — or its
+/// uniformly lowercase letters-only word (`let token =
+/// SecureHandle::new();`, or the annotation itself standing in as
+/// the matched value) — or its
 /// quoted value carries a placeholder marker ([`PLACEHOLDER_MARKERS`]); any other
 /// value — quoted or bare — masks in place through the `value`
 /// group, keeping the statement's syntax intact. `export` is
@@ -250,8 +251,8 @@ impl SecretPatternSet {
     /// variable declaration, which shares the key-value shape with a
     /// credential dump but is code: it passes through verbatim when
     /// its initializer is a bare identifier-shaped token (a strict
-    /// `UpperCamel` type reference or a uniformly lowercase word) or
-    /// its quoted value names itself a
+    /// `UpperCamel` type reference or a uniformly lowercase
+    /// letters-only word) or its quoted value names itself a
     /// placeholder, and otherwise masks only the value, leaving the
     /// statement's syntax intact. When the entropy heuristic is
     /// enabled, any remaining run of at least 32 token characters
@@ -349,10 +350,11 @@ fn rewrite_match(caps: &regex::Captures<'_>, placeholder: &str) -> String {
 /// A quoted literal masks unless it names itself a placeholder
 /// ([`PLACEHOLDER_MARKERS`]); a bare initializer masks unless it
 /// reads as an identifier ([`value_is_identifier_shaped`]) — strict
-/// `UpperCamel` humps or a uniformly lowercase word are code, while a
-/// lowercase letter followed anywhere by an uppercase, or a camel
-/// look-alike whose humps never reach two letters, is credential
-/// material.
+/// `UpperCamel` humps or a uniformly lowercase letters-only word are
+/// code, while a lowercase letter followed anywhere by an uppercase,
+/// a camel look-alike whose humps never reach two letters, or a
+/// lowercase token carrying a digit (hex and base36 material), is
+/// credential material.
 fn declaration_value_is_masked(caps: &regex::Captures<'_>) -> bool {
     caps.name("value").is_some_and(|value| {
         let text = value.as_str();
@@ -369,18 +371,22 @@ fn declaration_value_is_masked(caps: &regex::Captures<'_>) -> bool {
 /// secret.
 ///
 /// Structural, not statistical: a token is code when it is uniformly
-/// lowercase letters and digits (a word-led identifier) or strict
-/// `UpperCamel` — every maximal lowercase run spans at least two
-/// letters (`SecretStoreHandle012345`). Anything else is credential
+/// lowercase letters (a word-led identifier) or strict `UpperCamel`
+/// — every maximal lowercase run spans at least two letters
+/// (`SecretStoreHandle012345`). Anything else is credential
 /// material: a lowercase letter followed anywhere by an uppercase
 /// (`dGhpc0lz…`, real base64), a camel look-alike whose humps never
 /// reach two letters (`Ab3dEf5g…`), a lone lowercase letter that a
-/// digit terminates (`At8` — chance camel by digit resets), or a
-/// digit-led token. Two chance bands remain and are disclosed rather
-/// than claimed away: a uniformly lowercase token (by design, a
-/// word-led identifier) and a strict-camel token, measured at
-/// roughly 0.9% of random 24-character values, an order of magnitude
-/// lower at 44.
+/// digit terminates (`At8` — chance camel by digit resets), a
+/// digit-led token, and a lowercase token carrying any digit — hex
+/// and base36 material, disqualified the same way a path word
+/// segment is ([`is_dictionary_segment`]). One chance band remains
+/// and is disclosed rather than claimed away: a strict-camel token,
+/// measured at roughly 0.9% of random 24-character values, an order
+/// of magnitude lower at 44; the uniformly lowercase band is by
+/// design — a word-led identifier, letters only — and uniform-random
+/// credential material essentially never lands in it, because it
+/// carries digits.
 fn value_is_identifier_shaped(bare: &str) -> bool {
     is_uniformly_lowercase(bare) || is_strict_upper_camel(bare)
 }
@@ -388,14 +394,18 @@ fn value_is_identifier_shaped(bare: &str) -> bool {
 /// Whether a bare initializer token is a word-led lowercase
 /// identifier.
 ///
-/// A lowercase letter first and only lowercase letters and digits
-/// after — the shape single-word identifiers take
-/// (`defaultconfiguration`). A token carrying any uppercase fails
-/// here and must answer to [`is_strict_upper_camel`] instead.
+/// A lowercase letter first and only lowercase letters after — the
+/// shape single-word identifiers take (`defaultconfiguration`). A
+/// digit disqualifies the token exactly as it disqualifies a path
+/// segment in [`is_dictionary_segment`]: uniform-random credential
+/// material — hex and base36 keys — mixes digits into lowercase,
+/// while a word-led identifier is letters only. A token carrying any
+/// uppercase fails here and must answer to [`is_strict_upper_camel`]
+/// instead.
 fn is_uniformly_lowercase(token: &str) -> bool {
     let mut chars = token.chars();
     chars.next().is_some_and(|first| first.is_ascii_lowercase())
-        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+        && chars.all(|ch| ch.is_ascii_lowercase())
 }
 
 /// Whether a bare initializer token is strict `UpperCamel` code.

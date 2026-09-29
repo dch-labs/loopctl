@@ -493,6 +493,18 @@ fn hump_body(rng: &mut Lcg) -> String {
     body
 }
 
+/// A letter-led lowercase hex body carrying a guaranteed digit — the
+/// bare-declaration secret class whose digits must disqualify it from
+/// identifier-hood, so it never survives a declaration.
+fn hex_led_digit_bearing_body(rng: &mut Lcg, len: usize) -> String {
+    const HEX_LETTERS: &str = "abcdef";
+    let head = HEX_LETTERS
+        .chars()
+        .nth(rng.below(6) as usize)
+        .unwrap_or('a');
+    format!("{head}0{}", hex_body(rng, len.saturating_sub(2)))
+}
+
 /// Generate one output: `(text, planted secret bodies, benign survivors)`.
 fn gen_output(rng: &mut Lcg) -> (String, Vec<String>, Vec<String>) {
     let mut text = String::from("log line\n");
@@ -502,7 +514,7 @@ fn gen_output(rng: &mut Lcg) -> (String, Vec<String>, Vec<String>) {
     for i in 0..pieces {
         let extra = rng.below(10) as usize;
         let body = distinct_body(rng, 32 + extra);
-        match rng.below(5) {
+        match rng.below(6) {
             0 => {
                 let secret = match i % 6 {
                     0 => format!("Authorization: Bearer {body}"),
@@ -536,6 +548,13 @@ fn gen_output(rng: &mut Lcg) -> (String, Vec<String>, Vec<String>) {
             3 => {
                 let body = hump_body(rng);
                 let line = format!("const token = {body}; ");
+                secrets.push(body);
+                text.push_str(&line);
+            }
+            4 => {
+                let extra = rng.below(16) as usize;
+                let body = hex_led_digit_bearing_body(rng, 24 + extra);
+                let line = format!("let secret = {body}; ");
                 secrets.push(body);
                 text.push_str(&line);
             }
@@ -985,12 +1004,42 @@ fn a_uniformly_lowercase_bare_initializer_passes_verbatim() {
     let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
     assert_eq!(
         count, 0,
-        "a uniformly lowercase bare initializer is an identifier, not a credential: {scrubbed}"
+        "a uniformly lowercase letters-only bare initializer is an identifier, not a credential — digits disqualify: {scrubbed}"
     );
     assert_eq!(
         scrubbed, line,
         "a lowercase word-led initializer survives the read verbatim"
     );
+}
+
+#[test]
+fn a_digit_bearing_lowercase_bare_initializer_masks_in_place() {
+    let cases = [
+        (
+            "const api_key = a3f9c2e81b7d4f6a0c5e9b2d7f1a8c3e;",
+            "const api_key = [REDACTED:api_key_kv];",
+        ),
+        (
+            "let secret = a3f9c2e81b7d4f6a0c5e9b2d7f1a8c3e;",
+            "let secret = [REDACTED:api_key_kv];",
+        ),
+        (
+            "let token = a3f9c2e81b7d4f6a0c5e9b2d7f1a8c3e;",
+            "let token = [REDACTED:api_key_kv];",
+        ),
+    ];
+    for (line, expected) in cases {
+        let mut scrubbed = line.to_string();
+        let count = SecretPatternSet::default_common().scrub(&mut scrubbed);
+        assert_eq!(
+            count, 1,
+            "a lowercase bare initializer carrying digits is hex or base36 material, not a word: {line} -> {scrubbed}"
+        );
+        assert_eq!(
+            scrubbed, expected,
+            "only the initializer masks; the declaration syntax survives: {line}"
+        );
+    }
 }
 
 #[test]

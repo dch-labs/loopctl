@@ -422,8 +422,11 @@ pub enum MessagePart {
         /// The reasoning text, as streamed.
         ///
         /// Concatenated fragments in arrival order; empty when the
-        /// provider redacted the reasoning.
+        /// turn's thinking carried something other than displayable
+        /// reasoning — a redacted block (its opaque payload rides
+        /// `redacted`) or a signature-only block.
         text: String,
+
         /// The provider's signature over the reasoning block.
         ///
         /// Latched from the delta that carries it and returned
@@ -431,6 +434,7 @@ pub enum MessagePart {
         /// thinking natively. `None` when the provider signs nothing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+
         /// The opaque payload of a redacted reasoning block.
         ///
         /// Set when the provider withheld the reasoning but demands

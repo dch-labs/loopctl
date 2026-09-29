@@ -357,13 +357,17 @@ pub struct BareLoop<C: ApiClient> {
 struct TurnAccounting {
     /// Wall-clock instant the `CallTools` arm began.
     ///
-    /// Captured before any tool dispatch starts. Subtracted from the current
-    /// instant when the turn-end observer event fires after dispatch,
-    /// producing the `duration_ms` reported on
+    /// Captured before any tool dispatch starts. Elapsed is taken when
+    /// dispatch completes — on the success path as
+    /// [`dispatch_and_record`](BareLoop::dispatch_and_record) returns, before
+    /// the results land in machine history and the context-size estimate is
+    /// refreshed; on the failure path inside that same helper — producing the
+    /// `duration_ms` reported on
     /// [`TurnEndContext`](crate::observer::TurnEndContext). The reported
-    /// duration covers the tool-dispatch phase only — the preceding model
-    /// call is timed separately in `handle_call_llm`, so the two phases never
-    /// double-count.
+    /// duration covers the tool-dispatch phase only: the preceding model call
+    /// is timed separately in `handle_call_llm`, and the post-dispatch
+    /// O(history) context recount stays outside the measured span, so the
+    /// success and failure events report the same measure.
     start: Instant,
 
     /// Prompt-side token count reported by the provider.
@@ -1569,7 +1573,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// providers expect. The turn's success `on_turn_end` fires after the
     /// results are recorded and the context-size estimate refreshed, so the
     /// event's figure includes this turn's tool results even when the turn
-    /// budget ends the run immediately after. Keeps the run budget in sync.
+    /// budget ends the run immediately after; the event's `duration` is
+    /// captured when dispatch completes, ahead of that recording and
+    /// refresh, so the O(history) context recount never inflates the
+    /// reported tool-phase timing. Keeps the run budget in sync.
     ///
     /// Cancellation is honoured at tool-call granularity: the in-flight call
     /// is raced against the cancel signal in
@@ -1626,6 +1633,7 @@ impl<C: ApiClient> BareLoop<C> {
         let dispatched_parts: Vec<MessagePart> = self
             .dispatch_and_record(&dispatch_calls, turn, &accounting)
             .await?;
+        let turn_duration = accounting.start.elapsed();
 
         debug_assert_eq!(
             dispatch_calls.len(),
@@ -1650,7 +1658,7 @@ impl<C: ApiClient> BareLoop<C> {
             turn,
             success: true,
             error: None,
-            duration: accounting.start.elapsed(),
+            duration: turn_duration,
             input_tokens: accounting.input_tokens,
             output_tokens: accounting.output_tokens,
             stop_reason: accounting.stop_reason,

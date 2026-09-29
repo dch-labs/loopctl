@@ -1549,6 +1549,49 @@ impl crate::observer::LoopObserver for ContextSizeRecorder {
     }
 }
 
+/// Per-count delay charged by [`SlowRecountCounter`]; the tool-phase
+/// duration must stay under half of it.
+const SLOW_RECOUNT_DELAY_MS: u64 = 150;
+
+/// Token counter that charges a fixed wall-clock delay on every count.
+///
+/// Gives the post-dispatch context recount a deterministic, measurable cost
+/// — without building a huge history — so the turn-end duration pin can
+/// prove the recount stays outside the reported tool-phase span.
+struct SlowRecountCounter {
+    /// Delay charged by each `count` call.
+    delay: Duration,
+    /// Consultations recorded so far.
+    calls: AtomicUsize,
+}
+
+impl crate::compact::TokenCounter for SlowRecountCounter {
+    fn count(&self, _messages: &[Message]) -> u64 {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        1
+    }
+}
+
+/// Records each turn-end event's turn, outcome, and reported duration.
+///
+/// Shared with the test body, which drains it after the run and checks the
+/// tool-phase success event's duration against the injected recount cost.
+struct TurnDurationRecorder {
+    /// `(turn, success, duration_ms)` per turn-end event, in event order.
+    ends: Arc<Mutex<Vec<(usize, bool, u64)>>>,
+}
+
+impl crate::observer::LoopObserver for TurnDurationRecorder {
+    fn name(&self) -> &'static str {
+        "turn-duration-recorder"
+    }
+    fn on_turn_end(&self, ctx: &crate::observer::TurnEndContext) {
+        let entry = (ctx.turn, ctx.success, ctx.duration_ms);
+        crate::error::recover_guard(self.ends.lock()).push(entry);
+    }
+}
+
 #[tokio::test]
 async fn the_context_size_accessor_exposes_the_engine_estimate_after_a_run() {
     let client = MockClient::new("test-model");
@@ -1723,6 +1766,50 @@ async fn the_last_turn_end_figure_survives_the_max_turns_edge() {
         figure,
         agent.context_tokens(),
         "the run's last turn-end carries the post-results figure — no later event fires, so the live lane's last word must equal the at-rest accessor"
+    );
+}
+
+#[tokio::test]
+async fn the_success_turn_end_duration_excludes_the_context_recount() {
+    let counter = Arc::new(SlowRecountCounter {
+        delay: Duration::from_millis(SLOW_RECOUNT_DELAY_MS),
+        calls: AtomicUsize::new(0),
+    });
+    let manager = ContextManager::new(Arc::new(TruncatingCompactor::new()))
+        .with_token_counter(counter.clone());
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        registry,
+        make_config(),
+        LoopManagers::new().with_context_manager(Arc::new(manager)),
+    );
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(TurnDurationRecorder { ends: ends.clone() }));
+    agent.run("echo hi", &RunConfig::default()).await.unwrap();
+
+    let recorded = crate::error::recover_guard(ends.lock()).clone();
+    let tool_phase: Vec<(usize, bool, u64)> = recorded
+        .iter()
+        .filter(|(turn, success, _)| *turn == 0 && *success)
+        .copied()
+        .collect();
+    assert_eq!(
+        tool_phase.len(),
+        1,
+        "the tool turn fires exactly one success turn-end: {recorded:?}"
+    );
+    let duration_ms = tool_phase.first().map_or(0, |(_, _, ms)| *ms);
+    assert!(
+        counter.calls.load(Ordering::SeqCst) >= 1,
+        "the engine must consult the injected counter, or this pin proves nothing"
+    );
+    assert!(
+        duration_ms < SLOW_RECOUNT_DELAY_MS / 2,
+        "the tool-phase duration must exclude the {SLOW_RECOUNT_DELAY_MS}ms context recount: {duration_ms}ms"
     );
 }
 

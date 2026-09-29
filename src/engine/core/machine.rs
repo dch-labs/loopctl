@@ -486,6 +486,25 @@ impl LoopMachine {
         self.context_tokens = tokens;
     }
 
+    /// The engine's current context-size estimate, in tokens.
+    ///
+    /// The exact figure the compaction trigger evaluates: the driver's
+    /// estimate of the payload the provider would receive — the
+    /// conversation history plus the per-request overhead (system
+    /// prompt, tool schemas) and, when known ahead of the call, the
+    /// turn's transient messages. The driver refreshes it at run
+    /// start, after tool results land, before a model call that
+    /// carries fresh transients, and with every model response; a
+    /// compaction pass replaces it with the compacted size.
+    /// [`accept_input`](Self::accept_input) zeroes it until the
+    /// run-start feed. Once the machine is terminal the figure is
+    /// frozen at its last value — the setter no-ops there, and this
+    /// getter keeps reporting what the run ended with.
+    #[must_use]
+    pub fn context_tokens(&self) -> u64 {
+        self.context_tokens
+    }
+
     /// Return the next step the driver must perform.
     ///
     /// `policy` supplies the turn budget and compaction thresholds the machine
@@ -1411,6 +1430,67 @@ mod tests {
             ),
             "the exhausted turn budget wins over the emergency compaction \
              the same step could request"
+        );
+    }
+
+    #[test]
+    fn a_fresh_machine_reports_zero_context_tokens() {
+        let machine = LoopMachine::from_history(vec![Message::user("seed")]);
+        assert_eq!(
+            machine.context_tokens(),
+            0,
+            "a machine seeded from history starts its context estimate at zero — the driver feeds the real figure at run start"
+        );
+    }
+
+    #[test]
+    fn the_context_tokens_getter_returns_the_last_fed_estimate() {
+        let mut machine = LoopMachine::from_history(vec![Message::user("seed")]);
+        machine.set_context_tokens(500);
+        assert_eq!(
+            machine.context_tokens(),
+            500,
+            "the getter returns the last fed estimate — the figure the compaction trigger evaluates"
+        );
+        assert!(matches!(
+            machine.next_step(test_policy(0)),
+            MachineStep::Done(MachineOutcome::MaxTurnsExceeded)
+        ));
+        machine.set_context_tokens(999);
+        assert_eq!(
+            machine.context_tokens(),
+            500,
+            "a terminal machine freezes its estimate — the setter no-ops and the getter reports the figure the run ended with"
+        );
+    }
+
+    #[test]
+    fn compaction_shrinks_the_exposed_context_size() {
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: true,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(250))]);
+        let _ = machine.next_step(policy);
+        machine.model_response(tool_response("echo", &["echo"], 0), 90);
+        assert_eq!(
+            machine.context_tokens(),
+            90,
+            "the estimate the driver fed with the model response reads back verbatim"
+        );
+        let _ = machine.next_step(policy);
+        machine.tool_results(vec![Message::user(long_text(250))]);
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::Compact { .. }
+        ));
+        machine.compaction_result(vec![Message::user("compacted")], 90, 40);
+        assert_eq!(
+            machine.context_tokens(),
+            40,
+            "a compaction pass replaces the estimate with the compacted size"
         );
     }
 

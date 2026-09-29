@@ -562,6 +562,25 @@ impl<C: ApiClient> BareLoop<C> {
         &self.session
     }
 
+    /// The engine's current context-size estimate, in tokens.
+    ///
+    /// Passthrough to [`LoopMachine::context_tokens`]: the figure the
+    /// compaction trigger and the 95% emergency line evaluate — the
+    /// estimated payload the provider would receive, refreshed by the
+    /// driver at every growth and shrink point of the conversation.
+    /// Read it between or after runs; during a run the same number
+    /// arrives per turn through
+    /// [`on_turn_end`](crate::observer::LoopObserver::on_turn_end)'s
+    /// [`TurnEndContext::context_tokens`](crate::observer::TurnEndContext::context_tokens),
+    /// since `run()` holds the loop mutably. Compare against
+    /// [`session_config`](Self::session_config)'s
+    /// [`context_window`](crate::config::SessionConfig::context_window)
+    /// for a utilization view.
+    #[must_use]
+    pub fn context_tokens(&self) -> u64 {
+        self.machine.context_tokens()
+    }
+
     /// Get the run configuration for the current run, if a run has started.
     ///
     /// Returns a reference to the [`RunConfig`] stored on the in-flight
@@ -1078,6 +1097,7 @@ impl<C: ApiClient> BareLoop<C> {
                     input_tokens: accounting.input_tokens,
                     output_tokens: accounting.output_tokens,
                     stop_reason: accounting.stop_reason,
+                    context_tokens: self.machine.context_tokens(),
                 });
                 Ok(parts)
             }
@@ -1091,6 +1111,7 @@ impl<C: ApiClient> BareLoop<C> {
                     input_tokens: accounting.input_tokens,
                     output_tokens: accounting.output_tokens,
                     stop_reason: accounting.stop_reason,
+                    context_tokens: self.machine.context_tokens(),
                 });
                 Err(e)
             }
@@ -1253,6 +1274,7 @@ impl<C: ApiClient> BareLoop<C> {
                     input_tokens: 0,
                     output_tokens: 0,
                     stop_reason: StreamStopReason::EndTurn,
+                    context_tokens: self.machine.context_tokens(),
                 });
                 return Err(LoopError::Cancelled);
             }
@@ -1266,6 +1288,7 @@ impl<C: ApiClient> BareLoop<C> {
                     input_tokens: 0,
                     output_tokens: 0,
                     stop_reason: StreamStopReason::EndTurn,
+                    context_tokens: self.machine.context_tokens(),
                 });
                 return Err(e);
             }
@@ -1316,6 +1339,7 @@ impl<C: ApiClient> BareLoop<C> {
                 input_tokens: turn_in,
                 output_tokens: turn_out,
                 stop_reason: stream_stop,
+                context_tokens: self.machine.context_tokens(),
             });
             return Err(e);
         }
@@ -1359,6 +1383,7 @@ impl<C: ApiClient> BareLoop<C> {
                 input_tokens: turn_in,
                 output_tokens: turn_out,
                 stop_reason: stream_stop,
+                context_tokens: self.machine.context_tokens(),
             });
         }
         Ok(())

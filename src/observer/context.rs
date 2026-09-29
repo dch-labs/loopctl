@@ -150,6 +150,19 @@ pub struct TurnEndContext {
     /// [`EndTurn`](crate::stream::StreamStopReason::EndTurn) default — the
     /// [`error`](Self::error) field tells that story.
     pub stop_reason: crate::stream::StreamStopReason,
+
+    /// The engine's context-size estimate at the moment the turn ended.
+    ///
+    /// The same figure
+    /// [`LoopMachine::context_tokens`](crate::engine::core::LoopMachine::context_tokens)
+    /// reports at rest: the estimated payload the provider would
+    /// receive — history plus per-request overhead and known
+    /// transients. Distinct from
+    /// [`input_tokens`](Self::input_tokens), which is the provider's
+    /// after-the-fact count of the call it actually served: this is
+    /// the engine's forward-looking estimate, present even when the
+    /// provider reports no usage.
+    pub context_tokens: u64,
 }
 
 /// Context for [`LoopObserver::on_stream_success`](crate::observer::LoopObserver::on_stream_success).

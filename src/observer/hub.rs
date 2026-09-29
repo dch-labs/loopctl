@@ -631,6 +631,7 @@ mod tests {
             input_tokens: 10,
             output_tokens: 5,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
+            context_tokens: 12,
         });
         hub.on_run_end(&RunEndContext::new(true, None, 1, 5));
 
@@ -681,6 +682,32 @@ mod tests {
             seqs, expected_seqs,
             "the run's events must number 1 through {count} in call order"
         );
+    }
+
+    #[test]
+    fn the_hub_forwards_the_turn_end_context_size() {
+        let hub = EventHub::new(16);
+        let mut receiver = hub.subscribe();
+        hub.on_turn_end(&TurnEndContext {
+            turn: 0,
+            success: true,
+            error: None,
+            duration_ms: 5,
+            input_tokens: 10,
+            output_tokens: 5,
+            stop_reason: crate::stream::StreamStopReason::EndTurn,
+            context_tokens: 777,
+        });
+        let observed = receiver
+            .try_recv()
+            .expect("the turn-end event is receivable");
+        match observed.event {
+            LoopEvent::TurnEnd(ctx) => assert_eq!(
+                ctx.context_tokens, 777,
+                "the hub re-emits the turn-end context by value — the context-size field arrives with it"
+            ),
+            other => panic!("expected a turn-end event, got {}", kind_of(&other)),
+        }
     }
 
     #[test]

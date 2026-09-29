@@ -98,6 +98,7 @@ pub mod compact;
 pub mod config;
 pub mod contributor;
 pub mod detection;
+pub mod determinism;
 pub mod engine;
 pub mod error;
 pub mod fallback;

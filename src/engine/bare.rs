@@ -357,8 +357,9 @@ pub struct BareLoop<C: ApiClient> {
 struct TurnAccounting {
     /// Wall-clock instant the `CallTools` arm began.
     ///
-    /// Captured before any tool dispatch starts. Elapsed is taken when
-    /// dispatch completes — on the success path as
+    /// Captured from the managers' [`Clock`](crate::determinism::Clock)
+    /// before any tool dispatch starts. Elapsed is taken when dispatch
+    /// completes — on the success path as
     /// [`dispatch_and_record`](BareLoop::dispatch_and_record) returns, before
     /// the results land in machine history and the context-size estimate is
     /// refreshed; on the failure path inside that same helper — producing the
@@ -496,7 +497,7 @@ impl<C: ApiClient> BareLoop<C> {
             let seeded = Self::default_context_manager(&session_config);
             managers.set_context_manager(Arc::new(seeded));
         }
-        let session = Session::new(session_config);
+        let session = Self::new_session(session_config, &managers);
         let session_temp_dir = Some(Self::session_temp_subdir(&std::env::temp_dir(), session.id));
         let mut loop_ = Self {
             client,
@@ -779,7 +780,7 @@ impl<C: ApiClient> BareLoop<C> {
         let mut managers = LoopManagers::new();
         let seeded = Self::default_context_manager(&session_config);
         managers.set_context_manager(Arc::new(seeded));
-        let session = Session::new(session_config);
+        let session = Self::new_session(session_config, &managers);
         let session_temp_dir = Some(Self::session_temp_subdir(&std::env::temp_dir(), session.id));
         let mut loop_ = Self {
             client,
@@ -887,7 +888,7 @@ impl<C: ApiClient> BareLoop<C> {
             let seeded = Self::default_context_manager(&session_config);
             managers.set_context_manager(Arc::new(seeded));
         }
-        let session = Session::new(session_config);
+        let session = Self::new_session(session_config, &managers);
         let session_temp_dir = Some(Self::session_temp_subdir(&std::env::temp_dir(), session.id));
         let mut loop_ = Self {
             client,
@@ -928,6 +929,44 @@ impl<C: ApiClient> BareLoop<C> {
         ContextManager::new(Arc::new(TruncatingCompactor::default()))
             .with_context_window(session_config.context_window)
             .with_threshold(session_config.compact_threshold)
+    }
+
+    /// Build the session record from the id seam.
+    ///
+    /// Same shape as [`Session::new`] — empty run list, no session start yet
+    /// — with the identity minted by the managers'
+    /// [`IdGen`](crate::determinism::IdGen) instead of a direct v4 draw, so a
+    /// seeded generator pins the session id and everything keyed on it (the
+    /// temp-dir name, session tags). The public [`Session::new`] stays the
+    /// unpinned path for external callers.
+    fn new_session(config: SessionConfig, managers: &LoopManagers) -> Session {
+        Session {
+            id: managers.id_gen().next_id(),
+            config,
+            session_start: None,
+            runs: Vec::new(),
+        }
+    }
+
+    /// Build the run record from the id and clock seams.
+    ///
+    /// Same shape as [`Run::new`] — no turns, no output, no terminal error —
+    /// with the identity minted by the [`IdGen`](crate::determinism::IdGen)
+    /// and the start instant read from the
+    /// [`Clock`](crate::determinism::Clock), so pinned seams reproduce a
+    /// run's id and every duration measured over its span. The public
+    /// [`Run::new`] stays the unpinned path for external callers.
+    fn new_run(input: &str, config: &RunConfig, managers: &LoopManagers) -> Run {
+        Run {
+            id: managers.id_gen().next_id(),
+            start: managers.clock().monotonic(),
+            end: None,
+            turns: Vec::new(),
+            input: input.to_string(),
+            output: None,
+            config: config.clone(),
+            stop_reason: None,
+        }
     }
 
     /// Compute the per-session temp subdir path under `base`.
@@ -1093,7 +1132,7 @@ impl<C: ApiClient> BareLoop<C> {
         accounting: &TurnAccounting,
     ) -> Result<Vec<MessagePart>, LoopError> {
         let result = self.dispatch_tools(tool_calls, turn).await;
-        let turn_duration = accounting.start.elapsed();
+        let turn_duration = self.managers.clock().elapsed_since(accounting.start);
         match result {
             Ok(results) => Ok(Self::build_tool_result_parts(results)),
             Err(e) => {
@@ -1222,7 +1261,7 @@ impl<C: ApiClient> BareLoop<C> {
             return Err(LoopError::FallbackExhausted);
         }
 
-        let turn_start = Instant::now();
+        let turn_start = self.managers.clock().monotonic();
         let turn_input = self.turn_input(turn);
 
         let mut messages = self.collect_contributor_messages(turn);
@@ -1265,7 +1304,7 @@ impl<C: ApiClient> BareLoop<C> {
                     turn,
                     success: false,
                     error: Some("cancelled"),
-                    duration: turn_start.elapsed(),
+                    duration: self.managers.clock().elapsed_since(turn_start),
                     input_tokens: 0,
                     output_tokens: 0,
                     stop_reason: StreamStopReason::EndTurn,
@@ -1279,7 +1318,7 @@ impl<C: ApiClient> BareLoop<C> {
                     turn,
                     success: false,
                     error: Some(&err_str),
-                    duration: turn_start.elapsed(),
+                    duration: self.managers.clock().elapsed_since(turn_start),
                     input_tokens: 0,
                     output_tokens: 0,
                     stop_reason: StreamStopReason::EndTurn,
@@ -1330,7 +1369,7 @@ impl<C: ApiClient> BareLoop<C> {
                 turn,
                 success: false,
                 error: Some(&err_str),
-                duration: turn_start.elapsed(),
+                duration: self.managers.clock().elapsed_since(turn_start),
                 input_tokens: turn_in,
                 output_tokens: turn_out,
                 stop_reason: stream_stop,
@@ -1374,7 +1413,7 @@ impl<C: ApiClient> BareLoop<C> {
                 turn,
                 success: true,
                 error: None,
-                duration: turn_start.elapsed(),
+                duration: self.managers.clock().elapsed_since(turn_start),
                 input_tokens: turn_in,
                 output_tokens: turn_out,
                 stop_reason: stream_stop,
@@ -1593,7 +1632,7 @@ impl<C: ApiClient> BareLoop<C> {
         turn: usize,
         calls: &[PendingToolCall],
     ) -> Result<(), LoopError> {
-        let turn_start = Instant::now();
+        let turn_start = self.managers.clock().monotonic();
         let mut tool_calls: Vec<ToolCall> = Vec::with_capacity(calls.len());
         let mut slots: Vec<Option<MessagePart>> = vec![None; calls.len()];
         let mut dispatch_calls: Vec<ToolCall> = Vec::new();
@@ -1633,7 +1672,7 @@ impl<C: ApiClient> BareLoop<C> {
         let dispatched_parts: Vec<MessagePart> = self
             .dispatch_and_record(&dispatch_calls, turn, &accounting)
             .await?;
-        let turn_duration = accounting.start.elapsed();
+        let turn_duration = self.managers.clock().elapsed_since(accounting.start);
 
         debug_assert_eq!(
             dispatch_calls.len(),
@@ -1745,14 +1784,16 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             let session_is_new = self.session.session_start.is_none();
 
             if session_is_new {
-                self.session.session_start = Some(Instant::now());
+                self.session.session_start = Some(self.managers.clock().monotonic());
             }
 
             if run_config.reset_managers {
                 self.managers.reset_all()?;
             }
 
-            self.session.runs.push(Run::new(input, run_config));
+            self.session
+                .runs
+                .push(Self::new_run(input, run_config, &self.managers));
             self.notify_run_start();
             self.machine.accept_input(input);
             self.deferred_transient_tokens = 0;
@@ -1847,7 +1888,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
     ) -> Pin<Box<dyn Future<Output = RunResult> + Send + 'a>> {
         Box::pin(async move {
             if let Some(run) = self.session.current_run_mut() {
-                run.end = Some(Instant::now());
+                run.end = Some(self.managers.clock().monotonic());
                 run.stop_reason = error.cloned();
             }
 

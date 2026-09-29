@@ -10,10 +10,8 @@
 
 use super::{ApiClient, BareLoop, LoopError};
 #[cfg(feature = "hooks")]
-use super::{CompactTrigger, Instant, PostCompactContext, PreCompactContext};
+use super::{CompactTrigger, PostCompactContext, PreCompactContext};
 use crate::compact::EnsureContextResult;
-#[cfg(not(feature = "hooks"))]
-use std::time::Instant;
 
 use crate::capabilities::Compactable;
 #[cfg(feature = "hooks")]
@@ -130,7 +128,7 @@ impl<C: ApiClient> BareLoop<C> {
 
         #[cfg(feature = "hooks")]
         let messages_before = history.len();
-        let compact_start = Instant::now();
+        let compact_start = self.managers.clock().monotonic();
         let pre_snapshot = history.clone();
         #[cfg(feature = "hooks")]
         let (instructions, additional_context) = (hook.new_instructions, hook.additional_context);
@@ -173,12 +171,12 @@ impl<C: ApiClient> BareLoop<C> {
                 let tokens_saved = tokens_before.saturating_sub(tokens_after);
                 #[cfg(feature = "hooks")]
                 let messages_after = outcome.messages.len();
-                let telemetry = ctx_manager.build_telemetry(
+                let telemetry = ctx_manager.build_telemetry_with_duration(
                     reason,
                     &pre_snapshot,
                     &outcome.messages,
                     None,
-                    compact_start,
+                    self.managers.clock().elapsed_since(compact_start),
                 );
                 self.managers.observers().on_compaction(&CompactedContext {
                     tokens_before,
@@ -194,7 +192,7 @@ impl<C: ApiClient> BareLoop<C> {
                     messages_after,
                     tokens_after,
                     tokens_saved,
-                    compact_start.elapsed(),
+                    self.managers.clock().elapsed_since(compact_start),
                 );
                 Ok(CompactStepOutcome {
                     tokens_before,

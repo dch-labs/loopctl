@@ -582,7 +582,7 @@ impl<C: ApiClient> BareLoop<C> {
                 return Ok(refused);
             }
 
-            let start = Instant::now();
+            let start = self.managers.clock().monotonic();
             let tool_result = tokio::select! {
                 biased;
                 () = self.cancelled.notified() => return Err(LoopError::Cancelled),
@@ -774,7 +774,7 @@ impl<C: ApiClient> BareLoop<C> {
     ) -> ToolDispatchResult {
         if let Some(pipeline) = self.managers.pipeline() {
             return self
-                .dispatch_via_pipeline(pipeline, tc, tool_context, turn_idx)
+                .dispatch_via_pipeline(pipeline, tc, tool_context, start, turn_idx)
                 .await;
         }
 
@@ -785,20 +785,20 @@ impl<C: ApiClient> BareLoop<C> {
             match call_result {
                 Ok(Ok(result)) => Self::result_for_call(
                     tc,
-                    start.elapsed(),
+                    self.managers.clock().elapsed_since(start),
                     result.payload,
                     result.is_error,
                     result.display_hint,
                 ),
                 Ok(Err(e)) => Self::result_for_call(
                     tc,
-                    start.elapsed(),
+                    self.managers.clock().elapsed_since(start),
                     ToolContent::Text(e.to_string()),
                     true,
                     None,
                 ),
                 Err(panic_payload) => {
-                    let duration = start.elapsed();
+                    let duration = self.managers.clock().elapsed_since(start);
                     let msg = panic_payload
                         .downcast_ref::<&'static str>()
                         .map(std::string::ToString::to_string)
@@ -1044,14 +1044,21 @@ impl<C: ApiClient> BareLoop<C> {
     /// the gate's key from the resolved name
     /// [`record_tool_health`](Self::record_tool_health) records under;
     /// the two key spaces are identical for every pipeline that
-    /// renames nothing (no in-tree middleware renames). Observer
-    /// notifications are handled by the caller
-    /// ([`execute_tool_call`](Self::execute_tool_call)).
+    /// renames nothing (no in-tree middleware renames). The result's
+    /// `duration` is re-measured through the managers'
+    /// [`Clock`](crate::determinism::Clock) from the caller's
+    /// `start` — the pipeline core's internal `Instant` read never
+    /// reaches this result — so per-call durations are seam-sourced on
+    /// this path exactly as on the direct-registry path, and the span
+    /// covers the whole dispatch (middleware included), matching what
+    /// the direct path reports. Observer notifications are handled by
+    /// the caller ([`execute_tool_call`](Self::execute_tool_call)).
     async fn dispatch_via_pipeline(
         &self,
         pipeline: &ToolPipeline,
         tc: &ToolCall,
         tool_context: &ToolContext,
+        start: Instant,
         turn_idx: usize,
     ) -> ToolDispatchResult {
         let ctx = ToolDispatchContext {
@@ -1064,11 +1071,12 @@ impl<C: ApiClient> BareLoop<C> {
             tool_context: tool_context.clone(),
         };
         let dispatch_result = pipeline.invoke(ctx).await;
+        let duration = self.managers.clock().elapsed_since(start);
         ToolDispatchResult {
             tool_call_id: tc.id.clone(),
             output: dispatch_result.output,
             is_error: dispatch_result.is_error,
-            duration: dispatch_result.duration,
+            duration,
             resolved_tool_name: dispatch_result.resolved_tool_name,
             display_hint: dispatch_result.display_hint,
         }

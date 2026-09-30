@@ -69,6 +69,7 @@ use crate::compact::ContextManager;
 use crate::compact::demote::DemotionSink;
 use crate::detection::DetectionManager;
 use crate::detection::{ConvergenceAction, DetectedPattern};
+use crate::determinism::{Clock, IdGen, SystemClock, UuidIdGen};
 
 use crate::fallback::FallbackManager;
 #[cfg(feature = "hooks")]
@@ -123,7 +124,8 @@ pub use crate::capabilities::*;
 /// Call [`reset_all`](LoopManagers::reset_all) at the start of a new
 /// session to reinitialise the fallback, detection, and observer state.
 /// Optional managers (compaction, hooks, pipeline, stream handler,
-/// tool health) keep whatever they hold across it.
+/// tool health) keep whatever they hold across it, as do the clock and
+/// id seams — they are session infrastructure, not per-run state.
 pub struct LoopManagers {
     /// Circuit breaker for API model fallback.
     ///
@@ -208,6 +210,27 @@ pub struct LoopManagers {
     /// backend — demoted history is meant to outlive the breaker and
     /// detection state.
     demotion_sink: Arc<dyn crate::compact::demote::DemotionSink>,
+
+    /// The clock seam for every engine-side time read.
+    ///
+    /// Sessions and runs source their start instants from it, and every
+    /// duration the engine reports is measured through
+    /// [`elapsed_since`](crate::determinism::Clock::elapsed_since), so a
+    /// pinned clock makes those artifacts reproducible. Defaults to
+    /// [`SystemClock`](crate::determinism::SystemClock) — the live reads.
+    /// Persists across manager resets, like the memory backend: it is
+    /// session infrastructure, not per-run state.
+    clock: Arc<dyn Clock>,
+
+    /// The id seam for session and run identity.
+    ///
+    /// The engine mints the session id in its constructors and a run id at
+    /// every `run()` call through this generator, so a seeded generator
+    /// makes both reproducible. Defaults to
+    /// [`UuidIdGen`](crate::determinism::UuidIdGen) — fresh v4 values,
+    /// the exact pre-seam behavior. Persists across manager resets, like
+    /// the memory backend.
+    id_gen: Arc<dyn IdGen>,
 }
 
 impl LoopManagers {
@@ -237,6 +260,8 @@ impl LoopManagers {
             health_registry: None,
             memory: None,
             demotion_sink: Arc::new(crate::compact::demote::NoopDemotionSink),
+            clock: Arc::new(SystemClock),
+            id_gen: Arc::new(UuidIdGen),
         }
     }
 
@@ -513,6 +538,97 @@ impl LoopManagers {
         &self.demotion_sink
     }
 
+    /// Set the clock seam (builder-style).
+    ///
+    /// The engine sources every session/run start instant and every
+    /// reported duration from this clock, so installing a pinned
+    /// implementation (for example [`FixedClock`](crate::determinism::FixedClock))
+    /// makes those artifacts reproducible. Install before constructing the
+    /// loop — the session id is minted inside the constructors, and the
+    /// session's start instant is read from the same clock at the first
+    /// `run()`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::determinism::FixedClock;
+    /// use std::sync::Arc;
+    /// use std::time::UNIX_EPOCH;
+    ///
+    /// let managers = LoopManagers::new()
+    ///     .with_clock(Arc::new(FixedClock::new(UNIX_EPOCH)));
+    /// ```
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Set the clock seam.
+    ///
+    /// Non-consuming variant of [`with_clock`](Self::with_clock). Note that
+    /// a loop already constructed keeps reading the clock it was built
+    /// with — the swap only affects loops constructed afterwards.
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
+    }
+
+    /// Borrow the clock seam.
+    ///
+    /// Always configured — the default is
+    /// [`SystemClock`], the live reads, so
+    /// a loop without an explicit clock behaves exactly as the engine
+    /// always has.
+    #[must_use]
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
+    /// Set the id seam (builder-style).
+    ///
+    /// The engine mints the session id in its constructors and a run id at
+    /// every `run()` call through this generator, so installing a seeded
+    /// implementation (for example
+    /// [`SeededIdGen`](crate::determinism::SeededIdGen)) makes both
+    /// reproducible across engines built from the same seed. Install before
+    /// constructing the loop — the session id is minted inside the
+    /// constructors.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::determinism::SeededIdGen;
+    /// use std::sync::Arc;
+    ///
+    /// let managers = LoopManagers::new()
+    ///     .with_id_gen(Arc::new(SeededIdGen::new(42)));
+    /// ```
+    #[must_use]
+    pub fn with_id_gen(mut self, id_gen: Arc<dyn IdGen>) -> Self {
+        self.id_gen = id_gen;
+        self
+    }
+
+    /// Set the id seam.
+    ///
+    /// Non-consuming variant of [`with_id_gen`](Self::with_id_gen). Note
+    /// that a loop already constructed keeps the id generator it was built
+    /// with — the swap only affects loops constructed afterwards.
+    pub fn set_id_gen(&mut self, id_gen: Arc<dyn IdGen>) {
+        self.id_gen = id_gen;
+    }
+
+    /// Borrow the id seam.
+    ///
+    /// Always configured — the default is
+    /// [`UuidIdGen`], fresh v4 values, so a
+    /// loop without an explicit generator mints ids exactly as the engine
+    /// always has.
+    #[must_use]
+    pub fn id_gen(&self) -> &Arc<dyn IdGen> {
+        &self.id_gen
+    }
+
     /// Reset the fallback, detection, and observer managers to their
     /// initial state.
     ///
@@ -746,6 +862,35 @@ mod tests {
         assert!(
             Arc::ptr_eq(managers.demotion_sink(), &replacement),
             "set_demotion_sink replaces the configured sink"
+        );
+    }
+
+    #[test]
+    fn seams_install_via_builders_and_survive_reset_all() {
+        let clock: Arc<dyn Clock> = Arc::new(crate::determinism::FixedClock::new(
+            std::time::SystemTime::UNIX_EPOCH,
+        ));
+        let id_gen: Arc<dyn IdGen> = Arc::new(crate::determinism::SeededIdGen::new(9));
+        let managers = LoopManagers::new()
+            .with_clock(Arc::clone(&clock))
+            .with_id_gen(Arc::clone(&id_gen));
+        assert!(
+            Arc::ptr_eq(managers.clock(), &clock),
+            "with_clock installs the seam the accessor returns"
+        );
+        assert!(
+            Arc::ptr_eq(managers.id_gen(), &id_gen),
+            "with_id_gen installs the seam the accessor returns"
+        );
+
+        managers.reset_all().expect("reset succeeds");
+        assert!(
+            Arc::ptr_eq(managers.clock(), &clock),
+            "the clock seam survives a manager reset — session infrastructure, not per-run state"
+        );
+        assert!(
+            Arc::ptr_eq(managers.id_gen(), &id_gen),
+            "the id seam survives a manager reset like the memory backend"
         );
     }
 

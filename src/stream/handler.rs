@@ -36,6 +36,7 @@
 use crate::api::ApiClient;
 use crate::api::error::{ApiError, http_status_from_message, parse_retry_after};
 use crate::cancel::CancelSignal;
+use crate::determinism::{Rng, ThreadLocalRng};
 use crate::message::Message;
 use crate::stream::rate_limit;
 use crate::stream::{StreamAccumulator, StreamEvent, StreamStopReason, Usage};
@@ -268,16 +269,22 @@ impl StreamRetryConfig {
     /// The raw exponential backoff with [`jitter_factor`](Self::jitter_factor) applied.
     ///
     /// Returns [`base_delay`](Self::base_delay)`(attempt)` scaled by a random
-    /// factor in `[1 - jitter_factor, 1 + jitter_factor]`, drawn from
-    /// [`fastrand`]. Concurrent retries with the same attempt number get
-    /// different delays — avoiding a thundering herd where every client
-    /// retries on the same tick. When [`jitter_factor`](Self::jitter_factor)
-    /// is `0.0`, returns [`base_delay`](Self::base_delay) unchanged (no
-    /// randomness, no allocation).
+    /// factor in `[1 - jitter_factor, 1 + jitter_factor]`, drawn from the rng
+    /// seam's default — [`ThreadLocalRng`],
+    /// which delegates to [`fastrand`]. Concurrent retries with the same
+    /// attempt number get different delays — avoiding a thundering herd
+    /// where every client retries on the same tick. When
+    /// [`jitter_factor`](Self::jitter_factor) is `0.0`, returns
+    /// [`base_delay`](Self::base_delay) unchanged (no randomness, no
+    /// allocation).
     ///
     /// This is the delay [`StreamHandler`] sleeps between transport-retry
-    /// attempts; [`base_delay`](Self::base_delay) is the deterministic core
-    /// it composes on.
+    /// attempts when no rng is installed; a handler built with
+    /// [`with_rng`](StreamHandler::with_rng) draws the same jitter through
+    /// its pinned rng via
+    /// [`jittered_base_delay_with`](Self::jittered_base_delay_with).
+    /// [`base_delay`](Self::base_delay) is the deterministic core it
+    /// composes on.
     ///
     /// # Example
     ///
@@ -291,22 +298,38 @@ impl StreamRetryConfig {
     /// ```
     #[must_use]
     pub fn jittered_base_delay(&self, attempt: u32) -> Duration {
+        self.jittered_base_delay_with(attempt, &ThreadLocalRng)
+    }
+
+    /// The raw exponential backoff with jitter drawn from a caller-supplied rng.
+    ///
+    /// The pinned twin of [`jittered_base_delay`](Self::jittered_base_delay):
+    /// identical arithmetic, with the random factor drawn from `rng` instead
+    /// of the thread-local default. Two same-seed rngs produce the same delay
+    /// sequence, so a handler built with a
+    /// [`SeededRng`](crate::determinism::SeededRng) retries with reproducible
+    /// backoffs. The [`jitter_factor`](Self::jitter_factor) == `0.0`
+    /// short-circuit returns [`base_delay`](Self::base_delay) before
+    /// consulting `rng`, preserving the no-randomness contract.
+    #[must_use]
+    pub fn jittered_base_delay_with(&self, attempt: u32, rng: &dyn Rng) -> Duration {
         let base = self.base_delay(attempt);
         if self.jitter_factor == 0.0 {
             return base;
         }
-        let f = Self::random_signed_fraction() * self.jitter_factor;
+        let f = Self::signed_fraction(rng) * self.jitter_factor;
         base.mul_f64(1.0 + f)
     }
 
-    /// A random signed fraction in `[-1.0, 1.0)` from [`fastrand`].
+    /// A random signed fraction in `[-1.0, 1.0)` from `rng`.
     ///
-    /// Draws a uniform `f64` in `[0.0, 1.0)` from fastrand's thread-local
-    /// Wyrand PRNG and remaps it to `[-1.0, 1.0)`. Each call produces a
-    /// different result, so concurrent retries spread their backoffs.
-    #[must_use]
-    fn random_signed_fraction() -> f64 {
-        (fastrand::f64() - 0.5) * 2.0
+    /// Draws a uniform `f64` in `[0.0, 1.0)` and remaps it to `[-1.0, 1.0)`.
+    /// The default [`ThreadLocalRng`](crate::determinism::ThreadLocalRng)
+    /// draws from fastrand's thread-local Wyrand PRNG, so each call produces
+    /// a different result and concurrent retries spread their backoffs; a
+    /// seeded rng replays a fixed sequence.
+    fn signed_fraction(rng: &dyn Rng) -> f64 {
+        (rng.next_f64() - 0.5) * 2.0
     }
 
     /// Validates the configuration, returning an error message if invalid.
@@ -1452,6 +1475,17 @@ pub struct StreamHandler {
     /// handler proceeds anyway rather than hanging the agent. Defaults
     /// to 30 seconds.
     rate_limit_max_wait: Duration,
+
+    /// The rng seam for retry-backoff jitter.
+    ///
+    /// Drawn from by every transport-retry sleep via
+    /// [`jittered_base_delay_with`](StreamRetryConfig::jittered_base_delay_with).
+    /// Defaults to [`ThreadLocalRng`](crate::determinism::ThreadLocalRng) —
+    /// the live fastrand draw, exactly what the handler drew before the
+    /// seam existed; install a [`SeededRng`](crate::determinism::SeededRng)
+    /// with [`with_rng`](Self::with_rng) to make retry backoffs
+    /// reproducible.
+    rng: Arc<dyn Rng>,
 }
 
 impl fmt::Debug for StreamHandler {
@@ -1462,6 +1496,7 @@ impl fmt::Debug for StreamHandler {
             .field("rate_limit_config", &self.rate_limit_config)
             .field("rate_limiter", &self.rate_limiter)
             .field("rate_limit_max_wait", &self.rate_limit_max_wait)
+            .field("rng", &self.rng)
             .finish()
     }
 }
@@ -1527,6 +1562,7 @@ impl StreamHandler {
             },
             rate_limiter: None,
             rate_limit_max_wait: Duration::from_secs(30),
+            rng: Arc::new(ThreadLocalRng),
         }
     }
 
@@ -1570,7 +1606,42 @@ impl StreamHandler {
             rate_limit_config: RateLimitConfig::default(),
             rate_limiter: None,
             rate_limit_max_wait: Duration::from_secs(30),
+            rng: Arc::new(ThreadLocalRng),
         }
+    }
+
+    /// Set the rng seam for retry-backoff jitter, consuming `self`.
+    ///
+    /// Every transport-retry sleep draws its jitter factor from this rng
+    /// instead of the thread-local default, so a seeded rng makes the
+    /// retry ladder reproducible (and, pinned near zero, fast in tests).
+    /// The zero-`jitter_factor` short-circuit consults no rng either way.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::determinism::SeededRng;
+    /// use loopctl::stream::handler::StreamHandler;
+    /// use std::sync::Arc;
+    ///
+    /// let handler = StreamHandler::new()
+    ///     .with_rng(Arc::new(SeededRng::new(42)));
+    /// ```
+    #[must_use]
+    pub fn with_rng(mut self, rng: Arc<dyn Rng>) -> Self {
+        self.rng = rng;
+        self
+    }
+
+    /// Borrow the rng seam.
+    ///
+    /// Always configured — the default is
+    /// [`ThreadLocalRng`], the live
+    /// fastrand draw, so a handler without an explicit rng backs off
+    /// exactly as the handler always has.
+    #[must_use]
+    pub fn rng(&self) -> &Arc<dyn Rng> {
+        &self.rng
     }
 
     /// Set the timeout configuration, consuming `self`.
@@ -2109,7 +2180,9 @@ impl StreamHandler {
             }
             return ErrorAction::Fail(err);
         }
-        let delay = self.retry_config.jittered_base_delay(*transport_attempts);
+        let delay = self
+            .retry_config
+            .jittered_base_delay_with(*transport_attempts, self.rng.as_ref());
         let delay = clamp_delay_to_deadline(delay, total_deadline);
         *transport_attempts = transport_attempts.saturating_add(1);
         ErrorAction::Retry(delay)
@@ -2726,6 +2799,81 @@ mod tests {
                 "attempt {attempt}: delay {delay:?} exceeds 2x base under max jitter"
             );
         }
+    }
+
+    #[test]
+    fn pinned_rng_makes_jitter_deterministic() {
+        let config = StreamRetryConfig {
+            base_delay_ms: 100,
+            max_delay_ms: 100_000,
+            jitter_factor: 1.0,
+            ..Default::default()
+        };
+        let left_rng = crate::determinism::SeededRng::new(21);
+        let right_rng = crate::determinism::SeededRng::new(21);
+        let left: Vec<_> = (0..4)
+            .map(|attempt| config.jittered_base_delay_with(attempt, &left_rng))
+            .collect();
+        let right: Vec<_> = (0..4)
+            .map(|attempt| config.jittered_base_delay_with(attempt, &right_rng))
+            .collect();
+        assert_eq!(
+            left, right,
+            "two same-seed rngs must produce the identical jitter sequence"
+        );
+        let base: Vec<_> = (0..4).map(|attempt| config.base_delay(attempt)).collect();
+        assert_ne!(
+            left, base,
+            "full jitter must move at least one attempt off the raw backoff"
+        );
+    }
+
+    #[test]
+    fn zero_jitter_short_circuits_before_consulting_the_rng() {
+        struct CountingRng {
+            draws: std::sync::atomic::AtomicUsize,
+        }
+        impl crate::determinism::Rng for CountingRng {
+            fn next_f64(&self) -> f64 {
+                self.draws.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                0.5
+            }
+        }
+        impl std::fmt::Debug for CountingRng {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("CountingRng")
+            }
+        }
+
+        let config = StreamRetryConfig {
+            jitter_factor: 0.0,
+            ..Default::default()
+        };
+        let rng = CountingRng {
+            draws: std::sync::atomic::AtomicUsize::new(0),
+        };
+        for attempt in 0..5 {
+            assert_eq!(
+                config.jittered_base_delay_with(attempt, &rng),
+                config.base_delay(attempt),
+                "zero jitter must reproduce the raw backoff exactly"
+            );
+        }
+        assert_eq!(
+            rng.draws.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the zero-jitter short-circuit must not consult the rng"
+        );
+    }
+
+    #[test]
+    fn with_rng_replaces_the_handler_s_rng() {
+        let rng: Arc<dyn crate::determinism::Rng> = Arc::new(crate::determinism::SeededRng::new(5));
+        let handler = StreamHandler::new().with_rng(Arc::clone(&rng));
+        assert!(
+            Arc::ptr_eq(handler.rng(), &rng),
+            "with_rng installs the rng the accessor returns"
+        );
     }
 
     #[test]

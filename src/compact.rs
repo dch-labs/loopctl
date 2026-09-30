@@ -65,7 +65,7 @@ use std::future::Future;
 use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub mod demote;
 pub mod truncating;
@@ -1109,6 +1109,56 @@ impl ContextManager {
         compactor_name: Option<&str>,
         start: Instant,
     ) -> CompactTelemetry {
+        self.build_telemetry_with_duration(
+            trigger,
+            pre_messages,
+            post_messages,
+            compactor_name,
+            start.elapsed(),
+        )
+    }
+
+    /// Build a compaction [`CompactTelemetry`] with a caller-measured duration.
+    ///
+    /// The pinned twin of [`build_telemetry`](Self::build_telemetry): identical
+    /// statistics, with the compaction duration supplied by the caller instead
+    /// of measured from a start instant — so an engine holding a
+    /// [`Clock`](crate::determinism::Clock) seam reports durations measured
+    /// through it and a pinned clock yields reproducible telemetry. Hosts
+    /// measuring by hand pass the same value they would have derived from
+    /// `start.elapsed()`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use loopctl::compact::{CompactReason, ContextManager, TruncatingCompactor};
+    /// use loopctl::message::Message;
+    ///
+    /// let manager = ContextManager::new(Arc::new(TruncatingCompactor::new()))
+    ///     .with_context_window(200_000);
+    /// let pre = vec![Message::user("a long conversation now summarized")];
+    /// let post = vec![Message::user("summary")];
+    /// let telemetry = manager.build_telemetry_with_duration(
+    ///     CompactReason::ThresholdExceeded,
+    ///     &pre,
+    ///     &post,
+    ///     Some("QaSummarizer"),
+    ///     Duration::from_millis(12),
+    /// );
+    /// assert_eq!(telemetry.duration, Duration::from_millis(12));
+    /// assert_eq!(telemetry.compactor_name.as_deref(), Some("QaSummarizer"));
+    /// ```
+    #[must_use]
+    pub fn build_telemetry_with_duration(
+        &self,
+        trigger: CompactReason,
+        pre_messages: &[Message],
+        post_messages: &[Message],
+        compactor_name: Option<&str>,
+        duration: Duration,
+    ) -> CompactTelemetry {
         let pre_tokens = CompactionOutcome::estimate_tokens(pre_messages);
         let post_tokens = CompactionOutcome::estimate_tokens(post_messages);
         let tokens_saved = pre_tokens.saturating_sub(post_tokens);
@@ -1179,7 +1229,7 @@ impl ContextManager {
                 assistant_tokens: post_tokens.saturating_sub(post_user_tokens),
                 density: tokens_per_message(post_tokens, post_messages.len()),
             },
-            duration: start.elapsed(),
+            duration,
             compression_ratio,
             headroom_pct,
             compactor_name: compactor_name.map(str::to_string),

@@ -8,6 +8,7 @@
 use super::*;
 use crate::api::error::ApiError;
 use crate::capabilities::FallbackCapable;
+use crate::determinism::IdGen;
 use crate::engine::core::Loop;
 use crate::fallback::FallbackManager;
 use crate::observer::{LoopObserver, ModelSwitchedContext, StreamFailureContext};
@@ -1811,6 +1812,378 @@ async fn the_success_turn_end_duration_excludes_the_context_recount() {
         duration_ms < SLOW_RECOUNT_DELAY_MS / 2,
         "the tool-phase duration must exclude the {SLOW_RECOUNT_DELAY_MS}ms context recount: {duration_ms}ms"
     );
+}
+
+/// A clock whose monotonic half advances a fixed step per read.
+///
+/// Deterministic timing without sleeps: every `monotonic()` call returns
+/// the base instant advanced by one step per prior read, so any duration
+/// the engine measures through the seam is an exact multiple of the step.
+#[derive(Debug)]
+struct StepClock {
+    /// The zeroth reading, captured once at construction.
+    ///
+    /// Every monotonic read returns this instant advanced by `step` times
+    /// the number of prior reads, so the sequence is reproducible from a
+    /// single captured base — no re-reading the real clock mid-test.
+    base: Instant,
+
+    /// The fixed advance per monotonic read.
+    ///
+    /// The quantum of every duration the engine can measure through the
+    /// seam: each elapsed span is an exact multiple of this step, which
+    /// the duration pins assert on.
+    step: Duration,
+
+    /// Reads served so far.
+    ///
+    /// Counts monotonic calls to derive the next reading's multiplier;
+    /// atomic because the engine may consult the clock from tool futures.
+    calls: AtomicUsize,
+}
+
+impl StepClock {
+    /// Freeze a clock advancing `step` per read from now.
+    ///
+    /// The base is captured from the real clock once, here — after
+    /// construction the clock is fully deterministic and never touches
+    /// the system again.
+    fn new(step: Duration) -> Self {
+        Self {
+            base: Instant::now(),
+            step,
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl crate::determinism::Clock for StepClock {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::UNIX_EPOCH
+    }
+
+    fn monotonic(&self) -> Instant {
+        let reads = u32::try_from(self.calls.fetch_add(1, Ordering::SeqCst)).unwrap_or(0);
+        let offset = self.step.checked_mul(reads).unwrap_or(Duration::MAX);
+        self.base.checked_add(offset).unwrap_or(self.base)
+    }
+}
+
+fn recording_agent(client: RecordingClient, managers: LoopManagers) -> BareLoop<RecordingClient> {
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    BareLoop::new_with_managers(Arc::new(client), registry, make_config(), managers)
+}
+
+#[tokio::test]
+async fn default_seams_match_current_behavior() {
+    let plain_client = RecordingClient::new("test-model");
+    plain_client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
+    let mut plain_agent = recording_agent(plain_client.clone(), LoopManagers::new());
+    plain_agent
+        .run("echo hi", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let explicit_client = RecordingClient::new("test-model");
+    explicit_client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
+    let mut explicit_agent = recording_agent(
+        explicit_client.clone(),
+        LoopManagers::new()
+            .with_clock(Arc::new(crate::determinism::SystemClock))
+            .with_id_gen(Arc::new(crate::determinism::UuidIdGen)),
+    );
+    explicit_agent
+        .run("echo hi", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let plain_seen = crate::error::recover_guard(plain_client.seen.lock()).clone();
+    let explicit_seen = crate::error::recover_guard(explicit_client.seen.lock()).clone();
+    let plain_rendered = serde_json::to_string(&plain_seen).unwrap();
+    let explicit_rendered = serde_json::to_string(&explicit_seen).unwrap();
+    assert_eq!(
+        plain_rendered, explicit_rendered,
+        "explicit default seams and the implicit defaults produce identical requests"
+    );
+    assert_eq!(
+        plain_seen.len(),
+        2,
+        "the tool-turn script issues exactly two requests: {plain_seen:?}"
+    );
+    assert_eq!(
+        plain_agent.session().id.get_version_num(),
+        4,
+        "the implicit default mints a live v4 session id"
+    );
+    assert_eq!(
+        explicit_agent.session().id.get_version_num(),
+        4,
+        "the explicit default mints a live v4 session id"
+    );
+    assert_ne!(
+        plain_agent.session().id,
+        explicit_agent.session().id,
+        "the default id gen is the live v4 draw, not a constant"
+    );
+}
+
+#[tokio::test]
+async fn pinned_seams_produce_identical_request_bytes_across_runs() {
+    let left_client = RecordingClient::new("test-model");
+    left_client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
+    left_client.add_text_response("second answer");
+    let mut left_agent = recording_agent(
+        left_client.clone(),
+        LoopManagers::new()
+            .with_clock(Arc::new(crate::determinism::FixedClock::new(
+                std::time::UNIX_EPOCH,
+            )))
+            .with_id_gen(Arc::new(crate::determinism::SeededIdGen::new(7))),
+    );
+    left_agent
+        .run("echo hi", &RunConfig::default())
+        .await
+        .unwrap();
+    left_agent
+        .run("again", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let right_client = RecordingClient::new("test-model");
+    right_client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
+    right_client.add_text_response("second answer");
+    let mut right_agent = recording_agent(
+        right_client.clone(),
+        LoopManagers::new()
+            .with_clock(Arc::new(crate::determinism::FixedClock::new(
+                std::time::UNIX_EPOCH,
+            )))
+            .with_id_gen(Arc::new(crate::determinism::SeededIdGen::new(7))),
+    );
+    right_agent
+        .run("echo hi", &RunConfig::default())
+        .await
+        .unwrap();
+    right_agent
+        .run("again", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let left_seen = crate::error::recover_guard(left_client.seen.lock()).clone();
+    let right_seen = crate::error::recover_guard(right_client.seen.lock()).clone();
+    let left_rendered = serde_json::to_string(&left_seen).unwrap();
+    let right_rendered = serde_json::to_string(&right_seen).unwrap();
+    assert_eq!(
+        left_rendered, right_rendered,
+        "two engines from the same seeds issue identical requests, turn for turn"
+    );
+    assert_eq!(
+        left_agent.session().id,
+        right_agent.session().id,
+        "the pinned id seam mints the same session id in both engines"
+    );
+    let left_runs: Vec<_> = left_agent.session().runs.iter().map(|run| run.id).collect();
+    let right_runs: Vec<_> = right_agent
+        .session()
+        .runs
+        .iter()
+        .map(|run| run.id)
+        .collect();
+    assert_eq!(
+        left_runs, right_runs,
+        "the pinned id seam mints the same run ids, position for position"
+    );
+    assert_ne!(
+        left_agent.session().id,
+        left_runs[0],
+        "the seeded sequence advances — the session id and the first run id differ"
+    );
+    assert_ne!(
+        left_runs[0], left_runs[1],
+        "successive runs draw successive ids from the seeded sequence"
+    );
+}
+
+#[tokio::test]
+async fn engine_session_and_run_ids_come_from_the_id_gen_seam() {
+    let client = RecordingClient::new("test-model");
+    client.add_text_response("first answer");
+    client.add_text_response("second answer");
+    let mut agent = recording_agent(
+        client,
+        LoopManagers::new().with_id_gen(Arc::new(crate::determinism::SeededIdGen::new(123))),
+    );
+    agent.run("one", &RunConfig::default()).await.unwrap();
+    agent.run("two", &RunConfig::default()).await.unwrap();
+
+    let oracle = crate::determinism::SeededIdGen::new(123);
+    assert_eq!(
+        agent.session().id,
+        oracle.next_id(),
+        "the session id is the seeded sequence's first draw"
+    );
+    assert_eq!(
+        agent.session().runs[0].id,
+        oracle.next_id(),
+        "the first run's id is the seeded sequence's second draw"
+    );
+    assert_eq!(
+        agent.session().runs[1].id,
+        oracle.next_id(),
+        "the second run's id is the seeded sequence's third draw"
+    );
+}
+
+#[tokio::test]
+async fn engine_durations_come_from_the_clock_seam() {
+    let client = RecordingClient::new("test-model");
+    client.add_text_response("all done");
+    let mut agent = recording_agent(
+        client,
+        LoopManagers::new().with_clock(Arc::new(StepClock::new(Duration::from_millis(7)))),
+    );
+    let run = agent.run("hi", &RunConfig::default()).await.unwrap();
+
+    let millis = run.duration().as_millis();
+    assert!(
+        millis > 0,
+        "the stepping clock must advance the run's measured span past zero: {millis}ms"
+    );
+    assert_eq!(
+        millis % 7,
+        0,
+        "every engine-measured duration is an exact multiple of the clock's 7ms step: {millis}ms"
+    );
+}
+
+/// Records each tool-post event's reported per-call duration.
+///
+/// Shared with the test body, which drains it after the run and checks
+/// the duration the engine reported for each dispatched tool call.
+struct ToolPostDurationRecorder {
+    /// One duration per `on_tool_post` dispatch, in event order.
+    durations: Arc<Mutex<Vec<Duration>>>,
+}
+
+impl crate::observer::LoopObserver for ToolPostDurationRecorder {
+    fn name(&self) -> &'static str {
+        "tool-post-duration-recorder"
+    }
+
+    fn on_tool_post(&self, ctx: &crate::observer::ToolPostContext) {
+        crate::error::recover_guard(self.durations.lock()).push(ctx.duration);
+    }
+}
+
+/// Records each compaction event's telemetry duration.
+///
+/// Shared with the test body, which drains it after the run and checks
+/// the compaction durations the engine measured and reported.
+struct CompactionDurationRecorder {
+    /// One telemetry duration per `on_compaction` dispatch, in event order.
+    durations: Arc<Mutex<Vec<Duration>>>,
+}
+
+impl crate::observer::LoopObserver for CompactionDurationRecorder {
+    fn name(&self) -> &'static str {
+        "compaction-duration-recorder"
+    }
+
+    fn on_compaction(&self, ctx: &crate::observer::CompactedContext) {
+        crate::error::recover_guard(self.durations.lock()).push(ctx.telemetry.duration);
+    }
+}
+
+#[tokio::test]
+async fn pipeline_tool_durations_come_from_the_clock_seam() {
+    let client = MockClient::new("test-model");
+    client.add_tool_then_text("tool_1", "echo", &json!({"message": "hi"}), "done");
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let durations = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        registry,
+        make_config(),
+        LoopManagers::new().with_clock(Arc::new(crate::determinism::FixedClock::new(
+            std::time::SystemTime::UNIX_EPOCH,
+        ))),
+    );
+    agent.register_observer(Arc::new(ToolPostDurationRecorder {
+        durations: Arc::clone(&durations),
+    }));
+    agent.run("hi", &RunConfig::default()).await.unwrap();
+
+    let recorded = crate::error::recover_guard(durations.lock()).clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the scripted tool turn dispatches exactly one tool call: {recorded:?}"
+    );
+    assert_eq!(
+        recorded[0],
+        Duration::ZERO,
+        "the default-installed pipeline path must report the seam-sourced duration — \
+         a frozen clock elapses zero, never real wall-clock time"
+    );
+}
+
+#[tokio::test]
+async fn compaction_telemetry_durations_come_from_the_clock_seam() {
+    let client = MockClient::new("test-model");
+    // Drive enough tokens to trip a low threshold, then finish; the second
+    // run guarantees the trip even if the first stays under the line.
+    client.add_text_response(&"x".repeat(200));
+    client.add_text_response("done");
+    client.add_text_response("done again");
+    let durations = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config()
+            .with_context_window(100)
+            .with_compact_threshold(20),
+        LoopManagers::new().with_clock(Arc::new(StepClock::new(Duration::from_millis(7)))),
+    );
+    agent.set_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(
+            crate::compact::TruncatingCompactor::new()
+                .with_preserve_recent(1)
+                .with_min_messages(2),
+        ))
+        .with_context_window(100)
+        .with_threshold(20),
+    ));
+    agent.register_observer(Arc::new(CompactionDurationRecorder {
+        durations: Arc::clone(&durations),
+    }));
+    agent
+        .run("fill it up", &RunConfig::default())
+        .await
+        .unwrap();
+    agent
+        .run("second run", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let recorded = crate::error::recover_guard(durations.lock()).clone();
+    assert!(
+        !recorded.is_empty(),
+        "precondition: the low threshold tripped at least one compaction pass"
+    );
+    for (idx, duration) in recorded.iter().enumerate() {
+        assert!(
+            *duration >= Duration::from_millis(7),
+            "compaction {idx}: a stepping clock reports at least one 7ms step, got {duration:?}"
+        );
+        assert_eq!(
+            duration.as_nanos() % 7_000_000,
+            0,
+            "compaction {idx}: the telemetry duration is an exact multiple of the \
+             clock's 7ms step: {duration:?}"
+        );
+    }
 }
 
 #[tokio::test]

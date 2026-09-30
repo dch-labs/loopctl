@@ -589,6 +589,14 @@ impl Run {
     /// fields. The framework fills in turns, token totals, and the terminal
     /// outcome as the run progresses.
     ///
+    /// This is the unpinned path: the id is a live v4 draw and the start
+    /// instant a live monotonic read. The engine builds its own runs
+    /// through the [`IdGen`](crate::determinism::IdGen) and
+    /// [`Clock`](crate::determinism::Clock) seams instead, so a host that
+    /// needs reproducible run records installs pinned implementations on
+    /// [`LoopManagers`](crate::managers::LoopManagers) before constructing
+    /// a loop.
+    ///
     /// # Example
     ///
     /// ```
@@ -752,7 +760,12 @@ impl Session {
     /// Create a new session with a fresh random id and the given config.
     ///
     /// The session starts with `session_start = None` (set on the first
-    /// `run()` call) and an empty run list.
+    /// `run()` call) and an empty run list. This is the unpinned path:
+    /// the id is a live v4 draw. The engine constructs its own sessions
+    /// through the [`IdGen`](crate::determinism::IdGen) seam instead, so
+    /// a host that needs reproducible session ids installs a pinned
+    /// generator on [`LoopManagers`](crate::managers::LoopManagers)
+    /// before constructing a loop.
     #[must_use]
     pub fn new(config: crate::config::SessionConfig) -> Self {
         Self {

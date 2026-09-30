@@ -108,6 +108,25 @@ fn sse_event_type(line: &str) -> Option<&str> {
     Some(event.strip_prefix(' ').unwrap_or(event))
 }
 
+/// The replayable tail of a reasoning trace.
+///
+/// Conclusions arrive last, so an over-long trace keeps its tail and
+/// drops its head; the cap bounds a pathological turn's replay size
+/// without losing the part the next turn needs most. Shared by the
+/// OpenAI and Anthropic replay renderers so the cap cannot drift
+/// between the two dialects.
+#[cfg(any(feature = "openai", feature = "anthropic"))]
+pub(super) fn replay_reasoning_tail(text: &str) -> String {
+    const MAX_REPLAY_REASONING_CHARS: usize = 32_768;
+    let count = text.chars().count();
+    if count <= MAX_REPLAY_REASONING_CHARS {
+        return text.to_string();
+    }
+    text.chars()
+        .skip(count.saturating_sub(MAX_REPLAY_REASONING_CHARS))
+        .collect()
+}
+
 /// Maximum accepted response body size (10 MB).
 ///
 /// Guards against unbounded memory growth from a misbehaving or hostile
@@ -1281,6 +1300,48 @@ mod tests {
 
     #[cfg(feature = "testing")]
     use crate::testing::EnvGuard;
+
+    #[cfg(any(feature = "openai", feature = "anthropic"))]
+    #[test]
+    fn replay_reasoning_tail_keeps_exactly_the_last_32_768_chars() {
+        let at_cap = "a".repeat(32_768);
+        assert_eq!(
+            replay_reasoning_tail(&at_cap),
+            at_cap,
+            "a trace at the cap passes through whole"
+        );
+
+        let over_cap = format!("{}{}", 'b', "c".repeat(32_768));
+        let tail = replay_reasoning_tail(&over_cap);
+        assert_eq!(
+            tail.chars().count(),
+            32_768,
+            "a trace one char over the cap drops exactly its head: {tail}"
+        );
+        assert!(
+            tail.starts_with('c') && !tail.starts_with('b'),
+            "the head is dropped, the tail kept"
+        );
+
+        let multibyte_at_cap = format!("{}{}", "é".repeat(16_385), "x".repeat(16_383));
+        assert_eq!(
+            replay_reasoning_tail(&multibyte_at_cap),
+            multibyte_at_cap,
+            "the cap counts chars, not bytes — a 49 153-byte trace of 32 768 chars stays whole"
+        );
+
+        let multibyte_over = format!("{}{}", "é".repeat(16_386), "x".repeat(16_383));
+        let tail = replay_reasoning_tail(&multibyte_over);
+        assert_eq!(
+            tail.chars().count(),
+            32_768,
+            "a one-char overflow drops one whole multi-byte char, never half of one"
+        );
+        assert!(
+            tail.starts_with('é'),
+            "the surviving head is a complete character"
+        );
+    }
 
     #[cfg(all(feature = "azure", feature = "testing"))]
     #[test]

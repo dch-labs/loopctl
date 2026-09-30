@@ -71,6 +71,16 @@ const TEXT_PART_INDEX: usize = 0;
 /// thinking deltas, and the lanes interleave in any order.
 const THINKING_PART_INDEX: usize = 1;
 
+/// Total deadline for one metadata probe request.
+///
+/// The probes ride the client's pooled HTTP layer but override its
+/// read-idleness timeout with this shorter per-request deadline — a
+/// total bound that covers connecting through body completion, so a
+/// metadata endpoint that accepts the connection and never answers
+/// costs run start seconds, not the conversational timeout's minutes,
+/// and answers `None` (fail-soft) when the deadline fires.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The per-model state of a context-window probe.
 ///
 /// Distinguishes "never asked" from "asked and the endpoint disclosed
@@ -339,9 +349,7 @@ impl OpenAiClient {
         api_key: &str,
         body: &Value,
     ) -> Result<reqwest::Response, ApiError> {
-        let mut bearer = reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
-            .map_err(|e| ApiError::auth_invalid_key(format!("invalid bearer token: {e}")))?;
-        bearer.set_sensitive(true);
+        let bearer = bearer_header(api_key)?;
         super::post_json_checked(http, url, &[(reqwest::header::AUTHORIZATION, bearer)], body).await
     }
 
@@ -365,10 +373,11 @@ impl OpenAiClient {
     /// `/api/show` for the current model; the first endpoint that
     /// answers a usable window wins, and a failed or absent answer is
     /// `None` — the caller's declared window then stands. Both probes
-    /// reuse the client's pooled HTTP layer and its configured
-    /// timeouts, and the answer caches for the current model: a probe
-    /// that started under a model a hot-swap replaced returns its
-    /// value to its own caller but does not poison the cache.
+    /// reuse the client's pooled HTTP layer under their own short total
+    /// deadline ([`PROBE_TIMEOUT`]), and the answer caches for the
+    /// current model: a probe that started under a model a hot-swap
+    /// replaced returns its value to its own caller but does not
+    /// poison the cache.
     async fn probe_context_window(&self) -> Option<u64> {
         {
             let cache = crate::error::recover_guard(self.context_window_probe.lock());
@@ -411,12 +420,12 @@ impl OpenAiClient {
     /// is what any single request must fit.
     async fn probe_llama_cpp_props(&self, root: &str) -> Option<u64> {
         let url = format!("{root}/props");
-        let api_key = self.api_key.clone();
+        let bearer = bearer_header(&self.api_key).ok()?;
         let response = self
             .probe_request(|| {
                 self.http
                     .get(&url)
-                    .header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
+                    .header(reqwest::header::AUTHORIZATION, bearer)
             })
             .await?;
         let body = self.probe_body(response).await?;
@@ -443,13 +452,13 @@ impl OpenAiClient {
     async fn probe_ollama_show(&self, root: &str) -> Option<u64> {
         let url = format!("{root}/api/show");
         let model = self.model();
-        let api_key = self.api_key.clone();
+        let bearer = bearer_header(&self.api_key).ok()?;
         let payload = serde_json::json!({ "model": model });
         let response = self
             .probe_request(|| {
                 self.http
                     .post(&url)
-                    .header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
+                    .header(reqwest::header::AUTHORIZATION, bearer)
                     .json(&payload)
             })
             .await?;
@@ -466,13 +475,17 @@ impl OpenAiClient {
 
     /// Run one probe request, mapping failure to `None` plus a metric.
     ///
-    /// The request builder is supplied lazily so the payload (and its
-    /// borrows) is constructed only when the request actually runs.
+    /// The request carries the probe's own total deadline
+    /// ([`PROBE_TIMEOUT`]) regardless of the client's configured
+    /// timeouts — a wedged metadata endpoint must not stall a run's
+    /// start on the conversational read timeout. The request builder
+    /// is supplied lazily so the payload (and its borrows) is
+    /// constructed only when the request actually runs.
     async fn probe_request(
         &self,
         build: impl FnOnce() -> reqwest::RequestBuilder,
     ) -> Option<reqwest::Response> {
-        match build().send().await {
+        match build().timeout(PROBE_TIMEOUT).send().await {
             Ok(response) if response.status().is_success() => Some(response),
             Ok(response) => {
                 Self::emit_probe_failure("http", response.status().as_u16());
@@ -492,21 +505,18 @@ impl OpenAiClient {
 
     /// Read a probe response's body, mapping failure to `None`.
     ///
-    /// The text of a successful probe response; a read failure counts
-    /// as an http-shaped probe failure and contributes nothing.
+    /// The text of a successful probe response, read through the
+    /// crate's bounded-body control (the same ceiling the completion
+    /// paths enforce) so a hostile or malfunctioning endpoint cannot
+    /// exhaust memory with an oversized metadata document; a read
+    /// failure — an over-cap body included — counts as an http-shaped
+    /// probe failure and contributes nothing.
     async fn probe_body(&self, response: reqwest::Response) -> Option<String> {
-        match response.text().await {
-            Ok(body) => Some(body),
-            Err(error) => {
-                let kind = if error.is_timeout() {
-                    "timeout"
-                } else {
-                    "http"
-                };
-                Self::emit_probe_failure(kind, 0);
-                None
-            }
-        }
+        let Ok(bytes) = super::read_bounded_body(response).await else {
+            Self::emit_probe_failure("http", 0);
+            return None;
+        };
+        Some(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// Parse a probe body as JSON, mapping a parse failure to `None`.
@@ -548,6 +558,26 @@ fn is_version_segment(segment: &str) -> bool {
     let rest = segment.strip_prefix('v').unwrap_or("");
     let mut chars = rest.chars();
     chars.next().is_some_and(|first| first.is_ascii_digit())
+}
+
+/// The bearer `Authorization` header for `api_key`, marked sensitive.
+///
+/// The single construction site for the credential header the
+/// completions path and both metadata probes send: the sensitivity
+/// marker keeps the credential out of debug output and HTTP/2 header
+/// indexing, exactly as [`post_json_checked`](super::post_json_checked)'s
+/// contract requires of its callers.
+///
+/// # Errors
+///
+/// Returns [`ApiError::auth_invalid_key`] when the key cannot form a
+/// header value (non-ASCII or control characters) — the same loud
+/// failure the completions path has always raised.
+fn bearer_header(api_key: &str) -> Result<reqwest::header::HeaderValue, ApiError> {
+    let mut bearer = reqwest::header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+        .map_err(|e| ApiError::auth_invalid_key(format!("invalid bearer token: {e}")))?;
+    bearer.set_sensitive(true);
+    Ok(bearer)
 }
 
 impl ApiClient for OpenAiClient {
@@ -1333,7 +1363,7 @@ fn convert_message(m: &Message, replay_reasoning: bool) -> Vec<Value> {
         match p {
             MessagePart::Text { text } => text_parts.push(text.as_str()),
             MessagePart::Thinking { text, .. } if replay_reasoning && !text.is_empty() => {
-                reasoning_parts.push(super::anthropic::replay_reasoning_tail(text));
+                reasoning_parts.push(super::replay_reasoning_tail(text));
             }
             MessagePart::ToolCall { id, name, input } => {
                 tool_calls.push(serde_json::json!({
@@ -2274,6 +2304,24 @@ mod tests {
     use super::*;
     use crate::message::{Message, MessagePart, Role, ToolContent};
     use crate::tool::ToolSchema;
+
+    #[test]
+    fn bearer_headers_are_marked_sensitive() {
+        let header = bearer_header("sk-test").expect("a well-formed key builds a header");
+        assert!(
+            header.is_sensitive(),
+            "the bearer header carries the sensitivity marker so redaction layers skip the credential"
+        );
+        assert_eq!(
+            header.to_str().expect("the header renders"),
+            "Bearer sk-test",
+            "the header value is unchanged — only its sensitivity classification moves"
+        );
+        assert!(
+            bearer_header("bad\nkey").is_err(),
+            "a key that cannot form a header value fails loudly, as the completions path always did"
+        );
+    }
 
     #[test]
     fn openai_emitter_part_lane_default_closed() {

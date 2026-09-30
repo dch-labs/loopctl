@@ -355,6 +355,20 @@ pub struct BareLoop<C: ApiClient> {
     /// [`switch_model`](Self::switch_model) apply, so the next run
     /// re-probes for the new model.
     context_window: Option<u64>,
+
+    /// Whether the installed context manager's window came from a
+    /// probe-backed resolution.
+    ///
+    /// Armed when a disclosed window re-syncs the manager, consumed by
+    /// the next probe-less resolution, which re-syncs the manager back
+    /// to the declared
+    /// [`context_window`](crate::config::SessionConfig::context_window)
+    /// so the machine's trigger and the manager's targeting share one
+    /// number again instead of splitting across a disclosure the
+    /// current model no longer offers. A manager a probe never touched
+    /// is never rewritten: the flag is armed only by the engine's own
+    /// sync.
+    manager_synced_from_probe: bool,
 }
 
 /// Per-turn accounting forwarded from [`handle_call_tools`](BareLoop::handle_call_tools)
@@ -536,6 +550,7 @@ impl<C: ApiClient> BareLoop<C> {
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
             turn_mode: default_turn_mode(),
             context_window: None,
+            manager_synced_from_probe: false,
         };
         Self::wire_default_profile(&mut loop_);
         loop_
@@ -723,9 +738,13 @@ impl<C: ApiClient> BareLoop<C> {
     /// emitted when the value changed — first resolution included.
     /// Only a disclosed window re-syncs the installed
     /// [`ContextManager`] (the same sync a model switch performs): a
-    /// probe-less resolution leaves the installed manager exactly as
-    /// the host built it — the declaration governs the machine's
-    /// trigger, not a rewrite of the manager's own targeting.
+    /// probe-less resolution leaves a host-built manager exactly as
+    /// the host installed it, but reverts a manager an earlier probe
+    /// synced back to the declared window — the trigger and the
+    /// compaction target must not split across a disclosure the
+    /// current model no longer offers. The caller races this against
+    /// the cancel signal: a cancel during the probe ends the run
+    /// typed `Cancelled` without waiting the probe out.
     async fn resolve_context_window(&mut self) {
         if self.session.config.context_window == 0 {
             self.context_window = Some(0);
@@ -748,18 +767,23 @@ impl<C: ApiClient> BareLoop<C> {
         self.context_window = Some(window);
         if probed {
             self.sync_manager_window(window);
+            self.manager_synced_from_probe = true;
+        } else if self.manager_synced_from_probe {
+            self.manager_synced_from_probe = false;
+            self.sync_manager_window(declared);
         }
     }
 
-    /// Re-sync the installed context manager to a disclosed window.
+    /// Re-sync the installed context manager to a resolved window.
     ///
-    /// Called only from a probe-backed resolution — the disclosure
+    /// Called from the probe-backed resolution (the disclosure
     /// outranks even a host-installed manager's own window, because
     /// the manager keeps its own copy for targeting and fit checks
     /// and without this re-sync the machine would trigger on the
     /// disclosed number while the manager compacted toward the stale
-    /// one. The same clone-and-sync a model switch's window change
-    /// performs.
+    /// one) and from the probe-less resolution that reverts an
+    /// earlier probe's sync. The same clone-and-sync a model switch's
+    /// window change performs.
     fn sync_manager_window(&mut self, window: u64) {
         if let Some(manager) = self.managers.context_manager()
             && manager.context_window() != window
@@ -929,6 +953,7 @@ impl<C: ApiClient> BareLoop<C> {
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
             turn_mode: default_turn_mode(),
             context_window: None,
+            manager_synced_from_probe: false,
         };
         Self::wire_default_profile(&mut loop_);
         loop_
@@ -1038,6 +1063,7 @@ impl<C: ApiClient> BareLoop<C> {
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
             turn_mode: default_turn_mode(),
             context_window: None,
+            manager_synced_from_probe: false,
         };
         Self::wire_default_profile(&mut loop_);
         loop_
@@ -1052,8 +1078,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// no compaction machinery of its own, so the session's auto-compaction
     /// trigger is never an alarm without a sprinkler. Hosts that want
     /// different behavior install their own manager: the declaration
-    /// never rewrites it, and only a provider-disclosed window
-    /// re-syncs it.
+    /// never rewrites it, only a provider-disclosed window re-syncs
+    /// it, and a disclosure's re-sync is undone when a later run
+    /// falls back to the declaration — the manager then returns to
+    /// the declared window, not the host's original value.
     fn default_context_manager(session_config: &SessionConfig) -> ContextManager {
         ContextManager::new(Arc::new(TruncatingCompactor::default()))
             .with_context_window(session_config.context_window)
@@ -1146,6 +1174,11 @@ impl<C: ApiClient> BareLoop<C> {
     ///   the pass is dropped mid-flight — compactors follow the same
     ///   cancellation-safety contract as tools (drop-safe futures; no
     ///   required cleanup that only runs to completion).
+    /// - During the run-start context-window resolution: the metadata
+    ///   probe is raced against the cancel signal in the same biased
+    ///   `select!`; when cancel wins the run ends typed `Cancelled`
+    ///   through the ordinary finalize path rather than waiting the
+    ///   probe out.
     pub fn cancel(&self) {
         self.cancelled.cancel();
     }
@@ -1933,7 +1966,17 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             self.notify_run_start();
             self.machine.accept_input(input);
             self.deferred_transient_tokens = 0;
-            self.resolve_context_window().await;
+            let cancelled = Arc::clone(&self.cancelled);
+            let resolution = tokio::select! {
+                biased;
+                () = cancelled.notified() => Err(LoopError::Cancelled),
+                () = self.resolve_context_window() => Ok(()),
+            };
+            if let Err(e) = resolution {
+                self.set_error_state(&e);
+                self.finalize(Some(&e)).await?;
+                return Err(e);
+            }
             let estimate = self
                 .count_context(&self.machine.full_history())
                 .saturating_add(self.overhead_tokens());

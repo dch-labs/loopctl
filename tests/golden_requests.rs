@@ -732,12 +732,22 @@ impl ReasoningScriptClient {
     }
 
     /// Record one call, then pop the next scripted response.
+    ///
+    /// An exhausted script fails the call with a typed error naming the
+    /// fixture bug — never a panic, so a miscounted scenario reports its
+    /// drift instead of poisoning the script lock.
     fn serve(&self, request: &StreamRequest) -> Result<NonStreamingResponse, ApiError> {
         self.calls
             .lock()
             .expect("recorded calls lock")
             .push((request.clone(), RequestOptions::default()));
-        let (message, stop_reason) = self.script.lock().expect("response script lock").remove(0);
+        let mut script = self.script.lock().expect("response script lock");
+        if script.is_empty() {
+            return Err(ApiError::api(
+                "reasoning script exhausted — the scenario drove more model calls than it scripted",
+            ));
+        }
+        let (message, stop_reason) = script.remove(0);
         Ok(NonStreamingResponse {
             message,
             stop_reason,
@@ -765,6 +775,22 @@ impl ApiClient for ReasoningScriptClient {
         let request = request.clone();
         Box::pin(async move { self.serve(&request) })
     }
+}
+
+#[test]
+fn an_exhausted_reasoning_script_fails_the_call_instead_of_panicking() {
+    let client = ReasoningScriptClient::new(Vec::new());
+    let error = client
+        .serve(&StreamRequest::new(Vec::new()))
+        .expect_err("an exhausted script must fail the call, never panic");
+    assert!(
+        error.to_string().contains("reasoning script exhausted"),
+        "the failure names the fixture bug so the scenario's drift is readable: {error}"
+    );
+    assert!(
+        client.serve(&StreamRequest::new(Vec::new())).is_err(),
+        "a second call fails cleanly too — the script lock was never poisoned by a panic"
+    );
 }
 
 /// A turn script entry: a reasoning trace ahead of a tool call.

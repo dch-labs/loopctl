@@ -47,13 +47,19 @@ mod engine_resolution {
     /// Delegates every conversational method to the wrapped
     /// [`MockApiClient`]; only `model_context_window` is the test's —
     /// a fixed window, nothing (the failure shape), or a hang gated on
-    /// a [`tokio::sync::Notify`] the test releases.
+    /// a [`tokio::sync::Notify`] the test releases. Tests that flip the
+    /// answer between runs (a model whose endpoint stops disclosing)
+    /// share the answer slot via the [`ProbingClient::flippable`]
+    /// constructor.
     struct ProbingClient {
         /// Serves the run's responses.
         inner: MockApiClient,
 
-        /// The window the probe reports, when it reports one.
-        window: Option<u64>,
+        /// The window the probe reports, when it reports one — shared
+        /// with the test so a multi-run pin can change the endpoint's
+        /// answer between runs, the way a swapped model's endpoint
+        /// would.
+        answer: Arc<std::sync::Mutex<Option<u64>>>,
 
         /// When set, the probe hangs until this gate fires — the
         /// slow-endpoint shape.
@@ -65,7 +71,18 @@ mod engine_resolution {
         fn probing(window: Option<u64>, inner: MockApiClient) -> Self {
             Self {
                 inner,
-                window,
+                answer: Arc::new(std::sync::Mutex::new(window)),
+                hang: None,
+            }
+        }
+
+        /// A client whose probe reads the shared `answer` slot every
+        /// consultation, so the test rewrites what the endpoint
+        /// discloses between runs.
+        fn flippable(answer: Arc<std::sync::Mutex<Option<u64>>>, inner: MockApiClient) -> Self {
+            Self {
+                inner,
+                answer,
                 hang: None,
             }
         }
@@ -79,7 +96,7 @@ mod engine_resolution {
         ) -> Self {
             Self {
                 inner,
-                window,
+                answer: Arc::new(std::sync::Mutex::new(window)),
                 hang: Some(gate),
             }
         }
@@ -98,6 +115,15 @@ mod engine_resolution {
             self.inner.stream_messages(request)
         }
 
+        fn stream_messages_with_options(
+            &self,
+            request: &StreamRequest,
+            options: loopctl::structured::RequestOptions,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>>
+        {
+            self.inner.stream_messages_with_options(request, options)
+        }
+
         fn create_message(
             &self,
             request: &StreamRequest,
@@ -106,15 +132,28 @@ mod engine_resolution {
             self.inner.create_message(request)
         }
 
+        fn create_message_with_options(
+            &self,
+            request: &StreamRequest,
+            options: loopctl::structured::RequestOptions,
+        ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>>
+        {
+            self.inner.create_message_with_options(request, options)
+        }
+
         fn model_context_window(&self) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + '_>> {
-            let window = self.window;
+            let answer = Arc::clone(&self.answer);
             let gate = self.hang.clone();
             Box::pin(async move {
                 if let Some(gate) = gate {
                     gate.notified().await;
                 }
-                window
+                *answer.lock().expect("probe answer slot")
             })
+        }
+
+        fn set_model(&self, model: &str) -> bool {
+            self.inner.set_model(model)
         }
     }
 
@@ -172,6 +211,19 @@ mod engine_resolution {
     /// A mock answering one plain text turn.
     fn text_mock() -> MockApiClient {
         MockApiClient::new("probed-model").with_text_response("done")
+    }
+
+    /// A mock answering one plain text turn per entry, for pins that
+    /// drive more than one run over one client.
+    fn text_mock_of_turns(turns: usize) -> MockApiClient {
+        let responses = (0..turns)
+            .map(|_| loopctl::testing::MockResponse {
+                text: "done".to_string(),
+                tool_call: None,
+                stop_reason: "end_turn".to_string(),
+            })
+            .collect();
+        MockApiClient::new("probed-model").with_responses(responses)
     }
 
     /// A seeded history big enough to cross a small window's threshold
@@ -375,12 +427,14 @@ mod engine_resolution {
         assert_eq!(
             manager.context_window(),
             50_000,
-            "a probe-less resolution keeps the host-installed manager's own window — the              declaration governs the trigger, not a rewrite of the manager"
+            "a probe-less resolution keeps the host-installed manager's own window — the \
+             declaration governs the trigger, not a rewrite of the manager"
         );
         assert_eq!(
             manager.threshold(),
             60,
-            "the host-installed manager's threshold rides along untouched — no config              value is silently overwritten when no probe participated"
+            "the host-installed manager's threshold rides along untouched — no config \
+             value is silently overwritten when no probe participated"
         );
     }
 
@@ -414,6 +468,134 @@ mod engine_resolution {
             4_096,
             "a disclosed window outranks even a host-installed manager's own — the probe \
              re-syncs the manager so trigger and compaction target share one number"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_less_run_restores_a_manager_an_earlier_probe_synced() {
+        let answer = Arc::new(std::sync::Mutex::new(Some(4_096_u64)));
+        let observer = Arc::new(RecordingObserver::new());
+        let managers = loopctl::managers::LoopManagers::new().with_observer(observer.clone());
+        let client = Arc::new(ProbingClient::flippable(
+            Arc::clone(&answer),
+            text_mock_of_turns(2),
+        ));
+        let mut agent = BareLoop::new_with_managers(
+            client,
+            loopctl::tool::ToolRegistry::new(),
+            SessionConfig::default(),
+            managers,
+        );
+        let first = agent.run("hello", &RunConfig::default()).await;
+        assert!(first.is_ok(), "the probing run completes: {first:?}");
+        assert_eq!(
+            agent
+                .managers()
+                .context_manager()
+                .expect("the installed manager survives the run")
+                .context_window(),
+            4_096,
+            "run 1 synced the installed manager to the disclosed window"
+        );
+
+        agent
+            .switch_model("model-b")
+            .apply()
+            .expect("the switch takes without a window change");
+        *answer.lock().expect("probe answer slot") = None;
+        let second = agent.run("again", &RunConfig::default()).await;
+        assert!(second.is_ok(), "the probe-less run completes: {second:?}");
+        let manager = agent
+            .managers()
+            .context_manager()
+            .expect("the installed manager survives the run");
+        assert_eq!(
+            manager.context_window(),
+            200_000,
+            "a probe-less resolution reverts the manager to the declared window — the \
+             machine triggers on 200 000 and the manager must target it, not the stale \
+             4 096 an earlier probe installed"
+        );
+        assert_eq!(
+            manager.threshold(),
+            80,
+            "the revert re-syncs the threshold to the session's, exactly as the probe \
+             sync it reverts did"
+        );
+        assert_eq!(
+            observer.last_turn_end_window(),
+            Some(Some(200_000)),
+            "run 2's denominator is the declared window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_switched_window_survives_a_probeless_run() {
+        let answer = Arc::new(std::sync::Mutex::new(Some(4_096_u64)));
+        let managers = loopctl::managers::LoopManagers::new();
+        let client = Arc::new(ProbingClient::flippable(
+            Arc::clone(&answer),
+            text_mock_of_turns(2),
+        ));
+        let mut agent = BareLoop::new_with_managers(
+            client,
+            loopctl::tool::ToolRegistry::new(),
+            SessionConfig::default(),
+            managers,
+        );
+        let first = agent.run("hello", &RunConfig::default()).await;
+        assert!(first.is_ok(), "the probing run completes: {first:?}");
+        agent
+            .switch_model("model-b")
+            .with_context_window(8_192)
+            .apply()
+            .expect("the switch applies its own window");
+        *answer.lock().expect("probe answer slot") = None;
+        let second = agent.run("again", &RunConfig::default()).await;
+        assert!(second.is_ok(), "the probe-less run completes: {second:?}");
+        assert_eq!(
+            agent
+                .managers()
+                .context_manager()
+                .expect("the installed manager survives the run")
+                .context_window(),
+            8_192,
+            "a probe-less run leaves a model-switched window alone — the revert targets \
+             the declaration, which the switch just set, so the manager does not move"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_during_the_run_start_probe_ends_the_run_typed() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let client = Arc::new(ProbingClient::hanging(
+            None,
+            text_mock_of_turns(1),
+            Arc::clone(&gate),
+        ));
+        let mut agent = BareLoop::new_with_managers(
+            client,
+            loopctl::tool::ToolRegistry::new(),
+            SessionConfig::default(),
+            loopctl::managers::LoopManagers::new(),
+        );
+        let signal = agent.cancel_signal();
+        let run =
+            tokio::spawn(async move { (agent.run("hello", &RunConfig::default()).await, agent) });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        signal.cancel();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), run).await;
+        let (outcome, agent) = joined
+            .expect("the cancel ends the run rather than waiting out the probe")
+            .expect("the spawned run task finished");
+        assert!(
+            matches!(outcome, Err(loopctl::error::LoopError::Cancelled)),
+            "the mid-probe cancel surfaces typed: {outcome:?}"
+        );
+        assert_eq!(
+            agent.conversation().first().map(Message::text_content),
+            Some("hello".to_string()),
+            "the run's prompt is salvaged into history like every other cancel point"
         );
     }
 }
@@ -627,5 +809,81 @@ mod client_probe {
             "each model's show endpoint was probed exactly once"
         );
         assert_eq!(large.calls_async().await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_metadata_document_yields_none() {
+        let server = httpmock::MockServer::start_async().await;
+        let pad = "x".repeat(11 * 1024 * 1024);
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET).path("/props");
+                then.status(200).json_body(serde_json::json!({
+                    "default_generation_settings": { "n_ctx": 4_096_u64 },
+                    "pad": pad,
+                }));
+            })
+            .await;
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).path("/api/show");
+                then.status(404);
+            })
+            .await;
+        let client = probing_client(&server.base_url()).await;
+        let window = client.model_context_window().await;
+        assert_eq!(
+            window, None,
+            "a metadata document past the bounded-body ceiling is refused, not parsed — \
+             the probe stays fail-soft and memory stays bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wedged_metadata_server_yields_none_within_the_probe_deadline() {
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the wedged server binds");
+        let addr = listener.local_addr().expect("the wedged server addresses");
+        let listener = Arc::new(listener);
+        let parked_listener = Arc::clone(&listener);
+        let parked = tokio::spawn(async move {
+            let (mut sock, _) = parked_listener
+                .accept()
+                .await
+                .expect("the first probe connects");
+            let mut buf = [0u8; 1024];
+            drop(sock.read(&mut buf).await);
+            std::future::pending::<()>().await;
+        });
+        let dropped = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("the second probe connects");
+            let mut buf = [0u8; 1024];
+            drop(sock.read(&mut buf).await);
+        });
+        let client = OpenAiClient::builder()
+            .with_api_key("probe-key")
+            .with_base_url(format!("http://{addr}/v1"))
+            .with_model("probe-model")
+            .with_timeout(std::time::Duration::from_secs(120))
+            .build()
+            .expect("the probe client builds");
+        let window = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            client.model_context_window().await
+        })
+        .await;
+        parked.abort();
+        dropped.abort();
+        let window = window.expect(
+            "the wedged server answers None within the probe's own deadline — not the \
+             client's 120-second read timeout",
+        );
+        assert_eq!(
+            window, None,
+            "a server that accepts and never answers is a failed probe, fail-soft"
+        );
     }
 }

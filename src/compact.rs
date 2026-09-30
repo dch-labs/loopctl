@@ -620,9 +620,12 @@ pub struct ContextManager {
     /// discloses (see
     /// [`ApiClient::model_context_window`](crate::api::ApiClient::model_context_window))
     /// wins over the declared
-    /// [`SessionConfig::context_window`](crate::config::SessionConfig::context_window),
-    /// and the manager is re-synced to the resolved value, so the trigger and
-    /// the compaction target always share one denominator.
+    /// [`SessionConfig::context_window`](crate::config::SessionConfig::context_window).
+    /// The manager's copy follows the resolution only when the engine moves
+    /// it: a disclosed window re-syncs the manager, and the next probe-less
+    /// resolution reverts that re-sync to the declared value, so the two
+    /// numbers never split across a disclosure; a manager the host
+    /// installed and no probe ever touched keeps its own window.
     context_window: u64,
 
     /// Threshold as a percentage (0–100) at which compaction triggers.

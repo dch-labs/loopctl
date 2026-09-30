@@ -1,0 +1,199 @@
+[
+  {
+    "options": {
+      "model": null,
+      "response_format": null,
+      "tool_constraint": "None"
+    },
+    "request": {
+      "messages": [
+        {
+          "parts": [
+            {
+              "text": "Reason through two echo passes, then settle.",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "system": null,
+      "tools": [
+        {
+          "description": "Echo a word back",
+          "input_schema": {
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "type": "object"
+          },
+          "tool": "echo"
+        }
+      ]
+    }
+  },
+  {
+    "options": {
+      "model": null,
+      "response_format": null,
+      "tool_constraint": "None"
+    },
+    "request": {
+      "messages": [
+        {
+          "parts": [
+            {
+              "text": "Reason through two echo passes, then settle.",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "parts": [
+            {
+              "text": "weighing whether to echo first",
+              "type": "thinking"
+            },
+            {
+              "id": "call_gold_reason_1",
+              "input": {
+                "text": "first"
+              },
+              "name": "echo",
+              "type": "tool_call"
+            }
+          ],
+          "role": "assistant"
+        },
+        {
+          "parts": [
+            {
+              "call_id": "call_gold_reason_1",
+              "is_error": false,
+              "name": "echo",
+              "output": "pong",
+              "type": "tool_result"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "system": null,
+      "tools": [
+        {
+          "description": "Echo a word back",
+          "input_schema": {
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "type": "object"
+          },
+          "tool": "echo"
+        }
+      ]
+    }
+  },
+  {
+    "options": {
+      "model": null,
+      "response_format": null,
+      "tool_constraint": "None"
+    },
+    "request": {
+      "messages": [
+        {
+          "parts": [
+            {
+              "text": "Reason through two echo passes, then settle.",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "parts": [
+            {
+              "id": "call_gold_reason_1",
+              "input": {
+                "text": "first"
+              },
+              "name": "echo",
+              "type": "tool_call"
+            }
+          ],
+          "role": "assistant"
+        },
+        {
+          "parts": [
+            {
+              "call_id": "call_gold_reason_1",
+              "is_error": false,
+              "name": "echo",
+              "output": "pong",
+              "type": "tool_result"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "parts": [
+            {
+              "text": "the first echo landed; one more pass",
+              "type": "thinking"
+            },
+            {
+              "id": "call_gold_reason_2",
+              "input": {
+                "text": "second"
+              },
+              "name": "echo",
+              "type": "tool_call"
+            }
+          ],
+          "role": "assistant"
+        },
+        {
+          "parts": [
+            {
+              "call_id": "call_gold_reason_2",
+              "is_error": false,
+              "name": "echo",
+              "output": "pong",
+              "type": "tool_result"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "system": null,
+      "tools": [
+        {
+          "description": "Echo a word back",
+          "input_schema": {
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "type": "object"
+          },
+          "tool": "echo"
+        }
+      ]
+    }
+  }
+]

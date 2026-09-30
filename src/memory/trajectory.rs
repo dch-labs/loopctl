@@ -1350,6 +1350,7 @@ mod tests {
             output_tokens: 5,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1615,6 +1616,7 @@ mod tests {
             output_tokens: 1,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1743,6 +1745,7 @@ mod tests {
             output_tokens: 9,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1797,6 +1800,7 @@ mod tests {
             output_tokens: 1,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 5,
@@ -1811,6 +1815,7 @@ mod tests {
             output_tokens: 1,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         // Turn 3's end arrives only after two later turns have closed.
         observer.on_turn_end(&TurnEndContext {
@@ -1822,6 +1827,7 @@ mod tests {
             output_tokens: 9,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1867,6 +1873,7 @@ mod tests {
             output_tokens: 6,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         // A later turn remains in flight; the late end must not close it.
         observer.on_turn_start(&TurnStartContext {
@@ -1915,6 +1922,7 @@ mod tests {
             output_tokens: 5,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_turn_end(&TurnEndContext {
             turn: 0,
@@ -1925,6 +1933,7 @@ mod tests {
             output_tokens: 15,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -2021,6 +2030,7 @@ mod tests {
                     output_tokens: *output,
                     stop_reason: crate::stream::StreamStopReason::EndTurn,
                     context_tokens: 10,
+                    context_window: None,
                 });
             }
         }
@@ -2115,6 +2125,7 @@ mod tests {
             output_tokens: 1,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 2,
@@ -2167,6 +2178,7 @@ mod tests {
             output_tokens: 1,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 1,
@@ -2221,6 +2233,7 @@ mod tests {
             output_tokens: 1,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 8,
@@ -2497,6 +2510,7 @@ mod tests {
             output_tokens: 1,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 4,
@@ -2511,6 +2525,7 @@ mod tests {
             output_tokens: 1,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 3,
@@ -2525,6 +2540,7 @@ mod tests {
             output_tokens: 2,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_run_end(&RunEndContext {
             success: true,

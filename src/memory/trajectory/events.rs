@@ -893,6 +893,7 @@ mod tests {
             output_tokens: 5,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_run_end(&RunEndContext::new(true, None, 1, 5));
         observer.on_run_start(&RunStartContext { session_id });
@@ -1173,6 +1174,7 @@ mod tests {
             output_tokens: 1,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
+            context_window: None,
         });
         observer.on_run_end(&RunEndContext::new(true, None, 1, 1));
 
@@ -1263,6 +1265,7 @@ mod tests {
                 output_tokens: 1,
                 stop_reason: crate::stream::StreamStopReason::EndTurn,
                 context_tokens: 10,
+                context_window: None,
             });
             observer.on_run_end(&RunEndContext::new(true, None, 1, 5));
         });

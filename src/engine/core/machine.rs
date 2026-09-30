@@ -450,8 +450,11 @@ impl LoopMachine {
     /// per-run state (turn counter, context tokens, cancellation flag,
     /// pending tools, state machine position) so the machine is ready for
     /// a fresh `CallLLM` → tool → ... → `Done` cycle. The conversation
-    /// history from previous runs is untouched — the model sees the full
-    /// cross-run context.
+    /// history from previous runs is kept minus its reasoning: a new run
+    /// has no live turn, so every [`MessagePart::Thinking`] part in the
+    /// committed history belongs to a finished run and is dropped here —
+    /// the boundary that keeps a resumed or long-lived session from
+    /// replaying stale reasoning into its first request.
     ///
     /// This replaces the old pattern of cloning `session.history` into a
     /// fresh `LoopMachine::from_history` at every `run()` call.
@@ -463,6 +466,7 @@ impl LoopMachine {
         self.context_tokens = 0;
         self.cancelled = false;
         self.pending_tools.clear();
+        self.strip_prior_reasoning();
     }
 
     /// Feed a driver-measured context estimate into the machine.
@@ -620,6 +624,13 @@ impl LoopMachine {
     /// next [`Self::next_step`] will request their dispatch via
     /// [`MachineStep::CallTools`].
     ///
+    /// Ahead of appending the new message, every [`MessagePart::Thinking`]
+    /// part already in the buffers is dropped: the message
+    /// being appended becomes the newest assistant turn, and the reasoning
+    /// of every earlier turn has served the one request that needed it —
+    /// the request that carried its tool results. The new message's own
+    /// thinking survives untouched through its tool loop.
+    ///
     /// Has no effect once the machine is terminal.
     pub fn model_response(&mut self, response: ModelResponse, context_tokens: u64) {
         if self.is_terminal() {
@@ -637,6 +648,7 @@ impl LoopMachine {
             })
             .collect();
         let turn_number = self.turns_taken;
+        self.strip_prior_reasoning();
         self.pending.push(message);
         self.context_tokens = context_tokens;
         self.turns_taken = self.turns_taken.saturating_add(1);
@@ -787,6 +799,53 @@ impl LoopMachine {
     /// machine's state reflects the abort rather than resuming the partial step.
     pub fn cancel(&mut self) {
         self.cancelled = true;
+    }
+
+    /// Drop turn-scoped reasoning from every buffered message.
+    ///
+    /// Reasoning serves the tool loop it was produced in: once a turn's
+    /// exchange has closed — a newer assistant message exists, or a new
+    /// run has started — its [`MessagePart::Thinking`] parts are dead
+    /// weight on every later request, paid in prefill and window
+    /// pressure for text the model already used. Called at the two
+    /// boundaries where "the live turn" changes hands:
+    /// [`accept_input`](Self::accept_input) (a new run has no live turn)
+    /// and [`model_response`](Self::model_response) ahead of appending
+    /// the new newest assistant message, whose own thinking stays
+    /// untouched. Walking both buffers covers post-compaction history
+    /// too, where a live turn's thinking legitimately survives a
+    /// compaction pass. A message whose parts were all thinking is
+    /// dropped outright — it would otherwise ride the next request as
+    /// an empty message providers reject.
+    fn strip_prior_reasoning(&mut self) {
+        let mut dropped_parts = 0usize;
+        let mut dropped_chars = 0usize;
+        for buffer in [&mut self.history, &mut self.pending] {
+            buffer.retain_mut(|message| {
+                if !message.parts.iter().any(is_thinking) {
+                    return true;
+                }
+                let thinking: Vec<&MessagePart> = message
+                    .parts
+                    .iter()
+                    .filter(|part| is_thinking(part))
+                    .collect();
+                dropped_parts = dropped_parts.saturating_add(thinking.len());
+                dropped_chars = dropped_chars
+                    .saturating_add(thinking.iter().map(|part| thinking_chars(part)).sum());
+                message.parts.retain(|part| !is_thinking(part));
+                !message.parts.is_empty()
+            });
+        }
+        if dropped_parts > 0 {
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.reasoning.dropped_at_turn_end",
+                parts = dropped_parts,
+                chars = dropped_chars,
+                "turn-scoped reasoning left the conversation at the turn boundary"
+            );
+        }
     }
 
     /// Record a terminal failure in the machine's state.
@@ -1026,6 +1085,29 @@ impl LoopMachine {
     }
 }
 
+/// Whether a part is a reasoning trace.
+///
+/// The strip's classification predicate: reasoning is content-scoped,
+/// not role-scoped, so the check never consults the carrying message.
+fn is_thinking(part: &MessagePart) -> bool {
+    matches!(part, MessagePart::Thinking { .. })
+}
+
+/// The character weight of one part's reasoning.
+///
+/// Visible text and a redacted block's opaque payload both count —
+/// either way the bytes were riding the wire — while non-thinking
+/// parts contribute nothing.
+fn thinking_chars(part: &MessagePart) -> usize {
+    match part {
+        MessagePart::Thinking { text, redacted, .. } => text
+            .chars()
+            .count()
+            .saturating_add(redacted.as_ref().map_or(0, |data| data.chars().count())),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,6 +1263,220 @@ mod tests {
         assert!(
             machine.history().is_empty(),
             "an empty buffer commits nothing"
+        );
+    }
+
+    /// A tool-call response that opens with a reasoning trace.
+    ///
+    /// The streaming accumulator's shape for a reasoning model turn:
+    /// the thinking part arrives ahead of the tool call it reasons
+    /// toward, and both ride one assistant message.
+    fn thinking_tool_response(trace: &str, call_id: &str, tool: &str) -> ModelResponse {
+        let parts = vec![
+            MessagePart::Thinking {
+                text: trace.to_string(),
+                signature: None,
+                redacted: None,
+            },
+            MessagePart::tool_call(call_id, tool, Value::Object(serde_json::Map::new())),
+        ];
+        ModelResponse {
+            message: Message::new(Role::Assistant, parts),
+            input_tokens: 10,
+            output_tokens: 10,
+            stop_reason: StopReason::ToolCall,
+            available_tools: vec![tool.to_string()],
+        }
+    }
+
+    /// A terminal response that opens with a reasoning trace.
+    ///
+    /// The final-answer sibling of [`thinking_tool_response`]: the
+    /// trace ahead of the visible text, on the newest assistant
+    /// message.
+    fn thinking_text_response(trace: &str, text: &str) -> ModelResponse {
+        let parts = vec![
+            MessagePart::Thinking {
+                text: trace.to_string(),
+                signature: None,
+                redacted: None,
+            },
+            MessagePart::text(text),
+        ];
+        ModelResponse {
+            message: Message::new(Role::Assistant, parts),
+            input_tokens: 10,
+            output_tokens: 10,
+            stop_reason: StopReason::EndTurn,
+            available_tools: Vec::new(),
+        }
+    }
+
+    /// The reasoning traces a slice of messages still carries.
+    ///
+    /// Collects every thinking part's text, in message order, so
+    /// boundary pins can name exactly which traces survived.
+    fn thinking_texts_of(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                MessagePart::Thinking { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn prior_turn_thinking_leaves_history_at_the_boundary() {
+        let mut machine = small_machine();
+        machine.accept_input("task");
+        machine.model_response(thinking_tool_response("first pass", "call_1", "echo"), 0);
+        feed_tool_result(&mut machine, "call_1", "echo");
+        machine.model_response(thinking_text_response("final pass", "done"), 0);
+        machine.commit_pending();
+        assert_eq!(
+            thinking_texts_of(machine.history()),
+            vec!["final pass".to_string()],
+            "reasoning is turn-scoped: only the newest assistant message's trace survives the \
+             boundary — the first turn's reasoning must leave the committed history"
+        );
+    }
+
+    #[test]
+    fn live_turn_thinking_survives_its_own_tool_loop() {
+        let mut machine = small_machine();
+        machine.accept_input("task");
+        machine.model_response(thinking_tool_response("live trace", "call_1", "echo"), 0);
+        assert_eq!(
+            thinking_texts_of(&machine.full_history()),
+            vec!["live trace".to_string()],
+            "the live turn's reasoning stays replayable beside its tool call"
+        );
+        feed_tool_result(&mut machine, "call_1", "echo");
+        assert_eq!(
+            thinking_texts_of(&machine.full_history()),
+            vec!["live trace".to_string()],
+            "the request that carries the tool results still finds the thinking block beside \
+             the tool call — the interleaved-thinking contract holds within the turn"
+        );
+    }
+
+    #[test]
+    fn redacted_and_empty_thinking_still_never_replay() {
+        let redacted_only = Message::new(
+            Role::Assistant,
+            vec![MessagePart::Thinking {
+                text: String::new(),
+                signature: None,
+                redacted: Some("opaque payload".to_string()),
+            }],
+        );
+        let mut machine = LoopMachine::from_history(vec![Message::user("earlier"), redacted_only]);
+        machine.accept_input("fresh task");
+        assert!(
+            thinking_texts_of(&machine.full_history()).is_empty(),
+            "a prior turn's redacted thinking leaves with everything else at the run boundary"
+        );
+
+        let mut machine = small_machine();
+        machine.accept_input("task");
+        let live_redacted = Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: String::new(),
+                    signature: None,
+                    redacted: Some("live opaque payload".to_string()),
+                },
+                MessagePart::tool_call("call_1", "echo", Value::Object(serde_json::Map::new())),
+            ],
+        );
+        machine.model_response(
+            ModelResponse {
+                message: live_redacted,
+                input_tokens: 10,
+                output_tokens: 10,
+                stop_reason: StopReason::ToolCall,
+                available_tools: vec!["echo".to_string()],
+            },
+            0,
+        );
+        feed_tool_result(&mut machine, "call_1", "echo");
+        assert_eq!(
+            machine
+                .full_history()
+                .iter()
+                .flat_map(|message| &message.parts)
+                .filter(|part| {
+                    matches!(
+                        part,
+                        MessagePart::Thinking {
+                            redacted: Some(_),
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            1,
+            "the live turn's redacted block survives its own tool loop untouched"
+        );
+    }
+
+    #[test]
+    fn resume_history_carrying_thinking_is_stripped_on_first_request() {
+        let seeded = vec![
+            Message::user("earlier question"),
+            Message::new(
+                Role::Assistant,
+                vec![
+                    MessagePart::Thinking {
+                        text: "stale reasoning from a finished run".to_string(),
+                        signature: None,
+                        redacted: None,
+                    },
+                    MessagePart::text("earlier answer"),
+                ],
+            ),
+        ];
+        let mut machine = LoopMachine::from_history(seeded);
+        machine.accept_input("new question");
+        assert!(
+            thinking_texts_of(&machine.full_history()).is_empty(),
+            "a resumed history's thinking is stripped before the first request assembles — no \
+             finished run's reasoning may ride the new run's requests"
+        );
+        assert_eq!(
+            machine.full_history().len(),
+            3,
+            "the stripped history keeps its non-reasoning messages: question, answer, new prompt"
+        );
+    }
+
+    #[test]
+    fn a_reasoning_only_assistant_message_is_dropped_not_emptied() {
+        let reasoning_only = Message::new(
+            Role::Assistant,
+            vec![MessagePart::Thinking {
+                text: "reasoning with no visible answer".to_string(),
+                signature: None,
+                redacted: None,
+            }],
+        );
+        let mut machine = LoopMachine::from_history(vec![Message::user("q1"), reasoning_only]);
+        machine.accept_input("q2");
+        assert!(
+            machine
+                .full_history()
+                .iter()
+                .all(|message| !message.parts.is_empty()),
+            "a message whose only part was reasoning leaves entirely rather than surviving as \
+             an empty-parts message the next request would carry"
+        );
+        assert_eq!(
+            machine.full_history().len(),
+            2,
+            "the dropped reasoning-only message leaves the two user prompts adjacent"
         );
     }
 

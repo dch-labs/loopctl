@@ -632,6 +632,7 @@ mod tests {
             output_tokens: 5,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 12,
+            context_window: None,
         });
         hub.on_run_end(&RunEndContext::new(true, None, 1, 5));
 
@@ -697,6 +698,7 @@ mod tests {
             output_tokens: 5,
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 777,
+            context_window: None,
         });
         let observed = receiver
             .try_recv()

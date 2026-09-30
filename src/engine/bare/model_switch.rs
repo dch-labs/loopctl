@@ -102,8 +102,6 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
             ));
         }
 
-        // Poison preflight: a poisoned breaker must abort the switch
-        // before any state — the client's model included — changes.
         loop_.managers.fallback().state()?;
         let from = loop_.client.model();
         if !loop_.client.set_model(trimmed) {
@@ -115,11 +113,7 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
 
         if let Some(cw) = context_window {
             loop_.session.config.context_window = cw;
-            // The installed ContextManager keeps its own copy of the
-            // window; without this re-sync the machine would trigger on
-            // the new window while the manager targets and fit-checks
-            // the old one — a shrink then dead-ends at the no-progress
-            // guard, a growth over-evicts toward the stale target.
+            loop_.context_window = None;
             if let Some(manager) = loop_.managers.context_manager() {
                 let synced = (**manager)
                     .clone()

@@ -163,6 +163,21 @@ pub struct TurnEndContext {
     /// the engine's forward-looking estimate, present even when the
     /// provider reports no usage.
     pub context_tokens: u64,
+
+    /// The compaction denominator the run actually measured against.
+    ///
+    /// The resolved context window — the client's disclosed window
+    /// when the provider offers one (see
+    /// [`ApiClient::model_context_window`](crate::api::ApiClient::model_context_window)),
+    /// otherwise the session's declared
+    /// [`context_window`](crate::config::SessionConfig::context_window)
+    /// — frozen for the run's whole life so the trigger and the
+    /// emergency line share one number. `None` when the window policy
+    /// is disabled (a resolved window of zero): there is no
+    /// denominator to report. Divide
+    /// [`context_tokens`](Self::context_tokens) by this field for a
+    /// utilization view against the limit the engine enforced.
+    pub context_window: Option<u64>,
 }
 
 /// Context for [`LoopObserver::on_stream_success`](crate::observer::LoopObserver::on_stream_success).

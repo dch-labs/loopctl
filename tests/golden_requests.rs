@@ -691,6 +691,158 @@ async fn multi_turn_tool_results_are_golden() {
     golden_calls("multi_turn_tool_results", &client.calls());
 }
 
+/// A scripted non-streaming client whose responses carry reasoning
+/// traces.
+///
+/// The mock's response queue has no thinking lane, and this client's
+/// scenario is exactly where thinking parts ride across turns — so it
+/// serves hand-built assistant messages (a reasoning trace ahead of a
+/// tool call, or ahead of the final text) on the non-streaming
+/// transport while recording every outbound request, the same
+/// request-and-options pair [`RecordingClient`] captures for the
+/// mock-driven scenarios.
+struct ReasoningScriptClient {
+    /// One assistant message with its stop reason per turn, in order.
+    ///
+    /// Each `create_message`-family call pops the front entry; an
+    /// exhausted script fails the call, which fails the scenario — a
+    /// golden run must script every turn it drives.
+    script: Mutex<Vec<(Message, loopctl::stream::StreamStopReason)>>,
+
+    /// Every recorded call, oldest first.
+    ///
+    /// Each entry is the outbound request paired with the resolved
+    /// request options, cloned at call time — the pair the engine
+    /// hands the provider.
+    calls: Mutex<Vec<(StreamRequest, RequestOptions)>>,
+}
+
+impl ReasoningScriptClient {
+    /// Wrap a turn script for recording.
+    fn new(script: Vec<(Message, loopctl::stream::StreamStopReason)>) -> Self {
+        Self {
+            script: Mutex::new(script),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// A snapshot of every recorded call, oldest first.
+    fn calls(&self) -> Vec<(StreamRequest, RequestOptions)> {
+        self.calls.lock().expect("recorded calls lock").clone()
+    }
+
+    /// Record one call, then pop the next scripted response.
+    fn serve(&self, request: &StreamRequest) -> Result<NonStreamingResponse, ApiError> {
+        self.calls
+            .lock()
+            .expect("recorded calls lock")
+            .push((request.clone(), RequestOptions::default()));
+        let (message, stop_reason) = self.script.lock().expect("response script lock").remove(0);
+        Ok(NonStreamingResponse {
+            message,
+            stop_reason,
+            usage: None,
+        })
+    }
+}
+
+impl ApiClient for ReasoningScriptClient {
+    fn model(&self) -> String {
+        "reasoning-model".to_string()
+    }
+
+    fn stream_messages(
+        &self,
+        _request: &StreamRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        Box::pin(futures::stream::empty())
+    }
+
+    fn create_message(
+        &self,
+        request: &StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>> {
+        let request = request.clone();
+        Box::pin(async move { self.serve(&request) })
+    }
+}
+
+/// A turn script entry: a reasoning trace ahead of a tool call.
+fn reasoning_tool_turn(
+    trace: &str,
+    call_id: &str,
+    input: &str,
+) -> (Message, loopctl::stream::StreamStopReason) {
+    (
+        Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: trace.to_string(),
+                    signature: None,
+                    redacted: None,
+                },
+                MessagePart::tool_call(call_id, "echo", json!({"text": input})),
+            ],
+        ),
+        loopctl::stream::StreamStopReason::ToolCall,
+    )
+}
+
+/// A turn script entry: a reasoning trace ahead of the final answer.
+fn reasoning_final_turn(trace: &str, answer: &str) -> (Message, loopctl::stream::StreamStopReason) {
+    (
+        Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::Thinking {
+                    text: trace.to_string(),
+                    signature: None,
+                    redacted: None,
+                },
+                MessagePart::text(answer),
+            ],
+        ),
+        loopctl::stream::StreamStopReason::EndTurn,
+    )
+}
+
+#[tokio::test]
+async fn turn_scoped_reasoning_request_is_golden() {
+    let client = Arc::new(ReasoningScriptClient::new(vec![
+        reasoning_tool_turn(
+            "weighing whether to echo first",
+            "call_gold_reason_1",
+            "first",
+        ),
+        reasoning_tool_turn(
+            "the first echo landed; one more pass",
+            "call_gold_reason_2",
+            "second",
+        ),
+        reasoning_final_turn("both passes done; settling", "settled after two passes"),
+    ]));
+    let mut registry = ToolRegistry::new();
+    registry.register(FixtureTool {
+        name: "echo",
+        description: "Echo a word back",
+        reply: "pong",
+    });
+    let mut agent = BareLoop::new(Arc::clone(&client), registry, SessionConfig::default());
+    agent.set_turn_mode(loopctl::engine::core::TurnMode::NonStreaming);
+    let run = agent
+        .run(
+            "Reason through two echo passes, then settle.",
+            &RunConfig::default(),
+        )
+        .await;
+    assert!(
+        run.is_ok(),
+        "golden turn_scoped_reasoning: the scripted run must complete: {run:?}"
+    );
+    golden_calls("turn_scoped_reasoning", &client.calls());
+}
+
 #[tokio::test]
 async fn fallback_routing_is_golden() {
     let manager = FallbackManager::new(1, 1);

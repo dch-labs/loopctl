@@ -339,6 +339,22 @@ pub struct BareLoop<C: ApiClient> {
     /// [`Drop`] best-effort removes the directory at this path; removal
     /// errors are logged at `warn!` and swallowed.
     session_temp_dir: Option<PathBuf>,
+
+    /// The compaction denominator resolved for the current run, if any.
+    ///
+    /// `None` until the first [`run()`](crate::engine::core::Loop::run)
+    /// resolves one; from then on it holds the window that run measured
+    /// against — the client's disclosed window when the provider offers
+    /// one ([`model_context_window`](crate::api::ApiClient::model_context_window)),
+    /// otherwise the session's declared
+    /// [`context_window`](crate::config::SessionConfig::context_window).
+    /// Frozen per run so the trigger and the emergency line cannot
+    /// disagree mid-run; a declared `0` (the policy-disable sentinel)
+    /// resolves to `0` unchanged — a deliberate opt-out outranks any
+    /// disclosure. Re-resolved at each run start and invalidated by a
+    /// [`switch_model`](Self::switch_model) apply, so the next run
+    /// re-probes for the new model.
+    context_window: Option<u64>,
 }
 
 /// Per-turn accounting forwarded from [`handle_call_tools`](BareLoop::handle_call_tools)
@@ -519,6 +535,7 @@ impl<C: ApiClient> BareLoop<C> {
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
             turn_mode: default_turn_mode(),
+            context_window: None,
         };
         Self::wire_default_profile(&mut loop_);
         loop_
@@ -577,13 +594,29 @@ impl<C: ApiClient> BareLoop<C> {
     /// arrives per turn through
     /// [`on_turn_end`](crate::observer::LoopObserver::on_turn_end)'s
     /// [`TurnEndContext::context_tokens`](crate::observer::TurnEndContext::context_tokens),
-    /// since `run()` holds the loop mutably. Compare against
-    /// [`session_config`](Self::session_config)'s
-    /// [`context_window`](crate::config::SessionConfig::context_window)
-    /// for a utilization view.
+    /// since `run()` holds the loop mutably. Compare against the
+    /// resolved denominator the run actually measured with —
+    /// [`TurnEndContext::context_window`](crate::observer::TurnEndContext::context_window)
+    /// carries it per turn — rather than the declared
+    /// [`context_window`](crate::config::SessionConfig::context_window),
+    /// which a provider-disclosed window may have superseded.
     #[must_use]
     pub fn context_tokens(&self) -> u64 {
         self.machine.context_tokens()
+    }
+
+    /// Get the managers bundle the loop runs with.
+    ///
+    /// Returns the live bundle — the same one the engine reads for
+    /// observers, detection, compaction, and fallback — so a host (or
+    /// a pin) can inspect what is currently installed, including a
+    /// context manager the run-start window resolution re-synced.
+    /// The bundle is shared by reference; mutation through it is the
+    /// caller's responsibility, as with any mid-session component
+    /// swap.
+    #[must_use]
+    pub fn managers(&self) -> &LoopManagers {
+        &self.managers
     }
 
     /// Get the run configuration for the current run, if a run has started.
@@ -632,17 +665,110 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Build the policy struct the machine needs for `next_step()`.
     ///
-    /// Combines the run's `max_turns` with the session's compaction knobs
-    /// into a single [`MachinePolicy`] passed fresh each call.
+    /// Combines the run's `max_turns` with the session's compaction
+    /// knobs into a single [`MachinePolicy`] passed fresh each call.
+    /// The window is the resolved denominator (see
+    /// `context_window`'s docs) once a run has resolved one,
+    /// and the declared window before the first run — so pre-run
+    /// `next_step` consultation is byte-identical to a loop that never
+    /// probes.
     fn machine_policy(&self) -> MachinePolicy {
         MachinePolicy {
             max_turns: self
                 .session
                 .current_run()
                 .map_or(usize::MAX, |r| r.config.max_turns),
-            context_window: self.session.config.context_window,
+            context_window: self.effective_context_window(),
             compact_threshold: self.session.config.compact_threshold,
             auto_compact: self.session.config.auto_compact,
+        }
+    }
+
+    /// The compaction denominator in effect right now.
+    ///
+    /// The run's resolved window when one exists (the client's
+    /// disclosed window or the declared fallback it resolved to),
+    /// otherwise the declared
+    /// [`context_window`](crate::config::SessionConfig::context_window)
+    /// — the figure a never-run loop and a probe-less client both
+    /// measure against, identical to the pre-probe behavior.
+    fn effective_context_window(&self) -> u64 {
+        self.context_window
+            .unwrap_or(self.session.config.context_window)
+    }
+
+    /// The denominator a turn-end event reports.
+    ///
+    /// `Some` of the effective window, except `None` when the window
+    /// policy is disabled (a resolved window of `0`) — there is no
+    /// denominator to report utilization against, and a display must
+    /// not divide by the sentinel.
+    fn turn_end_context_window(&self) -> Option<u64> {
+        let window = self.effective_context_window();
+        (window > 0).then_some(window)
+    }
+
+    /// Resolve this run's compaction denominator from the client.
+    ///
+    /// Consulted once at run start: a client-disclosed window (a
+    /// provider metadata probe that answered a positive number) wins
+    /// over the declared
+    /// [`context_window`](crate::config::SessionConfig::context_window),
+    /// because the disclosure is what the server will actually accept
+    /// and the declaration is a host's guess. A declared `0` — the
+    /// policy-disable sentinel — is kept as-is: a deliberate opt-out
+    /// outranks any disclosure. The resolved value freezes for the
+    /// run's whole life (the trigger and the emergency line measure
+    /// against one number), and the `loopctl.context.window` gauge is
+    /// emitted when the value changed — first resolution included.
+    /// Only a disclosed window re-syncs the installed
+    /// [`ContextManager`] (the same sync a model switch performs): a
+    /// probe-less resolution leaves the installed manager exactly as
+    /// the host built it — the declaration governs the machine's
+    /// trigger, not a rewrite of the manager's own targeting.
+    async fn resolve_context_window(&mut self) {
+        if self.session.config.context_window == 0 {
+            self.context_window = Some(0);
+            return;
+        }
+        let declared = self.session.config.context_window;
+        let (window, source, probed) = match self.client.model_context_window().await {
+            Some(disclosed) if disclosed > 0 => (disclosed, "probe", true),
+            _ => (declared, "declared", false),
+        };
+        if self.context_window != Some(window) {
+            tracing::debug!(
+                target: "loopctl::metrics",
+                metric = "loopctl.context.window",
+                source,
+                window,
+                "compaction denominator resolved for the run"
+            );
+        }
+        self.context_window = Some(window);
+        if probed {
+            self.sync_manager_window(window);
+        }
+    }
+
+    /// Re-sync the installed context manager to a disclosed window.
+    ///
+    /// Called only from a probe-backed resolution — the disclosure
+    /// outranks even a host-installed manager's own window, because
+    /// the manager keeps its own copy for targeting and fit checks
+    /// and without this re-sync the machine would trigger on the
+    /// disclosed number while the manager compacted toward the stale
+    /// one. The same clone-and-sync a model switch's window change
+    /// performs.
+    fn sync_manager_window(&mut self, window: u64) {
+        if let Some(manager) = self.managers.context_manager()
+            && manager.context_window() != window
+        {
+            let synced = (**manager)
+                .clone()
+                .with_context_window(window)
+                .with_threshold(self.session.config.compact_threshold);
+            self.managers.set_context_manager(Arc::new(synced));
         }
     }
 
@@ -802,6 +928,7 @@ impl<C: ApiClient> BareLoop<C> {
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
             turn_mode: default_turn_mode(),
+            context_window: None,
         };
         Self::wire_default_profile(&mut loop_);
         loop_
@@ -910,6 +1037,7 @@ impl<C: ApiClient> BareLoop<C> {
             last_routed_model: None,
             token_counter: Arc::new(crate::compact::HeuristicTokenCounter),
             turn_mode: default_turn_mode(),
+            context_window: None,
         };
         Self::wire_default_profile(&mut loop_);
         loop_
@@ -923,8 +1051,9 @@ impl<C: ApiClient> BareLoop<C> {
     /// [`Self::from_machine_with_managers`] when the manager bundle carries
     /// no compaction machinery of its own, so the session's auto-compaction
     /// trigger is never an alarm without a sprinkler. Hosts that want
-    /// different behavior install their own manager, which is never
-    /// overridden.
+    /// different behavior install their own manager: the declaration
+    /// never rewrites it, and only a provider-disclosed window
+    /// re-syncs it.
     fn default_context_manager(session_config: &SessionConfig) -> ContextManager {
         ContextManager::new(Arc::new(TruncatingCompactor::default()))
             .with_context_window(session_config.context_window)
@@ -1146,6 +1275,7 @@ impl<C: ApiClient> BareLoop<C> {
                     output_tokens: accounting.output_tokens,
                     stop_reason: accounting.stop_reason,
                     context_tokens: self.machine.context_tokens(),
+                    context_window: self.turn_end_context_window(),
                 });
                 Err(e)
             }
@@ -1238,6 +1368,35 @@ impl<C: ApiClient> BareLoop<C> {
             .collect()
     }
 
+    /// Fire the failure turn-end event for an aborted LLM phase.
+    ///
+    /// The cancelled, stream-error, and loop-detection arms of
+    /// [`handle_call_llm`](Self::handle_call_llm) report the same
+    /// shape — a failed turn with the machine's current context
+    /// figures — differing only in the error text, the token pair,
+    /// and the stop reason; this helper keeps that shape defined
+    /// once.
+    fn notify_failed_turn(
+        &self,
+        turn: usize,
+        error: &str,
+        turn_start: Instant,
+        tokens: (u64, u64),
+        stop_reason: StreamStopReason,
+    ) {
+        self.notify_turn_end(&TurnEnd {
+            turn,
+            success: false,
+            error: Some(error),
+            duration: self.managers.clock().elapsed_since(turn_start),
+            input_tokens: tokens.0,
+            output_tokens: tokens.1,
+            stop_reason,
+            context_tokens: self.machine.context_tokens(),
+            context_window: self.turn_end_context_window(),
+        });
+    }
+
     /// Handle a model-call request from the machine.
     ///
     /// Fires the per-turn observer events in order, injects contributor
@@ -1299,31 +1458,15 @@ impl<C: ApiClient> BareLoop<C> {
             transport_fallback,
         } = match turn_outcome {
             Ok(serving) => serving,
-            Err(LoopError::Cancelled) => {
-                self.notify_turn_end(&TurnEnd {
-                    turn,
-                    success: false,
-                    error: Some("cancelled"),
-                    duration: self.managers.clock().elapsed_since(turn_start),
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    stop_reason: StreamStopReason::EndTurn,
-                    context_tokens: self.machine.context_tokens(),
-                });
-                return Err(LoopError::Cancelled);
-            }
             Err(e) => {
-                let err_str = e.to_string();
-                self.notify_turn_end(&TurnEnd {
+                let failed = e.to_string();
+                self.notify_failed_turn(
                     turn,
-                    success: false,
-                    error: Some(&err_str),
-                    duration: self.managers.clock().elapsed_since(turn_start),
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    stop_reason: StreamStopReason::EndTurn,
-                    context_tokens: self.machine.context_tokens(),
-                });
+                    &failed,
+                    turn_start,
+                    (0, 0),
+                    StreamStopReason::EndTurn,
+                );
                 return Err(e);
             }
         };
@@ -1364,17 +1507,8 @@ impl<C: ApiClient> BareLoop<C> {
         self.notify_response(turn, &text, usage);
 
         if let Some(e) = self.apply_loop_detection(turn, &pattern) {
-            let err_str = e.to_string();
-            self.notify_turn_end(&TurnEnd {
-                turn,
-                success: false,
-                error: Some(&err_str),
-                duration: self.managers.clock().elapsed_since(turn_start),
-                input_tokens: turn_in,
-                output_tokens: turn_out,
-                stop_reason: stream_stop,
-                context_tokens: self.machine.context_tokens(),
-            });
+            let failed = e.to_string();
+            self.notify_failed_turn(turn, &failed, turn_start, (turn_in, turn_out), stream_stop);
             return Err(e);
         }
 
@@ -1418,6 +1552,7 @@ impl<C: ApiClient> BareLoop<C> {
                 output_tokens: turn_out,
                 stop_reason: stream_stop,
                 context_tokens: self.machine.context_tokens(),
+                context_window: self.turn_end_context_window(),
             });
         }
         Ok(())
@@ -1702,6 +1837,7 @@ impl<C: ApiClient> BareLoop<C> {
             output_tokens: accounting.output_tokens,
             stop_reason: accounting.stop_reason,
             context_tokens: self.machine.context_tokens(),
+            context_window: self.turn_end_context_window(),
         });
         Ok(())
     }
@@ -1797,6 +1933,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             self.notify_run_start();
             self.machine.accept_input(input);
             self.deferred_transient_tokens = 0;
+            self.resolve_context_window().await;
             let estimate = self
                 .count_context(&self.machine.full_history())
                 .saturating_add(self.overhead_tokens());

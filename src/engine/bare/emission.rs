@@ -118,13 +118,26 @@ pub(super) struct TurnEnd<'a> {
     ///
     /// Read from the machine's
     /// [`context_tokens`](crate::engine::core::LoopMachine::context_tokens)
-    /// at each call site — the figure the compaction trigger
-    /// evaluates, reported to observers without a re-estimate. The
-    /// tool-turn success event fires after this turn's tool results
-    /// are recorded and the estimate refreshed, so its figure already
-    /// includes them — including on the run's final tool turn, where
-    /// no later event would otherwise report the growth.
+    /// at event time — the numerator of the utilization pair; the
+    /// denominator arrives as [`context_window`](Self::context_window).
+    ///
+    /// The figure is the one the compaction trigger evaluates,
+    /// reported to observers without a re-estimate. The tool-turn
+    /// success event fires after this turn's tool results are recorded
+    /// and the estimate refreshed, so its figure already includes
+    /// them — including on the run's final tool turn, where no later
+    /// event would otherwise report the growth.
     pub context_tokens: u64,
+
+    /// The compaction denominator the run measured against.
+    ///
+    /// The resolved window (client-disclosed or declared), forwarded
+    /// onto
+    /// [`TurnEndContext::context_window`](crate::observer::TurnEndContext::context_window);
+    /// `None` when the window policy is disabled. Read from the driver
+    /// at event time via
+    /// [`turn_end_context_window`](BareLoop::turn_end_context_window).
+    pub context_window: Option<u64>,
 }
 
 impl<C: ApiClient> BareLoop<C> {
@@ -206,6 +219,7 @@ impl<C: ApiClient> BareLoop<C> {
             output_tokens: data.output_tokens,
             stop_reason: data.stop_reason,
             context_tokens: data.context_tokens,
+            context_window: data.context_window,
         });
     }
 

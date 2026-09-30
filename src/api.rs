@@ -258,6 +258,23 @@ pub trait ApiClient: Send + Sync {
         String::new()
     }
 
+    /// Probe the model's context window in tokens, when the provider
+    /// exposes a metadata endpoint.
+    ///
+    /// `None` when the provider offers nothing to probe, when the
+    /// probe fails (timeout, HTTP error, unparseable body), or when
+    /// the deployment reports no window — a probe failure is soft: the
+    /// caller keeps whatever window it declared and nothing surfaces
+    /// as a turn error. The shipped OpenAI-compatible client overrides
+    /// this to ask the llama.cpp family's `/props` and Ollama's
+    /// `/api/show` documents; the hosted APIs expose no metadata
+    /// endpoint and keep the default. Implementations cache the answer
+    /// and re-probe only when the model changes, so a caller may
+    /// consult this once per run without paying a request per call.
+    fn model_context_window(&self) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + '_>> {
+        Box::pin(async { None })
+    }
+
     /// Stream messages from the LLM provider.
     ///
     /// Sends the [`StreamRequest`] (conversation history, optional system

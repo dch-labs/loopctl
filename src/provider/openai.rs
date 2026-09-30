@@ -71,6 +71,31 @@ const TEXT_PART_INDEX: usize = 0;
 /// thinking deltas, and the lanes interleave in any order.
 const THINKING_PART_INDEX: usize = 1;
 
+/// The per-model state of a context-window probe.
+///
+/// Distinguishes "never asked" from "asked and the endpoint disclosed
+/// nothing" — the second must cache too, or a silent server is
+/// re-probed on every consultation.
+enum ProbeCache {
+    /// No probe has resolved for the current model yet.
+    ///
+    /// The next consultation probes; every other state serves from
+    /// the cache instead.
+    Unprobed,
+
+    /// The probe resolved; this is the disclosed window.
+    ///
+    /// Repeated consultations return this value without touching the
+    /// network again until the model changes.
+    Disclosed(u64),
+
+    /// The probe ran and no endpoint disclosed a window.
+    ///
+    /// Cached like a disclosure so a silent server is not re-asked on
+    /// every consultation; the caller's declared window stands.
+    Nothing,
+}
+
 /// An OpenAI-compatible chat completions client with streaming support.
 ///
 /// Implements [`ApiClient`] by translating between the framework's
@@ -135,6 +160,15 @@ pub struct OpenAiClient {
     /// last assistant message), so the field reaches it best-effort,
     /// not as a guaranteed round-trip.
     replay_reasoning: bool,
+
+    /// The cached context-window probe answer for the current model.
+    ///
+    /// [`ProbeCache::Unprobed`] until the first probe resolves;
+    /// [`ProbeCache::Nothing`] records a probe that answered nothing,
+    /// so the probe runs at most once per model — a silent endpoint is
+    /// not re-asked on every run. [`ApiClient::set_model`] clears the
+    /// cache, because the Ollama-shaped answer is per-model.
+    context_window_probe: std::sync::Mutex<ProbeCache>,
 }
 
 impl OpenAiClient {
@@ -310,6 +344,210 @@ impl OpenAiClient {
         bearer.set_sensitive(true);
         super::post_json_checked(http, url, &[(reqwest::header::AUTHORIZATION, bearer)], body).await
     }
+
+    /// The server root the metadata probes address.
+    ///
+    /// The chat-completions base URL carries a version segment
+    /// (`/v1`, and shared deployments may use `/v1beta`); llama.cpp's
+    /// `/props` and Ollama's `/api/show` sit above it, at the server
+    /// root.
+    fn probe_root(&self) -> String {
+        let trimmed = self.base_url.trim_end_matches('/');
+        match trimmed.rsplit_once('/') {
+            Some((root, last)) if is_version_segment(last) => root.to_string(),
+            _ => trimmed.to_string(),
+        }
+    }
+
+    /// Resolve the deployment's context window from server metadata.
+    ///
+    /// Tries the llama.cpp family's `/props` first, then Ollama's
+    /// `/api/show` for the current model; the first endpoint that
+    /// answers a usable window wins, and a failed or absent answer is
+    /// `None` — the caller's declared window then stands. Both probes
+    /// reuse the client's pooled HTTP layer and its configured
+    /// timeouts, and the answer caches for the current model: a probe
+    /// that started under a model a hot-swap replaced returns its
+    /// value to its own caller but does not poison the cache.
+    async fn probe_context_window(&self) -> Option<u64> {
+        {
+            let cache = crate::error::recover_guard(self.context_window_probe.lock());
+            match *cache {
+                ProbeCache::Unprobed => {}
+                ProbeCache::Disclosed(window) => return Some(window),
+                ProbeCache::Nothing => return None,
+            }
+        }
+        let probed_model = self.model();
+        let probed = self.fetch_context_window().await;
+        let mut cache = crate::error::recover_guard(self.context_window_probe.lock());
+        if matches!(*cache, ProbeCache::Unprobed) && self.model() == probed_model {
+            *cache = match probed {
+                Some(window) => ProbeCache::Disclosed(window),
+                None => ProbeCache::Nothing,
+            };
+        }
+        probed
+    }
+
+    /// Ask each metadata endpoint in turn for a context window.
+    ///
+    /// Every failure is soft: an endpoint that errors, times out, or
+    /// answers nothing contributes `None` (and one probe-failure
+    /// metric), and the next endpoint is tried.
+    async fn fetch_context_window(&self) -> Option<u64> {
+        let root = self.probe_root();
+        if let Some(window) = self.probe_llama_cpp_props(&root).await {
+            return Some(window);
+        }
+        self.probe_ollama_show(&root).await
+    }
+
+    /// Read the llama.cpp family's `/props` document.
+    ///
+    /// `default_generation_settings.n_ctx` is the server's total KV
+    /// budget; under `--parallel` it is split across `total_slots`
+    /// slots, and the per-slot allocation — `n_ctx / total_slots` —
+    /// is what any single request must fit.
+    async fn probe_llama_cpp_props(&self, root: &str) -> Option<u64> {
+        let url = format!("{root}/props");
+        let api_key = self.api_key.clone();
+        let response = self
+            .probe_request(|| {
+                self.http
+                    .get(&url)
+                    .header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
+            })
+            .await?;
+        let body = self.probe_body(response).await?;
+        let value = Self::probe_json(&body)?;
+        let n_ctx = value
+            .get("default_generation_settings")
+            .and_then(|settings| settings.get("n_ctx"))
+            .and_then(Value::as_u64)?;
+        let slots = value
+            .get("total_slots")
+            .and_then(Value::as_u64)
+            .filter(|slots| *slots > 0)
+            .unwrap_or(1);
+        let window = n_ctx.checked_div(slots)?;
+        (window > 0).then_some(window)
+    }
+
+    /// Read Ollama's `/api/show` answer for the current model.
+    ///
+    /// The request carries the model name (Ollama's show endpoint is a
+    /// POST), and the context length is matched by key suffix: real
+    /// Ollama keys it by architecture (`llama.context_length`), so a
+    /// literal `context_length` lookup would always miss.
+    async fn probe_ollama_show(&self, root: &str) -> Option<u64> {
+        let url = format!("{root}/api/show");
+        let model = self.model();
+        let api_key = self.api_key.clone();
+        let payload = serde_json::json!({ "model": model });
+        let response = self
+            .probe_request(|| {
+                self.http
+                    .post(&url)
+                    .header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"))
+                    .json(&payload)
+            })
+            .await?;
+        let body = self.probe_body(response).await?;
+        let value = Self::probe_json(&body)?;
+        let info = value.get("model_info")?.as_object()?;
+        info.iter()
+            .filter(|(key, _)| {
+                key.as_str() == "context_length" || key.as_str().ends_with(".context_length")
+            })
+            .filter_map(|(_, entry)| entry.as_u64())
+            .find(|length| *length > 0)
+    }
+
+    /// Run one probe request, mapping failure to `None` plus a metric.
+    ///
+    /// The request builder is supplied lazily so the payload (and its
+    /// borrows) is constructed only when the request actually runs.
+    async fn probe_request(
+        &self,
+        build: impl FnOnce() -> reqwest::RequestBuilder,
+    ) -> Option<reqwest::Response> {
+        match build().send().await {
+            Ok(response) if response.status().is_success() => Some(response),
+            Ok(response) => {
+                Self::emit_probe_failure("http", response.status().as_u16());
+                None
+            }
+            Err(error) => {
+                let kind = if error.is_timeout() {
+                    "timeout"
+                } else {
+                    "http"
+                };
+                Self::emit_probe_failure(kind, 0);
+                None
+            }
+        }
+    }
+
+    /// Read a probe response's body, mapping failure to `None`.
+    ///
+    /// The text of a successful probe response; a read failure counts
+    /// as an http-shaped probe failure and contributes nothing.
+    async fn probe_body(&self, response: reqwest::Response) -> Option<String> {
+        match response.text().await {
+            Ok(body) => Some(body),
+            Err(error) => {
+                let kind = if error.is_timeout() {
+                    "timeout"
+                } else {
+                    "http"
+                };
+                Self::emit_probe_failure(kind, 0);
+                None
+            }
+        }
+    }
+
+    /// Parse a probe body as JSON, mapping a parse failure to `None`.
+    ///
+    /// A body that is not valid JSON is a parse-shaped probe failure
+    /// — the endpoint answered, but not with a document to read. An
+    /// associated function because it reads no client state.
+    fn probe_json(body: &str) -> Option<Value> {
+        if let Ok(value) = serde_json::from_str(body) {
+            return Some(value);
+        }
+        Self::emit_probe_failure("parse", 0);
+        None
+    }
+
+    /// Emit the probe-failure counter for one failed attempt.
+    ///
+    /// A failure here is informational only — the provider declined
+    /// to disclose — never an error the caller sees. An associated
+    /// function because it reads no client state.
+    fn emit_probe_failure(kind: &'static str, status: u16) {
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.context.probe.failures",
+            kind,
+            status,
+            "context-window probe attempt failed"
+        );
+    }
+}
+
+/// Whether a URL path segment is a version marker (`v1`, `v1beta`).
+///
+/// A `v` followed by at least one digit and any lowercase suffix —
+/// the shape OpenAI-compatible and Gemini-style deployments hang
+/// their API under. Anything else (`version`, a host name) is not a
+/// version segment and stays part of the probe root.
+fn is_version_segment(segment: &str) -> bool {
+    let rest = segment.strip_prefix('v').unwrap_or("");
+    let mut chars = rest.chars();
+    chars.next().is_some_and(|first| first.is_ascii_digit())
 }
 
 impl ApiClient for OpenAiClient {
@@ -326,11 +564,16 @@ impl ApiClient for OpenAiClient {
             return false;
         }
         *crate::error::recover_guard(self.model.lock()) = model.to_string();
+        *crate::error::recover_guard(self.context_window_probe.lock()) = ProbeCache::Unprobed;
         true
     }
 
     fn supports_tool_constraints(&self) -> bool {
         true
+    }
+
+    fn model_context_window(&self) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + '_>> {
+        Box::pin(async move { self.probe_context_window().await })
     }
 
     fn stream_messages(
@@ -832,6 +1075,7 @@ impl OpenAiClientBuilder {
             stream_usage: self.stream_usage,
             thinking_effort: self.thinking_effort,
             replay_reasoning: self.replay_reasoning,
+            context_window_probe: std::sync::Mutex::new(ProbeCache::Unprobed),
         })
     }
 }
@@ -4366,6 +4610,30 @@ mod tests {
         assert!(
             body.contains("\"reasoning_content\":\"alpha pass\\nbeta pass\""),
             "each history thinking part rides back joined in part order: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_body_with_replay_on_carries_only_live_turn_reasoning() {
+        let prior_turn = Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call(
+                "call_done",
+                "search",
+                serde_json::json!({"q": "done"}),
+            )],
+        );
+        let live_turn = assistant_with_thinking(&["the reasoning the model still needs"]);
+        let body = captured_replay_body(true, vec![prior_turn, live_turn]).await;
+        let occurrences = body.matches("\"reasoning_content\"").count();
+        assert_eq!(
+            occurrences, 1,
+            "reasoning_content scopes per message — an engine-stripped history carries the \
+             field exactly once, on the newest assistant message: {body}"
+        );
+        assert!(
+            body.contains("\"reasoning_content\":\"the reasoning the model still needs\""),
+            "the single occurrence is the live turn's trace: {body}"
         );
     }
 

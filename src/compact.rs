@@ -614,7 +614,15 @@ pub struct ContextManager {
     /// The hard upper bound on tokens the model accepts in one request. Every
     /// threshold and target is expressed as a fraction of this value, so it is
     /// the denominator for [`compact_threshold_tokens`](Self::compact_threshold_tokens)
-    /// and the emergency-zone and compaction-target calculations.
+    /// and the emergency-zone and compaction-target calculations. When the
+    /// manager runs inside [`BareLoop`](crate::engine::BareLoop), the driver
+    /// resolves this number once per run — a window the client's provider
+    /// discloses (see
+    /// [`ApiClient::model_context_window`](crate::api::ApiClient::model_context_window))
+    /// wins over the declared
+    /// [`SessionConfig::context_window`](crate::config::SessionConfig::context_window),
+    /// and the manager is re-synced to the resolved value, so the trigger and
+    /// the compaction target always share one denominator.
     context_window: u64,
 
     /// Threshold as a percentage (0–100) at which compaction triggers.

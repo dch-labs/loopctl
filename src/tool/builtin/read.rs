@@ -1,4 +1,4 @@
-//! The `read` tool and the [`ContentSource`] seam it is parameterized by.
+//! The `Read` tool and the [`ContentSource`] seam it is parameterized by.
 //!
 //! A read that silently crops content is worse than no read at all: the
 //! model cannot tell a cut file from a complete one. This module is
@@ -176,7 +176,7 @@ pub trait ContentSource: Send + Sync {
 ///
 /// let mut registry = ToolRegistry::new();
 /// registry.register(ReadTool::new(MapSource(HashMap::new())));
-/// assert!(registry.contains("read"));
+/// assert!(registry.contains("Read"));
 /// ```
 #[derive(Debug, Clone)]
 pub struct ReadTool<S: ContentSource> {
@@ -695,7 +695,7 @@ fn bytes_output(path: &str, bytes: &[u8], max_image_bytes: usize) -> ToolOutput 
 
 impl<S: ContentSource> Tool for ReadTool<S> {
     fn name(&self) -> &'static str {
-        "read"
+        "Read"
     }
 
     fn description(&self) -> &'static str {
@@ -751,7 +751,7 @@ impl<S: ContentSource> Tool for ReadTool<S> {
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
         Box::pin(async move {
             let parsed: ReadInput = serde_json::from_value(input).map_err(|error| {
-                ToolError::InvalidInput(format!("read input must match the schema: {error}"))
+                ToolError::InvalidInput(format!("Read input must match the schema: {error}"))
             })?;
             let (offset, limit) =
                 resolve_range(&parsed, self.max_lines, self.default_offset_limit)?;
@@ -1505,7 +1505,7 @@ mod tests {
     #[test]
     fn schema_advertises_the_documented_fields() {
         let schema = ReadTool::new(FakeSource::with(&[])).schema();
-        assert_eq!(schema.tool, "read", "the registered name is lowercase read");
+        assert_eq!(schema.tool, "Read", "the registered name is CamelCase Read");
         let properties = schema
             .input_schema
             .get("properties")

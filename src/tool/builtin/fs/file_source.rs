@@ -1,6 +1,6 @@
 //! The filesystem [`ContentSource`] — and the family's read-side arm.
 //!
-//! The shared `read` tool stays policy-free; this source is where the
+//! The shared `Read` tool stays policy-free; this source is where the
 //! filesystem happens. It resolves every address under the session's
 //! containment policy, bounds what it reads the way the live read path
 //! always has, arms the staleness baseline with the bytes it serves —
@@ -32,7 +32,7 @@ use super::state;
 /// addresses raw bytes rather than attempt a text decode.
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
 
-/// The filesystem content source the shared `read` tool reads through.
+/// The filesystem content source the shared `Read` tool reads through.
 ///
 /// Constructed over the same [`FileSession`] the write tools operate
 /// through, so every read arms the staleness baseline the next write

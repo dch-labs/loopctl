@@ -32,29 +32,33 @@ use crate::message::ToolContent;
 use crate::message::ToolContentPart;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 
-/// Default line ceiling, sized so whole-file reads stay the default.
+/// Default line ceiling, sized so one default read costs a bounded
+/// slice of a small context window.
 ///
-/// Pagination-by-default would multiply turns and bet on the model's
-/// diligence; larger views page via `offset`/`limit`, each page
-/// self-describing. The byte ceiling below is the real bound — this
-/// line budget just keeps the numbering window generous enough that a
-/// typical source file lands in one read.
-const DEFAULT_MAX_LINES: usize = 2_000;
+/// A default read is the unit of context spending: a generous ceiling
+/// turns every casual read into a large silent spend that surfaces only
+/// when the provider rejects the request. The default keeps a typical
+/// read to a few thousand tokens; larger documents page via explicit
+/// `offset`/`limit`, where each page's cost is visible. The byte
+/// ceiling below is the real bound — this line budget only shapes
+/// typical text.
+const DEFAULT_MAX_LINES: usize = 400;
 
-/// Default output ceiling in bytes, guarding long-line content.
+/// Default ceiling on the joined numbered output, in bytes.
 ///
-/// A single minified line can exceed any line ceiling, so the joined
-/// numbered output is also capped in bytes: the cut lands on the last
-/// complete line and the marker names the returned range, the next
-/// offset, and the remedy.
-const DEFAULT_MAX_BYTES: usize = 400_000;
+/// The real bound on a default read: a single minified line can exceed
+/// any line ceiling, and a full window of ordinary-width lines can add
+/// past it — both cut here. The cut lands on the last complete line and
+/// the marker names the returned range, the next offset, and the remedy;
+/// it states the bound, never a cause the tool cannot verify.
+const DEFAULT_MAX_BYTES: usize = 32_768;
 
 /// Default `limit` when `offset` is given but `limit` is not.
 ///
 /// Reads that start mid-content get the same window size as a read from
 /// the top: the model is navigating, not skimming, and a stable page size
 /// keeps successive windows predictable.
-const DEFAULT_OFFSET_LIMIT: usize = 2_000;
+const DEFAULT_OFFSET_LIMIT: usize = 400;
 
 /// Default outright-refusal threshold, in bytes.
 ///
@@ -194,8 +198,9 @@ pub struct ReadTool<S: ContentSource> {
 
     /// Ceiling on the joined numbered output, in bytes.
     ///
-    /// Guards long-line content a line ceiling cannot; overridable via
-    /// [`ReadTool::with_max_bytes`].
+    /// The real bound on a view — it cuts long-line content a line
+    /// ceiling cannot, and a window of ordinary-width lines that adds
+    /// past it; overridable via [`ReadTool::with_max_bytes`].
     max_bytes: usize,
 
     /// `limit` applied when `offset` is given without one.
@@ -221,7 +226,7 @@ pub struct ReadTool<S: ContentSource> {
 impl<S: ContentSource> ReadTool<S> {
     /// Build a read tool over `source` with the default ceilings.
     ///
-    /// 2 000 lines, 400 000 bytes of joined output, a 2 000-line
+    /// 400 lines, 32 768 bytes of joined output, a 400-line
     /// default window for offset-only reads, a `10 MiB` outright-refusal
     /// threshold when the source reports sizes, and a `5 MiB` ceiling on
     /// encoded image payloads.
@@ -250,10 +255,10 @@ impl<S: ContentSource> ReadTool<S> {
 
     /// Override the joined-output byte ceiling.
     ///
-    /// Long-line content is the target: a single minified line can exceed
-    /// any line ceiling, and this ceiling is what cuts it honestly.
-    /// Values below 1 clamp to 1 — no line is zero bytes wide once
-    /// numbered.
+    /// The real bound on a view: a single minified line can exceed any
+    /// line ceiling, and a window of ordinary-width lines can add past
+    /// it — this ceiling is what cuts both honestly. Values below 1
+    /// clamp to 1 — no line is zero bytes wide once numbered.
     #[must_use]
     pub fn with_max_bytes(mut self, bytes: usize) -> Self {
         self.max_bytes = bytes.max(1);
@@ -469,9 +474,9 @@ fn parse_line_number(text: &str, field: &str) -> Result<usize, String> {
 /// truncation footer naming the returned range and the next offset; a
 /// partial view that reaches the end closes with a plain range line;
 /// the whole content under both ceilings carries no markers at all.
-/// The byte ceiling guards long-line content the same way: the joined
-/// numbered output is cut back to the last complete line and closed
-/// with a footer naming the returned range, the next offset, and the
+/// The byte ceiling bounds the joined output the same way: the numbered
+/// view is cut back to the last complete line and closed with a footer
+/// naming the returned range, the byte bound, the next offset, and the
 /// remedy — or, when not even one line fits, a pointer to where
 /// reading can resume.
 fn format_window(content: &str, offset: usize, limit: usize, max_bytes: usize) -> String {
@@ -576,8 +581,8 @@ fn byte_capped_view(numbered: &str, offset: usize, total_lines: usize, max_bytes
     write!(
         output,
         "\n\n[FILE TRUNCATED: Showing lines {offset}-{last_shown} of {total_lines}, cut at the \
-         {max_bytes}-byte output limit — the content has very long lines. Use offset={next_offset} \
-         with a smaller limit or line_range to page through the remaining {remaining} lines.]"
+         {max_bytes}-byte output limit. Use offset={next_offset} with a smaller limit or \
+         line_range to page through the remaining {remaining} lines.]"
     )
     .ok();
     output
@@ -1539,9 +1544,9 @@ mod tests {
             .await
             .expect("the default window resolves");
         assert!(
-            head.contains("Showing lines 1-2000 of 2500")
-                && head.contains("Use offset=2001 to see the remaining 500 lines"),
-            "the default line ceiling is 2000 and its cut names the continuation: {head}"
+            head.contains("Showing lines 1-400 of 2500")
+                && head.contains("Use offset=401 to see the remaining 2100 lines"),
+            "the default line ceiling is 400 and its cut names the continuation: {head}"
         );
         let page = read(
             &tool,
@@ -1550,8 +1555,8 @@ mod tests {
         .await
         .expect("the default offset-only window resolves");
         assert!(
-            page.contains("Showing lines 6-2005 of 2500"),
-            "the default offset-only window is 2000 lines: {page}"
+            page.contains("Showing lines 6-405 of 2500"),
+            "the default offset-only window is 400 lines: {page}"
         );
         let wide_line = "x".repeat(3000);
         let wide = (0..300)
@@ -1563,8 +1568,145 @@ mod tests {
             .await
             .expect("the default byte cap resolves");
         assert!(
-            output.contains("400000-byte output limit"),
-            "the default byte ceiling is 400 000: {output}"
+            output.contains("32768-byte output limit"),
+            "the default byte ceiling is 32 768: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_window_is_right_sized() {
+        let exactly_window = (1..=400)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let whole = read(
+            &ReadTool::new(FakeSource::with(&[("exact", &exactly_window)])),
+            input("exact"),
+        )
+        .await
+        .expect("a read at exactly the default window resolves");
+        assert!(
+            !whole.contains("TRUNCATED") && !whole.contains("Showing lines"),
+            "exactly 400 lines is a complete window and carries no marker: {whole}"
+        );
+
+        let one_past = (1..=401)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cut = read(
+            &ReadTool::new(FakeSource::with(&[("past", &one_past)])),
+            input("past"),
+        )
+        .await
+        .expect("a read one line past the default window resolves");
+        assert!(
+            cut.contains("Showing lines 1-400 of 401")
+                && cut.contains("Use offset=401 to see the remaining 1 lines"),
+            "the 400-line ceiling cuts one line past the window and names the continuation: {cut}"
+        );
+
+        let tall = (1..=1000)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let paged = read(
+            &ReadTool::new(FakeSource::with(&[("tall", &tall)])),
+            with_range("tall", &serde_json::json!({ "offset": 5 })),
+        )
+        .await
+        .expect("the default offset-only window resolves");
+        assert!(
+            paged.contains("Showing lines 5-404 of 1000")
+                && paged.contains("Use offset=405 to see the remaining 596 lines"),
+            "the default offset-only window is 400 lines: {paged}"
+        );
+
+        let long_lines = (0..120)
+            .map(|_| "z".repeat(400))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let byte_cut = read(
+            &ReadTool::new(FakeSource::with(&[("wide", &long_lines)])),
+            input("wide"),
+        )
+        .await
+        .expect("the default byte ceiling resolves");
+        assert!(
+            byte_cut.contains("32768-byte output limit"),
+            "the 32 768-byte ceiling is the real bound: {byte_cut}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_width_default_read_cuts_at_the_byte_ceiling_without_a_cause_claim() {
+        // 400 lines of exactly 90 bytes render at width-3 numbering to 95
+        // bytes each including the newline, so the joined output is 37 999
+        // bytes: the 32 768-byte default ceiling — not the line ceiling,
+        // which the window exactly fills — completes line 344 (344 × 95 =
+        // 32 680) and cuts inside line 345.
+        let ordinary = (0..400)
+            .map(|_| "x".repeat(90))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tool = ReadTool::new(FakeSource::with(&[("wide", &ordinary)]));
+        let output = read(&tool, input("wide"))
+            .await
+            .expect("an ordinary-width default read resolves");
+        assert!(
+            output.contains("Showing lines 1-344 of 400")
+                && output.contains("32768-byte output limit")
+                && output.contains("Use offset=345")
+                && output.contains("remaining 56 lines"),
+            "the byte cut names the returned range, the bound, and the next offset: {output}"
+        );
+        assert!(
+            !output.contains("very long lines"),
+            "90-byte lines are ordinary width — the footer states the bound, never a cause the \
+             tool cannot verify: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_big_file_default_read_cuts_with_a_marker() {
+        let big = (1..=12000)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tool = ReadTool::new(FakeSource::with(&[("big", &big)]));
+        let output = read(&tool, input("big"))
+            .await
+            .expect("a default read of a ~100 KiB file resolves");
+        assert!(
+            output.contains("FILE TRUNCATED")
+                && output.contains("Showing lines 1-400 of 12000")
+                && output.contains("Use offset=401 to see the remaining 11600 lines"),
+            "a big-file default read returns the first 400-line window and names the next \
+             offset: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_limits_beat_the_new_defaults() {
+        let tall = (1..=1000)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tool = ReadTool::new(FakeSource::with(&[("tall", &tall)]));
+        let output = read(
+            &tool,
+            with_range("tall", &serde_json::json!({ "offset": 5, "limit": 3 })),
+        )
+        .await
+        .expect("an explicit window resolves");
+        assert!(
+            output.contains("line5")
+                && output.contains("line7")
+                && !output.contains("line8")
+                && output.contains("Showing lines 5-7 of 1000")
+                && output.contains("Use offset=8 to see the remaining 993 lines"),
+            "an explicit offset and limit produce exactly that window, unaffected by the \
+             resized default: {output}"
         );
     }
 

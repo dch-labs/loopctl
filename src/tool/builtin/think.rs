@@ -1,4 +1,4 @@
-//! The `think` scratchpad tool.
+//! The `Think` scratchpad tool.
 //!
 //! Small models plan poorly inside a single forward pass. Registering
 //! [`ThinkTool`] gives the model a zero-cost place to reason in the
@@ -40,13 +40,13 @@ const ACKNOWLEDGEMENT: &str = "ok";
 ///
 /// let mut registry = ToolRegistry::new();
 /// registry.register(ThinkTool::new());
-/// assert!(registry.contains("think"));
+/// assert!(registry.contains("Think"));
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ThinkTool;
 
 impl ThinkTool {
-    /// A scratchpad tool advertising the `think` schema.
+    /// A scratchpad tool advertising the `Think` schema.
     ///
     /// The type carries no configuration; all instances behave
     /// identically and are cheap to construct per session.
@@ -58,7 +58,7 @@ impl ThinkTool {
 
 impl Tool for ThinkTool {
     fn name(&self) -> &'static str {
-        "think"
+        "Think"
     }
 
     fn description(&self) -> &'static str {
@@ -95,7 +95,7 @@ impl Tool for ThinkTool {
         Box::pin(async move {
             if input.get("thought").and_then(Value::as_str).is_none() {
                 return Err(ToolError::InvalidInput(
-                    "think requires a string `thought` field".to_string(),
+                    "Think requires a string `thought` field".to_string(),
                 ));
             }
             tracing::debug!(
@@ -172,7 +172,10 @@ mod tests {
     #[test]
     fn schema_advertises_only_the_thought_field() {
         let schema = ThinkTool::new().schema();
-        assert_eq!(schema.tool, "think");
+        assert_eq!(
+            schema.tool, "Think",
+            "the registered name is CamelCase Think"
+        );
         let input = &schema.input_schema;
         assert_eq!(input["type"], "object");
         assert_eq!(

@@ -113,7 +113,7 @@ const SHELL_TOOLS: &[&str] = &["Bash", "bash", "shell", "run_command", "execute"
 /// and [`WritePathExtractor`] (path-aware cache invalidation) with
 /// zero host code.
 ///
-/// Small-model recipe: register the `think` scratchpad tool
+/// Small-model recipe: register the `Think` scratchpad tool
 /// (`tool::builtin::ThinkTool`, behind the `builtin_tools` feature)
 /// alongside this profile — a place to plan before acting is one of the
 /// cheapest accuracy levers for local models.

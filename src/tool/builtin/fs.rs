@@ -1,7 +1,7 @@
 //! The filesystem tool family: shared session state and the validation seam.
 //!
 //! The family — `Write`, `Edit`, `MultiEdit`, `FileViewer`, and the
-//! filesystem [`FileSource`] the shared `read`
+//! filesystem [`FileSource`] the shared `Read`
 //! tool reads through — is wired together by one [`FileSession`]:
 //! the working directory every path resolves against, the containment
 //! policy, the pinned workspace anchor, and the map of the model's
@@ -33,7 +33,7 @@
 //! registry.register(WriteTool::new());
 //! registry.register(ReadTool::new(FileSource::new(session)));
 //! assert!(registry.contains("Write"));
-//! assert!(registry.contains("read"));
+//! assert!(registry.contains("Read"));
 //! ```
 
 mod atomic;

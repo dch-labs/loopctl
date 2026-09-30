@@ -1,8 +1,9 @@
 //! The `FileViewer` tool — paginated, token-efficient file viewing.
 //!
-//! The complement to the shared `read` tool: where `read` caps at ~200
-//! lines for quick lookups, `FileViewer` navigates large files in
-//! chunks via `page`/`page_size` (sequential) or `offset`/`limit`
+//! The complement to the shared `Read` tool: where `Read` serves whole
+//! files up to its 2 000-line ceiling, `FileViewer` navigates large
+//! files in chunks via `page`/`page_size` (sequential) or
+//! `offset`/`limit`
 //! (direct seek), with a header naming the current window and a
 //! `[Navigate: …]` hint. Only regular files are viewable — a missing
 //! or non-regular target (a directory, a FIFO, a device) is a soft

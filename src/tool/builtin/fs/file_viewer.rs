@@ -1,16 +1,15 @@
 //! The `FileViewer` tool — paginated, token-efficient file viewing.
 //!
-//! The complement to the shared `Read` tool: where `Read` serves whole
-//! files up to its 2 000-line ceiling, `FileViewer` navigates large
-//! files in chunks via `page`/`page_size` (sequential) or
-//! `offset`/`limit`
-//! (direct seek), with a header naming the current window and a
-//! `[Navigate: …]` hint. Only regular files are viewable — a missing
-//! or non-regular target (a directory, a FIFO, a device) is a soft
-//! error, so a special file can never hang the viewer on an open that
-//! never completes or a stream that never ends. Windows are read with
-//! a single-pass buffered scan that never holds more than the window
-//! and the per-line byte cap in memory, so a huge file costs its
+//! The complement to the shared `Read` tool: where a default `Read`
+//! serves one bounded window from the top of a file, `FileViewer`
+//! navigates large files in chunks via `page`/`page_size` (sequential)
+//! or `offset`/`limit` (direct seek), with a header naming the current
+//! window and a `[Navigate: …]` hint. Only regular files are viewable —
+//! a missing or non-regular target (a directory, a FIFO, a device) is a
+//! soft error, so a special file can never hang the viewer on an open
+//! that never completes or a stream that never ends. Windows are read
+//! with a single-pass buffered scan that never holds more than the
+//! window and the per-line byte cap in memory, so a huge file costs its
 //! window, not its size — and a pathological single-line file costs at
 //! most one capped line.
 

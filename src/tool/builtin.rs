@@ -178,4 +178,24 @@ mod tests {
             violations.join("\n")
         );
     }
+
+    #[test]
+    fn the_file_viewer_contrast_scopes_the_read_claim_to_the_default_window() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join("src/tool/builtin/fs/file_viewer.rs"))
+            .unwrap_or_else(|error| panic!("the viewer source must be readable: {error}"));
+        // Module-doc lines are re-joined so a sentence wrapped across `//!`
+        // lines still matches the phrase a reader sees.
+        let rendered = text
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("//!"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            rendered.contains("a default `Read` serves one bounded window"),
+            "the FileViewer contrast scopes its Read claim to the default window — Read seeks \
+             arbitrary windows via offset/limit and line_range"
+        );
+    }
 }

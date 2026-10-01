@@ -27,6 +27,10 @@ use super::{
 };
 #[cfg(feature = "hooks")]
 use super::{PostToolUseContext, PreToolUseContext};
+#[cfg(feature = "hooks")]
+use crate::ask::AskResolution;
+#[cfg(feature = "hooks")]
+use crate::ask::PendingAsk;
 use crate::capabilities::Detectable;
 #[cfg(feature = "tool_health")]
 use crate::capabilities::HealthTrackable;
@@ -34,6 +38,8 @@ use crate::capabilities::HealthTrackable;
 use crate::capabilities::Hookable;
 use crate::capabilities::PipelineAware;
 use crate::detection::loop_detector::{self, Operation};
+#[cfg(feature = "hooks")]
+use crate::tool::{GateDecision, GateRuleSource, GateVerdict};
 
 use crate::observer::{ToolPostContext, ToolPreContext};
 use crate::reflection::{Correction, CorrectionResult};
@@ -129,6 +135,86 @@ enum RecoveryDecision {
     /// `Err(LoopError::Cancelled)`, which the driver's error path records as
     /// [`MachineOutcome::Cancelled`](crate::engine::core::MachineOutcome::Cancelled)
     /// — a clean stop, not a failure.
+    Cancelled,
+}
+
+/// What a pre-tool-use hook check concluded for one call.
+///
+/// `Blocked` and `Ask` both stop the ordinary dispatch, `Ask` only
+/// until the parked ask resolves — an approved ask falls through to
+/// the caller's ordinary dispatch path.
+#[cfg(feature = "hooks")]
+enum HookCheck {
+    /// No hook intervened; dispatch proceeds.
+    ///
+    /// Either no executor is configured or every hook returned
+    /// `Allow`.
+    Proceed,
+
+    /// A hook blocked the call with a ready-made result.
+    ///
+    /// The result is returned to the model as a soft error;
+    /// nothing executes. Boxed to keep the enum's other variants
+    /// small — the block path is cold and one allocation is free.
+    Blocked(Box<ToolDispatchResult>),
+
+    /// A hook asked for external confirmation.
+    ///
+    /// Carries the hook's prompt; the caller parks the call on the
+    /// configured [`AskResolver`](crate::ask::AskResolver) before
+    /// dispatching.
+    Ask(String),
+}
+
+/// How a parked hook ask resolved for the caller.
+///
+/// `Approved` hands the record to the caller's dispatch result — it
+/// rides the `with_gate` precedence lattice, so a downstream gate's
+/// denial displaces it and the one deciding record is emitted per
+/// dispatch — unless an exit stops the approved call before any
+/// result exists, where the caller emits it directly. `Denied`
+/// returns the ready soft-error result; its record was already
+/// emitted and nothing executes.
+#[cfg(feature = "hooks")]
+enum HookAskResolution {
+    /// The approver approved; the record rides the dispatch result.
+    ///
+    /// The caller attaches it after the dispatch returns — the
+    /// lattice, not the park, decides which record survives a
+    /// composed pipeline — or emits it directly at an exit that stops
+    /// the call before any result exists to carry it.
+    Approved { record: GateDecision },
+
+    /// The ask denied — a refusal, an expiry, or the headless path.
+    ///
+    /// Carries the soft-error result the model reacts to; the denial
+    /// record has already been emitted.
+    Denied(ToolDispatchResult),
+}
+
+/// How a parked ask's wait ended.
+///
+/// Driver-internal control flow for [`park_hook_ask`]: an answer,
+/// the deadline, or the cancel signal — each maps to one emission and
+/// one outcome arm.
+///
+/// [`park_hook_ask`]: BareLoop::park_hook_ask
+#[cfg(feature = "hooks")]
+enum Parked {
+    /// The resolver answered.
+    ///
+    /// Carries the answer; approval falls through to dispatch, a
+    /// refusal returns the soft denial.
+    Answered(crate::ask::AskResolution),
+
+    /// The configured deadline passed with no answer.
+    ///
+    /// The policy denies and the expiry is audited.
+    Expired,
+
+    /// The cancel signal ended the wait.
+    ///
+    /// Distinct from a refusal — the run stops, no one said no.
     Cancelled,
 }
 
@@ -549,12 +635,26 @@ impl<C: ApiClient> BareLoop<C> {
             self.notify_tool_pre(turn_idx, &tc);
 
             #[cfg(feature = "hooks")]
-            if let Some(blocked) = self.check_pre_tool_use_hooks(&tc, turn_idx) {
-                self.notify_tool_post(turn_idx, &tc, &blocked);
-                return Ok(blocked);
-            }
+            let mut park_approval = match self.check_pre_tool_use_hooks(&tc, turn_idx) {
+                HookCheck::Proceed => None,
+                HookCheck::Blocked(blocked) => {
+                    self.notify_tool_post(turn_idx, &tc, &blocked);
+                    return Ok(*blocked);
+                }
+                HookCheck::Ask(prompt) => match self.park_hook_ask(&tc, turn_idx, &prompt).await? {
+                    HookAskResolution::Approved { record } => Some(record),
+                    HookAskResolution::Denied(denied) => {
+                        self.notify_tool_post(turn_idx, &tc, &denied);
+                        return Ok(denied);
+                    }
+                },
+            };
 
             if let Err(e) = self.pre_detection(turn_idx) {
+                #[cfg(feature = "hooks")]
+                if let Some(record) = park_approval.take() {
+                    self.notify_gate_decision(turn_idx, &tc.id, record);
+                }
                 let blocked = Self::result_for_call(
                     &tc,
                     Duration::ZERO,
@@ -570,6 +670,10 @@ impl<C: ApiClient> BareLoop<C> {
             if let Some(health) = self.managers.health_registry()
                 && !health.allow_request(&tc.tool)
             {
+                #[cfg(feature = "hooks")]
+                if let Some(record) = park_approval.take() {
+                    self.notify_gate_decision(turn_idx, &tc.id, record);
+                }
                 let refused = Self::result_for_call(
                     &tc,
                     Duration::ZERO,
@@ -585,11 +689,27 @@ impl<C: ApiClient> BareLoop<C> {
             }
 
             let start = self.managers.clock().monotonic();
-            let tool_result = tokio::select! {
+            let dispatched = tokio::select! {
                 biased;
-                () = self.cancelled.notified() => return Err(LoopError::Cancelled),
+                () = self.cancelled.notified() => {
+                    #[cfg(feature = "hooks")]
+                    if let Some(record) = park_approval.take() {
+                        self.notify_gate_decision(turn_idx, &tc.id, record);
+                    }
+                    return Err(LoopError::Cancelled);
+                }
                 r = self.dispatch_tool(&tc, &tool_context, start, turn_idx) => r,
             };
+            #[cfg(feature = "hooks")]
+            let tool_result = match park_approval.take() {
+                Some(record) => dispatched.with_gate(record),
+                None => dispatched,
+            };
+            #[cfg(not(feature = "hooks"))]
+            let tool_result = dispatched;
+            if let Some(gate) = tool_result.gate.clone() {
+                self.notify_gate_decision(turn_idx, &tc.id, gate);
+            }
             self.post_detection(&tc, &tool_result);
             self.notify_tool_post(turn_idx, &tc, &tool_result);
             #[cfg(feature = "hooks")]
@@ -642,10 +762,12 @@ impl<C: ApiClient> BareLoop<C> {
     /// Notify observers that a tool call has completed (or been blocked).
     ///
     /// Fires [`on_tool_post`](crate::observer::LoopObserver::on_tool_post) with
-    /// a result hash, error flag, and timing. Called for every outcome —
-    /// successful execution, hook block, detection block, or soft error — so
-    /// that every `on_tool_pre` has a matching `on_tool_post`, regardless of
-    /// the path taken. Observers can pair the two by `tool_call_id`.
+    /// a result hash, error flag, and timing. Called for every outcome that
+    /// produces a result — successful execution, hook block, detection
+    /// block, or soft error — so observers can pair the two by
+    /// `tool_call_id`. Cancellation paths return without a post event —
+    /// the run ends instead — so an `on_tool_pre` whose dispatch was
+    /// cancelled stays unpaired; pair those against the run-end event.
     fn notify_tool_post(&self, turn_idx: usize, tc: &ToolCall, result: &ToolDispatchResult) {
         self.managers.observers().on_tool_post(&ToolPostContext {
             turn: turn_idx,
@@ -884,21 +1006,16 @@ impl<C: ApiClient> BareLoop<C> {
     /// Check pre-tool-use hooks before a call executes.
     ///
     /// Consults the session's [`HookExecutor`](crate::hooks::HookExecutor) (if
-    /// configured) with the tool name, input, and turn number. Returns:
-    ///
-    /// - `None` when no hook is configured or all hooks return `Allow` — the
-    ///   call should proceed to execution.
-    /// - `Some(result)` when a hook returns `Block` or `Ask` — the result is a
-    ///   soft error (`is_error: true`, zero duration) carrying the hook's
-    ///   reason/message. The call is **not** executed; the caller returns this
-    ///   result to the model.
+    /// configured) with the tool name, input, and turn number, and
+    /// classifies the outcome: `Allow` (or no executor) proceeds, `Block`
+    /// returns a soft-error result the caller hands straight to the
+    /// model, and `Ask` hands the prompt to the caller, which parks the
+    /// call on the engine's ask resolver.
     #[cfg(feature = "hooks")]
-    fn check_pre_tool_use_hooks(
-        &self,
-        tc: &ToolCall,
-        turn_idx: usize,
-    ) -> Option<ToolDispatchResult> {
-        let executor = self.managers.hook_executor()?;
+    fn check_pre_tool_use_hooks(&self, tc: &ToolCall, turn_idx: usize) -> HookCheck {
+        let Some(executor) = self.managers.hook_executor() else {
+            return HookCheck::Proceed;
+        };
         let ctx = PreToolUseContext {
             tool_name: tc.tool.clone(),
             input: tc.input.clone(),
@@ -906,8 +1023,8 @@ impl<C: ApiClient> BareLoop<C> {
             turn_number: turn_idx,
         };
         match executor.check_pre_tool_use(&ctx) {
-            HookAction::Allow => None,
-            HookAction::Block { reason } => Some(ToolDispatchResult {
+            HookAction::Allow => HookCheck::Proceed,
+            HookAction::Block { reason } => HookCheck::Blocked(Box::new(ToolDispatchResult {
                 tool_call_id: tc.id.clone(),
                 output: ToolContent::Text(reason),
                 is_error: true,
@@ -915,16 +1032,160 @@ impl<C: ApiClient> BareLoop<C> {
                 resolved_tool_name: tc.tool.clone(),
                 display_hint: None,
                 gate: None,
-            }),
-            HookAction::Ask { message } => Some(ToolDispatchResult {
-                tool_call_id: tc.id.clone(),
-                output: ToolContent::Text(message),
-                is_error: true,
-                duration: Duration::ZERO,
-                resolved_tool_name: tc.tool.clone(),
-                display_hint: None,
-                gate: None,
-            }),
+            })),
+            HookAction::Ask { message } => HookCheck::Ask(message),
+        }
+    }
+
+    /// Build the soft-error result a denied or expired ask returns.
+    ///
+    /// One shape for every way a parked ask can end without executing
+    /// the call — a refusal, an expiry, a headless denial — so the model
+    /// sees one voice wherever the refusal originated.
+    #[cfg(feature = "hooks")]
+    fn ask_denied_result(tc: &ToolCall, message: &str) -> ToolDispatchResult {
+        ToolDispatchResult {
+            tool_call_id: tc.id.clone(),
+            output: ToolContent::Text(message.to_string()),
+            is_error: true,
+            duration: Duration::ZERO,
+            resolved_tool_name: tc.tool.clone(),
+            display_hint: None,
+            gate: None,
+        }
+    }
+
+    /// Park a hook's `ask` on the engine's resolver until it resolves.
+    ///
+    /// Mints the serialized [`PendingAsk`] (id from the id seam, the
+    /// call's arguments reduced to the gate digest) and suspends at the
+    /// pre-execution boundary — no tool has run and machine state is
+    /// coherent — racing the resolver against the cancel signal and,
+    /// when one is configured, the ask deadline. An approval hands its
+    /// record to the caller, which attaches it to the dispatch result
+    /// after the dispatch returns — the `with_gate` precedence lattice
+    /// keeps the deciding record, so a downstream gate's denial
+    /// displaces the approval and exactly one record is emitted per
+    /// dispatch — and emits it directly on the exits that stop an
+    /// approved call before any dispatch result exists to carry it: a
+    /// pre-detection hard stop, an open breaker, or a cancellation
+    /// mid-execution. A refusal or expiry returns the soft denial the model
+    /// reacts to, its record already emitted. With no resolver installed
+    /// the call denies headlessly — the result the model sees is
+    /// byte-identical to the pre-park behavior, plus one
+    /// [`AskUnresolved`](GateVerdict::AskUnresolved) record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::Cancelled`] when the cancel signal ends
+    /// the wait before anyone answers — the run stops, and no denial
+    /// reaches the model.
+    #[cfg(feature = "hooks")]
+    async fn park_hook_ask(
+        &self,
+        tc: &ToolCall,
+        turn: usize,
+        prompt: &str,
+    ) -> Result<HookAskResolution, LoopError> {
+        let Some(resolver) = self.managers.ask_resolver().cloned() else {
+            let record = GateDecision::new(
+                &tc.tool,
+                GateVerdict::AskUnresolved,
+                "hook",
+                GateRuleSource::Engine,
+            )
+            .for_args(&tc.input)
+            .with_reason(format!("permission required: {prompt}"));
+            self.notify_gate_decision(turn, &tc.id, record);
+            return Ok(HookAskResolution::Denied(Self::ask_denied_result(
+                tc, prompt,
+            )));
+        };
+        let pending = PendingAsk {
+            id: self.managers.id_gen().next_id(),
+            session_id: self.session.id,
+            run_id: self
+                .session
+                .current_run()
+                .map_or(uuid::Uuid::nil(), |run| run.id),
+            turn,
+            call_id: tc.id.clone(),
+            tool: tc.tool.clone(),
+            args_digest: GateDecision::args_digest(&tc.input),
+            prompt: prompt.to_string(),
+        };
+        let cancel = Arc::clone(&self.cancelled);
+        let parked = if let Some(deadline) = self.managers.ask_timeout() {
+            tokio::select! {
+                biased;
+                () = cancel.notified() => Parked::Cancelled,
+                answer = tokio::time::timeout(deadline, resolver.resolve(&pending)) => {
+                    match answer {
+                        Ok(answer) => Parked::Answered(answer),
+                        Err(_) => Parked::Expired,
+                    }
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                () = cancel.notified() => Parked::Cancelled,
+                answer = resolver.resolve(&pending) => Parked::Answered(answer),
+            }
+        };
+        match parked {
+            Parked::Answered(AskResolution::Approve) => {
+                let record = GateDecision::new(
+                    &tc.tool,
+                    GateVerdict::AskAllowed,
+                    "ask",
+                    GateRuleSource::AskResolver,
+                )
+                .for_args(&tc.input);
+                Ok(HookAskResolution::Approved { record })
+            }
+            Parked::Answered(AskResolution::Deny) => {
+                let record = GateDecision::new(
+                    &tc.tool,
+                    GateVerdict::AskDenied,
+                    "ask",
+                    GateRuleSource::AskResolver,
+                )
+                .for_args(&tc.input)
+                .with_reason("denied by approver");
+                self.notify_gate_decision(turn, &tc.id, record);
+                Ok(HookAskResolution::Denied(Self::ask_denied_result(
+                    tc,
+                    &format!("Permission denied by approver for tool '{}'", tc.tool),
+                )))
+            }
+            Parked::Expired => {
+                let record = GateDecision::new(
+                    &tc.tool,
+                    GateVerdict::AskExpired,
+                    "hook",
+                    GateRuleSource::Engine,
+                )
+                .for_args(&tc.input)
+                .with_reason("ask expired unanswered");
+                self.notify_gate_decision(turn, &tc.id, record);
+                Ok(HookAskResolution::Denied(Self::ask_denied_result(
+                    tc,
+                    &format!("Permission ask expired unanswered for tool '{}'", tc.tool),
+                )))
+            }
+            Parked::Cancelled => {
+                let record = GateDecision::new(
+                    &tc.tool,
+                    GateVerdict::Cancelled,
+                    "hook",
+                    GateRuleSource::Engine,
+                )
+                .for_args(&tc.input)
+                .with_reason("cancelled while awaiting approval");
+                self.notify_gate_decision(turn, &tc.id, record);
+                Err(LoopError::Cancelled)
+            }
         }
     }
 
@@ -1077,9 +1338,6 @@ impl<C: ApiClient> BareLoop<C> {
         };
         let dispatch_result = pipeline.invoke(ctx).await;
         let duration = self.managers.clock().elapsed_since(start);
-        if let Some(gate) = dispatch_result.gate.clone() {
-            self.notify_gate_decision(turn_idx, &tc.id, gate);
-        }
         ToolDispatchResult {
             tool_call_id: tc.id.clone(),
             output: dispatch_result.output,
@@ -1096,7 +1354,9 @@ impl<C: ApiClient> BareLoop<C> {
     /// Stamps the record's `ts` from the clock seam — the middleware
     /// that minted it has no clock — and forwards it with the turn and
     /// call id observers pair it by. Called once per gated dispatch,
-    /// after the pipeline returns and before the result is re-stamped.
+    /// after the dispatch returns and before the result is recorded —
+    /// the one emission site for every gate record a dispatch carries,
+    /// whichever gate minted it.
     fn notify_gate_decision(
         &self,
         turn: usize,

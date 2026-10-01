@@ -918,6 +918,7 @@ fn gate_precedence(verdict: GateVerdict) -> u8 {
         GateVerdict::Deny
         | GateVerdict::AskDenied
         | GateVerdict::AskUnresolved
+        | GateVerdict::AskExpired
         | GateVerdict::Cancelled => 2,
         GateVerdict::AllowModified => 1,
         GateVerdict::Allow | GateVerdict::Ask | GateVerdict::AskAllowed => 0,

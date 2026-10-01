@@ -220,15 +220,24 @@ pub trait LoopObserver: Send + Sync {
     /// [`on_turn_end`](Self::on_turn_end).
     fn on_attempt_reset(&self, _ctx: &AttemptResetContext) {}
 
-    /// Called when the permission gate's decision about a tool call is
+    /// Called when a permission gate's decision about a tool call is
     /// emitted.
     ///
-    /// Fires once per gated dispatch — after the pipeline returns,
-    /// before [`on_tool_post`](Self::on_tool_post) — carrying the
-    /// verdict, the argument digest, and the rule provenance as a
-    /// serializable record. Dispatches no gate consulted produce no
-    /// event. Notification-only, like every observer callback; the
-    /// decision has already been made and enforced.
+    /// Fires once per gated dispatch, at the point the deciding record
+    /// becomes final, carrying the verdict, the argument digest, and
+    /// the rule provenance as a serializable record. A record riding a
+    /// dispatch result — a middleware gate's, or an approved external
+    /// ask's — fires after the dispatch returns, before
+    /// [`on_tool_post`](Self::on_tool_post); a parked ask's
+    /// denial-family record fires at the park, before any dispatch,
+    /// and an approval whose call is refused before dispatching fires
+    /// at that exit — each ahead of the same call's post event. A
+    /// cancellation that cuts an approved dispatch mid-execution fires
+    /// the record and then ends the run: no post event follows, and
+    /// the unpaired pre pairs against the run-end event. Dispatches no
+    /// gate consulted produce no event. Notification-only, like every
+    /// observer callback; the decision has already been made and
+    /// enforced.
     fn on_gate_decision(&self, _ctx: &GateDecisionContext) {}
 
     /// Called when the engine has accumulated a tool call and is about to dispatch it.
@@ -547,8 +556,9 @@ impl ObserverHost {
 
     /// Dispatch [`LoopObserver::on_gate_decision`] to all observers.
     ///
-    /// Fired once per gated dispatch after the pipeline returns,
-    /// carrying the decision record. Iterates registered observers in
+    /// Fired when a gate's deciding record becomes final — the
+    /// emission point varies with which gate minted the record; the
+    /// callback doc enumerates them. Iterates registered observers in
     /// registration order.
     pub fn on_gate_decision(&self, ctx: &GateDecisionContext) {
         self.dispatch(|obs| obs.on_gate_decision(ctx));

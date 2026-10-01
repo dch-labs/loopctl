@@ -305,11 +305,15 @@ pub enum GateVerdict {
     /// answers.
     Ask,
 
-    /// The user approved the ask; the call proceeded.
+    /// The user approved the ask.
     ///
-    /// The decision the engine acted on — one record, not two: the
-    /// intermediate ask is a step, and this verdict is its
-    /// resolution.
+    /// The decision the engine acted on to dispatch the call — one
+    /// record, not two: the intermediate ask is a step, and this
+    /// verdict is its resolution. Whether the call ultimately ran is
+    /// read from the surrounding tool events, not from this verdict:
+    /// a downstream gate's record can displace it on the dispatch
+    /// result, and a call refused or cancelled after the approval
+    /// records this verdict at the exit that stopped it.
     AskAllowed,
 
     /// The user refused the ask; the call was denied.
@@ -323,6 +327,14 @@ pub enum GateVerdict {
     /// The headless path: the gate wanted a decision and had no way
     /// to get one.
     AskUnresolved,
+
+    /// The parked ask outlived its deadline and denied the call.
+    ///
+    /// An external approval was being awaited when the configured
+    /// deadline passed; the policy denies. Distinct from a refusal
+    /// (the approver said no) and from an unresolved ask (no approver
+    /// existed) — the wait itself expired.
+    AskExpired,
 
     /// The cancel signal ended the ask before anyone answered.
     ///
@@ -356,6 +368,13 @@ pub enum GateRuleSource {
     ///
     /// The rule asked; this source resolved.
     AskResolver,
+
+    /// The engine's own ask policy decided.
+    ///
+    /// The outcome a parked ask reaches without an approver's answer —
+    /// headless denial, deadline expiry, or cancellation — decided by
+    /// the engine's policy rather than by any rule or resolver.
+    Engine,
 }
 
 /// The serializable record of one permission-gate verdict.
@@ -419,7 +438,8 @@ pub struct GateDecision {
     /// reference it: `"middleware"` for an unnamed check function,
     /// the id a [`with_named_check`](crate::middleware::PermissionMiddleware::with_named_check)
     /// rule was given, `"context"` for a per-call claim, `"ask"` for
-    /// a resolver's answer.
+    /// a resolver's answer, `"hook"` for the engine's parked-ask
+    /// policy outcomes (an expired, cancelled, or headless hook ask).
     pub rule_id: String,
 
     /// Where the deciding rule came from.

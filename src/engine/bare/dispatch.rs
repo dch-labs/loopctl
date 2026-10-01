@@ -632,7 +632,7 @@ impl<C: ApiClient> BareLoop<C> {
             self.notify_tool_pre(turn_idx, &tc);
 
             #[cfg(feature = "hooks")]
-            let park_approval = match self.check_pre_tool_use_hooks(&tc, turn_idx) {
+            let mut park_approval = match self.check_pre_tool_use_hooks(&tc, turn_idx) {
                 HookCheck::Proceed => None,
                 HookCheck::Blocked(blocked) => {
                     self.notify_tool_post(turn_idx, &tc, &blocked);
@@ -648,6 +648,10 @@ impl<C: ApiClient> BareLoop<C> {
             };
 
             if let Err(e) = self.pre_detection(turn_idx) {
+                #[cfg(feature = "hooks")]
+                if let Some(record) = park_approval.take() {
+                    self.notify_gate_decision(turn_idx, &tc.id, record);
+                }
                 let blocked = Self::result_for_call(
                     &tc,
                     Duration::ZERO,
@@ -663,6 +667,10 @@ impl<C: ApiClient> BareLoop<C> {
             if let Some(health) = self.managers.health_registry()
                 && !health.allow_request(&tc.tool)
             {
+                #[cfg(feature = "hooks")]
+                if let Some(record) = park_approval.take() {
+                    self.notify_gate_decision(turn_idx, &tc.id, record);
+                }
                 let refused = Self::result_for_call(
                     &tc,
                     Duration::ZERO,
@@ -680,11 +688,17 @@ impl<C: ApiClient> BareLoop<C> {
             let start = self.managers.clock().monotonic();
             let dispatched = tokio::select! {
                 biased;
-                () = self.cancelled.notified() => return Err(LoopError::Cancelled),
+                () = self.cancelled.notified() => {
+                    #[cfg(feature = "hooks")]
+                    if let Some(record) = park_approval.take() {
+                        self.notify_gate_decision(turn_idx, &tc.id, record);
+                    }
+                    return Err(LoopError::Cancelled);
+                }
                 r = self.dispatch_tool(&tc, &tool_context, start, turn_idx) => r,
             };
             #[cfg(feature = "hooks")]
-            let tool_result = match park_approval {
+            let tool_result = match park_approval.take() {
                 Some(record) => dispatched.with_gate(record),
                 None => dispatched,
             };

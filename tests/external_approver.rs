@@ -725,4 +725,231 @@ mod engine {
             "the model saw the pipeline denial as an errored tool result"
         );
     }
+
+    /// A deploy tool that never resolves — the cancelled-dispatch pin's tool.
+    struct HangingDeploy;
+
+    impl loopctl::tool::Tool for HangingDeploy {
+        fn name(&self) -> &'static str {
+            "deploy"
+        }
+
+        fn description(&self) -> &'static str {
+            "Never resolves"
+        }
+
+        fn schema(&self) -> loopctl::tool::ToolSchema {
+            loopctl::tool::ToolSchema::new(
+                "deploy",
+                "Never resolves",
+                serde_json::json!({"type": "object"}),
+            )
+        }
+
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, loopctl::tool::ToolError>> + Send + '_>>
+        {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approved_ask_records_its_decision_when_dispatch_is_cancelled() {
+        let collector = Arc::new(GateCollector::new());
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (resolver, mut approver) = ApprovalChannel::pair(4);
+        let mut registry = ToolRegistry::new();
+        registry.register(HangingDeploy);
+        let managers = LoopManagers::new()
+            .with_observer(collector.clone() as Arc<dyn LoopObserver>)
+            .with_hook_executor(asking_executor())
+            .with_ask_resolver(resolver)
+            .with_clock(Arc::new(
+                loopctl::determinism::FixedClock::new(fixed_wall()),
+            ));
+        let client = MockApiClient::new("gated").with_responses(deploy_then_done("/prod", None));
+        let mut agent = BareLoop::new_with_managers(
+            Arc::new(client),
+            registry,
+            SessionConfig::default(),
+            managers,
+        );
+        let cancel = agent.cancel_signal();
+        let run_task =
+            tokio::spawn(async move { agent.run("deploy", &RunConfig::default()).await });
+
+        let pending = approver
+            .next_pending()
+            .await
+            .expect("the parked run delivers its ask");
+        assert!(
+            approver.resolve(pending.id, AskResolution::Approve),
+            "the approval unblocks the park — the call proceeds to dispatch"
+        );
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        let outcome = run_task.await.expect("the run task completes");
+        assert!(
+            matches!(outcome, Err(loopctl::error::LoopError::Cancelled)),
+            "the cancel ends the run while the approved call hangs in dispatch: {outcome:?}"
+        );
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the hanging tool never completed"
+        );
+
+        let recorded = collector.recorded();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the approval is recorded even though the run stopped before the dispatch \
+             returned: {recorded:?}"
+        );
+        let (_, _, decision) = recorded.first().cloned().expect("the record exists");
+        assert_eq!(decision.verdict, GateVerdict::AskAllowed);
+        assert_eq!(decision.rule_source, GateRuleSource::AskResolver);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "tool_health")]
+    async fn an_approved_ask_records_its_decision_when_the_breaker_refuses() {
+        let collector = Arc::new(GateCollector::new());
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (resolver, mut approver) = ApprovalChannel::pair(4);
+        let health = Arc::new(loopctl::tool::health::ToolHealthRegistry::new());
+        for _ in 0..3 {
+            health.record_failure("deploy", Duration::ZERO);
+        }
+        assert!(
+            !health.allow_request("deploy"),
+            "precondition: the breaker is open for deploy"
+        );
+        let managers = LoopManagers::new()
+            .with_observer(collector.clone() as Arc<dyn LoopObserver>)
+            .with_hook_executor(asking_executor())
+            .with_ask_resolver(resolver)
+            .with_health_registry(Arc::clone(&health))
+            .with_clock(Arc::new(
+                loopctl::determinism::FixedClock::new(fixed_wall()),
+            ));
+        let client = MockApiClient::new("gated").with_responses(deploy_then_done("/prod", None));
+        let mut agent = BareLoop::new_with_managers(
+            Arc::new(client),
+            deploy_registry(Arc::clone(&executions)),
+            SessionConfig::default(),
+            managers,
+        );
+        let run_task =
+            tokio::spawn(async move { agent.run("deploy", &RunConfig::default()).await });
+
+        let pending = approver
+            .next_pending()
+            .await
+            .expect("the parked run delivers its ask");
+        assert!(
+            approver.resolve(pending.id, AskResolution::Approve),
+            "the approval unblocks the park"
+        );
+
+        let run = run_task
+            .await
+            .expect("the run task completes")
+            .expect("the breaker refusal is soft — the run still completes");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the open breaker refused the approved call"
+        );
+
+        let recorded = collector.recorded();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the approval is recorded even though the breaker refused before execution: \
+             {recorded:?}"
+        );
+        let (_, _, decision) = recorded.first().cloned().expect("the record exists");
+        assert_eq!(decision.verdict, GateVerdict::AskAllowed);
+        assert_eq!(decision.rule_source, GateRuleSource::AskResolver);
+    }
+
+    #[tokio::test]
+    async fn an_approved_ask_records_its_decision_when_pre_detection_refuses() {
+        let collector = Arc::new(GateCollector::new());
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (resolver, mut approver) = ApprovalChannel::pair(4);
+        let detection = loopctl::detection::DetectionManager::new_with_config(
+            loopctl::detection::DetectionConfig {
+                loop_threshold: 2,
+                stop_threshold: 2,
+                ..Default::default()
+            },
+        )
+        .expect("valid detection config");
+        let repeated = loopctl::detection::loop_detector::Operation {
+            tool: "deploy".to_string(),
+            primary_param: "{\"target\":\"/prod\"}".to_string(),
+            result_hash: Some(7),
+        };
+        detection
+            .record_operation(repeated.clone())
+            .expect("records");
+        detection
+            .record_operation(repeated)
+            .expect("records — two identical operations trip the stop threshold");
+        let managers = LoopManagers::new()
+            .with_observer(collector.clone() as Arc<dyn LoopObserver>)
+            .with_hook_executor(asking_executor())
+            .with_ask_resolver(resolver)
+            .with_detection(detection)
+            .with_clock(Arc::new(
+                loopctl::determinism::FixedClock::new(fixed_wall()),
+            ));
+        let client = MockApiClient::new("gated").with_responses(deploy_then_done("/prod", None));
+        let mut agent = BareLoop::new_with_managers(
+            Arc::new(client),
+            deploy_registry(Arc::clone(&executions)),
+            SessionConfig::default(),
+            managers,
+        );
+        let run_task =
+            tokio::spawn(async move { agent.run("deploy", &RunConfig::default()).await });
+
+        let pending = approver
+            .next_pending()
+            .await
+            .expect("the parked run delivers its ask");
+        assert!(
+            approver.resolve(pending.id, AskResolution::Approve),
+            "the approval unblocks the park"
+        );
+
+        let outcome = run_task.await.expect("the run task completes");
+        assert!(
+            matches!(outcome, Err(loopctl::error::LoopError::LoopDetected { .. })),
+            "the pre-seeded repetition hard-stops the run before execution: {outcome:?}"
+        );
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refused call never executed"
+        );
+
+        let recorded = collector.recorded();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the approval is recorded even though pre-detection refused the dispatch: \
+             {recorded:?}"
+        );
+        let (_, _, decision) = recorded.first().cloned().expect("the record exists");
+        assert_eq!(decision.verdict, GateVerdict::AskAllowed);
+        assert_eq!(decision.rule_source, GateRuleSource::AskResolver);
+    }
 }

@@ -307,7 +307,9 @@ impl AskResolver for ApprovalChannel {
 /// [`resolve`](Self::resolve) quoting the ask's id. Each ask accepts
 /// exactly one answer — a second `resolve` for an id returns `false`
 /// and completes nothing, so a late or duplicated answer can never
-/// reach a run that already moved on.
+/// reach a run that already moved on. Dropping the approver denies
+/// every ask still awaiting an answer — no run parks forever on an
+/// answerer that is gone.
 pub struct Approver {
     state: Arc<ChannelState>,
     incoming: tokio::sync::mpsc::Receiver<PendingAsk>,
@@ -339,6 +341,30 @@ impl Approver {
             Some(sender) => sender.send(resolution).is_ok(),
             None => false,
         }
+    }
+}
+
+impl Drop for Approver {
+    /// Deny every ask still awaiting an answer.
+    ///
+    /// The delivered ask's completion slot lives in the shared
+    /// channel state, so an approver that goes away without answering
+    /// would otherwise leave its parked waits suspended forever — the
+    /// default no-deadline park would hang the run. Draining the
+    /// slots here fails every outstanding ask closed; a send racing an
+    /// already-ended wait returns an error that is deliberately
+    /// ignored, exactly like a late `resolve`.
+    fn drop(&mut self) {
+        let Ok(mut awaiting) = self.state.awaiting.lock() else {
+            return;
+        };
+        let senders: Vec<tokio::sync::oneshot::Sender<AskResolution>> =
+            awaiting.drain().map(|(_, sender)| sender).collect();
+        let denied = senders
+            .into_iter()
+            .filter_map(|sender| sender.send(AskResolution::Deny).ok())
+            .count();
+        tracing::debug!(denied, "approver dropped: outstanding asks denied");
     }
 }
 
@@ -450,6 +476,28 @@ mod tests {
         assert!(
             !approver.resolve(id, AskResolution::Approve),
             "an answer after the wait ended reaches nothing — the slot is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_approver_after_delivery_denies_the_parked_ask() {
+        let (resolver, mut approver) = ApprovalChannel::pair(4);
+        let parked = sample_ask(Uuid::new_v4(), "deploy");
+        let parked_clone = parked.clone();
+        let resolution_task = tokio::spawn(async move { resolver.resolve(&parked_clone).await });
+        assert!(
+            approver.next_pending().await.is_some(),
+            "the ask is delivered while the approver still lives"
+        );
+        drop(approver);
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(1), resolution_task)
+            .await
+            .expect("dropping the approver denies the parked ask — no hang")
+            .expect("the resolution task completes");
+        assert_eq!(
+            answer,
+            AskResolution::Deny,
+            "the drop-denial fails the delivered ask closed"
         );
     }
 

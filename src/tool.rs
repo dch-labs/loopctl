@@ -81,6 +81,9 @@ use crate::message::ToolContent as MessageToolContent;
 pub mod permission;
 pub mod registry;
 
+pub use permission::GateDecision;
+pub use permission::GateRuleSource;
+pub use permission::GateVerdict;
 pub use permission::PermissionCheck;
 pub use registry::{FnTool, ToolRegistry};
 
@@ -727,6 +730,14 @@ pub struct ToolDispatchResult {
     /// from. Carried into [`ToolPostContext`](crate::observer::ToolPostContext)
     /// for observers to read; never read by loop semantics.
     pub display_hint: Option<DisplayHint>,
+
+    /// The permission gate's decision about this call, when one ran.
+    ///
+    /// `None` on every path no gate consulted — a bare registry
+    /// dispatch, a pipeline without permission middleware. Set by the
+    /// gate middleware and read by the engine, which stamps and emits
+    /// it to observers.
+    pub gate: Option<GateDecision>,
 }
 
 impl ToolDispatchResult {
@@ -743,6 +754,7 @@ impl ToolDispatchResult {
             duration,
             resolved_tool_name: tool_name.to_string(),
             display_hint: None,
+            gate: None,
         }
     }
 
@@ -758,6 +770,7 @@ impl ToolDispatchResult {
             duration,
             resolved_tool_name: tool_name.to_string(),
             display_hint: None,
+            gate: None,
         }
     }
 
@@ -770,6 +783,31 @@ impl ToolDispatchResult {
         Self::from(output)
             .with_tool_name(tool_name)
             .with_duration(duration)
+    }
+
+    /// Builder: attach the gate's decision record.
+    ///
+    /// Set by the permission middleware on the result it returns —
+    /// deny arms on the result they build, pass-through arms on the
+    /// inner pipeline's result — so the engine can emit it.
+    /// Attachment is verdict-aware: a deny-family record displaces
+    /// any other, and [`AllowModified`](GateVerdict::AllowModified)
+    /// displaces a plain pass-through, so the record that decided the
+    /// outcome survives — an outer allow cannot erase an inner deny,
+    /// and an inner pass-through cannot mask an outer rewrite, whose
+    /// digest is the one that matches the model's call. Equal
+    /// precedence keeps the first writer. Two modifying gates cannot
+    /// both be expressed: one record carries one rewrite, and the
+    /// survivor is the first attached.
+    #[must_use]
+    pub fn with_gate(mut self, gate: GateDecision) -> Self {
+        let displaces = self.gate.as_ref().is_none_or(|existing| {
+            gate_precedence(gate.verdict) > gate_precedence(existing.verdict)
+        });
+        if displaces {
+            self.gate = Some(gate);
+        }
+        self
     }
 
     /// Builder: attach the [`tool_call_id`](Self::tool_call_id).
@@ -815,6 +853,7 @@ impl ToolDispatchResult {
             duration,
             resolved_tool_name: tool_name.to_string(),
             display_hint: None,
+            gate: None,
         }
     }
 
@@ -861,7 +900,27 @@ impl From<ToolOutput> for ToolDispatchResult {
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
             display_hint: output.display_hint,
+            gate: None,
         }
+    }
+}
+
+/// The precedence tier a gate verdict holds when records compete.
+///
+/// Deny-family verdicts — the dispatch did not execute — hold the
+/// top tier, [`GateVerdict::AllowModified`] the middle (its record
+/// digests the model's original arguments, so it is the record a
+/// call-digest join matches), and pass-through verdicts the bottom.
+/// A newly attached record displaces an existing one only from a
+/// higher tier; equal tiers keep the first writer.
+fn gate_precedence(verdict: GateVerdict) -> u8 {
+    match verdict {
+        GateVerdict::Deny
+        | GateVerdict::AskDenied
+        | GateVerdict::AskUnresolved
+        | GateVerdict::Cancelled => 2,
+        GateVerdict::AllowModified => 1,
+        GateVerdict::Allow | GateVerdict::Ask | GateVerdict::AskAllowed => 0,
     }
 }
 

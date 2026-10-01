@@ -17,10 +17,10 @@ use tokio::sync::broadcast;
 use super::LoopObserver;
 use super::context::{
     AttemptResetContext, CompactedContext, ConvergenceDetectedContext, FallbackContext,
-    LoopDetectedContext, ModelSwitchedContext, PreCompactionContext, ResponseContext,
-    RunEndContext, RunStartContext, StreamContext, StreamFailureContext, TextDeltaContext,
-    ThinkingDeltaContext, ToolCallReceivedContext, ToolPostContext, ToolPreContext,
-    TransportFallbackContext, TurnEndContext, TurnStartContext,
+    GateDecisionContext, LoopDetectedContext, ModelSwitchedContext, PreCompactionContext,
+    ResponseContext, RunEndContext, RunStartContext, StreamContext, StreamFailureContext,
+    TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext, ToolPostContext,
+    ToolPreContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
 };
 
 /// One observed lifecycle moment of a run, as forwarded by [`EventHub`].
@@ -90,6 +90,12 @@ pub enum LoopEvent {
     /// One per retry, before the retried attempt's first delta — the cue
     /// to drop buffered text/thinking deltas of the same turn.
     AttemptReset(AttemptResetContext),
+
+    /// A permission gate decided about a tool call.
+    ///
+    /// One per gated dispatch, after the pipeline returns: the
+    /// verdict, argument digest, and rule provenance as one record.
+    GateDecision(GateDecisionContext),
 
     /// A tool call was accumulated, before dispatch.
     ///
@@ -387,6 +393,15 @@ impl LoopObserver for EventHub {
     }
 
     /// Forwards
+    /// [`on_gate_decision`](LoopObserver::on_gate_decision) as a
+    /// [`GateDecision`](LoopEvent::GateDecision) event.
+    ///
+    /// One per gated dispatch; the record arrives by value.
+    fn on_gate_decision(&self, ctx: &GateDecisionContext) {
+        self.publish(LoopEvent::GateDecision(ctx.clone()));
+    }
+
+    /// Forwards
     /// [`on_tool_call_received`](LoopObserver::on_tool_call_received)
     /// as a [`ToolCallReceived`](LoopEvent::ToolCallReceived) event.
     ///
@@ -501,6 +516,7 @@ mod tests {
             LoopEvent::TextDelta(_) => "text_delta",
             LoopEvent::ThinkingDelta(_) => "thinking_delta",
             LoopEvent::AttemptReset(_) => "attempt_reset",
+            LoopEvent::GateDecision(_) => "gate_decision",
             LoopEvent::ToolCallReceived(_) => "tool_call_received",
             LoopEvent::ToolPre(_) => "tool_pre",
             LoopEvent::ToolPost(_) => "tool_post",
@@ -514,11 +530,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_callback_maps_to_its_event_kind_in_call_order() {
-        let hub = EventHub::new(64);
-        let mut receiver = hub.subscribe();
-        let session_id = uuid::Uuid::new_v4();
+    /// The compaction telemetry the mapping pin's events carry.
+    ///
+    /// A minimal real pass over a two-message conversation, built the
+    /// way the engine builds it, so the pin's `pre_compaction` and
+    /// `compaction` events carry genuine telemetry shapes.
+    fn mapping_pin_telemetry() -> crate::compact::CompactTelemetry {
         let manager = crate::compact::ContextManager::new(std::sync::Arc::new(
             crate::compact::TruncatingCompactor::new(),
         ))
@@ -527,13 +544,38 @@ mod tests {
             "a long conversation now summarized",
         )];
         let post = vec![crate::message::Message::user("summary")];
-        let telemetry = manager.build_telemetry(
+        manager.build_telemetry(
             crate::compact::CompactReason::ThresholdExceeded,
             &pre,
             &post,
             Some("TruncatingCompactor"),
             std::time::Instant::now(),
-        );
+        )
+    }
+
+    /// Publish one gate-decision event through the hub.
+    ///
+    /// The mapping pin's gate entry: a denied deploy under a named
+    /// middleware rule, the shape a gated dispatch produces.
+    fn publish_gate_decision(hub: &EventHub) {
+        hub.on_gate_decision(&GateDecisionContext {
+            turn: 0,
+            call_id: "call_gate".to_string(),
+            decision: crate::tool::permission::GateDecision::new(
+                "deploy",
+                crate::tool::permission::GateVerdict::Deny,
+                "deny-write-etc",
+                crate::tool::permission::GateRuleSource::Middleware,
+            ),
+        });
+    }
+
+    #[test]
+    fn every_callback_maps_to_its_event_kind_in_call_order() {
+        let hub = EventHub::new(64);
+        let mut receiver = hub.subscribe();
+        let session_id = uuid::Uuid::new_v4();
+        let telemetry = mapping_pin_telemetry();
 
         hub.on_run_start(&RunStartContext { session_id });
         hub.on_turn_start(&TurnStartContext {
@@ -579,6 +621,7 @@ mod tests {
             tool: "echo".to_string(),
             tool_call_id: "call_1".to_string(),
         });
+        publish_gate_decision(&hub);
         hub.on_tool_post(&ToolPostContext {
             tool_call_id: "call_1".to_string(),
             turn: 0,
@@ -588,6 +631,7 @@ mod tests {
             duration: std::time::Duration::from_millis(1),
             display_hint: None,
         });
+
         hub.on_pre_compaction(&PreCompactionContext {
             reason: crate::compact::CompactReason::ThresholdExceeded,
             turn: 0,
@@ -647,6 +691,7 @@ mod tests {
             "response",
             "tool_call_received",
             "tool_pre",
+            "gate_decision",
             "tool_post",
             "pre_compaction",
             "compaction",
@@ -658,7 +703,7 @@ mod tests {
             "turn_end",
             "run_end",
         ];
-        drain_and_assert_kinds(&mut receiver, &expected, 20);
+        drain_and_assert_kinds(&mut receiver, &expected, 21);
     }
 
     /// Drain a hub receiver and pin both the event-kind order and the

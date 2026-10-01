@@ -76,8 +76,11 @@ pub use crate::tool::ToolDispatchResult;
 
 pub use memoize::{MemoizingMiddleware, NoopPathExtractor, PathExtractor, WritePathExtractor};
 
+pub use crate::tool::permission::{GateDecision, GateRuleSource, GateVerdict};
 pub use output_limit::OutputLimitMiddleware;
-pub use permission::{AskResolverFn, PermissionCheckFn, PermissionMiddleware};
+pub use permission::AskResolverFn;
+pub use permission::PermissionCheckFn;
+pub use permission::PermissionMiddleware;
 #[cfg(feature = "redaction")]
 pub use redaction::{RedactingMiddleware, SecretPattern, SecretPatternSet};
 #[cfg(feature = "tool_shield")]

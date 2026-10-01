@@ -2,6 +2,7 @@
 
 use super::{ToolDispatchContext, ToolDispatchResult, ToolMiddleware, ToolPipeline};
 use crate::tool::PermissionCheck;
+use crate::tool::permission::{GateDecision, GateRuleSource, GateVerdict};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -66,6 +67,16 @@ pub struct PermissionMiddleware {
     /// Lets one pipeline impose a uniform policy regardless of what
     /// each dispatch claims.
     check_fn: Option<PermissionCheckFn>,
+
+    /// The stable rule id a named check carries onto its records.
+    ///
+    /// `None` for an unnamed [`with_check`](Self::with_check) closure,
+    /// whose records identify as `"middleware"`; the id a
+    /// [`with_named_check`](Self::with_named_check) rule was given
+    /// rides its records verbatim so manifests and audit roll-ups can
+    /// reference it.
+    rule_id: Option<String>,
+
     /// When `Some`, called to resolve [`PermissionCheck::Ask`] interactively.
     ///
     /// Absent, an `Ask` degrades to a denial naming the prompt, so a
@@ -84,6 +95,7 @@ impl PermissionMiddleware {
             check_fn: Some(Arc::new(|_| PermissionCheck::Deny {
                 reason: "blocked by policy".into(),
             })),
+            rule_id: None,
             ask_resolver: None,
         }
     }
@@ -98,6 +110,7 @@ impl PermissionMiddleware {
     pub fn allow_all() -> Self {
         Self {
             check_fn: Some(Arc::new(|_| PermissionCheck::Allow)),
+            rule_id: None,
             ask_resolver: None,
         }
     }
@@ -112,6 +125,25 @@ impl PermissionMiddleware {
         f: impl Fn(&ToolDispatchContext) -> PermissionCheck + Send + Sync + 'static,
     ) -> Self {
         self.check_fn = Some(Arc::new(f));
+        self.rule_id = None;
+        self
+    }
+
+    /// Set a custom permission check carrying a stable rule id.
+    ///
+    /// Identical to [`with_check`](Self::with_check) except that the
+    /// gate-decision records the check produces carry `rule_id`
+    /// verbatim — the identifier manifests reference and audit
+    /// roll-ups group by. An unnamed check's records identify as
+    /// `"middleware"`; naming one never changes what it decides.
+    #[must_use]
+    pub fn with_named_check(
+        mut self,
+        rule_id: impl Into<String>,
+        f: impl Fn(&ToolDispatchContext) -> PermissionCheck + Send + Sync + 'static,
+    ) -> Self {
+        self.check_fn = Some(Arc::new(f));
+        self.rule_id = Some(rule_id.into());
         self
     }
 
@@ -124,6 +156,7 @@ impl PermissionMiddleware {
     pub fn from_context() -> Self {
         Self {
             check_fn: None,
+            rule_id: None,
             ask_resolver: None,
         }
     }
@@ -146,12 +179,82 @@ impl PermissionMiddleware {
     /// per-call verdict.
     ///
     /// Centralizing the fallback keeps the configured and default
-    /// paths on one resolution rule.
-    fn resolve_permission(&self, ctx: &ToolDispatchContext) -> PermissionCheck {
+    /// paths on one resolution rule. The provenance pair beside the
+    /// verdict names the rule source and id the gate-decision record
+    /// carries: the middleware's (possibly named) check, or the
+    /// context claim.
+    fn resolve_permission(
+        &self,
+        ctx: &ToolDispatchContext,
+    ) -> (PermissionCheck, GateRuleSource, String) {
         match &self.check_fn {
-            Some(f) => f(ctx),
-            None => ctx.permission.clone(),
+            Some(f) => (
+                f(ctx),
+                GateRuleSource::Middleware,
+                self.rule_id
+                    .clone()
+                    .unwrap_or_else(|| "middleware".to_string()),
+            ),
+            None => (
+                ctx.permission.clone(),
+                GateRuleSource::Context,
+                "context".to_string(),
+            ),
         }
+    }
+
+    /// Mint the gate-decision record for one dispatch.
+    ///
+    /// The record digests the call's arguments as dispatched — for a
+    /// rewritten (`Modify`) call, the original input, because the
+    /// digest identifies the call the model made — and carries no
+    /// timestamp: the engine stamps at emission from its clock seam.
+    fn gate_record(
+        ctx: &ToolDispatchContext,
+        verdict: GateVerdict,
+        source: GateRuleSource,
+        rule_id: &str,
+    ) -> GateDecision {
+        GateDecision::new(&ctx.tool_name, verdict, rule_id, source).for_args(&ctx.input)
+    }
+
+    /// Answer what the gate would decide for a call, without running it.
+    ///
+    /// Builds a synthetic dispatch (the permission claim the engine
+    /// itself sets — [`PermissionCheck::Allow`] — a fresh cancel
+    /// signal, a default tool context) and resolves it through the
+    /// same rule stack a real dispatch takes, so `plan`-style and
+    /// dry-run callers get the engine's answer, not a parallel
+    /// policy. An [`PermissionCheck::Ask`] answers
+    /// [`GateVerdict::Ask`] with the prompt in `reason`: a dry-run
+    /// never consults the resolver, because it never shows a prompt.
+    /// The record digests `input`, carries no timestamp (no run clock
+    /// is consulted), and dispatches nothing.
+    #[must_use]
+    pub fn evaluate(&self, tool_name: &str, input: &serde_json::Value) -> GateDecision {
+        let ctx = ToolDispatchContext {
+            tool_name: tool_name.to_string(),
+            input: input.clone(),
+            call_id: String::new(),
+            turn_number: 0,
+            cancel: Arc::new(crate::cancel::CancelSignal::new()),
+            permission: PermissionCheck::Allow,
+            tool_context: crate::tool::ToolContext::default(),
+        };
+        let (permission, source, rule_id) = self.resolve_permission(&ctx);
+        let verdict = match permission {
+            PermissionCheck::Allow => GateVerdict::Allow,
+            PermissionCheck::Modify { .. } => GateVerdict::AllowModified,
+            PermissionCheck::Deny { .. } => GateVerdict::Deny,
+            PermissionCheck::Ask { .. } => GateVerdict::Ask,
+        };
+        let mut record = Self::gate_record(&ctx, verdict, source, &rule_id);
+        match permission {
+            PermissionCheck::Deny { reason } => record = record.with_reason(reason),
+            PermissionCheck::Ask { prompt } => record = record.with_reason(prompt),
+            _ => {}
+        }
+        record
     }
 }
 
@@ -165,14 +268,22 @@ impl ToolMiddleware for PermissionMiddleware {
         ctx: &'a mut ToolDispatchContext,
         next: &'a ToolPipeline,
     ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
-        let permission = self.resolve_permission(ctx);
+        let (permission, source, rule_id) = self.resolve_permission(ctx);
         match permission {
-            PermissionCheck::Allow => next.dispatch(ctx),
-            PermissionCheck::Modify { modified_input } => {
-                ctx.input = modified_input;
-                next.dispatch(ctx)
+            PermissionCheck::Allow => {
+                let record = Self::gate_record(ctx, GateVerdict::Allow, source, &rule_id);
+                Box::pin(async move { next.dispatch(ctx).await.with_gate(record) })
             }
-            PermissionCheck::Deny { reason } => Self::deny(ctx, &reason),
+            PermissionCheck::Modify { modified_input } => {
+                let record = Self::gate_record(ctx, GateVerdict::AllowModified, source, &rule_id);
+                ctx.input = modified_input;
+                Box::pin(async move { next.dispatch(ctx).await.with_gate(record) })
+            }
+            PermissionCheck::Deny { reason } => {
+                let record = Self::gate_record(ctx, GateVerdict::Deny, source, &rule_id)
+                    .with_reason(reason.clone());
+                Box::pin(async move { Self::deny(ctx, &reason).await.with_gate(record) })
+            }
             PermissionCheck::Ask { prompt } => {
                 if let Some(resolver) = &self.ask_resolver {
                     let resolver = Arc::clone(resolver);
@@ -183,19 +294,45 @@ impl ToolMiddleware for PermissionMiddleware {
                         let approved = tokio::select! {
                             approved = approved => approved,
                             () = cancel.notified() => {
+                                let record = Self::gate_record(
+                                        ctx,
+                                        GateVerdict::Cancelled,
+                                        source,
+                                        &rule_id,
+                                    )
+                                    .with_reason("cancelled while awaiting approval");
                                 return Self::deny(
                                     ctx,
                                     "cancelled while awaiting approval",
                                 )
-                                .await;
+                                .await
+                                .with_gate(record);
                             }
                         };
                         if approved && !cancel.is_cancelled() {
-                            next.dispatch(ctx).await
+                            let record = Self::gate_record(
+                                ctx,
+                                GateVerdict::AskAllowed,
+                                GateRuleSource::AskResolver,
+                                "ask",
+                            );
+                            next.dispatch(ctx).await.with_gate(record)
                         } else if approved {
-                            Self::deny(ctx, "cancelled while awaiting approval").await
+                            let record =
+                                Self::gate_record(ctx, GateVerdict::Cancelled, source, &rule_id)
+                                    .with_reason("cancelled while awaiting approval");
+                            Self::deny(ctx, "cancelled while awaiting approval")
+                                .await
+                                .with_gate(record)
                         } else {
-                            Self::deny(ctx, "denied by user").await
+                            let record = Self::gate_record(
+                                ctx,
+                                GateVerdict::AskDenied,
+                                GateRuleSource::AskResolver,
+                                "ask",
+                            )
+                            .with_reason("denied by user");
+                            Self::deny(ctx, "denied by user").await.with_gate(record)
                         }
                     })
                 } else {
@@ -204,7 +341,14 @@ impl ToolMiddleware for PermissionMiddleware {
                         prompt = %prompt,
                         "permission Ask denied: no resolver configured"
                     );
-                    Self::deny(ctx, &format!("permission required: {prompt}"))
+                    let record =
+                        Self::gate_record(ctx, GateVerdict::AskUnresolved, source, &rule_id)
+                            .with_reason(format!("permission required: {prompt}"));
+                    Box::pin(async move {
+                        Self::deny(ctx, &format!("permission required: {prompt}"))
+                            .await
+                            .with_gate(record)
+                    })
                 }
             }
         }

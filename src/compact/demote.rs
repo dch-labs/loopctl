@@ -341,8 +341,9 @@ fn render_message(msg: &Message) -> String {
 /// The standard offset basis and prime. The value is fixed by the
 /// algorithm, not the toolchain — unlike `DefaultHasher`, whose output
 /// Rust does not guarantee across releases — so tags derived from it
-/// stay comparable in stores that persist across upgrades.
-fn fnv1a64(bytes: &[u8]) -> u64 {
+/// stay comparable in stores that persist across upgrades. Shared
+/// with the permission gate's argument digest for the same reason.
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET_BASIS;

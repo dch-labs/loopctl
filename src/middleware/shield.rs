@@ -161,6 +161,7 @@ impl ToolMiddleware for SafetyShieldMiddleware {
                     resolved_tool_name: String::new(),
                     duration: std::time::Duration::ZERO,
                     display_hint: None,
+                    gate: None,
                 };
             }
             let (tool_name, input) = (ctx.tool_name.clone(), ctx.input.clone());

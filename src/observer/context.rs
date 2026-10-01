@@ -371,6 +371,39 @@ pub struct AttemptResetContext {
     pub attempt: usize,
 }
 
+/// Context for [`LoopObserver::on_gate_decision`](crate::observer::LoopObserver::on_gate_decision).
+///
+/// One permission-gate verdict, as the engine emitted it. Fired after
+/// the dispatch pipeline returns a result carrying a
+/// [`GateDecision`](crate::tool::permission::GateDecision) — every
+/// call a permission middleware decided about produces exactly one,
+/// while dispatches no gate consulted produce none. The `call_id`
+/// pairs the record with the surrounding
+/// [`on_tool_pre`](crate::observer::LoopObserver::on_tool_pre) /
+/// [`on_tool_post`](crate::observer::LoopObserver::on_tool_post)
+/// events; the decision itself carries the tool, the argument digest,
+/// the verdict, and the rule provenance.
+#[derive(Debug, Clone)]
+pub struct GateDecisionContext {
+    /// Turn number, 0-indexed.
+    ///
+    /// The turn whose dispatch the gate decided about, matching the
+    /// value on the surrounding tool events.
+    pub turn: usize,
+
+    /// The model-assigned call id the decision is about.
+    ///
+    /// Pairs this record with the dispatch's `tool.call` /
+    /// `tool.result` ledger lines and its pre/post observer events.
+    pub call_id: String,
+
+    /// The decision itself.
+    ///
+    /// Verdict, argument digest, rule id and source, matched
+    /// pattern, reason, and the engine-stamped timestamp.
+    pub decision: crate::tool::permission::GateDecision,
+}
+
 /// Context for [`LoopObserver::on_tool_call_received`](crate::observer::LoopObserver::on_tool_call_received).
 ///
 /// Fired once per tool call after the streaming response has been accumulated

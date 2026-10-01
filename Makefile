@@ -1,6 +1,6 @@
-.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal derive-consumer darwin-clippy
+.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal digest-canonical derive-consumer darwin-clippy
 
-ci: fmt check check-default clippy test docs examples redaction-minimal derive-consumer darwin-clippy
+ci: fmt check check-default clippy test docs examples redaction-minimal digest-canonical derive-consumer darwin-clippy
 
 check:
 	cargo check --all-features
@@ -60,6 +60,27 @@ fn main() {
 }
 endef
 
+define DIGEST_PROBE_TEXT
+fn main() {
+    let first = loopctl::tool::permission::GateDecision::args_digest(&serde_json::json!({
+        "path": "/tmp/x",
+        "limit": 10
+    }));
+    let second = loopctl::tool::permission::GateDecision::args_digest(&serde_json::json!({
+        "limit": 10,
+        "path": "/tmp/x"
+    }));
+    assert_eq!(
+        first, "f1ed61cd8ca5e26b",
+        "the gate digest must stay canonical under a preserve_order serde_json backend, got {first}"
+    );
+    assert_eq!(
+        first, second,
+        "key order must not move the gate digest under a preserve_order backend"
+    );
+}
+endef
+
 # The probe manifest embeds $(CURDIR) inside a quoted TOML basic string, so a
 # checkout path containing spaces stays valid; a quote or backslash in the
 # path would still break the manifest. The gate needs a POSIX
@@ -77,6 +98,18 @@ redaction-minimal:
 	printf '[package]\nname = "redaction-minimal-probe"\nversion = "0.0.0"\nedition = "%s"\nrust-version = "%s"\npublish = false\n\n[dependencies]\nloopctl = { path = "%s", features = ["redaction"] }\n\n[workspace]\n' "$$edition" "$$rust_version" "$(CURDIR)" > "$$tmp/Cargo.toml"; \
 	printf '%s' "$$PROBE_MAIN" > "$$tmp/src/main.rs"; \
 	CARGO_TARGET_DIR="$(CURDIR)/target/redaction-minimal" cargo run --quiet --manifest-path "$$tmp/Cargo.toml"
+
+digest-canonical: export DIGEST_PROBE_MAIN = $(DIGEST_PROBE_TEXT)
+digest-canonical:
+	@tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT INT TERM; \
+	edition=$$(sed -n 's/^edition = "\([^"]*\)".*/\1/p' Cargo.toml); \
+	rust_version=$$(sed -n 's/^rust-version = "\([^"]*\)".*/\1/p' Cargo.toml); \
+	[ -n "$$edition" ] && [ -n "$$rust_version" ] || { echo "digest-canonical: cannot derive edition/rust-version from Cargo.toml" >&2; exit 1; }; \
+	mkdir -p "$$tmp/src"; \
+	printf '[package]\nname = "digest-canonical-probe"\nversion = "0.0.0"\nedition = "%s"\nrust-version = "%s"\npublish = false\n\n[dependencies]\nloopctl = { path = "%s" }\nserde_json = { version = "1", features = ["preserve_order"] }\n\n[workspace]\n' "$$edition" "$$rust_version" "$(CURDIR)" > "$$tmp/Cargo.toml"; \
+	printf '%s' "$$DIGEST_PROBE_MAIN" > "$$tmp/src/main.rs"; \
+	CARGO_TARGET_DIR="$(CURDIR)/target/digest-canonical" cargo run --quiet --manifest-path "$$tmp/Cargo.toml"
 
 e2e: e2e-providers e2e-ollama
 

@@ -726,22 +726,29 @@ mod engine {
         );
     }
 
-    /// A deploy tool that never resolves — the cancelled-dispatch pin's tool.
-    struct HangingDeploy;
+    /// A deploy tool that counts its start and never resolves — the
+    /// cancelled-dispatch pin's tool.
+    ///
+    /// The count is the pin's arm-identity guard: one start proves the
+    /// cancel landed with the tool in flight (the mid-execution arm),
+    /// not before dispatch began.
+    struct CountingHangingDeploy {
+        starts: Arc<std::sync::atomic::AtomicUsize>,
+    }
 
-    impl loopctl::tool::Tool for HangingDeploy {
+    impl loopctl::tool::Tool for CountingHangingDeploy {
         fn name(&self) -> &'static str {
             "deploy"
         }
 
         fn description(&self) -> &'static str {
-            "Never resolves"
+            "Counts its start, never resolves"
         }
 
         fn schema(&self) -> loopctl::tool::ToolSchema {
             loopctl::tool::ToolSchema::new(
                 "deploy",
-                "Never resolves",
+                "Counts its start, never resolves",
                 serde_json::json!({"type": "object"}),
             )
         }
@@ -752,17 +759,23 @@ mod engine {
             _ctx: &ToolContext,
         ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, loopctl::tool::ToolError>> + Send + '_>>
         {
-            Box::pin(std::future::pending())
+            let starts = Arc::clone(&self.starts);
+            Box::pin(async move {
+                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<Result<ToolOutput, loopctl::tool::ToolError>>().await
+            })
         }
     }
 
     #[tokio::test]
     async fn an_approved_ask_records_its_decision_when_dispatch_is_cancelled() {
         let collector = Arc::new(GateCollector::new());
-        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (resolver, mut approver) = ApprovalChannel::pair(4);
         let mut registry = ToolRegistry::new();
-        registry.register(HangingDeploy);
+        registry.register(CountingHangingDeploy {
+            starts: Arc::clone(&starts),
+        });
         let managers = LoopManagers::new()
             .with_observer(collector.clone() as Arc<dyn LoopObserver>)
             .with_hook_executor(asking_executor())
@@ -798,9 +811,10 @@ mod engine {
             "the cancel ends the run while the approved call hangs in dispatch: {outcome:?}"
         );
         assert_eq!(
-            executions.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the hanging tool never completed"
+            starts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the cancelled dispatch had started the tool — the cancel landed \
+             mid-execution, not before dispatch"
         );
 
         let recorded = collector.recorded();

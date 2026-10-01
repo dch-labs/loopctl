@@ -171,15 +171,18 @@ enum HookCheck {
 /// `Approved` hands the record to the caller's dispatch result — it
 /// rides the `with_gate` precedence lattice, so a downstream gate's
 /// denial displaces it and the one deciding record is emitted per
-/// dispatch. `Denied` returns the ready soft-error result; its record
-/// was already emitted and nothing executes.
+/// dispatch — unless an exit stops the approved call before any
+/// result exists, where the caller emits it directly. `Denied`
+/// returns the ready soft-error result; its record was already
+/// emitted and nothing executes.
 #[cfg(feature = "hooks")]
 enum HookAskResolution {
     /// The approver approved; the record rides the dispatch result.
     ///
-    /// The caller attaches it after the dispatch returns, and the
-    /// lattice — not the park — decides which record survives a
-    /// composed pipeline.
+    /// The caller attaches it after the dispatch returns — the
+    /// lattice, not the park, decides which record survives a
+    /// composed pipeline — or emits it directly at an exit that stops
+    /// the call before any result exists to carry it.
     Approved { record: GateDecision },
 
     /// The ask denied — a refusal, an expiry, or the headless path.
@@ -1063,7 +1066,10 @@ impl<C: ApiClient> BareLoop<C> {
     /// after the dispatch returns — the `with_gate` precedence lattice
     /// keeps the deciding record, so a downstream gate's denial
     /// displaces the approval and exactly one record is emitted per
-    /// dispatch. A refusal or expiry returns the soft denial the model
+    /// dispatch — and emits it directly on the exits that stop an
+    /// approved call before any dispatch result exists to carry it: a
+    /// pre-detection hard stop, an open breaker, or a cancellation
+    /// mid-execution. A refusal or expiry returns the soft denial the model
     /// reacts to, its record already emitted. With no resolver installed
     /// the call denies headlessly — the result the model sees is
     /// byte-identical to the pre-park behavior, plus one

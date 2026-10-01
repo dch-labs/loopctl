@@ -93,8 +93,8 @@ pub enum LoopEvent {
 
     /// A permission gate decided about a tool call.
     ///
-    /// One per gated dispatch, after the pipeline returns: the
-    /// verdict, argument digest, and rule provenance as one record.
+    /// One per gated dispatch, when the deciding record becomes final:
+    /// the verdict, argument digest, and rule provenance as one record.
     GateDecision(GateDecisionContext),
 
     /// A tool call was accumulated, before dispatch.

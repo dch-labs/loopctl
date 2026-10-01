@@ -305,11 +305,15 @@ pub enum GateVerdict {
     /// answers.
     Ask,
 
-    /// The user approved the ask; the call proceeded.
+    /// The user approved the ask.
     ///
-    /// The decision the engine acted on — one record, not two: the
-    /// intermediate ask is a step, and this verdict is its
-    /// resolution.
+    /// The decision the engine acted on to dispatch the call — one
+    /// record, not two: the intermediate ask is a step, and this
+    /// verdict is its resolution. Whether the call ultimately ran is
+    /// read from the surrounding tool events, not from this verdict:
+    /// a downstream gate's record can displace it on the dispatch
+    /// result, and a call refused or cancelled after the approval
+    /// records this verdict at the exit that stopped it.
     AskAllowed,
 
     /// The user refused the ask; the call was denied.

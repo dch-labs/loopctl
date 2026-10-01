@@ -373,12 +373,13 @@ pub struct AttemptResetContext {
 
 /// Context for [`LoopObserver::on_gate_decision`](crate::observer::LoopObserver::on_gate_decision).
 ///
-/// One permission-gate verdict, as the engine emitted it. Fired after
-/// the dispatch pipeline returns a result carrying a
-/// [`GateDecision`](crate::tool::permission::GateDecision) — every
-/// call a permission middleware decided about produces exactly one,
-/// while dispatches no gate consulted produce none. The `call_id`
-/// pairs the record with the surrounding
+/// One permission-gate verdict, as the engine emitted it. Fired when
+/// the deciding record becomes final — a middleware's after the
+/// dispatch returns, a parked ask's denial at the park, an approved
+/// ask's at the dispatch return or at the exit that stopped its call —
+/// so every gated dispatch produces exactly one, while dispatches no
+/// gate consulted produce none. The `call_id` pairs the record with
+/// the surrounding
 /// [`on_tool_pre`](crate::observer::LoopObserver::on_tool_pre) /
 /// [`on_tool_post`](crate::observer::LoopObserver::on_tool_post)
 /// events; the decision itself carries the tool, the argument digest,

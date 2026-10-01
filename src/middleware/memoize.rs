@@ -15,6 +15,10 @@
 //!    write's paths are evicted. A write to file A does not evict a
 //!    cached read of file B.
 //!
+//! A cache hit replays the stored output and duration, but never the
+//! gate record: no gate ran for the replaying dispatch, so the hit
+//! carries `gate: None` and the engine emits no gate decision for it.
+//!
 //! # Registration
 //!
 //! Register *before* `.with_core(registry)` so the middleware can short-circuit
@@ -338,6 +342,7 @@ impl ToolMiddleware for MemoizingMiddleware {
                 let mut result = cached;
                 append_cached_marker(&mut result.output);
                 result.tool_call_id.clone_from(&ctx.call_id);
+                result.gate = None;
                 return result;
             }
 
@@ -553,6 +558,7 @@ mod tests {
                     tool_call_id: "fixture_call_id".to_string(),
                     duration: Duration::ZERO,
                     display_hint: None,
+                    gate: None,
                 }
             })
         }
@@ -593,6 +599,7 @@ mod tests {
                     tool_call_id: "fixture_call_id".to_string(),
                     duration: Duration::ZERO,
                     display_hint: None,
+                    gate: None,
                 }
             })
         }
@@ -960,6 +967,7 @@ mod tests {
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
                 display_hint: None,
+                gate: None,
             },
             0,
             vec![],
@@ -983,6 +991,7 @@ mod tests {
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
                 display_hint: None,
+                gate: None,
             },
             0,
             vec![],
@@ -1020,6 +1029,7 @@ mod tests {
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
                 display_hint: None,
+                gate: None,
             },
             0,
             vec![],
@@ -1035,6 +1045,7 @@ mod tests {
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
                 display_hint: None,
+                gate: None,
             },
             1,
             vec![],
@@ -1061,6 +1072,7 @@ mod tests {
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
             display_hint: None,
+            gate: None,
         };
         insert(
             &cache,
@@ -1107,6 +1119,7 @@ mod tests {
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
                 display_hint: None,
+                gate: None,
             },
             0,
             vec!["x".to_string()],
@@ -1131,6 +1144,7 @@ mod tests {
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
             display_hint: None,
+            gate: None,
         };
         // Two entries both touching "shared.rs".
         let k1 = make_key(
@@ -1195,6 +1209,7 @@ mod tests {
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
             display_hint: None,
+            gate: None,
         };
         let epoch = current_epoch(&cache);
         invalidate_paths(&cache, &["x".to_string()]);
@@ -1224,6 +1239,7 @@ mod tests {
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
             display_hint: None,
+            gate: None,
         };
         let epoch = current_epoch(&cache);
         assert!(
@@ -1258,6 +1274,7 @@ mod tests {
                         tool_call_id: String::new(),
                         duration: Duration::ZERO,
                         display_hint: None,
+                        gate: None,
                     }
                 })
             }
@@ -1319,6 +1336,7 @@ mod tests {
                         tool_call_id: String::new(),
                         duration: Duration::from_millis(250),
                         display_hint: None,
+                        gate: None,
                     }
                 })
             }
@@ -1632,6 +1650,7 @@ mod tests {
                         tool_call_id: String::new(),
                         duration: std::time::Duration::ZERO,
                         display_hint: None,
+                        gate: None,
                     }
                 })
             }

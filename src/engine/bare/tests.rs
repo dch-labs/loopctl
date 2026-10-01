@@ -3902,6 +3902,7 @@ async fn test_tool_result_message_format() {
         duration: Duration::from_millis(100),
         resolved_tool_name: String::new(),
         display_hint: None,
+        gate: None,
     }];
 
     let parts = BareLoop::<MockClient>::build_tool_result_parts(results);

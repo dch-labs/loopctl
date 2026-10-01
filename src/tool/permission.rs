@@ -3,7 +3,13 @@
 //! [`PermissionCheck`] — the result type returned by
 //! the agent loop's permission gate before a tool is allowed to execute.
 //! See the [`PermissionCheck`] documentation for the full decision tree.
+//!
+//! [`GateDecision`] — the serializable record of one gate verdict,
+//! carried on the dispatch result and emitted to observers so asks,
+//! plan mode, audit, and cassette replay all read one decision shape.
 
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 
 /// Result of a permission check before tool execution.
@@ -258,5 +264,315 @@ impl PermissionCheck {
     #[must_use]
     pub fn is_modify(&self) -> bool {
         matches!(self, Self::Modify { .. })
+    }
+}
+
+/// The outcome a gate reached, as data.
+///
+/// One variant per path the permission middleware can take: the four
+/// pre-resolution answers (the same four [`PermissionCheck`] yields)
+/// plus the resolutions only an executing dispatch observes — the
+/// user's answer to an ask, the headless denial of an unanswered ask,
+/// and a prompt the cancel signal cut short. A dry-run
+/// ([`GateDecision`]'s evaluation path) never produces the resolved
+/// variants, because no prompt is ever shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateVerdict {
+    /// The gate passed the call through unmodified.
+    ///
+    /// The dispatch proceeded with the input exactly as the model
+    /// sent it — no rule rewrote anything.
+    Allow,
+
+    /// The gate rewrote the input, then passed the call through.
+    ///
+    /// The call executed, but with sanitized or defaulted arguments.
+    /// The record's digest is of the original input, because it
+    /// identifies the call the model made.
+    AllowModified,
+
+    /// The gate refused the call.
+    ///
+    /// The dispatch never ran; the refusal surfaced to the model as
+    /// a soft error carrying the deciding rule's reason.
+    Deny,
+
+    /// The gate wants a user decision the caller has not given yet.
+    ///
+    /// The pre-resolution answer of an ask — what a dry-run reports
+    /// and what an executing dispatch holds only until the resolver
+    /// answers.
+    Ask,
+
+    /// The user approved the ask; the call proceeded.
+    ///
+    /// The decision the engine acted on — one record, not two: the
+    /// intermediate ask is a step, and this verdict is its
+    /// resolution.
+    AskAllowed,
+
+    /// The user refused the ask; the call was denied.
+    ///
+    /// The decision is the user's, so the record's provenance is the
+    /// resolver rather than the rule that asked.
+    AskDenied,
+
+    /// No resolver was configured, so the ask denied the call.
+    ///
+    /// The headless path: the gate wanted a decision and had no way
+    /// to get one.
+    AskUnresolved,
+
+    /// The cancel signal ended the ask before anyone answered.
+    ///
+    /// Distinct from a refusal: the run stopped, the user did not say
+    /// no.
+    Cancelled,
+}
+
+/// Where the rule that produced a verdict came from.
+///
+/// Provenance for [`GateDecision`]: a host auditing decisions (or a
+/// manifest referencing rule ids) can tell a middleware policy from a
+/// per-call claim from the user's own answer to a prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateRuleSource {
+    /// The permission middleware's own check function decided.
+    ///
+    /// The path every configured gate takes, named or unnamed — the
+    /// record's rule id is the check's own, or `"middleware"` when
+    /// it carries none.
+    Middleware,
+
+    /// The dispatch context's per-call claim decided.
+    ///
+    /// The path taken when no check function is configured and the
+    /// gate reads [`PermissionCheck`] from the context.
+    Context,
+
+    /// The user's answer to an ask decided.
+    ///
+    /// The rule asked; this source resolved.
+    AskResolver,
+}
+
+/// The serializable record of one permission-gate verdict.
+///
+/// Every decision the gate makes — allow, rewrite, refuse, ask, and
+/// each way an ask can resolve — produces one of these, carried on
+/// the [`ToolDispatchResult`](crate::tool::ToolDispatchResult) the
+/// middleware returns and emitted to observers by the engine. The
+/// arguments are **not** stored: only a digest, so the record is safe
+/// to persist and replay while remaining matchable against a known
+/// call. `ts` is stamped by whoever holds a clock — the engine at
+/// emission — so a record read before emission (and every
+/// dry-run record) carries `0`.
+///
+/// # Example
+///
+/// ```
+/// use loopctl::tool::permission::{GateDecision, GateVerdict, GateRuleSource};
+///
+/// let decision = GateDecision::new(
+///     "deploy",
+///     GateVerdict::Deny,
+///     "deny-write-etc",
+///     GateRuleSource::Middleware,
+/// )
+/// .with_reason("etc is off limits");
+///
+/// assert_eq!(decision.verdict, GateVerdict::Deny);
+/// assert_eq!(decision.rule_id, "deny-write-etc");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GateDecision {
+    /// The tool the gate decided about.
+    ///
+    /// The name as the model called it, matching the dispatch the
+    /// record rode out on.
+    pub tool: String,
+
+    /// A stable digest of the call's arguments.
+    ///
+    /// FNV-1a 64 over the input's canonical JSON — every object's keys
+    /// sorted, recursively, by the digest's own canonicalization —
+    /// rendered as 16 lowercase hex characters: the same fixed
+    /// algorithm the demotion sink tags persisted memories with, so
+    /// digests never churn across Rust releases. Key order never
+    /// moves it, whichever `serde_json` map backend the host's graph
+    /// resolves to; any argument change produces a different digest
+    /// except under a collision of the 64-bit hash. The arguments
+    /// themselves are never stored.
+    pub args_digest: String,
+
+    /// The outcome the gate reached.
+    ///
+    /// See [`GateVerdict`] for the full path inventory.
+    pub verdict: GateVerdict,
+
+    /// The identifier of the rule that decided.
+    ///
+    /// Stable across a session so manifests (and audit roll-ups) can
+    /// reference it: `"middleware"` for an unnamed check function,
+    /// the id a [`with_named_check`](crate::middleware::PermissionMiddleware::with_named_check)
+    /// rule was given, `"context"` for a per-call claim, `"ask"` for
+    /// a resolver's answer.
+    pub rule_id: String,
+
+    /// Where the deciding rule came from.
+    ///
+    /// One of the middleware's own check, the dispatch context's
+    /// per-call claim, or the user's answer to an ask — an audit
+    /// roll-up groups on this field to tell policy outcomes from user
+    /// outcomes. See [`GateRuleSource`].
+    pub rule_source: GateRuleSource,
+
+    /// The pattern a rule matched, when the rule is pattern-shaped.
+    ///
+    /// `None` on every built-in path — the shipped rules decide as
+    /// functions and claims, never by pattern. A gate implementation
+    /// whose rules match by pattern populates the field with the
+    /// matched pattern text.
+    pub matched_pattern: Option<String>,
+
+    /// Why the gate decided as it did, when it said so.
+    ///
+    /// A denial's reason, an ask's prompt — the text the deciding
+    /// rule produced. `None` when the verdict needs no explanation
+    /// (a plain allow).
+    pub reason: Option<String>,
+
+    /// When the decision was made, in Unix epoch milliseconds.
+    ///
+    /// Stamped from the engine's clock seam at emission; a record
+    /// read straight off a dispatch result before the engine emits —
+    /// and every dry-run record — carries `0`, because the middleware
+    /// that minted it has no clock.
+    pub ts: u64,
+}
+
+impl GateDecision {
+    /// Build a record from its decision facts.
+    ///
+    /// The construction path for code outside the crate — the type is
+    /// `#[non_exhaustive]`, so struct literals compile only inside
+    /// it. `matched_pattern`, `reason`, and `ts` default to
+    /// `None`/`None`/`0` and have their own builders.
+    #[must_use]
+    pub fn new(
+        tool: impl Into<String>,
+        verdict: GateVerdict,
+        rule_id: impl Into<String>,
+        rule_source: GateRuleSource,
+    ) -> Self {
+        Self {
+            tool: tool.into(),
+            args_digest: String::new(),
+            verdict,
+            rule_id: rule_id.into(),
+            rule_source,
+            matched_pattern: None,
+            reason: None,
+            ts: 0,
+        }
+    }
+
+    /// Digest a call's arguments for the record.
+    ///
+    /// The canonical-JSON FNV-1a 64 digest in 16 hex characters:
+    /// independent of key order and of the `serde_json` map backend,
+    /// and changed by any argument change except under a collision of
+    /// the 64-bit hash — the digest canonicalizes the input itself
+    /// (every object's keys sorted, recursively) instead of serializing
+    /// it verbatim, because a host's dependency graph can switch
+    /// `serde_json` to insertion-ordered maps.
+    #[must_use]
+    pub fn args_digest(input: &Value) -> String {
+        format!(
+            "{:016x}",
+            crate::compact::demote::fnv1a64(canonical_json(input).as_bytes())
+        )
+    }
+
+    /// Attach the digested arguments of the call this record is about.
+    ///
+    /// Digests `input` with [`args_digest`](Self::args_digest) and
+    /// stores the result.
+    #[must_use]
+    pub fn for_args(mut self, input: &Value) -> Self {
+        self.args_digest = Self::args_digest(input);
+        self
+    }
+
+    /// Set the matched pattern.
+    ///
+    /// Populates [`matched_pattern`](Self::matched_pattern) with the
+    /// pattern text a pattern-shaped rule matched — a built-in
+    /// record leaves it unset.
+    #[must_use]
+    pub fn with_matched_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.matched_pattern = Some(pattern.into());
+        self
+    }
+
+    /// Set the deciding reason.
+    ///
+    /// The text the deciding rule produced — a denial's reason or an
+    /// ask's prompt.
+    #[must_use]
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    /// Set the decision timestamp.
+    ///
+    /// Called by the holder of a clock — the engine, at emission.
+    #[must_use]
+    pub fn with_ts(mut self, ts: u64) -> Self {
+        self.ts = ts;
+        self
+    }
+}
+
+/// Render `value` as canonical JSON: every object's keys sorted.
+///
+/// The digest's cross-host contract — two hosts and a cassette agree
+/// on one digest for one call — cannot rest on `serde_json`'s default
+/// map backend: feature unification lets any downstream crate switch
+/// the `Map` to insertion-ordered (`preserve_order`), which would
+/// render the same arguments in the order they arrived and silently
+/// split digests across hosts. Rebuilding every object with its keys
+/// inserted in sorted order makes the rendering a function of the
+/// value alone under either backend; escaping and number formatting
+/// stay `serde_json`'s own, so digests computed before this
+/// canonicalization match digests computed after it.
+fn canonical_json(value: &Value) -> String {
+    sorted_keys(value).to_string()
+}
+
+/// Rebuild `value` with every object's keys in sorted order.
+///
+/// Recursion covers nested objects; array order is untouched,
+/// because it is semantic. Under the default `BTreeMap` backend the
+/// rebuild is byte-identical to the input — the map is already
+/// sorted — and only the insertion-ordered backend takes the sorted
+/// path.
+fn sorted_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let mut sorted = serde_json::Map::new();
+            for (key, entry) in entries {
+                sorted.insert(key.clone(), sorted_keys(entry));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted_keys).collect()),
+        other => other.clone(),
     }
 }

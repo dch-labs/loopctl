@@ -17,9 +17,12 @@
 //! - [`AttemptResetContext`] — reset cue before a retried stream attempt's first event
 //! - [`ToolCallReceivedContext`] — tool call accumulated, before dispatch
 //! - [`ToolPreContext`] / [`ToolPostContext`] — tool dispatch lifecycle
+//! - [`GateDecisionContext`] — permission-gate decision for a dispatch
+//! - [`PreCompactionContext`] — compaction pass starting
 //! - [`CompactedContext`] — context window compaction
 //! - [`FallbackContext`] — model fallback event
 //! - [`TransportFallbackContext`] — non-streaming transport fallback event
+//! - [`ModelSwitchedContext`] — runtime model hot-swap event
 //! - [`LoopDetectedContext`] — loop detection event
 //! - [`ConvergenceDetectedContext`] — convergence detection event
 //!
@@ -46,10 +49,10 @@ pub mod hub;
 
 pub use context::{
     AttemptResetContext, CompactedContext, ConvergenceDetectedContext, FallbackContext,
-    LoopDetectedContext, ModelSwitchedContext, PreCompactionContext, ResponseContext,
-    RunEndContext, RunStartContext, StreamContext, StreamFailureContext, TextDeltaContext,
-    ThinkingDeltaContext, ToolCallReceivedContext, ToolPostContext, ToolPreContext,
-    TransportFallbackContext, TurnEndContext, TurnStartContext,
+    GateDecisionContext, LoopDetectedContext, ModelSwitchedContext, PreCompactionContext,
+    ResponseContext, RunEndContext, RunStartContext, StreamContext, StreamFailureContext,
+    TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext, ToolPostContext,
+    ToolPreContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
 };
 pub use hub::{EventHub, LoopEvent, ObservedEvent};
 
@@ -216,6 +219,17 @@ pub trait LoopObserver: Send + Sync {
     /// buffered deltas), or
     /// [`on_turn_end`](Self::on_turn_end).
     fn on_attempt_reset(&self, _ctx: &AttemptResetContext) {}
+
+    /// Called when the permission gate's decision about a tool call is
+    /// emitted.
+    ///
+    /// Fires once per gated dispatch — after the pipeline returns,
+    /// before [`on_tool_post`](Self::on_tool_post) — carrying the
+    /// verdict, the argument digest, and the rule provenance as a
+    /// serializable record. Dispatches no gate consulted produce no
+    /// event. Notification-only, like every observer callback; the
+    /// decision has already been made and enforced.
+    fn on_gate_decision(&self, _ctx: &GateDecisionContext) {}
 
     /// Called when the engine has accumulated a tool call and is about to dispatch it.
     ///
@@ -531,6 +545,15 @@ impl ObserverHost {
         self.dispatch(|obs| obs.on_attempt_reset(ctx));
     }
 
+    /// Dispatch [`LoopObserver::on_gate_decision`] to all observers.
+    ///
+    /// Fired once per gated dispatch after the pipeline returns,
+    /// carrying the decision record. Iterates registered observers in
+    /// registration order.
+    pub fn on_gate_decision(&self, ctx: &GateDecisionContext) {
+        self.dispatch(|obs| obs.on_gate_decision(ctx));
+    }
+
     /// Dispatch [`LoopObserver::on_tool_pre`] to all observers.
     ///
     /// Fired before a tool is dispatched, carrying the call's name and
@@ -759,6 +782,41 @@ mod tests {
             vec!["first", "second"],
             "the pre-compaction event reaches every observer in registration order"
         );
+    }
+
+    #[test]
+    fn the_module_doc_inventory_lists_every_context_struct() {
+        let source = include_str!("observer.rs");
+        let reexport = source
+            .split_once("pub use context::{")
+            .expect("the context re-export lives in this file")
+            .1;
+        let reexport = reexport
+            .split_once("};")
+            .expect("the re-export list closes")
+            .0;
+        let names: Vec<&str> = reexport
+            .split(',')
+            .map(str::trim)
+            .filter(|name| name.ends_with("Context"))
+            .collect();
+        assert!(
+            !names.is_empty(),
+            "the census must find the re-exported context types"
+        );
+
+        let header: Vec<&str> = source
+            .lines()
+            .take_while(|line| line.starts_with("//!"))
+            .collect();
+        assert!(!header.is_empty(), "the census must find the module doc");
+        for name in names {
+            assert!(
+                header.iter().any(|line| line.contains(name)),
+                "the module doc's context inventory must list `{name}` — it is \
+                 presented as exhaustive"
+            );
+        }
     }
 
     #[test]

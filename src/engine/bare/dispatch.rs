@@ -484,6 +484,7 @@ impl<C: ApiClient> BareLoop<C> {
             duration: Duration::ZERO,
             resolved_tool_name: tc.map(|c| c.tool.clone()).unwrap_or_default(),
             display_hint: None,
+            gate: None,
         }
     }
 
@@ -507,6 +508,7 @@ impl<C: ApiClient> BareLoop<C> {
             duration,
             resolved_tool_name: tc.tool.clone(),
             display_hint,
+            gate: None,
         }
     }
 
@@ -843,6 +845,7 @@ impl<C: ApiClient> BareLoop<C> {
             duration: Duration::ZERO,
             resolved_tool_name: tc.tool.clone(),
             display_hint: None,
+            gate: None,
         }
     }
 
@@ -911,6 +914,7 @@ impl<C: ApiClient> BareLoop<C> {
                 duration: Duration::ZERO,
                 resolved_tool_name: tc.tool.clone(),
                 display_hint: None,
+                gate: None,
             }),
             HookAction::Ask { message } => Some(ToolDispatchResult {
                 tool_call_id: tc.id.clone(),
@@ -919,6 +923,7 @@ impl<C: ApiClient> BareLoop<C> {
                 duration: Duration::ZERO,
                 resolved_tool_name: tc.tool.clone(),
                 display_hint: None,
+                gate: None,
             }),
         }
     }
@@ -1072,6 +1077,9 @@ impl<C: ApiClient> BareLoop<C> {
         };
         let dispatch_result = pipeline.invoke(ctx).await;
         let duration = self.managers.clock().elapsed_since(start);
+        if let Some(gate) = dispatch_result.gate.clone() {
+            self.notify_gate_decision(turn_idx, &tc.id, gate);
+        }
         ToolDispatchResult {
             tool_call_id: tc.id.clone(),
             output: dispatch_result.output,
@@ -1079,7 +1087,35 @@ impl<C: ApiClient> BareLoop<C> {
             duration,
             resolved_tool_name: dispatch_result.resolved_tool_name,
             display_hint: dispatch_result.display_hint,
+            gate: dispatch_result.gate,
         }
+    }
+
+    /// Fire [`on_gate_decision`](crate::observer::LoopObserver::on_gate_decision).
+    ///
+    /// Stamps the record's `ts` from the clock seam — the middleware
+    /// that minted it has no clock — and forwards it with the turn and
+    /// call id observers pair it by. Called once per gated dispatch,
+    /// after the pipeline returns and before the result is re-stamped.
+    fn notify_gate_decision(
+        &self,
+        turn: usize,
+        call_id: &str,
+        gate: crate::tool::permission::GateDecision,
+    ) {
+        let ts = self
+            .managers
+            .clock()
+            .now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| Self::millis_u64(elapsed));
+        self.managers
+            .observers()
+            .on_gate_decision(&crate::observer::GateDecisionContext {
+                turn,
+                call_id: call_id.to_string(),
+                decision: gate.with_ts(ts),
+            });
     }
 
     /// Analyse a tool error and decide on a recovery action.

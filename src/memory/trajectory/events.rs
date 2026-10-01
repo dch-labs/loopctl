@@ -47,6 +47,7 @@
 //! | `detection` | `null` | `{detector, pattern, repetitions}` or `{detector, action}` |
 //! | `tool.call` | number | `{tool_call_id, tool}` |
 //! | `tool.result` | number | `{tool_call_id, tool, result_hash, is_error, duration_ms}` |
+//! | `gate.decision` | number | `{tool, args_digest, verdict, rule_id, rule_source, matched_pattern, reason, ts, call_id}` — the permission gate's verdict; joins the dispatch's `tool.call`/`tool.result` rows on `call_id`, which carries the same value their `tool_call_id` does |
 //!
 //! # Numbering and correlation
 //!
@@ -62,14 +63,16 @@
 //!
 //! # Excluded and reserved kinds
 //!
-//! v1 maps the ten kinds above. Text and thinking deltas, `response`,
+//! v1 maps the eleven kinds above. Text and thinking deltas, `response`,
 //! stream success/failure, `tool_call_received`, `pre_compaction`, and
 //! `transport.fallback` are excluded — delta volume, the
 //! reserved-for-`usage` per-turn accounting, pre-dispatch accumulation
 //! that `tool.call` already covers, and the streaming-to-non-streaming
 //! transport retry, which is mechanics rather than a run semantic (the
-//! mapped `fallback` kind is the model fallback). `gate.decision` and
-//! `usage` are reserved labels; this version does not emit them.
+//! mapped `fallback` kind is the model fallback). `gate.decision`
+//! maps the permission gate's per-call verdict (tool, argument
+//! digest, rule provenance); `usage` remains a reserved label this
+//! version does not emit.
 //!
 //! # Reader tolerance
 //!
@@ -100,9 +103,9 @@ use serde_json::Value;
 
 use crate::error::recover_guard;
 use crate::observer::{
-    CompactedContext, ConvergenceDetectedContext, FallbackContext, LoopDetectedContext,
-    LoopObserver, ModelSwitchedContext, RunEndContext, RunStartContext, ToolPostContext,
-    ToolPreContext, TurnEndContext, TurnStartContext,
+    CompactedContext, ConvergenceDetectedContext, FallbackContext, GateDecisionContext,
+    LoopDetectedContext, LoopObserver, ModelSwitchedContext, RunEndContext, RunStartContext,
+    ToolPostContext, ToolPreContext, TurnEndContext, TurnStartContext,
 };
 
 use super::sink::{DEFAULT_QUEUE_CAPACITY, LedgerWriter};
@@ -116,8 +119,8 @@ const EVENTS_FILE: &str = "events.jsonl";
 
 /// Which lifecycle moment one event line records.
 ///
-/// One dotted JSON label per mapped callback; the reserved labels
-/// `gate.decision` and `usage` are not emitted in this version.
+/// One dotted JSON label per mapped callback; the reserved label
+/// `usage` is not emitted in this version.
 /// The enum is `#[non_exhaustive]`: a later kind widens it in a minor
 /// release, so out-of-crate consumers match with a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +189,14 @@ pub enum TrajectoryEventKind {
     #[serde(rename = "tool.result")]
     ToolResult,
 
+    /// A permission gate decided about a tool call.
+    ///
+    /// One per gated dispatch: verdict, argument digest, and rule
+    /// provenance in `data`, with the call id pairing it against the
+    /// `tool.call` / `tool.result` lines.
+    #[serde(rename = "gate.decision")]
+    GateDecision,
+
     /// A kind this version does not know.
     ///
     /// Deserialization-only: a ledger written by a newer release may
@@ -217,6 +228,7 @@ impl TrajectoryEventKind {
             Self::Detection => "detection",
             Self::ToolCall => "tool.call",
             Self::ToolResult => "tool.result",
+            Self::GateDecision => "gate.decision",
             Self::Unknown => "unknown",
         }
     }
@@ -265,8 +277,8 @@ pub struct TrajectoryEvent {
 
     /// Which lifecycle moment this line records.
     ///
-    /// One of the ten v1 kinds; the module's interchange table holds
-    /// the `data` shape each one carries.
+    /// One of the eleven emitted kinds; the module's interchange
+    /// table holds the `data` shape each one carries.
     pub kind: TrajectoryEventKind,
 
     /// The kind-specific payload.
@@ -552,6 +564,21 @@ impl LoopObserver for EventLedgerObserver {
         );
     }
 
+    /// Records a permission gate's decision about one call.
+    ///
+    /// The verdict, argument digest, and rule provenance; the `call_id`
+    /// in `data` pairs the line with the dispatch's `tool.call` and
+    /// `tool.result`.
+    fn on_gate_decision(&self, ctx: &GateDecisionContext) {
+        let mut state = recover_guard(self.state.lock());
+        self.append(
+            &mut state,
+            TrajectoryEventKind::GateDecision,
+            Some(ctx.turn),
+            gate_decision_data(ctx),
+        );
+    }
+
     /// Records a completed compaction pass's token facts.
     ///
     /// Run-scoped: the line's `turn` is null.
@@ -738,6 +765,20 @@ fn tool_result_data(ctx: &ToolPostContext) -> Value {
     })
 }
 
+/// Build the `data` object for one gate-decision line.
+///
+/// The decision's own fields (tool, digest, verdict, rule provenance,
+/// reason, engine-stamped ts) plus the `call_id` that pairs the line
+/// with the dispatch's `tool.call` / `tool.result`.
+fn gate_decision_data(ctx: &GateDecisionContext) -> Value {
+    let mut data = serde_json::to_value(&ctx.decision)
+        .unwrap_or_else(|_| serde_json::json!({"tool": ctx.decision.tool}));
+    if let Some(object) = data.as_object_mut() {
+        object.insert("call_id".to_string(), Value::String(ctx.call_id.clone()));
+    }
+    data
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,6 +831,19 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({"query": "fix the bug"}),
             serde_json::json!({"tool_call_id": "call_a", "tool": "echo"}),
+            serde_json::json!({
+                "tool": "echo",
+                "args_digest": crate::tool::permission::GateDecision::args_digest(
+                    &serde_json::json!({"path": "/tmp/x", "limit": 10})
+                ),
+                "verdict": "allow",
+                "rule_id": "middleware",
+                "rule_source": "middleware",
+                "matched_pattern": null,
+                "reason": null,
+                "ts": 0,
+                "call_id": "call_a",
+            }),
             serde_json::json!({
                 "tool_call_id": "call_a",
                 "tool": "echo",
@@ -852,6 +906,17 @@ mod tests {
             tool: "echo".to_string(),
             tool_call_id: "call_a".to_string(),
         });
+        observer.on_gate_decision(&GateDecisionContext {
+            turn: 0,
+            call_id: "call_a".to_string(),
+            decision: crate::tool::permission::GateDecision::new(
+                "echo",
+                crate::tool::permission::GateVerdict::Allow,
+                "middleware",
+                crate::tool::permission::GateRuleSource::Middleware,
+            )
+            .for_args(&serde_json::json!({"path": "/tmp/x", "limit": 10})),
+        });
         observer.on_tool_post(&ToolPostContext {
             tool_call_id: "call_a".to_string(),
             turn: 0,
@@ -907,6 +972,7 @@ mod tests {
                 "run.started",
                 "turn.started",
                 "tool.call",
+                "gate.decision",
                 "tool.result",
                 "compaction",
                 "fallback",
@@ -923,13 +989,13 @@ mod tests {
         let seqs: Vec<u64> = events.iter().map(|e| e.seq).collect();
         assert_eq!(
             seqs,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 1, 2],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2],
             "each run's events must number from 1 in call order"
         );
         let run_ids: Vec<u64> = events.iter().map(|e| e.run_id).collect();
         assert_eq!(
             run_ids,
-            vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2],
+            vec![1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2],
             "the second run must carry the next per-sink run id"
         );
         assert!(
@@ -952,12 +1018,55 @@ mod tests {
             serde_json::json!({"tool_call_id": "call_a", "tool": "echo"}),
             "tool.call carries the dispatch identity"
         );
+        assert_eq!(
+            events[3].data.get("call_id"),
+            events[2].data.get("tool_call_id"),
+            "a gate.decision line joins its dispatch's tool.call/tool.result rows — \
+             call_id here carries the value their tool_call_id does"
+        );
         let datas: Vec<Value> = events.iter().map(|e| e.data.clone()).collect();
         assert_eq!(
             datas,
             expected_event_datas(),
             "every kind's data object must match the module's interchange table exactly — a \
              field rename or drop in any payload helper must fail here, not in a consumer"
+        );
+    }
+
+    #[test]
+    fn the_kinds_table_lists_every_emitted_kind_and_nothing_else() {
+        let source = include_str!("events.rs");
+        let enum_body = source
+            .split_once("pub enum TrajectoryEventKind")
+            .expect("the kind enum lives in this file")
+            .1;
+        let enum_body = enum_body
+            .split_once('}')
+            .expect("the enum body closes before any nested brace")
+            .0;
+        let mut emitted: Vec<&str> = enum_body
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("#[serde(rename = \""))
+            .filter_map(|rest| rest.strip_suffix("\")]"))
+            .collect();
+        assert!(
+            !emitted.is_empty(),
+            "the census must find the emitted kinds in the enum"
+        );
+
+        let mut table: Vec<&str> = source
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("//! | `"))
+            .filter_map(|rest| rest.split('`').next())
+            .collect();
+        assert!(!table.is_empty(), "the census must find the kinds table");
+
+        emitted.sort_unstable();
+        table.sort_unstable();
+        assert_eq!(
+            emitted, table,
+            "the module's interchange table is the schema contract a consumer implements \
+             against — every emitted kind needs a row, and a row needs an emitting kind"
         );
     }
 
@@ -1094,10 +1203,69 @@ mod tests {
     }
 
     #[test]
+    fn gate_decisions_land_in_the_ledger() {
+        let observer = EventLedgerObserver::writing_to(temp_dir("gate-decision"));
+        observer.on_run_start(&RunStartContext {
+            session_id: uuid::Uuid::new_v4(),
+        });
+        observer.on_gate_decision(&GateDecisionContext {
+            turn: 2,
+            call_id: "call_gate".to_string(),
+            decision: crate::tool::permission::GateDecision::new(
+                "deploy",
+                crate::tool::permission::GateVerdict::AskDenied,
+                "ask",
+                crate::tool::permission::GateRuleSource::AskResolver,
+            )
+            .for_args(&serde_json::json!({"target": "/etc"}))
+            .with_reason("denied by user")
+            .with_ts(1_700_000_000_000),
+        });
+        observer.on_run_end(&RunEndContext::new(true, None, 1, 5));
+
+        let lines: Vec<TrajectoryEvent> = read_events(&observer);
+        assert_eq!(lines.len(), 3, "run start, the decision, run end");
+        let decision = lines.get(1).cloned().expect("the decision line exists");
+        assert_eq!(
+            decision.kind,
+            TrajectoryEventKind::GateDecision,
+            "the gate.decision label parses as the real kind, not the fallback"
+        );
+        assert_eq!(
+            decision.turn,
+            Some(2),
+            "the line carries the dispatch's turn"
+        );
+        let data = decision.data;
+        assert_eq!(data.get("call_id"), Some(&serde_json::json!("call_gate")));
+        assert_eq!(data.get("verdict"), Some(&serde_json::json!("ask_denied")));
+        assert_eq!(data.get("rule_id"), Some(&serde_json::json!("ask")));
+        assert_eq!(
+            data.get("rule_source"),
+            Some(&serde_json::json!("ask_resolver"))
+        );
+        assert_eq!(
+            data.get("args_digest"),
+            Some(&serde_json::json!(
+                crate::tool::permission::GateDecision::args_digest(
+                    &serde_json::json!({"target": "/etc"})
+                )
+            )),
+            "the digest rides the line — self-calibrated against the same public machinery"
+        );
+        assert_eq!(
+            data.get("ts"),
+            Some(&serde_json::json!(1_700_000_000_000_u64)),
+        );
+    }
+
+    #[test]
     fn an_unknown_future_kind_still_parses_with_its_envelope_intact() {
+        // `gate.decision` mapped in this version; `usage` is the label
+        // still reserved and unemitted, so it exercises the fallback.
         let line = concat!(
             r#"{"seq":3,"ts":"2026-09-28T00:00:00Z","run_id":1,"session_id":"s-1","#,
-            r#""turn":null,"kind":"gate.decision","data":{"rule":"budget"}}"#
+            r#""turn":null,"kind":"usage","data":{"rule":"budget"}}"#
         );
         let event: TrajectoryEvent = serde_json::from_str(line).expect(
             "an unknown kind from a newer release must not reject the whole line — the \
@@ -1132,6 +1300,16 @@ mod tests {
             turn: 0,
             tool: "echo".to_string(),
             tool_call_id: "call_a".to_string(),
+        });
+        observer.on_gate_decision(&GateDecisionContext {
+            turn: 0,
+            call_id: "call_a".to_string(),
+            decision: crate::tool::permission::GateDecision::new(
+                "echo",
+                crate::tool::permission::GateVerdict::Allow,
+                "middleware",
+                crate::tool::permission::GateRuleSource::Middleware,
+            ),
         });
         observer.on_tool_post(&ToolPostContext {
             tool_call_id: "call_a".to_string(),
@@ -1179,7 +1357,7 @@ mod tests {
         observer.on_run_end(&RunEndContext::new(true, None, 1, 1));
 
         let events = read_events(&observer);
-        assert_eq!(events.len(), 11, "every mapped kind must have fired");
+        assert_eq!(events.len(), 12, "every mapped kind must have fired");
         assert!(
             events
                 .iter()

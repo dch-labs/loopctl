@@ -324,6 +324,14 @@ pub enum GateVerdict {
     /// to get one.
     AskUnresolved,
 
+    /// The parked ask outlived its deadline and denied the call.
+    ///
+    /// An external approval was being awaited when the configured
+    /// deadline passed; the policy denies. Distinct from a refusal
+    /// (the approver said no) and from an unresolved ask (no approver
+    /// existed) — the wait itself expired.
+    AskExpired,
+
     /// The cancel signal ended the ask before anyone answered.
     ///
     /// Distinct from a refusal: the run stopped, the user did not say
@@ -356,6 +364,13 @@ pub enum GateRuleSource {
     ///
     /// The rule asked; this source resolved.
     AskResolver,
+
+    /// The engine's own ask policy decided.
+    ///
+    /// The outcome a parked ask reaches without an approver's answer —
+    /// headless denial, deadline expiry, or cancellation — decided by
+    /// the engine's policy rather than by any rule or resolver.
+    Engine,
 }
 
 /// The serializable record of one permission-gate verdict.
@@ -419,7 +434,8 @@ pub struct GateDecision {
     /// reference it: `"middleware"` for an unnamed check function,
     /// the id a [`with_named_check`](crate::middleware::PermissionMiddleware::with_named_check)
     /// rule was given, `"context"` for a per-call claim, `"ask"` for
-    /// a resolver's answer.
+    /// a resolver's answer, `"hook"` for the engine's parked-ask
+    /// policy outcomes (an expired, cancelled, or headless hook ask).
     pub rule_id: String,
 
     /// Where the deciding rule came from.

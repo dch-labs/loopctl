@@ -64,7 +64,9 @@
 //! you only pay for (and configure) the infrastructure you actually use.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::ask::AskResolver;
 use crate::compact::ContextManager;
 use crate::compact::demote::DemotionSink;
 use crate::detection::DetectionManager;
@@ -231,6 +233,22 @@ pub struct LoopManagers {
     /// the exact pre-seam behavior. Persists across manager resets, like
     /// the memory backend.
     id_gen: Arc<dyn IdGen>,
+
+    /// The external resolver a parked `ask` waits on.
+    ///
+    /// When set, a hook that asks parks the dispatch until this
+    /// resolver answers or the ask deadline passes; absent, an ask
+    /// denies headlessly exactly as it always has. Persists across
+    /// manager resets — it is session infrastructure, like the
+    /// pipeline.
+    ask_resolver: Option<Arc<dyn AskResolver>>,
+
+    /// The deadline a parked `ask` may wait.
+    ///
+    /// `None` (the default) parks without an engine-enforced deadline —
+    /// the resolver owns its own liveness; `Some` bounds the wait, and
+    /// an ask that outlives it denies with the expiry verdict.
+    ask_timeout: Option<Duration>,
 }
 
 impl LoopManagers {
@@ -262,6 +280,8 @@ impl LoopManagers {
             demotion_sink: Arc::new(crate::compact::demote::NoopDemotionSink),
             clock: Arc::new(SystemClock),
             id_gen: Arc::new(UuidIdGen),
+            ask_resolver: None,
+            ask_timeout: None,
         }
     }
 
@@ -629,14 +649,74 @@ impl LoopManagers {
         &self.id_gen
     }
 
+    /// Set the resolver parked asks wait on (builder-style).
+    ///
+    /// With a resolver installed, a hook's `ask` parks the dispatch
+    /// until the resolver answers — the external-approver channel. Pair
+    /// with [`with_ask_timeout`](Self::with_ask_timeout) to bound how
+    /// long a run may wait.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use loopctl::ask::{ApprovalChannel, AskResolution};
+    /// use loopctl::managers::LoopManagers;
+    ///
+    /// let (resolver, mut approver) = ApprovalChannel::pair(8);
+    /// let managers = LoopManagers::new()
+    ///     .with_ask_resolver(resolver)
+    ///     .with_ask_timeout(std::time::Duration::from_secs(120));
+    /// ```
+    #[must_use]
+    pub fn with_ask_resolver(mut self, resolver: Arc<dyn AskResolver>) -> Self {
+        self.ask_resolver = Some(resolver);
+        self
+    }
+
+    /// Set the resolver parked asks wait on.
+    ///
+    /// Non-consuming variant of [`with_ask_resolver`](Self::with_ask_resolver).
+    pub fn set_ask_resolver(&mut self, resolver: Arc<dyn AskResolver>) {
+        self.ask_resolver = Some(resolver);
+    }
+
+    /// Borrow the ask resolver, if configured.
+    ///
+    /// `None` when no external approver is installed — asks then deny
+    /// headlessly, the engine's default posture.
+    #[must_use]
+    pub fn ask_resolver(&self) -> Option<&Arc<dyn AskResolver>> {
+        self.ask_resolver.as_ref()
+    }
+
+    /// Set the deadline a parked ask may wait (builder-style).
+    ///
+    /// `None` (the default) parks without an engine-enforced deadline;
+    /// `Some` bounds the wait, and an ask that outlives it denies with
+    /// the expiry verdict.
+    #[must_use]
+    pub fn with_ask_timeout(mut self, timeout: Duration) -> Self {
+        self.ask_timeout = Some(timeout);
+        self
+    }
+
+    /// Borrow the ask deadline, if configured.
+    ///
+    /// `None` when the resolver owns its own liveness; `Some` when the
+    /// engine bounds the park.
+    #[must_use]
+    pub fn ask_timeout(&self) -> Option<Duration> {
+        self.ask_timeout
+    }
+
     /// Reset the fallback, detection, and observer managers to their
     /// initial state.
     ///
     /// Clears the fallback circuit breaker, loop/convergence detection
     /// history, and per-observer accumulators. The compaction manager,
     /// hook executor, tool pipeline, stream handler, tool-health
-    /// registry, memory store, and demotion sink keep whatever they
-    /// hold. Call this
+    /// registry, memory store, ask resolver, and demotion sink keep
+    /// whatever they hold. Call this
     /// when you want a clean slate mid-session — for example after a
     /// provider outage resolves (so the circuit breaker does not stay
     /// tripped) or when switching to an unrelated task (so stale

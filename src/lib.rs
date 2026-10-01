@@ -92,6 +92,7 @@ pub mod __private {
 pub use loopctl_derive::Tool;
 
 pub mod api;
+pub mod ask;
 pub mod cancel;
 pub mod capabilities;
 pub mod compact;

@@ -726,14 +726,18 @@ mod engine {
         );
     }
 
-    /// A deploy tool that counts its start and never resolves — the
-    /// cancelled-dispatch pin's tool.
+    /// A deploy tool that counts its start, signals it, and never
+    /// resolves — the cancelled-dispatch pin's tool.
     ///
-    /// The count is the pin's arm-identity guard: one start proves the
-    /// cancel landed with the tool in flight (the mid-execution arm),
-    /// not before dispatch began.
+    /// The notify-after-increment is the pin's synchronization: it fires
+    /// only from inside the polled tool future, so awaiting it proves the
+    /// dispatch arm was entered — the count then proves the cancel
+    /// landed with the tool in flight (the mid-execution arm), not
+    /// before dispatch began. `yield_now` cannot stand in: tokio does
+    /// not guarantee the yielding task waits while others poll.
     struct CountingHangingDeploy {
         starts: Arc<std::sync::atomic::AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
     }
 
     impl loopctl::tool::Tool for CountingHangingDeploy {
@@ -760,8 +764,10 @@ mod engine {
         ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, loopctl::tool::ToolError>> + Send + '_>>
         {
             let starts = Arc::clone(&self.starts);
+            let started = Arc::clone(&self.started);
             Box::pin(async move {
                 starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                started.notify_one();
                 std::future::pending::<Result<ToolOutput, loopctl::tool::ToolError>>().await
             })
         }
@@ -771,10 +777,12 @@ mod engine {
     async fn an_approved_ask_records_its_decision_when_dispatch_is_cancelled() {
         let collector = Arc::new(GateCollector::new());
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
         let (resolver, mut approver) = ApprovalChannel::pair(4);
         let mut registry = ToolRegistry::new();
         registry.register(CountingHangingDeploy {
             starts: Arc::clone(&starts),
+            started: Arc::clone(&started),
         });
         let managers = LoopManagers::new()
             .with_observer(collector.clone() as Arc<dyn LoopObserver>)
@@ -802,7 +810,7 @@ mod engine {
             approver.resolve(pending.id, AskResolution::Approve),
             "the approval unblocks the park — the call proceeds to dispatch"
         );
-        tokio::task::yield_now().await;
+        started.notified().await;
         cancel.cancel();
 
         let outcome = run_task.await.expect("the run task completes");

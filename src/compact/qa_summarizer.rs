@@ -422,6 +422,11 @@ impl QaSummarizerConfig {
     /// Reserve-then-cap: the smaller of the hard ceiling and the
     /// fraction's exact share of the target, so the summary can neither
     /// starve the preserved recent turns nor balloon on a giant window.
+    /// The ceiling is enforced, not merely instructed: a step-1 response
+    /// whose heuristic token estimate exceeds this figure fails the pass
+    /// (strictly — a summary estimating exactly at the budget passes),
+    /// with the folded answer section bounded separately by the same
+    /// budget in characters.
     ///
     /// # Example
     ///
@@ -663,13 +668,18 @@ impl QaSummarizer {
     /// dropped slice to the demotion sink with nothing replacing it in
     /// the feed, and store an empty prior that silently disables the
     /// next pass's prior-summary filtering — the information loss this
-    /// compactor exists to prevent.
+    /// compactor exists to prevent. A response whose heuristic token
+    /// estimate exceeds the pass budget fails the step for the mirror
+    /// reason: the budget is a ceiling, not a suggestion, and shipping an
+    /// oversized summary would silently break the reserve-then-cap
+    /// guarantee that the preserved tail keeps its share of the window.
     ///
     /// # Errors
     ///
     /// Propagates the provider's [`ApiError`] from the underlying
     /// `create_message` call, and fails with a typed error when the
-    /// response carries no usable summary text.
+    /// response carries no usable summary text or a summary whose
+    /// estimate exceeds the pass budget.
     async fn summarize(
         &self,
         dropped: &[Message],
@@ -685,7 +695,13 @@ impl QaSummarizer {
         if text.trim().is_empty() {
             return Err(ApiError::api("the model returned an empty summary"));
         }
-        Ok(Self::summary_of(text))
+        let summary = Self::summary_of(text);
+        if summary.estimated_tokens > budget {
+            return Err(ApiError::api(format!(
+                "the model returned a summary over the {budget}-token budget"
+            )));
+        }
+        Ok(summary)
     }
 
     /// Step 2: ask what the summary is missing.
@@ -1752,6 +1768,67 @@ mod tests {
                 .error
                 .is_some_and(|error| error.contains("empty summary")),
             "the whitespace direction fails for the same named cause"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_summary_fails_the_pass() {
+        let scripted = "a summary text of a known length";
+        let as_message = Message::assistant(scripted.to_string());
+        let at_budget = CompactionOutcome::estimate_tokens(std::slice::from_ref(&as_message));
+        let one_under = at_budget.saturating_sub(1);
+
+        let client = RecordingClient::new(vec![ok(scripted), ok("[]")]);
+        let summarizer = QaSummarizer::new(
+            Arc::clone(&client) as SharedApiClient,
+            QaSummarizerConfig::default().with_max_summary_tokens(one_under),
+        );
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(
+            !outcome.success,
+            "a summary over the hard ceiling must fail the pass, not ship through it"
+        );
+        let error = outcome.error.expect("the failure carries a reason");
+        assert!(
+            error.contains(&format!("{one_under}-token budget")),
+            "the error names the budget figure it was measured against: {error}"
+        );
+        assert_eq!(
+            outcome.messages.len(),
+            messages.len(),
+            "the original messages return intact"
+        );
+        assert_eq!(
+            outcome.evicted.len(),
+            0,
+            "nothing is demoted on a failed pass"
+        );
+        assert!(
+            summarizer.prior_summary().is_none(),
+            "an over-budget summary is never committed as the prior"
+        );
+        assert_eq!(client.prompts().len(), 1, "the pass stops at step 1");
+
+        let boundary_client = RecordingClient::new(vec![ok(scripted), ok("[]")]);
+        let boundary = QaSummarizer::new(
+            Arc::clone(&boundary_client) as SharedApiClient,
+            QaSummarizerConfig::default().with_max_summary_tokens(at_budget),
+        );
+        let messages = conversation();
+        let outcome = boundary
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(
+            outcome.success,
+            "a summary estimating exactly at the budget passes — the ceiling rejects strictly"
+        );
+        assert_eq!(
+            outcome.messages.first().map(Message::text_content),
+            Some(scripted.to_string()),
+            "the at-budget summary rides the output verbatim"
         );
     }
 

@@ -773,11 +773,12 @@ pub struct StructuredSummarizer {
 /// caller maps onto a failed outcome, and carries whether the retry path
 /// ran so the telemetry can name it.
 enum SummarizeOutcome {
-    /// A parsed summary, or raw text degraded into `key_facts`.
+    /// A parsed summary, or raw text degraded into the template's first
+    /// rendered section.
     ///
     /// Both shapes are successes: the parse path fills the configured
-    /// sections, while a second unparsable response rides whole as the
-    /// single key-facts entry so no data is lost to the shape contract.
+    /// sections, while a second unparsable response rides whole as one
+    /// section's single entry so no data is lost to the shape contract.
     Parsed {
         /// The summary to render.
         ///
@@ -870,11 +871,12 @@ impl StructuredSummarizer {
 
     /// Run the summarization call (plus its retry) over the dropped slice.
     ///
-    /// One call; a response with no recognizable heading triggers exactly
-    /// one retry with the harder template instruction; a second malformed
-    /// response degrades to its raw text as the summary body. Blank and
-    /// over-budget responses fail the pass regardless of which call delivers
-    /// them — the retry exists for shape problems, not content problems.
+    /// One call; a response with no recognizable heading — or whose parse
+    /// fills no section the template renders — triggers exactly one retry
+    /// with the harder template instruction; a second such response
+    /// degrades to its raw text as the summary body. Blank and over-budget
+    /// responses fail the pass regardless of which call delivers them — the
+    /// retry exists for shape problems, not content problems.
     async fn summarize(&self, dropped: &[Message], budget: u64) -> SummarizeOutcome {
         let transcript = render_evicted(dropped, self.config.transcript_max_chars);
         let user_prompt = format!(
@@ -900,11 +902,13 @@ impl StructuredSummarizer {
             }
             if !self.config.parse_output {
                 return SummarizeOutcome::Parsed {
-                    summary: raw_text_summary(text),
+                    summary: raw_text_summary(text, &self.config.template),
                     retried: retry,
                 };
             }
-            if let Some(summary) = Self::parse_summary(&text) {
+            if let Some(summary) = Self::parse_summary(&text)
+                && summary_fits_template(&summary, &self.config.template)
+            {
                 return SummarizeOutcome::Parsed {
                     summary,
                     retried: retry,
@@ -912,7 +916,7 @@ impl StructuredSummarizer {
             }
             if retry {
                 return SummarizeOutcome::Parsed {
-                    summary: raw_text_summary(text),
+                    summary: raw_text_summary(text, &self.config.template),
                     retried: true,
                 };
             }
@@ -976,8 +980,11 @@ impl StructuredSummarizer {
     ///
     /// Walks the lines: a heading line (any `#` depth, case-insensitive,
     /// optional trailing colon or bold markers) names the current section;
-    /// bullet lines under it append their text. A fenced code block's
-    /// markers are skipped so a fenced whole-document answer still parses.
+    /// bullet lines under it append their text. An unrecognized heading
+    /// line ends the previous section — its bullets are dropped, never
+    /// attributed to the section above, so a rejected alternative cannot
+    /// surface as a settled decision. A fenced code block's markers are
+    /// skipped so a fenced whole-document answer still parses.
     fn parse_heading_summary(text: &str) -> Option<StructuredSummary> {
         let mut summary = StructuredSummary::default();
         let mut current: Option<SummarySection> = None;
@@ -990,6 +997,10 @@ impl StructuredSummarizer {
             if let Some(section) = heading_section(trimmed) {
                 recognized = true;
                 current = Some(section);
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                current = None;
                 continue;
             }
             let Some(section) = current else {
@@ -1147,10 +1158,30 @@ const fn section_purpose(section: SummarySection) -> &'static str {
 
 /// The summary a raw (unparsed) response degrades to.
 ///
-/// The whole text rides as the single key-facts entry so the render still
-/// produces a section-shaped message; the fallback never loses data.
-fn raw_text_summary(text: String) -> StructuredSummary {
-    StructuredSummary::new(vec![text], Vec::new(), Vec::new(), Vec::new())
+/// The whole text rides as the single entry of the template's first
+/// rendered section, so whatever sections the configured template carries,
+/// the render still produces a section-shaped message and the fallback
+/// never loses data to the template's filter.
+fn raw_text_summary(text: String, template: &SummaryTemplate) -> StructuredSummary {
+    let mut summary = StructuredSummary::default();
+    let section = rendered_sections(template)
+        .first()
+        .copied()
+        .unwrap_or(SummarySection::KeyFacts);
+    section_mut(&mut summary, section).push(text);
+    summary
+}
+
+/// Whether a parsed summary can render under the configured template.
+///
+/// A parse that collected entries but none in a section the template
+/// renders would compact to a bare header over an evicted slice — the
+/// discard this module's guards exist to prevent — so it counts as
+/// unparsed and takes the retry/degrade path. A fully-empty parse stays
+/// accepted: the model answering "nothing here" is a valid outcome that
+/// renders the stub line.
+fn summary_fits_template(summary: &StructuredSummary, template: &SummaryTemplate) -> bool {
+    summary.is_empty() || summary.populated_count(rendered_sections(template)) > 0
 }
 
 /// A mutable borrow of one section's entries.
@@ -2117,6 +2148,96 @@ mod tests {
         assert!(
             summary.is_empty(),
             "the model stating no sections is a valid empty parse, not a retry signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_output_false_parks_the_raw_text_in_the_first_rendered_section() {
+        let raw = "### Key facts\n- the unwired model answer rides whole";
+        let (client, summarizer) = scripted_with(
+            vec![ok(raw), ok("[]")],
+            StructuredSummaryConfig::default()
+                .with_parse_output(false)
+                .with_template(SummaryTemplate::action_only()),
+        );
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(outcome.success, "the unparsed pass succeeds");
+        assert_eq!(client.calls().len(), 1, "no parse means no retry path");
+        let summary_text = outcome
+            .messages
+            .first()
+            .map(Message::text_content)
+            .unwrap_or_default();
+        assert!(
+            summary_text.contains("### Decisions")
+                && summary_text.contains("the unwired model answer rides whole"),
+            "the raw text parks in the template's first rendered section, never a bare \
+             header: {summary_text}"
+        );
+        assert_eq!(
+            outcome.messages.len(),
+            7,
+            "one summary message plus the six preserved — the evicted slice was replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parse_that_fills_no_rendered_section_degrades_to_raw_text() {
+        let off_template = "### Key facts\n- a fact outside the action template";
+        let (client, summarizer) = scripted_with(
+            vec![ok(off_template), ok(off_template)],
+            StructuredSummaryConfig::default().with_template(SummaryTemplate::action_only()),
+        );
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(
+            outcome.success,
+            "the degrade path succeeds, never a bare header: {outcome:?}"
+        );
+        assert_eq!(
+            client.calls().len(),
+            2,
+            "an off-template parse is unparsed: one retry, then the degrade"
+        );
+        let summary_text = outcome
+            .messages
+            .first()
+            .map(Message::text_content)
+            .unwrap_or_default();
+        assert!(
+            summary_text.contains("### Decisions")
+                && summary_text.contains("a fact outside the action template"),
+            "the off-template content rides the first rendered section instead of \
+             vanishing: {summary_text}"
+        );
+        assert!(
+            !summary_text.contains(EMPTY_SUMMARY_STUB),
+            "a content-bearing response never renders the nothing-salient stub"
+        );
+    }
+
+    #[test]
+    fn bullets_under_an_unknown_heading_are_not_attributed_to_the_previous_section() {
+        let summary = StructuredSummarizer::parse_summary(
+            "### Decisions\n- use X\n### Rejected alternatives\n- use Y",
+        )
+        .expect("the recognized heading makes the parse recognized");
+        assert_eq!(
+            summary.decisions,
+            vec!["use X".to_string()],
+            "a bullet under an unknown heading never joins the previous section: {:?}",
+            summary.decisions
+        );
+        assert!(
+            summary.key_facts.is_empty()
+                && summary.pending_tasks.is_empty()
+                && summary.open_questions.is_empty(),
+            "the unknown heading's content is dropped, not attributed elsewhere"
         );
     }
 

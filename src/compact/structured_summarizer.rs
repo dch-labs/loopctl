@@ -876,14 +876,35 @@ impl StructuredSummarizer {
     /// with the harder template instruction; a second such response
     /// degrades to its raw text as the summary body. Blank and over-budget
     /// responses fail the pass regardless of which call delivers them — the
-    /// retry exists for shape problems, not content problems.
-    async fn summarize(&self, dropped: &[Message], budget: u64) -> SummarizeOutcome {
+    /// retry exists for shape problems, not content problems. Hook
+    /// contributions from the [`CompactionContext`] ride along as host
+    /// instructions and context fragments appended after the transcript, so
+    /// both the first call and the retry see them.
+    async fn summarize(
+        &self,
+        dropped: &[Message],
+        budget: u64,
+        context: &CompactionContext,
+    ) -> SummarizeOutcome {
+        use std::fmt::Write as _;
         let transcript = render_evicted(dropped, self.config.transcript_max_chars);
-        let user_prompt = format!(
+        let mut user_prompt = format!(
             "Summarize the conversation in <conversation> into the sections the system \
              message specifies, so another agent can continue the work without \
              re-reading it.\n\n<conversation>\n{transcript}\n</conversation>"
         );
+        if let Some(instructions) = context.instructions.as_deref() {
+            let _ignored = write!(
+                user_prompt,
+                "\n\nAdditional instructions from the host:\n{instructions}"
+            );
+        }
+        for fragment in &context.additional_context {
+            let _ignored = write!(
+                user_prompt,
+                "\n\nAdditional context to weave in:\n{fragment}"
+            );
+        }
         let mut retry = false;
         loop {
             let system = self.system_prompt(budget, retry);
@@ -1084,7 +1105,7 @@ impl ContextCompactor for StructuredSummarizer {
             }
 
             let budget = self.config.summary_budget(target_tokens);
-            let outcome = self.summarize(dropped, budget).await;
+            let outcome = self.summarize(dropped, budget, &context).await;
             let summary = match outcome {
                 SummarizeOutcome::Parsed { summary, retried } => (summary, retried),
                 SummarizeOutcome::Blank => {
@@ -2306,6 +2327,62 @@ mod tests {
             client.calls().len(),
             2,
             "the over-budget arrived on the retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_instructions_and_additional_context_reach_the_prompt() {
+        let (client, summarizer) = scripted(vec![
+            ok("Prose answer with no headings at all."),
+            ok(&canonical_response()),
+        ]);
+        let messages = conversation();
+        let mut context = context_for(&messages);
+        context.instructions = Some("Focus on API decisions".to_string());
+        context.additional_context = vec![
+            "The service is deploy-vacation".to_string(),
+            "The branch is feat/structured-compactor".to_string(),
+        ];
+        let outcome = summarizer.compact(messages, 40_000, context).await;
+        assert!(outcome.success, "the scripted retry recovers the shape");
+        let prompts = client.user_prompts();
+        assert_eq!(prompts.len(), 2, "the malformed first answer retried once");
+        for (call, prompt) in prompts.iter().enumerate() {
+            assert!(
+                prompt.contains("Additional instructions from the host:\nFocus on API decisions"),
+                "the hook instructions ride call {call}'s prompt: {prompt}"
+            );
+            assert!(
+                prompt.contains("Additional context to weave in:\nThe service is deploy-vacation")
+                    && prompt.contains(
+                        "Additional context to weave in:\nThe branch is feat/structured-compactor"
+                    ),
+                "every additional-context fragment rides call {call}'s prompt: {prompt}"
+            );
+        }
+        let close = prompts[0]
+            .find("</conversation>")
+            .expect("the transcript block closes");
+        let host_block = prompts[0]
+            .find("Additional instructions from the host:")
+            .expect("the host block is present on the first call");
+        assert!(
+            host_block > close,
+            "the host block follows the transcript, never rides inside it: {}",
+            prompts[0]
+        );
+
+        let (bare_client, bare) = scripted(vec![ok(&canonical_response())]);
+        let messages = conversation();
+        let outcome = bare
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(outcome.success);
+        let prompt = &bare_client.user_prompts()[0];
+        assert!(
+            !prompt.contains("Additional instructions from the host:")
+                && !prompt.contains("Additional context to weave in:"),
+            "a context carrying no hook fields appends no host block: {prompt}"
         );
     }
 }

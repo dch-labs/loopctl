@@ -47,6 +47,7 @@ pub use types::{
 use std::collections::BTreeMap;
 
 use serde_yaml_ng::Value;
+
 /// The FNV-1a 64 offset basis.
 ///
 /// The standard 64-bit FNV-1a starting state.

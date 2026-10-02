@@ -22,6 +22,10 @@
 //!   question gaps, answer) that preserves the facts a future turn
 //!   needs; requires a caller-supplied [`ApiClient`](crate::api::ApiClient)
 //!   for its calls.
+//! - [`StructuredSummarizer`] — LLM-driven compaction into a fixed
+//!   sectioned skeleton (key facts / decisions / pending tasks / open
+//!   questions) rendered from a [`SummaryTemplate`]; the same
+//!   caller-supplied-client shape, one call per pass.
 //!
 //! Hosts with their own compaction strategy (a different summarizer
 //! shape, a domain-specific reducer) implement [`ContextCompactor`]
@@ -73,6 +77,7 @@ use std::time::{Duration, Instant};
 
 pub mod demote;
 pub mod qa_summarizer;
+pub mod structured_summarizer;
 pub mod truncating;
 pub mod types;
 
@@ -80,6 +85,10 @@ pub use demote::{
     DemotionContext, DemotionSink, MemoryDemotionSink, NoopDemotionSink, render_evicted,
 };
 pub use qa_summarizer::{CompactionSummary, PriorSummary, QaSummarizer, QaSummarizerConfig};
+pub use structured_summarizer::{
+    StructuredSummarizer, StructuredSummary, StructuredSummaryConfig, SummarySection,
+    SummaryTemplate,
+};
 pub use truncating::{SplitResult, TokenSplitter, TruncatingCompactor};
 pub use types::{
     CompactReason, CompactTelemetry, CompactionContext, CompactionOutcome, ContextOverflow,
@@ -418,6 +427,54 @@ fn decimal_ratio(text: &str) -> Option<(u64, u64)> {
         .checked_mul(den)?
         .checked_add(fraction.parse().ok()?)?;
     Some((num, den))
+}
+
+/// The exact per-mille integer a clamped budget fraction renders to.
+///
+/// Runs the fraction's decimal rendering through the shared rational
+/// parser and computes the thousandfold scaling in a `u128` intermediate —
+/// a computed fraction like `0.1 + 0.2` renders with 17 fractional digits,
+/// whose numerator times 1 000 overflows `u64` and would saturate to a
+/// silently wrong per-mille. The input arrives pre-clamped to a unit
+/// fraction, so the downcast is total; any unreachable shape falls back to
+/// 250 per-mille. The LLM compactors share this one conversion so a fix to
+/// it cannot drift between them.
+fn budget_permille(pct: f64) -> u64 {
+    match decimal_ratio(&format!("{pct}")) {
+        Some((num, den)) => u128::from(num)
+            .saturating_mul(1_000)
+            .checked_div(u128::from(den))
+            .and_then(|permille| u64::try_from(permille).ok())
+            .unwrap_or(250),
+        None => 250,
+    }
+}
+
+/// Whether the conversation opens with a system-role history message.
+///
+/// The one message kind the LLM compactors pull back from the dropped
+/// slice: a system-role message carries standing instructions the summary
+/// must not absorb, so it survives at the assembled output's head and is
+/// excluded from both the summarizer transcript and the evicted handoff.
+fn leading_system(messages: &[Message]) -> bool {
+    messages
+        .first()
+        .is_some_and(|first| first.role == Role::System)
+}
+
+/// The slice of dropped messages a pass actually summarizes.
+///
+/// The dropped slice minus a leading system-role message: standing
+/// instructions survive at the head of the assembled output, so rendering
+/// them into the transcript would let the summary restate them, carry them
+/// twice in the result, and spend prompt tokens on content that is never
+/// evicted. A slice holding only the system message summarizes nothing;
+/// the caller treats that empty result as a no-change pass rather than
+/// spending calls on it.
+fn summarizable(to_compact: &[Message]) -> &[Message] {
+    to_compact
+        .get(usize::from(leading_system(to_compact))..)
+        .unwrap_or_default()
 }
 
 impl TokenCounter for RatioTokenCounter {

@@ -57,7 +57,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 
-use super::decimal_ratio;
+use super::budget_permille;
+use super::leading_system;
+use super::summarizable;
 
 /// The shared system prompt for all three summarization calls.
 ///
@@ -259,7 +261,7 @@ impl QaSummarizerConfig {
     fn fresh() -> Self {
         Self {
             budget_pct: DEFAULT_BUDGET_PCT,
-            budget_permille: permille_of(DEFAULT_BUDGET_PCT),
+            budget_permille: budget_permille(DEFAULT_BUDGET_PCT),
             max_summary_tokens: DEFAULT_MAX_SUMMARY_TOKENS,
             min_messages: DEFAULT_MIN_MESSAGES,
             preserve_recent: DEFAULT_PRESERVE_RECENT,
@@ -288,7 +290,7 @@ impl QaSummarizerConfig {
         } else {
             DEFAULT_BUDGET_PCT
         };
-        (clamped, permille_of(clamped))
+        (clamped, budget_permille(clamped))
     }
 
     /// Set the fraction of the compaction target budgeted for the summary.
@@ -447,31 +449,6 @@ impl QaSummarizerConfig {
 impl Default for QaSummarizerConfig {
     fn default() -> Self {
         Self::fresh()
-    }
-}
-
-/// The exact per-mille integer a clamped fraction renders to.
-///
-/// Runs the fraction's decimal rendering through the module's shared
-/// rational parser — the same conversion [`RatioTokenCounter`](crate::compact::RatioTokenCounter)
-/// uses for its ratios — so the budget arithmetic stays in exact
-/// integers and never trips a float cast. The thousandfold scaling
-/// runs in a `u128` intermediate because a computed fraction such as
-/// `0.1 + 0.2` renders with seventeen fractional digits, and scaling
-/// that `u64` numerator by a thousand overflows into saturation — a
-/// per-mille far below the fraction's true share. The input arrives
-/// pre-clamped to `[0.05, 0.95]`, so the parser always succeeds and
-/// the per-mille lands in `[50, 950]`; both bounds are re-asserted
-/// defensively.
-fn permille_of(pct: f64) -> u64 {
-    match decimal_ratio(&format!("{pct}")) {
-        Some((num, den)) => u128::from(num)
-            .saturating_mul(1_000)
-            .checked_div(u128::from(den))
-            .and_then(|permille| u64::try_from(permille).ok())
-            .unwrap_or(250)
-            .clamp(50, 950),
-        None => 250,
     }
 }
 
@@ -1049,31 +1026,6 @@ impl ContextCompactor for QaSummarizer {
                 .with_evicted(dropped.to_vec())
         })
     }
-}
-
-/// Whether the conversation opens with a system-role history message.
-///
-/// The one message kind pulled back from the dropped slice: a system-role
-/// message carries standing instructions the summary must not absorb.
-fn leading_system(messages: &[Message]) -> bool {
-    messages
-        .first()
-        .is_some_and(|first| first.role == Role::System)
-}
-
-/// The slice of dropped messages a pass actually summarizes.
-///
-/// The dropped slice minus a leading system-role message: standing
-/// instructions survive at the head of the assembled output, so rendering
-/// them into the transcript would let the summary restate them, carry
-/// them twice in the result, and spend prompt tokens on content that is
-/// never evicted. A slice holding only the system message summarizes
-/// nothing; the caller treats that empty result as a no-change pass
-/// rather than spending calls on it.
-fn summarizable(to_compact: &[Message]) -> &[Message] {
-    to_compact
-        .get(usize::from(leading_system(to_compact))..)
-        .unwrap_or_default()
 }
 
 /// The summarizer's own token spend for one pass.
@@ -2079,21 +2031,21 @@ mod tests {
     #[test]
     fn a_computed_fraction_budgets_at_its_full_per_mille() {
         assert_eq!(
-            permille_of(0.1 + 0.2),
+            budget_permille(0.1 + 0.2),
             300,
             "a computed fraction budgets at its true per-mille, not the saturated 184"
         );
         assert_eq!(
-            permille_of(0.4 * 0.75),
+            budget_permille(0.4 * 0.75),
             300,
             "the second computed-fraction shape reaches its true share too"
         );
         assert_eq!(
-            permille_of(0.3),
+            budget_permille(0.3),
             300,
             "short decimal literals are unchanged"
         );
-        assert_eq!(permille_of(0.25), 250);
+        assert_eq!(budget_permille(0.25), 250);
         let config = QaSummarizerConfig::default().with_summary_budget_pct(0.1 + 0.2);
         assert_eq!(
             config.summary_budget(20_000),

@@ -18,10 +18,14 @@
 //! - [`TruncatingCompactor`] — drops the oldest messages, keeping the
 //!   system prompt and a configurable number of recent messages. No LLM
 //!   calls required.
+//! - [`QaSummarizer`] — LLM-driven three-step compaction (summarize,
+//!   question gaps, answer) that preserves the facts a future turn
+//!   needs; requires a caller-supplied [`ApiClient`](crate::api::ApiClient)
+//!   for its calls.
 //!
-//! Agent-side compactors (LLM-based summarization, Q&A extraction, etc.)
-//! live outside the framework and implement [`ContextCompactor`] against
-//! their own API client.
+//! Hosts with their own compaction strategy (a different summarizer
+//! shape, a domain-specific reducer) implement [`ContextCompactor`]
+//! against their own machinery — the trait is the whole contract.
 //!
 //! # Supporting Types
 //!
@@ -68,12 +72,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub mod demote;
+pub mod qa_summarizer;
 pub mod truncating;
 pub mod types;
 
 pub use demote::{
     DemotionContext, DemotionSink, MemoryDemotionSink, NoopDemotionSink, render_evicted,
 };
+pub use qa_summarizer::{CompactionSummary, PriorSummary, QaSummarizer, QaSummarizerConfig};
 pub use truncating::{SplitResult, TokenSplitter, TruncatingCompactor};
 pub use types::{
     CompactReason, CompactTelemetry, CompactionContext, CompactionOutcome, ContextOverflow,

@@ -658,10 +658,18 @@ impl QaSummarizer {
     /// [`CompactionContext`] ride along as host instructions and context
     /// fragments.
     ///
+    /// A response whose text is empty or whitespace-only fails the step:
+    /// committing it would assemble an empty summary message, hand the
+    /// dropped slice to the demotion sink with nothing replacing it in
+    /// the feed, and store an empty prior that silently disables the
+    /// next pass's prior-summary filtering — the information loss this
+    /// compactor exists to prevent.
+    ///
     /// # Errors
     ///
     /// Propagates the provider's [`ApiError`] from the underlying
-    /// `create_message` call.
+    /// `create_message` call, and fails with a typed error when the
+    /// response carries no usable summary text.
     async fn summarize(
         &self,
         dropped: &[Message],
@@ -673,7 +681,11 @@ impl QaSummarizer {
         let transcript = self.transcript(dropped, prior);
         let prompt = Self::summarize_prompt(&transcript, prior, budget, context);
         let response = self.call_with_spend(prompt, spend).await?;
-        Ok(Self::summary_of(response.message.text_content()))
+        let text = response.message.text_content();
+        if text.trim().is_empty() {
+            return Err(ApiError::api("the model returned an empty summary"));
+        }
+        Ok(Self::summary_of(text))
     }
 
     /// Step 2: ask what the summary is missing.
@@ -908,20 +920,6 @@ impl QaSummarizer {
         out
     }
 
-    /// The evicted slice for a successful pass.
-    ///
-    /// Every dropped message leaves the feed, except a leading
-    /// system-role message pulled back into the output — the demotion
-    /// sink's contract is that nothing still present in the history is
-    /// listed as evicted.
-    fn evicted(dropped: &[Message], pulled_system: bool) -> Vec<Message> {
-        dropped
-            .iter()
-            .skip(usize::from(pulled_system))
-            .cloned()
-            .collect()
-    }
-
     /// The failure outcome: the original messages intact, the step named.
     ///
     /// Pure construction — the caller owns the decision to stop, and the
@@ -1004,7 +1002,8 @@ impl ContextCompactor for QaSummarizer {
                 return CompactionOutcome::no_change(messages);
             }
             let split = self.splitter().split(&messages);
-            if split.to_compact.is_empty() {
+            let dropped = summarizable(&split.to_compact);
+            if dropped.is_empty() {
                 return CompactionOutcome::no_change(messages);
             }
 
@@ -1013,7 +1012,7 @@ impl ContextCompactor for QaSummarizer {
             let mut spend = TokenSpend::default();
             let (enriched, steps, questions) = match self
                 .run_steps(
-                    &split.to_compact,
+                    dropped,
                     &split.preserved,
                     budget,
                     prior.as_ref(),
@@ -1026,14 +1025,12 @@ impl ContextCompactor for QaSummarizer {
                 Err((step, error)) => return Self::fail(original, &context, step, &error),
             };
 
-            let pulled_system = leading_system(&messages);
             let out = Self::assemble(&enriched.text, &split.preserved, &messages);
             let tokens_after = context.counter.count(&out);
             self.commit_prior(enriched.text, prior.as_ref().map(|prior| prior.pass));
             Self::emit_telemetry(steps, questions, budget, &spend);
-            let evicted = Self::evicted(&split.to_compact, pulled_system);
             CompactionOutcome::compacted(out, context.tokens_before, tokens_after)
-                .with_evicted(evicted)
+                .with_evicted(dropped.to_vec())
         })
     }
 }
@@ -1046,6 +1043,21 @@ fn leading_system(messages: &[Message]) -> bool {
     messages
         .first()
         .is_some_and(|first| first.role == Role::System)
+}
+
+/// The slice of dropped messages a pass actually summarizes.
+///
+/// The dropped slice minus a leading system-role message: standing
+/// instructions survive at the head of the assembled output, so rendering
+/// them into the transcript would let the summary restate them, carry
+/// them twice in the result, and spend prompt tokens on content that is
+/// never evicted. A slice holding only the system message summarizes
+/// nothing; the caller treats that empty result as a no-change pass
+/// rather than spending calls on it.
+fn summarizable(to_compact: &[Message]) -> &[Message] {
+    to_compact
+        .get(usize::from(leading_system(to_compact))..)
+        .unwrap_or_default()
 }
 
 /// The summarizer's own token spend for one pass.
@@ -1508,6 +1520,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_leading_system_message_never_rides_the_summarizer_transcript() {
+        let (client, summarizer) = scripted(vec![
+            ok("SUMMARY-S"),
+            ok("[\"what fact was fixed?\"]"),
+            ok("1. the fixed fact"),
+        ]);
+        let mut messages = conversation();
+        messages.insert(
+            0,
+            Message::new(
+                Role::System,
+                vec![crate::message::MessagePart::text("standing instructions")],
+            ),
+        );
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(outcome.success);
+        let prompts = client.prompts();
+        assert_eq!(prompts.len(), 3, "the scripted pass runs all three steps");
+        assert!(
+            prompts[0].contains("<conversation>")
+                && prompts[0].contains("user turn 0 asks about topic-0"),
+            "the step-1 transcript still renders the dropped conversation: {}",
+            prompts[0]
+        );
+        assert!(
+            !prompts[0].contains("standing instructions"),
+            "the system message survives at the output head, so it must not ride the \
+             step-1 transcript and get restated by the summary: {}",
+            prompts[0]
+        );
+        assert!(
+            prompts[2].contains("<conversation>") && !prompts[2].contains("standing instructions"),
+            "the step-3 transcript draws from the same system-free slice: {}",
+            prompts[2]
+        );
+        let head = outcome.messages.first().expect("the output is non-empty");
+        assert_eq!(
+            (head.role, head.text_content()),
+            (Role::System, "standing instructions".to_string()),
+            "the survival contract is unchanged — the message still heads the output"
+        );
+        assert_eq!(
+            outcome.messages.get(1).map(|m| m.role),
+            Some(Role::Assistant),
+            "the summary follows the system message"
+        );
+        assert!(
+            outcome
+                .evicted
+                .iter()
+                .all(|msg| msg.text_content() != "standing instructions"),
+            "the pulled-back system message is never demoted"
+        );
+    }
+
+    #[test]
+    fn the_summarizable_slice_excludes_only_a_leading_system_message() {
+        let system =
+            |text: &str| Message::new(Role::System, vec![crate::message::MessagePart::text(text)]);
+        let slice = vec![
+            system("standing instructions"),
+            Message::user("question"),
+            Message::assistant("answer"),
+        ];
+        let texts: Vec<String> = summarizable(&slice)
+            .iter()
+            .map(Message::text_content)
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["question".to_string(), "answer".to_string()],
+            "a leading system message is the one slice member never summarized"
+        );
+        let user_led = vec![Message::user("question"), Message::assistant("answer")];
+        assert_eq!(
+            summarizable(&user_led).len(),
+            2,
+            "a slice with no leading system message passes through whole"
+        );
+        let only_system = system("the only compactable message");
+        assert!(
+            summarizable(std::slice::from_ref(&only_system)).is_empty(),
+            "a slice holding only the system message summarizes nothing — the \
+             caller's no-change case"
+        );
+    }
+
+    #[tokio::test]
     async fn a_second_pass_accumulates_on_the_first_summary() {
         let (client, summarizer) =
             scripted(vec![ok("SUMMARY-1"), ok("[]"), ok("SUMMARY-2"), ok("[]")]);
@@ -1602,6 +1704,55 @@ mod tests {
             "a failed pass commits no prior"
         );
         assert_eq!(outcome.evicted.len(), 0, "nothing left the feed");
+    }
+
+    #[tokio::test]
+    async fn an_empty_summary_fails_the_pass_and_keeps_the_original_messages() {
+        let (client, summarizer) = scripted(vec![ok(""), ok("[]")]);
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(
+            !outcome.success,
+            "a response with no usable text must fail the pass, not commit an empty summary"
+        );
+        let error = outcome.error.expect("the failure carries a reason");
+        assert!(
+            error.contains("summarize") && error.contains("empty summary"),
+            "the error names the step and the cause: {error}"
+        );
+        assert_eq!(
+            outcome.messages.len(),
+            messages.len(),
+            "the original messages return intact"
+        );
+        assert_eq!(
+            outcome.evicted.len(),
+            0,
+            "nothing is demoted when no summary replaces it"
+        );
+        assert!(
+            summarizer.prior_summary().is_none(),
+            "an empty summary is never committed as the prior"
+        );
+        assert_eq!(client.prompts().len(), 1, "the pass stops at step 1");
+
+        let (_client, whitespace) = scripted(vec![ok("   \n\t"), ok("[]")]);
+        let messages = conversation();
+        let outcome = whitespace
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(
+            !outcome.success,
+            "a whitespace-only summary is the same empty class: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .error
+                .is_some_and(|error| error.contains("empty summary")),
+            "the whitespace direction fails for the same named cause"
+        );
     }
 
     #[test]

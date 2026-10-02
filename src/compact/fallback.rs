@@ -14,6 +14,11 @@
 //! [`ChainReport`](FallbackCompactor::last_report), so the chain stays
 //! debuggable while it survives; the winning stage's outcome rides out
 //! verbatim, its [`evicted`](CompactionOutcome::evicted) handoff included.
+//! A failed stage's returned messages are discarded rather than handed
+//! onward — every stage runs against the original input, so a stage that
+//! fails with a partial or emptied list cannot corrupt the history its
+//! successors compact, and an all-stages-failed chain returns the original
+//! input, not the last failure's leftovers.
 //!
 //! # Example
 //!
@@ -470,14 +475,14 @@ impl ContextCompactor for FallbackCompactor {
     ) -> Pin<Box<dyn Future<Output = CompactionOutcome> + Send + '_>> {
         Box::pin(async move {
             let mut report = ChainReport::default();
-            let mut current = messages;
+            let original = messages;
             for (index, stage) in self.stages.iter().enumerate() {
                 let started = Instant::now();
                 let mut stage_context = context.clone();
-                stage_context.tokens_before = context.counter.count(&current);
+                stage_context.tokens_before = context.counter.count(&original);
                 let outcome = stage
                     .compactor
-                    .compact(current, target_tokens, stage_context.clone())
+                    .compact(original.clone(), target_tokens, stage_context)
                     .await;
                 let duration = started.elapsed();
                 if outcome.success {
@@ -515,11 +520,10 @@ impl ContextCompactor for FallbackCompactor {
                     tokens_after: outcome.tokens_after,
                     duration,
                 });
-                current = outcome.messages;
             }
-            let tokens_after = context.counter.count(&current);
+            let tokens_after = context.counter.count(&original);
             self.store_report(report);
-            CompactionOutcome::failed(current, tokens_after, ALL_STAGES_FAILED)
+            CompactionOutcome::failed(original, tokens_after, ALL_STAGES_FAILED)
         })
     }
 }
@@ -575,8 +579,17 @@ mod tests {
     enum Scripted {
         /// Fail the pass with this error text.
         ///
-        /// The error surfaces verbatim in the chain's report.
+        /// The error surfaces verbatim in the chain's report; the returned
+        /// messages are the stage's input verbatim, the honest shape.
         Fail(&'static str),
+
+        /// Fail the pass and return an emptied message list.
+        ///
+        /// The corrupted-history shape a misbehaving stage can produce —
+        /// a failed outcome only "typically" carries the original input,
+        /// so the chain's defenses are pinned against this arm.
+        FailEmpty(&'static str),
+
         /// Succeed by compacting down to the final message.
         ///
         /// The shrink is drastic on purpose — the winner's output must be
@@ -655,6 +668,9 @@ mod tests {
             Box::pin(std::future::ready(match next {
                 Scripted::Fail(error) => {
                     CompactionOutcome::failed(messages, context.tokens_before, error)
+                }
+                Scripted::FailEmpty(error) => {
+                    CompactionOutcome::failed(Vec::new(), context.tokens_before, error)
                 }
                 Scripted::ShrinkToLast => {
                     let last = messages.last().cloned().unwrap_or_else(|| {
@@ -1021,6 +1037,58 @@ mod tests {
             second.seen()[0].messages,
             expected,
             "no partial or half-compacted state leaks between stages"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_stage_s_emptied_output_never_reaches_the_next_stage() {
+        let first =
+            ScriptedCompactor::new(vec![Scripted::FailEmpty("stage one mangled its return")]);
+        let second = ScriptedCompactor::new(vec![Scripted::ShrinkToLast]);
+        let chain = FallbackCompactor::builder()
+            .stage("first", Arc::clone(&first) as Arc<dyn ContextCompactor>)
+            .stage("second", Arc::clone(&second) as Arc<dyn ContextCompactor>)
+            .build();
+        let messages = conversation();
+        let expected: Vec<String> = messages.iter().map(Message::text_content).collect();
+        chain
+            .compact(messages, 40_000, context_for(&conversation()))
+            .await;
+        assert_eq!(
+            second.seen()[0].messages,
+            expected,
+            "every stage sees the original input — a failed stage's returned list is \
+             discarded, never handed onward"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_all_failed_outcome_carries_the_original_not_a_stage_s_emptied_list() {
+        let first =
+            ScriptedCompactor::new(vec![Scripted::FailEmpty("stage one mangled its return")]);
+        let second =
+            ScriptedCompactor::new(vec![Scripted::FailEmpty("stage two mangled its return")]);
+        let chain = FallbackCompactor::builder()
+            .stage("first", Arc::clone(&first) as Arc<dyn ContextCompactor>)
+            .stage("second", Arc::clone(&second) as Arc<dyn ContextCompactor>)
+            .build();
+        let messages = conversation();
+        let expected: Vec<String> = messages.iter().map(Message::text_content).collect();
+        let outcome = chain
+            .compact(messages, 40_000, context_for(&conversation()))
+            .await;
+        assert!(
+            !outcome.success,
+            "both stages failed; the chain fails honestly"
+        );
+        let returned: Vec<String> = outcome.messages.iter().map(Message::text_content).collect();
+        assert_eq!(
+            returned, expected,
+            "the chain's failure returns the original input, never a failed stage's emptied list"
+        );
+        assert!(
+            outcome.evicted.is_empty(),
+            "a mangled stage's drops are not evictions — nothing left the chain's feed"
         );
     }
 

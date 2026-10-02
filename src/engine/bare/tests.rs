@@ -1552,7 +1552,14 @@ impl crate::observer::LoopObserver for ContextSizeRecorder {
 
 /// Per-count delay charged by [`SlowRecountCounter`]; the tool-phase
 /// duration must stay under half of it.
-const SLOW_RECOUNT_DELAY_MS: u64 = 150;
+///
+/// The delay is the defect signal (a recount leaking into the reported
+/// span adds at least one full delay) and must dominate runner scheduling
+/// noise, which has been observed stalling a test thread for ~170 ms
+/// inside the dispatch window on a contended CI machine. Six hundred
+/// milliseconds keeps the pass bound at 300 ms — roughly twice that
+/// observed stall — while a leaked recount still measures ≥ 600 ms.
+const SLOW_RECOUNT_DELAY_MS: u64 = 600;
 
 /// Token counter that charges a fixed wall-clock delay on every count.
 ///

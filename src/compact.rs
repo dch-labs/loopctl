@@ -76,6 +76,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub mod demote;
+pub mod fallback;
 pub mod qa_summarizer;
 pub mod structured_summarizer;
 pub mod truncating;
@@ -83,6 +84,10 @@ pub mod types;
 
 pub use demote::{
     DemotionContext, DemotionSink, MemoryDemotionSink, NoopDemotionSink, render_evicted,
+};
+pub use fallback::{
+    ChainBuilder, ChainReport, ChainStage, FallbackCompactor, FallbackConfig, StageOutcome,
+    TerminalCapture,
 };
 pub use qa_summarizer::{CompactionSummary, PriorSummary, QaSummarizer, QaSummarizerConfig};
 pub use structured_summarizer::{

@@ -8,8 +8,8 @@
 //! same headings — key facts, decisions, pending tasks, open questions — each
 //! as a bullet list, so a consumer (telemetry, an attachment layer, a UI) can
 //! locate "pending tasks" without parsing prose. One LLM call per pass (plus
-//! at most one retry when the first response carries no recognizable
-//! heading), a tolerant parse back into [`StructuredSummary`], and a
+//! at most one retry when the first response's shape defeats the parser), a
+//! tolerant parse back into [`StructuredSummary`], and a
 //! [`SummaryTemplate`] render that omits empty sections. Failures — a blank
 //! response, a response over the configured token budget, a provider error —
 //! fail the pass with the original messages intact, the seam a fallback chain
@@ -730,8 +730,10 @@ impl Default for StructuredSummaryConfig {
 /// options.
 ///
 /// Each pass makes one LLM call, retried at most once when the first
-/// response carries no recognizable section heading; a second malformed
-/// response degrades to its raw text as the summary body rather than
+/// response's shape defeats the parser — no recognizable section heading, a
+/// heading whose body the scan could not read, or a parse that fills no
+/// section the template renders; a second malformed response degrades to
+/// its raw text as the summary body rather than
 /// failing. Blank responses and responses over the configured budget fail
 /// the pass with the original messages intact — the seam a fallback chain
 /// catches. The compactor is stateless: no summary accumulates across
@@ -871,15 +873,17 @@ impl StructuredSummarizer {
 
     /// Run the summarization call (plus its retry) over the dropped slice.
     ///
-    /// One call; a response with no recognizable heading — or whose parse
-    /// fills no section the template renders — triggers exactly one retry
-    /// with the harder template instruction; a second such response
-    /// degrades to its raw text as the summary body. Blank and over-budget
-    /// responses fail the pass regardless of which call delivers them — the
-    /// retry exists for shape problems, not content problems. Hook
-    /// contributions from the [`CompactionContext`] ride along as host
-    /// instructions and context fragments appended after the transcript, so
-    /// both the first call and the retry see them.
+    /// One call; a response with no recognizable heading — or whose
+    /// recognized heading collected no entry over lines the scan could not
+    /// interpret, or whose parse fills no section the template renders —
+    /// triggers exactly one retry with the harder template instruction; a
+    /// second such response degrades to its raw text as the summary body.
+    /// Blank and over-budget responses fail the pass regardless of which
+    /// call delivers them — the retry exists for shape problems, not
+    /// content problems. Hook contributions from the
+    /// [`CompactionContext`] ride along as host instructions and context
+    /// fragments appended after the transcript, so both the first call and
+    /// the retry see them.
     async fn summarize(
         &self,
         dropped: &[Message],
@@ -949,11 +953,16 @@ impl StructuredSummarizer {
     ///
     /// Prefers a JSON object keyed by the sections' `snake_case` names (the
     /// shape a JSON-mode provider emits); falls back to scanning for the
-    /// canonical headings case-insensitively under any `#` depth, with `- `,
-    /// `* `, or numbered bullets. Unknown headings and non-bullet lines are
-    /// ignored; each section caps at [`MAX_ITEMS_PER_SECTION`] entries.
-    /// Returns `None` when no recognizable section appears at all — the
-    /// caller's retry signal.
+    /// canonical headings case-insensitively at any `#` depth — including
+    /// none, so a bare `Key facts:` line names a section — with `- `, `* `,
+    /// or numbered bullets. Each section caps at
+    /// [`MAX_ITEMS_PER_SECTION`] entries. Returns `None` — the caller's
+    /// retry signal — when no recognizable section appears, and when a
+    /// recognized heading collected no entry while the response carried
+    /// non-blank lines the scan could not interpret (prose under a
+    /// heading, an unrecognized heading, a preamble): those lines are the
+    /// data the "nothing salient" stub would discard, and only a JSON
+    /// empty array affirmatively states that nothing was there.
     fn parse_summary(text: &str) -> Option<StructuredSummary> {
         if let Some(summary) = Self::parse_json_summary(text) {
             return Some(summary);
@@ -999,20 +1008,31 @@ impl StructuredSummarizer {
 
     /// The heading-scan parse path.
     ///
-    /// Walks the lines: a heading line (any `#` depth, case-insensitive,
-    /// optional trailing colon or bold markers) names the current section;
-    /// bullet lines under it append their text. An unrecognized heading
-    /// line ends the previous section — its bullets are dropped, never
-    /// attributed to the section above, so a rejected alternative cannot
-    /// surface as a settled decision. A fenced code block's markers are
-    /// skipped so a fenced whole-document answer still parses.
+    /// Walks the lines: a heading line (any `#` depth — including none, so a
+    /// bare `Key facts:` line names a section — case-insensitive, optional
+    /// trailing colon or bold markers) names the current section; bullet
+    /// lines under it append their text. An unrecognized heading line ends
+    /// the previous section — its bullets are dropped, never attributed to
+    /// the section above, so a rejected alternative cannot surface as a
+    /// settled decision. A fenced code block's markers are skipped so a
+    /// fenced whole-document answer still parses.
+    ///
+    /// A scan that recognized a heading while collecting no entry returns
+    /// `None` whenever the response carried non-blank lines it could not
+    /// interpret — prose under the heading, an unrecognized heading, a
+    /// preamble. Those lines are exactly the data the "nothing salient"
+    /// stub would discard, and only an explicit JSON empty array
+    /// affirmatively states that nothing was there; a heading with no
+    /// interpretable lines beneath it still parses as the deliberate
+    /// empty.
     fn parse_heading_summary(text: &str) -> Option<StructuredSummary> {
         let mut summary = StructuredSummary::default();
         let mut current: Option<SummarySection> = None;
         let mut recognized = false;
+        let mut discarded_content = false;
         for line in text.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("```") {
+            if trimmed.is_empty() || trimmed.starts_with("```") {
                 continue;
             }
             if let Some(section) = heading_section(trimmed) {
@@ -1022,9 +1042,11 @@ impl StructuredSummarizer {
             }
             if trimmed.starts_with('#') {
                 current = None;
+                discarded_content = true;
                 continue;
             }
             let Some(section) = current else {
+                discarded_content = true;
                 continue;
             };
             if let Some(bullet) = bullet_item(trimmed) {
@@ -1032,7 +1054,12 @@ impl StructuredSummarizer {
                 if entries.len() < MAX_ITEMS_PER_SECTION {
                     entries.push(bullet.to_string());
                 }
+                continue;
             }
+            discarded_content = true;
+        }
+        if summary.is_empty() && discarded_content {
+            return None;
         }
         recognized.then_some(summary)
     }
@@ -1220,8 +1247,9 @@ fn section_mut(summary: &mut StructuredSummary, section: SummarySection) -> &mut
 
 /// Which canonical section a heading line names, if any.
 ///
-/// Accepts any `#` depth, any casing, an optional trailing colon, and
-/// surrounding bold markers — the tolerant half of the heading contract.
+/// Accepts any `#` depth — zero included, so a bare `Key facts:` line names
+/// a section — any casing, an optional trailing colon, and surrounding bold
+/// markers: the tolerant half of the heading contract.
 fn heading_section(line: &str) -> Option<SummarySection> {
     let stripped = line.trim_start_matches('#').trim();
     let stripped = stripped.trim_matches('*').trim();
@@ -1261,8 +1289,11 @@ fn numbered_bullet(line: &str) -> Option<&str> {
 
 /// The heuristic token estimate for one summary-sized text.
 ///
-/// The same message-wrapped heuristic every compactor self-reports with, so
-/// the budget check and the outcome's counter speak one unit.
+/// The basis the pass budget is enforced against, measured on the raw
+/// response text. It is independent of the outcome's `tokens_after`, which
+/// the pass counts with the context's configured counter — a host counter
+/// may read higher or lower than this heuristic, and the manager's
+/// whole-conversation fit check is the backstop when the two disagree.
 fn estimate_text_tokens(text: &str) -> u64 {
     CompactionOutcome::estimate_tokens(std::slice::from_ref(&Message::assistant(text.to_string())))
 }
@@ -2383,6 +2414,148 @@ mod tests {
             !prompt.contains("Additional instructions from the host:")
                 && !prompt.contains("Additional context to weave in:"),
             "a context carrying no hook fields appends no host block: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn heading_plus_prose_responses_retry_then_degrade_to_raw_text_never_the_stub() {
+        let heading_prose = "### Key facts\nThe user worked on src/api.rs and settled \
+             deployment on Docker.\nA migration of the database is still pending and must \
+             finish before Friday.";
+        let (client, summarizer) = scripted(vec![ok(heading_prose), ok(heading_prose)]);
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(
+            outcome.success,
+            "the degraded pass succeeds — a shape problem is not a content problem: {outcome:?}"
+        );
+        assert_eq!(
+            client.calls().len(),
+            2,
+            "a heading-plus-prose response is unparsed: the retry fires before the degrade"
+        );
+        let summary_text = outcome
+            .messages
+            .first()
+            .map(Message::text_content)
+            .unwrap_or_default();
+        assert!(
+            summary_text.contains("settled deployment on Docker")
+                && summary_text.contains("must finish before Friday"),
+            "the model's prose rides the summary message instead of vanishing: {summary_text}"
+        );
+        assert!(
+            !summary_text.contains(EMPTY_SUMMARY_STUB),
+            "a content-bearing response never renders the nothing-salient stub: {summary_text}"
+        );
+        assert!(
+            !outcome.evicted.is_empty(),
+            "the successful compact demoted its slice with the content riding the summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_heading_prose_retry_recovers_when_the_second_answer_is_sectioned() {
+        let heading_prose = "### Key facts\nThe user worked on src/api.rs and settled \
+             deployment on Docker.";
+        let (client, summarizer) = scripted(vec![ok(heading_prose), ok(&canonical_response())]);
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(outcome.success, "the retry recovers the shape");
+        assert_eq!(client.calls().len(), 2, "exactly one retry ran");
+        let systems = client.systems();
+        assert!(
+            systems[1].contains("MUST emit ONLY the sections"),
+            "the retry prompt carries the sharper exact-headings instruction"
+        );
+        let summary_text = outcome
+            .messages
+            .first()
+            .map(Message::text_content)
+            .unwrap_or_default();
+        assert!(
+            summary_text.contains("### Key facts")
+                && summary_text.contains("src/api.rs uses reqwest"),
+            "the second response's sectioned summary renders: {summary_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn headings_with_no_content_stay_the_deliberate_empty() {
+        let headings_only = "### Key facts\n\n### Decisions\n";
+        let parsed = StructuredSummarizer::parse_summary(headings_only)
+            .expect("headings with no content lines are a recognized empty");
+        assert!(
+            parsed.is_empty(),
+            "headings alone state emptiness — not a retry signal"
+        );
+        let (client, summarizer) = scripted(vec![ok(headings_only)]);
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(outcome.success);
+        assert_eq!(client.calls().len(), 1, "an explicit empty needs no retry");
+        let summary_text = outcome
+            .messages
+            .first()
+            .map(Message::text_content)
+            .unwrap_or_default();
+        assert_eq!(
+            summary_text,
+            format!("## Conversation summary (compacted)\n\n{EMPTY_SUMMARY_STUB}"),
+            "the deliberate empty renders the stub"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_heading_line_is_not_an_empty_statement() {
+        assert!(
+            StructuredSummarizer::parse_summary("### Key facts\n### Rejected alternatives")
+                .is_none(),
+            "an unknown heading line is content the parse could not interpret, not an empty \
+             statement"
+        );
+        assert!(
+            StructuredSummarizer::parse_summary("Key facts:\nThe user worked on src/api.rs.")
+                .is_none(),
+            "a bare-colon heading over prose is the same discarded-content shape"
+        );
+    }
+
+    #[test]
+    fn a_bare_colon_heading_line_still_names_a_section() {
+        let summary = StructuredSummarizer::parse_summary(
+            "Key facts:\n- a bare-heading bullet\n**Decisions**\n- a bold-heading bullet",
+        )
+        .expect("a heading line with no # characters still names a section");
+        assert_eq!(
+            summary.key_facts,
+            vec!["a bare-heading bullet".to_string()],
+            "bullets collect under a bare-colon heading"
+        );
+        assert_eq!(
+            summary.decisions,
+            vec!["a bold-heading bullet".to_string()],
+            "bullets collect under a bold-marker heading"
+        );
+    }
+
+    #[test]
+    fn a_populated_section_still_parses_over_a_discarded_preamble() {
+        let summary = StructuredSummarizer::parse_summary(
+            "Here is the summary you asked for.\n### Key facts\n- a fact beneath the heading",
+        )
+        .expect("the populated section carries the parse");
+        assert_eq!(
+            summary.key_facts,
+            vec!["a fact beneath the heading".to_string()],
+            "discarded preamble lines do not unparse a response whose sections collected \
+             entries"
         );
     }
 }

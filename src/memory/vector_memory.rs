@@ -53,7 +53,7 @@
 //! ```
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::RwLock;
@@ -63,7 +63,7 @@ use uuid::Uuid;
 
 use crate::error::{LoopError, recover_guard};
 use crate::memory::entry::PROVIDER_DERIVED_TAG;
-use crate::memory::vector::{Embedding, EmbeddingProvider, VectorIndex, cosine_similarity};
+use crate::memory::vector::{Embedding, EmbeddingProvider, VectorIndex};
 use crate::memory::{ConsolidationStats, LoopMemory, MemoryEntry};
 use crate::numeric::unit_ratio;
 
@@ -125,6 +125,16 @@ pub struct VectorMemoryConfig {
     /// disables merging entirely — only mathematically identical vectors
     /// exceed it.
     pub dedup_threshold: f32,
+
+    /// How many nearest survivors each survivor is compared against while
+    /// planning near-duplicate merges.
+    ///
+    /// Consolidation asks the index for this many neighbours per survivor
+    /// instead of comparing every pair, so planning cost stays near-linear
+    /// in the entry count; the merge set is therefore top-k-bounded — a
+    /// duplicate cluster wider than this window merges across repeated
+    /// passes rather than in one. Values below 1 clamp to 1.
+    pub dedup_candidates: usize,
 }
 
 impl Default for VectorMemoryConfig {
@@ -143,6 +153,7 @@ impl Default for VectorMemoryConfig {
             overfetch: 4,
             prune_threshold: 0.1,
             dedup_threshold: 0.95,
+            dedup_candidates: 16,
         }
     }
 }
@@ -152,14 +163,14 @@ impl VectorMemoryConfig {
     ///
     /// Non-finite weights become zero and negative weights clamp to zero;
     /// if every weight sanitizes to zero the defaults are restored so the
-    /// store can never end up with no active channel. `overfetch` clamps to
-    /// at least 1 and the two thresholds to `0.0..=1.0` (non-finite
-    /// thresholds fall back to their defaults).
+    /// store can never end up with no active channel. `overfetch` and
+    /// `dedup_candidates` clamp to at least 1 and the two thresholds to
+    /// `0.0..=1.0` (non-finite thresholds fall back to their defaults).
     #[must_use]
     pub fn normalized(mut self) -> Self {
-        self.semantic_weight = sanitize_weight(self.semantic_weight, 0.6);
-        self.lexical_weight = sanitize_weight(self.lexical_weight, 0.3);
-        self.tag_weight = sanitize_weight(self.tag_weight, 0.1);
+        self.semantic_weight = sanitize_weight(self.semantic_weight);
+        self.lexical_weight = sanitize_weight(self.lexical_weight);
+        self.tag_weight = sanitize_weight(self.tag_weight);
         let sum = self.semantic_weight + self.lexical_weight + self.tag_weight;
         if sum <= 0.0 {
             let fallback = Self::default();
@@ -172,6 +183,7 @@ impl VectorMemoryConfig {
             self.tag_weight /= sum;
         }
         self.overfetch = self.overfetch.max(1);
+        self.dedup_candidates = self.dedup_candidates.max(1);
         self.prune_threshold = sanitize_threshold(self.prune_threshold, 0.1);
         self.dedup_threshold = sanitize_threshold(self.dedup_threshold, 0.95);
         self
@@ -180,12 +192,13 @@ impl VectorMemoryConfig {
 
 /// Clamp a blend weight to a finite, non-negative value.
 ///
-/// Non-finite inputs fall back to `fallback`; otherwise negative values
+/// Non-finite inputs become zero — a poisoned channel goes silent rather
+/// than borrowing a share it did not earn — while otherwise negative values
 /// clamp to `0.0` and values above 1.0 clamp to 1.0, keeping every channel
 /// share inside the range the normalization step expects.
-fn sanitize_weight(weight: f32, fallback: f32) -> f32 {
+fn sanitize_weight(weight: f32) -> f32 {
     if !weight.is_finite() {
-        return fallback;
+        return 0.0;
     }
     weight.clamp(0.0, 1.0)
 }
@@ -304,11 +317,13 @@ pub struct VectorMemoryStore {
 
     /// The store↔consolidation sequencing lock.
     ///
-    /// [`store`](LoopMemory::store) holds it across its whole insert and
+    /// [`store`](LoopMemory::store) embeds first and then holds this lock
+    /// across its index insert and map writes, and
     /// [`consolidate`](LoopMemory::consolidate) across its whole pass, so
-    /// the two operations can never interleave: a pass observes either the
-    /// full pre-state or the full post-state of any concurrent store,
-    /// which is what makes the snapshot-bound removals sound.
+    /// the two write phases can never interleave: a pass observes either
+    /// the full pre-state or the full post-state of any concurrent store,
+    /// which is what makes the snapshot-bound removals sound — while no
+    /// lock at all spans either side's embedder latency.
     /// [`retrieve`](LoopMemory::retrieve) takes no part in it and stays
     /// lock-free.
     pass_lock: tokio::sync::Mutex<()>,
@@ -377,14 +392,15 @@ impl VectorMemoryStore {
 impl LoopMemory for VectorMemoryStore {
     /// Embed and index one entry.
     ///
-    /// The whole insert runs under the store↔consolidation pass lock, so
-    /// a consolidation pass can never interleave with an in-flight store —
-    /// the guarantee the pass's snapshot-bound removals rest on. The
-    /// embedding is awaited **before any inner data lock is taken** (the
-    /// pass lock only serializes against consolidations, never against
-    /// [`retrieve`](LoopMemory::retrieve), which stays lock-free), so a
-    /// slow or remote embedder never blocks concurrent readers. The
-    /// vector lands in the index first and the payload maps second,
+    /// The embedding is awaited **before the store↔consolidation pass lock
+    /// is taken** — no lock at all is held across the embedder call, so
+    /// overlapping stores interleave their embeds and a slow or remote
+    /// embedder never serializes concurrent stores behind its own latency.
+    /// The pass lock then covers only the index insert and the two map
+    /// writes, keeping a store's write phase atomic against consolidation
+    /// passes — the guarantee the pass's snapshot-bound removals rest on —
+    /// while [`retrieve`](LoopMemory::retrieve) stays lock-free throughout.
+    /// The vector lands in the index first and the payload maps second,
     /// keeping the index and the store's vector copy in lockstep with the
     /// entry they describe. Embedding and index errors propagate as
     /// [`LoopError`] unchanged — the embedding provider picks the variant
@@ -394,9 +410,9 @@ impl LoopMemory for VectorMemoryStore {
         entry: MemoryEntry,
     ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>> {
         Box::pin(async move {
-            let _pass = self.pass_lock.lock().await;
             let id = entry.id;
             let embedding = self.embedder.embed(&entry.memory).await?;
+            let _pass = self.pass_lock.lock().await;
             self.index.add(id, embedding.clone()).await?;
             recover_guard(self.vectors.write()).insert(id, embedding);
             recover_guard(self.entries.write()).insert(id, entry);
@@ -483,9 +499,12 @@ impl LoopMemory for VectorMemoryStore {
     /// copies the payload map under a short read lock; deciding (which
     /// entries fall below
     /// [`prune_threshold`](VectorMemoryConfig::prune_threshold) — validated
-    /// entries are exempt — and which surviving pairs exceed
-    /// [`dedup_threshold`](VectorMemoryConfig::dedup_threshold) in cosine)
-    /// is pure computation over the store's vector copy; applying awaits
+    /// entries are exempt — and which survivors merge, via one bounded
+    /// index search per survivor over the store's own embedding copy,
+    /// keeping matches strictly above
+    /// [`dedup_threshold`](VectorMemoryConfig::dedup_threshold)) is
+    /// computation over the store's vector copy and never a re-embed;
+    /// applying awaits
     /// the index removals **before** taking the write locks, then removes
     /// payloads, folds merged victims' tags into their survivors (a
     /// `provider-derived` provenance tag never folds — provenance belongs
@@ -547,7 +566,7 @@ impl LoopMemory for VectorMemoryStore {
                     .collect()
             };
             live.sort_by_key(|entry| entry.0);
-            let (merged_ids, tag_folds) = self.plan_merges(&survivors, &live);
+            let (merged_ids, tag_folds) = self.plan_merges(&survivors, &live).await?;
             let by_id: HashMap<Uuid, &MemoryEntry> =
                 snapshot.iter().map(|entry| (entry.id, entry)).collect();
             let mut candidates: Vec<(Uuid, MemoryEntry)> = Vec::new();
@@ -571,6 +590,7 @@ impl LoopMemory for VectorMemoryStore {
                 }
                 (removed, raced)
             };
+            let removed_set: HashSet<Uuid> = removed_ids.iter().copied().collect();
             for id in &raced_ids {
                 let replacement = recover_guard(self.vectors.read()).get(id).cloned();
                 if let Some(vector) = replacement {
@@ -583,7 +603,7 @@ impl LoopMemory for VectorMemoryStore {
                     entries.remove(id);
                 }
                 for fold in &tag_folds {
-                    if removed_ids.contains(&fold.victim)
+                    if removed_set.contains(&fold.victim)
                         && let Some(survivor) = entries.get_mut(&fold.survivor)
                     {
                         for tag in &fold.tags {
@@ -605,11 +625,11 @@ impl LoopMemory for VectorMemoryStore {
             let bytes_saved = removed_total.saturating_mul(self.embedder.dim().saturating_mul(4));
             let pruned_count = pruned_ids
                 .iter()
-                .filter(|id| removed_ids.contains(id))
+                .filter(|id| removed_set.contains(id))
                 .count();
             let merged_count = merged_ids
                 .iter()
-                .filter(|id| removed_ids.contains(id))
+                .filter(|id| removed_set.contains(id))
                 .count();
             tracing::debug!(
                 target: "loopctl::metrics",
@@ -639,50 +659,69 @@ impl LoopMemory for VectorMemoryStore {
 }
 
 impl VectorMemoryStore {
-    /// Decide which near-duplicate survivors merge, purely and lock-free.
+    /// Decide which near-duplicate survivors merge, without re-embedding.
     ///
-    /// Pairs are scanned in id order over the id-sorted `live` vectors; a
-    /// pair whose strict cosine exceeds
-    /// [`dedup_threshold`](VectorMemoryConfig::dedup_threshold) folds the
-    /// lower-ranked entry into the higher-ranked one (relevance, then
-    /// access count, then creation time, then id). Already-absorbed entries
-    /// leave the scan, so each entry merges at most once per pass. Returns
+    /// Survivors are visited in id order over the id-sorted `live`
+    /// vectors; each survivor's candidates come from one
+    /// [`VectorIndex::search`] over the store's own copy of its embedding
+    /// — the top [`dedup_candidates`](VectorMemoryConfig::dedup_candidates)
+    /// matches — keeping only candidates that are survivors, are not
+    /// already absorbed, and score strictly above
+    /// [`dedup_threshold`](VectorMemoryConfig::dedup_threshold), so
+    /// planning costs one bounded index search per survivor instead of an
+    /// all-pairs scan. The merge set is therefore top-k-bounded: a
+    /// duplicate cluster wider than the window merges across repeated
+    /// passes rather than in one. A matching pair folds the lower-ranked
+    /// entry into the higher-ranked one (relevance, then access count,
+    /// then creation time, then id); already-absorbed entries leave the
+    /// candidate scan, so each entry merges at most once per pass. Returns
     /// the victim ids and the folds — the `provider-derived` provenance
     /// tag is never folded, because provenance belongs to the entry that
-    /// earned it.
-    fn plan_merges(
+    /// earned it. The pass lock is held throughout, and the index still
+    /// contains every survivor at plan time (removals are apply-phase), so
+    /// the searches run against the full live set.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError`] unchanged from the per-survivor
+    /// [`VectorIndex::search`] calls — an index failure mid-planning
+    /// aborts the pass before any removal or fold is applied, leaving
+    /// the store exactly as the snapshot saw it.
+    async fn plan_merges(
         &self,
         survivors: &[MemoryEntry],
         live: &[(Uuid, Vec<f32>)],
-    ) -> (Vec<Uuid>, Vec<MergeFold>) {
+    ) -> Result<(Vec<Uuid>, Vec<MergeFold>), LoopError> {
         let mut merged_ids: Vec<Uuid> = Vec::new();
         let mut tag_folds: Vec<MergeFold> = Vec::new();
         if self.config.dedup_threshold >= 1.0 {
-            return (merged_ids, tag_folds);
+            return Ok((merged_ids, tag_folds));
         }
-        let entry_for =
-            |id: Uuid| -> Option<&MemoryEntry> { survivors.iter().find(|entry| entry.id == id) };
-        let mut absorbed = vec![false; live.len()];
-        for i in 0..live.len() {
-            if absorbed.get(i).copied().unwrap_or(false) {
+        let by_survivor: HashMap<Uuid, &MemoryEntry> =
+            survivors.iter().map(|entry| (entry.id, entry)).collect();
+        let mut absorbed: HashSet<Uuid> = HashSet::new();
+        for (survivor_id, vector) in live {
+            if absorbed.contains(survivor_id) {
                 continue;
             }
-            let Some((first_id, first_vector)) = live.get(i) else {
+            let Some(first) = by_survivor.get(survivor_id) else {
                 continue;
             };
-            for j in (i.saturating_add(1))..live.len() {
-                if absorbed.get(j).copied().unwrap_or(false) {
+            let candidates = self
+                .index
+                .search(
+                    &Embedding::new(vector.clone()),
+                    self.config.dedup_candidates,
+                )
+                .await?;
+            for candidate in candidates {
+                if candidate.id == *survivor_id
+                    || candidate.score <= self.config.dedup_threshold
+                    || absorbed.contains(&candidate.id)
+                {
                     continue;
                 }
-                let Some((second_id, second_vector)) = live.get(j) else {
-                    continue;
-                };
-                let cosine = cosine_similarity(first_vector, second_vector);
-                if cosine <= self.config.dedup_threshold {
-                    continue;
-                }
-                let (Some(first), Some(second)) = (entry_for(*first_id), entry_for(*second_id))
-                else {
+                let Some(second) = by_survivor.get(&candidate.id) else {
                     continue;
                 };
                 let ordering = sanitize_relevance(first.relevance)
@@ -691,10 +730,10 @@ impl VectorMemoryStore {
                     .then_with(|| first.access_count.cmp(&second.access_count))
                     .then_with(|| first.created_at.cmp(&second.created_at))
                     .then_with(|| first.id.cmp(&second.id));
-                let (survivor_id, victim, victim_index) = if ordering.is_ge() {
-                    (first.id, second, j)
+                let (survivor_entry, victim) = if ordering.is_ge() {
+                    (first, second)
                 } else {
-                    (second.id, first, i)
+                    (second, first)
                 };
                 let folded: Vec<String> = victim
                     .tags
@@ -703,20 +742,19 @@ impl VectorMemoryStore {
                     .cloned()
                     .collect();
                 tag_folds.push(MergeFold {
-                    survivor: survivor_id,
+                    survivor: survivor_entry.id,
                     victim: victim.id,
                     tags: folded,
                 });
                 merged_ids.push(victim.id);
-                if let Some(flag) = absorbed.get_mut(victim_index) {
-                    *flag = true;
-                }
-                if victim_index == i {
+                absorbed.insert(victim.id);
+                if victim.id == *survivor_id {
                     break;
                 }
             }
+            tokio::task::yield_now().await;
         }
-        (merged_ids, tag_folds)
+        Ok((merged_ids, tag_folds))
     }
 }
 

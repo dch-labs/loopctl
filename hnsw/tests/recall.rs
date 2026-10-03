@@ -156,6 +156,128 @@ async fn removed_ids_are_tombstoned_until_rebuild_compacts() {
 }
 
 #[tokio::test]
+async fn removals_past_the_ratio_compact_tombstones_without_a_rebuild() {
+    let hnsw = HnswIndex::new(8);
+    for i in 0..4_u128 {
+        hnsw.add(
+            Uuid::from_u128(i),
+            Embedding::from_slice(&[i as f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+        .unwrap();
+    }
+    for removed in 0..3_u128 {
+        hnsw.remove(Uuid::from_u128(removed)).await.unwrap();
+    }
+    assert_eq!(
+        hnsw.tombstone_count(),
+        0,
+        "three removals past the default ratio must compact the tombstones away"
+    );
+    assert_eq!(hnsw.len(), 1, "the live count survives compaction");
+    let query = Embedding::from_slice(&[3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    let hits = hnsw.search(&query, 10).await.unwrap();
+    assert_eq!(
+        hits.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![Uuid::from_u128(3)],
+        "the surviving vector still retrieves after the automatic compaction"
+    );
+}
+
+#[tokio::test]
+async fn upserts_past_the_ratio_compact_tombstones_without_a_rebuild() {
+    let hnsw = HnswIndex::new(8);
+    let id = Uuid::from_u128(7);
+    for component in 1..=3_u128 {
+        hnsw.add(
+            id,
+            Embedding::from_slice(&[component as f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        hnsw.tombstone_count(),
+        0,
+        "the third same-id upsert must compact its superseded slots away"
+    );
+    assert_eq!(hnsw.len(), 1, "exactly the freshest vector is live");
+    let query = Embedding::from_slice(&[3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    let hits = hnsw.search(&query, 1).await.unwrap();
+    assert_eq!(
+        hits.first().map(|m| m.id),
+        Some(id),
+        "the upserted id retrieves with its freshest vector after compaction"
+    );
+}
+
+#[tokio::test]
+async fn sub_ratio_tombstones_stay_until_an_explicit_rebuild() {
+    let hnsw = HnswIndex::new(8);
+    for i in 0..10_u128 {
+        hnsw.add(
+            Uuid::from_u128(i),
+            Embedding::from_slice(&[i as f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+        .unwrap();
+    }
+    for removed in [1_u128, 4, 7] {
+        hnsw.remove(Uuid::from_u128(removed)).await.unwrap();
+    }
+    assert_eq!(
+        hnsw.tombstone_count(),
+        3,
+        "three tombstones below the ratio must stay — compaction is \
+         threshold-gated, not eager"
+    );
+    hnsw.rebuild().unwrap();
+    assert_eq!(
+        hnsw.tombstone_count(),
+        0,
+        "the explicit rebuild still reclaims them"
+    );
+}
+
+#[tokio::test]
+async fn a_configured_ratio_below_one_compacts_sooner() {
+    let vector = Embedding::from_slice(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    let tuned = HnswIndex::with_params(
+        8,
+        HnswParams {
+            max_tombstone_ratio: 0.25,
+            ..HnswParams::default()
+        },
+    );
+    for i in 0..2_u128 {
+        tuned.add(Uuid::from_u128(i), vector.clone()).await.unwrap();
+    }
+    tuned.remove(Uuid::from_u128(0)).await.unwrap();
+    assert_eq!(
+        tuned.tombstone_count(),
+        0,
+        "one tombstone behind two live slots exceeds a 0.25 ratio — the \
+         compaction must fire"
+    );
+    assert_eq!(tuned.len(), 1, "the live vector survives the compaction");
+
+    let default_ratio = HnswIndex::new(8);
+    for i in 0..2_u128 {
+        default_ratio
+            .add(Uuid::from_u128(i), vector.clone())
+            .await
+            .unwrap();
+    }
+    default_ratio.remove(Uuid::from_u128(0)).await.unwrap();
+    assert_eq!(
+        default_ratio.tombstone_count(),
+        1,
+        "the same debt stays under the default ratio of one tombstone per \
+         live vector"
+    );
+}
+
+#[tokio::test]
 async fn same_seed_and_insertion_sequence_build_identical_indexes() {
     let (corpus, queries) = seeded_data(200, 5, 42);
     let build = || async {

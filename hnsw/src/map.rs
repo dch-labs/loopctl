@@ -24,8 +24,8 @@ pub(crate) struct Slot {
     /// The stored vector components.
     ///
     /// Kept after tombstoning because the graph's neighbour expansion
-    /// still scores this slot while walking; a rebuild drops it together
-    /// with the slot.
+    /// still scores this slot while walking; a compaction drops it
+    /// together with the slot.
     pub(crate) vector: Vec<f32>,
 }
 
@@ -39,8 +39,8 @@ pub(crate) struct IdMap {
     /// The slots, in allocation order; indexed by the `u32` key.
     ///
     /// Append-only growth keeps every slot number meaningful for the
-    /// graph's adjacency lists; only a rebuild compacts, and it rebuilds
-    /// the graph along with the map.
+    /// graph's adjacency lists; only a compaction rewrites them, and it
+    /// rebuilds the graph along with the map.
     slots: Vec<Slot>,
 
     /// Forward lookup: live id to its slot.
@@ -49,7 +49,7 @@ pub(crate) struct IdMap {
     /// size is the count [`len`](IdMap::len) reports.
     forward: HashMap<Uuid, u32>,
 
-    /// Slots removed since the last rebuild, still traversable in the
+    /// Slots removed since the last compaction, still traversable in the
     /// graph but excluded from results and `len`.
     ///
     /// The set is what search over-fetches against: a deleted neighbour
@@ -174,8 +174,8 @@ impl IdMap {
     /// [`len`](loopctl::memory::vector::VectorIndex::len) reports.
     ///
     /// Tombstoned slots are excluded because the trait's `len` contract
-    /// counts distinct live ids; a rebuild shrinks the slot vector back
-    /// to this count.
+    /// counts distinct live ids; a compaction shrinks the slot vector
+    /// back to this count.
     pub(crate) fn len(&self) -> usize {
         self.forward.len()
     }
@@ -191,8 +191,8 @@ impl IdMap {
 
     /// Every live `(slot, id, vector)` in allocation order.
     ///
-    /// This is the input a rebuild replays: same order, same seed, same
-    /// graph.
+    /// This is the input a compaction replays: same order, same seed,
+    /// same graph.
     pub(crate) fn live(&self) -> Vec<(u32, Uuid, &[f32])> {
         self.slots
             .iter()

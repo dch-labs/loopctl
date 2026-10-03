@@ -4,7 +4,8 @@
 //! hand-rolled, incremental Hierarchical Navigable Small World graph
 //! (Malkov & Yashunin, 2016): `add` links a new vector into the layered
 //! graph immediately, `remove` tombstones without disturbing traversal,
-//! and `rebuild` compacts tombstones into a fresh graph. Distances are
+//! and compaction clears tombstones into a fresh graph — automatically
+//! past the configured tombstone ratio, or on demand through `rebuild`. Distances are
 //! computed with loopctl's own [`cosine_similarity`], so results are
 //! directly comparable with the reference [`LinearVectorIndex`] — the
 //! recall gate in this crate's tests pins that comparability at
@@ -108,11 +109,24 @@ pub struct HnswParams {
     /// an insert sequence produce identical search results — the pinned,
     /// result-level contract.
     pub seed: u64,
+
+    /// The tombstone-to-live ratio past which `add` and `remove` compact
+    /// the graph automatically.
+    ///
+    /// Compaction is a full graph replay under the write lock, so it is
+    /// amortized behind a debt threshold rather than run per removal: it
+    /// fires once tombstones exceed `len() × max_tombstone_ratio`. The
+    /// default `1.0` tolerates one tombstone per live vector — bounded
+    /// over-fetch in the meantime; a lower ratio trades replay cost for a
+    /// leaner graph sooner. Non-finite and non-positive values sanitize
+    /// to the default.
+    pub max_tombstone_ratio: f32,
 }
 
 impl Default for HnswParams {
     /// The defaults the recall gate runs at: `M = 16`,
-    /// `efConstruction = 200`, `efSearch = 128`, fixed seed.
+    /// `efConstruction = 200`, `efSearch = 128`, fixed seed, compaction
+    /// past one tombstone per live vector.
     ///
     /// Every constructor and both quality gates run at these values;
     /// raise `ef_search` (or `ef_construction`) through [`HnswParams`]
@@ -123,6 +137,7 @@ impl Default for HnswParams {
             ef_construction: 200,
             ef_search: 128,
             seed: DEFAULT_SEED,
+            max_tombstone_ratio: 1.0,
         }
     }
 }
@@ -132,11 +147,17 @@ impl HnswParams {
     ///
     /// `m` clamps to at least 2; the two `ef` values clamp to at least 1,
     /// so a hand-built parameter set cannot produce a degenerate search.
+    /// The tombstone ratio must be finite and positive — anything else
+    /// would either never trigger compaction or trigger it on every
+    /// removal — so degenerate values restore the default `1.0`.
     #[must_use]
     pub fn sanitized(mut self) -> Self {
         self.m = self.m.max(2);
         self.ef_construction = self.ef_construction.max(1);
         self.ef_search = self.ef_search.max(1);
+        if !self.max_tombstone_ratio.is_finite() || self.max_tombstone_ratio <= 0.0 {
+            self.max_tombstone_ratio = 1.0;
+        }
         self
     }
 }
@@ -189,9 +210,12 @@ struct Inner {
 /// # Removal model
 ///
 /// HNSW graphs have no native deletion: [`remove`](VectorIndex::remove)
-/// tombstones the slot (still traversable, never returned) and
-/// [`rebuild`](HnswIndex::rebuild) compacts tombstones into a fresh
-/// graph. `search` over-fetches by the tombstone count so a deleted
+/// tombstones the slot (still traversable, never returned) and a
+/// compaction clears the tombstones into a fresh graph — explicitly
+/// through [`rebuild`](HnswIndex::rebuild), or automatically at the end
+/// of `add`/`remove` once tombstones exceed
+/// [`max_tombstone_ratio`](HnswParams::max_tombstone_ratio) live slots.
+/// `search` over-fetches by the tombstone count so a deleted
 /// neighbour cannot crowd a live one out of the top `k`.
 ///
 /// # Thread safety
@@ -279,7 +303,12 @@ impl HnswIndex {
     /// live set always rebuilds to an index with identical search results
     /// (pinned by `a_rebuild_replays_the_same_live_set_identically`).
     /// Recall is unaffected —
-    /// same vectors, same metric, fresh links.
+    /// same vectors, same metric, fresh links. This is also the engine
+    /// behind automatic compaction: `add` and `remove` run the same
+    /// replay once tombstones pass
+    /// [`max_tombstone_ratio`](HnswParams::max_tombstone_ratio), so an
+    /// index left to its own devices never accumulates unbounded
+    /// tombstone debt.
     ///
     /// # Errors
     ///
@@ -287,18 +316,93 @@ impl HnswIndex {
     /// unreachable in practice, refused rather than wrapped.
     pub fn rebuild(&self) -> Result<(), LoopError> {
         let mut inner = recover_guard(self.inner.write());
+        Self::compact_forced(&mut inner, self.params)
+    }
+
+    /// Replay the live set into a fresh interior, deterministically.
+    ///
+    /// The one compaction engine: live vectors are re-inserted in
+    /// allocation order into a new map and graph with the level RNG reset
+    /// to the configured seed — the same live set always replays to an
+    /// index with identical search results, whether the replay was
+    /// requested through [`rebuild`](HnswIndex::rebuild) or triggered by
+    /// the tombstone ratio.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Memory`] if the replayed id space overflows `u32` —
+    /// unreachable in practice, refused rather than wrapped.
+    fn replay_live(live: Vec<(Uuid, Vec<f32>)>, params: HnswParams) -> Result<Inner, LoopError> {
         let mut map = IdMap::new();
         let mut graph = hnsw_graph::Graph::new();
-        let mut rng = fastrand::Rng::with_seed(self.params.seed);
-        for (_, id, vector) in inner.map.live() {
-            let slot = map.insert(id, vector.to_vec())?;
-            let level = hnsw_graph::random_level(&mut rng, self.params.m);
-            hnsw_graph::insert(&map, &mut graph, self.params, slot, vector, level);
+        let mut rng = fastrand::Rng::with_seed(params.seed);
+        for (id, vector) in live {
+            let slot = map.insert(id, vector.clone())?;
+            let level = hnsw_graph::random_level(&mut rng, params.m);
+            hnsw_graph::insert(&map, &mut graph, params, slot, &vector, level);
         }
-        inner.map = map;
-        inner.graph = graph;
-        inner.rng = rng;
+        Ok(Inner { map, graph, rng })
+    }
+
+    /// Replay the live set into `inner`, unconditionally.
+    ///
+    /// What [`rebuild`](HnswIndex::rebuild) reduces to once the write
+    /// lock is held: the live set is collected from the map and handed to
+    /// [`replay_live`](Self::replay_live), and the fresh interior replaces
+    /// the old in one assignment batch.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Memory`] if the replayed id space overflows `u32` —
+    /// unreachable in practice, refused rather than wrapped.
+    fn compact_forced(inner: &mut Inner, params: HnswParams) -> Result<(), LoopError> {
+        let live: Vec<(Uuid, Vec<f32>)> = inner
+            .map
+            .live()
+            .into_iter()
+            .map(|(_, id, vector)| (id, vector.to_vec()))
+            .collect();
+        *inner = Self::replay_live(live, params)?;
         Ok(())
+    }
+
+    /// Compact past the configured tombstone ratio, under the held write
+    /// lock.
+    ///
+    /// The threshold check both mutation paths run after their write
+    /// lands: once tombstones exceed the live count scaled by
+    /// [`max_tombstone_ratio`](HnswParams::max_tombstone_ratio), the
+    /// live set replays through [`compact_forced`](Self::compact_forced)
+    /// — the same engine [`rebuild`](HnswIndex::rebuild) drives — so
+    /// tombstone debt stays bounded without any host intervention.
+    /// Below the ratio this is a no-op, keeping the replay amortized.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Memory`] if the replayed id space overflows `u32` —
+    /// unreachable in practice, refused rather than wrapped.
+    fn compact_if_past_ratio(inner: &mut Inner, params: HnswParams) -> Result<(), LoopError> {
+        if !tombstones_exceed_ratio(
+            inner.map.tombstone_count(),
+            inner.map.len(),
+            params.max_tombstone_ratio,
+        ) {
+            return Ok(());
+        }
+        Self::compact_forced(inner, params)
+    }
+
+    /// The number of tombstoned slots the graph still carries.
+    ///
+    /// Slots removed since the last compaction keep their vectors so
+    /// traversal can walk past them; this count is how a host observes
+    /// that debt — against the configured
+    /// [`max_tombstone_ratio`](HnswParams::max_tombstone_ratio), past
+    /// which `add` and `remove` compact automatically — or when deciding
+    /// on an explicit [`rebuild`](HnswIndex::rebuild).
+    #[must_use]
+    pub fn tombstone_count(&self) -> usize {
+        recover_guard(self.inner.read()).map.tombstone_count()
     }
 }
 
@@ -314,10 +418,15 @@ impl VectorIndex for HnswIndex {
     /// Link one vector into the graph under `id`.
     ///
     /// Upsert semantics: an id that is already live is tombstoned first
-    /// (its old slot stays traversable until a rebuild) and a fresh slot
-    /// is linked, so [`len`](VectorIndex::len) counts distinct live ids.
-    /// The new node's level is drawn from the index's seeded RNG, making
-    /// an insert sequence reproducible end to end.
+    /// (its old slot stays traversable until a compaction) and a fresh
+    /// slot is linked, so [`len`](VectorIndex::len) counts distinct live
+    /// ids. The new node's level is drawn from the index's seeded RNG,
+    /// making an insert sequence reproducible end to end. Once the
+    /// tombstone debt passes
+    /// [`max_tombstone_ratio`](HnswParams::max_tombstone_ratio), the
+    /// insert finishes by compacting the graph — the same replay
+    /// [`rebuild`](HnswIndex::rebuild) performs — so replace-heavy
+    /// workloads cannot grow the graph without bound.
     ///
     /// # Errors
     ///
@@ -340,14 +449,16 @@ impl VectorIndex for HnswIndex {
                 )));
             }
             let mut inner = recover_guard(self.inner.write());
-            let Inner { map, graph, rng } = &mut *inner;
-            map.ensure_capacity()?;
-            map.remove(id);
-            let stored = vector.as_slice().to_vec();
-            let slot = map.insert(id, stored.clone())?;
-            let level = hnsw_graph::random_level(rng, self.params.m);
-            hnsw_graph::insert(map, graph, self.params, slot, &stored, level);
-            Ok(())
+            {
+                let Inner { map, graph, rng } = &mut *inner;
+                map.ensure_capacity()?;
+                map.remove(id);
+                let stored = vector.as_slice().to_vec();
+                let slot = map.insert(id, stored.clone())?;
+                let level = hnsw_graph::random_level(rng, self.params.m);
+                hnsw_graph::insert(map, graph, self.params, slot, &stored, level);
+            }
+            Self::compact_if_past_ratio(&mut inner, self.params)
         })
     }
 
@@ -442,13 +553,16 @@ impl VectorIndex for HnswIndex {
     ///
     /// Idempotent like the linear index: a missing id is a no-op. The
     /// slot stays traversable so the graph never loses connectivity, but
-    /// it can no longer be returned; [`rebuild`](HnswIndex::rebuild)
-    /// drops it for real.
+    /// it can no longer be returned; a compaction drops it for real —
+    /// explicitly through [`rebuild`](HnswIndex::rebuild), or
+    /// automatically at the end of this very removal once the tombstone
+    /// debt passes
+    /// [`max_tombstone_ratio`](HnswParams::max_tombstone_ratio).
     fn remove(&self, id: Uuid) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>> {
         Box::pin(async move {
             let mut inner = recover_guard(self.inner.write());
             inner.map.remove(id);
-            Ok(())
+            Self::compact_if_past_ratio(&mut inner, self.params)
         })
     }
 
@@ -459,6 +573,19 @@ impl VectorIndex for HnswIndex {
     fn len(&self) -> usize {
         recover_guard(self.inner.read()).map.len()
     }
+}
+
+/// Whether tombstone debt has passed the configured ratio of live slots.
+///
+/// Counts convert through `u32` into `f64` — lossless at both steps, and
+/// the lint-clean path the repo-wide no-cast-allow ruling permits — so
+/// the comparison needs no raw `usize as f32` narrowing; a count above
+/// the `u32` slot space cannot exist, making the saturating conversion
+/// exact in every reachable state.
+fn tombstones_exceed_ratio(tombstones: usize, live: usize, ratio: f32) -> bool {
+    let tombstones = f64::from(u32::try_from(tombstones).unwrap_or(u32::MAX));
+    let live = f64::from(u32::try_from(live).unwrap_or(u32::MAX));
+    tombstones > live * f64::from(ratio)
 }
 
 /// Emit the `vector.index.search` metric event for one completed search.
@@ -479,4 +606,30 @@ fn emit_search_metric(k: usize, matches: &[VectorMatch], started: std::time::Ins
         duration_ms = %started.elapsed().as_millis(),
         "vector index search complete"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HnswParams;
+
+    /// Degenerate tombstone ratios sanitize to the default.
+    ///
+    /// Non-finite, zero, and negative ratios all mean "not a usable
+    /// threshold" — the first never triggers compaction, the others fire
+    /// it on every removal — so the sanitized parameter set must carry
+    /// the default `1.0` instead.
+    #[test]
+    fn a_degenerate_tombstone_ratio_sanitizes_to_the_default() {
+        for degenerate in [f32::NAN, f32::INFINITY, 0.0, -0.5] {
+            let params = HnswParams {
+                max_tombstone_ratio: degenerate,
+                ..HnswParams::default()
+            }
+            .sanitized();
+            assert!(
+                (params.max_tombstone_ratio - 1.0).abs() < f32::EPSILON,
+                "a degenerate ratio ({degenerate}) must sanitize to the default 1.0"
+            );
+        }
+    }
 }

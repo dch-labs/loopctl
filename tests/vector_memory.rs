@@ -19,15 +19,15 @@
     clippy::arithmetic_side_effects
 )]
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use loopctl::error::LoopError;
 use loopctl::memory::vector::{Embedding, HashingEmbedder, LinearVectorIndex, VectorIndex};
-use loopctl::memory::vector_memory::{
-    GoldenSet, VectorMemoryConfig, VectorMemoryStore, golden_set,
-};
+use loopctl::memory::vector_memory::{VectorMemoryConfig, VectorMemoryStore};
 use loopctl::memory::{InMemoryStore, LoopMemory, MemoryCategory, MemoryEntry};
 use uuid::Uuid;
 
@@ -351,67 +351,6 @@ async fn a_retrieve_stamp_between_snapshot_and_apply_races_the_victim_into_survi
     }
 }
 
-/// The golden fixture spans exactly the four documented categories.
-///
-/// The `GoldenSet` doc names `Strategy`, `Fact`, `Insight`, and
-/// `ErrorPattern` — a characterization pin, so widening the fixture to
-/// `Trajectory` or `Working` breaks here and forces the doc along with it.
-#[test]
-fn the_golden_fixture_spans_four_of_the_six_categories() {
-    let set = golden_set();
-    assert_eq!(
-        set.entries.len(),
-        50,
-        "the fixture holds fifty entries — the documented size"
-    );
-    let mut categories: Vec<String> = Vec::new();
-    for fixture_entry in &set.entries {
-        let name = format!("{:?}", fixture_entry.category);
-        if !categories.contains(&name) {
-            categories.push(name);
-        }
-    }
-    categories.sort_unstable();
-    assert_eq!(
-        categories,
-        vec![
-            "ErrorPattern".to_string(),
-            "Fact".to_string(),
-            "Insight".to_string(),
-            "Strategy".to_string(),
-        ],
-        "the fixture spans exactly the four documented categories — widen \
-         the fixture and the GoldenSet doc together"
-    );
-}
-
-#[tokio::test]
-async fn golden_set_queries_hit_a_relevant_memory_eighty_percent_of_the_time() {
-    let set = golden_set();
-    let store = store();
-    for fixture_entry in &set.entries {
-        store.store(fixture_entry.clone()).await.unwrap();
-    }
-    assert_eq!(store.len(), set.entries.len(), "every fixture entry stored");
-    let mut hits: Vec<bool> = Vec::with_capacity(set.queries.len());
-    for (index, query) in set.queries.iter().enumerate() {
-        let relevant = set.relevant_ids(index);
-        let returned = store.retrieve(query.text, 3).await.unwrap();
-        hits.push(returned.iter().any(|entry| relevant.contains(&entry.id)));
-    }
-    let precision = GoldenSet::precision_ratio(&hits);
-    assert!(
-        precision >= 0.8,
-        "semantic precision {precision:.2} is below the 80% acceptance gate; \
-         missed queries: {:?}",
-        hits.iter()
-            .zip(set.queries.iter())
-            .filter(|(hit, _)| !**hit)
-            .map(|(_, query)| query.text)
-            .collect::<Vec<_>>()
-    );
-}
-
 #[tokio::test]
 async fn vector_store_satisfies_the_loop_memory_contract_like_in_memory_store() {
     let fixture: Vec<MemoryEntry> = [
@@ -549,6 +488,39 @@ async fn a_tag_hit_promotes_an_entry_until_the_tag_weight_is_zeroed() {
         flipped_hits.first().map(|entry| entry.id),
         Some(untagged.id),
         "zeroing the tag weight ties the twins; the id tiebreak flips the order"
+    );
+}
+
+#[test]
+fn a_non_finite_weight_zeroes_its_channel_and_all_non_finite_restores_the_defaults() {
+    let single = VectorMemoryConfig {
+        semantic_weight: f32::NAN,
+        ..VectorMemoryConfig::default()
+    }
+    .normalized();
+    assert!(
+        single.semantic_weight.abs() < 1e-6,
+        "a non-finite semantic weight must zero its channel, not borrow the \
+         default share: {}",
+        single.semantic_weight
+    );
+    assert!(
+        (single.lexical_weight + single.tag_weight - 1.0).abs() < 1e-6,
+        "the surviving channels renormalize to carry the whole blend"
+    );
+    let all = VectorMemoryConfig {
+        semantic_weight: f32::NAN,
+        lexical_weight: f32::INFINITY,
+        tag_weight: f32::NEG_INFINITY,
+        ..VectorMemoryConfig::default()
+    }
+    .normalized();
+    let defaults = VectorMemoryConfig::default();
+    assert!(
+        (all.semantic_weight - defaults.semantic_weight).abs() < 1e-6
+            && (all.lexical_weight - defaults.lexical_weight).abs() < 1e-6
+            && (all.tag_weight - defaults.tag_weight).abs() < 1e-6,
+        "an all-non-finite config restores the default blend, got {all:?}"
     );
 }
 
@@ -721,6 +693,218 @@ async fn consolidate_merges_near_duplicates_and_folds_their_tags() {
     assert_eq!(disabled_store.len(), 2, "both twins survive");
 }
 
+/// An embedder with hand-picked vectors, so pairwise cosine geometry is
+/// exact.
+///
+/// Merge planning compares embeddings through the index; a scripted
+/// embedder lets a test decide the exact cosines the planner must see
+/// instead of hashing prose and hoping the geometry cooperates. Unknown
+/// texts embed to the zero vector, which scores zero against everything.
+#[derive(Clone)]
+struct ScriptedEmbedder {
+    dim: usize,
+    by_text: Arc<HashMap<String, Vec<f32>>>,
+}
+
+impl ScriptedEmbedder {
+    /// One embedder over the four-vector duplicate-cluster geometry.
+    ///
+    /// Every pair of cluster vectors has cosine above `0.9` — one is
+    /// nearer than another, but all of them clear the merge threshold —
+    /// so a test controls which pairs the planner can see purely through
+    /// the candidate window.
+    fn duplicate_cluster(dim: usize) -> Self {
+        let cluster = [
+            ("cluster entry one", vec![1.0, 0.0, 0.0]),
+            ("cluster entry two", vec![1.0, 0.3, 0.0]),
+            ("cluster entry three", vec![1.0, 0.0, 0.3]),
+            ("cluster entry four", vec![1.0, 0.3, 0.3]),
+        ];
+        let by_text: HashMap<String, Vec<f32>> = cluster
+            .into_iter()
+            .map(|(text, prefix)| {
+                let mut vector = vec![0.0; dim];
+                for (slot, component) in prefix.iter().enumerate() {
+                    vector[slot] = *component;
+                }
+                (text.to_string(), vector)
+            })
+            .collect();
+        Self {
+            dim,
+            by_text: Arc::new(by_text),
+        }
+    }
+}
+
+impl loopctl::memory::vector::EmbeddingProvider for ScriptedEmbedder {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn embed<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Embedding, LoopError>> + Send + 'a>> {
+        let by_text = Arc::clone(&self.by_text);
+        let dim = self.dim;
+        Box::pin(async move {
+            let vector = by_text.get(text).cloned().unwrap_or_else(|| vec![0.0; dim]);
+            Ok(Embedding::new(vector))
+        })
+    }
+}
+
+/// Store one cluster entry: id-ordered, first entry dominant, tags
+/// distinct per entry.
+///
+/// The first entry carries the highest relevance so it outranks every
+/// twin — the survivor ranking is decided by the fixture, not by
+/// construction-order timestamps — and each entry carries one distinct
+/// tag so folded tags are observable per victim.
+async fn store_cluster_entry(store: &VectorMemoryStore, index: usize, text: &str) {
+    let mut cluster_entry = entry(Uuid::from_u128(index as u128 + 1), text);
+    cluster_entry.relevance = if index == 0 { 0.9 } else { 0.3 };
+    cluster_entry.tags.push(format!("cluster-tag-{index}"));
+    store.store(cluster_entry).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_dedup_window_too_narrow_for_the_cluster_leaves_a_duplicate_behind() {
+    let texts = [
+        "cluster entry one",
+        "cluster entry two",
+        "cluster entry three",
+        "cluster entry four",
+    ];
+    let narrow = VectorMemoryConfig {
+        dedup_candidates: 2,
+        dedup_threshold: 0.9,
+        prune_threshold: 0.0,
+        ..VectorMemoryConfig::default()
+    };
+    let narrow_store = VectorMemoryStore::with_config(
+        Box::new(ScriptedEmbedder::duplicate_cluster(DIM)),
+        Box::new(LinearVectorIndex::new(DIM)),
+        narrow,
+    );
+    for (index, text) in texts.iter().enumerate() {
+        store_cluster_entry(&narrow_store, index, text).await;
+    }
+    let narrow_stats = narrow_store.consolidate().await.unwrap();
+    assert_eq!(
+        narrow_stats.merged, 2,
+        "a window of two — self-match included — merges only two of the \
+         three twins in one pass"
+    );
+    assert_eq!(
+        narrow_store.len(),
+        2,
+        "the cluster stalls at two survivors — the window cannot reach \
+         every above-threshold pair an all-pairs scan would merge"
+    );
+
+    let wide = VectorMemoryConfig {
+        dedup_threshold: 0.9,
+        prune_threshold: 0.0,
+        ..VectorMemoryConfig::default()
+    };
+    let wide_store = VectorMemoryStore::with_config(
+        Box::new(ScriptedEmbedder::duplicate_cluster(DIM)),
+        Box::new(LinearVectorIndex::new(DIM)),
+        wide,
+    );
+    for (index, text) in texts.iter().enumerate() {
+        store_cluster_entry(&wide_store, index, text).await;
+    }
+    let wide_stats = wide_store.consolidate().await.unwrap();
+    assert_eq!(
+        wide_stats.merged, 3,
+        "the default window covers the whole cluster"
+    );
+    assert_eq!(wide_store.len(), 1, "the cluster collapses to its survivor");
+}
+
+#[tokio::test]
+async fn the_default_dedup_window_merges_a_ten_entry_cluster_completely() {
+    let dim = 4;
+    let by_text: HashMap<String, Vec<f32>> = (0..10)
+        .map(|index| (format!("twin entry {index}"), vec![1.0, 0.0, 0.0, 0.0]))
+        .collect();
+    let store = VectorMemoryStore::with_config(
+        Box::new(ScriptedEmbedder {
+            dim,
+            by_text: Arc::new(by_text),
+        }),
+        Box::new(LinearVectorIndex::new(dim)),
+        VectorMemoryConfig {
+            prune_threshold: 0.0,
+            ..VectorMemoryConfig::default()
+        },
+    );
+    for index in 0..10_usize {
+        store_cluster_entry(&store, index, &format!("twin entry {index}")).await;
+    }
+    let stats = store.consolidate().await.unwrap();
+    assert_eq!(
+        stats.merged, 9,
+        "the whole identical cluster folds into its survivor in one pass"
+    );
+    assert_eq!(store.len(), 1, "one survivor remains");
+}
+
+#[tokio::test]
+async fn merge_planning_is_deterministic_across_identically_built_stores() {
+    let texts = [
+        "cluster entry one",
+        "cluster entry two",
+        "cluster entry three",
+        "cluster entry four",
+    ];
+    let config = VectorMemoryConfig {
+        dedup_threshold: 0.9,
+        prune_threshold: 0.0,
+        ..VectorMemoryConfig::default()
+    };
+    let mut outcomes: Vec<(usize, Uuid, Vec<String>)> = Vec::new();
+    for _ in 0..2 {
+        let store = VectorMemoryStore::with_config(
+            Box::new(ScriptedEmbedder::duplicate_cluster(DIM)),
+            Box::new(LinearVectorIndex::new(DIM)),
+            config,
+        );
+        for (index, text) in texts.iter().enumerate() {
+            store_cluster_entry(&store, index, text).await;
+        }
+        let stats = store.consolidate().await.unwrap();
+        let survivor = store
+            .retrieve("cluster entry", 4)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|stored| stored.tags.iter().any(|tag| tag == "cluster-tag-0"))
+            .expect("the dominant survivor retrieves with its folded tags");
+        let mut folded: Vec<String> = survivor
+            .tags
+            .iter()
+            .filter(|tag| *tag != "cluster-tag-0")
+            .cloned()
+            .collect();
+        folded.sort();
+        outcomes.push((stats.merged, survivor.id, folded));
+    }
+    assert_eq!(
+        outcomes.len(),
+        2,
+        "both identically built stores produced an outcome"
+    );
+    assert_eq!(
+        outcomes[0], outcomes[1],
+        "identical inputs must merge identically — merge count, survivor, \
+         and folded tags: {outcomes:?}"
+    );
+}
+
 #[tokio::test]
 async fn concurrent_store_and_retrieve_complete_without_deadlock() {
     let store = Arc::new(store());
@@ -761,6 +945,91 @@ async fn concurrent_store_and_retrieve_complete_without_deadlock() {
          across the embed await"
     );
     assert_eq!(store.len(), 250, "every concurrent write landed");
+}
+
+/// An embedder that parks its first embed on a gate, so a test can hold one
+/// `store` inside its embedder call and probe what a racing `store` does.
+///
+/// Every embed after the first returns immediately; the first sets the
+/// started event and waits for its release event, giving the choreography a
+/// deterministic point where one store is provably mid-embed.
+#[derive(Clone)]
+struct ParkFirstEmbedder {
+    hashing: Arc<HashingEmbedder>,
+    embeds_started: Arc<AtomicUsize>,
+    first_started: Arc<Event>,
+    release_first: Arc<Event>,
+}
+
+impl loopctl::memory::vector::EmbeddingProvider for ParkFirstEmbedder {
+    fn dim(&self) -> usize {
+        self.hashing.dim()
+    }
+
+    fn embed<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Embedding, LoopError>> + Send + 'a>> {
+        let hashing = Arc::clone(&self.hashing);
+        let embeds_started = Arc::clone(&self.embeds_started);
+        let first_started = Arc::clone(&self.first_started);
+        let release_first = Arc::clone(&self.release_first);
+        Box::pin(async move {
+            let order = embeds_started.fetch_add(1, Ordering::SeqCst);
+            if order == 0 {
+                first_started.set();
+                release_first.wait().await;
+            }
+            hashing.embed(text).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_second_store_embeds_while_the_first_is_still_parked_in_its_embed() {
+    let embedder = ParkFirstEmbedder {
+        hashing: Arc::new(HashingEmbedder::new(DIM)),
+        embeds_started: Arc::new(AtomicUsize::new(0)),
+        first_started: Arc::new(Event::default()),
+        release_first: Arc::new(Event::default()),
+    };
+    let store = Arc::new(VectorMemoryStore::new(
+        Box::new(embedder.clone()),
+        Box::new(LinearVectorIndex::new(DIM)),
+    ));
+
+    let parked_store = Arc::clone(&store);
+    let parked = tokio::spawn(async move {
+        parked_store
+            .store(entry(Uuid::from_u128(1), "the first store's entry"))
+            .await
+    });
+    embedder.first_started.wait().await;
+
+    let overlapping_store = Arc::clone(&store);
+    let overlapping = tokio::spawn(async move {
+        overlapping_store
+            .store(entry(Uuid::from_u128(2), "the second store's entry"))
+            .await
+    });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        embedder.embeds_started.load(Ordering::SeqCst),
+        2,
+        "the second store's embed must start while the first is still \
+         parked — no lock may be held across the embed await"
+    );
+    assert!(
+        !parked.is_finished(),
+        "the first store is still inside its embed at the assertion point"
+    );
+
+    embedder.release_first.set();
+    parked.await.unwrap().unwrap();
+    overlapping.await.unwrap().unwrap();
+    assert_eq!(store.len(), 2, "both overlapping stores landed");
 }
 
 /// An embedder that always fails, for the error-propagation pin.

@@ -562,10 +562,25 @@ pub mod gemini;
 #[cfg(feature = "grammar")]
 pub mod grammar;
 
+/// Real embedding backends for the `vector` module's
+/// [`EmbeddingProvider`](crate::memory::vector::EmbeddingProvider).
+///
+/// Compiled when the vector primitives and at least the OpenAI provider
+/// surface are both on — the embedders exist to feed a
+/// `VectorMemoryStore`,
+/// so a provider-only build (no `vector_index`) does not pay for them.
+#[cfg(all(feature = "vector_index", feature = "openai"))]
+pub mod embeddings;
+
 #[cfg(feature = "openai")]
 pub use openai::OpenAiClient;
 #[cfg(feature = "openai")]
 pub use openai::OpenAiClientBuilder;
+
+#[cfg(all(feature = "vector_index", feature = "ollama"))]
+pub use embeddings::OllamaEmbedder;
+#[cfg(all(feature = "vector_index", feature = "openai"))]
+pub use embeddings::OpenAiEmbedder;
 
 #[cfg(feature = "anthropic")]
 pub use anthropic::AnthropicClient;

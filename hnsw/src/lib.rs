@@ -97,10 +97,11 @@ pub struct HnswParams {
 
     /// Candidate list size while *searching* (`efSearch`).
     ///
-    /// The effective value at query time never drops below the requested
-    /// `k` plus the live tombstone count — deleted slots must be
-    /// traversed past — and never exceeds the total slot count, live
-    /// plus tombstoned: the whole traversable graph.
+    /// The effective value at query time never drops below the smaller of
+    /// the requested `k` plus the live tombstone count and the total slot
+    /// count — deleted slots must be traversed past, and a request larger
+    /// than the whole traversable graph returns what exists — and never
+    /// exceeds the total slot count, live plus tombstoned.
     pub ef_search: usize,
 
     /// The seed for the level-assignment RNG.

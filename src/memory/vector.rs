@@ -30,6 +30,11 @@ use uuid::Uuid;
 
 use crate::error::LoopError;
 
+#[cfg(feature = "ollama")]
+pub use crate::provider::embeddings::OllamaEmbedder;
+#[cfg(feature = "openai")]
+pub use crate::provider::embeddings::OpenAiEmbedder;
+
 /// A dense vector embedding of a piece of text.
 ///
 /// Produced by [`EmbeddingProvider::embed`], consumed by [`VectorIndex`].
@@ -633,6 +638,106 @@ impl EmbeddingProvider for HashingEmbedder {
                 "embedding complete"
             );
             Ok(embedding)
+        })
+    }
+}
+
+#[cfg(feature = "openai")]
+impl EmbeddingProvider for crate::provider::embeddings::OpenAiEmbedder {
+    /// Returns the configured dimension every vector must carry.
+    ///
+    /// The model's native length, or the Matryoshka truncation when one
+    /// was set at build time.
+    fn dim(&self) -> usize {
+        self.dim()
+    }
+
+    /// Embed one text through the `/v1/embeddings` endpoint.
+    ///
+    /// A single-item batch through the shared pipeline — the same token
+    /// guard, batching, and reassembly the batch path applies — with the
+    /// provider's [`ApiError`](crate::api::error::ApiError) mapped into
+    /// [`LoopError::Api`] as the trait's error contract expects.
+    fn embed<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Embedding, LoopError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut embedded = self
+                .embed_texts(std::slice::from_ref(&text))
+                .await
+                .map_err(|error| LoopError::Api(error.to_string()))?;
+            embedded.pop().ok_or_else(|| {
+                LoopError::Memory(
+                    "openai embedder returned no embedding for a single input".to_string(),
+                )
+            })
+        })
+    }
+
+    /// Embed many texts in bounded batches, in input order.
+    ///
+    /// Overrides the trait's sequential default so one HTTP round-trip
+    /// carries up to 256 inputs instead of one per text.
+    fn embed_batch(
+        &self,
+        texts: &[&str],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Embedding>, LoopError>> + Send + '_>> {
+        let owned: Vec<String> = texts.iter().map(|text| (*text).to_string()).collect();
+        Box::pin(async move {
+            let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+            self.embed_texts(&borrowed)
+                .await
+                .map_err(|error| LoopError::Api(error.to_string()))
+        })
+    }
+}
+
+#[cfg(feature = "ollama")]
+impl EmbeddingProvider for crate::provider::embeddings::OllamaEmbedder {
+    /// Returns the configured dimension every vector must carry.
+    ///
+    /// The model's fixed output length, set at build time.
+    fn dim(&self) -> usize {
+        self.dim()
+    }
+
+    /// Embed one text through the native `/api/embed` endpoint.
+    ///
+    /// A single-item batch through the shared pipeline, with the
+    /// provider's [`ApiError`](crate::api::error::ApiError) mapped into
+    /// [`LoopError::Api`] as the trait's error contract expects.
+    fn embed<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Embedding, LoopError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut embedded = self
+                .embed_texts(std::slice::from_ref(&text))
+                .await
+                .map_err(|error| LoopError::Api(error.to_string()))?;
+            embedded.pop().ok_or_else(|| {
+                LoopError::Memory(
+                    "ollama embedder returned no embedding for a single input".to_string(),
+                )
+            })
+        })
+    }
+
+    /// Embed many texts in bounded batches, in input order.
+    ///
+    /// Overrides the trait's sequential default so one HTTP round-trip
+    /// carries up to 256 inputs instead of one per text.
+    fn embed_batch(
+        &self,
+        texts: &[&str],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Embedding>, LoopError>> + Send + '_>> {
+        let owned: Vec<String> = texts.iter().map(|text| (*text).to_string()).collect();
+        Box::pin(async move {
+            let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+            self.embed_texts(&borrowed)
+                .await
+                .map_err(|error| LoopError::Api(error.to_string()))
         })
     }
 }

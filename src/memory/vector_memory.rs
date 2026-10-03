@@ -511,7 +511,10 @@ impl LoopMemory for VectorMemoryStore {
     /// to the entry that earned it), and stamps the stats. A duplicate
     /// pair's survivor is the entry with the higher sanitized relevance,
     /// then access count, then creation time, then id — deterministic in
-    /// every tie.
+    /// every tie — and an absorber is never itself a victim within a
+    /// pass, so every fold's survivor is live at apply time; transitive
+    /// chains complete across passes, each folded tag reaching the chain's
+    /// final survivor.
     ///
     /// A fresh store returns default stats without touching the embedder
     /// or the index.
@@ -670,11 +673,15 @@ impl VectorMemoryStore {
     /// [`dedup_threshold`](VectorMemoryConfig::dedup_threshold), so
     /// planning costs one bounded index search per survivor instead of an
     /// all-pairs scan. The merge set is therefore top-k-bounded: a
-    /// duplicate cluster wider than the window merges across repeated
-    /// passes rather than in one. A matching pair folds the lower-ranked
+    /// duplicate cluster wider than the window — or chained through an
+    /// intermediate absorber — merges across repeated passes rather than
+    /// in one. A matching pair folds the lower-ranked
     /// entry into the higher-ranked one (relevance, then access count,
     /// then creation time, then id); already-absorbed entries leave the
-    /// candidate scan, so each entry merges at most once per pass. Returns
+    /// candidate scan, so each entry merges at most once per pass, and
+    /// an entry that has already won a merge cannot become a victim in
+    /// the same pass — a transitive pair defers to a later pass, keeping
+    /// every fold's survivor live when the folds apply. Returns
     /// the victim ids and the folds — the `provider-derived` provenance
     /// tag is never folded, because provenance belongs to the entry that
     /// earned it. The pass lock is held throughout, and the index still
@@ -700,6 +707,7 @@ impl VectorMemoryStore {
         let by_survivor: HashMap<Uuid, &MemoryEntry> =
             survivors.iter().map(|entry| (entry.id, entry)).collect();
         let mut absorbed: HashSet<Uuid> = HashSet::new();
+        let mut absorbers: HashSet<Uuid> = HashSet::new();
         for (survivor_id, vector) in live {
             if absorbed.contains(survivor_id) {
                 continue;
@@ -735,6 +743,9 @@ impl VectorMemoryStore {
                 } else {
                     (second, first)
                 };
+                if absorbers.contains(&victim.id) {
+                    continue;
+                }
                 let folded: Vec<String> = victim
                     .tags
                     .iter()
@@ -748,6 +759,7 @@ impl VectorMemoryStore {
                 });
                 merged_ids.push(victim.id);
                 absorbed.insert(victim.id);
+                absorbers.insert(survivor_entry.id);
                 if victim.id == *survivor_id {
                     break;
                 }

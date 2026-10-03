@@ -693,6 +693,62 @@ async fn consolidate_merges_near_duplicates_and_folds_their_tags() {
     assert_eq!(disabled_store.len(), 2, "both twins survive");
 }
 
+#[tokio::test]
+async fn an_absorbed_victims_tags_survive_a_transitive_merge() {
+    let shared_text = "the cache invalidates on every write";
+    let store = store();
+    let mut x_topic = entry(Uuid::from_u128(1), shared_text);
+    x_topic.relevance = 0.5;
+    x_topic.tags.push("x-topic".to_string());
+    let mut y_topic = entry(Uuid::from_u128(2), shared_text);
+    y_topic.relevance = 0.1;
+    y_topic.tags.push("y-topic".to_string());
+    let mut z_topic = entry(Uuid::from_u128(3), shared_text);
+    z_topic.relevance = 0.9;
+    z_topic.tags.push("z-topic".to_string());
+    store.store(x_topic).await.unwrap();
+    store.store(y_topic).await.unwrap();
+    store.store(z_topic).await.unwrap();
+    let first = store.consolidate().await.unwrap();
+    assert_eq!(
+        first.merged, 1,
+        "only the lowest-ranked duplicate merges in the first pass — an \
+         absorber is never a victim in the same pass"
+    );
+    let after_first = store.retrieve(shared_text, 3).await.unwrap();
+    assert_eq!(
+        after_first.len(),
+        2,
+        "the intermediate absorber survives the first pass"
+    );
+    let first_tags: Vec<String> = after_first
+        .iter()
+        .flat_map(|stored| stored.tags.clone())
+        .collect();
+    assert!(
+        first_tags.iter().any(|tag| tag == "y-topic"),
+        "the first victim's topic tags must ride the intermediate absorber, \
+         got {first_tags:?}"
+    );
+    let second = store.consolidate().await.unwrap();
+    assert_eq!(
+        second.merged, 1,
+        "the deferred transitive merge lands on the second pass"
+    );
+    let final_entries = store.retrieve(shared_text, 1).await.unwrap();
+    let survivor = final_entries
+        .first()
+        .expect("the chain's final survivor retrieves");
+    for tag in ["x-topic", "y-topic", "z-topic"] {
+        assert!(
+            survivor.tags.iter().any(|stored| stored == tag),
+            "the final survivor must carry {tag} — every folded tag reaches \
+             the end of the chain, got {:?}",
+            survivor.tags
+        );
+    }
+}
+
 /// An embedder with hand-picked vectors, so pairwise cosine geometry is
 /// exact.
 ///

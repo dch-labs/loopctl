@@ -1891,7 +1891,6 @@ mod tests {
     /// Build one event-stream frame (for tests).
     ///
     /// Encodes one frame of the event-stream wire so a decoder test can feed it exact bytes.
-    #[allow(clippy::cast_possible_truncation, clippy::unreadable_literal)]
     fn build_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
         let mut headers = Vec::new();
         // :message-type = "event"
@@ -1900,7 +1899,11 @@ mod tests {
         headers.extend_from_slice(b"event");
         // :event-type
         headers.extend_from_slice(b"\x0b:event-type\x07");
-        headers.extend_from_slice(&(event_type.len() as u16).to_be_bytes());
+        headers.extend_from_slice(
+            &u16::try_from(event_type.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         headers.extend_from_slice(event_type.as_bytes());
         // :content-type
         headers.extend_from_slice(b"\x0c:content-type\x07");
@@ -1912,8 +1915,12 @@ mod tests {
             .saturating_add(payload.len())
             .saturating_add(4);
         let mut out = Vec::with_capacity(total);
-        out.extend_from_slice(&(total as u32).to_be_bytes());
-        out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        out.extend_from_slice(&u32::try_from(total).unwrap_or(u32::MAX).to_be_bytes());
+        out.extend_from_slice(
+            &u32::try_from(headers.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
         out.extend_from_slice(&0u32.to_be_bytes()); // preamble CRC (unchecked)
         out.extend_from_slice(&headers);
         out.extend_from_slice(payload);
@@ -1924,14 +1931,17 @@ mod tests {
     /// Build one exception event-stream frame (for tests) —
     /// `:message-type: exception` plus `:exception-type`, no
     /// `:event-type`, as real AWS exception frames arrive.
-    #[allow(clippy::cast_possible_truncation)]
     fn build_exception_frame(exception_type: &str, payload: &[u8]) -> Vec<u8> {
         let mut headers = Vec::new();
         headers.extend_from_slice(b"\x0d:message-type\x07");
         headers.extend_from_slice(&9u16.to_be_bytes());
         headers.extend_from_slice(b"exception");
         headers.extend_from_slice(b"\x0f:exception-type\x07");
-        headers.extend_from_slice(&(exception_type.len() as u16).to_be_bytes());
+        headers.extend_from_slice(
+            &u16::try_from(exception_type.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         headers.extend_from_slice(exception_type.as_bytes());
 
         let total = 12usize
@@ -1939,8 +1949,12 @@ mod tests {
             .saturating_add(payload.len())
             .saturating_add(4);
         let mut out = Vec::with_capacity(total);
-        out.extend_from_slice(&(total as u32).to_be_bytes());
-        out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        out.extend_from_slice(&u32::try_from(total).unwrap_or(u32::MAX).to_be_bytes());
+        out.extend_from_slice(
+            &u32::try_from(headers.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
         out.extend_from_slice(&0u32.to_be_bytes());
         out.extend_from_slice(&headers);
         out.extend_from_slice(payload);

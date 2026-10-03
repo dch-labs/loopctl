@@ -1,0 +1,36 @@
+[package]
+name = "loopctl-hnsw"
+version = "0.3.2"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+description = "HNSW-backed VectorIndex for loopctl's semantic memory"
+repository = "https://github.com/dch-labs/loopctl"
+homepage = "https://loopctl.rs"
+keywords = ["agent", "loopctl", "hnsw", "ann", "vector"]
+categories = ["api-bindings", "data-structures"]
+
+[dependencies]
+loopctl = { path = "..", version = "=0.3.2", default-features = false, features = ["vector_index"] }
+fastrand = "2"
+tracing = "0.1"
+uuid = "1"
+
+[dev-dependencies]
+loopctl = { path = "..", version = "=0.3.2", default-features = false, features = ["vector_memory", "testing"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+arithmetic_side_effects = "deny"
+indexing_slicing = "deny"
+match_same_arms = "deny"
+redundant_clone = "deny"
+clone_on_ref_ptr = "deny"
+let_underscore_must_use = "deny"

@@ -1403,6 +1403,56 @@ async fn memory_top_k_zero_skips_retrieve() {
     );
 }
 
+#[cfg(feature = "vector_memory")]
+#[tokio::test]
+async fn a_large_memory_injection_stays_a_transient_turn_message() {
+    use crate::memory::vector::{HashingEmbedder, LinearVectorIndex};
+    use crate::memory::vector_memory::VectorMemoryStore;
+    use crate::memory::{LoopMemory, MemoryCategory, MemoryEntry};
+
+    let memory = Arc::new(VectorMemoryStore::new(
+        Box::new(HashingEmbedder::new(128)),
+        Box::new(LinearVectorIndex::new(128)),
+    ));
+    let payload = "a very large learned fact about deployments ".repeat(512);
+    memory
+        .store(MemoryEntry::new(MemoryCategory::Fact, &payload))
+        .await
+        .unwrap();
+    memory
+        .store(MemoryEntry::new(MemoryCategory::Insight, &payload))
+        .await
+        .unwrap();
+
+    let client = RecordingClient::new("test");
+    client.add_text_response("done");
+
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    agent.set_memory(memory);
+
+    agent.run("answer", &RunConfig::default()).await.unwrap();
+
+    let seen = agent.client.first_seen();
+    assert!(
+        seen.iter()
+            .any(|message| message.text_content().contains("large learned fact")),
+        "the vector store's injection must reach the outbound request — \
+         the store is a drop-in LoopMemory"
+    );
+    let history_text = agent
+        .machine
+        .full_history()
+        .iter()
+        .map(crate::message::Message::text_content)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !history_text.contains("large learned fact"),
+        "the injection is a per-turn transient — it must never persist \
+         into the machine history the window accounting measures"
+    );
+}
+
 struct SequenceObserver {
     log: Arc<Mutex<Vec<String>>>,
 }
@@ -1568,8 +1618,15 @@ const SLOW_RECOUNT_DELAY_MS: u64 = 600;
 /// prove the recount stays outside the reported tool-phase span.
 struct SlowRecountCounter {
     /// Delay charged by each `count` call.
+    ///
+    /// Built from [`SLOW_RECOUNT_DELAY_MS`] so a leaked recount visibly
+    /// outlasts the tool phase while staying far under any test timeout.
     delay: Duration,
+
     /// Consultations recorded so far.
+    ///
+    /// One increment per `count`; the duration pin asserts at least one
+    /// consultation happened, or its exclusion proof would prove nothing.
     calls: AtomicUsize,
 }
 
@@ -1587,6 +1644,10 @@ impl crate::compact::TokenCounter for SlowRecountCounter {
 /// tool-phase success event's duration against the injected recount cost.
 struct TurnDurationRecorder {
     /// `(turn, success, duration_ms)` per turn-end event, in event order.
+    ///
+    /// One row per `on_turn_end` dispatch; the duration pin locates the
+    /// tool-phase success row and checks it against the injected recount
+    /// cost.
     ends: Arc<Mutex<Vec<(usize, bool, u64)>>>,
 }
 
@@ -2070,6 +2131,9 @@ async fn engine_durations_come_from_the_clock_seam() {
 /// the duration the engine reported for each dispatched tool call.
 struct ToolPostDurationRecorder {
     /// One duration per `on_tool_post` dispatch, in event order.
+    ///
+    /// Each row is the engine-reported per-call span the pin compares
+    /// against the wall-clock cost the dispatched tool injected.
     durations: Arc<Mutex<Vec<Duration>>>,
 }
 
@@ -2089,6 +2153,10 @@ impl crate::observer::LoopObserver for ToolPostDurationRecorder {
 /// the compaction durations the engine measured and reported.
 struct CompactionDurationRecorder {
     /// One telemetry duration per `on_compaction` dispatch, in event order.
+    ///
+    /// Each row is the span the engine measured for the compaction
+    /// itself, which the pin checks rather than trusting the compacted
+    /// output.
     durations: Arc<Mutex<Vec<Duration>>>,
 }
 

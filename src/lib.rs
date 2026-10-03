@@ -17,6 +17,7 @@
 //!   trajectory capture, and learned-memory extraction
 //!   ([`extractor`](memory::extractor)).
 //! - **`memory::vector`** — Vector primitives for semantic retrieval ([`EmbeddingProvider`](memory::vector::EmbeddingProvider), [`VectorIndex`](memory::vector::VectorIndex)). *Requires `vector_index` feature.*
+//! - **`memory::vector_memory`** — Semantic `LoopMemory` backend ([`VectorMemoryStore`](memory::vector_memory::VectorMemoryStore)) blending vector, keyword, and tag scores. *Requires `vector_memory` feature.*
 //! - **[`reflection`]** — Failure reflection and recovery strategies.
 //! - **[`detection`]** — Loop and convergence detection ([`DetectionManager`](detection::DetectionManager)).
 //! - **[`fallback`]** — Circuit breaker pattern for automatic API model fallback.

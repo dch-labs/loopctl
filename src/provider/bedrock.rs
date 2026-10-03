@@ -1891,7 +1891,6 @@ mod tests {
     /// Build one event-stream frame (for tests).
     ///
     /// Encodes one frame of the event-stream wire so a decoder test can feed it exact bytes.
-    #[allow(clippy::cast_possible_truncation, clippy::unreadable_literal)]
     fn build_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
         let mut headers = Vec::new();
         // :message-type = "event"
@@ -1900,7 +1899,11 @@ mod tests {
         headers.extend_from_slice(b"event");
         // :event-type
         headers.extend_from_slice(b"\x0b:event-type\x07");
-        headers.extend_from_slice(&(event_type.len() as u16).to_be_bytes());
+        headers.extend_from_slice(
+            &u16::try_from(event_type.len())
+                .expect("event type exceeds the u16 header length limit")
+                .to_be_bytes(),
+        );
         headers.extend_from_slice(event_type.as_bytes());
         // :content-type
         headers.extend_from_slice(b"\x0c:content-type\x07");
@@ -1912,8 +1915,16 @@ mod tests {
             .saturating_add(payload.len())
             .saturating_add(4);
         let mut out = Vec::with_capacity(total);
-        out.extend_from_slice(&(total as u32).to_be_bytes());
-        out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        out.extend_from_slice(
+            &u32::try_from(total)
+                .expect("frame total exceeds the u32 length limit")
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(
+            &u32::try_from(headers.len())
+                .expect("header block exceeds the u32 length limit")
+                .to_be_bytes(),
+        );
         out.extend_from_slice(&0u32.to_be_bytes()); // preamble CRC (unchecked)
         out.extend_from_slice(&headers);
         out.extend_from_slice(payload);
@@ -1924,14 +1935,17 @@ mod tests {
     /// Build one exception event-stream frame (for tests) —
     /// `:message-type: exception` plus `:exception-type`, no
     /// `:event-type`, as real AWS exception frames arrive.
-    #[allow(clippy::cast_possible_truncation)]
     fn build_exception_frame(exception_type: &str, payload: &[u8]) -> Vec<u8> {
         let mut headers = Vec::new();
         headers.extend_from_slice(b"\x0d:message-type\x07");
         headers.extend_from_slice(&9u16.to_be_bytes());
         headers.extend_from_slice(b"exception");
         headers.extend_from_slice(b"\x0f:exception-type\x07");
-        headers.extend_from_slice(&(exception_type.len() as u16).to_be_bytes());
+        headers.extend_from_slice(
+            &u16::try_from(exception_type.len())
+                .expect("exception type exceeds the u16 header length limit")
+                .to_be_bytes(),
+        );
         headers.extend_from_slice(exception_type.as_bytes());
 
         let total = 12usize
@@ -1939,13 +1953,46 @@ mod tests {
             .saturating_add(payload.len())
             .saturating_add(4);
         let mut out = Vec::with_capacity(total);
-        out.extend_from_slice(&(total as u32).to_be_bytes());
-        out.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+        out.extend_from_slice(
+            &u32::try_from(total)
+                .expect("frame total exceeds the u32 length limit")
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(
+            &u32::try_from(headers.len())
+                .expect("header block exceeds the u32 length limit")
+                .to_be_bytes(),
+        );
         out.extend_from_slice(&0u32.to_be_bytes());
         out.extend_from_slice(&headers);
         out.extend_from_slice(payload);
         out.extend_from_slice(&0u32.to_be_bytes());
         out
+    }
+
+    /// An over-long event type is rejected, not silently substituted.
+    ///
+    /// The header length must match the appended value; a `u16::MAX`
+    /// substitute would emit a malformed frame instead of failing the test
+    /// setup that asked for the impossible frame.
+    #[test]
+    #[should_panic(expected = "event type exceeds the u16 header length limit")]
+    fn an_over_long_event_type_is_rejected_not_substituted() {
+        let event_type = "x".repeat(usize::from(u16::MAX).saturating_add(1));
+        let _ = build_frame(&event_type, b"{}");
+    }
+
+    /// An over-long exception type is rejected, not silently substituted.
+    ///
+    /// The same header-length contract as the event-type builder: the
+    /// exception frame's header must describe the value it carries, so an
+    /// impossible length fails the builder rather than corrupting the wire
+    /// bytes a decoder test feeds on.
+    #[test]
+    #[should_panic(expected = "exception type exceeds the u16 header length limit")]
+    fn an_over_long_exception_type_is_rejected_not_substituted() {
+        let exception_type = "x".repeat(usize::from(u16::MAX).saturating_add(1));
+        let _ = build_exception_frame(&exception_type, b"{}");
     }
 
     // A known SigV4 test vector (the AWS-documented example request).

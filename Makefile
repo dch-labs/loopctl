@@ -14,10 +14,12 @@ test:
 	cargo test --doc --all-features
 	cargo test -p loopctl-derive
 	cargo test -p loopctl-sqlite
+	cargo test -p loopctl-hnsw
 
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo clippy --all-targets -p loopctl-sqlite -- -D warnings
+	cargo clippy --all-targets -p loopctl-hnsw -- -D warnings
 
 darwin-clippy:
 	cargo clippy --target aarch64-apple-darwin --features fs_tools -- -D warnings
@@ -31,10 +33,12 @@ lint:
 docs:
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p loopctl-sqlite
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p loopctl-hnsw
 
 examples:
 	cargo build --examples --all-features
 	cargo build -p loopctl-sqlite --examples
+	cargo build -p loopctl-hnsw --examples
 
 define PROBE_TEXT
 fn main() {

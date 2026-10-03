@@ -14,7 +14,7 @@ readme = "README.md"
 rust-version = "1.98"
 
 [workspace]
-members = ["derive", "sqlite"]
+members = ["derive", "sqlite", "hnsw"]
 
 [lib]
 name = "loopctl"
@@ -61,6 +61,7 @@ default = []
 builtin_tools = ["dep:base64"]
 fs_tools = ["builtin_tools", "dep:libc", "dep:tempfile", "tokio/fs", "tokio/io-util"]
 vector_index = []
+vector_memory = ["vector_index"]
 derive = ["dep:loopctl-derive"]
 hooks = []
 testing = []
@@ -95,6 +96,10 @@ required-features = ["testing"]
 [[example]]
 name = "vector-index-demo"
 required-features = ["vector_index"]
+
+[[example]]
+name = "vector-memory-cli"
+required-features = ["vector_memory"]
 
 [[example]]
 name = "derived-tool-cli"

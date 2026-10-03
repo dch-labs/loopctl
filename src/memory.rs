@@ -26,6 +26,10 @@
 //! - **[`vector`]** — semantic-retrieval primitives (feature
 //!   `vector_index`): [`EmbeddingProvider`] and [`VectorIndex`] traits
 //!   with dependency-free reference implementations.
+//! - **[`vector_memory`]** — the semantic backend (feature
+//!   `vector_memory`): [`VectorMemoryStore`] blends vector similarity with
+//!   keyword and tag overlap over any [`EmbeddingProvider`] +
+//!   [`VectorIndex`] pair.
 //! - **[`extractor`]** — mines those records into reusable memories:
 //!   [`extract`](extractor::extract) / [`extract_into`](extractor::extract_into)
 //!   read a ledger's newest complete record, and
@@ -43,6 +47,11 @@
 //! - **[`FileMemoryStore`]** — The same store persisted to a JSONL file,
 //!   so learned memory survives a process restart (feature
 //!   `file_memory`).
+//! - **[`VectorMemoryStore`]** — Semantic retrieval over an
+//!   [`EmbeddingProvider`] + [`VectorIndex`] pair: embeds on store,
+//!   blends vector, keyword, and tag scores on retrieve, and prunes or
+//!   merges with index eviction on consolidation (feature
+//!   `vector_memory`).
 //!
 //! # Quick Start
 //!
@@ -107,6 +116,8 @@ pub use vector::{
     Embedding, EmbeddingProvider, HashingEmbedder, LinearVectorIndex, VectorIndex, VectorMatch,
     cosine_similarity,
 };
+#[cfg(feature = "vector_memory")]
+pub use vector_memory::{VectorMemoryConfig, VectorMemoryStore};
 
 pub mod builtin;
 pub mod consolidate;
@@ -118,6 +129,8 @@ pub mod score;
 pub mod trajectory;
 #[cfg(feature = "vector_index")]
 pub mod vector;
+#[cfg(feature = "vector_memory")]
+pub mod vector_memory;
 
 #[cfg(feature = "file_memory")]
 pub use file::FileMemoryStore;

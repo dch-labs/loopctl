@@ -189,7 +189,7 @@ pub fn walk_entries(base: &Path, max_depth: Option<usize>) -> Vec<WalkEntry> {
 pub fn build_default_overrides(base: &Path) -> ignore::overrides::Override {
     let mut builder = ignore::overrides::OverrideBuilder::new(base);
     for dir in ALWAYS_PRUNE_DIRS {
-        builder.add(&format!("!{dir}/**")).ok();
+        builder.add(&format!("!**/{dir}/**")).ok();
     }
     builder
         .build()
@@ -553,6 +553,22 @@ mod tests {
         assert!(
             !got.contains(&"local-only.rs".to_string()),
             ".loopctlignore'd file must be absent: {got:?}"
+        );
+    }
+
+    #[test]
+    fn walk_files_prunes_always_exclude_dirs_at_any_depth() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("pkg/node_modules")).expect("mkdir");
+        std::fs::write(tmp.path().join("pkg/node_modules/x.js"), "").expect("write");
+        std::fs::create_dir_all(tmp.path().join("vendor/.venv")).expect("mkdir");
+        std::fs::write(tmp.path().join("vendor/.venv/tool.py"), "").expect("write");
+        std::fs::write(tmp.path().join("main.rs"), "").expect("write");
+        let got = walked(tmp.path(), &[], &[]);
+        assert_eq!(
+            got,
+            vec!["main.rs".to_string()],
+            "a nested always-prune dir is not anchored to the root: {got:?}"
         );
     }
 

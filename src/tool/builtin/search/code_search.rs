@@ -25,7 +25,7 @@ use crate::tool::builtin::search::content::{parse_input, relative_file, run};
 use crate::tool::builtin::search::output::MAX_INLINE_OUTPUT_BYTES;
 use crate::tool::builtin::search::output::truncate_or_spill;
 use crate::tool::builtin::search::resolve;
-use crate::tool::{DisplayHint, Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
+use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 
 /// Default total match cap across all files when the caller omits `max_results`.
 ///
@@ -198,7 +198,7 @@ async fn code_search_inner<S: SearchSource + 'static>(
         return Ok(no_matches_message(&parsed.pattern));
     }
 
-    Ok(render(&matches, &parsed.pattern, context_lines, &temp_dir).with_hint(DisplayHint::Json))
+    Ok(render(&matches, &parsed.pattern, context_lines, &temp_dir))
 }
 
 /// Scan one file's lines for regex matches; return up to `limit`.
@@ -525,6 +525,23 @@ mod tests {
         assert!(text.contains("   1: alpha"), "{text}");
         assert!(text.contains("\n>2: needle here"), "{text}");
         assert!(text.contains("\n 3: gamma"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn call_renders_plain_text_without_a_json_hint() {
+        let tool = CodeSearchTool::new(FakeSearchSource::with(&[(
+            "/repo/a.rs",
+            text("hit one\nhit two\n"),
+        )]));
+        let output = tool
+            .call(json!({"pattern": "hit", "path": "/repo"}), &ctx_in("/repo"))
+            .await
+            .expect("call");
+        assert!(
+            output.display_hint.is_none(),
+            "the grouped text body is not JSON; a Json hint would send              presentation layers into a failed parse: {:?}",
+            output.display_hint
+        );
     }
 
     #[tokio::test]

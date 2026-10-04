@@ -78,7 +78,7 @@ pub fn truncate_or_spill(
     }
 
     let spill_path = spill_file_path(temp_dir, tool_name);
-    let Ok(mut file) = std::fs::File::create(&spill_path) else {
+    let Some(mut file) = create_spill_file(&spill_path) else {
         return ToolOutput::text(truncate_inline(&content));
     };
     if file.write_all(content.as_bytes()).is_err() {
@@ -94,6 +94,37 @@ pub fn truncate_or_spill(
         spill_path.display(),
         preview
     ))
+}
+
+/// Create the spill file at `path`, exclusively and owner-only.
+///
+/// `create_new` refuses a path that already exists, so a local user
+/// who pre-creates the predictable pid-and-counter name in a shared
+/// temp directory can neither redirect the write into their file nor
+/// read the results through it; on Unix the mode is `0o600` for the
+/// same reason. On platforms without a mode knob the exclusive
+/// creation still applies. Every failure — including the collision
+/// itself — reads as `None` and the caller degrades to inline
+/// truncation, never an error.
+fn create_spill_file(path: &Path) -> Option<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .ok()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .ok()
+    }
 }
 
 /// The unique spill-file path for one oversized result.
@@ -203,6 +234,40 @@ mod tests {
             text[start..end].trim().to_string()
         };
         assert_ne!(path_of(&first), path_of(&second), "distinct spill files");
+    }
+
+    #[test]
+    fn spill_files_refuse_a_pre_created_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let contested = tmp.path().join("loopctl-grep-0-0.txt");
+        std::fs::write(&contested, b"attacker content").unwrap();
+        assert!(
+            create_spill_file(&contested).is_none(),
+            "an existing path must not be truncated or followed into"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&contested).unwrap(),
+            "attacker content",
+            "the pre-created file must be untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_files_are_owner_only() {
+        use std::os::unix::fs::MetadataExt as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = "x".repeat(200);
+        let out = truncate_or_spill(body, "grep", tmp.path(), 64);
+        let text = out.text_content();
+        let start = text.find("written to: ").unwrap() + "written to: ".len();
+        let end = text[start..].find('\n').unwrap() + start;
+        let spilled = std::path::Path::new(text[start..end].trim());
+        let mode = std::fs::metadata(spilled).unwrap().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "spill files must not be group- or world-readable"
+        );
     }
 
     #[test]

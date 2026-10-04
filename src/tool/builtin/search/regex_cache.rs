@@ -122,6 +122,7 @@ pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 )]
 mod tests {
     use super::*;
+    use crate::tool::builtin::search::content::compile_pattern;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
@@ -198,6 +199,28 @@ mod tests {
         let re = get_or_compile(&m, true).unwrap();
         assert!(re.is_match(&m.to_uppercase()));
         assert!(!re.is_match("no_match_xyz"));
+    }
+
+    /// The Unicode-seam parity pin: whatever feature set enables the
+    /// search tools must keep `regex` Unicode-capable, matching the
+    /// crate-wide `redaction` configuration — non-ASCII case folding
+    /// and Perl classes degrade silently to ASCII-only otherwise, a
+    /// gap `--all-features` unification hides.
+    #[test]
+    fn unicode_folding_and_classes_survive_the_minimal_feature_set() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        clear_cache();
+        let folded = compile_pattern("\u{0439}", true).unwrap();
+        assert!(
+            folded.is_match("\u{0419}"),
+            "case-insensitive matching must fold non-ASCII letters"
+        );
+        let words = compile_pattern(r"\w+", false).unwrap();
+        assert!(
+            words.is_match("\u{0441}\u{043b}\u{043e}\u{0432}\u{043e}"),
+            "Perl classes must stay Unicode-aware, not ASCII-only"
+        );
+        clear_cache();
     }
 
     #[test]

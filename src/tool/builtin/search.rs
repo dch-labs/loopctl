@@ -125,6 +125,10 @@ impl<S: SearchSource> ContentSource for std::sync::Arc<S> {
     ) -> Pin<Box<dyn Future<Output = Result<SourceContent, ToolError>> + Send + 'a>> {
         (**self).read(path)
     }
+
+    fn size<'a>(&'a self, path: &'a str) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + 'a>> {
+        (**self).size(path)
+    }
 }
 
 /// A shared source serves the seam.
@@ -463,6 +467,27 @@ pub(crate) mod test_support {
                 .find(|(candidate, _)| candidate == path)
                 .is_some_and(|(_, file)| file.too_large)
         }
+    }
+
+    /// An `Arc`-shared source keeps the `ContentSource::size` probe.
+    ///
+    /// The delegation must forward `size` too: `ReadTool`'s
+    /// refuse-before-read guard consults `size`, and a wrapper
+    /// that dropped it would turn every shared-source read into an
+    /// unbounded whole-file load. Proven over the filesystem source
+    /// with a real file of known length, and over a missing path
+    /// (the honest `None`, not a fabricated zero).
+    #[tokio::test]
+    async fn arc_shared_sources_keep_the_size_probe() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let file = tmp.path().join("sized.txt");
+        std::fs::write(&file, "12345").expect("write");
+        let shared = std::sync::Arc::new(FsSearchSource);
+        let reported = ContentSource::size(&shared, &file.to_string_lossy()).await;
+        assert_eq!(reported, Some(5), "the wrapper must forward the probe");
+        let missing =
+            ContentSource::size(&shared, &tmp.path().join("absent.txt").to_string_lossy()).await;
+        assert_eq!(missing, None, "a missing file reports unknown size");
     }
 
     #[test]

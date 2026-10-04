@@ -62,7 +62,7 @@ tempfile = "3"
 [features]
 default = []
 builtin_tools = ["dep:base64"]
-search_tools = ["builtin_tools", "dep:ignore", "dep:lru", "dep:same-file", "dep:regex"]
+search_tools = ["builtin_tools", "dep:ignore", "dep:lru", "dep:same-file", "dep:regex", "regex/unicode-case", "regex/unicode-perl"]
 fs_tools = ["builtin_tools", "dep:libc", "dep:tempfile", "tokio/fs", "tokio/io-util"]
 vector_index = []
 vector_memory = ["vector_index"]

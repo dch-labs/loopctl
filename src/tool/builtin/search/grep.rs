@@ -499,6 +499,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn call_tags_the_json_array_with_the_json_hint() {
+        let tool = GrepTool::new(FakeSearchSource::with(&[("/repo/a.rs", text("needle\n"))]));
+        let output = tool
+            .call(
+                json!({"pattern": "needle", "path": "/repo"}),
+                &ctx_in("/repo"),
+            )
+            .await
+            .expect("call");
+        assert_eq!(
+            output.display_hint,
+            Some(crate::tool::DisplayHint::Json),
+            "the body is a JSON array and must say so"
+        );
+    }
+
+    #[tokio::test]
     async fn call_no_matches_is_the_shared_message() {
         let tool = GrepTool::new(FakeSearchSource::with(&[("/repo/a.rs", text("nothing\n"))]));
         let output = tool

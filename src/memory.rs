@@ -107,6 +107,7 @@ pub use builtin::InMemoryStore;
 pub use consolidate::{ConsolidationConfig, MemoryCluster};
 pub use entry::{ConsolidationStats, MemoryCategory, MemoryEntry};
 pub use extractor::{ExtractedMemory, ExtractionConfig, ExtractionObserver, ExtractionStrategy};
+pub use search_tool::SearchMemoriesTool;
 pub use trajectory::{
     TokenSummary, TrajectoryObserver, TrajectoryOutcome, TrajectoryRecord, TrajectoryToolCall,
     TrajectoryTurn,
@@ -126,6 +127,7 @@ pub mod extractor;
 #[cfg(feature = "file_memory")]
 pub mod file;
 pub mod score;
+pub mod search_tool;
 pub mod trajectory;
 #[cfg(feature = "vector_index")]
 pub mod vector;

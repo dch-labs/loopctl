@@ -896,13 +896,10 @@ impl<C: ApiClient> BareLoop<C> {
         start: Instant,
         turn_idx: usize,
     ) -> ToolDispatchResult {
-        if let Some(pipeline) = self.managers.pipeline() {
-            return self
-                .dispatch_via_pipeline(pipeline, tc, tool_context, start, turn_idx)
-                .await;
-        }
-
-        if let Some(tool) = self.tools.get(&tc.tool) {
+        let result = if let Some(pipeline) = self.managers.pipeline() {
+            self.dispatch_via_pipeline(pipeline, tc, tool_context, start, turn_idx)
+                .await
+        } else if let Some(tool) = self.tools.get(&tc.tool) {
             let call_result = AssertUnwindSafe(tool.call(tc.input.clone(), tool_context))
                 .catch_unwind()
                 .await;
@@ -946,7 +943,9 @@ impl<C: ApiClient> BareLoop<C> {
             }
         } else {
             self.tool_not_found(tc)
-        }
+        };
+        Self::emit_tool_call_metric(&tc.tool, &result);
+        result
     }
 
     /// Build a soft-error result for a tool whose name is not in the registry.
@@ -969,6 +968,24 @@ impl<C: ApiClient> BareLoop<C> {
             display_hint: None,
             gate: None,
         }
+    }
+
+    /// Emit the per-tool-call counter event for one settled dispatch.
+    ///
+    /// One `loopctl.tools.calls` event per call on both dispatch paths —
+    /// the direct registry path and the middleware pipeline — emitted at
+    /// the single exit they share, so no call is counted twice and none
+    /// is missed. The duration rides the dispatch result's seam-sourced
+    /// duration, keeping the stream byte-stable under replay.
+    fn emit_tool_call_metric(tool: &str, result: &ToolDispatchResult) {
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.tools.calls",
+            tool,
+            outcome = if result.is_error { "error" } else { "ok" },
+            duration_ms = %result.duration.as_millis(),
+            "tool call settled"
+        );
     }
 
     /// Decide whether to retry a failed tool or return the error as a soft result.
@@ -1280,6 +1297,13 @@ impl<C: ApiClient> BareLoop<C> {
             return;
         };
         if tool_result.is_error {
+            return;
+        }
+        if self
+            .tools
+            .get(&tc.tool)
+            .is_some_and(|tool| !tool.records_trajectory())
+        {
             return;
         }
         let input = truncate_to(&tc.input.to_string(), MAX_FIELD_LEN);

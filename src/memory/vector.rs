@@ -448,7 +448,7 @@ impl VectorIndex for LinearVectorIndex {
     /// Score every row against `query` and return the top `k`.
     ///
     /// A brute-force cosine scan sorted descending with a stable id
-    /// tiebreak; emits one `vector.index.search` metric event per
+    /// tiebreak; emits one `loopctl.vector.index.search` metric event per
     /// successful call — a dimension-mismatch rejection returns before
     /// the event fires.
     fn search(
@@ -485,7 +485,7 @@ impl VectorIndex for LinearVectorIndex {
             let top_score = matches.first().map_or(0.0, |m| m.score);
             tracing::debug!(
                 target: "loopctl::metrics",
-                span = "vector.index.search",
+                metric = "loopctl.vector.index.search",
                 k,
                 returned = matches.len(),
                 top_score = %top_score,
@@ -619,7 +619,7 @@ impl EmbeddingProvider for HashingEmbedder {
     ///
     /// Delegates to the synchronous hashing pass and wraps it in the
     /// boxed-future shape the trait requires, emitting a
-    /// `vector.embed` metric event per call.
+    /// `loopctl.vector.embed` metric event per call.
     fn embed<'a>(
         &'a self,
         text: &'a str,
@@ -629,7 +629,7 @@ impl EmbeddingProvider for HashingEmbedder {
             let embedding = self.embed_sync(text);
             tracing::debug!(
                 target: "loopctl::metrics",
-                span = "vector.embed",
+                metric = "loopctl.vector.embed",
                 provider = "hashing",
                 model = "hashing",
                 dim = self.dim,

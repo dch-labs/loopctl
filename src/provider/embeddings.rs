@@ -22,7 +22,7 @@
 //! `Debug` output), bounded response bodies, and typed [`ApiError`]
 //! failures. Batches split at 256 inputs per request — and, on OpenAI,
 //! at a conservative estimated token sum per request as well — and every
-//! batch settles one `embed.batch` metric event.
+//! batch settles one `loopctl.embed.batch` metric event.
 //!
 //! # Embedding models are not interchangeable
 //!
@@ -397,7 +397,7 @@ fn optional_env_dimension(name: &str) -> Result<Option<usize>, ApiError> {
     )
 }
 
-/// Emit the `embed.batch` metric event for one settled batch.
+/// Emit the `loopctl.embed.batch` metric event for one settled batch.
 ///
 /// One event per HTTP batch on both the success and failure paths, with
 /// the usage pair recorded when the provider reports one — the intake
@@ -414,7 +414,7 @@ fn emit_batch_metric(
 ) {
     tracing::debug!(
         target: "loopctl::metrics",
-        span = "embed.batch",
+        metric = "loopctl.embed.batch",
         provider,
         model,
         dim,
@@ -606,7 +606,7 @@ impl OllamaEmbedder {
     /// the results in input order.
     ///
     /// An empty slice returns an empty vector without touching the wire.
-    /// Each batch settles one `embed.batch` metric event, success or
+    /// Each batch settles one `loopctl.embed.batch` metric event, success or
     /// failure; a failed batch aborts the call with its error (partial
     /// results are never returned — a caller cannot mistake them for a
     /// complete embedding of the input set).
@@ -1168,7 +1168,7 @@ impl OpenAiEmbedder {
     /// An empty slice returns an empty vector without touching the wire;
     /// every input passes the token guard before any HTTP traffic, and
     /// batches close at the input-count or estimated-token bound,
-    /// whichever comes first. Each batch settles one `embed.batch`
+    /// whichever comes first. Each batch settles one `loopctl.embed.batch`
     /// metric event — carrying the request's usage pair when the server
     /// reports one — and a failed batch aborts the call (partial results
     /// are never returned).

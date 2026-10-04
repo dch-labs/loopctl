@@ -118,7 +118,7 @@ async fn every_batch_settles_one_event_and_a_mismatch_warns() {
         "one batch, one event — the success path settles exactly one: {delta:?}"
     );
     assert!(
-        delta[0].contains("span=embed.batch")
+        delta[0].contains("metric=loopctl.embed.batch")
             && delta[0].contains("provider=openai")
             && delta[0].contains("model=text-embedding-3-small")
             && delta[0].contains("dim=256")
@@ -152,7 +152,7 @@ async fn every_batch_settles_one_event_and_a_mismatch_warns() {
         "one batch, one event — the failure path settles exactly one: {delta:?}"
     );
     assert!(
-        delta[0].contains("span=embed.batch")
+        delta[0].contains("metric=loopctl.embed.batch")
             && delta[0].contains("provider=ollama")
             && delta[0].contains("outcome=error"),
         "the failed batch's event names its provider and outcome: {delta:?}"

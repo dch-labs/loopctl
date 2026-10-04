@@ -50,7 +50,7 @@ tempfile = { version = "3", optional = true }
 rmcp = { version = "3.4", optional = true, default-features = false, features = ["client", "server", "macros", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-io"] }
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
 proptest = "1"
 httpmock = { version = "0.8.3", default-features = false, features = ["record"] }
 serde_yaml = "0.9"

@@ -208,12 +208,12 @@ async fn demo(
 | `builtin_tools` | No | `base64` | Built-in tools under `tool::builtin`: `ThinkTool` (a no-side-effect scratchpad the model reasons into before acting) and `ReadTool` (line-aware reading over a pluggable `ContentSource`: `cat -n` numbering, truncation markers that name the next offset, multipart image reads with an encoded-size ceiling, binary refusal, and a size-probe guard); explicit registration only |
 | `file_memory` | No | — | `memory::FileMemoryStore` — a `LoopMemory` backend persisting to a JSONL file (one entry per line, atomic rewrites on consolidation), so learned memory survives a process restart with zero extra dependencies |
 | `vector_index` | No | — | Vector primitives under `memory::vector`: `EmbeddingProvider` + `VectorIndex` traits, `HashingEmbedder` (deterministic test embedder) and `LinearVectorIndex` (brute-force cosine search) reference impls |
-| `vector_memory` | No | `vector_index` | `memory::VectorMemoryStore` — a semantic `LoopMemory` backend: embeds entries through an `EmbeddingProvider`, blends vector similarity with keyword + tag overlap on retrieve, prunes/merges with index eviction on consolidate; the separate `loopctl-hnsw` companion crate supplies an HNSW `VectorIndex` for approximate search at scale |
+| `vector_memory` | No | `vector_index` | `memory::VectorMemoryStore` — a semantic `LoopMemory` backend: embeds entries through an `EmbeddingProvider`, blends vector similarity with keyword + tag overlap on retrieve, prunes/merges with index eviction on consolidate; the separate `loopctl-hnsw` companion crate supplies an HNSW `VectorIndex` for approximate search at scale; real embedders arrive via the `openai`/`ollama` provider flags (`provider::embeddings`) |
 | `streaming` | No | `async-stream` | Streaming engine path: `StreamHandler` (retry, timeout, fallback), per-delta observer callbacks (`on_text_delta`, `on_thinking_delta`), `text_streamer`. Without it the engine drives each turn via `ApiClient::create_message`. |
 | `providers` | No | `reqwest`, `httpdate`, `bytes` | Base HTTP provider support; enables the `provider` module |
-| `openai` | No | `providers`, `streaming` | OpenAI-compatible API client (`provider::openai`) |
+| `openai` | No | `providers`, `streaming` | OpenAI-compatible API client (`provider::openai`); with `vector_index`, `provider::embeddings::OpenAiEmbedder` — the `/v1/embeddings` `EmbeddingProvider` (`text-embedding-3-small`, Matryoshka truncation, batch splitting, index-keyed reassembly) |
 | `anthropic` | No | `providers`, `streaming` | Anthropic Claude API client (`provider::anthropic`) |
-| `ollama` | No | `providers`, `openai` | Ollama local model client (OpenAI-compatible) |
+| `ollama` | No | `providers`, `openai` | Ollama local model client (OpenAI-compatible); with `vector_index`, `provider::embeddings::OllamaEmbedder` — the native `/api/embed` `EmbeddingProvider` (`nomic-embed-text`, local and key-free) |
 | `deepseek` | No | `providers`, `openai` | DeepSeek API client (OpenAI-compatible) |
 | `grok` | No | `providers`, `openai` | Grok (xAI) API client (OpenAI-compatible) |
 | `xai` | No | `grok` | Alias for `grok` (xAI API client) |

@@ -7,7 +7,10 @@
 //! streamed usage support varies by model.
 //!
 //! Run:
-//!   `set -a; source .env; set +a; LOOPCTL_E2E=1 cargo test --features ollama,openai,anthropic,gemini,grok,deepseek,zai,azure,moonshot,bedrock --test provider_e2e -- --nocapture --test-threads=1`
+//!   `set -a; source .env; set +a; LOOPCTL_E2E=1 cargo test --features ollama,openai,anthropic,gemini,grok,deepseek,zai,azure,moonshot,bedrock,vector_memory,testing --test provider_e2e -- --nocapture --test-threads=1`
+//!   (the trailing `vector_memory,testing` pair wakes the embedder round-trips
+//!   and the local-vs-remote precision measurement; without them the live
+//!   embedding entries compile out.)
 //!
 //! The whole file compiles only when at least one provider feature is on;
 //! without a provider the helpers have no callers and would trip the
@@ -796,4 +799,132 @@ async fn attempt_openai_rate_limit_cassette() {
             .unwrap()
     })
     .await;
+}
+
+#[cfg(all(feature = "openai", feature = "vector_index"))]
+#[tokio::test]
+async fn openai_embedder_round_trips_live() {
+    if std::env::var("LOOPCTL_E2E").as_deref() != Ok("1")
+        || std::env::var("OPENAI_API_KEY").is_err()
+    {
+        eprintln!("{DIM}skip{RESET}  openai embedder (live)");
+        return;
+    }
+    use loopctl::memory::vector::EmbeddingProvider as _;
+    use loopctl::provider::embeddings::OpenAiEmbedder;
+
+    let embedder = OpenAiEmbedder::from_env().unwrap();
+    let embedding = embedder
+        .embed("the deploy pipeline reruns on config changes")
+        .await
+        .unwrap();
+    assert_eq!(
+        embedding.dim(),
+        embedder.dim(),
+        "the live answer's dimension matches the configured one"
+    );
+    assert!(
+        embedding.as_slice().iter().copied().all(f32::is_finite),
+        "every component of a live embedding is finite"
+    );
+    eprintln!(
+        "{GREEN}ok{RESET}    openai embedder: {} dims, finite",
+        embedding.dim()
+    );
+}
+
+#[cfg(all(feature = "ollama", feature = "vector_index"))]
+#[tokio::test]
+async fn ollama_embedder_round_trips_live() {
+    if std::env::var("LOOPCTL_E2E").as_deref() != Ok("1")
+        || std::env::var("OLLAMA_EMBEDDING_MODEL").is_err()
+    {
+        eprintln!("{DIM}skip{RESET}  ollama embedder (live)");
+        return;
+    }
+    use loopctl::memory::vector::EmbeddingProvider as _;
+    use loopctl::provider::embeddings::OllamaEmbedder;
+
+    let embedder = OllamaEmbedder::from_env().unwrap();
+    let embedding = embedder
+        .embed("the deploy pipeline reruns on config changes")
+        .await
+        .unwrap();
+    assert_eq!(
+        embedding.dim(),
+        embedder.dim(),
+        "the live answer's dimension matches the configured one"
+    );
+    assert!(
+        embedding.as_slice().iter().copied().all(f32::is_finite),
+        "every component of a live embedding is finite"
+    );
+    eprintln!(
+        "{GREEN}ok{RESET}    ollama embedder: {} dims, finite",
+        embedding.dim()
+    );
+}
+
+#[cfg(all(
+    feature = "ollama",
+    feature = "openai",
+    feature = "vector_memory",
+    feature = "testing"
+))]
+#[tokio::test]
+async fn ollama_keeps_relative_retrieval_precision_live() {
+    if std::env::var("LOOPCTL_E2E").as_deref() != Ok("1")
+        || std::env::var("OPENAI_API_KEY").is_err()
+    {
+        eprintln!("{DIM}skip{RESET}  embedder precision pair (live)");
+        return;
+    }
+    use loopctl::memory::LoopMemory as _;
+    use loopctl::memory::vector::LinearVectorIndex;
+    use loopctl::memory::vector_memory::{GoldenSet, VectorMemoryStore, golden_set};
+    use loopctl::provider::embeddings::{OllamaEmbedder, OpenAiEmbedder};
+
+    let set = golden_set();
+    let openai_store = VectorMemoryStore::new(
+        Box::new(OpenAiEmbedder::from_env().unwrap()),
+        Box::new(LinearVectorIndex::new(1536)),
+    );
+    let mut openai_hits: Vec<bool> = Vec::with_capacity(set.queries.len());
+    for fixture_entry in &set.entries {
+        openai_store.store(fixture_entry.clone()).await.unwrap();
+    }
+    for (index, query) in set.queries.iter().enumerate() {
+        let relevant = set.relevant_ids(index);
+        let returned = openai_store.retrieve(query.text, 3).await.unwrap();
+        openai_hits.push(returned.iter().any(|entry| relevant.contains(&entry.id)));
+    }
+    let openai_ratio = GoldenSet::precision_ratio(&openai_hits);
+
+    let ollama = match std::env::var("OLLAMA_EMBEDDING_MODEL") {
+        Ok(_) => OllamaEmbedder::from_env().unwrap(),
+        Err(_) => OllamaEmbedder::builder().build().unwrap(),
+    };
+    let ollama_store =
+        VectorMemoryStore::new(Box::new(ollama), Box::new(LinearVectorIndex::new(768)));
+    let mut ollama_hits: Vec<bool> = Vec::with_capacity(set.queries.len());
+    for fixture_entry in &set.entries {
+        ollama_store.store(fixture_entry.clone()).await.unwrap();
+    }
+    for (index, query) in set.queries.iter().enumerate() {
+        let relevant = set.relevant_ids(index);
+        let returned = ollama_store.retrieve(query.text, 3).await.unwrap();
+        ollama_hits.push(returned.iter().any(|entry| relevant.contains(&entry.id)));
+    }
+    let ollama_ratio = GoldenSet::precision_ratio(&ollama_hits);
+    eprintln!(
+        "{CYAN}info{RESET}  precision pair: openai {:.2}, ollama {:.2} (relative {:.2})",
+        openai_ratio,
+        ollama_ratio,
+        ollama_ratio / openai_ratio.max(f32::EPSILON)
+    );
+    assert!(
+        ollama_ratio + f32::EPSILON >= 0.9 * openai_ratio,
+        "local retrieval keeps at least 90% of the frontier baseline's precision: \
+         ollama {ollama_ratio:.2} vs openai {openai_ratio:.2}"
+    );
 }

@@ -42,12 +42,12 @@ struct MetricCapture {
 impl MetricCapture {
     /// Only the vector-index search metric events, oldest first.
     ///
-    /// Filters the full capture down to the `span=vector.index.search`
+    /// Filters the full capture down to the `metric=loopctl.vector.index.search`
     /// rows, so counting them is counting searches that reported.
     fn search_events(&self) -> Vec<String> {
         self.events()
             .into_iter()
-            .filter(|event| event.contains("span=vector.index.search"))
+            .filter(|event| event.contains("metric=loopctl.vector.index.search"))
             .collect()
     }
 
@@ -107,7 +107,7 @@ fn captured_number(event: &str, name: &str) -> Option<u64> {
 /// successes included.
 ///
 /// `k = 0`, an empty index, and a populated search must each land one
-/// `vector.index.search` event with their own `returned` count, matching
+/// `loopctl.vector.index.search` event with their own `returned` count, matching
 /// the linear index's one-event-per-success contract; before the fix only
 /// the populated path emitted, so the two backends disagreed observably.
 #[tokio::test]

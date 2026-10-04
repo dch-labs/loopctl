@@ -477,7 +477,7 @@ impl VectorIndex for HnswIndex {
     /// the same
     /// metric, clamped to `-1.0..=1.0`, with the same descending-score,
     /// id-tiebreak ordering the linear index guarantees. Emits one
-    /// `vector.index.search` metric event per successful call.
+    /// `loopctl.vector.index.search` metric event per successful call.
     ///
     /// # Errors
     ///
@@ -592,7 +592,7 @@ fn tombstones_exceed_ratio(tombstones: usize, live: usize, ratio: f32) -> bool {
     tombstones > live * f64::from(ratio)
 }
 
-/// Emit the `vector.index.search` metric event for one completed search.
+/// Emit the `loopctl.vector.index.search` metric event for one completed search.
 ///
 /// Called on every successful return — the degenerate successes (`k = 0`,
 /// an empty map, an empty graph) included — so the event stream matches
@@ -602,7 +602,7 @@ fn emit_search_metric(k: usize, matches: &[VectorMatch], started: std::time::Ins
     let top_score = matches.first().map_or(0.0, |m| m.score);
     tracing::debug!(
         target: "loopctl::metrics",
-        span = "vector.index.search",
+        metric = "loopctl.vector.index.search",
         provider = "hnsw",
         k,
         returned = matches.len(),

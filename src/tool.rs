@@ -1462,6 +1462,7 @@ impl Default for ToolContext {
 /// | `is_safe_for_concurrent_execution`  | delegates | Per-input concurrency check         |
 /// | `is_read_only`                      | `false`   | Side-effect flag for permission     |
 /// | `system_prompt`                     | `None`    | Extra LLM context for this tool     |
+/// | `records_trajectory`                | `true`    | Whether calls become memory entries |
 ///
 /// # Example
 ///
@@ -1689,7 +1690,12 @@ pub trait Tool: Send + Sync {
     /// Whether this tool only reads data and has no side effects.
     ///
     /// Read-only tools (e.g., file readers, search tools) can be
-    /// auto-approved by permission gates. Defaults to `false`.
+    /// auto-approved by permission gates. Defaults to `false`. The
+    /// claim is about externally observable effects, not about internal
+    /// bookkeeping: a tool over a stateful source may still stamp
+    /// access counters or caches under the source's own locks —
+    /// lock-guarded statistics that no caller outside the source can
+    /// observe do not make a tool non-read-only.
     ///
     /// # When called
     ///
@@ -1730,6 +1736,24 @@ pub trait Tool: Send + Sync {
     /// ```
     fn system_prompt(&self) -> Option<String> {
         None
+    }
+
+    /// Whether the engine records this tool's calls as trajectory memory.
+    ///
+    /// After every successful call the engine offers a
+    /// [`Trajectory`](crate::memory::MemoryCategory::Trajectory) entry —
+    /// the tool's name, input, and rendered result — to the configured
+    /// [`LoopMemory`](crate::memory::LoopMemory) store. A tool whose
+    /// results are themselves read from that same store must override
+    /// this to `false`: a store-search tool that records would store its
+    /// own answers, and the next search would return them — the tool
+    /// feeding on its own output. The engine resolves the tool that
+    /// actually executed — the result's `resolved_tool_name` when
+    /// middleware redirected the call — before consulting this flag,
+    /// so a redirect cannot smuggle an opted-out tool's output into
+    /// the store. Defaults to `true`.
+    fn records_trajectory(&self) -> bool {
+        true
     }
 }
 

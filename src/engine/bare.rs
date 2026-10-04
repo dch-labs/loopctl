@@ -1651,6 +1651,15 @@ impl<C: ApiClient> BareLoop<C> {
         if let Some(memory) = self.managers.memory() {
             match memory.retrieve(turn_input, memory_top_k).await {
                 Ok(entries) => {
+                    tracing::debug!(
+                        target: "loopctl::metrics",
+                        metric = "loopctl.memory.retrieve.results",
+                        trigger = "turn",
+                        outcome = "ok",
+                        k_requested = memory_top_k,
+                        k_returned = entries.len(),
+                        "passive memory retrieve settled"
+                    );
                     let (trusted, provider_derived): (
                         Vec<&crate::memory::MemoryEntry>,
                         Vec<&crate::memory::MemoryEntry>,
@@ -1692,6 +1701,14 @@ impl<C: ApiClient> BareLoop<C> {
                     }
                 }
                 Err(e) => {
+                    tracing::debug!(
+                        target: "loopctl::metrics",
+                        metric = "loopctl.memory.retrieve.results",
+                        trigger = "turn",
+                        outcome = "error",
+                        k_requested = memory_top_k,
+                        "passive memory retrieve settled"
+                    );
                     tracing::warn!(error = %e, "memory retrieve failed");
                 }
             }

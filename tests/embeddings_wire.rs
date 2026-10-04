@@ -652,7 +652,141 @@ async fn an_overflowing_exponent_fails_the_embed_at_the_parse() {
     let message = error.to_string();
     assert!(
         message.contains("out of range"),
-        "an exponent too large for f32 must fail loudly at the parse — JSON \
-         cannot carry it, so it never reaches normalization as a quiet value: {message}"
+        "an exponent past the f64 range is refused at the parse in every \
+         configuration: {message}"
+    );
+}
+
+#[cfg(feature = "ollama")]
+#[tokio::test]
+async fn status_classified_failures_carry_no_serve_hint() {
+    let server = httpmock::MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/embed");
+            then.status(404)
+                .body("{\"error\":\"model 'wire-test-embed' not found\"}");
+        })
+        .await;
+    let error = ollama_at(&server)
+        .embed_texts(&["one text"])
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("HTTP 404"),
+        "a classified status error keeps its status-tagged shape: {message}"
+    );
+    assert!(
+        !message.contains("ollama serve"),
+        "a 404 from a running server must not suggest a transport problem: {message}"
+    );
+}
+
+#[cfg(feature = "ollama")]
+#[tokio::test]
+async fn ollama_non_finite_components_fail_even_without_normalization() {
+    let server = httpmock::MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/embed");
+            then.status(200)
+                .body("{\"model\":\"wire-test-embed\",\"embeddings\":[[1.0,1e39,0.0]]}");
+        })
+        .await;
+    let error = ollama_at(&server)
+        .embed_texts(&["hostile exponent"])
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("out of range") || message.contains("non-finite"),
+        "an exponent past f32's range must fail loudly whichever layer this build \
+         arms — the parse under serde_json's float_roundtrip feature, the finiteness \
+         check otherwise: {message}"
+    );
+}
+
+#[tokio::test]
+async fn non_finite_components_fail_even_without_normalization() {
+    let server = httpmock::MockServer::start_async().await;
+    let components = format!("1.0,1e39,{}", vec!["0.0"; 254].join(","));
+    server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path("/embeddings");
+            then.status(200).body(format!(
+                "{{\"data\":[{{\"index\":0,\"embedding\":[{components}]}}]}}"
+            ));
+        })
+        .await;
+    let embedder = OpenAiEmbedder::builder()
+        .with_api_key("sk-wire-test")
+        .with_base_url(server.base_url())
+        .with_dimensions(256)
+        .build()
+        .unwrap();
+    let error = embedder
+        .embed_texts(&["hostile exponent"])
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("out of range") || message.contains("non-finite"),
+        "an exponent past f32's range must fail loudly whichever layer this build \
+         arms — the parse under serde_json's float_roundtrip feature, the finiteness \
+         check otherwise: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_trailing_slash_base_url_forms_a_single_slash_endpoint() {
+    let server = httpmock::MockServer::start_async().await;
+    let mock = server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path("/embeddings");
+            then.status(200).body(openai_body(&[(1.0, 0)]));
+        })
+        .await;
+    let embeddings = OpenAiEmbedder::builder()
+        .with_api_key("sk-wire-test")
+        .with_base_url(format!("{}/", server.base_url()))
+        .build()
+        .unwrap()
+        .embed_texts(&["single slash"])
+        .await
+        .unwrap();
+    mock.assert_calls(1);
+    assert_eq!(
+        embeddings.len(),
+        1,
+        "a trailing-slash base URL posts to /embeddings, never //embeddings"
+    );
+}
+
+#[cfg(feature = "ollama")]
+#[tokio::test]
+async fn ollama_trailing_slash_base_url_forms_a_single_slash_endpoint() {
+    let server = httpmock::MockServer::start_async().await;
+    let mock = server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/embed");
+            then.status(200)
+                .body("{\"model\":\"wire-test-embed\",\"embeddings\":[[1.0,0.0,0.0]]}");
+        })
+        .await;
+    let embeddings = OllamaEmbedder::builder()
+        .with_model("wire-test-embed")
+        .with_dim(3)
+        .with_base_url(format!("{}/", server.base_url()))
+        .build()
+        .unwrap()
+        .embed_texts(&["single slash"])
+        .await
+        .unwrap();
+    mock.assert_calls(1);
+    assert_eq!(
+        embeddings.len(),
+        1,
+        "a trailing-slash base URL posts to /api/embed, never /api//embed"
     );
 }

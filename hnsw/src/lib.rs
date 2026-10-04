@@ -99,9 +99,12 @@ pub struct HnswParams {
     ///
     /// The effective value at query time never drops below the smaller of
     /// the requested `k` plus the live tombstone count and the total slot
-    /// count — deleted slots must be traversed past, and a request larger
-    /// than the whole traversable graph returns what exists — and never
-    /// exceeds the total slot count, live plus tombstoned.
+    /// count, and never exceeds the total slot count, live plus
+    /// tombstoned. Deleted slots must be traversed past. A request
+    /// larger than the layer-0 component reachable from the entry
+    /// point can return fewer results: `ef` equal to the total slot
+    /// count makes the layer-0 search exhaustive only over that
+    /// reachable component, not over every live slot in the graph.
     pub ef_search: usize,
 
     /// The seed for the level-assignment RNG.

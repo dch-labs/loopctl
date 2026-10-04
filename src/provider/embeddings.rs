@@ -20,8 +20,9 @@
 //! Both share the provider family's HTTP discipline: validated builders,
 //! `from_env()` profiles, a sensitive `Authorization` header (never in
 //! `Debug` output), bounded response bodies, and typed [`ApiError`]
-//! failures. Batches split at 256 inputs per request, and every batch
-//! settles one `embed.batch` metric event.
+//! failures. Batches split at 256 inputs per request — and, on OpenAI,
+//! at a conservative estimated token sum per request as well — and every
+//! batch settles one `embed.batch` metric event.
 //!
 //! # Embedding models are not interchangeable
 //!
@@ -112,8 +113,22 @@ const OPENAI_MAX_INPUT_CHARS: usize = OPENAI_MAX_INPUT_TOKENS * CHARS_PER_TOKEN_
 /// per-request latency
 /// bounded. OpenAI's own per-request cap is 2048 inputs — the tighter
 /// client-side split also keeps a batch's response inside the bounded-body
-/// budget where one 2048-input request would need ~34 MB.
+/// budget where one 2048-input request would need ~34 MB. On OpenAI this
+/// is one of two batch bounds; the estimated token sum closes
+/// large-input batches earlier (see
+/// [`OPENAI_MAX_REQUEST_TOKENS_ESTIMATE`]).
 const MAX_BATCH_INPUTS: usize = 256;
+
+/// The estimated token sum one OpenAI embedding request may carry.
+///
+/// OpenAI enforces a 300,000-token sum across a request's inputs; the
+/// client-side split closes a batch under it, at an estimate the server
+/// cannot beat. The estimate divides UTF-8 byte length by
+/// [`CHARS_PER_TOKEN_ESTIMATE`], which over-counts multibyte text
+/// relative to the server's tokenizer — the conservative direction —
+/// and the 250,000 bound leaves headroom for its counter disagreeing
+/// with the heuristic on plain ASCII too.
+const OPENAI_MAX_REQUEST_TOKENS_ESTIMATE: usize = 250_000;
 
 /// The per-float byte estimate the response budget is derived from.
 ///
@@ -206,7 +221,7 @@ struct OpenAiEmbedUsage {
     total_tokens: u64,
 }
 
-/// Read a successful response body under the [`MAX_RESPONSE_BYTES`] budget.
+/// Read a successful response body under the caller's bounded budget.
 ///
 /// The content-length header is consulted first when present (an early,
 /// cheap refusal), then the stream is accumulated chunk by chunk so a
@@ -265,9 +280,11 @@ async fn read_body_bounded(
 /// # Errors
 ///
 /// Returns [`ApiError::api`] naming the first non-finite component's
-/// position — JSON cannot carry such a value onto this path, so seeing
-/// one means the vector did not come from a parsed response, and the
-/// failure is loud rather than a quiet zero vector.
+/// position. Both embedder paths run [`enforce_finite`] first —
+/// whether the parse itself refuses such values depends on
+/// `serde_json`'s `float_roundtrip` feature — so the check here is
+/// defense for direct callers, and the failure is loud rather than
+/// a quiet zero vector.
 fn l2_normalize_in_place(vector: &mut [f32]) -> Result<(), ApiError> {
     let mut scale = 0.0_f32;
     for (position, component) in vector.iter().enumerate() {
@@ -328,6 +345,56 @@ fn enforce_dimension(
         "{provider} embedding dimension mismatch: model {model} returned {received} \
          components, the embedder is configured for {expected}"
     )))
+}
+
+/// Verify every component of a returned vector is finite.
+///
+/// The companion of [`enforce_dimension`] on both embedder paths,
+/// whatever the `normalized` setting. Whether an out-of-range JSON
+/// exponent fails at the parse depends on `serde_json`'s feature set:
+/// the default float parser casts it to `f32` infinity silently,
+/// while the `float_roundtrip` feature refuses it — so this check is
+/// the configuration-independent gate. A vector carrying a non-finite
+/// component poisons cosine scoring to `NaN`, making ranking and dedup
+/// behave arbitrarily, so the answer is refused instead of indexed.
+///
+/// # Errors
+///
+/// Returns [`ApiError::api`] naming the first non-finite component's
+/// position.
+fn enforce_finite(provider: &str, model: &str, vector: &[f32]) -> Result<(), ApiError> {
+    if let Some(position) = vector.iter().position(|component| !component.is_finite()) {
+        return Err(ApiError::api(format!(
+            "{provider} embedding model {model} returned a non-finite component at \
+             position {position} — the answer is not usable"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse an optional dimension-valued environment variable.
+///
+/// Both embedder `from_env` profiles read one:
+/// `OLLAMA_EMBEDDING_DIM` and `OPENAI_EMBEDDING_DIMENSIONS`. Absent
+/// means the builder default — the model's own geometry — because a
+/// wrong guess there fails every embed loudly at the dimension check,
+/// so the variable is strictly opt-in.
+///
+/// # Errors
+///
+/// Returns [`ApiError::config_validation`] naming the variable and the
+/// unparseable value.
+fn optional_env_dimension(name: &str) -> Result<Option<usize>, ApiError> {
+    std::env::var(name).map_or_else(
+        |_| Ok(None),
+        |raw| {
+            raw.trim().parse::<usize>().map(Some).map_err(|error| {
+                ApiError::config_validation(format!(
+                    "{name} is not a valid dimension: {raw:?} ({error})"
+                ))
+            })
+        },
+    )
 }
 
 /// Emit the `embed.batch` metric event for one settled batch.
@@ -494,16 +561,20 @@ impl OllamaEmbedder {
     ///
     /// Reads `OLLAMA_EMBEDDING_MODEL` (**required** — deliberately not
     /// `OLLAMA_MODEL`, which names the chat model; conflating them
-    /// silently embeds with a chat model) and `OLLAMA_BASE_URL`
+    /// silently embeds with a chat model), `OLLAMA_BASE_URL`
     /// (optional, default `http://localhost:11434`; a chat-style `/v1`
-    /// suffix is trimmed). The dimension defaults to `nomic-embed-text`'s
-    /// 768 — pair a different-geometry model with the builder's
+    /// suffix is trimmed), and `OLLAMA_EMBEDDING_DIM` (optional — the
+    /// model's true output length for a non-768 geometry, e.g. `1024`
+    /// for `mxbai-embed-large`). The dimension defaults to
+    /// `nomic-embed-text`'s 768 — pair a different geometry with the
+    /// variable here or the builder's
     /// [`with_dim`](OllamaEmbedderBuilder::with_dim).
     ///
     /// # Errors
     ///
     /// Returns [`ApiError::config`] when `OLLAMA_EMBEDDING_MODEL` is not
-    /// set, and the builder's own validation otherwise.
+    /// set, [`ApiError::config_validation`] when `OLLAMA_EMBEDDING_DIM`
+    /// does not parse, and the builder's own validation otherwise.
     pub fn from_env() -> Result<Self, ApiError> {
         let model = std::env::var("OLLAMA_EMBEDDING_MODEL").map_err(|_| {
             ApiError::config(
@@ -516,10 +587,11 @@ impl OllamaEmbedder {
             |_| OLLAMA_DEFAULT_BASE_URL.to_string(),
             |raw| ollama_root_base(&raw),
         );
-        Self::builder()
-            .with_model(model)
-            .with_base_url(base_url)
-            .build()
+        let mut builder = Self::builder().with_model(model).with_base_url(base_url);
+        if let Some(dim) = optional_env_dimension("OLLAMA_EMBEDDING_DIM")? {
+            builder = builder.with_dim(dim);
+        }
+        builder.build()
     }
 
     /// The full `/api/embed` endpoint URL.
@@ -602,10 +674,14 @@ impl OllamaEmbedder {
         )
         .await
         .map_err(|error| match error {
-            ApiError::Http(message) => ApiError::http(format!(
-                "{message} — no embedding answer from {}; is `ollama serve` running?",
-                self.endpoint()
-            )),
+            ApiError::Http(message)
+                if crate::api::error::http_status_from_message(&message).is_none() =>
+            {
+                ApiError::http(format!(
+                    "{message} — no embedding answer from {}; is `ollama serve` running?",
+                    self.endpoint()
+                ))
+            }
             other => other,
         })?;
         let bytes = read_body_bounded(response, response_budget(self.dim)).await?;
@@ -621,6 +697,7 @@ impl OllamaEmbedder {
         let mut embeddings = Vec::with_capacity(parsed.embeddings.len());
         for mut vector in parsed.embeddings {
             enforce_dimension("ollama", &self.model, self.dim, vector.len())?;
+            enforce_finite("ollama", &self.model, &vector)?;
             if self.normalized {
                 l2_normalize_in_place(&mut vector)?;
             }
@@ -674,9 +751,10 @@ pub struct OllamaEmbedderBuilder {
 impl OllamaEmbedderBuilder {
     /// Point the embedder at `base_url` (the server root, no `/v1`).
     ///
-    /// The value is used verbatim after the shared chat-style `/v1`
-    /// trimming rule applies to environment reads — explicit builder
-    /// values are trusted as the root.
+    /// Trailing slashes are trimmed at build so the `/api/embed`
+    /// endpoint keeps a single slash, matching the chat client's
+    /// handling of the same override; a chat-style `/v1` suffix from
+    /// an environment read is trimmed as well.
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = Some(base_url.into());
@@ -769,7 +847,9 @@ impl OllamaEmbedderBuilder {
         }
         let base_url = self
             .base_url
-            .unwrap_or_else(|| OLLAMA_DEFAULT_BASE_URL.to_string());
+            .unwrap_or_else(|| OLLAMA_DEFAULT_BASE_URL.to_string())
+            .trim_end_matches('/')
+            .to_string();
         let endpoint = format!("{base_url}/api/embed");
         reqwest::Url::parse(&endpoint).map_err(|error| {
             ApiError::config_validation(format!(
@@ -785,6 +865,39 @@ impl OllamaEmbedderBuilder {
             normalized: self.normalized,
         })
     }
+}
+
+/// Split `texts` into OpenAI request batches.
+///
+/// A batch closes at [`MAX_BATCH_INPUTS`] inputs or when one more
+/// input's estimated tokens would pass
+/// [`OPENAI_MAX_REQUEST_TOKENS_ESTIMATE`] — whichever comes first — so
+/// no request can trip the server's summed-token ceiling. The estimate
+/// divides UTF-8 byte length by [`CHARS_PER_TOKEN_ESTIMATE`]. The
+/// first input of a batch always rides, even when its estimate alone
+/// exceeds the bound: a single oversized input is the per-input
+/// guard's rejection, not a batching decision.
+fn openai_batches<'t>(texts: &[&'t str]) -> Vec<Vec<&'t str>> {
+    let mut batches = Vec::new();
+    let mut current: Vec<&'t str> = Vec::new();
+    let mut tokens = 0_usize;
+    for &text in texts {
+        let estimate = text.len().div_ceil(CHARS_PER_TOKEN_ESTIMATE);
+        if !current.is_empty()
+            && (current.len() == MAX_BATCH_INPUTS
+                || tokens.saturating_add(estimate) > OPENAI_MAX_REQUEST_TOKENS_ESTIMATE)
+        {
+            batches.push(current);
+            current = Vec::new();
+            tokens = 0;
+        }
+        tokens = tokens.saturating_add(estimate);
+        current.push(text);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
 }
 
 /// The request body of one `/v1/embeddings` call.
@@ -880,10 +993,11 @@ fn bearer_header(api_key: &str) -> Result<reqwest::header::HeaderValue, ApiError
 /// (`256..=1536`), and any OpenAI-compatible embeddings server can be
 /// targeted through the base-URL override with honest naming.
 ///
-/// Batches split at `MAX_BATCH_INPUTS` inputs per request, every input
-/// is guarded against OpenAI's per-input token ceiling before any wire
-/// traffic, and the response's `data` array is reassembled by its `index`
-/// field — never by position, because the wire does not guarantee order.
+/// Batches split at `MAX_BATCH_INPUTS` inputs per request and at an
+/// estimated token sum per request, every input is guarded against
+/// OpenAI's per-input token ceiling before any wire traffic, and the
+/// response's `data` array is reassembled by its `index` field — never
+/// by position, because the wire does not guarantee order.
 ///
 /// # Example
 ///
@@ -979,19 +1093,24 @@ impl OpenAiEmbedder {
     /// Build from the OpenAI environment.
     ///
     /// Reads `OPENAI_API_KEY` (**required**), `OPENAI_BASE_URL`
-    /// (optional, default `https://api.openai.com/v1`), and
+    /// (optional, default `https://api.openai.com/v1`),
     /// `OPENAI_EMBEDDING_MODEL` (optional, default
-    /// `text-embedding-3-small`). The dimension follows the model default
-    /// — `text-embedding-3-large` and other geometries pair with the
-    /// builder's
+    /// `text-embedding-3-small`), and `OPENAI_EMBEDDING_DIMENSIONS`
+    /// (optional — the Matryoshka truncation, validated into the
+    /// enforced `256..=3072` range at build). Without the truncation
+    /// the dimension follows the model default —
+    /// `text-embedding-3-large` and other geometries pair with the
+    /// variable here or the builder's
     /// [`with_dimensions`](OpenAiEmbedderBuilder::with_dimensions),
-    /// anywhere in its enforced `256..=3072` range (3072 matching
-    /// 3-large's full-length output).
+    /// anywhere in that range (3072 matching 3-large's full-length
+    /// output).
     ///
     /// # Errors
     ///
     /// Returns [`ApiError::auth_invalid_key`] when `OPENAI_API_KEY` is
-    /// not set, and the builder's own validation otherwise.
+    /// not set, [`ApiError::config_validation`] when
+    /// `OPENAI_EMBEDDING_DIMENSIONS` does not parse, and the builder's
+    /// own validation otherwise.
     pub fn from_env() -> Result<Self, ApiError> {
         let api_key = std::env::var("OPENAI_API_KEY")
             .map_err(|_| ApiError::auth_invalid_key("OPENAI_API_KEY not set"))?;
@@ -999,11 +1118,14 @@ impl OpenAiEmbedder {
             .unwrap_or_else(|_| OPENAI_DEFAULT_BASE_URL.to_string());
         let model = std::env::var("OPENAI_EMBEDDING_MODEL")
             .unwrap_or_else(|_| OPENAI_DEFAULT_MODEL.to_string());
-        Self::builder()
+        let mut builder = Self::builder()
             .with_api_key(api_key)
             .with_base_url(base_url)
-            .with_model(model)
-            .build()
+            .with_model(model);
+        if let Some(dimensions) = optional_env_dimension("OPENAI_EMBEDDING_DIMENSIONS")? {
+            builder = builder.with_dimensions(dimensions);
+        }
+        builder.build()
     }
 
     /// The full `/embeddings` endpoint URL.
@@ -1044,10 +1166,12 @@ impl OpenAiEmbedder {
     /// the results in input order.
     ///
     /// An empty slice returns an empty vector without touching the wire;
-    /// every input passes the token guard before any HTTP traffic. Each
-    /// batch settles one `embed.batch` metric event — carrying the
-    /// request's usage pair when the server reports one — and a failed
-    /// batch aborts the call (partial results are never returned).
+    /// every input passes the token guard before any HTTP traffic, and
+    /// batches close at the input-count or estimated-token bound,
+    /// whichever comes first. Each batch settles one `embed.batch`
+    /// metric event — carrying the request's usage pair when the server
+    /// reports one — and a failed batch aborts the call (partial results
+    /// are never returned).
     ///
     /// # Errors
     ///
@@ -1059,9 +1183,9 @@ impl OpenAiEmbedder {
         }
         Self::guard_input_sizes(texts)?;
         let mut embeddings = Vec::with_capacity(texts.len());
-        for batch in texts.chunks(MAX_BATCH_INPUTS) {
+        for batch in openai_batches(texts) {
             let started = Instant::now();
-            match self.embed_batch_once(batch).await {
+            match self.embed_batch_once(&batch).await {
                 Ok((mut embedded, usage)) => {
                     emit_batch_metric(
                         "openai",
@@ -1143,6 +1267,7 @@ impl OpenAiEmbedder {
         let mut embeddings = Vec::with_capacity(data.len());
         for mut datum in data {
             enforce_dimension("openai", &self.model, self.dim, datum.embedding.len())?;
+            enforce_finite("openai", &self.model, &datum.embedding)?;
             if self.normalized {
                 l2_normalize_in_place(&mut datum.embedding)?;
             }
@@ -1224,8 +1349,9 @@ impl OpenAiEmbedderBuilder {
 
     /// Point the embedder at `base_url` (the API root, `/v1` included).
     ///
-    /// The value is used verbatim, exactly like the chat client's
-    /// override — one `OPENAI_BASE_URL` moves both.
+    /// Trailing slashes are trimmed at build so the `/embeddings`
+    /// endpoint keeps a single slash — the chat client's handling of
+    /// the same override — and one `OPENAI_BASE_URL` moves both.
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = Some(base_url.into());
@@ -1333,7 +1459,9 @@ impl OpenAiEmbedderBuilder {
         }
         let base_url = self
             .base_url
-            .unwrap_or_else(|| OPENAI_DEFAULT_BASE_URL.to_string());
+            .unwrap_or_else(|| OPENAI_DEFAULT_BASE_URL.to_string())
+            .trim_end_matches('/')
+            .to_string();
         let endpoint = format!("{base_url}/embeddings");
         reqwest::Url::parse(&endpoint).map_err(|error| {
             ApiError::config_validation(format!(
@@ -1471,6 +1599,57 @@ mod tests {
             super::response_budget(10_000_000),
             super::MAX_RESPONSE_BUDGET_BYTES,
             "an absurd dimension clamps down to the ceiling — hostile streams stay bounded"
+        );
+    }
+
+    #[test]
+    fn openai_batches_close_on_the_estimated_token_sum() {
+        let plain = "x".repeat(40_000);
+        let inputs: Vec<&str> = vec![plain.as_str(); 30];
+        let sizes: Vec<usize> = super::openai_batches(&inputs)
+            .iter()
+            .map(Vec::len)
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![25, 5],
+            "twenty-five 40,000-byte inputs reach the 250,000-token estimate exactly; \
+             the twenty-sixth opens a new batch"
+        );
+        let wide = "é".repeat(20_000);
+        let multibyte: Vec<&str> = vec![wide.as_str(); 30];
+        let sizes: Vec<usize> = super::openai_batches(&multibyte)
+            .iter()
+            .map(Vec::len)
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![25, 5],
+            "the estimate divides UTF-8 byte length, not char count — 20,000 two-byte \
+             characters count like 40,000 ASCII ones"
+        );
+    }
+
+    #[test]
+    fn openai_batches_keep_the_input_count_cap_and_ride_a_lone_oversized_input() {
+        let inputs: Vec<String> = (0..300).map(|index| format!("input {index}")).collect();
+        let borrowed: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        let sizes: Vec<usize> = super::openai_batches(&borrowed)
+            .iter()
+            .map(Vec::len)
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![256, 44],
+            "tiny inputs split at the 256-input cap — the wire pin's shape"
+        );
+        let oversized = "x".repeat(1_200_000);
+        let lone = super::openai_batches(&[oversized.as_str()]);
+        assert_eq!(
+            lone,
+            vec![vec![oversized.as_str()]],
+            "an input whose estimate alone exceeds the bound rides its own batch — \
+             rejection is the per-input guard's job"
         );
     }
 
@@ -1647,12 +1826,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn enforce_finite_names_the_first_offending_position() {
+        for garbage in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = super::enforce_finite(
+                "openai",
+                "text-embedding-3-small",
+                &[1.0, garbage, f32::NAN],
+            )
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("non-finite")
+                    && message.contains("position 1")
+                    && message.contains("openai")
+                    && message.contains("text-embedding-3-small"),
+                "the failure names the provider, the model, and the first offending \
+                 position: {message}"
+            );
+        }
+        assert!(
+            super::enforce_finite("ollama", "nomic-embed-text", &[0.0, 1.5, -2.5]).is_ok(),
+            "an all-finite vector passes untouched"
+        );
+    }
+
     #[cfg(all(feature = "ollama", feature = "testing"))]
     #[test]
     fn ollama_from_env_requires_the_embedding_model_var() {
-        let env = crate::testing::EnvGuard::acquire(&["OLLAMA_EMBEDDING_MODEL", "OLLAMA_BASE_URL"]);
+        let env = crate::testing::EnvGuard::acquire(&[
+            "OLLAMA_EMBEDDING_MODEL",
+            "OLLAMA_BASE_URL",
+            "OLLAMA_EMBEDDING_DIM",
+        ]);
         env.remove("OLLAMA_EMBEDDING_MODEL");
         env.remove("OLLAMA_BASE_URL");
+        env.remove("OLLAMA_EMBEDDING_DIM");
         let error = super::OllamaEmbedder::from_env().unwrap_err();
         assert!(
             error
@@ -1671,6 +1880,19 @@ mod tests {
             embedder.base_url, "http://gpu-box:11434",
             "a chat-style base URL is normalized to the server root"
         );
+        env.set("OLLAMA_EMBEDDING_DIM", "1024");
+        let dimensional = super::OllamaEmbedder::from_env().unwrap();
+        assert_eq!(
+            dimensional.dim, 1024,
+            "the dimension variable pins a non-default geometry"
+        );
+        env.set("OLLAMA_EMBEDDING_DIM", "wide");
+        let error = super::OllamaEmbedder::from_env().unwrap_err();
+        assert!(
+            matches!(error, crate::api::error::ApiError::Config(_))
+                && error.to_string().contains("OLLAMA_EMBEDDING_DIM"),
+            "an unparseable dimension is a config validation naming the variable: {error}"
+        );
     }
 
     #[cfg(feature = "testing")]
@@ -1680,10 +1902,12 @@ mod tests {
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_EMBEDDING_MODEL",
+            "OPENAI_EMBEDDING_DIMENSIONS",
         ]);
         env.remove("OPENAI_API_KEY");
         env.remove("OPENAI_BASE_URL");
         env.remove("OPENAI_EMBEDDING_MODEL");
+        env.remove("OPENAI_EMBEDDING_DIMENSIONS");
         let error = OpenAiEmbedder::from_env().unwrap_err();
         assert!(
             error.to_string().contains("OPENAI_API_KEY"),
@@ -1709,6 +1933,19 @@ mod tests {
         assert_eq!(
             overridden.base_url, "https://proxy.example/v1",
             "the env var overrides the API root"
+        );
+        env.set("OPENAI_EMBEDDING_DIMENSIONS", "512");
+        let truncated = OpenAiEmbedder::from_env().unwrap();
+        assert_eq!(
+            truncated.dim, 512,
+            "the dimensions variable pins the truncation"
+        );
+        env.set("OPENAI_EMBEDDING_DIMENSIONS", "small");
+        let error = OpenAiEmbedder::from_env().unwrap_err();
+        assert!(
+            matches!(error, crate::api::error::ApiError::Config(_))
+                && error.to_string().contains("OPENAI_EMBEDDING_DIMENSIONS"),
+            "an unparseable truncation is a config validation naming the variable: {error}"
         );
     }
 }

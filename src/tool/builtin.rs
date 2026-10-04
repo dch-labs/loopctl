@@ -37,6 +37,9 @@ pub mod think;
 #[cfg(feature = "fs_tools")]
 pub mod fs;
 
+#[cfg(feature = "search_tools")]
+pub mod search;
+
 pub use read::{ContentSource, ReadTool};
 pub use think::ThinkTool;
 

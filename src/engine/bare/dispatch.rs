@@ -1271,10 +1271,23 @@ impl<C: ApiClient> BareLoop<C> {
     /// one dispatch by one name.
     #[cfg(feature = "tool_health")]
     fn health_key(tc: &ToolCall, tool_result: &ToolDispatchResult) -> String {
+        Self::executed_tool_name(tc, tool_result).to_string()
+    }
+
+    /// The tool name a dispatch actually executed.
+    ///
+    /// Middleware may redirect a call to a different registered tool;
+    /// the result's `resolved_tool_name` records what ran, and the
+    /// requested name is the fallback for results that never set it.
+    /// Policy that follows execution — health keys, trajectory
+    /// recording — resolves through this, never through the raw
+    /// requested name, so a redirect cannot move a call outside the
+    /// policy of the tool that ran.
+    fn executed_tool_name<'a>(tc: &'a ToolCall, tool_result: &'a ToolDispatchResult) -> &'a str {
         if tool_result.resolved_tool_name.is_empty() {
-            tc.tool.clone()
+            tc.tool.as_str()
         } else {
-            tool_result.resolved_tool_name.clone()
+            tool_result.resolved_tool_name.as_str()
         }
     }
 
@@ -1301,7 +1314,8 @@ impl<C: ApiClient> BareLoop<C> {
         }
         if self
             .tools
-            .get(&tc.tool)
+            .get(Self::executed_tool_name(tc, tool_result))
+            .or_else(|| self.tools.get(&tc.tool))
             .is_some_and(|tool| !tool.records_trajectory())
         {
             return;

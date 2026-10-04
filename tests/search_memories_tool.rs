@@ -1558,3 +1558,132 @@ async fn the_passive_memory_key_after_a_search_is_the_tool_result() {
          feed: {queries:?}"
     );
 }
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn a_redirected_search_still_opts_out_of_trajectory_recording() {
+    use loopctl::config::SessionConfig;
+    use loopctl::engine::Loop;
+    use loopctl::engine::{BareLoop, RunConfig};
+    use loopctl::middleware::ToolDispatchContext;
+    use loopctl::middleware::ToolMiddleware;
+    use loopctl::middleware::ToolPipeline;
+    use loopctl::testing::MockApiClient;
+    use loopctl::tool::ToolRegistry;
+    use loopctl::tool::{ToolOutput, ToolSchema};
+
+    struct RedirectMiddleware;
+
+    impl ToolMiddleware for RedirectMiddleware {
+        fn name(&self) -> &'static str {
+            "redirect"
+        }
+        fn dispatch<'a>(
+            &'a self,
+            ctx: &'a mut ToolDispatchContext,
+            next: &'a ToolPipeline,
+        ) -> Pin<Box<dyn Future<Output = loopctl::middleware::ToolDispatchResult> + Send + 'a>>
+        {
+            let redirected = ctx.tool_name == "search_memories";
+            if redirected {
+                ctx.tool_name = "recall".to_string();
+            }
+            Box::pin(async move {
+                let result = next.dispatch(ctx).await;
+                if redirected {
+                    return result.with_tool_name("recall");
+                }
+                result
+            })
+        }
+    }
+
+    struct FacadeTool;
+
+    impl Tool for FacadeTool {
+        fn name(&self) -> &'static str {
+            "search_memories"
+        }
+        fn description(&self) -> &'static str {
+            "A recording facade the redirect replaces"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(
+                self.name(),
+                self.description(),
+                serde_json::json!({"type": "object"}),
+            )
+        }
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async { Ok(ToolOutput::text("facade output")) })
+        }
+    }
+
+    let store = Arc::new(InMemoryStore::new());
+    store
+        .store(MemoryEntry::new(
+            MemoryCategory::Fact,
+            "the launch code is ARC-7",
+        ))
+        .await
+        .unwrap();
+    let responses = vec![
+        search_call("s1", "launch code"),
+        plain_call("p1"),
+        terminal_response(),
+    ];
+    let mut registry = ToolRegistry::new();
+    registry.register(FacadeTool);
+    registry.register(
+        SearchMemoriesTool::new(Arc::clone(&store) as Arc<dyn LoopMemory>).with_name("recall"),
+    );
+    registry.register(engine_tools::PlainTool);
+    let mut loop_ = BareLoop::new(
+        Arc::new(MockApiClient::new("m").with_responses(responses)),
+        registry,
+        SessionConfig::default(),
+    );
+    loop_
+        .set_pipeline(ToolPipeline::builder().with_middleware(RedirectMiddleware))
+        .expect("static pipeline composition is valid");
+    loop_.set_memory(Arc::clone(&store) as Arc<dyn LoopMemory>);
+    loop_
+        .run(
+            "search through the facade redirect, then record",
+            &RunConfig::default(),
+        )
+        .await
+        .unwrap();
+
+    let stored = store.retrieve("", usize::MAX).await.unwrap();
+    let trajectories: Vec<&MemoryEntry> = stored
+        .iter()
+        .filter(|entry| entry.memory.starts_with("tool="))
+        .collect();
+    assert_eq!(
+        trajectories.len(),
+        1,
+        "exactly one trajectory entry lands — the plain call; the redirected search's \
+         output must not: {:?}",
+        trajectories
+            .iter()
+            .map(|entry| &entry.memory)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        trajectories[0].memory.contains("VICTOR-3"),
+        "the un-redirected recording tool still records — the opt-out follows the \
+         executed tool, not the existence of redirection"
+    );
+    assert!(
+        trajectories
+            .iter()
+            .all(|entry| !entry.memory.contains("Relevant memory")),
+        "the redirected search's rendered output never lands in the store — the \
+         opt-out resolves through resolved_tool_name, closing the redirect miss"
+    );
+}

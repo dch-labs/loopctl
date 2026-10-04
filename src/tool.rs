@@ -1747,7 +1747,11 @@ pub trait Tool: Send + Sync {
     /// results are themselves read from that same store must override
     /// this to `false`: a store-search tool that records would store its
     /// own answers, and the next search would return them — the tool
-    /// feeding on its own output. Defaults to `true`.
+    /// feeding on its own output. The engine resolves the tool that
+    /// actually executed — the result's `resolved_tool_name` when
+    /// middleware redirected the call — before consulting this flag,
+    /// so a redirect cannot smuggle an opted-out tool's output into
+    /// the store. Defaults to `true`.
     fn records_trajectory(&self) -> bool {
         true
     }

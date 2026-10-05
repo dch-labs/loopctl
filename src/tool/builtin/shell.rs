@@ -159,7 +159,10 @@ pub trait ShellBackend: Send + Sync {
 /// is the other half of that contract. Not read-only; concurrency
 /// is decided per input by an allowlist of read-only command
 /// prefixes (read-only commands dispatch in parallel with other
-/// reads, everything else runs serialized).
+/// reads, everything else runs serialized). Registering the tool
+/// grants the model the host account's execution authority: the
+/// working directory is a starting point, not a sandbox, so the
+/// host decides what registering this tool permits.
 pub struct ShellTool<B: ShellBackend + 'static> {
     /// The backend commands run through.
     ///
@@ -391,7 +394,13 @@ const READ_ONLY_PREFIXES: &[&str] = &[
 /// regardless of the words around it — a pipeline or redirection can
 /// have side effects even when every word looks read-only, and a bare
 /// `&` backgrounds the command, whose lifetime then escapes the call.
-const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", "`", "$(", ">", ">>", "<", "&"];
+/// A `$` or `{` disqualifies for a different reason: the shell expands
+/// parameters (`${IFS}`, `$HOME`), command substitutions (`$(…)`),
+/// ANSI-C quoting (`$'…'`), and brace expansions (`{a,b}`) into words
+/// *after* the command text is matched, so any command carrying one
+/// executes words the checks never saw. Refusing is conservative — a
+/// benign `echo $HOME` runs serialized — which is the safe direction.
+const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", "`", "$", "{", ">", ">>", "<", "&"];
 
 /// Substrings that make an otherwise-allowlisted command unsafe.
 ///
@@ -512,7 +521,10 @@ fn is_read_only_command(input: &Value) -> bool {
 /// escaped argument cannot slip an unsafe flag past checks that
 /// match space-separated text — a tab-separated `find . -delete`, `find .
 /// "-delete"`, and `git branch \-D` normalize to the same literal
-/// forms the denylist guards.
+/// forms the denylist guards. The collapse is purely lexical: it
+/// sees only the literal text, never the words run-time expansion
+/// produces, so expansion-bearing commands are refused outright by
+/// the operator check rather than normalized.
 fn shell_normalized(command: &str) -> String {
     command
         .replace(['"', '\'', '\\'], "")
@@ -699,10 +711,34 @@ mod tests {
             "find . -exec rm {} \";",
             "find . -fls log",
             "find . -fprint out",
+            "find . ${IFS}-delete",
+            "find . $'-delete'",
+            "find . {-delete,}",
         ] {
             assert!(
                 !is_read_only_command(&json!({ "command": command })),
-                "find's mutating flags must not ride the read-only prefix: {command}"
+                "find's mutating flags must not ride the read-only prefix, spelled literally \
+                 or through shell expansion: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrency_check_shell_expansion_spellings_unsafe() {
+        for command in [
+            "find . ${IFS}-delete",
+            "find . $'-delete'",
+            "find . {-delete,}",
+            "find . $IFS-delete",
+            "find . \"${IFS}-delete\"",
+            "cat $(echo hi)",
+            "ls ${PWD}",
+            "echo $HOME",
+        ] {
+            assert!(
+                !is_read_only_command(&json!({ "command": command })),
+                "the shell expands '$' and '{{' into words the checked text never shows, so \
+                 the command must run serialized: {command}"
             );
         }
     }

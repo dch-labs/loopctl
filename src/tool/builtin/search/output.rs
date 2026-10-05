@@ -12,6 +12,14 @@
 //! created, the file cannot be written) degrades gracefully to inline
 //! truncation: the caller always gets a usable result, never an error
 //! from this module.
+//!
+//! Spill lifecycle: files land under the temp directory the caller's
+//! `ToolContext` names — under the engine that is the per-session
+//! subdir removed when the loop drops. A direct context caller (or a
+//! host whose managed session directory could not be created and fell
+//! back to process-wide temp) owns cleaning what it passed; degraded
+//! attempts remove every file they created, and no pointer is
+//! returned unless every chunk reached disk.
 
 use std::io::Write;
 use std::path::Path;
@@ -60,8 +68,9 @@ static SPILL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Every failure mode (the temp directory cannot be created, a file
 /// cannot be written, the disk fills) degrades to inline truncation
 /// with a note — the function never returns an error and never
-/// panics, and chunks already written before the failure are
-/// removed so a degraded result never leaves orphaned files.
+/// panics, and every spill file the attempt created, including the
+/// one whose write failed, is removed so a degraded result never
+/// leaves orphaned files.
 #[must_use]
 pub fn truncate_or_spill(
     content: String,
@@ -86,20 +95,11 @@ pub fn truncate_or_spill(
     let budget =
         usize::try_from(crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES).unwrap_or(usize::MAX);
     let chunks = split_into_chunks(&content, budget);
-    let mut written: Vec<PathBuf> = Vec::new();
-    for chunk in &chunks {
-        let spill_path = spill_file_path(temp_dir, tool_name);
-        let Some(mut file) = create_spill_file(&spill_path) else {
-            remove_orphans(&written);
-            return ToolOutput::text(truncate_inline(&content));
-        };
-        if file.write_all(chunk.as_bytes()).is_err() {
-            remove_orphans(&written);
-            return ToolOutput::text(truncate_inline(&content));
-        }
-        drop(file);
-        written.push(spill_path);
-    }
+    let Some(written) = spill_chunks(temp_dir, tool_name, &chunks, |file, chunk| {
+        file.write_all(chunk.as_bytes())
+    }) else {
+        return ToolOutput::text(truncate_inline(&content));
+    };
 
     let preview = preview_slice(&content);
     let pointer = if let [only] = written.as_slice() {
@@ -122,6 +122,42 @@ pub fn truncate_or_spill(
     ToolOutput::text(format!(
         "{pointer}preview (first ~10 `KiB`):\n{preview}\n\nuse the Read tool on the path above to view the full content"
     ))
+}
+
+/// Write every chunk to its own spill file, or `None` on any failure.
+///
+/// One chunk per file, each path from [`spill_file_path`], each file
+/// from [`create_spill_file`]. A file joins the ownership list the
+/// moment it is created — before its write — so a failure anywhere
+/// (this chunk's write, a later chunk's creation) cleans every file
+/// the attempt made, including a partially written current chunk.
+/// The write step is a parameter so that failure path is pinnable
+/// without conjuring a full disk; production passes a `write_all`
+/// closure over the chunk's bytes.
+fn spill_chunks<F>(
+    temp_dir: &Path,
+    tool_name: &str,
+    chunks: &[&str],
+    mut write: F,
+) -> Option<Vec<PathBuf>>
+where
+    F: FnMut(&mut std::fs::File, &str) -> std::io::Result<()>,
+{
+    let mut written: Vec<PathBuf> = Vec::new();
+    for chunk in chunks {
+        let spill_path = spill_file_path(temp_dir, tool_name);
+        let Some(mut file) = create_spill_file(&spill_path) else {
+            remove_orphans(&written);
+            return None;
+        };
+        written.push(spill_path);
+        if write(&mut file, chunk).is_err() {
+            drop(file);
+            remove_orphans(&written);
+            return None;
+        }
+    }
+    Some(written)
 }
 
 /// Best-effort removal of spill files a degraded result must disown.
@@ -151,7 +187,10 @@ fn remove_orphans(written: &[PathBuf]) {
 /// named tool can actually open. Chunks break on newlines — every
 /// tool body is line-oriented (pretty JSON rows, rendered listings) —
 /// and reassemble to the original bytes exactly; a body that fits the
-/// budget comes back as one chunk. A single line longer than the
+/// budget comes back as one chunk. A final suffix with no trailing
+/// newline gets the same budget check at the last line boundary, so
+/// unterminated output (`CodeSearch` renders without a final newline)
+/// cannot ride one over-budget chunk. A single line longer than the
 /// budget lands alone in its own chunk rather than being split
 /// mid-line (no in-family body produces one: matching lines are
 /// bounded by the per-file read cap).
@@ -177,6 +216,10 @@ fn split_into_chunks(content: &str, budget: usize) -> Vec<&str> {
         }
     }
     if start < content.len() {
+        if content.len().saturating_sub(start) > budget && boundary > start {
+            chunks.push(&content[start..boundary]);
+            start = boundary;
+        }
         chunks.push(&content[start..]);
     }
     chunks
@@ -386,6 +429,58 @@ mod tests {
         assert_eq!(chunks, vec!["one\ntwo\n"], "no split under the budget");
     }
 
+    /// An unterminated final suffix must not escape the chunk budget.
+    ///
+    /// Fail-first pin for the PR review's open finding: the loop
+    /// checked the budget only at newlines, so `"aaaaa\nbbbbbbbb"`
+    /// under a 10-byte budget rode one 14-byte chunk — and a real
+    /// unterminated body could push a spill file past the Read
+    /// ceiling after the pointer had already named it.
+    #[test]
+    fn a_final_suffix_with_no_trailing_newline_cannot_escape_the_budget() {
+        let chunks = split_into_chunks("aaaaa\nbbbbbbbb", 10);
+        assert_eq!(
+            chunks,
+            vec!["aaaaa\n", "bbbbbbbb"],
+            "the unterminated tail must split at the last line boundary: {chunks:?}"
+        );
+        assert_eq!(
+            chunks.concat(),
+            "aaaaa\nbbbbbbbb",
+            "chunks must reassemble the body exactly"
+        );
+    }
+
+    /// A failed chunk write removes every file the attempt created.
+    ///
+    /// Fail-first pin for the retained cleanup concern: ownership of
+    /// a spill file begins at creation, not at write success —
+    /// otherwise the partially written current chunk lingers behind
+    /// a degraded result that names no path for anyone to find.
+    #[test]
+    fn a_failed_chunk_write_removes_every_file_including_the_current_one() {
+        use std::io::Write as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chunks = vec!["first\n", "second\n"];
+        let mut attempts = 0;
+        let outcome = spill_chunks(tmp.path(), "grep", &chunks, |file, chunk| {
+            attempts += 1;
+            if attempts == 2 {
+                return Err(std::io::Error::other("injected write failure"));
+            }
+            file.write_all(chunk.as_bytes())
+        });
+        assert!(
+            outcome.is_none(),
+            "an injected write failure must degrade the whole spill"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
+        assert!(
+            leftovers.is_empty(),
+            "a degraded spill must leave nothing behind, not even the partially written chunk: {leftovers:?}"
+        );
+    }
+
     #[test]
     fn oversized_spills_chunk_under_the_read_ceiling_and_name_every_file() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -403,6 +498,54 @@ mod tests {
         let text = out.text_content();
         assert!(text.contains("full output written to 2 files"), "{text}");
         assert!(text.contains("use the Read tool"), "{text}");
+        let prefix = tmp.path().to_string_lossy().into_owned();
+        let mut paths = Vec::new();
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find(&prefix) {
+            let after = &rest[at..];
+            let end = after.find('\n').unwrap_or(after.len());
+            paths.push(after[..end].trim().to_string());
+            rest = &rest[at + end..];
+        }
+        assert_eq!(paths.len(), 2, "both chunk paths must be named: {text}");
+        let mut reassembled = String::new();
+        for path in &paths {
+            let spilled = std::path::Path::new(path);
+            let len = std::fs::metadata(spilled).unwrap().len();
+            assert!(
+                len <= crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES,
+                "each chunk must stay at or under the read ceiling: {len}"
+            );
+            reassembled.push_str(&std::fs::read_to_string(spilled).unwrap());
+        }
+        assert_eq!(reassembled, body, "the chunks must carry the whole body");
+    }
+
+    /// An unterminated body still chunks under the Read ceiling.
+    ///
+    /// The end-to-end arm of the unterminated-suffix fix, in
+    /// `CodeSearch`'s shape — rendered output with no trailing
+    /// newline: a head that fills a chunk to just under the ceiling
+    /// plus a short tail must still land as files the named tool
+    /// will open, reassembling to the exact body.
+    #[test]
+    fn oversized_unterminated_spills_chunk_under_the_read_ceiling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ceiling = usize::try_from(crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES)
+            .unwrap_or(usize::MAX);
+        let line = format!("{}\n", "needle".repeat(64));
+        let head_target = ceiling.saturating_sub(100);
+        let mut head = line.repeat(head_target / line.len());
+        let shortfall = head_target - head.len();
+        if shortfall > 0 {
+            head.push_str(&"p".repeat(shortfall - 1));
+            head.push('\n');
+        }
+        let body = format!("{head}{}", "t".repeat(200));
+        assert!(body.len() > ceiling, "the fixture must exceed the ceiling");
+        let out = truncate_or_spill(body.clone(), "code_search", tmp.path(), 64);
+        let text = out.text_content();
+        assert!(text.contains("full output written to 2 files"), "{text}");
         let prefix = tmp.path().to_string_lossy().into_owned();
         let mut paths = Vec::new();
         let mut rest = text.as_str();

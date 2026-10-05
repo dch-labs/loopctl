@@ -8,6 +8,16 @@
 //! implementation ships here, and a remote source (a `GitHub` tree at a
 //! pinned revision, for a difftrace-style consumer) can serve the same
 //! tools later without touching them.
+//!
+//! Security trust boundary: the registered source *is* the authority
+//! boundary. [`FsSearchSource`] applies no containment policy — a
+//! recorded port decision (the walker is read-only and the fs-session
+//! machinery is `fs_tools`-gated), so its search roots resolve
+//! lexically and its reads go wherever the process's own permissions
+//! allow. A host that runs contained filesystem tools should register
+//! a source enforcing its own boundary — the seam exists for exactly
+//! that — or treat an `FsSearchSource` registration as granting
+//! unrestricted read access.
 
 pub mod code_search;
 pub mod content;
@@ -169,6 +179,13 @@ impl<S: SearchSource> SearchSource for std::sync::Arc<S> {
 /// Delegates to the [`walk`] module's gitignore-aware machinery and
 /// plain filesystem reads — the behavior the search family was ported
 /// with, preserved as one implementation of the seam.
+///
+/// Trust boundary: this implementation carries no containment
+/// policy — roots resolve lexically against the context cwd and
+/// reads go wherever the process's own permissions allow. The host
+/// that registers it chooses that authority; a host that wants a
+/// contained search should supply its own [`SearchSource`] that
+/// enforces the boundary before serving entries.
 #[derive(Debug, Clone, Default)]
 pub struct FsSearchSource;
 

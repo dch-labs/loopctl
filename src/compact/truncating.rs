@@ -672,10 +672,11 @@ pub struct SplitResult {
     /// The index in the original message list where the split occurred.
     ///
     /// Zero when no split was needed (the entire conversation was
-    /// preserved), or when no cut can keep the kept side self-contained —
-    /// every candidate boundary, even slid back to its straddling call,
-    /// would orphan a kept tool result, so the whole conversation stays
-    /// preserved.
+    /// preserved), when no assistant-to-user boundary exists at or
+    /// before the target (an all-user history offers no cut), or when
+    /// no cut can keep the kept side self-contained — every candidate
+    /// boundary, even slid back to its straddling call, would orphan a
+    /// kept tool result, so the whole conversation stays preserved.
     pub split_index: usize,
 }
 
@@ -769,7 +770,8 @@ impl TokenSplitter {
     /// applied to its fixed point (the adjustment is non-increasing
     /// and bottoms out at zero, the truncator's own convergence
     /// argument); among candidates that all slide, the furthest-forward
-    /// slide wins. Zero is returned only when nothing can be split off
+    /// slide wins. Zero is returned when no assistant-to-user boundary
+    /// exists at or before the target, or when nothing can be split off
     /// without orphaning a kept result — the whole conversation stays
     /// preserved.
     fn find_turn_boundary(messages: &[Message], target: usize) -> usize {

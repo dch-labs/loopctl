@@ -16,11 +16,12 @@ use tokio::sync::broadcast;
 
 use super::LoopObserver;
 use super::context::{
-    AttemptResetContext, CompactedContext, CompactionFailedContext, ConvergenceDetectedContext,
-    FallbackContext, GateDecisionContext, LoopDetectedContext, ModelSwitchedContext,
-    PreCompactionContext, ResponseContext, RunEndContext, RunStartContext, StreamContext,
-    StreamFailureContext, TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext,
-    ToolPostContext, ToolPreContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
+    AttemptResetContext, BudgetWarnContext, CompactedContext, CompactionFailedContext,
+    ConvergenceDetectedContext, FallbackContext, GateDecisionContext, LoopDetectedContext,
+    ModelSwitchedContext, PreCompactionContext, ResponseContext, RunEndContext, RunStartContext,
+    StreamContext, StreamFailureContext, TextDeltaContext, ThinkingDeltaContext,
+    ToolCallReceivedContext, ToolPostContext, ToolPreContext, TransportFallbackContext,
+    TurnEndContext, TurnStartContext,
 };
 
 /// One observed lifecycle moment of a run, as forwarded by [`EventHub`].
@@ -96,6 +97,13 @@ pub enum LoopEvent {
     /// One per gated dispatch, when the deciding record becomes final:
     /// the verdict, argument digest, and rule provenance as one record.
     GateDecision(GateDecisionContext),
+
+    /// A budget line's soft threshold was crossed.
+    ///
+    /// One per dimension per run, at the first pre-request check past
+    /// the derived soft line: the dimension, the spend, and the hard
+    /// limit it derives from.
+    BudgetWarn(BudgetWarnContext),
 
     /// A tool call was accumulated, before dispatch.
     ///
@@ -410,6 +418,16 @@ impl LoopObserver for EventHub {
     }
 
     /// Forwards
+    /// [`on_budget_warn`](LoopObserver::on_budget_warn) as a
+    /// [`BudgetWarn`](LoopEvent::BudgetWarn) event.
+    ///
+    /// One per dimension per run; the context is small and plain,
+    /// so the forward clones only the event's own copy.
+    fn on_budget_warn(&self, ctx: &BudgetWarnContext) {
+        self.publish(LoopEvent::BudgetWarn(ctx.clone()));
+    }
+
+    /// Forwards
     /// [`on_tool_call_received`](LoopObserver::on_tool_call_received)
     /// as a [`ToolCallReceived`](LoopEvent::ToolCallReceived) event.
     ///
@@ -536,6 +554,7 @@ mod tests {
             LoopEvent::ThinkingDelta(_) => "thinking_delta",
             LoopEvent::AttemptReset(_) => "attempt_reset",
             LoopEvent::GateDecision(_) => "gate_decision",
+            LoopEvent::BudgetWarn(_) => "budget_warn",
             LoopEvent::ToolCallReceived(_) => "tool_call_received",
             LoopEvent::ToolPre(_) => "tool_pre",
             LoopEvent::ToolPost(_) => "tool_post",

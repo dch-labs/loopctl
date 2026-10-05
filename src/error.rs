@@ -69,6 +69,8 @@
 ///   the variant.
 /// - [`CompactionStalled`](LoopError::CompactionStalled) — Compaction
 ///   made no progress on this conversation.
+/// - [`BudgetExhausted`](LoopError::BudgetExhausted) — A budget line
+///   was crossed; the gate refused the next model request.
 /// - [`LockPoisoned`](LoopError::LockPoisoned) — A mutex protecting a
 ///   multi-field state machine (fallback, detection, rate limiting) was
 ///   found poisoned; the state may be desynchronised and must not be
@@ -248,8 +250,10 @@ pub enum LoopError {
     /// (the conversation's size and the window it had to fit).
     ///
     /// Recoverable, like `ContextExceeded`: the failure may be
-    /// transient, and a retry re-attempts the pass. Constructed by the
-    /// engine from the
+    /// transient, and a retry re-attempts the pass — the failed run's
+    /// coherent prefix is salvaged into history, so the retry continues
+    /// the conversation instead of restarting from the pre-run state.
+    /// Constructed by the engine from the
     /// [`ContextOverflow`](crate::compact::types::ContextOverflow)
     /// the manager returns when `compactor_error` is set.
     #[error("Compaction failed: {cause} (used {used} of {limit} tokens)")]
@@ -280,9 +284,9 @@ pub enum LoopError {
     /// Compaction made no progress on this conversation.
     ///
     /// The machine's no-progress guard: a compaction feed reported a
-    /// post-pass size at or above the pre-pass size, so another model
-    /// call would exceed the window and re-compacting cannot shrink
-    /// the conversation. Distinguishable from a genuine over-window
+    /// post-pass size at or above the pre-pass size, so re-compacting
+    /// cannot shrink the conversation past the line that triggered the
+    /// pass. Distinguishable from a genuine over-window
     /// refusal ([`ContextExceeded`](LoopError::ContextExceeded)) by
     /// variant, and deliberately claims no token limit at all — the
     /// pre-fix wording ("used N of N tokens") misread a stall as a
@@ -298,6 +302,36 @@ pub enum LoopError {
         /// equal to (or above) the pre-pass measurement that triggered
         /// the guard.
         used: u64,
+    },
+
+    /// A budget line was crossed, refusing the next model request.
+    ///
+    /// The run's spend reached a configured hard ceiling, and the
+    /// budget gate refused the request before it was sent — the
+    /// litellm `max_budget` shape. Not recoverable: more spend is
+    /// exactly what the line exists to prevent, so a retry with the
+    /// same inputs would repeat the refusal. The dimension names
+    /// which line (tokens, turns, or wall-clock); `spent` and
+    /// `limit` carry the numbers for diagnostics and reporting.
+    #[error("Budget exhausted: {dimension} spent {spent} of {limit}")]
+    BudgetExhausted {
+        /// The budget line that was crossed.
+        ///
+        /// Tokens, turns, or wall-clock — the one vocabulary every
+        /// budget surface shares.
+        dimension: crate::budget::BudgetDimension,
+
+        /// The spend at the refusal.
+        ///
+        /// Tokens or turns counted, or elapsed milliseconds when the
+        /// dimension is wall-clock.
+        spent: u64,
+
+        /// The hard ceiling that was crossed.
+        ///
+        /// The configured limit, not the derived soft line — the
+        /// number the operator set.
+        limit: u64,
     },
 
     /// A mutex protecting multi-field state with cross-field invariants

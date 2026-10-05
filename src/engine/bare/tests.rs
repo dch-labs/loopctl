@@ -2680,37 +2680,85 @@ async fn compaction_then_cancellation_leaves_history_compacted() {
     agent.run("third run", &RunConfig::default()).await.unwrap();
 }
 
+/// A compaction double that always succeeds by shrinking to one small
+/// message.
+///
+/// The sequence pin needs a pass that succeeds deterministically at
+/// whatever growth point the window threshold trips, so the placement
+/// assertion observes a completed `on_compaction` rather than a
+/// failure path; the shrunken history is small enough that the run
+/// continues under the same threshold instead of re-tripping.
+struct ShrinkingPassCompactor;
+
+impl crate::compact::ContextCompactor for ShrinkingPassCompactor {
+    fn compact(
+        &self,
+        _messages: Vec<Message>,
+        _target_tokens: u64,
+        context: crate::compact::types::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = crate::compact::types::CompactionOutcome> + Send + '_>> {
+        Box::pin(std::future::ready(
+            crate::compact::types::CompactionOutcome::compacted(
+                vec![Message::user("r".repeat(40))],
+                context.tokens_before,
+                1,
+            ),
+        ))
+    }
+}
+
 #[tokio::test]
 async fn observer_sequence_compaction_turn() {
     let client = MockClient::new("test-model");
-    // Drive enough tokens to trip a low threshold, then finish.
-    client.add_text_response(&"x".repeat(200));
-    client.add_text_response("compacted-and-done");
-    let log = sequence_log();
-    let mut agent = agent_with_sequence_observer(client, ToolRegistry::new(), log.clone());
-    agent.set_context_manager(Arc::new(
-        crate::compact::ContextManager::new(Arc::new(crate::compact::TruncatingCompactor::new()))
-            .with_context_window(100)
-            .with_threshold(55),
-    ));
-    let run_config = RunConfig::default();
-    let run_result = agent.run("fill it up", &run_config).await;
-    // The compaction scenario drives the run to completion; event placement is asserted below.
-    assert!(run_result.is_ok(), "compaction run completes");
-
-    let events = snapshot(&log);
-    // If compaction ran, on_compaction sits at a turn boundary (after a
-    // turn_end, before the next turn_start). If the estimate didn't trip,
-    // the scenario is N/A — assert placement only when present.
-    if let Some(idx) = events.iter().position(|e| e == "on_compaction") {
-        let before = idx.checked_sub(1).and_then(|i| events.get(i));
-        let after = events.get(idx + 1);
-        assert!(
-            before == Some(&"on_turn_end".to_string())
-                || after == Some(&"on_turn_start".to_string()),
-            "on_compaction at idx {idx} sits at a turn boundary, got before={before:?} after={after:?}"
+    // Three tool-carrying turns grow the history past the session
+    // window's threshold, so the machine requests a compaction pass
+    // after a completed turn; the shrinking double above guarantees
+    // the pass succeeds wherever the growth trips, and a final text
+    // response completes the run afterwards.
+    for idx in 0..3 {
+        client.add_tool_only_response(
+            &format!("c{idx}"),
+            "echo",
+            &json!({ "message": "x".repeat(400) }),
         );
     }
+    client.add_text_response("compacted-and-done");
+    let log = sequence_log();
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(50);
+    let mut agent = BareLoop::new(Arc::new(client), registry, config);
+    agent.register_observer(Arc::new(SequenceObserver::new(log.clone())));
+    agent.set_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+        ShrinkingPassCompactor,
+    ))));
+    let run_result = agent.run("fill it up", &RunConfig::default()).await;
+    assert!(
+        run_result.is_ok(),
+        "the compacting run completes: {run_result:?}"
+    );
+
+    let events = snapshot(&log);
+    let idx = events
+        .iter()
+        .position(|e| e == "on_compaction")
+        .expect("the over-threshold history trips a compaction pass mid-run");
+    let before = idx.checked_sub(1).and_then(|i| events.get(i));
+    let after = events.get(idx + 1);
+    assert_eq!(
+        before,
+        Some(&"on_turn_end".to_string()),
+        "on_compaction fires after the completed turn's on_turn_end, got \
+         before={before:?} after={after:?}"
+    );
+    assert_eq!(
+        after,
+        Some(&"on_turn_start".to_string()),
+        "on_compaction fires before the next turn's on_turn_start, got \
+         before={before:?} after={after:?}"
+    );
 }
 
 #[tokio::test]
@@ -8440,4 +8488,195 @@ async fn a_fallback_turn_aborted_by_detection_leaves_no_flagged_record() {
          turn left no flagged record"
     );
     assert_eq!(first.transport_fallback_count(), 1);
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod budget_gate_tests {
+    use super::*;
+
+    /// Collector for the budget gate's observer surface.
+    ///
+    /// Captures the two event kinds the gate's engine pins assert
+    /// against — soft-line warns and gate decisions — behind shared
+    /// handles, so the run and the assertions read the same lists.
+    struct BudgetCollector {
+        /// Every soft-line warn the run emitted.
+        ///
+        /// One entry per `on_budget_warn` callback, in firing order;
+        /// the once-per-run-per-dimension latch is asserted against
+        /// this list's length.
+        warns: Mutex<Vec<crate::observer::BudgetWarnContext>>,
+
+        /// Every gate decision the run emitted (the budget deny among them).
+        ///
+        /// One entry per `on_gate_decision` callback; the budget pins
+        /// find their `budget.hard` deny record by rule id here.
+        decisions: Mutex<Vec<crate::tool::permission::GateDecision>>,
+    }
+
+    impl LoopObserver for BudgetCollector {
+        fn name(&self) -> &'static str {
+            "budget-collector"
+        }
+
+        fn on_budget_warn(&self, ctx: &crate::observer::BudgetWarnContext) {
+            if let Ok(mut warns) = self.warns.lock() {
+                warns.push(ctx.clone());
+            }
+        }
+
+        fn on_gate_decision(&self, ctx: &crate::observer::GateDecisionContext) {
+            if let Ok(mut decisions) = self.decisions.lock() {
+                decisions.push(ctx.decision.clone());
+            }
+        }
+    }
+
+    /// Scripted tool-call responses: each turn calls `echo` so the run
+    /// keeps going until the budget (or the script) stops it. The mock's
+    /// usage is 75 tokens per response (50 in + 25 out).
+    fn budget_script(count: usize) -> Vec<crate::testing::MockResponse> {
+        (0..count)
+            .map(|index| crate::testing::MockResponse {
+                text: format!("turn-{index}"),
+                tool_call: Some(crate::testing::MockToolCall {
+                    id: format!("call_{index}"),
+                    name: "echo".to_string(),
+                    input: json!({ "message": "x" }),
+                }),
+                stop_reason: "tool_use".to_string(),
+            })
+            .collect()
+    }
+
+    fn budget_loop(
+        client: crate::testing::MockApiClient,
+        limits: crate::budget::BudgetLimits,
+        collector: std::sync::Arc<BudgetCollector>,
+    ) -> BareLoop<crate::testing::MockApiClient> {
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let mut agent = BareLoop::new(std::sync::Arc::new(client), registry, make_config());
+        agent.register_observer(collector);
+        agent.with_budget_gate(std::sync::Arc::new(crate::budget::BudgetGate::new(limits)))
+    }
+
+    /// The task-named pin: the soft line emits `budget.warn` exactly once
+    /// per dimension per run, then the hard line ends it. Six responses at
+    /// 75 tokens each against a 400-token budget: the 375-spend check
+    /// warns (soft line 320), the 450-spend check refuses (hard line 400).
+    #[tokio::test]
+    async fn soft_threshold_emits_budget_warn_once() {
+        let client =
+            crate::testing::MockApiClient::new("budget-model").with_responses(budget_script(6));
+        let collector = std::sync::Arc::new(BudgetCollector {
+            warns: Mutex::new(Vec::new()),
+            decisions: Mutex::new(Vec::new()),
+        });
+        let mut agent = budget_loop(
+            client,
+            crate::budget::BudgetLimits {
+                tokens: Some(400),
+                ..crate::budget::BudgetLimits::new()
+            },
+            std::sync::Arc::clone(&collector),
+        );
+        let error = agent
+            .run("start", &make_run_config())
+            .await
+            .expect_err("the hard line ends the run");
+        match error {
+            crate::error::LoopError::BudgetExhausted {
+                dimension,
+                spent,
+                limit,
+            } => {
+                assert_eq!(dimension, crate::budget::BudgetDimension::Tokens);
+                assert_eq!(spent, 450);
+                assert_eq!(limit, 400);
+            }
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
+        let warns = collector.warns.lock().unwrap().clone();
+        assert_eq!(
+            warns.len(),
+            1,
+            "the warn fires once across the 375-spend and 450-spend checks: {warns:?}"
+        );
+        assert_eq!(warns[0].dimension, crate::budget::BudgetDimension::Tokens);
+        assert_eq!(warns[0].spent, 375);
+        assert_eq!(warns[0].limit, 400);
+        let decisions = collector.decisions.lock().unwrap().clone();
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| decision.rule_id == "budget.hard"
+                    && decision.verdict == crate::tool::permission::GateVerdict::Deny),
+            "the refusal mints a deny record on the gate trail: {decisions:?}"
+        );
+    }
+
+    /// The task-named pin: the hard line blocks the NEXT request, not the
+    /// one that crossed it. Two responses at 75 tokens each against a
+    /// 100-token budget: both responses complete (the second one is what
+    /// crosses the line — its text must be in the conversation), and the
+    /// third request is refused before it is sent.
+    #[tokio::test]
+    async fn hard_threshold_blocks_the_next_request_not_the_current_one() {
+        let client =
+            crate::testing::MockApiClient::new("budget-model").with_responses(budget_script(2));
+        let collector = std::sync::Arc::new(BudgetCollector {
+            warns: Mutex::new(Vec::new()),
+            decisions: Mutex::new(Vec::new()),
+        });
+        let mut agent = budget_loop(
+            client.clone(),
+            crate::budget::BudgetLimits {
+                tokens: Some(100),
+                ..crate::budget::BudgetLimits::new()
+            },
+            std::sync::Arc::clone(&collector),
+        );
+        let error = agent
+            .run("start", &make_run_config())
+            .await
+            .expect_err("the third request is refused");
+        match error {
+            crate::error::LoopError::BudgetExhausted { spent, limit, .. } => {
+                assert_eq!(spent, 150);
+                assert_eq!(limit, 100);
+            }
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            client.with_options_calls(),
+            2,
+            "only the two completed requests hit the provider"
+        );
+        let conversation = agent.conversation();
+        let texts: Vec<String> = conversation
+            .iter()
+            .filter_map(|message| {
+                let text = message.text_content();
+                if text.is_empty() { None } else { Some(text) }
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|text| text.contains("turn-1")),
+            "the crossing response completed — its text is in the history: {texts:?}"
+        );
+        let decisions = collector.decisions.lock().unwrap().clone();
+        let deny = decisions
+            .iter()
+            .find(|decision| decision.rule_id == "budget.hard")
+            .expect("the refusal mints a budget.hard record");
+        assert_eq!(deny.verdict, crate::tool::permission::GateVerdict::Deny);
+        assert!(
+            deny.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("150 of 100")),
+            "the record's reason carries the numbers: {:?}",
+            deny.reason
+        );
+    }
 }

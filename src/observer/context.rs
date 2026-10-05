@@ -405,6 +405,46 @@ pub struct GateDecisionContext {
     pub decision: crate::tool::permission::GateDecision,
 }
 
+/// Context for [`LoopObserver::on_budget_warn`](crate::observer::LoopObserver::on_budget_warn).
+///
+/// The budget gate's soft-line crossing report: which budget line
+/// crossed, the spend at the crossing, and the hard limit the soft
+/// line derives from — the numbers a "N of M" warning needs.
+///
+/// # Examples
+///
+/// ```
+/// use loopctl::observer::BudgetWarnContext;
+///
+/// let ctx = BudgetWarnContext {
+///     dimension: loopctl::budget::BudgetDimension::Tokens,
+///     spent: 8_100,
+///     limit: 10_000,
+/// };
+/// assert_eq!(ctx.spent, 8_100);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetWarnContext {
+    /// The budget line whose soft threshold was crossed.
+    ///
+    /// Tokens, turns, or wall-clock — the same vocabulary the
+    /// exhausted error and the gate records use.
+    pub dimension: crate::budget::BudgetDimension,
+
+    /// The spend at the crossing.
+    ///
+    /// Tokens or turns counted, or elapsed milliseconds for the
+    /// wall-clock line.
+    pub spent: u64,
+
+    /// The hard limit the soft line derives from.
+    ///
+    /// The operator's configured ceiling, not the derived soft
+    /// line, so consumers report spend against the number that was
+    /// set.
+    pub limit: u64,
+}
+
 /// Context for [`LoopObserver::on_tool_call_received`](crate::observer::LoopObserver::on_tool_call_received).
 ///
 /// Fired once per tool call after the streaming response has been accumulated

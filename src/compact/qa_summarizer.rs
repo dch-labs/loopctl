@@ -1279,6 +1279,10 @@ mod tests {
     }
 
     /// Six user/assistant pairs with unique, probe-able text per message.
+    ///
+    /// The standing fixture for the chat-history pins: enough turns for
+    /// every splitter configuration to find a boundary, with text each
+    /// assertion can grep for.
     fn conversation() -> Vec<Message> {
         let mut messages = Vec::new();
         for turn in 0..6 {
@@ -1317,6 +1321,70 @@ mod tests {
         assert!(
             client.prompts().is_empty(),
             "no LLM call is spent below min_messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn qa_summarizer_compacts_a_tool_loop_history() {
+        use crate::message::MessagePart;
+        use crate::message::ToolContent;
+
+        let mut messages = vec![Message::user("task")];
+        for index in 0..3 {
+            messages.push(Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    format!("c{index}"),
+                    "Read",
+                    serde_json::json!({ "path": format!("f{index}.rs") }),
+                )],
+            ));
+            messages.push(Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    format!("c{index}"),
+                    "Read",
+                    ToolContent::from_string(format!("output {index}")),
+                    false,
+                )],
+            ));
+        }
+        messages.push(Message::assistant("done"));
+        messages.push(Message::user("next"));
+        let tail: Vec<String> = messages[messages.len().saturating_sub(4)..]
+            .iter()
+            .map(Message::text_content)
+            .collect();
+
+        let client = RecordingClient::new(vec![ok("condensed facts"), ok("[]")]);
+        let summarizer = QaSummarizer::new(
+            Arc::clone(&client) as SharedApiClient,
+            QaSummarizerConfig::default().with_preserve_recent(4),
+        );
+        let context = context_for(&messages);
+        let outcome = summarizer.compact(messages, 40_000, context).await;
+        assert!(
+            !client.prompts().is_empty(),
+            "a tool-loop history has a summarizable slice — the pass must \
+             spend its summarize call instead of answering no-change"
+        );
+        assert!(
+            outcome.success,
+            "the pass is a success, not a failure: {}",
+            outcome.error.as_deref().unwrap_or_default()
+        );
+        assert!(
+            outcome.messages.len() < 9,
+            "the assembled output replaces the dropped slice with the summary"
+        );
+        let rendered_tail: Vec<String> = outcome.messages
+            [outcome.messages.len().saturating_sub(4)..]
+            .iter()
+            .map(Message::text_content)
+            .collect();
+        assert_eq!(
+            rendered_tail, tail,
+            "the preserved recent tail rides through verbatim"
         );
     }
 

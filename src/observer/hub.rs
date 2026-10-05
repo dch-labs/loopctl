@@ -16,11 +16,11 @@ use tokio::sync::broadcast;
 
 use super::LoopObserver;
 use super::context::{
-    AttemptResetContext, CompactedContext, ConvergenceDetectedContext, FallbackContext,
-    GateDecisionContext, LoopDetectedContext, ModelSwitchedContext, PreCompactionContext,
-    ResponseContext, RunEndContext, RunStartContext, StreamContext, StreamFailureContext,
-    TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext, ToolPostContext,
-    ToolPreContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
+    AttemptResetContext, CompactedContext, CompactionFailedContext, ConvergenceDetectedContext,
+    FallbackContext, GateDecisionContext, LoopDetectedContext, ModelSwitchedContext,
+    PreCompactionContext, ResponseContext, RunEndContext, RunStartContext, StreamContext,
+    StreamFailureContext, TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext,
+    ToolPostContext, ToolPreContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
 };
 
 /// One observed lifecycle moment of a run, as forwarded by [`EventHub`].
@@ -123,6 +123,14 @@ pub enum LoopEvent {
     ///
     /// Carries what was compacted and the token delta.
     Compaction(CompactedContext),
+
+    /// A compaction pass was attempted and failed.
+    ///
+    /// Fired from the engine's compaction error arm — the compactor
+    /// errored (`error` set), or its successful result still did not
+    /// fit the window (`error` absent). The success
+    /// [`Compaction`](LoopEvent::Compaction) event never follows.
+    CompactionFailed(CompactionFailedContext),
 
     /// A model fallback occurred.
     ///
@@ -448,6 +456,17 @@ impl LoopObserver for EventHub {
         self.publish(LoopEvent::Compaction(ctx.clone()));
     }
 
+    /// Forwards
+    /// [`on_compaction_failed`](LoopObserver::on_compaction_failed) as
+    /// a [`CompactionFailed`](LoopEvent::CompactionFailed) event.
+    ///
+    /// Fired when a pass was attempted and died — the compactor's own
+    /// error text rides `error` when there was one; `None` means the
+    /// pass succeeded but its result still did not fit the window.
+    fn on_compaction_failed(&self, ctx: &CompactionFailedContext) {
+        self.publish(LoopEvent::CompactionFailed(ctx.clone()));
+    }
+
     /// Forwards [`on_fallback`](LoopObserver::on_fallback) as a
     /// [`Fallback`](LoopEvent::Fallback) event.
     ///
@@ -522,6 +541,7 @@ mod tests {
             LoopEvent::ToolPost(_) => "tool_post",
             LoopEvent::PreCompaction(_) => "pre_compaction",
             LoopEvent::Compaction(_) => "compaction",
+            LoopEvent::CompactionFailed(_) => "compaction_failed",
             LoopEvent::Fallback(_) => "fallback",
             LoopEvent::TransportFallback(_) => "transport_fallback",
             LoopEvent::ModelSwitched(_) => "model_switched",
@@ -648,6 +668,13 @@ mod tests {
             evicted_messages: 1,
             telemetry,
         });
+        hub.on_compaction_failed(&CompactionFailedContext {
+            reason: crate::compact::CompactReason::Emergency,
+            turn: 0,
+            tokens_before: 100,
+            context_window: 200_000,
+            error: Some("summarizer unavailable".to_string()),
+        });
         hub.on_fallback(&FallbackContext {
             from: "primary".to_string(),
             to: "backup".to_string(),
@@ -695,6 +722,7 @@ mod tests {
             "tool_post",
             "pre_compaction",
             "compaction",
+            "compaction_failed",
             "fallback",
             "transport_fallback",
             "model_switched",
@@ -703,7 +731,7 @@ mod tests {
             "turn_end",
             "run_end",
         ];
-        drain_and_assert_kinds(&mut receiver, &expected, 21);
+        drain_and_assert_kinds(&mut receiver, &expected, 22);
     }
 
     /// Drain a hub receiver and pin both the event-kind order and the

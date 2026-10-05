@@ -756,7 +756,7 @@ impl LoopMachine {
     /// current context size. The same no-progress guard as
     /// [`Self::compaction_result`] applies: when nothing was shaved off, the
     /// machine transitions to [`MachineOutcome::Failed`] with
-    /// [`LoopError::ContextExceeded`] — compaction cannot shrink this
+    /// [`LoopError::CompactionStalled`] — compaction cannot shrink this
     /// conversation, and another model call would exceed the context window.
     /// Has no effect once the machine is terminal.
     pub fn compaction_noop(&mut self, tokens_before: u64, tokens_after: u64) {
@@ -776,17 +776,17 @@ impl LoopMachine {
     /// [`Self::compaction_noop`]: compares the driver's measured post-pass
     /// token count against its measured pre-pass count of the full history.
     /// When nothing was shaved off, transitions to [`MachineOutcome::Failed`]
-    /// with [`LoopError::ContextExceeded`] (preventing an infinite compaction
-    /// cycle) and returns `true`; returns `false` when the feed may proceed.
+    /// with [`LoopError::CompactionStalled`] — the stall wording claims no
+    /// token limit, because the honest statement is that this compactor
+    /// cannot shrink this conversation, not that a budget was exceeded
+    /// (preventing an infinite compaction cycle) — and returns `true`;
+    /// returns `false` when the feed may proceed.
     fn terminate_on_no_progress(&mut self, tokens_before: u64, tokens_after: u64) -> bool {
         if tokens_after < tokens_before {
             return false;
         }
         self.state = MachineState::Terminal(MachineOutcome::Failed {
-            error: LoopError::ContextExceeded {
-                used: tokens_after,
-                limit: tokens_before,
-            },
+            error: LoopError::CompactionStalled { used: tokens_after },
         });
         true
     }
@@ -2134,12 +2134,60 @@ mod tests {
 
         match machine.next_step(policy) {
             MachineStep::Done(MachineOutcome::Failed {
-                error: LoopError::ContextExceeded { .. },
-            }) => {}
+                error: LoopError::CompactionStalled { used },
+            }) => assert_eq!(
+                used, tokens_before,
+                "the stall reports the un-shrunk post-pass size"
+            ),
             other => {
-                panic!("no-progress compaction must terminate with ContextExceeded, got {other:?}")
+                panic!(
+                    "no-progress compaction must terminate with CompactionStalled, got {other:?}"
+                )
             }
         }
+    }
+
+    #[test]
+    fn the_no_progress_guard_names_the_stall_not_a_bogus_limit() {
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: true,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(250))]);
+        let _ = machine.next_step(policy);
+        machine.model_response(tool_response("echo", &["echo"], 0), count_tokens(&machine));
+        let _ = machine.next_step(policy);
+        machine.tool_results(vec![Message::user(long_text(250))]);
+        assert!(matches!(
+            machine.next_step(policy),
+            MachineStep::Compact { .. }
+        ));
+        let tokens_before = count_tokens(&machine);
+        machine.compaction_result(
+            vec![Message::user("compacted")],
+            tokens_before,
+            tokens_before,
+        );
+
+        let MachineStep::Done(MachineOutcome::Failed {
+            error: LoopError::CompactionStalled { used },
+        }) = machine.next_step(policy)
+        else {
+            panic!("the no-progress guard terminates the run as a stall");
+        };
+        assert_eq!(used, tokens_before);
+        let rendered = LoopError::CompactionStalled { used }.to_string();
+        assert!(
+            rendered.contains("made no progress"),
+            "the wording names the stall: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("of {used} tokens")),
+            "a stall claims no token limit — the pre-fix wording read as a \
+             budget the run never exceeded: {rendered}"
+        );
     }
 
     #[test]

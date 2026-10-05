@@ -2352,6 +2352,218 @@ async fn compaction_sees_pending_messages() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_loop_run_crosses_the_compaction_boundary_instead_of_stalling() {
+    let client = MockClient::new("m");
+    client.add_tool_only_response("c0", "echo", &json!({"message": "head"}));
+    for index in 1..4 {
+        client.add_tool_only_response(
+            &format!("c{index}"),
+            "echo",
+            &json!({ "message": "y".repeat(9_000) }),
+        );
+    }
+    client.add_text_response("done");
+
+    let summarizer_client = MockClient::new("summarizer");
+    summarizer_client.add_text_response("condensed facts");
+    summarizer_client.add_text_response("[]");
+    let summarizer = crate::compact::qa_summarizer::QaSummarizer::new(
+        Arc::new(summarizer_client) as crate::api::SharedApiClient,
+        crate::compact::qa_summarizer::QaSummarizerConfig::default().with_preserve_recent(2),
+    );
+
+    let config = make_config()
+        .with_context_window(20_000)
+        .with_compact_threshold(55);
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, config);
+    agent.set_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(summarizer))
+            .with_context_window(20_000)
+            .with_threshold(55),
+    ));
+
+    let run = agent.run("task", &make_run_config()).await.expect(
+        "a tool-loop history crossing the threshold compacts through the \
+             summarizer and finishes instead of stalling at used == before",
+    );
+    assert_eq!(
+        run.output.as_deref(),
+        Some("done"),
+        "the run reaches its final answer after the compaction pass"
+    );
+}
+
+/// A compactor double whose every pass fails with a fixed cause.
+///
+/// Drives the engine's compaction error arm without any network — the
+/// shape the failure-surfacing pins need.
+struct FailingPassCompactor;
+
+impl crate::compact::ContextCompactor for FailingPassCompactor {
+    fn compact(
+        &self,
+        messages: Vec<Message>,
+        _target_tokens: u64,
+        context: crate::compact::types::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = crate::compact::types::CompactionOutcome> + Send + '_>> {
+        Box::pin(std::future::ready(
+            crate::compact::types::CompactionOutcome::failed(
+                messages,
+                context.tokens_before,
+                "qa summarizer summarize step failed: error sending request",
+            ),
+        ))
+    }
+}
+
+/// A compactor double whose pass succeeds but barely reduces, leaving
+/// the result inside the window yet over it once the request reserve
+/// rides along.
+struct TightFitCompactor;
+
+impl crate::compact::ContextCompactor for TightFitCompactor {
+    fn compact(
+        &self,
+        _messages: Vec<Message>,
+        _target_tokens: u64,
+        context: crate::compact::types::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = crate::compact::types::CompactionOutcome> + Send + '_>> {
+        Box::pin(std::future::ready(
+            crate::compact::types::CompactionOutcome::compacted(
+                vec![Message::user("r".repeat(3_000))],
+                context.tokens_before,
+                750,
+            ),
+        ))
+    }
+}
+
+/// Records both compaction event kinds as formatted lines.
+///
+/// The success and failure lists are read after the run — the engine
+/// owns the observer through an `Arc`, so both counts cross shared
+/// handles rather than borrows.
+struct CompactionEventRecorder {
+    passes: Arc<std::sync::Mutex<Vec<String>>>,
+    failures: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl crate::observer::LoopObserver for CompactionEventRecorder {
+    fn name(&self) -> &'static str {
+        "compaction-event-recorder"
+    }
+    fn on_compaction(&self, ctx: &crate::observer::CompactedContext) {
+        self.passes
+            .lock()
+            .expect("passes lock")
+            .push(format!("{:?}", ctx.reason));
+    }
+    fn on_compaction_failed(&self, ctx: &crate::observer::CompactionFailedContext) {
+        self.failures.lock().expect("failures lock").push(format!(
+            "{:?}/turn {}/before {}/window {}/error {:?}",
+            ctx.reason, ctx.turn, ctx.tokens_before, ctx.context_window, ctx.error
+        ));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_compaction_pass_fires_on_compaction_failed() {
+    let client = MockClient::new("m");
+    client.add_text_response("never reached");
+
+    let passes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(50);
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+    agent.set_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(FailingPassCompactor))
+            .with_context_window(1_000)
+            .with_threshold(50),
+    ));
+    agent.register_observer(Arc::new(CompactionEventRecorder {
+        passes: Arc::clone(&passes),
+        failures: Arc::clone(&failures),
+    }));
+
+    let error = agent
+        .run(&"t".repeat(3_000), &make_run_config())
+        .await
+        .expect_err("the failing compactor ends the run");
+    match &error {
+        crate::error::LoopError::CompactionFailed { cause, .. } => assert!(
+            cause.contains("error sending request"),
+            "the run failure carries the compactor's real cause, not an \
+             over-window misdescription: {cause}"
+        ),
+        other => panic!("expected CompactionFailed, got {other:?}"),
+    }
+    assert!(
+        error.to_string().contains("error sending request"),
+        "the rendered error names the cause: {error}"
+    );
+    let failures = failures.lock().expect("failures lock");
+    assert_eq!(failures.len(), 1, "one failed-pass event: {failures:?}");
+    assert!(
+        failures[0].contains("error sending request"),
+        "the event carries the compactor's error text: {failures:?}"
+    );
+    assert!(
+        passes.lock().expect("passes lock").is_empty(),
+        "no success on_compaction follows a dead pass"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_that_succeeds_but_does_not_fit_keeps_the_window_error() {
+    let client = MockClient::new("m");
+    client.add_text_response("never reached");
+
+    let passes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let config = SessionConfig {
+        system_prompt: Some("s".repeat(2_000)),
+        context_window: 1_000,
+        compact_threshold: 50,
+        ..SessionConfig::default()
+    };
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+    agent.set_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(TightFitCompactor))
+            .with_context_window(1_000)
+            .with_threshold(50),
+    ));
+    agent.register_observer(Arc::new(CompactionEventRecorder {
+        passes: Arc::clone(&passes),
+        failures: Arc::clone(&failures),
+    }));
+
+    let error = agent
+        .run(&"t".repeat(3_000), &make_run_config())
+        .await
+        .expect_err("the tight-fit result cannot carry the request reserve");
+    assert!(
+        matches!(error, crate::error::LoopError::ContextExceeded { .. }),
+        "a pass that succeeded but does not fit keeps the over-window error \
+         with the window as the limit — the compactor did not fail: {error:?}"
+    );
+    let failures = failures.lock().expect("failures lock");
+    assert_eq!(failures.len(), 1, "the unfit pass still reports its event");
+    assert!(
+        failures[0].contains("error None"),
+        "no compactor error rides the event — the pass succeeded, the \
+         conversation simply does not fit: {failures:?}"
+    );
+    assert!(
+        passes.lock().expect("passes lock").is_empty(),
+        "no success on_compaction follows an unfit pass"
+    );
+}
+
 #[tokio::test]
 async fn context_token_count_includes_model_response_message() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2479,7 +2691,7 @@ async fn observer_sequence_compaction_turn() {
     agent.set_context_manager(Arc::new(
         crate::compact::ContextManager::new(Arc::new(crate::compact::TruncatingCompactor::new()))
             .with_context_window(100)
-            .with_threshold(10),
+            .with_threshold(55),
     ));
     let run_config = RunConfig::default();
     let run_result = agent.run("fill it up", &run_config).await;
@@ -5992,6 +6204,35 @@ async fn run_end_reason_max_turns() {
     );
 
     assert_eq!(hook.captured(), Some(RunEndReason::MaxTurns));
+}
+
+/// The compaction failure family classifies as `ContextOverflow`, not
+/// `Error` — a pass that died, a pass that could not fit, and a pass
+/// that made no progress are all context conditions to a host reading
+/// the run-end hook.
+#[cfg(feature = "hooks")]
+#[tokio::test]
+async fn run_end_reason_compaction_failures_are_context_overflow() {
+    for err in [
+        LoopError::CompactionFailed {
+            used: 120,
+            limit: 100,
+            cause: "summarizer unavailable".to_string(),
+        },
+        LoopError::CompactionStalled { used: 120 },
+    ] {
+        let (loop_, hook) = loop_with_reason_hook();
+        loop_.notify_run_end(
+            &loop_.session.current_run().unwrap().clone(),
+            Duration::from_millis(100),
+            Some(&err),
+        );
+        assert_eq!(
+            hook.captured(),
+            Some(RunEndReason::ContextOverflow),
+            "{err:?} is a context condition, not a generic error"
+        );
+    }
 }
 
 /// A run that legitimately completes on exactly the `max_turns`-th

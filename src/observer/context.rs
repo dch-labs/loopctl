@@ -599,6 +599,59 @@ pub struct CompactedContext {
 }
 
 /// Context for
+/// [`LoopObserver::on_compaction_failed`](crate::observer::LoopObserver::on_compaction_failed).
+///
+/// The pass-failure notification: fired when a compaction pass was
+/// attempted and died, so a display layer can row it like a retry
+/// episode even with no tracing subscriber installed. The matching
+/// [`on_pre_compaction`](crate::observer::LoopObserver::on_pre_compaction)
+/// already fired at pass start; the success
+/// [`on_compaction`](crate::observer::LoopObserver::on_compaction)
+/// never follows. `#[non_exhaustive]` so fields can be added in minor
+/// releases; it is constructed by the engine — external code reads it,
+/// never builds it.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CompactionFailedContext {
+    /// Why the pass ran.
+    ///
+    /// The [`CompactReason`](crate::compact::CompactReason) that
+    /// triggered the failed pass — the same value the pass-start
+    /// event carried, so the pair matches without guessing.
+    pub reason: crate::compact::CompactReason,
+
+    /// The turn the pass ran in.
+    ///
+    /// The engine's current turn number, matching the turn carried by
+    /// the surrounding turn-start/turn-end events.
+    pub turn: usize,
+
+    /// Estimated token count before the failed pass.
+    ///
+    /// The payload estimate the pass ran against — the history plus
+    /// the per-request overhead, the same figure the pass-start event
+    /// reported.
+    pub tokens_before: u64,
+
+    /// The context window the pass was compacting toward.
+    ///
+    /// The configured [`ContextManager`](crate::compact::ContextManager)
+    /// window, so an observer can compute utilization at failure
+    /// without holding the configuration itself.
+    pub context_window: u64,
+
+    /// The compactor's own error text, when the compactor failed.
+    ///
+    /// `Some(cause)` when a compactor ran and errored — the verbatim
+    /// text the run failure's `cause` field also carries. `None` when
+    /// the pass *succeeded* but its result still did not fit the
+    /// window: a different failure (the compactor did its job and the
+    /// conversation still overflows), reported through the same event
+    /// so hosts have one place to watch.
+    pub error: Option<String>,
+}
+
+/// Context for
 /// [`LoopObserver::on_pre_compaction`](crate::observer::LoopObserver::on_pre_compaction).
 ///
 /// The pass-start notification: fired when a compaction pass is about

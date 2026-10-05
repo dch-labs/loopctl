@@ -20,6 +20,7 @@
 //! - [`GateDecisionContext`] — permission-gate decision for a dispatch
 //! - [`PreCompactionContext`] — compaction pass starting
 //! - [`CompactedContext`] — context window compaction
+//! - [`CompactionFailedContext`] — compaction pass failed
 //! - [`FallbackContext`] — model fallback event
 //! - [`TransportFallbackContext`] — non-streaming transport fallback event
 //! - [`ModelSwitchedContext`] — runtime model hot-swap event
@@ -48,11 +49,11 @@ pub mod context;
 pub mod hub;
 
 pub use context::{
-    AttemptResetContext, CompactedContext, ConvergenceDetectedContext, FallbackContext,
-    GateDecisionContext, LoopDetectedContext, ModelSwitchedContext, PreCompactionContext,
-    ResponseContext, RunEndContext, RunStartContext, StreamContext, StreamFailureContext,
-    TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext, ToolPostContext,
-    ToolPreContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
+    AttemptResetContext, CompactedContext, CompactionFailedContext, ConvergenceDetectedContext,
+    FallbackContext, GateDecisionContext, LoopDetectedContext, ModelSwitchedContext,
+    PreCompactionContext, ResponseContext, RunEndContext, RunStartContext, StreamContext,
+    StreamFailureContext, TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext,
+    ToolPostContext, ToolPreContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
 };
 pub use hub::{EventHub, LoopEvent, ObservedEvent};
 
@@ -323,6 +324,41 @@ pub trait LoopObserver: Send + Sync {
     /// statistics (`telemetry`). Only fired when compaction actually
     /// occurred — not on no-action passes.
     fn on_compaction(&self, _ctx: &CompactedContext) {}
+
+    /// Called when a compaction pass was attempted and failed.
+    ///
+    /// Fires from the error arm of the engine's compaction step — a
+    /// compactor that errored, or a pass whose successful result still
+    /// did not fit the window (`error` is `None` for the latter). The
+    /// matching [`on_pre_compaction`](Self::on_pre_compaction) already
+    /// fired at pass start, and the success
+    /// [`on_compaction`](Self::on_compaction) never follows, so this
+    /// event is the only programmatic signal that a pass was attempted
+    /// and died — hosts that row retry episodes can row this one the
+    /// same way. Notification-only: the run has already failed with
+    /// the cause-carrying error by the time observers see this.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    /// use loopctl::observer::{CompactionFailedContext, LoopObserver};
+    ///
+    /// struct FailureTally {
+    ///     failed_passes: AtomicUsize,
+    /// }
+    ///
+    /// impl LoopObserver for FailureTally {
+    ///     fn name(&self) -> &'static str {
+    ///         "failure_tally"
+    ///     }
+    ///
+    ///     fn on_compaction_failed(&self, _ctx: &CompactionFailedContext) {
+    ///         self.failed_passes.fetch_add(1, Ordering::SeqCst);
+    ///     }
+    /// }
+    /// ```
+    fn on_compaction_failed(&self, _ctx: &CompactionFailedContext) {}
 
     /// Called when a model fallback is triggered.
     ///
@@ -614,6 +650,20 @@ impl ObserverHost {
     /// actually occurred, not on no-action passes.
     pub fn on_compaction(&self, ctx: &CompactedContext) {
         self.dispatch(|obs| obs.on_compaction(ctx));
+    }
+
+    /// Dispatch [`LoopObserver::on_compaction_failed`] to all observers.
+    ///
+    /// Fired when a compaction pass was attempted and died — a
+    /// compactor error, or a successful pass whose result still did
+    /// not fit the window — carrying the pass's reason, turn, and
+    /// pre-pass size, the window it compacted toward, and the
+    /// compactor's own error text when there was one. Iterates
+    /// registered observers in registration order; the success
+    /// [`on_compaction`](Self::on_compaction) never follows this
+    /// event.
+    pub fn on_compaction_failed(&self, ctx: &CompactionFailedContext) {
+        self.dispatch(|obs| obs.on_compaction_failed(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_fallback`] to all observers.

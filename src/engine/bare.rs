@@ -1907,12 +1907,17 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Errors
     ///
-    /// Propagates [`LoopError::ContextExceeded`] when compaction could not
-    /// reduce the history enough, and [`LoopError::Cancelled`] when the
-    /// cancel signal fires while a pass is in flight — the in-flight pass
+    /// Propagates [`LoopError::CompactionFailed`] when the compactor ran
+    /// and errored, [`LoopError::ContextExceeded`] when a pass succeeded
+    /// but its result still does not fit, and
+    /// [`LoopError::Cancelled`] when the cancel signal fires while a
+    /// pass is in flight — the in-flight pass
     /// is dropped and its result never lands, so the uncompacted history
     /// survives; the run loop then drives the machine to its terminal
-    /// `Cancelled` state.
+    /// `Cancelled` state. A pass that changed nothing feeds the machine
+    /// unchanged and ends the run with
+    /// [`LoopError::CompactionStalled`] from the machine's no-progress
+    /// guard.
     async fn handle_compact(
         &mut self,
         reason: crate::compact::types::CompactReason,
@@ -2144,8 +2149,10 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
 ///
 /// Two signals mean the same thing — the request as built will keep
 /// being refused — and both take the full-discard arm of
-/// [`finalize`](BareLoop::finalize): the compactor-reported
-/// [`LoopError::ContextExceeded`], and a provider rejection whose
+/// [`finalize`](BareLoop::finalize): the compaction family's errors
+/// ([`LoopError::ContextExceeded`],
+/// [`LoopError::CompactionFailed`], [`LoopError::CompactionStalled`]),
+/// and a provider rejection whose
 /// error text reports an oversized prompt (see
 /// `message_reports_context_overflow` — a phrase set deliberately
 /// stricter than the error-code classification, so context-bearing
@@ -2155,7 +2162,9 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
 /// salvages.
 fn conversation_cannot_fit(error: &LoopError) -> bool {
     match error {
-        LoopError::ContextExceeded { .. } => true,
+        LoopError::ContextExceeded { .. }
+        | LoopError::CompactionFailed { .. }
+        | LoopError::CompactionStalled { .. } => true,
         LoopError::Api(message) => message_reports_context_overflow(message),
         _ => false,
     }

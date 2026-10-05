@@ -64,6 +64,11 @@
 /// - [`ContextExceeded`](LoopError::ContextExceeded) — Token usage
 ///   overflowed the model's context window and compaction could not
 ///   recover.
+/// - [`CompactionFailed`](LoopError::CompactionFailed) — A compaction
+///   pass was attempted and the compactor errored; the cause rides
+///   the variant.
+/// - [`CompactionStalled`](LoopError::CompactionStalled) — Compaction
+///   made no progress on this conversation.
 /// - [`LockPoisoned`](LoopError::LockPoisoned) — A mutex protecting a
 ///   multi-field state machine (fallback, detection, rate limiting) was
 ///   found poisoned; the state may be desynchronised and must not be
@@ -229,6 +234,70 @@ pub enum LoopError {
         /// because compaction could not reduce the conversation. Pair
         /// with `used` to report utilization to the caller.
         limit: u64,
+    },
+
+    /// A compaction pass was attempted and failed.
+    ///
+    /// The configured compactor ran and errored — a summarizer
+    /// transport failure, a timeout, an unusable summary — so the run
+    /// ends here. The `cause` field carries the compactor's own error
+    /// text verbatim, so a host without a tracing subscriber still
+    /// learns why the pass died instead of reading the failure as an
+    /// over-window request; `used` and `limit` keep the
+    /// [`ContextExceeded`](LoopError::ContextExceeded) payload pair
+    /// (the conversation's size and the window it had to fit).
+    ///
+    /// Recoverable, like `ContextExceeded`: the failure may be
+    /// transient, and a retry re-attempts the pass. Constructed by the
+    /// engine from the
+    /// [`ContextOverflow`](crate::compact::types::ContextOverflow)
+    /// the manager returns when `compactor_error` is set.
+    #[error("Compaction failed: {cause} (used {used} of {limit} tokens)")]
+    CompactionFailed {
+        /// Number of tokens the conversation occupied when the pass failed.
+        ///
+        /// The payload-comparable estimate the pass ran against —
+        /// pair with `limit` for utilization reporting, as in
+        /// [`ContextExceeded`](LoopError::ContextExceeded).
+        used: u64,
+
+        /// The context window the pass was compacting toward.
+        ///
+        /// The manager's configured window, the same figure
+        /// [`ContextExceeded`](LoopError::ContextExceeded) would have
+        /// carried for this conversation.
+        limit: u64,
+
+        /// The compactor's own error text.
+        ///
+        /// Verbatim from the failing stage — for the default chain,
+        /// the failing tier's message (for example a QA summarizer
+        /// transport error) — so the real cause reaches hosts that
+        /// install no tracing subscriber.
+        cause: String,
+    },
+
+    /// Compaction made no progress on this conversation.
+    ///
+    /// The machine's no-progress guard: a compaction feed reported a
+    /// post-pass size at or above the pre-pass size, so another model
+    /// call would exceed the window and re-compacting cannot shrink
+    /// the conversation. Distinguishable from a genuine over-window
+    /// refusal ([`ContextExceeded`](LoopError::ContextExceeded)) by
+    /// variant, and deliberately claims no token limit at all — the
+    /// pre-fix wording ("used N of N tokens") misread a stall as a
+    /// budget. Not recoverable: the measurement is the evidence that
+    /// retrying the same compactor changes nothing.
+    #[error(
+        "Compaction made no progress at {used} tokens: the configured compactor cannot shrink this conversation further"
+    )]
+    CompactionStalled {
+        /// The post-pass token count that did not shrink.
+        ///
+        /// The driver's measured payload estimate after the pass —
+        /// equal to (or above) the pre-pass measurement that triggered
+        /// the guard.
+        used: u64,
     },
 
     /// A mutex protecting multi-field state with cross-field invariants
@@ -555,12 +624,17 @@ impl LoopError {
     ///   (network blip, temporary overload).
     /// - [`ContextExceeded`](LoopError::ContextExceeded) —
     ///   compaction may free enough tokens for a retry.
+    /// - [`CompactionFailed`](LoopError::CompactionFailed) — the
+    ///   failure that killed the pass may be transient; a retry
+    ///   re-attempts compaction.
     /// - [`Reflection`](LoopError::Reflection) — a second
     ///   reflection pass may produce a valid correction.
     ///
     /// Returns `false` for all other variants (e.g. invalid input,
-    /// cancel, configuration errors) where retrying is unlikely to
-    /// help.
+    /// cancel, configuration errors,
+    /// [`CompactionStalled`](LoopError::CompactionStalled) — whose
+    /// measured no-progress is evidence a retry changes nothing)
+    /// where retrying is unlikely to help.
     #[must_use]
     pub const fn is_recoverable(&self) -> bool {
         matches!(
@@ -568,6 +642,7 @@ impl LoopError {
             Self::ToolExecution { .. }
                 | Self::Api(_)
                 | Self::ContextExceeded { .. }
+                | Self::CompactionFailed { .. }
                 | Self::Reflection(_)
                 | Self::RateLimitEscalation { .. }
         )

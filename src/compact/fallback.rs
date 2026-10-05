@@ -1,8 +1,11 @@
-//! Compactor chain: run inner compactors in sequence until one succeeds.
+//! Compactor chain: run inner compactors in sequence until one
+//! reduces the conversation.
 //!
 //! [`FallbackCompactor`] holds an ordered chain of [`ContextCompactor`]s and
-//! runs them in order, returning the first successful outcome. The default
-//! chain is quality-descending — [`QaSummarizer`]
+//! runs them in order, returning the first outcome that both succeeds and
+//! actually reduces — a success that changed nothing does not win, because a
+//! later stage (the terminal truncator can always drop) still might. The
+//! default chain is quality-descending — [`QaSummarizer`]
 //! → [`StructuredSummarizer`]
 //! → [`TerminalCapture`] around a [`TruncatingCompactor`] — so compaction
 //! degrades from best-effort summarization down to deterministic truncation
@@ -10,15 +13,18 @@
 //! fails to compact: an out-of-tokens condition stops surfacing as a failed
 //! pass with the original messages returned intact.
 //!
-//! Each failed stage is logged at `warn` and recorded in a
+//! Each failed or declined stage is logged at `warn` and recorded in a
 //! [`ChainReport`](FallbackCompactor::last_report), so the chain stays
 //! debuggable while it survives; the winning stage's outcome rides out
 //! verbatim, its [`evicted`](CompactionOutcome::evicted) handoff included.
 //! A failed stage's returned messages are discarded rather than handed
 //! onward — every stage runs against the original input, so a stage that
 //! fails with a partial or emptied list cannot corrupt the history its
-//! successors compact, and an all-stages-failed chain returns the original
-//! input, not the last failure's leftovers.
+//! successors compact. When every stage declines without reducing, the
+//! last unchanged outcome rides out as a success, so the caller's own
+//! no-action classification (not a manufactured failure) decides what
+//! the pass meant; the all-stages-failed outcome is reserved for chains
+//! whose every stage errored.
 //!
 //! # Example
 //!
@@ -63,6 +69,15 @@ const DEFAULT_TERMINAL_MIN_RECENT: usize = 4;
 /// the whole chain declined.
 const ALL_STAGES_FAILED: &str = "all compactor stages failed";
 
+/// The decline reason recorded for a stage that succeeded without
+/// reducing anything.
+///
+/// A success that changed nothing cannot carry the pass while a later
+/// stage might still reduce — the decline is a chain verdict, not the
+/// compactor's own error, so it gets its own label rather than riding
+/// the failure text verbatim.
+const NO_REDUCTION: &str = "stage returned success without reducing";
+
 /// One stage in a fallback chain.
 ///
 /// Carries the compactor and the name logs, reports, and telemetry address it
@@ -99,15 +114,19 @@ pub struct StageOutcome {
     /// the entry that carried the pass.
     pub name: String,
 
-    /// Whether this stage produced a successful outcome.
+    /// Whether this stage carried the pass.
     ///
-    /// Exactly one `true` entry exists in a succeeded run — the winner's.
+    /// `true` only on the stage whose reducing outcome the chain
+    /// returned. A stage that succeeded without reducing anything is
+    /// recorded `false` — its outcome did not carry the pass — with
+    /// the decline reason in [`error`](Self::error).
     pub success: bool,
 
-    /// The stage's own error string when it failed.
+    /// The stage's own error string when it failed, or its decline
+    /// reason when it succeeded without reducing.
     ///
-    /// `None` on the winner and on stages that never ran (there are none —
-    /// entries exist only for stages that ran).
+    /// `None` on the winner and on stages that never ran (there are
+    /// none — entries exist only for stages that ran).
     pub error: Option<String>,
 
     /// The token figure the stage's outcome self-reported.
@@ -141,8 +160,10 @@ pub struct ChainReport {
 
     /// The index in `stages` of the stage whose output was used.
     ///
-    /// `None` only when every stage failed — impossible with a
-    /// [`TerminalCapture`]-terminated chain, but typed for honesty.
+    /// `None` when no stage reduced the conversation — every stage
+    /// errored, or every stage declined without reducing. Impossible
+    /// with a [`TerminalCapture`]-terminated chain over a splittable
+    /// history, but typed for honesty.
     pub winning_stage: Option<usize>,
 }
 
@@ -476,16 +497,37 @@ impl ContextCompactor for FallbackCompactor {
         Box::pin(async move {
             let mut report = ChainReport::default();
             let original = messages;
+            let mut last_unchanged: Option<CompactionOutcome> = None;
             for (index, stage) in self.stages.iter().enumerate() {
                 let started = Instant::now();
+                let tokens_before = context.counter.count(&original);
                 let mut stage_context = context.clone();
-                stage_context.tokens_before = context.counter.count(&original);
+                stage_context.tokens_before = tokens_before;
                 let outcome = stage
                     .compactor
                     .compact(original.clone(), target_tokens, stage_context)
                     .await;
                 let duration = started.elapsed();
                 if outcome.success {
+                    let measured_after = context.counter.count(&outcome.messages);
+                    let reduced =
+                        outcome.messages.len() != original.len() || measured_after < tokens_before;
+                    if !reduced {
+                        tracing::warn!(
+                            target: "loopctl::compact",
+                            stage = stage.name,
+                            "fallback chain stage returned success without reducing; trying the next stage"
+                        );
+                        report.stages.push(StageOutcome {
+                            name: stage.name.to_string(),
+                            success: false,
+                            error: Some(NO_REDUCTION.to_string()),
+                            tokens_after: outcome.tokens_after,
+                            duration,
+                        });
+                        last_unchanged = Some(outcome);
+                        continue;
+                    }
                     for failed in &report.stages {
                         emit_degradation(&failed.name, stage.name);
                     }
@@ -523,6 +565,9 @@ impl ContextCompactor for FallbackCompactor {
             }
             let tokens_after = context.counter.count(&original);
             self.store_report(report);
+            if let Some(unchanged) = last_unchanged {
+                return unchanged;
+            }
             CompactionOutcome::failed(original, tokens_after, ALL_STAGES_FAILED)
         })
     }
@@ -595,6 +640,13 @@ mod tests {
         /// The shrink is drastic on purpose — the winner's output must be
         /// unmistakably this stage's.
         ShrinkToLast,
+
+        /// Succeed without changing anything.
+        ///
+        /// The no-change shape the chain must not treat as a win: an
+        /// outcome that reduced nothing cannot carry the pass while a
+        /// later stage might still reduce.
+        Unchanged,
     }
 
     /// What one scripted stage observed per call.
@@ -678,6 +730,7 @@ mod tests {
                     });
                     CompactionOutcome::compacted(vec![last], context.tokens_before, 1)
                 }
+                Scripted::Unchanged => CompactionOutcome::no_change(messages),
             }))
         }
     }
@@ -1037,6 +1090,80 @@ mod tests {
             second.seen()[0].messages,
             expected,
             "no partial or half-compacted state leaks between stages"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_success_does_not_win_the_chain() {
+        let first = ScriptedCompactor::new(vec![Scripted::Unchanged]);
+        let second = ScriptedCompactor::new(vec![Scripted::ShrinkToLast]);
+        let chain = FallbackCompactor::builder()
+            .stage("first", Arc::clone(&first) as Arc<dyn ContextCompactor>)
+            .stage("second", Arc::clone(&second) as Arc<dyn ContextCompactor>)
+            .build();
+        let messages = conversation();
+        let outcome = chain
+            .compact(messages, 40_000, context_for(&conversation()))
+            .await;
+        assert_eq!(
+            second.call_count(),
+            1,
+            "a stage that returned success without reducing anything cannot \
+             win the chain — the pass must fall through to the next stage"
+        );
+        assert_eq!(
+            outcome.messages.len(),
+            1,
+            "the reducing stage's output is the pass's output"
+        );
+        let report = chain.last_report().expect("a report is stored per run");
+        assert_eq!(
+            report.winning_stage,
+            Some(1),
+            "the winner is the stage that actually reduced"
+        );
+        assert!(
+            !report.stages[0].success,
+            "the unchanged stage is recorded as not carrying the pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chain_whose_stages_never_reduce_returns_the_last_unchanged_outcome() {
+        let first = ScriptedCompactor::new(vec![Scripted::Unchanged]);
+        let second = ScriptedCompactor::new(vec![Scripted::Unchanged]);
+        let chain = FallbackCompactor::builder()
+            .stage("first", Arc::clone(&first) as Arc<dyn ContextCompactor>)
+            .stage("second", Arc::clone(&second) as Arc<dyn ContextCompactor>)
+            .build();
+        let messages = conversation();
+        let expected: Vec<String> = messages.iter().map(Message::text_content).collect();
+        let outcome = chain
+            .compact(messages, 40_000, context_for(&conversation()))
+            .await;
+        assert_eq!(
+            second.call_count(),
+            1,
+            "every stage runs when none of them reduces"
+        );
+        assert!(
+            outcome.success,
+            "no stage errored, so the chain does not manufacture a failure"
+        );
+        let rendered: Vec<String> = outcome.messages.iter().map(Message::text_content).collect();
+        assert_eq!(
+            rendered, expected,
+            "the conversation rides out unchanged for the caller's own \
+             no-action classification"
+        );
+        assert!(
+            outcome.error.is_none(),
+            "the all-stages-failed text is reserved for stages that errored"
+        );
+        let report = chain.last_report().expect("a report is stored per run");
+        assert_eq!(
+            report.winning_stage, None,
+            "no stage reduced, so no stage won"
         );
     }
 

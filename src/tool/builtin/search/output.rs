@@ -6,7 +6,10 @@
 //! under the tool context's temp directory and the tool returns a
 //! short message naming the path plus a preview and a pointer telling
 //! the caller how to read the full content — one oversized search
-//! cannot blow out a model's context window.
+//! cannot blow out a model's context window. Bodies whose lines
+//! outgrow what one numbered Read line can return are wrapped at
+//! character boundaries before spilling, so every physical line of a
+//! spilled file stays within the Read tool's emission.
 //!
 //! Any failure along the spill path (the temp directory cannot be
 //! created, the file cannot be written) degrades gracefully to inline
@@ -37,6 +40,25 @@ use crate::tool::ToolOutput;
 /// out a model's context window.
 pub const MAX_INLINE_OUTPUT_BYTES: usize = 50 * 1024;
 
+/// The line width spilled bodies wrap to, for Read retrievability.
+///
+/// Read's default output cap bounds the joined numbered view and
+/// always cuts at complete lines, so a physical line wider than
+/// that cap can never be emitted — at any offset. Spilled bodies
+/// wrap lines past this width at character boundaries, continuation
+/// pieces carrying the wrap marker; a quarter of the cap leaves
+/// the `cat -n` number, its tab, and any framing three times over
+/// while keeping a wrapped piece a readable, page-sized row.
+pub const MAX_SPILL_LINE_BYTES: usize = crate::tool::builtin::read::DEFAULT_MAX_BYTES / 4;
+
+/// The prefix marking a wrapped line's continuation pieces.
+///
+/// Makes wrap points self-describing inside the spilled file: a
+/// reader paging through the Read tool concatenates a marked line
+/// with the line above it, marker stripped, to rebuild the original
+/// line.
+const WRAP_CONTINUATION_MARKER: &str = "↪ ";
+
 /// Preview size when output spills or truncates (~10 `KiB`), sliced on a
 /// character boundary.
 const PREVIEW_BYTES: usize = 10 * 1024;
@@ -58,7 +80,12 @@ static SPILL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// crate-internal `DEFAULT_MAX_SIZE_BYTES` the read path enforces)
 /// is split on line boundaries into several files each at or under
 /// that ceiling, every path named — the message must never point at
-/// a file the named tool would refuse to open.
+/// a file the named tool would refuse to open. Before that split,
+/// physical lines past [`MAX_SPILL_LINE_BYTES`] wrap at character
+/// boundaries with marked continuations — Read's output cap cuts at
+/// complete lines, so one over-long line could never be returned at
+/// any offset — and the pointer discloses the wrap convention
+/// whenever wrapping happened.
 ///
 /// `threshold` is a parameter (not a const read inside) so tests can
 /// drive the spill path with a tiny fixture instead of generating
@@ -94,7 +121,8 @@ pub fn truncate_or_spill(
 
     let budget =
         usize::try_from(crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES).unwrap_or(usize::MAX);
-    let chunks = split_into_chunks(&content, budget);
+    let wrapped = wrap_overlong_lines(&content, MAX_SPILL_LINE_BYTES);
+    let chunks = split_into_chunks(&wrapped, budget);
     let Some(written) = spill_chunks(temp_dir, tool_name, &chunks, |file, chunk| {
         file.write_all(chunk.as_bytes())
     }) else {
@@ -102,6 +130,13 @@ pub fn truncate_or_spill(
     };
 
     let preview = preview_slice(&content);
+    let wrap_note = if wrapped.len() == content.len() {
+        String::new()
+    } else {
+        format!(
+            "lines over {MAX_SPILL_LINE_BYTES} bytes are wrapped at character boundaries; a line starting with `{WRAP_CONTINUATION_MARKER}` continues the line above\n\n"
+        )
+    };
     let pointer = if let [only] = written.as_slice() {
         format!(
             "result too large to return inline; full output written to: {}\n\n",
@@ -120,8 +155,80 @@ pub fn truncate_or_spill(
         )
     };
     ToolOutput::text(format!(
-        "{pointer}preview (first ~10 `KiB`):\n{preview}\n\nuse the Read tool on the path above to view the full content"
+        "{pointer}{wrap_note}preview (first ~10 `KiB`):\n{preview}\n\nuse the Read tool on the path above to view the full content"
     ))
+}
+
+/// Wrap physical lines past `width`, at character boundaries.
+///
+/// Bodies whose lines already fit come back byte-equal. An overlong
+/// line becomes its leading `width` bytes on one physical line with
+/// the remainder in bounded pieces, each continuation prefixed with
+/// [`WRAP_CONTINUATION_MARKER`] so the wrap points stay
+/// self-describing; stripping the markers and joining the pieces
+/// rebuilds the original line exactly. Splits land on `str`
+/// boundaries — never inside a multi-byte character.
+fn wrap_overlong_lines(content: &str, width: usize) -> String {
+    if width == 0 {
+        return content.to_string();
+    }
+    let mut wrapped = String::with_capacity(content.len());
+    let mut separator_pending = false;
+    for line in content.split('\n') {
+        if separator_pending {
+            wrapped.push('\n');
+        }
+        separator_pending = true;
+        if line.len() <= width {
+            wrapped.push_str(line);
+            continue;
+        }
+        let mut rest = line;
+        let mut continuation = false;
+        while rest.len() > piece_limit(width, continuation) {
+            if continuation {
+                wrapped.push('\n');
+                wrapped.push_str(WRAP_CONTINUATION_MARKER);
+            }
+            let cut = char_boundary_prefix(rest, piece_limit(width, continuation));
+            wrapped.push_str(&rest[..cut]);
+            rest = &rest[cut..];
+            continuation = true;
+        }
+        if !rest.is_empty() {
+            if continuation {
+                wrapped.push('\n');
+                wrapped.push_str(WRAP_CONTINUATION_MARKER);
+            }
+            wrapped.push_str(rest);
+        }
+    }
+    wrapped
+}
+
+/// The content-byte limit for one wrapped piece of a line.
+///
+/// Continuation pieces must leave room for their marker inside
+/// `width`; the first piece takes the whole width.
+fn piece_limit(width: usize, continuation: bool) -> usize {
+    if continuation {
+        width.saturating_sub(WRAP_CONTINUATION_MARKER.len())
+    } else {
+        width
+    }
+}
+
+/// The largest character boundary at or below `limit`.
+///
+/// Never zero for non-empty text: when `limit` falls inside the
+/// first character, that character's own length is the boundary, so
+/// wrapping always makes progress.
+fn char_boundary_prefix(text: &str, limit: usize) -> usize {
+    let mut cut = text.floor_char_boundary(limit);
+    if cut == 0 && !text.is_empty() {
+        cut = text.chars().next().map_or(0, char::len_utf8);
+    }
+    cut
 }
 
 /// Write every chunk to its own spill file, or `None` on any failure.
@@ -429,13 +536,6 @@ mod tests {
         assert_eq!(chunks, vec!["one\ntwo\n"], "no split under the budget");
     }
 
-    /// An unterminated final suffix must not escape the chunk budget.
-    ///
-    /// Fail-first pin for the PR review's open finding: the loop
-    /// checked the budget only at newlines, so `"aaaaa\nbbbbbbbb"`
-    /// under a 10-byte budget rode one 14-byte chunk — and a real
-    /// unterminated body could push a spill file past the Read
-    /// ceiling after the pointer had already named it.
     #[test]
     fn a_final_suffix_with_no_trailing_newline_cannot_escape_the_budget() {
         let chunks = split_into_chunks("aaaaa\nbbbbbbbb", 10);
@@ -451,12 +551,6 @@ mod tests {
         );
     }
 
-    /// A failed chunk write removes every file the attempt created.
-    ///
-    /// Fail-first pin for the retained cleanup concern: ownership of
-    /// a spill file begins at creation, not at write success —
-    /// otherwise the partially written current chunk lingers behind
-    /// a degraded result that names no path for anyone to find.
     #[test]
     fn a_failed_chunk_write_removes_every_file_including_the_current_one() {
         use std::io::Write as _;
@@ -521,13 +615,6 @@ mod tests {
         assert_eq!(reassembled, body, "the chunks must carry the whole body");
     }
 
-    /// An unterminated body still chunks under the Read ceiling.
-    ///
-    /// The end-to-end arm of the unterminated-suffix fix, in
-    /// `CodeSearch`'s shape — rendered output with no trailing
-    /// newline: a head that fills a chunk to just under the ceiling
-    /// plus a short tail must still land as files the named tool
-    /// will open, reassembling to the exact body.
     #[test]
     fn oversized_unterminated_spills_chunk_under_the_read_ceiling() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -567,6 +654,45 @@ mod tests {
             reassembled.push_str(&std::fs::read_to_string(spilled).unwrap());
         }
         assert_eq!(reassembled, body, "the chunks must carry the whole body");
+    }
+
+    #[test]
+    fn overlong_lines_wrap_at_character_boundaries_for_read_retrieval() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let giant = format!("z{}", "é-x".repeat(3000));
+        let body = format!("start\n{giant}\nend\n");
+        let out = truncate_or_spill(body.clone(), "code_search", tmp.path(), 64);
+        let text = out.text_content();
+        let start = text.find("written to: ").expect("spill pointer") + "written to: ".len();
+        let end = text[start..].find('\n').expect("line end") + start;
+        let spilled = std::fs::read_to_string(text[start..end].trim()).expect("spill body");
+        let mut logical = String::new();
+        let mut saw_marker = false;
+        for line in spilled.split('\n') {
+            assert!(
+                line.len() <= MAX_SPILL_LINE_BYTES,
+                "every physical line must fit one numbered Read line: {}",
+                line.len()
+            );
+            if let Some(rest) = line.strip_prefix(WRAP_CONTINUATION_MARKER) {
+                saw_marker = true;
+                logical.push_str(rest);
+            } else {
+                if !logical.is_empty() {
+                    logical.push('\n');
+                }
+                logical.push_str(line);
+            }
+        }
+        assert!(saw_marker, "the overlong line must actually wrap");
+        assert_eq!(
+            logical, body,
+            "marker-stripped lines must reassemble the exact body"
+        );
+        assert!(
+            text.contains("wrapped at character boundaries"),
+            "the pointer must disclose the wrap convention: {text}"
+        );
     }
 
     #[test]

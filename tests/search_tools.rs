@@ -210,11 +210,13 @@ async fn grep_skips_binary_files() {
 #[tokio::test]
 async fn grep_spills_oversized_results_to_the_context_temp_dir() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let line = format!("needle {}\n", "payload".repeat(2000));
+    let line = format!("needle {}\n", "payload".repeat(500));
     write_file(
         tmp.path(),
         "big.rs",
-        &line.repeat(20), // ~280 KB, far over the 50 KiB inline limit
+        // ~70 KB, over the 50 KiB inline limit; rows stay under the
+        // spill wrap width so the spilled body still re-parses as JSON
+        &line.repeat(20),
     );
     let context = ctx_in(tmp.path());
     let tool = GrepTool::new(FsSearchSource);
@@ -249,6 +251,82 @@ async fn grep_spills_oversized_results_to_the_context_temp_dir() {
     let contents = std::fs::read_to_string(spilled).expect("read spill");
     let reparsed: Vec<Value> = serde_json::from_str(&contents).expect("spilled json");
     assert_eq!(reparsed.len(), 20);
+}
+
+#[tokio::test]
+async fn grep_spilled_overlong_lines_stay_retrievable_through_the_read_tool() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let payload = "payload".repeat(30_000);
+    write_file(
+        tmp.path(),
+        "huge.rs",
+        &format!("needle {payload}\nlet other = 1;\n"),
+    );
+    let context = ctx_in(tmp.path());
+    let tool = GrepTool::new(FsSearchSource);
+    let output = tool
+        .call(
+            json!({
+                "pattern": "needle",
+                "path": tmp.path().to_string_lossy(),
+                "max_matches": 5
+            }),
+            &context,
+        )
+        .await
+        .expect("grep call");
+    let text = output.text_content();
+    let start = text.find("written to: ").expect("spill pointer") + "written to: ".len();
+    let end = text[start..].find('\n').expect("line end") + start;
+    let spill_path = text[start..end].trim().to_string();
+    assert!(
+        text.contains("wrapped at character boundaries"),
+        "the spill pointer must disclose the wrap convention: {text}"
+    );
+
+    let reader = loopctl::tool::builtin::ReadTool::new(FsSearchSource);
+    let mut collected = String::new();
+    let mut saw_marker = false;
+    let mut offset = 1usize;
+    loop {
+        let page = reader
+            .call(
+                json!({"path": spill_path, "offset": offset, "limit": 400}),
+                &context,
+            )
+            .await
+            .expect("read page")
+            .text_content();
+        for line in page.split('\n') {
+            let Some((_, content)) = line.split_once('\t') else {
+                continue;
+            };
+            assert!(
+                content.len() <= loopctl::tool::builtin::search::output::MAX_SPILL_LINE_BYTES,
+                "every numbered Read line must fit the wrap width: {}",
+                content.len()
+            );
+            if let Some(rest) = content.strip_prefix("↪ ") {
+                saw_marker = true;
+                collected.push_str(rest);
+            } else {
+                if !collected.is_empty() {
+                    collected.push('\n');
+                }
+                collected.push_str(content);
+            }
+        }
+        let Some(next) = page.split("Use offset=").nth(1) else {
+            break;
+        };
+        let digits: String = next.chars().take_while(char::is_ascii_digit).collect();
+        offset = digits.parse().expect("next offset");
+    }
+    assert!(saw_marker, "the overlong row must actually wrap");
+    assert!(
+        collected.contains(&payload),
+        "the paged read must recover the whole matched payload"
+    );
 }
 
 #[tokio::test]

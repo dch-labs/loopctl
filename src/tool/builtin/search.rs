@@ -486,14 +486,6 @@ pub(crate) mod test_support {
         }
     }
 
-    /// An `Arc`-shared source keeps the `ContentSource::size` probe.
-    ///
-    /// The delegation must forward `size` too: `ReadTool`'s
-    /// refuse-before-read guard consults `size`, and a wrapper
-    /// that dropped it would turn every shared-source read into an
-    /// unbounded whole-file load. Proven over the filesystem source
-    /// with a real file of known length, and over a missing path
-    /// (the honest `None`, not a fabricated zero).
     #[tokio::test]
     async fn arc_shared_sources_keep_the_size_probe() {
         let tmp = tempfile::TempDir::new().expect("tempdir");

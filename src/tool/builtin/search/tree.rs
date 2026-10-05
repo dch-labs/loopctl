@@ -527,9 +527,6 @@ mod tests {
         assert!(filtered[0].is_dir);
     }
 
-    /// The dch v1 contract: a pattern containing `/` matches the path
-    /// relative to the root, not the basename — and `src/*.rs` must not
-    /// leak files from a directory whose name merely starts with `src`.
     #[test]
     fn filter_entries_slash_pattern_matches_relative_paths() {
         let entries = vec![

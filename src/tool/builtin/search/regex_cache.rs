@@ -201,11 +201,6 @@ mod tests {
         assert!(!re.is_match("no_match_xyz"));
     }
 
-    /// The Unicode-seam parity pin: whatever feature set enables the
-    /// search tools must keep `regex` Unicode-capable, matching the
-    /// crate-wide `redaction` configuration — non-ASCII case folding
-    /// and Perl classes degrade silently to ASCII-only otherwise, a
-    /// gap `--all-features` unification hides.
     #[test]
     fn unicode_folding_and_classes_survive_the_minimal_feature_set() {
         let _guard = TEST_LOCK.lock().unwrap();

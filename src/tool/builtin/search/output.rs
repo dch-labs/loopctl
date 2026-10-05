@@ -40,22 +40,28 @@ const PREVIEW_BYTES: usize = 10 * 1024;
 /// feature — the counter is monotonic for the process lifetime.
 static SPILL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Return `content` as a tool result, spilling to a file when oversized.
+/// Return `content` as a tool result, spilling to files when oversized.
 ///
 /// If `content.len()` is at or under `threshold`, it is returned
-/// inline. If it exceeds `threshold`, it is written to a fresh file
-/// under `temp_dir` and the returned text names the path, carries a
-/// preview of the first ~10 `KiB`, and points the caller at the Read
-/// tool for the full content.
+/// inline. If it exceeds `threshold`, it is written under `temp_dir`
+/// and the returned text carries a preview of the first ~10 `KiB`
+/// and points the caller at the Read tool for the full content. A
+/// body over the Read tool's own refuse-before-read ceiling (the
+/// crate-internal `DEFAULT_MAX_SIZE_BYTES` the read path enforces)
+/// is split on line boundaries into several files each at or under
+/// that ceiling, every path named — the message must never point at
+/// a file the named tool would refuse to open.
 ///
 /// `threshold` is a parameter (not a const read inside) so tests can
 /// drive the spill path with a tiny fixture instead of generating
 /// 50 `KiB` of content; production callers pass
 /// [`MAX_INLINE_OUTPUT_BYTES`].
 ///
-/// Every failure mode (the temp directory cannot be created, the file
+/// Every failure mode (the temp directory cannot be created, a file
 /// cannot be written, the disk fills) degrades to inline truncation
-/// with a note — the function never returns an error and never panics.
+/// with a note — the function never returns an error and never
+/// panics, and chunks already written before the failure are
+/// removed so a degraded result never leaves orphaned files.
 #[must_use]
 pub fn truncate_or_spill(
     content: String,
@@ -77,23 +83,103 @@ pub fn truncate_or_spill(
         return ToolOutput::text(truncate_inline(&content));
     }
 
-    let spill_path = spill_file_path(temp_dir, tool_name);
-    let Some(mut file) = create_spill_file(&spill_path) else {
-        return ToolOutput::text(truncate_inline(&content));
-    };
-    if file.write_all(content.as_bytes()).is_err() {
-        return ToolOutput::text(truncate_inline(&content));
+    let budget =
+        usize::try_from(crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES).unwrap_or(usize::MAX);
+    let chunks = split_into_chunks(&content, budget);
+    let mut written: Vec<PathBuf> = Vec::new();
+    for chunk in &chunks {
+        let spill_path = spill_file_path(temp_dir, tool_name);
+        let Some(mut file) = create_spill_file(&spill_path) else {
+            remove_orphans(&written);
+            return ToolOutput::text(truncate_inline(&content));
+        };
+        if file.write_all(chunk.as_bytes()).is_err() {
+            remove_orphans(&written);
+            return ToolOutput::text(truncate_inline(&content));
+        }
+        drop(file);
+        written.push(spill_path);
     }
-    drop(file);
 
     let preview = preview_slice(&content);
+    let pointer = if let [only] = written.as_slice() {
+        format!(
+            "result too large to return inline; full output written to: {}\n\n",
+            only.display()
+        )
+    } else {
+        let listed = written
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "result too large to return inline; full output written to {} files:\n{}\n\n",
+            written.len(),
+            listed
+        )
+    };
     ToolOutput::text(format!(
-        "result too large to return inline; full output written to: {}\n\n\
-         preview (first ~10 `KiB`):\n{}\n\n\
-         use the Read tool on the path above to view the full content",
-        spill_path.display(),
-        preview
+        "{pointer}preview (first ~10 `KiB`):\n{preview}\n\nuse the Read tool on the path above to view the full content"
     ))
+}
+
+/// Best-effort removal of spill files a degraded result must disown.
+///
+/// When a later chunk fails after earlier ones reached disk, the
+/// inline-truncation fallback names no files — so the half-written
+/// set must not linger behind a pointer nobody gave. A removal
+/// failure is logged, never propagated: the caller is already on
+/// its degrade path.
+fn remove_orphans(written: &[PathBuf]) {
+    for orphan in written {
+        if let Err(error) = std::fs::remove_file(orphan) {
+            tracing::warn!(
+                target: "loopctl::metrics",
+                path = %orphan.display(),
+                error = %error,
+                "failed to remove an orphaned spill chunk"
+            );
+        }
+    }
+}
+
+/// Split `content` into line-boundary chunks of at most `budget` bytes.
+///
+/// The read tool refuses files over its own size ceiling, so a spill
+/// body larger than that ceiling must reach disk as several files the
+/// named tool can actually open. Chunks break on newlines — every
+/// tool body is line-oriented (pretty JSON rows, rendered listings) —
+/// and reassemble to the original bytes exactly; a body that fits the
+/// budget comes back as one chunk. A single line longer than the
+/// budget lands alone in its own chunk rather than being split
+/// mid-line (no in-family body produces one: matching lines are
+/// bounded by the per-file read cap).
+fn split_into_chunks(content: &str, budget: usize) -> Vec<&str> {
+    if budget == 0 {
+        return vec![content];
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut boundary = 0;
+    for (offset, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            let after_line = offset.saturating_add(1);
+            if after_line.saturating_sub(start) > budget && boundary > start {
+                chunks.push(&content[start..boundary]);
+                start = boundary;
+            }
+            boundary = after_line;
+            if boundary.saturating_sub(start) >= budget {
+                chunks.push(&content[start..boundary]);
+                start = boundary;
+            }
+        }
+    }
+    if start < content.len() {
+        chunks.push(&content[start..]);
+    }
+    chunks
 }
 
 /// Create the spill file at `path`, exclusively and owner-only.
@@ -268,6 +354,76 @@ mod tests {
             mode, 0o600,
             "spill files must not be group- or world-readable"
         );
+    }
+
+    #[test]
+    fn chunk_split_respects_the_budget_and_round_trips() {
+        let body = "alpha\nbravo\ncharlie\ndelta\n";
+        let chunks = split_into_chunks(body, 13);
+        assert!(
+            chunks.len() >= 2,
+            "a body over the budget must split: {chunks:?}"
+        );
+        for chunk in &chunks {
+            assert!(
+                chunk.len() <= 13,
+                "every chunk must fit the budget: {chunk:?}"
+            );
+        }
+        assert_eq!(chunks.concat(), body, "chunks must reassemble the body");
+        for chunk in &chunks {
+            assert!(
+                chunk.ends_with('\n') || *chunk == body,
+                "chunks break on line boundaries: {chunk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_split_keeps_a_fitting_body_whole() {
+        let body = "one\ntwo\n";
+        let chunks = split_into_chunks(body, 1024);
+        assert_eq!(chunks, vec!["one\ntwo\n"], "no split under the budget");
+    }
+
+    #[test]
+    fn oversized_spills_chunk_under_the_read_ceiling_and_name_every_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // ~11.5 `MiB` of lines: two chunks under the read tool's own
+        // 10 `MiB` refuse-before-read ceiling, not one 11.5 `MiB` file
+        // the named tool would refuse.
+        let line = format!("{}\n", "needle".repeat(64));
+        let body = line.repeat(48_000);
+        assert!(
+            body.len()
+                > usize::try_from(crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES)
+                    .unwrap_or(usize::MAX)
+        );
+        let out = truncate_or_spill(body.clone(), "grep", tmp.path(), 64);
+        let text = out.text_content();
+        assert!(text.contains("full output written to 2 files"), "{text}");
+        assert!(text.contains("use the Read tool"), "{text}");
+        let prefix = tmp.path().to_string_lossy().into_owned();
+        let mut paths = Vec::new();
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find(&prefix) {
+            let after = &rest[at..];
+            let end = after.find('\n').unwrap_or(after.len());
+            paths.push(after[..end].trim().to_string());
+            rest = &rest[at + end..];
+        }
+        assert_eq!(paths.len(), 2, "both chunk paths must be named: {text}");
+        let mut reassembled = String::new();
+        for path in &paths {
+            let spilled = std::path::Path::new(path);
+            let len = std::fs::metadata(spilled).unwrap().len();
+            assert!(
+                len <= crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES,
+                "each chunk must stay at or under the read ceiling: {len}"
+            );
+            reassembled.push_str(&std::fs::read_to_string(spilled).unwrap());
+        }
+        assert_eq!(reassembled, body, "the chunks must carry the whole body");
     }
 
     #[test]

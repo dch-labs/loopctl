@@ -129,7 +129,7 @@ search_tools-minimal:
 	rust_version=$$(sed -n 's/^rust-version = "\([^"]*\)".*/\1/p' Cargo.toml); \
 	[ -n "$$edition" ] && [ -n "$$rust_version" ] || { echo "search_tools-minimal: cannot derive edition/rust-version from Cargo.toml" >&2; exit 1; }; \
 	mkdir -p "$$tmp/src"; \
-	printf '[package]\nname = "search-tools-minimal-probe"\nversion = "0.0.0"\nedition = "%s"\nrust_version = "%s"\npublish = false\n\n[dependencies]\nloopctl = { path = "%s", features = ["search_tools"] }\n\n[workspace]\n' "$$edition" "$$rust_version" "$(CURDIR)" > "$$tmp/Cargo.toml"; \
+	printf '[package]\nname = "search-tools-minimal-probe"\nversion = "0.0.0"\nedition = "%s"\nrust-version = "%s"\npublish = false\n\n[dependencies]\nloopctl = { path = "%s", features = ["search_tools"] }\n\n[workspace]\n' "$$edition" "$$rust_version" "$(CURDIR)" > "$$tmp/Cargo.toml"; \
 	printf '%s' "$$SEARCH_PROBE_MAIN" > "$$tmp/src/main.rs"; \
 	CARGO_TARGET_DIR="$(CURDIR)/target/search-tools-minimal" cargo run --quiet --manifest-path "$$tmp/Cargo.toml"
 

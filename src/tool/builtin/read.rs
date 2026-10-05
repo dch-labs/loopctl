@@ -50,8 +50,10 @@ const DEFAULT_MAX_LINES: usize = 400;
 /// any line ceiling, and a full window of ordinary-width lines can add
 /// past it — both cut here. The cut lands on the last complete line and
 /// the marker names the returned range, the next offset, and the remedy;
-/// it states the bound, never a cause the tool cannot verify.
-const DEFAULT_MAX_BYTES: usize = 32_768;
+/// it states the bound, never a cause the tool cannot verify. Shared as
+/// `pub(crate)`: the search spill wrap derives its line width from this
+/// cap so the two cannot drift.
+pub(crate) const DEFAULT_MAX_BYTES: usize = 32_768;
 
 /// Default `limit` when `offset` is given but `limit` is not.
 ///

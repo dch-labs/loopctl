@@ -1,6 +1,6 @@
-.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal digest-canonical derive-consumer darwin-clippy
+.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy
 
-ci: fmt check check-default clippy test docs examples redaction-minimal digest-canonical derive-consumer darwin-clippy
+ci: fmt check check-default clippy test docs examples redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy
 
 check:
 	cargo check --all-features
@@ -102,6 +102,36 @@ redaction-minimal:
 	printf '[package]\nname = "redaction-minimal-probe"\nversion = "0.0.0"\nedition = "%s"\nrust-version = "%s"\npublish = false\n\n[dependencies]\nloopctl = { path = "%s", features = ["redaction"] }\n\n[workspace]\n' "$$edition" "$$rust_version" "$(CURDIR)" > "$$tmp/Cargo.toml"; \
 	printf '%s' "$$PROBE_MAIN" > "$$tmp/src/main.rs"; \
 	CARGO_TARGET_DIR="$(CURDIR)/target/redaction-minimal" cargo run --quiet --manifest-path "$$tmp/Cargo.toml"
+
+# The search-tools feature-graph probe: a consumer enabling only
+# search_tools must get the same regex semantics every other enabling
+# in this crate configures — non-ASCII case folding and Unicode-aware
+# Perl classes. In-crate tests cannot see this (dev-dependencies unify
+# regex features into the test build), so the probe builds loopctl as
+# a dependency with search_tools alone. Manifest-shape and environment
+# constraints mirror redaction-minimal.
+define SEARCH_PROBE_TEXT
+fn main() {
+    let folded = loopctl::tool::builtin::search::content::compile_pattern("\u{0439}", true)
+        .expect("the pattern must compile under search_tools alone");
+    assert!(folded.is_match("\u{0419}"), "case-insensitive matching must fold non-ASCII letters under search_tools alone");
+    let words = loopctl::tool::builtin::search::content::compile_pattern(r"\w+", false)
+        .expect("the class pattern must compile under search_tools alone");
+    assert!(words.is_match("\u{0441}\u{043b}\u{043e}\u{0432}\u{043e}"), "Perl classes must stay Unicode-aware, not ASCII-only, under search_tools alone");
+}
+endef
+
+search_tools-minimal: export SEARCH_PROBE_MAIN = $(SEARCH_PROBE_TEXT)
+search_tools-minimal:
+	@tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT INT TERM; \
+	edition=$$(sed -n 's/^edition = "\([^"]*\)".*/\1/p' Cargo.toml); \
+	rust_version=$$(sed -n 's/^rust-version = "\([^"]*\)".*/\1/p' Cargo.toml); \
+	[ -n "$$edition" ] && [ -n "$$rust_version" ] || { echo "search_tools-minimal: cannot derive edition/rust-version from Cargo.toml" >&2; exit 1; }; \
+	mkdir -p "$$tmp/src"; \
+	printf '[package]\nname = "search-tools-minimal-probe"\nversion = "0.0.0"\nedition = "%s"\nrust-version = "%s"\npublish = false\n\n[dependencies]\nloopctl = { path = "%s", features = ["search_tools"] }\n\n[workspace]\n' "$$edition" "$$rust_version" "$(CURDIR)" > "$$tmp/Cargo.toml"; \
+	printf '%s' "$$SEARCH_PROBE_MAIN" > "$$tmp/src/main.rs"; \
+	CARGO_TARGET_DIR="$(CURDIR)/target/search-tools-minimal" cargo run --quiet --manifest-path "$$tmp/Cargo.toml"
 
 digest-canonical: export DIGEST_PROBE_MAIN = $(DIGEST_PROBE_TEXT)
 digest-canonical:

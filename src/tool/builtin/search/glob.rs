@@ -140,12 +140,7 @@ async fn glob_inner<S: SearchSource + 'static>(
 
     let json = serde_json::to_string_pretty(&matches)
         .map_err(|error| ToolError::Execution(format!("Failed to serialize results: {error}")))?;
-    Ok(truncate_or_spill(
-        json,
-        "glob",
-        &temp_dir,
-        MAX_INLINE_OUTPUT_BYTES,
-    ))
+    Ok(truncate_or_spill(json, "glob", &temp_dir, MAX_INLINE_OUTPUT_BYTES).0)
 }
 
 /// Walk `base` on `source` and collect the relative paths of files
@@ -176,6 +171,7 @@ fn collect_matches(
 /// `pattern` is the user's glob, copied verbatim — no normalization;
 /// the pattern feeds directly into the `ignore` matcher. `base_path`
 /// is the search root, either as supplied or defaulted to `"."`.
+#[derive(Debug)]
 struct ParsedInput {
     /// The glob pattern supplied by the caller.
     ///
@@ -198,11 +194,19 @@ struct ParsedInput {
 /// Returns [`ToolError::InvalidInput`] when `pattern` is missing or
 /// not a string.
 fn parse_input(input: &Value) -> Result<ParsedInput, ToolError> {
-    let pattern = input
-        .get("pattern")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::InvalidInput("Missing 'pattern' field".to_string()))?
-        .to_string();
+    let pattern = match input.get("pattern") {
+        None => {
+            return Err(ToolError::InvalidInput(
+                "Missing 'pattern' field".to_string(),
+            ));
+        }
+        Some(Value::String(pattern)) => pattern.clone(),
+        Some(_) => {
+            return Err(ToolError::InvalidInput(
+                "'pattern' must be a string".to_string(),
+            ));
+        }
+    };
     let base_path = input
         .get("path")
         .and_then(Value::as_str)
@@ -347,6 +351,21 @@ mod tests {
         let input = json!({"pattern": "*.rs", "path": "/other"});
         let parsed = parse_input(&input).unwrap();
         assert_eq!(parsed.base_path, "/other");
+    }
+
+    #[test]
+    fn parse_input_rejects_a_wrong_typed_pattern_as_typed() {
+        for wrong in [json!(42), json!(2.5), json!(null), json!(["x"])] {
+            let error = parse_input(&json!({ "pattern": wrong }))
+                .expect_err("a present-but-wrong-typed pattern is a correction prompt");
+            match error {
+                ToolError::InvalidInput(message) => assert_eq!(
+                    message, "'pattern' must be a string",
+                    "the model sent the field; it must be told the type, not that it is missing"
+                ),
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
     }
 
     #[test]

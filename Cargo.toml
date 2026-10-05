@@ -50,7 +50,6 @@ tempfile = { version = "3", optional = true }
 rmcp = { version = "3.4", optional = true, default-features = false, features = ["client", "server", "macros", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-io"] }
 ignore = { version = "0.4", optional = true }
 lru = { version = "0.18.2", optional = true }
-same-file = { version = "1.0.6", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
@@ -62,7 +61,8 @@ tempfile = "3"
 [features]
 default = []
 builtin_tools = ["dep:base64"]
-search_tools = ["builtin_tools", "dep:ignore", "dep:lru", "dep:same-file", "dep:regex", "regex/unicode-case", "regex/unicode-perl"]
+search_tools = ["builtin_tools", "dep:ignore", "dep:lru", "dep:regex", "regex/unicode-case", "regex/unicode-perl"]
+shell_tools = ["builtin_tools", "dep:libc", "tokio/process", "tokio/io-util"]
 fs_tools = ["builtin_tools", "dep:libc", "dep:tempfile", "tokio/fs", "tokio/io-util"]
 vector_index = []
 vector_memory = ["vector_index"]

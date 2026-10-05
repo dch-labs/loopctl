@@ -1,6 +1,6 @@
-.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy
+.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check
 
-ci: fmt check check-default clippy test docs examples redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy
+ci: fmt check check-default clippy test docs examples redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check
 
 check:
 	cargo check --all-features
@@ -23,6 +23,9 @@ clippy:
 
 darwin-clippy:
 	cargo clippy --target aarch64-apple-darwin --features fs_tools -- -D warnings
+
+windows-check:
+	cargo check --target x86_64-pc-windows-msvc --features shell_tools,fs_tools,search_tools
 
 fmt:
 	cargo fmt --all -- --check

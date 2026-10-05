@@ -303,7 +303,7 @@ fn render(matches: &[Match], pattern: &str, context_lines: usize, temp_dir: &Pat
         }
     }
     let text = out.join("\n");
-    truncate_or_spill(text, "code_search", temp_dir, MAX_INLINE_OUTPUT_BYTES)
+    truncate_or_spill(text, "code_search", temp_dir, MAX_INLINE_OUTPUT_BYTES).0
 }
 
 #[cfg(test)]

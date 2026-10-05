@@ -19,6 +19,18 @@
 //!   [`FileViewerTool`](fs::FileViewerTool), and the
 //!   [`FileSource`](fs::FileSource) filesystem content source — over
 //!   one shared [`FileSession`](fs::FileSession).
+//! - With the `search_tools` feature: the search family —
+//!   [`GlobTool`](search::GlobTool), [`GrepTool`](search::GrepTool),
+//!   [`CodeSearchTool`](search::CodeSearchTool), and
+//!   [`TreeTool`](search::TreeTool), generic over the
+//!   [`SearchSource`](search::SearchSource) seam with
+//!   [`FsSearchSource`](search::FsSearchSource) as the filesystem
+//!   implementation.
+//! - With the `shell_tools` feature: the execution family — the
+//!   `Shell` tool and [`JobsTool`](shell::jobs::JobsTool) over the
+//!   [`ShellBackend`](shell::ShellBackend) seam and one shared
+//!   [`JobStore`](shell::jobs::JobStore), with
+//!   [`UnixShellBackend`](shell::unix::UnixShellBackend) on Unix.
 //!
 //! # Example
 //!
@@ -39,6 +51,9 @@ pub mod fs;
 
 #[cfg(feature = "search_tools")]
 pub mod search;
+
+#[cfg(feature = "shell_tools")]
+pub mod shell;
 
 pub use read::{ContentSource, ReadTool};
 pub use think::ThinkTool;
@@ -99,6 +114,35 @@ mod tests {
             assert_camel_case(super::fs::EditTool::new().name());
             assert_camel_case(super::fs::MultiEditTool::new().name());
             assert_camel_case(super::fs::FileViewerTool.name());
+        }
+        #[cfg(feature = "search_tools")]
+        {
+            assert_camel_case(super::search::GlobTool::new(super::search::FsSearchSource).name());
+            assert_camel_case(super::search::GrepTool::new(super::search::FsSearchSource).name());
+            assert_camel_case(
+                super::search::CodeSearchTool::new(super::search::FsSearchSource).name(),
+            );
+            assert_camel_case(super::search::TreeTool::new(super::search::FsSearchSource).name());
+        }
+        #[cfg(feature = "shell_tools")]
+        {
+            #[cfg(unix)]
+            let backend = super::shell::unix::UnixShellBackend;
+            #[cfg(not(unix))]
+            let backend = super::shell::UnsupportedShellBackend;
+            assert_camel_case(
+                super::shell::ShellTool::new(
+                    backend,
+                    std::sync::Arc::new(super::shell::jobs::JobStore::new()),
+                )
+                .name(),
+            );
+            assert_camel_case(
+                super::shell::jobs::JobsTool::new(std::sync::Arc::new(
+                    super::shell::jobs::JobStore::new(),
+                ))
+                .name(),
+            );
         }
     }
 

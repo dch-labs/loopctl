@@ -156,20 +156,9 @@ async fn tree_inner<S: SearchSource + 'static>(
     let base_path = resolve::path_field(&input)?.to_string();
     resolve::reject_url("Tree", &base_path)?;
 
-    let max_depth = input
-        .get("max_depth")
-        .and_then(Value::as_u64)
-        .and_then(|depth| usize::try_from(depth).ok())
-        .unwrap_or(DEFAULT_MAX_DEPTH)
-        .clamp(MIN_MAX_DEPTH, MAX_MAX_DEPTH);
-    let include_files = input
-        .get("include_files")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let pattern = input
-        .get("pattern")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let max_depth = max_depth_field(&input)?.clamp(MIN_MAX_DEPTH, MAX_MAX_DEPTH);
+    let include_files = include_files_field(&input)?;
+    let pattern = pattern_field(&input)?;
     let full_path = resolve::resolve_root(&base_path, &cwd);
 
     tokio::task::spawn_blocking(move || {
@@ -209,10 +198,81 @@ async fn tree_inner<S: SearchSource + 'static>(
             "tree",
             &temp_dir,
             MAX_INLINE_OUTPUT_BYTES,
-        ))
+        )
+        .0)
     })
     .await
     .map_err(|error| ToolError::Execution(format!("Tree walk task failed: {error}")))?
+}
+
+/// Read the `max_depth` field: absent → the default, integer → kept.
+///
+/// The family-wide numeric-input rule (the shared search parse and
+/// the shell family's typed getters): absent is the default, a
+/// non-negative integer is taken, anything else is a correction
+/// prompt naming the field — a model that sends `"max_depth":
+/// "10"` must be told, not silently shown depth 3. An integer
+/// above the clamp ceiling — including one a narrower `usize`
+/// cannot represent, as on a 32-bit host receiving `4294967296` —
+/// meets the ceiling here, never a silent default.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] when the field is present but
+/// not a non-negative integer.
+fn max_depth_field(input: &Value) -> Result<usize, ToolError> {
+    match input.get("max_depth") {
+        None => Ok(DEFAULT_MAX_DEPTH),
+        Some(value) if value.is_u64() => {
+            let raw = value.as_u64().unwrap_or(0);
+            Ok(match usize::try_from(raw) {
+                Ok(depth) => depth.min(MAX_MAX_DEPTH),
+                Err(_) => MAX_MAX_DEPTH,
+            })
+        }
+        Some(_) => Err(ToolError::InvalidInput(
+            "'max_depth' must be a positive integer".to_string(),
+        )),
+    }
+}
+
+/// Read the `include_files` flag: absent → `true`, boolean → kept.
+///
+/// The same present-but-wrong-typed rule: a string `"false"` must
+/// be corrected, not silently rendered with the files it asked to
+/// hide.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] when the field is present but
+/// not a boolean.
+fn include_files_field(input: &Value) -> Result<bool, ToolError> {
+    match input.get("include_files") {
+        None => Ok(true),
+        Some(value) if value.is_boolean() => Ok(value.as_bool().unwrap_or(true)),
+        Some(_) => Err(ToolError::InvalidInput(
+            "'include_files' must be a boolean".to_string(),
+        )),
+    }
+}
+
+/// Read the `pattern` field: absent → `None`, string → kept.
+///
+/// The same present-but-wrong-typed rule: a numeric pattern must be
+/// corrected, not silently dropped so the listing shows everything.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] when the field is present but
+/// not a string.
+fn pattern_field(input: &Value) -> Result<Option<String>, ToolError> {
+    match input.get("pattern") {
+        None => Ok(None),
+        Some(Value::String(pattern)) => Ok(Some(pattern.clone())),
+        Some(_) => Err(ToolError::InvalidInput(
+            "'pattern' must be a string".to_string(),
+        )),
+    }
 }
 
 /// Filter the walked entries by `include_files` and the optional pattern.
@@ -667,6 +727,80 @@ mod tests {
                 assert!(message.contains("not a directory"), "{message}");
             }
             other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_rejects_wrong_typed_max_depth_include_files_and_pattern() {
+        let tool = TreeTool::new(FsSearchSource);
+        for wrong in [json!("10"), json!(2.5), json!(null), json!(true)] {
+            let error = tool
+                .call(json!({ "max_depth": wrong }), &ctx_in("/"))
+                .await
+                .expect_err("a present-but-wrong-typed depth is a correction prompt");
+            match error {
+                ToolError::InvalidInput(message) => {
+                    assert_eq!(message, "'max_depth' must be a positive integer");
+                }
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
+        for wrong in [json!("true"), json!(2.5), json!(null), json!(7)] {
+            let error = tool
+                .call(json!({ "include_files": wrong }), &ctx_in("/"))
+                .await
+                .expect_err("a present-but-wrong-typed flag is a correction prompt");
+            match error {
+                ToolError::InvalidInput(message) => {
+                    assert_eq!(message, "'include_files' must be a boolean");
+                }
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
+        for wrong in [json!(123), json!(2.5), json!(null), json!(true)] {
+            let error = tool
+                .call(json!({ "pattern": wrong }), &ctx_in("/"))
+                .await
+                .expect_err("a present-but-wrong-typed pattern is a correction prompt");
+            match error {
+                ToolError::InvalidInput(message) => {
+                    assert_eq!(message, "'pattern' must be a string");
+                }
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_optional_fields_still_take_their_defaults() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "").unwrap();
+        let output = TreeTool::new(FsSearchSource)
+            .call(
+                json!({ "path": tmp.path().to_string_lossy() }),
+                &ctx_in(&tmp.path().to_string_lossy()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            output.text_content().contains("a.rs"),
+            "absent means the defaults (files included, no pattern), never an error: {}",
+            output.text_content()
+        );
+    }
+
+    #[test]
+    fn an_absurd_max_depth_clamps_never_silently_defaults() {
+        for raw in [u64::from(u32::MAX), 1u64 << 32, u64::MAX] {
+            let depth = max_depth_field(&json!({ "max_depth": raw })).unwrap();
+            assert_ne!(
+                depth, DEFAULT_MAX_DEPTH,
+                "an absurd depth must meet the clamp ceiling on every pointer width, never a silent default (raw {raw})"
+            );
+            assert_eq!(
+                depth, MAX_MAX_DEPTH,
+                "an out-of-range depth meets the documented clamp (raw {raw})"
+            );
         }
     }
 

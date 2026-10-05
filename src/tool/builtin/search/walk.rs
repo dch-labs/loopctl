@@ -2,8 +2,9 @@
 //!
 //! The single [`walk_files`] entry point is what every search-style tool
 //! (`Glob`, `Grep`, `CodeSearch`, `Tree`) uses for directory traversal. It
-//! honors `.gitignore`, `.git/info/exclude`, the global gitignore, and an
-//! optional `.dchignore` file, and it applies an always-exclude list so that
+//! honors `.gitignore`, `.git/info/exclude`, the global gitignore, the
+//! `ignore` crate's `.ignore`, and the custom ignore files `.loopctlignore`
+//! and `.dchignore`, and it applies an always-exclude list so that
 //! `target/`, `node_modules/`, `.git/`, and friends never leak into results —
 //! even in non-git repositories.
 //!
@@ -15,8 +16,9 @@ use std::path::Path;
 
 /// Build a gitignore-aware file walker over `base`.
 ///
-/// Honors `.gitignore`, `.git/info/exclude`, the global gitignore, and a
-/// `.dchignore` file (when present); skips hidden entries; and always excludes
+/// Honors `.gitignore`, `.git/info/exclude`, the global gitignore, and the
+/// custom ignore files `.loopctlignore` and `.dchignore` (when present);
+/// skips hidden entries; and always excludes
 /// `target/`, `node_modules/`, `.git/`, `__pycache__/`, `.venv/`, and the other
 /// directories named by [`build_default_overrides`] — even in non-git
 /// repositories. Symlinks are not followed, matching `ignore`'s default, so
@@ -112,7 +114,8 @@ const ALWAYS_PRUNE_DIRS: &[&str] = &[
 /// Walk `base` yielding both files and directories, gitignore-aware.
 ///
 /// Shares the same `WalkBuilder` config as [`walk_files`] (hidden entries
-/// skipped, `.gitignore`/`.git/info/exclude`/global gitignore/`.dchignore`
+/// skipped, `.gitignore`/`.git/info/exclude`/global gitignore and the
+/// `.loopctlignore`/`.dchignore` custom names
 /// honored, always-exclude overrides applied) but does **not** filter to
 /// files only. The optional `max_depth` caps the traversal depth (number of
 /// path components below `base`; `None` = unlimited). Used by the Tree tool,

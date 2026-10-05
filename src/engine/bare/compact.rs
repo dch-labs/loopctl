@@ -17,7 +17,7 @@ use crate::capabilities::Compactable;
 #[cfg(feature = "hooks")]
 use crate::capabilities::Hookable;
 use crate::message::Message;
-use crate::observer::{CompactedContext, PreCompactionContext};
+use crate::observer::{CompactedContext, CompactionFailedContext, PreCompactionContext};
 
 /// The result of servicing a [`MachineStep::Compact`](crate::engine::core::MachineStep::Compact),
 /// before it is fed back into the machine.
@@ -81,9 +81,10 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::ContextExceeded`] when compaction was required but
-    /// the compactor could not reduce the history enough to fit the context
-    /// window.
+    /// Returns [`LoopError::CompactionFailed`] when the configured
+    /// compactor ran and errored — the real cause rides the variant —
+    /// and [`LoopError::ContextExceeded`] when a pass succeeded but
+    /// its result still does not fit the context window.
     pub(super) async fn run_compaction(
         &mut self,
         turn: usize,
@@ -217,10 +218,26 @@ impl<C: ApiClient> BareLoop<C> {
                         "compaction failed; reporting the context overflow it could not fix"
                     );
                 }
-                Err(LoopError::ContextExceeded {
-                    used: overflow.tokens_used,
-                    limit: overflow.context_window,
-                })
+                self.managers
+                    .observers()
+                    .on_compaction_failed(&CompactionFailedContext {
+                        reason,
+                        turn,
+                        tokens_before,
+                        context_window: overflow.context_window,
+                        error: overflow.compactor_error.clone(),
+                    });
+                match overflow.compactor_error {
+                    Some(cause) => Err(LoopError::CompactionFailed {
+                        used: overflow.tokens_used,
+                        limit: overflow.context_window,
+                        cause,
+                    }),
+                    None => Err(LoopError::ContextExceeded {
+                        used: overflow.tokens_used,
+                        limit: overflow.context_window,
+                    }),
+                }
             }
         }
     }

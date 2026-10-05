@@ -139,23 +139,6 @@ impl ToolPairing {
         new_split
     }
 
-    /// Whether splitting at `index` keeps every paired result with its
-    /// call.
-    ///
-    /// `false` when any paired result at or after `index` has its call
-    /// before `index` — judged per occurrence, so a reused id's later
-    /// pair does not vouch for the earlier one.
-    fn boundary_pair_safe(&self, index: usize) -> bool {
-        !self.mates.iter().enumerate().skip(index).any(|(i, row)| {
-            row.iter().flatten().any(|mate| {
-                matches!(
-                    mate,
-                    PartMate::Paired { message: m, .. } if *m < index && *m < i
-                )
-            })
-        })
-    }
-
     /// Result-message indices in `1..split` paired with calls carried
     /// by the first message.
     ///
@@ -603,8 +586,13 @@ impl TruncatingCompactor {
 ///
 /// Used by compactors (and agent-side code) that need to know which
 /// messages to compact versus preserve. Splits at role transitions for
-/// coherent summarization — the split always occurs between a complete
-/// request/response pair.
+/// coherent summarization, and never orphans a tool result on the kept
+/// side: a boundary that would strand a call behind its kept result
+/// slides back to include the call, so chat histories cut between
+/// complete request/response pairs and agent tool-loop histories cut
+/// after a complete exchange — the dropped side ending with a
+/// result-bearing user message whose calls ride above it in the same
+/// slice.
 ///
 /// # Rules
 ///
@@ -684,8 +672,10 @@ pub struct SplitResult {
     /// The index in the original message list where the split occurred.
     ///
     /// Zero when no split was needed (the entire conversation was
-    /// preserved), or when no split is possible without separating a
-    /// tool call from its result.
+    /// preserved), or when no cut can keep the kept side self-contained —
+    /// every candidate boundary, even slid back to its straddling call,
+    /// would orphan a kept tool result, so the whole conversation stays
+    /// preserved.
     pub split_index: usize,
 }
 
@@ -725,12 +715,20 @@ impl TokenSplitter {
     /// Split the given messages into old and recent portions.
     ///
     /// The split point is chosen at a turn boundary (a role transition
-    /// from assistant to a user message carrying no tool results) as
-    /// close as possible to leaving `preserve_recent` messages in the
-    /// recent portion. Splitting never separates a tool call from its
-    /// result: when no pair-safe boundary exists at or before the
-    /// target, the entire conversation is preserved and `to_compact`
-    /// is empty.
+    /// from assistant to user) as close as possible to leaving
+    /// `preserve_recent` messages in the recent portion. A boundary
+    /// that would orphan a kept tool result — its call landing in the
+    /// dropped portion — slides backward to include the message
+    /// carrying that call, the truncator's own pairing discipline, so
+    /// the kept side is self-contained exactly as
+    /// [`TruncatingCompactor`] guarantees and agent tool-loop
+    /// histories (every user message after the head delivering tool
+    /// results) still yield a dropped slice: the cut lands after a
+    /// complete exchange, the dropped side ending with a
+    /// result-bearing user message whose calls ride above it in the
+    /// same slice. When every candidate cut slides past the
+    /// conversation's head, nothing can be split off and the whole
+    /// conversation is preserved.
     ///
     /// If the conversation has fewer than `min_messages`, the entire
     /// conversation goes into `preserved` and `to_compact` is empty.
@@ -758,24 +756,29 @@ impl TokenSplitter {
         }
     }
 
-    /// Find the nearest pair-safe turn boundary at or before the target
-    /// index.
+    /// Find the nearest turn boundary at or before the target index,
+    /// sliding an orphaning cut back to the straddling call.
     ///
     /// A turn boundary is a position where the previous message is
-    /// assistant-role and the next is user-role, and no tool result in
-    /// the kept portion references a call that would be split off (see
-    /// [`split_is_pair_safe`](Self::split_is_pair_safe)) — a user
-    /// message delivering tool results continues the same turn, so
-    /// splitting there would separate a call from its result. This
-    /// ensures we split at a coherent conversation boundary. When no
-    /// such boundary exists at or before the target, `0` is returned:
-    /// nothing can be split off without breaking a call/result pair,
-    /// so the whole conversation stays preserved.
+    /// assistant-role and the next is user-role. A boundary that is
+    /// also pair-safe — no tool result in the kept portion references
+    /// a call that would be split off — wins immediately, so chat
+    /// histories keep the cut they always had. A boundary that would
+    /// orphan a kept result slides backward to include the message
+    /// carrying that call, through [`ToolPairing::adjusted_split`]
+    /// applied to its fixed point (the adjustment is non-increasing
+    /// and bottoms out at zero, the truncator's own convergence
+    /// argument); among candidates that all slide, the furthest-forward
+    /// slide wins. Zero is returned only when nothing can be split off
+    /// without orphaning a kept result — the whole conversation stays
+    /// preserved.
     fn find_turn_boundary(messages: &[Message], target: usize) -> usize {
         if target == 0 {
             return 0;
         }
 
+        let pairing = ToolPairing::scan(messages);
+        let mut best_slide = 0;
         for i in (1..=target).rev() {
             if i >= messages.len() {
                 continue;
@@ -786,29 +789,24 @@ impl TokenSplitter {
             let Some(curr) = messages.get(i) else {
                 continue;
             };
-            if prev.role == Role::Assistant
-                && curr.role == Role::User
-                && Self::split_is_pair_safe(messages, i)
-            {
-                return i;
+            if prev.role != Role::Assistant || curr.role != Role::User {
+                continue;
             }
+            let mut split = i;
+            loop {
+                let adjusted = pairing.adjusted_split(split);
+                if adjusted == split {
+                    break;
+                }
+                split = adjusted;
+            }
+            if split == i {
+                return split;
+            }
+            best_slide = best_slide.max(split);
         }
 
-        0
-    }
-
-    /// Whether splitting at `index` keeps every tool call with its
-    /// result.
-    ///
-    /// `false` when any paired result in the kept portion (from
-    /// `index` on) has its call in the dropped portion (before
-    /// `index`) — judged per occurrence regardless of how far apart
-    /// the two messages are, so histories with interleaved or
-    /// consecutive user messages are covered, and a call id reused by
-    /// a later complete pair does not vouch for an earlier occurrence
-    /// being split off.
-    fn split_is_pair_safe(messages: &[Message], index: usize) -> bool {
-        ToolPairing::scan(messages).boundary_pair_safe(index)
+        best_slide
     }
 }
 
@@ -1370,10 +1368,12 @@ mod tests {
     }
 
     #[test]
-    fn splitter_skips_boundaries_that_straddle_a_later_result() {
+    fn splitter_slides_a_straddling_boundary_back_to_the_call() {
         // The boundary candidate itself carries no tool results, but a
         // consecutive user message behind it delivers a result for a
-        // call that would be split off — the boundary is not pair-safe.
+        // call that would be split off — the boundary is not pair-safe,
+        // so the cut slides back to include the call's message instead
+        // of refusing to split.
         let messages = vec![
             Message::user("q1"),
             Message::new(
@@ -1403,13 +1403,163 @@ mod tests {
             .with_preserve_recent(5);
         let split = splitter.split(&messages);
         assert_eq!(
-            split.split_index, 0,
+            split.split_index, 1,
             "a boundary that strands a call behind a result delivered in a \
-             later message is not pair-safe — nothing is split"
+             later message slides back to that call's message — the cut \
+             lands after the request that prompted it, never inside the pair"
+        );
+        assert_eq!(
+            split.to_compact.len(),
+            1,
+            "only the leading request rides the dropped side"
         );
         assert!(
-            split.to_compact.is_empty(),
-            "the whole conversation stays preserved"
+            has_tool_call(&split.preserved, "c1") && has_tool_result(&split.preserved, "c1"),
+            "the straddled pair stays whole on the kept side"
+        );
+    }
+
+    #[test]
+    fn splitter_still_prefers_a_boundary_that_needs_no_slide() {
+        // A pair-safe boundary sits below an orphaning one; the safe cut
+        // wins immediately even though the higher candidate exists.
+        let messages = vec![
+            Message::user("q1"),
+            Message::assistant("r1"),
+            Message::user("q2"),
+            Message::assistant("r2"),
+            Message::user("q3"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "c1",
+                    "Read",
+                    json!({"path": "a.rs"}),
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "c1",
+                    "Read",
+                    tool_text("ok"),
+                    false,
+                )],
+            ),
+            Message::assistant("final"),
+        ];
+        let splitter = TokenSplitter::new()
+            .with_min_messages(4)
+            .with_preserve_recent(2);
+        let split = splitter.split(&messages);
+        assert_eq!(
+            split.split_index, 4,
+            "the pair-safe boundary below the orphaning one wins without \
+             sliding — chat histories keep the cut they always had"
+        );
+        assert_eq!(
+            split.to_compact.len(),
+            4,
+            "the chat head rides the dropped side"
+        );
+        assert!(
+            has_tool_call(&split.preserved, "c1") && has_tool_result(&split.preserved, "c1"),
+            "the straddling pair at the tail stays whole on the kept side"
+        );
+    }
+
+    /// A pure agent tool-loop history: one request, three complete
+    /// call/result exchanges, a closing assistant answer, and a fresh
+    /// user message.
+    ///
+    /// Every user message after the head carries tool results, so every
+    /// role-transition boundary orphans a kept result — the shape the
+    /// slide pins need and the shape that stalled real sessions.
+    fn tool_loop_history() -> Vec<Message> {
+        let mut messages = vec![Message::user("task")];
+        for index in 0..3 {
+            messages.push(Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    format!("c{index}"),
+                    "Read",
+                    json!({ "path": format!("f{index}.rs") }),
+                )],
+            ));
+            messages.push(Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    format!("c{index}"),
+                    "Read",
+                    tool_text(&format!("output {index}")),
+                    false,
+                )],
+            ));
+        }
+        messages.push(Message::assistant("done"));
+        messages.push(Message::user("next"));
+        messages
+    }
+
+    /// The tool-call ids appearing in a message list, in order.
+    ///
+    /// The pairing assertions read these as the dropped and kept sides'
+    /// call inventories.
+    fn call_ids_in(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                MessagePart::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The tool-result call ids appearing in a message list, in order.
+    ///
+    /// The pairing assertions read these as the dropped and kept sides'
+    /// result inventories.
+    fn result_ids_in(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                MessagePart::ToolResult { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn splitter_slides_an_orphaning_cut_back_to_the_straddling_call() {
+        let messages = tool_loop_history();
+        let splitter = TokenSplitter::new()
+            .with_min_messages(4)
+            .with_preserve_recent(3);
+        let split = splitter.split(&messages);
+        assert!(
+            !split.to_compact.is_empty(),
+            "a pure tool-loop history must still yield a dropped slice — \
+             every role-transition boundary orphans a kept result, so the \
+             cut slides back to the straddling call instead of refusing"
+        );
+        let dropped_calls = call_ids_in(&split.to_compact);
+        let dropped_results = result_ids_in(&split.to_compact);
+        let kept_calls = call_ids_in(&split.preserved);
+        let kept_results = result_ids_in(&split.preserved);
+        assert!(
+            kept_results.iter().all(|id| !dropped_calls.contains(id)),
+            "the kept side must reference no dropped call"
+        );
+        assert!(
+            dropped_results.iter().all(|id| dropped_calls.contains(id)),
+            "the dropped slice is self-contained: the result-bearing user \
+             message it ends with rides above its call in the same slice"
+        );
+        assert!(
+            kept_results.iter().all(|id| kept_calls.contains(id)),
+            "the kept side carries every call its results reference"
         );
     }
 

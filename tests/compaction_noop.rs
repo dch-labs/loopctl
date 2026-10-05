@@ -118,6 +118,10 @@ mod scenarios {
     }
 
     /// An observer counting compaction events behind a shared handle.
+    ///
+    /// The test body drains the counter after the run — the engine owns
+    /// the observer through an `Arc`, so the count must cross a shared
+    /// handle rather than a borrow.
     struct CountingObserver {
         events: Arc<AtomicUsize>,
     }
@@ -132,6 +136,9 @@ mod scenarios {
     }
 
     /// A contributor injecting a fixed chunk of transient context.
+    ///
+    /// Every consultation appends the same `chars`-sized chunk, so the
+    /// swept window budgets must always leave room for it.
     struct ChunkyContributor {
         chars: usize,
     }
@@ -143,6 +150,9 @@ mod scenarios {
     }
 
     /// A contributor that counts its consultations.
+    ///
+    /// Contributes nothing itself; the counter tells the test how many
+    /// times the engine asked for transient context.
     struct CountingContributor {
         consultations: Arc<AtomicUsize>,
     }
@@ -172,6 +182,10 @@ mod scenarios {
     }
 
     /// A compactor that always fails, reporting its input unchanged.
+    ///
+    /// The one error text every failing-pass pin greps for; the input
+    /// passthrough is the honest failure shape the chain contract
+    /// describes.
     struct FailingCompactor;
 
     impl ContextCompactor for FailingCompactor {
@@ -189,6 +203,9 @@ mod scenarios {
     }
 
     /// An observer counting turn starts.
+    ///
+    /// Distinguishes a dead run (no turn started) from a live one in
+    /// the veto and failure scenarios.
     struct TurnStartCounter {
         starts: Arc<AtomicUsize>,
     }
@@ -667,9 +684,9 @@ mod scenarios {
     }
 
     #[tokio::test]
-    async fn a_failing_compactor_surfaces_a_payload_comparable_context_exceeded() {
+    async fn a_failing_compactor_surfaces_a_payload_comparable_compaction_failed() {
         // End-to-end over the engine: a compactor that fails outright
-        // ends the run with ContextExceeded, and the surfaced usage is
+        // ends the run with CompactionFailed, and the surfaced usage is
         // the payload estimate — history plus the per-request overhead
         // riding the reserve — never a history-only number that reads
         // as a pass (252 of 300) while the run is dead.
@@ -688,16 +705,20 @@ mod scenarios {
         let result = agent.run(&"x".repeat(1_000), &RunConfig::default()).await;
 
         match result {
-            Err(LoopError::ContextExceeded { used, limit }) => {
+            Err(LoopError::CompactionFailed { used, limit, cause }) => {
                 assert_eq!(limit, 300, "the window is the configured one");
                 assert!(
                     used >= limit,
                     "the failure reports the payload estimate, not a \
                      history-only pass: used {used} of {limit}"
                 );
+                assert_eq!(
+                    cause, "summarizer unavailable",
+                    "the run failure carries the compactor's own cause"
+                );
             }
             other => panic!(
-                "a failing compactor must end the run with ContextExceeded, \
+                "a failing compactor must end the run with CompactionFailed, \
                  got {other:?}"
             ),
         }
@@ -729,7 +750,7 @@ mod scenarios {
         let result = agent.run(&"x".repeat(1_000), &RunConfig::default()).await;
 
         assert!(
-            matches!(result, Err(LoopError::ContextExceeded { .. })),
+            matches!(result, Err(LoopError::CompactionFailed { .. })),
             "the failing compactor ends the run: {result:?}"
         );
         assert_eq!(
@@ -816,6 +837,8 @@ mod scenarios {
                     result,
                     Ok(_)
                         | Err(LoopError::ContextExceeded { .. })
+                        | Err(LoopError::CompactionFailed { .. })
+                        | Err(LoopError::CompactionStalled { .. })
                         | Err(LoopError::MaxTurnsExceeded { .. })
                 ),
                 "case {case} (window {window}, threshold {threshold}, fill {fill}, \
@@ -880,7 +903,13 @@ mod scenarios {
             .run("grow against the window", &RunConfig::default())
             .await;
         assert!(
-            matches!(result, Ok(_) | Err(LoopError::ContextExceeded { .. })),
+            matches!(
+                result,
+                Ok(_)
+                    | Err(LoopError::ContextExceeded { .. })
+                    | Err(LoopError::CompactionFailed { .. })
+                    | Err(LoopError::CompactionStalled { .. })
+            ),
             "the run terminates — fitting or failing honestly: {result:?}"
         );
 
@@ -1041,7 +1070,10 @@ mod scenarios {
         armed.store(true, Ordering::SeqCst);
         let second = agent.run("overload now", &RunConfig::default()).await;
         assert!(
-            matches!(second, Err(LoopError::ContextExceeded { .. })),
+            matches!(
+                second,
+                Err(LoopError::CompactionStalled { .. }) | Err(LoopError::ContextExceeded { .. })
+            ),
             "run 2 defers on the transient overload and dies at the vetoed \
              compaction with the budget unconsumed: {second:?}"
         );
@@ -1225,14 +1257,14 @@ mod scenarios {
         let result = agent.run("keep echoing", &RunConfig::default()).await;
 
         match result {
-            Err(LoopError::ContextExceeded { used, .. }) => {
+            Err(LoopError::CompactionStalled { used }) => {
                 assert!(
                     used > 0,
                     "the vetoed pass must report a measured estimate, got {used}"
                 );
             }
             other => panic!(
-                "a vetoed compaction over the threshold must fail with ContextExceeded, got {other:?}"
+                "a vetoed compaction over the threshold must fail with CompactionStalled, got {other:?}"
             ),
         }
         for tokens in client_handle.served_request_tokens() {

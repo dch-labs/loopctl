@@ -462,7 +462,9 @@ impl<C: ApiClient> BareLoop<C> {
     /// Derive the structured [`RunEndReason`] from the terminal error.
     ///
     /// Cancellation (signalled or carried by [`LoopError::Cancelled`]) takes
-    /// precedence; then [`LoopError::ContextExceeded`] maps to
+    /// precedence; then the context-overflow family —
+    /// [`LoopError::ContextExceeded`], [`LoopError::CompactionFailed`],
+    /// [`LoopError::CompactionStalled`] — maps to
     /// [`ContextOverflow`](RunEndReason::ContextOverflow),
     /// [`LoopError::MaxTurnsExceeded`] to
     /// [`MaxTurns`](RunEndReason::MaxTurns), any other error to
@@ -476,7 +478,11 @@ impl<C: ApiClient> BareLoop<C> {
         match error {
             None => RunEndReason::Complete,
             Some(LoopError::Cancelled) => RunEndReason::Cancelled,
-            Some(LoopError::ContextExceeded { .. }) => RunEndReason::ContextOverflow,
+            Some(
+                LoopError::ContextExceeded { .. }
+                | LoopError::CompactionFailed { .. }
+                | LoopError::CompactionStalled { .. },
+            ) => RunEndReason::ContextOverflow,
             Some(LoopError::MaxTurnsExceeded { .. }) => RunEndReason::MaxTurns,
             Some(_) => RunEndReason::Error,
         }

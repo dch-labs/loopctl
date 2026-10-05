@@ -117,6 +117,7 @@ pub struct SearchJob {
 /// `include_patterns`, and `exclude_patterns` parse identically in
 /// every content-search tool; this struct is that shared parse, with
 /// the resolved absolute base swapped in for the raw `path` string.
+#[derive(Debug)]
 pub struct CommonInput {
     /// The regex pattern, required and verbatim.
     ///
@@ -166,11 +167,19 @@ pub struct CommonInput {
 /// a numeric field is present but not a non-negative integer, or when
 /// an array field is present but not an array of strings.
 pub fn parse_input(input: &Value, default_max_results: usize) -> Result<CommonInput, ToolError> {
-    let pattern = input
-        .get("pattern")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::InvalidInput("Missing 'pattern' field".to_string()))?
-        .to_string();
+    let pattern = match input.get("pattern") {
+        None => {
+            return Err(ToolError::InvalidInput(
+                "Missing 'pattern' field".to_string(),
+            ));
+        }
+        Some(Value::String(pattern)) => pattern.clone(),
+        Some(_) => {
+            return Err(ToolError::InvalidInput(
+                "'pattern' must be a string".to_string(),
+            ));
+        }
+    };
     let base_path = match input.get("path") {
         None => ".".to_string(),
         Some(Value::String(value)) => value.clone(),
@@ -230,8 +239,8 @@ pub fn get_usize(input: &Value, field: &str) -> Result<Option<usize>, ToolError>
 /// Read an array-of-strings field, present or absent.
 ///
 /// The shared list-input rule: absent is empty, an array yields only
-/// its string elements (non-string elements are dropped, matching the
-/// walker-tolerant contract the tools were ported with), and anything
+/// its string elements (non-string elements are dropped, the
+/// walker-tolerant shape), and anything
 /// other than an array is a correction prompt.
 ///
 /// # Errors

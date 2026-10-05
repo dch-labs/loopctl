@@ -1,13 +1,13 @@
 //! Pins for the search tool family — `GlobTool`, `GrepTool`,
 //! `CodeSearchTool`, and `TreeTool` over [`FsSearchSource`].
 //!
-//! The task-named pins hold the family to the contract it was ported
-//! with: the gitignore-aware walk (`.gitignore`, `.ignore`, and the
-//! loopctl-superset `.loopctlignore`/`.dchignore` names) behaves like
-//! the original, and grep's include/exclude filters plus code-search's
-//! context windows match the dch shapes. Everything runs against a
-//! real temporary filesystem through the public tool surface — no
-//! fakes, no shortcuts.
+//! The task-named pins hold the family to its contract: the
+//! gitignore-aware walk (`.gitignore`, `.ignore`, and the
+//! loopctl-superset `.loopctlignore`/`.dchignore` names) prunes what
+//! it must, and grep's include/exclude filters plus code-search's
+//! context windows render their documented shapes. Everything runs
+//! against a real temporary filesystem through the public tool
+//! surface — no fakes, no shortcuts.
 
 #![cfg(feature = "search_tools")]
 #![allow(
@@ -233,6 +233,10 @@ async fn grep_spills_oversized_results_to_the_context_temp_dir() {
         .expect("call");
     let text = output.text_content();
     assert!(text.contains("result too large"), "{text}");
+    assert_eq!(
+        output.display_hint, None,
+        "the spilled body is pointer prose, not JSON — a `Json` hint would send presentation layers into a failed parse"
+    );
     let start = text
         .find("written to: ")
         .map(|index| index + "written to: ".len())

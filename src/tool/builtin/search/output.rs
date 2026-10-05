@@ -87,6 +87,12 @@ static SPILL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// any offset — and the pointer discloses the wrap convention
 /// whenever wrapping happened.
 ///
+/// The returned flag says which arm ran: `true` only when the body
+/// came back verbatim (it fit `threshold`); both the spill pointer
+/// and a degraded inline truncation report `false`. Callers that tag
+/// the body's shape — Grep's `Json` display hint — key on this flag
+/// so the tag can never desync from the decision made here.
+///
 /// `threshold` is a parameter (not a const read inside) so tests can
 /// drive the spill path with a tiny fixture instead of generating
 /// 50 `KiB` of content; production callers pass
@@ -104,9 +110,9 @@ pub fn truncate_or_spill(
     tool_name: &str,
     temp_dir: &Path,
     threshold: usize,
-) -> ToolOutput {
+) -> (ToolOutput, bool) {
     if content.len() <= threshold {
-        return ToolOutput::text(content);
+        return (ToolOutput::text(content), true);
     }
 
     if let Err(error) = std::fs::create_dir_all(temp_dir) {
@@ -116,7 +122,7 @@ pub fn truncate_or_spill(
             error = %error,
             "failed to create spill directory; falling back to inline truncation"
         );
-        return ToolOutput::text(truncate_inline(&content));
+        return (ToolOutput::text(truncate_inline(&content)), false);
     }
 
     let budget =
@@ -126,7 +132,7 @@ pub fn truncate_or_spill(
     let Some(written) = spill_chunks(temp_dir, tool_name, &chunks, |file, chunk| {
         file.write_all(chunk.as_bytes())
     }) else {
-        return ToolOutput::text(truncate_inline(&content));
+        return (ToolOutput::text(truncate_inline(&content)), false);
     };
 
     let preview = preview_slice(&content);
@@ -154,9 +160,12 @@ pub fn truncate_or_spill(
             listed
         )
     };
-    ToolOutput::text(format!(
-        "{pointer}{wrap_note}preview (first ~10 `KiB`):\n{preview}\n\nuse the Read tool on the path above to view the full content"
-    ))
+    (
+        ToolOutput::text(format!(
+            "{pointer}{wrap_note}preview (first ~10 `KiB`):\n{preview}\n\nuse the Read tool on the path above to view the full content"
+        )),
+        false,
+    )
 }
 
 /// Wrap physical lines past `width`, at character boundaries.
@@ -271,19 +280,27 @@ where
 ///
 /// When a later chunk fails after earlier ones reached disk, the
 /// inline-truncation fallback names no files — so the half-written
-/// set must not linger behind a pointer nobody gave. A removal
-/// failure is logged, never propagated: the caller is already on
-/// its degrade path.
+/// set (the failing chunk's partial file included) must not linger
+/// behind a pointer nobody gave. A removal failure is logged, never
+/// propagated: the caller is already on its degrade path.
 fn remove_orphans(written: &[PathBuf]) {
     for orphan in written {
-        if let Err(error) = std::fs::remove_file(orphan) {
-            tracing::warn!(
-                target: "loopctl::metrics",
-                path = %orphan.display(),
-                error = %error,
-                "failed to remove an orphaned spill chunk"
-            );
-        }
+        remove_spill_file(orphan);
+    }
+}
+
+/// Remove one spill file best-effort, logging a failure.
+///
+/// Shared by the orphan sweep and the partial-file cleanup on a
+/// failed chunk write, so every removal path logs the same way.
+fn remove_spill_file(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        tracing::warn!(
+            target: "loopctl::metrics",
+            path = %path.display(),
+            error = %error,
+            "failed to remove a partial spill file"
+        );
     }
 }
 
@@ -418,7 +435,7 @@ mod tests {
 
     #[test]
     fn inline_when_under_threshold() {
-        let out = truncate_or_spill("hello".to_string(), "grep", Path::new("/tmp"), 64);
+        let (out, _) = truncate_or_spill("hello".to_string(), "grep", Path::new("/tmp"), 64);
         assert!(!out.is_error);
         assert_eq!(out.text_content(), "hello");
     }
@@ -426,15 +443,47 @@ mod tests {
     #[test]
     fn inline_when_exactly_at_threshold() {
         let body = "a".repeat(64);
-        let out = truncate_or_spill(body.clone(), "grep", Path::new("/tmp"), 64);
+        let (out, _) = truncate_or_spill(body.clone(), "grep", Path::new("/tmp"), 64);
         assert_eq!(out.text_content(), body);
+    }
+
+    #[test]
+    fn the_verbatim_flag_marks_the_delivered_inline_arm_and_only_it() {
+        let at_threshold = "a".repeat(64);
+        let (out, verbatim) =
+            truncate_or_spill(at_threshold.clone(), "grep", Path::new("/tmp"), 64);
+        assert!(
+            verbatim,
+            "a body exactly at the threshold is delivered verbatim"
+        );
+        assert_eq!(out.text_content(), at_threshold);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (out, verbatim) = truncate_or_spill("a".repeat(65), "grep", tmp.path(), 64);
+        assert!(
+            !verbatim,
+            "a spilled body is pointer prose, not the verbatim body"
+        );
+        assert!(out.text_content().contains("result too large"));
+
+        let (out, verbatim) = truncate_or_spill(
+            "a".repeat(65),
+            "grep",
+            Path::new("/proc/dch_should_not_exist"),
+            64,
+        );
+        assert!(
+            !verbatim,
+            "a degraded inline truncation is not the verbatim body either"
+        );
+        assert!(out.text_content().contains("Result truncated"));
     }
 
     #[test]
     fn spills_when_over_threshold() {
         let tmp = tempfile::TempDir::new().unwrap();
         let body = "match line\n".repeat(20); // 220 bytes
-        let out = truncate_or_spill(body, "grep", tmp.path(), 64);
+        let (out, _) = truncate_or_spill(body, "grep", tmp.path(), 64);
         let text = out.text_content();
         assert!(!out.is_error, "{text}");
         assert!(text.contains("result too large"), "{text}");
@@ -461,8 +510,8 @@ mod tests {
     fn spill_names_are_unique_across_calls() {
         let tmp = tempfile::TempDir::new().unwrap();
         let body = "x".repeat(200);
-        let first = truncate_or_spill(body.clone(), "grep", tmp.path(), 64);
-        let second = truncate_or_spill(body, "grep", tmp.path(), 64);
+        let (first, _) = truncate_or_spill(body.clone(), "grep", tmp.path(), 64);
+        let (second, _) = truncate_or_spill(body, "grep", tmp.path(), 64);
         let path_of = |out: &ToolOutput| -> String {
             let text = out.text_content();
             let start = text.find("written to: ").unwrap() + "written to: ".len();
@@ -494,7 +543,7 @@ mod tests {
         use std::os::unix::fs::MetadataExt as _;
         let tmp = tempfile::TempDir::new().unwrap();
         let body = "x".repeat(200);
-        let out = truncate_or_spill(body, "grep", tmp.path(), 64);
+        let (out, _) = truncate_or_spill(body, "grep", tmp.path(), 64);
         let text = out.text_content();
         let start = text.find("written to: ").unwrap() + "written to: ".len();
         let end = text[start..].find('\n').unwrap() + start;
@@ -588,7 +637,7 @@ mod tests {
                 > usize::try_from(crate::tool::builtin::read::DEFAULT_MAX_SIZE_BYTES)
                     .unwrap_or(usize::MAX)
         );
-        let out = truncate_or_spill(body.clone(), "grep", tmp.path(), 64);
+        let (out, _) = truncate_or_spill(body.clone(), "grep", tmp.path(), 64);
         let text = out.text_content();
         assert!(text.contains("full output written to 2 files"), "{text}");
         assert!(text.contains("use the Read tool"), "{text}");
@@ -630,7 +679,7 @@ mod tests {
         }
         let body = format!("{head}{}", "t".repeat(200));
         assert!(body.len() > ceiling, "the fixture must exceed the ceiling");
-        let out = truncate_or_spill(body.clone(), "code_search", tmp.path(), 64);
+        let (out, _) = truncate_or_spill(body.clone(), "code_search", tmp.path(), 64);
         let text = out.text_content();
         assert!(text.contains("full output written to 2 files"), "{text}");
         let prefix = tmp.path().to_string_lossy().into_owned();
@@ -661,7 +710,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let giant = format!("z{}", "é-x".repeat(3000));
         let body = format!("start\n{giant}\nend\n");
-        let out = truncate_or_spill(body.clone(), "code_search", tmp.path(), 64);
+        let (out, _) = truncate_or_spill(body.clone(), "code_search", tmp.path(), 64);
         let text = out.text_content();
         let start = text.find("written to: ").expect("spill pointer") + "written to: ".len();
         let end = text[start..].find('\n').expect("line end") + start;
@@ -698,7 +747,7 @@ mod tests {
     #[test]
     fn write_failure_degrades_to_inline_truncation() {
         let body = "x".repeat(200);
-        let out = truncate_or_spill(body, "grep", Path::new("/proc/dch_should_not_exist"), 64);
+        let (out, _) = truncate_or_spill(body, "grep", Path::new("/proc/dch_should_not_exist"), 64);
         let text = out.text_content();
         assert!(!out.is_error, "degraded output is still a success: {text}");
         assert!(text.contains("Result truncated"), "{text}");

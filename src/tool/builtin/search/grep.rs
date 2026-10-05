@@ -201,7 +201,7 @@ async fn grep_inner<S: SearchSource + 'static>(
         return Ok(no_matches_message(&parsed.pattern));
     }
 
-    render(&matches, &temp_dir).map(|output| output.with_hint(DisplayHint::Json))
+    render(&matches, &temp_dir)
 }
 
 /// Scan one file's content for regex matches; return up to `limit`.
@@ -260,12 +260,12 @@ fn render(matches: &[Match], temp_dir: &Path) -> Result<ToolOutput, ToolError> {
         .collect();
     let json = serde_json::to_string_pretty(&json_array)
         .map_err(|error| ToolError::Execution(format!("Failed to serialize results: {error}")))?;
-    Ok(truncate_or_spill(
-        json,
-        "grep",
-        temp_dir,
-        MAX_INLINE_OUTPUT_BYTES,
-    ))
+    let (output, inline) = truncate_or_spill(json, "grep", temp_dir, MAX_INLINE_OUTPUT_BYTES);
+    if inline {
+        Ok(output.with_hint(DisplayHint::Json))
+    } else {
+        Ok(output)
+    }
 }
 
 #[cfg(test)]
@@ -281,6 +281,7 @@ fn render(matches: &[Match], temp_dir: &Path) -> Result<ToolOutput, ToolError> {
 mod tests {
     use super::*;
     use crate::tool::builtin::search::content::parse_input;
+    use crate::tool::builtin::search::test_support::FakeFile;
     use crate::tool::builtin::search::test_support::FakeSearchSource;
     use crate::tool::builtin::search::test_support::text;
     use serde_json::json;
@@ -321,6 +322,21 @@ mod tests {
             .unwrap()
             .unwrap_or(DEFAULT_MAX_MATCHES);
         assert_eq!(max_matches, 5);
+    }
+
+    #[test]
+    fn parse_rejects_a_wrong_typed_pattern_as_typed() {
+        for wrong in [json!(42), json!(2.5), json!(null), json!(["x"])] {
+            let error = parse_input(&json!({ "pattern": wrong }), DEFAULT_MAX_RESULTS)
+                .expect_err("a present-but-wrong-typed pattern is a correction prompt");
+            match error {
+                ToolError::InvalidInput(message) => assert_eq!(
+                    message, "'pattern' must be a string",
+                    "the model sent the field; it must be told the type, not that it is missing"
+                ),
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -515,6 +531,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_json_hint_sits_exactly_on_the_spill_boundary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let matches_of = |content_len: usize| {
+            vec![Match {
+                file: "f.rs".to_string(),
+                line: 1,
+                content: "x".repeat(content_len),
+            }]
+        };
+        let probe = render(&matches_of(100), dir.path()).unwrap();
+        let overhead = probe.text_content().len() - 100;
+
+        let at_edge = render(&matches_of(MAX_INLINE_OUTPUT_BYTES - overhead), dir.path()).unwrap();
+        assert_eq!(
+            at_edge.display_hint,
+            Some(crate::tool::DisplayHint::Json),
+            "a body exactly at the inline threshold is the JSON array itself and carries the hint"
+        );
+
+        let one_over = render(
+            &matches_of(MAX_INLINE_OUTPUT_BYTES - overhead + 1),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            one_over.display_hint, None,
+            "one byte past the threshold the body is spill pointer prose — the hint must follow the spill decision, not a second predicate"
+        );
+        assert!(one_over.text_content().contains("result too large"));
+    }
+
     #[tokio::test]
     async fn call_no_matches_is_the_shared_message() {
         let tool = GrepTool::new(FakeSearchSource::with(&[("/repo/a.rs", text("nothing\n"))]));
@@ -599,16 +647,47 @@ mod tests {
 
     #[tokio::test]
     async fn call_max_results_above_cap_is_lowered() {
-        let tool = GrepTool::new(FakeSearchSource::with(&[("/repo/a.rs", text("x\n"))]));
+        // Eleven files at the per-file default cap: 1,100 matches in
+        // total, so the global ceiling — not the per-file one — is
+        // the binding constraint this pin discriminates.
+        let owned: Vec<(String, FakeFile)> = (0..11)
+            .map(|index| (format!("/repo/f{index}.rs"), text(&"x\n".repeat(100))))
+            .collect();
+        let files: Vec<(&str, FakeFile)> = owned
+            .iter()
+            .map(|(path, file)| (path.as_str(), file.clone()))
+            .collect();
+        let tool = GrepTool::new(FakeSearchSource::with(&files));
+        let spill_dir = tempfile::TempDir::new().unwrap();
+        let context = ToolContext {
+            cwd: "/repo".to_string(),
+            temp_dir: spill_dir.path().to_string_lossy().into_owned(),
+            ..ToolContext::default()
+        };
         let output = tool
             .call(
                 json!({"pattern": "x", "path": "/repo", "max_results": 99_999}),
-                &ctx_in("/repo"),
+                &context,
             )
             .await
             .expect("call");
-        // The cap only bounds the total; a single match still returns.
-        let parsed: Vec<Value> = serde_json::from_str(&output.text_content()).expect("json");
-        assert_eq!(parsed.len(), 1);
+        // A capped result this size spills; the count lives in the
+        // spilled JSON body.
+        let text = output.text_content();
+        let start = text
+            .find("written to: ")
+            .map(|at| at + "written to: ".len())
+            .expect("spill pointer");
+        let end = text[start..]
+            .find('\n')
+            .map(|offset| start + offset)
+            .expect("line end");
+        let spilled = std::fs::read_to_string(text[start..end].trim()).expect("read spill");
+        let parsed: Vec<Value> = serde_json::from_str(&spilled).expect("spilled json");
+        assert_eq!(
+            parsed.len(),
+            MAX_RESULTS_CAP,
+            "an over-cap request stops at the hard ceiling"
+        );
     }
 }

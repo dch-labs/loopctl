@@ -82,8 +82,8 @@ impl SourceEntry {
 /// under ignore rules, sniffs binaries, and guards against oversized
 /// files. This trait extends the read seam with those operations so
 /// the four tools stay source-agnostic — the filesystem
-/// implementation ([`FsSearchSource`]) ships here, and a remote tree
-/// source implements the same surface later without any tool change.
+/// implementation ([`FsSearchSource`]) ships here, and any tree-shaped
+/// source implements the same surface without any tool change.
 pub trait SearchSource: ContentSource {
     /// Walk files under `base` under ignore rules and name filters.
     ///

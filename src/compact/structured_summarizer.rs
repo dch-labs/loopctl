@@ -7,7 +7,9 @@
 //! retention for a contractually stable shape: the summary always carries the
 //! same headings — key facts, decisions, pending tasks, open questions — each
 //! as a bullet list, so a consumer (telemetry, an attachment layer, a UI) can
-//! locate "pending tasks" without parsing prose. One LLM call per pass (plus
+//! locate "pending tasks" without parsing prose; the pending-tasks section is
+//! the continuation's task ledger, demanding per-item done/remaining status
+//! and coverage of already-read or verified work. One LLM call per pass (plus
 //! at most one retry when the first response's shape defeats the parser), a
 //! tolerant parse back into [`StructuredSummary`], and a
 //! [`SummaryTemplate`] render that omits empty sections. Failures — a blank
@@ -44,7 +46,7 @@ use std::pin::Pin;
 
 use super::budget_permille;
 use super::leading_system;
-use super::render_evicted;
+use super::render_compaction_transcript;
 use super::summarizable;
 
 /// The shared system-prompt stem for both the first call and the retry.
@@ -107,9 +109,12 @@ const DEFAULT_PRESERVE_RECENT: usize = 6;
 
 /// Default character budget for the dropped-context transcript in a prompt.
 ///
-/// Bounds the summarizer's *input* independently of the output budget — the
-/// small-model knob the shared renderer honors.
-const DEFAULT_TRANSCRIPT_MAX_CHARS: usize = 24_000;
+/// Forty-eight thousand characters is roughly twelve thousand tokens of
+/// prompt — the compaction transcript renderer splits this budget between
+/// the head and the tail of the drop, so both the conversation's opening
+/// and its most recent dropped work reach the summarizer without
+/// overwhelming a small local model's input window.
+const DEFAULT_TRANSCRIPT_MAX_CHARS: usize = 48_000;
 
 /// The header line a default template renders above the sections.
 ///
@@ -149,9 +154,14 @@ pub enum SummarySection {
     /// settled questions.
     Decisions,
 
-    /// Work in flight or explicitly outstanding.
+    /// The continuation's task ledger: per-item status and coverage.
     ///
-    /// These become the model's implicit todo list on re-entry.
+    /// One bullet per goal or work item — including todo-list entries —
+    /// carrying its status, done (with its conclusion or finding) or
+    /// remaining, plus which files or areas were already read,
+    /// reviewed, or verified and what was found, so the model re-entering
+    /// on the summary can tell covered work from new work instead of
+    /// re-doing it.
     PendingTasks,
 
     /// Unknowns the dropped context raised but did not answer.
@@ -306,9 +316,11 @@ pub struct StructuredSummary {
     /// it, the reason — losing the why is how re-litigation starts.
     pub decisions: Vec<String>,
 
-    /// Work in flight or explicitly outstanding.
+    /// The continuation's task ledger: per-item status and coverage.
     ///
-    /// The model's implicit todo list on re-entry; the attachment layer can
+    /// One bullet per goal or work item — done (with its conclusion or
+    /// finding) or remaining — including which files or areas were
+    /// already read, reviewed, or verified; the attachment layer can
     /// lift this section wholesale.
     pub pending_tasks: Vec<String>,
 
@@ -485,6 +497,15 @@ pub struct StructuredSummaryConfig {
     /// the small-model knob the shared renderer honors.
     transcript_max_chars: usize,
 
+    /// Additional host instructions appended to the summarize prompt.
+    ///
+    /// Advisory text a host layers over the section contract —
+    /// workload-specific state the compactor cannot know. `None` until
+    /// [`with_summary_instructions`](Self::with_summary_instructions)
+    /// sets it; an empty value is rejected with a warning and stays
+    /// unset.
+    summary_instructions: Option<String>,
+
     /// Which sections to request and render.
     ///
     /// The prompt enumerates and the renderer emits exactly these sections
@@ -509,6 +530,7 @@ impl StructuredSummaryConfig {
             min_messages: DEFAULT_MIN_MESSAGES,
             preserve_recent: DEFAULT_PRESERVE_RECENT,
             transcript_max_chars: DEFAULT_TRANSCRIPT_MAX_CHARS,
+            summary_instructions: None,
             template: SummaryTemplate::default_template(),
             parse_output: true,
         }
@@ -593,6 +615,30 @@ impl StructuredSummaryConfig {
         self
     }
 
+    /// Set additional host instructions for the summarize prompt.
+    ///
+    /// The text rides the summarize prompt inside a delimited
+    /// `<host-instructions>` block — separated from the conversation
+    /// data the way `<conversation>` separates its own — ahead of any
+    /// per-pass hook instructions, layering host workload knowledge
+    /// over the section contract. An empty or whitespace-only string is
+    /// rejected with a warning and the knob stays unset — advisory text
+    /// that renders nothing is a configuration mistake, not a quieter
+    /// prompt.
+    #[must_use]
+    pub fn with_summary_instructions(mut self, instructions: impl Into<String>) -> Self {
+        let text = instructions.into();
+        if text.trim().is_empty() {
+            tracing::warn!(
+                target: "loopctl::compact",
+                "summary instructions empty; leaving the built-in prompt unchanged"
+            );
+            return self;
+        }
+        self.summary_instructions = Some(text);
+        self
+    }
+
     /// Set the template carrying which sections are requested and rendered.
     ///
     /// The prompt enumerates and the renderer emits exactly the template's
@@ -670,6 +716,16 @@ impl StructuredSummaryConfig {
     #[must_use]
     pub fn transcript_max_chars(&self) -> usize {
         self.transcript_max_chars
+    }
+
+    /// The additional host instructions for the summarize prompt.
+    ///
+    /// The stored text after the empty-value rejection — `None` unless
+    /// [`with_summary_instructions`](Self::with_summary_instructions)
+    /// set a non-empty value.
+    #[must_use]
+    pub fn summary_instructions(&self) -> Option<&str> {
+        self.summary_instructions.as_deref()
     }
 
     /// The template carrying which sections are requested and rendered.
@@ -880,10 +936,10 @@ impl StructuredSummarizer {
     /// second such response degrades to its raw text as the summary body.
     /// Blank and over-budget responses fail the pass regardless of which
     /// call delivers them — the retry exists for shape problems, not
-    /// content problems. Hook contributions from the
-    /// [`CompactionContext`] ride along as host instructions and context
-    /// fragments appended after the transcript, so both the first call and
-    /// the retry see them.
+    /// content problems. Host-configured summary instructions and hook
+    /// contributions from the [`CompactionContext`] ride along after the
+    /// transcript — the config channel first, the per-pass hook channel
+    /// beneath it — so both the first call and the retry see them.
     async fn summarize(
         &self,
         dropped: &[Message],
@@ -891,12 +947,18 @@ impl StructuredSummarizer {
         context: &CompactionContext,
     ) -> SummarizeOutcome {
         use std::fmt::Write as _;
-        let transcript = render_evicted(dropped, self.config.transcript_max_chars);
+        let transcript = render_compaction_transcript(dropped, self.config.transcript_max_chars);
         let mut user_prompt = format!(
             "Summarize the conversation in <conversation> into the sections the system \
              message specifies, so another agent can continue the work without \
              re-reading it.\n\n<conversation>\n{transcript}\n</conversation>"
         );
+        if let Some(instructions) = self.config.summary_instructions.as_deref() {
+            let _ignored = write!(
+                user_prompt,
+                "\n\n<host-instructions>\n{instructions}\n</host-instructions>"
+            );
+        }
         if let Some(instructions) = context.instructions.as_deref() {
             let _ignored = write!(
                 user_prompt,
@@ -1191,15 +1253,18 @@ const fn section_purpose(section: SummarySection) -> &'static str {
         }
         SummarySection::Decisions => {
             "Choices committed to, each with its reason where the \
-             conversation recorded one."
+              conversation recorded one."
         }
         SummarySection::PendingTasks => {
-            "Work in flight or explicitly outstanding; the continuation's \
-             implicit todo list."
+            "The continuation's task ledger. Per goal or work item — \
+              including todo-list entries — its status: done (with its \
+              conclusion or finding) or remaining; also which files or \
+              areas were already read, reviewed, or verified, and what \
+              was found."
         }
         SummarySection::OpenQuestions => {
             "Unknowns raised but not answered; things the continuation \
-             should know it does not know."
+              should know it does not know."
         }
     }
 }
@@ -1442,6 +1507,101 @@ mod tests {
          ### Pending tasks\n- finish the tests\n\n\
          ### Open questions\n- should the ceiling scale?"
             .to_string()
+    }
+
+    #[test]
+    fn pending_tasks_purpose_demands_done_and_remaining_per_item() {
+        let purpose = section_purpose(SummarySection::PendingTasks);
+        assert!(
+            purpose.contains("done") && purpose.contains("remaining"),
+            "the section demands per-item status: {purpose}"
+        );
+        assert!(
+            purpose.contains("already read"),
+            "the section demands coverage of covered work: {purpose}"
+        );
+        let summarizer = StructuredSummarizer::new(
+            RecordingClient::new(vec![]) as SharedApiClient,
+            StructuredSummaryConfig::default(),
+        );
+        let system = summarizer.system_prompt(2_000, false);
+        assert!(
+            system.contains(purpose),
+            "the section contract reaches the system prompt verbatim: {system}"
+        );
+        for other in [
+            SummarySection::KeyFacts,
+            SummarySection::Decisions,
+            SummarySection::OpenQuestions,
+        ] {
+            let expected = match other {
+                SummarySection::KeyFacts => Some(
+                    "Hard facts: file paths, identifiers, configuration values, \
+                     environment details a future turn would re-derive expensively.",
+                ),
+                SummarySection::Decisions => Some(
+                    "Choices committed to, each with its reason where the \
+                     conversation recorded one.",
+                ),
+                SummarySection::OpenQuestions => Some(
+                    "Unknowns raised but not answered; things the continuation \
+                     should know it does not know.",
+                ),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                assert_eq!(
+                    section_purpose(other),
+                    expected,
+                    "the other sections' purposes are unchanged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn structured_default_transcript_budget_is_48_000_chars() {
+        assert_eq!(
+            StructuredSummaryConfig::default().transcript_max_chars(),
+            48_000,
+            "the compaction transcript carries head and tail halves of the \
+             doubled default"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_configured_instructions_ride_the_structured_prompt() {
+        let (client, summarizer) = scripted_with(
+            vec![ok(&canonical_response())],
+            StructuredSummaryConfig::default()
+                .with_summary_instructions("name the findings file path in the ledger"),
+        );
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(outcome.success);
+        let prompts = client.user_prompts();
+        let user = prompts
+            .first()
+            .expect("the first call carries the user prompt");
+        assert!(
+            user.contains(
+                "<host-instructions>\nname the findings file path in the ledger\n</host-instructions>"
+            ),
+            "the config seam rides in a delimited host-instructions block: {user:.700}"
+        );
+        assert!(
+            client
+                .systems()
+                .first()
+                .is_some_and(|sys| sys.contains("task ledger")),
+            "the section contract still rides the system prompt: {:?}",
+            client
+                .systems()
+                .first()
+                .map(|sys| sys[..80.min(sys.len())].to_string())
+        );
     }
 
     #[tokio::test]
@@ -2056,17 +2216,20 @@ mod tests {
             .compact(messages.clone(), 40_000, context_for(&messages))
             .await;
         assert!(outcome.success);
-        let user = client.user_prompts()[0].clone();
+        let prompts = client.user_prompts();
+        let user = prompts
+            .first()
+            .expect("the first call carries the user prompt");
         assert!(
-            user.contains("user turn 0 asks about topic-0"),
-            "the head of the dropped slice still renders: {user}"
+            user.contains("assistant turn 2 decided fact-2"),
+            "the newest dropped message still renders inside the budget: {user}"
         );
         assert!(
-            user.contains("[evicted "),
-            "a saturated render closes with the truncation marker: {user}"
+            user.contains("[5 messages elided]…"),
+            "a saturated render marks its elided gap: {user}"
         );
         assert!(
-            !user.contains("topic-3"),
+            !user.contains("topic-0"),
             "messages past the transcript budget never reach the prompt: {user}"
         );
     }

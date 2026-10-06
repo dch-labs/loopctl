@@ -352,6 +352,7 @@ impl ContextCompactor for TruncatingCompactor {
                 success: true,
                 error: None,
                 evicted,
+                stage: None,
             }
         })
     }
@@ -510,6 +511,7 @@ impl TruncatingCompactor {
             success: true,
             error: None,
             evicted,
+            stage: None,
         }
     }
 

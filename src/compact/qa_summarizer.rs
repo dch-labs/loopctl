@@ -6,21 +6,22 @@
 //! truncation with a compaction pass that preserves the facts a future
 //! turn will need. Each pass makes up to three non-streaming LLM calls:
 //!
-//! 1. **Summarize** the about-to-be-dropped portion into a dense running
-//!    summary.
+//! 1. **Summarize** the about-to-be-dropped portion into a progress
+//!    ledger — per-item done/remaining status with coverage of work
+//!    already read or verified — followed by a dense running summary.
 //! 2. **Question gaps** — ask the model what it would need to know from
-//!    the dropped context that the summary does not carry. Surfacing the
-//!    *questions* instead of guessing means nothing critical is silently
-//!    lost.
+//!    the dropped context that the summary does not carry, including
+//!    ledger completeness. Surfacing the *questions* instead of guessing
+//!    means nothing critical is silently lost.
 //! 3. **Answer** — pull the answers to those questions out of the full
 //!    pre-compaction context before it is discarded, and fold them into
 //!    the summary.
 //!
 //! The final summary becomes one assistant [`Message`] prepended to the
 //! preserved recent turns, so the model re-enters a long session already
-//! knowing the decisions, open tasks, and key identifiers. The summarizer
-//! carries a running [`PriorSummary`] across passes (accumulation), and
-//! every message it drops rides
+//! knowing the task state, the decisions, open tasks, and key
+//! identifiers. The summarizer carries a running [`PriorSummary`] across
+//! passes (accumulation), and every message it drops rides
 //! [`CompactionOutcome::evicted`](crate::compact::CompactionOutcome::evicted)
 //! so the demotion sink still receives it.
 //!
@@ -45,7 +46,7 @@ use crate::api::SharedApiClient;
 use crate::api::StreamRequest;
 use crate::api::error::ApiError;
 use crate::compact::ContextCompactor;
-use crate::compact::demote::render_evicted;
+use crate::compact::demote::render_compaction_transcript;
 use crate::compact::truncating::TokenSplitter;
 use crate::compact::types::CompactionContext;
 use crate::compact::types::CompactionOutcome;
@@ -116,10 +117,12 @@ const DEFAULT_PRESERVE_RECENT: usize = 6;
 
 /// Default character budget for the dropped-context transcript in a prompt.
 ///
-/// Twenty-four thousand characters is roughly six thousand tokens of
-/// prompt: a full marathon drop rendered without overwhelming a small
-/// local model's input window.
-const DEFAULT_TRANSCRIPT_MAX_CHARS: usize = 24_000;
+/// Forty-eight thousand characters is roughly twelve thousand tokens of
+/// prompt — the compaction transcript renderer splits this budget
+/// between the head and the tail of the drop, so both the conversation's
+/// opening and its most recent dropped work reach the summarizer without
+/// overwhelming a small local model's input window.
+const DEFAULT_TRANSCRIPT_MAX_CHARS: usize = 48_000;
 
 /// Character budget for the preserved-tail excerpt in the question prompt.
 ///
@@ -251,6 +254,16 @@ pub struct QaSummarizerConfig {
     /// Bounds the summarizer's *input* independently of the output
     /// budget — the small-model knob the transcript renderer honors.
     transcript_max_chars: usize,
+
+    /// Additional host instructions appended to the step-1 prompt.
+    ///
+    /// Advisory text a host layers over the built-in ledger and summary
+    /// requirements — workload-specific state the compactor cannot know
+    /// (where the session's findings file lives, which tracker to read).
+    /// `None` until [`with_summary_instructions`](Self::with_summary_instructions)
+    /// sets it; an empty value is rejected with a warning and stays
+    /// unset.
+    summary_instructions: Option<String>,
 }
 
 impl QaSummarizerConfig {
@@ -267,6 +280,7 @@ impl QaSummarizerConfig {
             preserve_recent: DEFAULT_PRESERVE_RECENT,
             accumulate: true,
             transcript_max_chars: DEFAULT_TRANSCRIPT_MAX_CHARS,
+            summary_instructions: None,
         }
     }
 
@@ -365,6 +379,30 @@ impl QaSummarizerConfig {
         self
     }
 
+    /// Set additional host instructions for the step-1 prompt.
+    ///
+    /// The text rides the summarize prompt inside a delimited
+    /// `<host-instructions>` block — separated from the conversation
+    /// data the way `<conversation>` and `<prior-summary>` separate
+    /// theirs — ahead of any per-pass hook instructions, layering host
+    /// workload knowledge over the built-in ledger requirement. An
+    /// empty or whitespace-only string is rejected with a warning and
+    /// the knob stays unset — advisory text that renders nothing is a
+    /// configuration mistake, not a quieter prompt.
+    #[must_use]
+    pub fn with_summary_instructions(mut self, instructions: impl Into<String>) -> Self {
+        let text = instructions.into();
+        if text.trim().is_empty() {
+            tracing::warn!(
+                target: "loopctl::compact",
+                "summary instructions empty; leaving the built-in prompt unchanged"
+            );
+            return self;
+        }
+        self.summary_instructions = Some(text);
+        self
+    }
+
     /// The fraction of the compaction target budgeted for the summary.
     ///
     /// The stored value after clamping — `0.25` unless overridden.
@@ -417,6 +455,16 @@ impl QaSummarizerConfig {
     #[must_use]
     pub fn transcript_max_chars(&self) -> usize {
         self.transcript_max_chars
+    }
+
+    /// The additional host instructions for the step-1 prompt.
+    ///
+    /// The stored text after the empty-value rejection — `None` unless
+    /// [`with_summary_instructions`](Self::with_summary_instructions)
+    /// set a non-empty value.
+    #[must_use]
+    pub fn summary_instructions(&self) -> Option<&str> {
+        self.summary_instructions.as_deref()
     }
 
     /// The summary token budget for a compaction pass at `target_tokens`.
@@ -588,16 +636,19 @@ impl QaSummarizer {
         } else {
             dropped.to_vec()
         };
-        render_evicted(&rendered_source, self.config.transcript_max_chars)
+        render_compaction_transcript(&rendered_source, self.config.transcript_max_chars)
     }
 
     /// Run the three steps over one split.
     ///
     /// The orchestrator of a pass: summarize, question, and — only when
-    /// the question step found gaps — answer and fold. Returns the final
-    /// summary, how many LLM calls ran, and how many gap questions the
-    /// pass answered; the step name in the error position names the arm
-    /// that failed.
+    /// the question step found gaps — answer and fold. The pass's
+    /// transcript is rendered once here and shared by the summarize and
+    /// answer steps, so the answer prompt cannot drift from what was
+    /// summarized and the render cost is paid once per pass. Returns
+    /// the final summary, how many LLM calls ran, and how many gap
+    /// questions the pass answered; the step name in the error position
+    /// names the arm that failed.
     ///
     /// # Errors
     ///
@@ -613,8 +664,9 @@ impl QaSummarizer {
         spend: &mut TokenSpend,
     ) -> Result<(CompactionSummary, u8, usize), (&'static str, ApiError)> {
         let mergeable_prior = prior.filter(|_| self.config.accumulate);
+        let transcript = self.transcript(dropped, mergeable_prior);
         let summary = self
-            .summarize(dropped, mergeable_prior, budget, context, spend)
+            .summarize(&transcript, mergeable_prior, budget, context, spend)
             .await
             .map_err(|error| ("summarize", error))?;
         let questions = self
@@ -625,7 +677,7 @@ impl QaSummarizer {
             return Ok((summary, 2, 0));
         }
         let enriched = self
-            .answer_and_merge(summary, &questions, dropped, mergeable_prior, budget, spend)
+            .answer_and_merge(summary, &questions, &transcript, budget, spend)
             .await
             .map_err(|error| ("answer", error))?;
         Ok((enriched, 3, questions.len()))
@@ -659,14 +711,19 @@ impl QaSummarizer {
     /// estimate exceeds the pass budget.
     async fn summarize(
         &self,
-        dropped: &[Message],
+        transcript: &str,
         prior: Option<&PriorSummary>,
         budget: u64,
         context: &CompactionContext,
         spend: &mut TokenSpend,
     ) -> Result<CompactionSummary, ApiError> {
-        let transcript = self.transcript(dropped, prior);
-        let prompt = Self::summarize_prompt(&transcript, prior, budget, context);
+        let prompt = Self::summarize_prompt(
+            transcript,
+            prior,
+            budget,
+            context,
+            self.config.summary_instructions.as_deref(),
+        );
         let response = self.call_with_spend(prompt, spend).await?;
         let text = response.message.text_content();
         if text.trim().is_empty() {
@@ -701,7 +758,7 @@ impl QaSummarizer {
         preserved: &[Message],
         spend: &mut TokenSpend,
     ) -> Result<Vec<String>, ApiError> {
-        let recent = render_evicted(preserved, RECENT_EXCERPT_MAX_CHARS);
+        let recent = render_compaction_transcript(preserved, RECENT_EXCERPT_MAX_CHARS);
         let prompt = Self::question_prompt(&summary.text, &recent);
         let response = self.call_with_spend(prompt, spend).await?;
         let raw = response.message.text_content();
@@ -721,10 +778,10 @@ impl QaSummarizer {
     /// One call for every question, numbered; answers the dropped context
     /// does not contain come back `UNKNOWN` and are dropped, so no
     /// hallucinated fact ever enters the summary. The transcript is the
-    /// same accumulate-filtered render step 1 saw, so the prior summary
-    /// never re-enters the answer prompt as answerable conversation. The
-    /// folded section is capped to the pass budget, shedding the latest
-    /// answers first.
+    /// same render step 1 saw — produced once per pass by the
+    /// orchestrator — so the prior summary never re-enters the answer
+    /// prompt as answerable conversation. The folded section is capped
+    /// to the pass budget, shedding the latest answers first.
     ///
     /// # Errors
     ///
@@ -734,13 +791,11 @@ impl QaSummarizer {
         &self,
         summary: CompactionSummary,
         questions: &[String],
-        dropped: &[Message],
-        prior: Option<&PriorSummary>,
+        transcript: &str,
         budget: u64,
         spend: &mut TokenSpend,
     ) -> Result<CompactionSummary, ApiError> {
-        let transcript = self.transcript(dropped, prior);
-        let prompt = Self::answer_prompt(questions, &transcript);
+        let prompt = Self::answer_prompt(questions, transcript);
         let response = self.call_with_spend(prompt, spend).await?;
         let text = fold_answers(
             &summary.text,
@@ -799,13 +854,17 @@ impl QaSummarizer {
     /// The step-1 user prompt.
     ///
     /// Optionally opens with the prior-summary merge block, always
-    /// carries the tagged transcript and token budget, and closes with
-    /// any hook instructions and context fragments.
+    /// carries the ledger-first summarize instruction, the tagged
+    /// transcript and token budget, and closes with any host-configured
+    /// instructions, hook instructions, and context fragments — in that
+    /// order, so the standing host channel stays distinguishable from
+    /// the per-pass hook channel in tests and telemetry.
     fn summarize_prompt(
         transcript: &str,
         prior: Option<&PriorSummary>,
         budget: u64,
         context: &CompactionContext,
+        host_instructions: Option<&str>,
     ) -> String {
         use std::fmt::Write as _;
         let mut prompt = String::new();
@@ -824,11 +883,21 @@ impl QaSummarizer {
         let _ignored = write!(
             prompt,
             "Summarize the conversation in <conversation> so another agent can continue the \
-             work without re-reading it. Capture the objective, decisions made and why, important \
+             work without re-reading or re-doing it. Open with a progress ledger: one line per \
+             goal or work item the conversation shows — including anything a todo list shows — \
+             stating its status, done (with its conclusion or finding) or remaining, and naming \
+             the files or areas already read, reviewed, or verified with what was found. Then \
+             give the dense running summary: the objective, decisions made and why, important \
              constraints, active and blocked work, and the key files, paths, and identifiers \
              involved. Keep it under roughly {budget} tokens. Emit only the summary.\n\n\
              <conversation>\n{transcript}\n</conversation>"
         );
+        if let Some(instructions) = host_instructions {
+            let _ignored = write!(
+                prompt,
+                "\n\n<host-instructions>\n{instructions}\n</host-instructions>"
+            );
+        }
         if let Some(instructions) = context.instructions.as_deref() {
             let _ignored = write!(
                 prompt,
@@ -844,14 +913,18 @@ impl QaSummarizer {
     /// The step-2 user prompt.
     ///
     /// Shows the questioner the summary and the preserved tail but never
-    /// the dropped portion — it must ask for what it cannot see.
+    /// the dropped portion — it must ask for what it cannot see. The
+    /// probe covers plain missing facts and the ledger's completeness,
+    /// so a summary that dropped its task state is caught as a gap.
     fn question_prompt(summary: &str, recent: &str) -> String {
         format!(
             "An agent continues the work with only <summary> (of earlier context) and <recent> \
-             (the messages that follow it). List what facts from the earlier context are missing \
-             from <summary> that the agent would need to continue effectively. Emit a JSON array \
-             of short question strings — [] if the summary is sufficient. No other text.\n\n\
-             <summary>\n{summary}\n</summary>\n\n<recent>\n{recent}\n</recent>"
+              (the messages that follow it). List what facts from the earlier context are missing \
+              from <summary> that the agent would need to continue effectively — including any \
+              goal or work item the summary's ledger omits or leaves with an unclear \
+              done-or-remaining status. Emit a JSON array of short question strings — [] if the \
+              summary is sufficient. No other text.\n\n\
+              <summary>\n{summary}\n</summary>\n\n<recent>\n{recent}\n</recent>"
         )
     }
 
@@ -1502,6 +1575,109 @@ mod tests {
             outcome.messages.first().map(Message::text_content),
             Some("SUMMARY-B".to_string()),
             "the summary message is the step-1 output verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarize_prompt_opens_with_the_progress_ledger_requirement() {
+        let (client, summarizer) = scripted(vec![ok("SUMMARY-LEDGER"), ok("[]")]);
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(outcome.success);
+        let prompts = client.prompts();
+        let prompt = prompts.first().expect("step 1 ran");
+        assert!(
+            prompt.contains("progress ledger"),
+            "the step-1 instruction names the ledger: {prompt:.700}"
+        );
+        assert!(
+            prompt.contains("done") && prompt.contains("remaining"),
+            "the ledger demands per-item status: {prompt:.700}"
+        );
+        assert!(
+            prompt.contains("already read"),
+            "the ledger demands coverage of covered work: {prompt:.700}"
+        );
+    }
+
+    #[tokio::test]
+    async fn question_prompt_probes_ledger_completeness() {
+        let (client, summarizer) = scripted(vec![ok("SUMMARY-PROBE"), ok("[]")]);
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(outcome.success);
+        let prompts = client.prompts();
+        let prompt = prompts.get(1).expect("step 2 ran");
+        assert!(
+            prompt.contains("ledger"),
+            "the question step probes the summary's ledger: {prompt:.700}"
+        );
+    }
+
+    #[test]
+    fn qa_default_transcript_budget_is_48_000_chars() {
+        assert_eq!(
+            QaSummarizerConfig::default().transcript_max_chars(),
+            48_000,
+            "the compaction transcript carries head and tail halves of the \
+             doubled default"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_configured_instructions_ride_the_summarize_prompt() {
+        let client = RecordingClient::new(vec![ok("SUMMARY-HOST"), ok("[]")]);
+        let summarizer = QaSummarizer::new(
+            Arc::clone(&client) as SharedApiClient,
+            QaSummarizerConfig::default()
+                .with_summary_instructions("name the findings file path in the ledger"),
+        );
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(outcome.success);
+        let prompts = client.prompts();
+        let prompt = prompts.first().expect("step 1 ran");
+        assert!(
+            prompt.contains(
+                "<host-instructions>\nname the findings file path in the ledger\n</host-instructions>"
+            ),
+            "the config seam rides in a delimited host-instructions block: {prompt:.700}"
+        );
+        assert!(
+            prompt.contains("progress ledger"),
+            "the built-in ledger requirement stays beneath the host block: {prompt:.700}"
+        );
+    }
+
+    #[test]
+    fn empty_summary_instructions_are_rejected_with_a_warning() {
+        let config = QaSummarizerConfig::default().with_summary_instructions("   ");
+        assert!(
+            config.summary_instructions().is_none(),
+            "an empty instruction string leaves the knob unset"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ledger_shaped_summary_rides_into_history_verbatim() {
+        let ledger = "Progress ledger:\n- review the tools layer: done — no findings\n\
+                      \x20- review the loop layer: remaining\n\nSUMMARY-LEDGER-BODY";
+        let (_client, summarizer) = scripted(vec![ok(ledger), ok("[]")]);
+        let messages = conversation();
+        let outcome = summarizer
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(outcome.success);
+        let summary_text = outcome.messages.first().map(Message::text_content).unwrap();
+        assert_eq!(
+            summary_text, ledger,
+            "the ledger the model emitted rides into history unfiltered"
         );
     }
 
@@ -2176,17 +2352,18 @@ mod tests {
         let context = context_for(&messages);
         let outcome = summarizer.compact(messages, 40_000, context).await;
         assert!(outcome.success);
-        let prompt = &client.prompts()[0];
+        let prompts = client.prompts();
+        let prompt = prompts.first().expect("step 1 ran");
         assert!(
-            prompt.contains("user turn 0 asks about topic-0"),
-            "the head of the dropped slice still renders: {prompt}"
+            prompt.contains("assistant turn 2 decided fact-2"),
+            "the newest dropped message still renders inside the budget: {prompt}"
         );
         assert!(
-            prompt.contains("[evicted "),
-            "a saturated render closes with the truncation marker: {prompt}"
+            prompt.contains("[5 messages elided]…"),
+            "a saturated render marks its elided gap: {prompt}"
         );
         assert!(
-            !prompt.contains("topic-3"),
+            !prompt.contains("topic-0"),
             "messages past the transcript budget never reach the prompt: {prompt}"
         );
     }

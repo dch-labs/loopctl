@@ -933,6 +933,7 @@ mod tests {
             reason: crate::compact::CompactReason::ThresholdExceeded,
             evicted_messages: 1,
             telemetry,
+            stage: None,
         });
         observer.on_fallback(&FallbackContext {
             from: "primary".to_string(),
@@ -1327,6 +1328,7 @@ mod tests {
             reason: crate::compact::CompactReason::ThresholdExceeded,
             evicted_messages: 0,
             telemetry,
+            stage: None,
         });
         observer.on_fallback(&FallbackContext {
             from: "primary".to_string(),

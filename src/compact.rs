@@ -82,6 +82,7 @@ pub mod structured_summarizer;
 pub mod truncating;
 pub mod types;
 
+pub(crate) use demote::render_compaction_transcript;
 pub use demote::{
     DemotionContext, DemotionSink, MemoryDemotionSink, NoopDemotionSink, render_evicted,
 };
@@ -2096,6 +2097,7 @@ mod tests {
             success: true,
             error: None,
             evicted: Vec::new(),
+            stage: None,
         };
 
         let start = Instant::now();

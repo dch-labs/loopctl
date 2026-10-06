@@ -691,6 +691,7 @@ mod tests {
             reason: crate::compact::CompactReason::ThresholdExceeded,
             evicted_messages: 1,
             telemetry,
+            stage: None,
         });
         hub.on_compaction_failed(&CompactionFailedContext {
             reason: crate::compact::CompactReason::Emergency,

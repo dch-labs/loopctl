@@ -32,6 +32,15 @@ const DEFAULT_MAX_CHARS: usize = 8_000;
 /// entry.
 const PART_CHARS: usize = 200;
 
+/// Per-part budget for thinking parts in the compaction transcript.
+///
+/// The LLM compactors' only view of the dropped work runs through the
+/// compaction transcript, and marathon sessions carry their conclusions
+/// in thinking parts — two thousand characters per part recovers them
+/// while the demotion render's one-line memory entries stay at
+/// [`PART_CHARS`].
+const COMPACTION_THINKING_CHARS: usize = 2_000;
+
 /// Receives messages a compaction pass removed from the feed.
 ///
 /// Called once per compacting pass that removed messages, with every
@@ -279,11 +288,123 @@ pub fn render_evicted(messages: &[Message], max_chars: usize) -> String {
     out
 }
 
+/// Render a dropped-context transcript for an LLM compactor's prompt.
+///
+/// The compaction view of [`render_evicted`]: per-message lines in the
+/// same shape, but thinking parts carry [`COMPACTION_THINKING_CHARS`]
+/// characters, and a render that would exceed `max_chars` splits its
+/// budget between the longest fitting prefix and the longest fitting
+/// suffix of complete messages — the suffix side is the most recent
+/// dropped work, the live progress a summarizer must see — with one
+/// `…[{n} messages elided]…` line marking the gap. When the halves
+/// would overlap or either side keeps nothing (few huge messages), the
+/// render degrades to [`render_evicted`]'s head-cut shape rather than
+/// duplicating content. Markers may append past the budget, matching
+/// `render_evicted`'s tolerance.
+pub(crate) fn render_compaction_transcript(messages: &[Message], max_chars: usize) -> String {
+    use std::fmt::Write as _;
+    let blocks: Vec<String> = messages
+        .iter()
+        .map(|msg| render_message_with(msg, COMPACTION_THINKING_CHARS))
+        .collect();
+    let total: usize = blocks.iter().map(|block| block.chars().count()).sum();
+    if total <= max_chars {
+        return blocks.concat();
+    }
+    if let Some((head_end, tail_start)) = sampled_split(&blocks, max_chars) {
+        let mut out: String = blocks.iter().take(head_end).map(String::as_str).collect();
+        let elided = tail_start.saturating_sub(head_end);
+        let _ignored = writeln!(out, "…[{elided} messages elided]…");
+        let tail: String = blocks.iter().skip(tail_start).map(String::as_str).collect();
+        out.push_str(&tail);
+        return out;
+    }
+    head_cut(&blocks, max_chars)
+}
+
+/// Find the prefix/suffix split for an over-budget transcript.
+///
+/// Returns `(head_end, tail_start)` — the number of blocks the head
+/// half keeps and the index the tail half starts at — when the halves
+/// each keep at least one block and do not overlap; `None` otherwise,
+/// so the caller degrades to the head cut. Head and tail halves each
+/// receive half of `max_chars` (the tail keeps the remainder on odd
+/// budgets), and both accumulate complete blocks only.
+fn sampled_split(blocks: &[String], max_chars: usize) -> Option<(usize, usize)> {
+    let head_budget = max_chars / 2;
+    let tail_budget = max_chars.saturating_sub(head_budget);
+    let mut head_end = 0usize;
+    let mut head_used = 0usize;
+    for block in blocks {
+        let len = block.chars().count();
+        if head_used.saturating_add(len) > head_budget {
+            break;
+        }
+        head_used = head_used.saturating_add(len);
+        head_end = head_end.saturating_add(1);
+    }
+    let mut tail_start = blocks.len();
+    let mut tail_used = 0usize;
+    for block in blocks.iter().rev() {
+        let len = block.chars().count();
+        if tail_used.saturating_add(len) > tail_budget {
+            break;
+        }
+        tail_used = tail_used.saturating_add(len);
+        tail_start = tail_start.saturating_sub(1);
+    }
+    let splittable = head_end > 0 && tail_start < blocks.len() && tail_start > head_end;
+    splittable.then_some((head_end, tail_start))
+}
+
+/// The degraded head-biased render for unsplittable transcripts.
+///
+/// The same overflow behavior [`render_evicted`] applies to its own
+/// messages: complete blocks while they fit, then a character cut into
+/// the next block and the `…[evicted {n} more messages]` marker
+/// counting everything from the partially-rendered message on. The
+/// blocks arrive pre-rendered, so the per-part budget of the caller's
+/// lane (demotion or compaction) applies, not this helper's.
+fn head_cut(blocks: &[String], max_chars: usize) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for (index, block) in blocks.iter().enumerate() {
+        let block_len = block.chars().count();
+        if used.saturating_add(block_len) <= max_chars {
+            out.push_str(block);
+            used = used.saturating_add(block_len);
+            continue;
+        }
+        let budget = max_chars.saturating_sub(used);
+        let keep = budget.saturating_sub(1);
+        out.extend(block.chars().take(keep));
+        out.push('…');
+        let unrendered = blocks.len().saturating_sub(index);
+        let _ignored = write!(out, "[evicted {unrendered} more messages]");
+        return out;
+    }
+    out
+}
+
 /// Render one message as a single summary line.
 ///
 /// The per-message unit of [`render_evicted`]: role prefix, text content,
-/// then per-part summaries in part order, closed by a newline.
+/// then per-part summaries in part order, closed by a newline. Parts
+/// truncate at [`PART_CHARS`] — the one-line memory-entry budget.
 fn render_message(msg: &Message) -> String {
+    render_message_with(msg, PART_CHARS)
+}
+
+/// Render one message with an explicit thinking-part budget.
+///
+/// The shared body of [`render_message`]: identical output for
+/// `thinking_chars == PART_CHARS`. Tool-call inputs and tool-result
+/// outputs always truncate at [`PART_CHARS`] — serialized arguments are
+/// noise beyond a snippet — so the parameter widens only the thinking
+/// lane, the part marathon sessions carry their conclusions in (see
+/// [`render_compaction_transcript`]).
+fn render_message_with(msg: &Message, thinking_chars: usize) -> String {
     use std::fmt::Write as _;
     let role = match msg.role {
         Role::User => "User",
@@ -301,7 +422,7 @@ fn render_message(msg: &Message) -> String {
                 if redacted.is_some() {
                     line.push_str(" thought: [redacted]");
                 } else if !text.is_empty() {
-                    let rendered: String = text.chars().take(PART_CHARS).collect();
+                    let rendered: String = text.chars().take(thinking_chars).collect();
                     line.push_str(" thought: ");
                     line.push_str(&rendered);
                 }
@@ -394,6 +515,87 @@ mod tests {
         assert!(
             rendered.contains(" thought: weighed two options"),
             "a demoted thinking part renders behind the thought marker: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_transcript_under_the_cap_renders_whole_with_no_markers() {
+        let messages: Vec<Message> = (0..6)
+            .map(|index| Message::assistant(format!("message-{index} of a short drop")))
+            .collect();
+        let rendered = render_compaction_transcript(&messages, 4_096);
+        for (index, _) in messages.iter().enumerate() {
+            assert!(
+                rendered.contains(&format!("message-{index} of a short drop")),
+                "an under-budget transcript renders every message: {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("elided") && !rendered.contains("evicted"),
+            "an under-budget transcript carries no saturation markers: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_over_cap_transcript_includes_the_newest_dropped_messages() {
+        let messages: Vec<Message> = (0..40)
+            .map(|index| Message::assistant(format!("message-{index:02} {}", "x".repeat(200))))
+            .collect();
+        let rendered = render_compaction_transcript(&messages, 2_000);
+        assert!(
+            rendered.contains("message-00"),
+            "the head side of the drop still renders: {rendered}"
+        );
+        assert!(
+            rendered.contains("message-39"),
+            "the newest dropped work must be visible to the summarizer: {rendered}"
+        );
+        assert!(
+            rendered.contains("messages elided]…"),
+            "the middle gap is marked with its elided count: {rendered}"
+        );
+    }
+
+    #[test]
+    fn overlapping_head_and_tail_degrades_to_the_head_cut() {
+        let messages = vec![
+            Message::assistant("a".repeat(3_000)),
+            Message::assistant("b".repeat(3_000)),
+        ];
+        let rendered = render_compaction_transcript(&messages, 2_000);
+        assert!(
+            rendered.starts_with("Assistant: aaa"),
+            "the degraded render still opens on the first message: {rendered:.200}"
+        );
+        assert!(
+            rendered.contains("…[evicted 2 more messages]"),
+            "the degraded render carries the head-cut marker counting both messages: {rendered:.200}"
+        );
+        assert!(
+            !rendered.contains("bbb"),
+            "the degraded render never reaches the second message: {rendered:.200}"
+        );
+    }
+
+    #[test]
+    fn thinking_survives_the_compaction_transcript_beyond_the_part_cap() {
+        let messages = vec![Message::new(
+            Role::Assistant,
+            vec![MessagePart::Thinking {
+                text: "z".repeat(1_000),
+                signature: None,
+                redacted: None,
+            }],
+        )];
+        let compaction = render_compaction_transcript(&messages, 8_192);
+        let demotion = render_evicted(&messages, 8_192);
+        assert!(
+            compaction.matches('z').count() == 1_000,
+            "the compaction view carries thinking past the one-line part cap: {compaction:.400}"
+        );
+        assert!(
+            demotion.matches('z').count() <= PART_CHARS,
+            "the demotion render still caps thinking at its one-line budget"
         );
     }
 

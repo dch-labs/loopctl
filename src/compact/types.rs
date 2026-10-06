@@ -230,6 +230,17 @@ pub struct CompactionOutcome {
     /// no-surviving-representative rule above is an obligation on compactors,
     /// not something the machinery polices.
     pub evicted: Vec<Message>,
+
+    /// The compactor's own account of which internal stage produced this
+    /// outcome.
+    ///
+    /// `None` from compactors without internal stages. A chain fills one
+    /// line naming each stage it declined through — with the reason — and
+    /// the stage that won, e.g. `QaSummarizer: error sending request;
+    /// StructuredSummarizer (won)`, so a host reading the outcome sees its
+    /// provenance without the pull-API report. Set through
+    /// [`with_stage`](Self::with_stage).
+    pub stage: Option<String>,
 }
 
 impl CompactionOutcome {
@@ -247,6 +258,7 @@ impl CompactionOutcome {
             success: true,
             error: None,
             evicted: Vec::new(),
+            stage: None,
         }
     }
 
@@ -266,6 +278,7 @@ impl CompactionOutcome {
             success: true,
             error: None,
             evicted: Vec::new(),
+            stage: None,
         }
     }
 
@@ -285,6 +298,7 @@ impl CompactionOutcome {
             success: false,
             error: Some(error.into()),
             evicted: Vec::new(),
+            stage: None,
         }
     }
 
@@ -310,6 +324,32 @@ impl CompactionOutcome {
     #[must_use]
     pub fn with_evicted(mut self, evicted: Vec<Message>) -> Self {
         self.evicted = evicted;
+        self
+    }
+
+    /// Attach the producing stage trail, consuming `self`.
+    ///
+    /// The producer-side path for [`stage`](Self::stage): a compactor
+    /// with internal stages — a fallback chain — records which stage
+    /// carried the pass and why the earlier ones declined. Single-stage
+    /// compactors leave it unset.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::compact::CompactionOutcome;
+    /// use loopctl::message::Message;
+    ///
+    /// let outcome = CompactionOutcome::compacted(vec![Message::user("kept")], 100, 20)
+    ///     .with_stage("Summarizer: error sending request; Truncator (won)");
+    /// assert_eq!(
+    ///     outcome.stage.as_deref(),
+    ///     Some("Summarizer: error sending request; Truncator (won)")
+    /// );
+    /// ```
+    #[must_use]
+    pub fn with_stage(mut self, stage: impl Into<String>) -> Self {
+        self.stage = Some(stage.into());
         self
     }
 

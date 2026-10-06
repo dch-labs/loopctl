@@ -642,6 +642,18 @@ pub struct CompactedContext {
     /// token fields above stay payload-comparable; this field is the
     /// history-only deep view.
     pub telemetry: crate::compact::CompactTelemetry,
+
+    /// The compactor's stage trail for this pass.
+    ///
+    /// A copy of [`CompactionOutcome`'s stage
+    /// field](crate::compact::CompactionOutcome::stage): one line
+    /// naming each internal stage the pass declined through — with its
+    /// reason — and the stage that won, e.g. `QaSummarizer: error
+    /// sending request; StructuredSummarizer (won)`. `None` when the
+    /// configured compactor reports no internal stages, so a host
+    /// distinguishes "no provenance available" from "a chain stage
+    /// carried the pass" without installing a tracing subscriber.
+    pub stage: Option<String>,
 }
 
 /// Context for

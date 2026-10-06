@@ -538,6 +538,7 @@ impl ContextCompactor for FallbackCompactor {
                         duration,
                     });
                     report.winning_stage = Some(index);
+                    let trail = stage_trail(&report);
                     self.store_report(report);
                     tracing::info!(
                         target: "loopctl::compact",
@@ -546,7 +547,7 @@ impl ContextCompactor for FallbackCompactor {
                         "fallback chain succeeded at a stage"
                     );
                     emit_pass(stage.name);
-                    return outcome;
+                    return outcome.with_stage(trail);
                 }
                 tracing::warn!(
                     target: "loopctl::compact",
@@ -563,13 +564,46 @@ impl ContextCompactor for FallbackCompactor {
                 });
             }
             let tokens_after = context.counter.count(&original);
+            let trail = stage_trail(&report);
             self.store_report(report);
             if let Some(unchanged) = last_unchanged {
-                return unchanged;
+                return unchanged.with_stage(trail);
             }
-            CompactionOutcome::failed(original, tokens_after, ALL_STAGES_FAILED)
+            CompactionOutcome::failed(original, tokens_after, ALL_STAGES_FAILED).with_stage(trail)
         })
     }
+}
+
+/// Render the one-line stage trail for a chain outcome.
+///
+/// Each stage the pass declined through appears as `name: reason` — its
+/// recorded error or decline text — and the winning stage as
+/// `name (won)`; when no stage won, every stage lists its reason and the
+/// trail closes with `no stage reduced`. The trail is the digest a host
+/// reads off the outcome; [`ChainReport`](FallbackCompactor::last_report)
+/// stays the full record.
+fn stage_trail(report: &ChainReport) -> String {
+    use std::fmt::Write as _;
+    let mut trail = String::new();
+    for (index, stage) in report.stages.iter().enumerate() {
+        if index > 0 {
+            trail.push_str("; ");
+        }
+        if report.winning_stage == Some(index) {
+            let _ignored = write!(trail, "{} (won)", stage.name);
+            continue;
+        }
+        let _ignored = write!(
+            trail,
+            "{}: {}",
+            stage.name,
+            stage.error.as_deref().unwrap_or("unknown")
+        );
+    }
+    if report.winning_stage.is_none() && !report.stages.is_empty() {
+        trail.push_str("; no stage reduced");
+    }
+    trail
 }
 
 /// Emit the pass counter event at the stage that served it.
@@ -1137,6 +1171,65 @@ mod tests {
         assert!(
             !report.stages[0].success,
             "the unchanged stage is recorded as not carrying the pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_outcome_carries_the_winning_stage_trail() {
+        let first = ScriptedCompactor::new(vec![Scripted::Fail("transport died")]);
+        let second = ScriptedCompactor::new(vec![Scripted::ShrinkToLast]);
+        let third = ScriptedCompactor::new(vec![Scripted::ShrinkToLast]);
+        let chain = FallbackCompactor::builder()
+            .stage("first", Arc::clone(&first) as Arc<dyn ContextCompactor>)
+            .stage("second", Arc::clone(&second) as Arc<dyn ContextCompactor>)
+            .stage("third", Arc::clone(&third) as Arc<dyn ContextCompactor>)
+            .build();
+        let messages = conversation();
+        let outcome = chain
+            .compact(messages, 40_000, context_for(&conversation()))
+            .await;
+        let trail = outcome
+            .stage
+            .as_deref()
+            .expect("a chain outcome names the stages that decided it");
+        assert!(
+            trail.starts_with("first: transport died; "),
+            "the trail names every declined stage with its reason: {trail}"
+        );
+        assert!(
+            trail.ends_with("second (won)"),
+            "the trail names the winning stage as the winner: {trail}"
+        );
+        assert!(
+            third.call_count() == 0,
+            "a stage after the winner never runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_reduction_ride_out_names_every_stage_and_states_none_reduced() {
+        let first = ScriptedCompactor::new(vec![Scripted::Unchanged]);
+        let second = ScriptedCompactor::new(vec![Scripted::Unchanged]);
+        let chain = FallbackCompactor::builder()
+            .stage("first", Arc::clone(&first) as Arc<dyn ContextCompactor>)
+            .stage("second", Arc::clone(&second) as Arc<dyn ContextCompactor>)
+            .build();
+        let messages = conversation();
+        let outcome = chain
+            .compact(messages, 40_000, context_for(&conversation()))
+            .await;
+        let trail = outcome
+            .stage
+            .as_deref()
+            .expect("a ride-out outcome still names the stages that decided it");
+        assert!(
+            trail.contains("first: stage returned success without reducing")
+                && trail.contains("second: stage returned success without reducing"),
+            "the trail names every stage with its decline reason: {trail}"
+        );
+        assert!(
+            trail.ends_with("no stage reduced"),
+            "a pass no stage carried states that outright: {trail}"
         );
     }
 

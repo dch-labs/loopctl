@@ -186,6 +186,7 @@ impl<C: ApiClient> BareLoop<C> {
                     reason,
                     evicted_messages: outcome.evicted.len(),
                     telemetry,
+                    stage: outcome.stage.clone(),
                 });
                 #[cfg(feature = "hooks")]
                 self.notify_post_compact_hook(

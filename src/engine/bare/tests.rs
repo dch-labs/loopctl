@@ -2707,6 +2707,100 @@ impl crate::compact::ContextCompactor for ShrinkingPassCompactor {
     }
 }
 
+/// A compaction double that declines by returning the input unchanged.
+///
+/// The stage-trail pin needs a chain whose first stage cannot carry the
+/// pass; an unchanged success is the chain's decline shape, so the
+/// winner below it is provably the second stage.
+struct DecliningCompactor;
+
+impl crate::compact::ContextCompactor for DecliningCompactor {
+    fn compact(
+        &self,
+        messages: Vec<Message>,
+        _target_tokens: u64,
+        _context: crate::compact::types::CompactionContext,
+    ) -> Pin<Box<dyn Future<Output = crate::compact::types::CompactionOutcome> + Send + '_>> {
+        Box::pin(std::future::ready(
+            crate::compact::types::CompactionOutcome::no_change(messages),
+        ))
+    }
+}
+
+/// Records the stage trail of every `on_compaction` dispatch.
+///
+/// One entry per dispatch, holding the context's stage field verbatim,
+/// so the pin asserts on the trail the engine surfaced rather than on
+/// the chain's own bookkeeping.
+struct StageTrailRecorder {
+    /// One entry per `on_compaction` dispatch: the context's stage trail.
+    ///
+    /// Shared with the test body, which drains it once the run ends.
+    trails: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+}
+
+impl crate::observer::LoopObserver for StageTrailRecorder {
+    fn name(&self) -> &'static str {
+        "stage-trail-recorder"
+    }
+    fn on_compaction(&self, ctx: &crate::observer::CompactedContext) {
+        self.trails
+            .lock()
+            .expect("trails lock")
+            .push(ctx.stage.clone());
+    }
+}
+
+#[tokio::test]
+async fn on_compaction_carries_the_stage_trail() {
+    let client = MockClient::new("test-model");
+    for idx in 0..3 {
+        client.add_tool_only_response(
+            &format!("c{idx}"),
+            "echo",
+            &json!({ "message": "x".repeat(400) }),
+        );
+    }
+    client.add_text_response("compacted-and-done");
+    let trails = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(50);
+    let chain = crate::compact::FallbackCompactor::builder()
+        .stage(
+            "declining",
+            Arc::new(DecliningCompactor) as Arc<dyn crate::compact::ContextCompactor>,
+        )
+        .stage(
+            "winner",
+            Arc::new(ShrinkingPassCompactor) as Arc<dyn crate::compact::ContextCompactor>,
+        )
+        .build();
+    let mut agent = BareLoop::new(Arc::new(client), registry, config);
+    agent.register_observer(Arc::new(StageTrailRecorder {
+        trails: Arc::clone(&trails),
+    }));
+    agent.set_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+        chain,
+    ))));
+    let run_result = agent.run("fill it up", &RunConfig::default()).await;
+    assert!(
+        run_result.is_ok(),
+        "the compacting run completes: {run_result:?}"
+    );
+    let trails = trails.lock().expect("trails lock");
+    assert!(
+        trails
+            .iter()
+            .any(|trail| trail.as_deref().is_some_and(|trail| trail
+                .contains("declining: stage returned success without reducing")
+                && trail.ends_with("winner (won)"))),
+        "the engine surfaces which chain stage carried each pass: {trails:?}"
+    );
+}
+
 #[tokio::test]
 async fn observer_sequence_compaction_turn() {
     let client = MockClient::new("test-model");

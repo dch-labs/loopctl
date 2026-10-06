@@ -16,8 +16,10 @@
 //! Each failed or declined stage is logged at `warn` and recorded in a
 //! [`ChainReport`](FallbackCompactor::last_report), so the chain stays
 //! debuggable while it survives; the winning stage's outcome rides out
-//! verbatim, its [`evicted`](CompactionOutcome::evicted) handoff included.
-//! A failed stage's returned messages are discarded rather than handed
+//! with its [`evicted`](CompactionOutcome::evicted) handoff intact and
+//! the one-line stage trail stamped on
+//! [`stage`](CompactionOutcome::stage). A failed stage's returned
+//! messages are discarded rather than handed
 //! onward — every stage runs against the original input, so a stage that
 //! fails with a partial or emptied list cannot corrupt the history its
 //! successors compact. When every stage declines without reducing, the
@@ -146,10 +148,12 @@ pub struct StageOutcome {
 /// Diagnostic record of one chain run.
 ///
 /// Stored after each `compact` and readable through
-/// [`FallbackCompactor::last_report`]; the winning stage's name is the
-/// provenance a host can surface (for example as
-/// `"FallbackCompactor(TruncatingCompactor)"`) — the outcome itself carries
-/// no name slot, by design.
+/// [`FallbackCompactor::last_report`]; the one-line digest of this
+/// report also rides every outcome out on
+/// [`stage`](CompactionOutcome::stage) — each declined stage with its
+/// reason, the winner marked — so a host reads provenance off the
+/// outcome and reserves this full record for per-stage detail the
+/// trail compresses away (durations, per-stage token counts).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ChainReport {
@@ -547,7 +551,7 @@ impl ContextCompactor for FallbackCompactor {
                         "fallback chain succeeded at a stage"
                     );
                     emit_pass(stage.name);
-                    return outcome.with_stage(trail);
+                    return stamped(outcome, &trail);
                 }
                 tracing::warn!(
                     target: "loopctl::compact",
@@ -567,10 +571,27 @@ impl ContextCompactor for FallbackCompactor {
             let trail = stage_trail(&report);
             self.store_report(report);
             if let Some(unchanged) = last_unchanged {
-                return unchanged.with_stage(trail);
+                return stamped(unchanged, &trail);
             }
-            CompactionOutcome::failed(original, tokens_after, ALL_STAGES_FAILED).with_stage(trail)
+            stamped(
+                CompactionOutcome::failed(original, tokens_after, ALL_STAGES_FAILED),
+                &trail,
+            )
         })
+    }
+}
+
+/// Stamp the trail on an outcome unless there is none.
+///
+/// An empty trail — a chain with no stages — leaves
+/// [`stage`](crate::compact::CompactionOutcome::stage) `None`, the
+/// documented "no provenance available" value, instead of an empty
+/// string a host would have to special-case.
+fn stamped(outcome: CompactionOutcome, trail: &str) -> CompactionOutcome {
+    if trail.is_empty() {
+        outcome
+    } else {
+        outcome.with_stage(trail)
     }
 }
 
@@ -1407,6 +1428,10 @@ mod tests {
             outcome.messages.len(),
             messages.len(),
             "the messages pass through untouched"
+        );
+        assert!(
+            outcome.stage.is_none(),
+            "a chain with no stages reports no provenance, not an empty trail"
         );
         let terminal_chain = FallbackCompactor::builder()
             .terminal(&TruncatingCompactor::new())

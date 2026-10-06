@@ -292,15 +292,21 @@ pub fn render_evicted(messages: &[Message], max_chars: usize) -> String {
 ///
 /// The compaction view of [`render_evicted`]: per-message lines in the
 /// same shape, but thinking parts carry [`COMPACTION_THINKING_CHARS`]
-/// characters, and a render that would exceed `max_chars` splits its
-/// budget between the longest fitting prefix and the longest fitting
-/// suffix of complete messages — the suffix side is the most recent
-/// dropped work, the live progress a summarizer must see — with one
-/// `…[{n} messages elided]…` line marking the gap. When the halves
-/// would overlap or either side keeps nothing (few huge messages), the
-/// render degrades to [`render_evicted`]'s head-cut shape rather than
-/// duplicating content. Markers may append past the budget, matching
-/// `render_evicted`'s tolerance.
+/// characters, and a render that would exceed `max_chars` keeps
+/// complete messages from both ends — the longest fitting prefix and
+/// the longest fitting suffix, each against half the budget — with one
+/// `…[{n} messages elided]…` line marking the gap. A head half that
+/// cannot keep even one complete message (a huge leading message)
+/// hands its budget to the tail, which then renders tail-only against
+/// the whole budget under a leading elision marker — the newest
+/// dropped work, the live progress a summarizer must see, stays
+/// visible whenever any complete message fits. The head-cut
+/// degradation — today's shape, partial first message plus `…[evicted
+/// {n} more messages]` — fires only when the tail side cannot keep a
+/// single complete message either, i.e. the newest dropped message
+/// alone exceeds the budget the tail side holds (its half, or the
+/// whole budget when the head keeps nothing). Markers may append past
+/// the budget, matching `render_evicted`'s tolerance.
 pub(crate) fn render_compaction_transcript(messages: &[Message], max_chars: usize) -> String {
     use std::fmt::Write as _;
     let blocks: Vec<String> = messages
@@ -314,7 +320,9 @@ pub(crate) fn render_compaction_transcript(messages: &[Message], max_chars: usiz
     if let Some((head_end, tail_start)) = sampled_split(&blocks, max_chars) {
         let mut out: String = blocks.iter().take(head_end).map(String::as_str).collect();
         let elided = tail_start.saturating_sub(head_end);
-        let _ignored = writeln!(out, "…[{elided} messages elided]…");
+        if elided > 0 {
+            let _ignored = writeln!(out, "…[{elided} messages elided]…");
+        }
         let tail: String = blocks.iter().skip(tail_start).map(String::as_str).collect();
         out.push_str(&tail);
         return out;
@@ -325,14 +333,20 @@ pub(crate) fn render_compaction_transcript(messages: &[Message], max_chars: usiz
 /// Find the prefix/suffix split for an over-budget transcript.
 ///
 /// Returns `(head_end, tail_start)` — the number of blocks the head
-/// half keeps and the index the tail half starts at — when the halves
-/// each keep at least one block and do not overlap; `None` otherwise,
-/// so the caller degrades to the head cut. Head and tail halves each
-/// receive half of `max_chars` (the tail keeps the remainder on odd
-/// budgets), and both accumulate complete blocks only.
+/// side keeps and the index the tail side starts at, with `head_end ==
+/// 0` denoting a tail-only render — whenever the tail side keeps at
+/// least one complete block; `None` otherwise, so the caller degrades
+/// to the head cut. The guard's overlap test is defensive, not a
+/// reachable state: with the render over budget, greedy halves that
+/// met or crossed would have covered every block within the budget —
+/// a contradiction — so the reachable `None` is exactly "the tail
+/// side kept nothing". Each side accumulates complete blocks only:
+/// the head against half the budget, the tail against the other half
+/// — or against the whole budget when the head keeps nothing, the
+/// handoff that keeps a huge leading message from starving the newest
+/// work out of the render.
 fn sampled_split(blocks: &[String], max_chars: usize) -> Option<(usize, usize)> {
     let head_budget = max_chars / 2;
-    let tail_budget = max_chars.saturating_sub(head_budget);
     let mut head_end = 0usize;
     let mut head_used = 0usize;
     for block in blocks {
@@ -343,6 +357,11 @@ fn sampled_split(blocks: &[String], max_chars: usize) -> Option<(usize, usize)> 
         head_used = head_used.saturating_add(len);
         head_end = head_end.saturating_add(1);
     }
+    let tail_budget = if head_end == 0 {
+        max_chars
+    } else {
+        max_chars.saturating_sub(head_budget)
+    };
     let mut tail_start = blocks.len();
     let mut tail_used = 0usize;
     for block in blocks.iter().rev() {
@@ -353,7 +372,10 @@ fn sampled_split(blocks: &[String], max_chars: usize) -> Option<(usize, usize)> 
         tail_used = tail_used.saturating_add(len);
         tail_start = tail_start.saturating_sub(1);
     }
-    let splittable = head_end > 0 && tail_start < blocks.len() && tail_start > head_end;
+    if tail_start >= blocks.len() {
+        return None;
+    }
+    let splittable = head_end == 0 || tail_start > head_end;
     splittable.then_some((head_end, tail_start))
 }
 
@@ -553,6 +575,64 @@ mod tests {
         assert!(
             rendered.contains("messages elided]…"),
             "the middle gap is marked with its elided count: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_huge_leading_message_does_not_hide_the_newest_dropped_work() {
+        let messages = vec![
+            Message::assistant("a".repeat(5_000)),
+            Message::assistant(format!("newest-context {}", "b".repeat(100))),
+            Message::assistant(format!("newest-verification {}", "c".repeat(100))),
+        ];
+        let rendered = render_compaction_transcript(&messages, 2_000);
+        assert!(
+            rendered.contains("newest-context") && rendered.contains("newest-verification"),
+            "messages that fit the tail side must render even when a huge \
+             leading message starves the head half: {rendered:.400}"
+        );
+        assert!(
+            rendered.contains("messages elided]…"),
+            "the leading gap is marked with its elided count: {rendered:.400}"
+        );
+    }
+
+    #[test]
+    fn a_sampled_split_never_overlaps_on_over_budget_renders() {
+        let mut sampled_cases = 0usize;
+        for block_count in 1..=6usize {
+            for leader in [10usize, 700, 1_300, 3_000] {
+                for tail_sizes in [10usize, 300, 900, 2_100] {
+                    let mut blocks: Vec<String> = vec!["x".repeat(leader)];
+                    for _ in 1..block_count {
+                        blocks.push("y".repeat(tail_sizes));
+                    }
+                    blocks.push(format!("newest-{}", "z".repeat(tail_sizes)));
+                    let total: usize = blocks.iter().map(|b| b.chars().count()).sum();
+                    for cap in [400usize, 1_200, 2_600] {
+                        if total <= cap {
+                            continue;
+                        }
+                        let Some((head_end, tail_start)) = sampled_split(&blocks, cap) else {
+                            continue;
+                        };
+                        sampled_cases = sampled_cases.saturating_add(1);
+                        assert!(
+                            head_end == 0 || tail_start > head_end,
+                            "an over-budget render never samples overlapping halves: \
+                             head_end={head_end} tail_start={tail_start} cap={cap}"
+                        );
+                        assert!(
+                            tail_start < blocks.len(),
+                            "a sampled render always keeps tail-side content"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            sampled_cases > 0,
+            "the sweep must exercise sampled splits, not only degradations"
         );
     }
 

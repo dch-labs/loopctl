@@ -381,12 +381,14 @@ impl QaSummarizerConfig {
 
     /// Set additional host instructions for the step-1 prompt.
     ///
-    /// The text rides the summarize prompt under its own label, ahead of
-    /// any per-pass hook instructions, layering host workload knowledge
-    /// over the built-in ledger requirement. An empty or whitespace-only
-    /// string is rejected with a warning and the knob stays unset —
-    /// advisory text that renders nothing is a configuration mistake,
-    /// not a quieter prompt.
+    /// The text rides the summarize prompt inside a delimited
+    /// `<host-instructions>` block — separated from the conversation
+    /// data the way `<conversation>` and `<prior-summary>` separate
+    /// theirs — ahead of any per-pass hook instructions, layering host
+    /// workload knowledge over the built-in ledger requirement. An
+    /// empty or whitespace-only string is rejected with a warning and
+    /// the knob stays unset — advisory text that renders nothing is a
+    /// configuration mistake, not a quieter prompt.
     #[must_use]
     pub fn with_summary_instructions(mut self, instructions: impl Into<String>) -> Self {
         let text = instructions.into();
@@ -640,10 +642,13 @@ impl QaSummarizer {
     /// Run the three steps over one split.
     ///
     /// The orchestrator of a pass: summarize, question, and — only when
-    /// the question step found gaps — answer and fold. Returns the final
-    /// summary, how many LLM calls ran, and how many gap questions the
-    /// pass answered; the step name in the error position names the arm
-    /// that failed.
+    /// the question step found gaps — answer and fold. The pass's
+    /// transcript is rendered once here and shared by the summarize and
+    /// answer steps, so the answer prompt cannot drift from what was
+    /// summarized and the render cost is paid once per pass. Returns
+    /// the final summary, how many LLM calls ran, and how many gap
+    /// questions the pass answered; the step name in the error position
+    /// names the arm that failed.
     ///
     /// # Errors
     ///
@@ -659,8 +664,9 @@ impl QaSummarizer {
         spend: &mut TokenSpend,
     ) -> Result<(CompactionSummary, u8, usize), (&'static str, ApiError)> {
         let mergeable_prior = prior.filter(|_| self.config.accumulate);
+        let transcript = self.transcript(dropped, mergeable_prior);
         let summary = self
-            .summarize(dropped, mergeable_prior, budget, context, spend)
+            .summarize(&transcript, mergeable_prior, budget, context, spend)
             .await
             .map_err(|error| ("summarize", error))?;
         let questions = self
@@ -671,7 +677,7 @@ impl QaSummarizer {
             return Ok((summary, 2, 0));
         }
         let enriched = self
-            .answer_and_merge(summary, &questions, dropped, mergeable_prior, budget, spend)
+            .answer_and_merge(summary, &questions, &transcript, budget, spend)
             .await
             .map_err(|error| ("answer", error))?;
         Ok((enriched, 3, questions.len()))
@@ -705,15 +711,14 @@ impl QaSummarizer {
     /// estimate exceeds the pass budget.
     async fn summarize(
         &self,
-        dropped: &[Message],
+        transcript: &str,
         prior: Option<&PriorSummary>,
         budget: u64,
         context: &CompactionContext,
         spend: &mut TokenSpend,
     ) -> Result<CompactionSummary, ApiError> {
-        let transcript = self.transcript(dropped, prior);
         let prompt = Self::summarize_prompt(
-            &transcript,
+            transcript,
             prior,
             budget,
             context,
@@ -773,10 +778,10 @@ impl QaSummarizer {
     /// One call for every question, numbered; answers the dropped context
     /// does not contain come back `UNKNOWN` and are dropped, so no
     /// hallucinated fact ever enters the summary. The transcript is the
-    /// same accumulate-filtered render step 1 saw, so the prior summary
-    /// never re-enters the answer prompt as answerable conversation. The
-    /// folded section is capped to the pass budget, shedding the latest
-    /// answers first.
+    /// same render step 1 saw — produced once per pass by the
+    /// orchestrator — so the prior summary never re-enters the answer
+    /// prompt as answerable conversation. The folded section is capped
+    /// to the pass budget, shedding the latest answers first.
     ///
     /// # Errors
     ///
@@ -786,13 +791,11 @@ impl QaSummarizer {
         &self,
         summary: CompactionSummary,
         questions: &[String],
-        dropped: &[Message],
-        prior: Option<&PriorSummary>,
+        transcript: &str,
         budget: u64,
         spend: &mut TokenSpend,
     ) -> Result<CompactionSummary, ApiError> {
-        let transcript = self.transcript(dropped, prior);
-        let prompt = Self::answer_prompt(questions, &transcript);
+        let prompt = Self::answer_prompt(questions, transcript);
         let response = self.call_with_spend(prompt, spend).await?;
         let text = fold_answers(
             &summary.text,
@@ -892,7 +895,7 @@ impl QaSummarizer {
         if let Some(instructions) = host_instructions {
             let _ignored = write!(
                 prompt,
-                "\n\nHost-configured summary instructions:\n{instructions}"
+                "\n\n<host-instructions>\n{instructions}\n</host-instructions>"
             );
         }
         if let Some(instructions) = context.instructions.as_deref() {
@@ -1642,9 +1645,9 @@ mod tests {
         let prompt = prompts.first().expect("step 1 ran");
         assert!(
             prompt.contains(
-                "Host-configured summary instructions:\nname the findings file path in the ledger"
+                "<host-instructions>\nname the findings file path in the ledger\n</host-instructions>"
             ),
-            "the config-seam block rides under its own label: {prompt:.700}"
+            "the config seam rides in a delimited host-instructions block: {prompt:.700}"
         );
         assert!(
             prompt.contains("progress ledger"),
@@ -2349,17 +2352,18 @@ mod tests {
         let context = context_for(&messages);
         let outcome = summarizer.compact(messages, 40_000, context).await;
         assert!(outcome.success);
-        let prompt = &client.prompts()[0];
+        let prompts = client.prompts();
+        let prompt = prompts.first().expect("step 1 ran");
         assert!(
-            prompt.contains("user turn 0 asks about topic-0"),
-            "the head of the dropped slice still renders: {prompt}"
+            prompt.contains("assistant turn 2 decided fact-2"),
+            "the newest dropped message still renders inside the budget: {prompt}"
         );
         assert!(
-            prompt.contains("[evicted "),
-            "a saturated render closes with the truncation marker: {prompt}"
+            prompt.contains("[5 messages elided]…"),
+            "a saturated render marks its elided gap: {prompt}"
         );
         assert!(
-            !prompt.contains("topic-3"),
+            !prompt.contains("topic-0"),
             "messages past the transcript budget never reach the prompt: {prompt}"
         );
     }

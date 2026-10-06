@@ -617,8 +617,10 @@ impl StructuredSummaryConfig {
 
     /// Set additional host instructions for the summarize prompt.
     ///
-    /// The text rides the summarize prompt under its own label, ahead of
-    /// any per-pass hook instructions, layering host workload knowledge
+    /// The text rides the summarize prompt inside a delimited
+    /// `<host-instructions>` block — separated from the conversation
+    /// data the way `<conversation>` separates its own — ahead of any
+    /// per-pass hook instructions, layering host workload knowledge
     /// over the section contract. An empty or whitespace-only string is
     /// rejected with a warning and the knob stays unset — advisory text
     /// that renders nothing is a configuration mistake, not a quieter
@@ -954,7 +956,7 @@ impl StructuredSummarizer {
         if let Some(instructions) = self.config.summary_instructions.as_deref() {
             let _ignored = write!(
                 user_prompt,
-                "\n\nHost-configured summary instructions:\n{instructions}"
+                "\n\n<host-instructions>\n{instructions}\n</host-instructions>"
             );
         }
         if let Some(instructions) = context.instructions.as_deref() {
@@ -1585,9 +1587,9 @@ mod tests {
             .expect("the first call carries the user prompt");
         assert!(
             user.contains(
-                "Host-configured summary instructions:\nname the findings file path in the ledger"
+                "<host-instructions>\nname the findings file path in the ledger\n</host-instructions>"
             ),
-            "the config-seam block rides under its own label: {user:.700}"
+            "the config seam rides in a delimited host-instructions block: {user:.700}"
         );
         assert!(
             client
@@ -2214,17 +2216,20 @@ mod tests {
             .compact(messages.clone(), 40_000, context_for(&messages))
             .await;
         assert!(outcome.success);
-        let user = client.user_prompts()[0].clone();
+        let prompts = client.user_prompts();
+        let user = prompts
+            .first()
+            .expect("the first call carries the user prompt");
         assert!(
-            user.contains("user turn 0 asks about topic-0"),
-            "the head of the dropped slice still renders: {user}"
+            user.contains("assistant turn 2 decided fact-2"),
+            "the newest dropped message still renders inside the budget: {user}"
         );
         assert!(
-            user.contains("[evicted "),
-            "a saturated render closes with the truncation marker: {user}"
+            user.contains("[5 messages elided]…"),
+            "a saturated render marks its elided gap: {user}"
         );
         assert!(
-            !user.contains("topic-3"),
+            !user.contains("topic-0"),
             "messages past the transcript budget never reach the prompt: {user}"
         );
     }

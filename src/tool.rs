@@ -78,9 +78,11 @@ use std::time::Duration;
 
 use crate::message::ToolContent as MessageToolContent;
 
+pub mod grant;
 pub mod permission;
 pub mod registry;
 
+pub use grant::{Grant, GrantScope, GrantStore, GrantVerdict};
 pub use permission::GateDecision;
 pub use permission::GateRuleSource;
 pub use permission::GateVerdict;
@@ -1571,6 +1573,27 @@ pub trait Tool: Send + Sync {
     /// schema will cause the LLM to produce malformed tool calls.
     fn schema(&self) -> ToolSchema;
 
+    /// The content digest of this tool's descriptor.
+    ///
+    /// Sixteen hex characters: the FNV-1a 64-bit hash of the
+    /// canonical JSON over `{name, description, schema}` — the same
+    /// recursive key-sorted canonicalization and the same digest
+    /// family as
+    /// [`GateDecision::args_digest`](crate::tool::permission::GateDecision::args_digest),
+    /// so a pinned digest is stable across hosts and `serde_json`
+    /// map backends and changes when any part of the descriptor the
+    /// model sees changes. First-use approval pins this value; a
+    /// later mismatch is the re-ask signal — the tool's contract
+    /// moved since the user approved it.
+    ///
+    /// The default digests the trait's own three accessors, so no
+    /// implementation (and no `#[derive(Tool)]` expansion) needs to
+    /// change; override only for descriptors assembled outside
+    /// `name`/`description`/`schema`.
+    fn descriptor_digest(&self) -> String {
+        descriptor_digest_of(self.name(), self.description(), &self.schema())
+    }
+
     /// Invoke the tool with the given input and context.
     ///
     /// Main execution entry point. The `input` is a
@@ -1757,6 +1780,65 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Digest a tool descriptor: name, description, and schema.
+///
+/// [`Tool::descriptor_digest`](Tool::descriptor_digest)'s engine,
+/// shared crate-wide so the grant store and the gate machinery pin
+/// identical values for one descriptor. The schema serializes through
+/// its plain `Serialize` impl (strings and a `Value` — infallible in
+/// practice, digested as `null` should it ever fail, loudly wrong
+/// rather than panicking).
+pub(crate) fn descriptor_digest_of(name: &str, description: &str, schema: &ToolSchema) -> String {
+    let descriptor = serde_json::json!({
+        "name": name,
+        "description": description,
+        "schema": serde_json::to_value(schema).unwrap_or(Value::Null),
+    });
+    format!(
+        "{:016x}",
+        crate::compact::demote::fnv1a64(canonical_json(&descriptor).as_bytes())
+    )
+}
+
+/// Render `value` as canonical JSON: every object's keys sorted.
+///
+/// The digest family's cross-host contract — two hosts and a cassette
+/// agree on one digest for one value — cannot rest on `serde_json`'s
+/// default map backend: feature unification lets any downstream crate
+/// switch the `Map` to insertion-ordered (`preserve_order`), which
+/// would render the same value in the order it arrived and silently
+/// split digests across hosts. Rebuilding every object with its keys
+/// inserted in sorted order makes the rendering a function of the
+/// value alone under either backend; escaping and number formatting
+/// stay `serde_json`'s own, so digests computed before this
+/// canonicalization match digests computed after it.
+pub(crate) fn canonical_json(value: &Value) -> String {
+    sorted_keys(value).to_string()
+}
+
+/// Rebuild `value` with every object's keys in sorted order.
+///
+/// Recursion covers nested objects; array order is untouched,
+/// because it is semantic. Under the default `BTreeMap` backend the
+/// rebuild is byte-identical to the input — the map is already
+/// sorted — and only the insertion-ordered backend takes the sorted
+/// path.
+fn sorted_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let mut sorted = serde_json::Map::new();
+            for (key, entry) in entries {
+                sorted.insert(key.clone(), sorted_keys(entry));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted_keys).collect()),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1846,6 +1928,117 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
             Box::pin(async { Err(ToolError::Execution("always fails".into())) })
         }
+    }
+
+    /// A tool whose descriptor parts vary per instance.
+    ///
+    /// The digest pin needs otherwise-identical tools that differ in
+    /// exactly one descriptor part; the call body is irrelevant to
+    /// the digest and answers with empty text.
+    struct DescriptorProbeTool {
+        /// The name the probe reports.
+        ///
+        /// One of the three descriptor parts the digest covers,
+        /// varied per instance to move the digest.
+        probe_name: String,
+
+        /// The description the probe reports.
+        ///
+        /// Varied independently of the other parts so each pin
+        /// isolates exactly one change.
+        probe_description: String,
+
+        /// The input schema the probe reports.
+        ///
+        /// Cloned verbatim into the `ToolSchema` — the schema half of
+        /// the digest input.
+        probe_input_schema: Value,
+    }
+
+    impl DescriptorProbeTool {
+        /// A probe over one `{name, description, schema}` triple.
+        ///
+        /// Keeps the three parts together so the digest pins can
+        /// vary one at a time.
+        fn over(name: &str, description: &str, input_schema: Value) -> Self {
+            Self {
+                probe_name: name.to_string(),
+                probe_description: description.to_string(),
+                probe_input_schema: input_schema,
+            }
+        }
+    }
+
+    impl Tool for DescriptorProbeTool {
+        fn name(&self) -> &str {
+            &self.probe_name
+        }
+        fn description(&self) -> &str {
+            &self.probe_description
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: self.probe_name.clone(),
+                description: self.probe_description.clone(),
+                input_schema: self.probe_input_schema.clone(),
+            }
+        }
+        fn call(
+            &self,
+            _input: Value,
+            _context: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async { Ok(ToolOutput::text(String::new())) })
+        }
+    }
+
+    #[test]
+    fn descriptor_hash_changes_when_schema_changes() {
+        let base_schema = json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"]
+        });
+        let wider_schema = json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "offset": { "type": "integer" }
+            },
+            "required": ["path"]
+        });
+        let base = DescriptorProbeTool::over("read", "Reads a file", base_schema.clone());
+        let same_base = DescriptorProbeTool::over("read", "Reads a file", base_schema.clone());
+        let changed_schema = DescriptorProbeTool::over("read", "Reads a file", wider_schema);
+        let changed_name = DescriptorProbeTool::over("read2", "Reads a file", base_schema.clone());
+        let changed_description = DescriptorProbeTool::over("read", "Reads two files", base_schema);
+
+        let digest = base.descriptor_digest();
+        assert_eq!(
+            digest.len(),
+            16,
+            "the digest is sixteen hex characters: {digest}"
+        );
+        assert_eq!(
+            same_base.descriptor_digest(),
+            digest,
+            "identical descriptors digest identically across instances"
+        );
+        assert_ne!(
+            changed_schema.descriptor_digest(),
+            digest,
+            "a changed schema is a changed contract — the digest must move"
+        );
+        assert_ne!(
+            changed_name.descriptor_digest(),
+            digest,
+            "a renamed tool is a different tool to pin"
+        );
+        assert_ne!(
+            changed_description.descriptor_digest(),
+            digest,
+            "a changed description changes what the model was told"
+        );
     }
 
     #[test]
@@ -2270,6 +2463,9 @@ mod tests {
     }
 
     /// A stub tool that returns a fixed hinted `ToolOutput`.
+    ///
+    /// The display-hint threading pins need a tool whose output
+    /// carries a chosen hint without any dispatch machinery.
     #[cfg(feature = "testing")]
     struct HintedTool {
         name: &'static str,
@@ -2307,6 +2503,9 @@ mod tests {
     }
 
     /// Captures every `on_tool_post` snapshot for later assertion.
+    ///
+    /// Behind a shared mutex so the run and the assertions read the
+    /// same list once the dispatch settles.
     #[cfg(feature = "testing")]
     #[derive(Default)]
     struct PostCapture {

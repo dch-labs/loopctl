@@ -4,11 +4,13 @@
 //! accumulates what a run spends (provider-reported tokens, completed
 //! turns, wall-clock measured by the caller's clock seam) and enforces two
 //! lines per dimension — a **soft** line that emits a warn event once
-//! per crossing, and a **hard** line that refuses the *next* model
-//! request before it is sent. Decisions flow through
+//! per crossing, and a **hard** line that refuses the *next turn's*
+//! model request before it is sent. Decisions flow through
 //! [`GateDecision`](crate::tool::permission::GateDecision) records
 //! like any gate, so audit and replay see budget enforcement through
-//! the same trail.
+//! the same trail. Both lines scope to the run's turn requests:
+//! compaction-pass model calls are outside the accounting and the
+//! enforcement alike.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -28,14 +30,17 @@ use crate::error::LoopError;
 pub enum BudgetDimension {
     /// Provider-reported tokens, input plus output.
     ///
-    /// Counted from usage records, never estimates — a provider that
-    /// reports no usage spends nothing against this line.
+    /// Counted from the turn-serving usage records the engine feeds,
+    /// never estimates — a provider that reports no usage spends
+    /// nothing against this line, and compaction-pass model calls are
+    /// outside the accounting.
     Tokens,
 
     /// Completed assistant turns.
     ///
-    /// Incremented once per turn end, so an in-flight turn never
-    /// counts against itself.
+    /// Incremented once per successful turn end, so an in-flight turn
+    /// never counts against itself and a turn that fails mid-run
+    /// counts nothing.
     Turns,
 
     /// Wall-clock time since the run began.
@@ -62,11 +67,10 @@ impl std::fmt::Display for BudgetDimension {
 /// The gate's own input shape, independent of any manifest type: a
 /// host supplies limits directly, or maps the manifest's advisory
 /// [`Budgets`](crate::manifest::Budgets) stanza through the
-/// `From` impl behind the `manifest` feature. `None` disables a
-/// line — no threshold, no warn, no refusal. Cost-in-dollars has no
-/// line here until price tables exist; a configured `cost_usd` maps
-/// to nothing (its own manifest doc calls it unenforceable without
-/// a price table, and the gate refuses to guess a cost).
+/// `From<&Budgets>` impl behind the `manifest` feature. `None`
+/// disables a line — no threshold, no warn, no refusal. No price
+/// table is consulted, so cost has no line; a configured `cost_usd`
+/// maps to nothing (the gate refuses to guess a cost).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BudgetLimits {
     /// The hard ceiling on provider-reported tokens per run.
@@ -259,13 +263,13 @@ pub struct BudgetWarn {
 ///
 /// The engine begins a run (`begin` with the clock's now), feeds it
 /// usage and turn completions as they happen, and consults
-/// `pre_request` before sending each model request: soft crossings
-/// come back as warns — each dimension warns exactly once per run —
-/// and a hard crossing refuses, identifying the dimension and the
-/// numbers for the caller's [`LoopError::BudgetExhausted`] and deny
-/// record. The in-flight request that crosses a line is never the
-/// one refused: accumulation is post-response, so the crossing call
-/// completes and the *next* check refuses.
+/// `pre_request` before sending each turn's model request: soft
+/// crossings come back as warns — each dimension warns exactly once
+/// per run — and a hard crossing refuses, identifying the dimension
+/// and the numbers for the caller's [`LoopError::BudgetExhausted`]
+/// and deny record. The in-flight request that crosses a line is
+/// never the one refused: accumulation is post-response, so the
+/// crossing call completes and the *next* check refuses.
 #[derive(Debug)]
 pub struct BudgetGate {
     /// The configured lines and derived soft thresholds.
@@ -294,17 +298,21 @@ struct BudgetConfig {
 
     /// The fraction of each hard limit the soft line sits at.
     ///
-    /// In `(0.0, 1.0]` — a fraction at or above 1 would never warn
-    /// before the refusal, and one at or below 0 would warn before
-    /// anything was spent.
+    /// In `[0.0001, 1.0]` — a fraction at or above 1 would never warn
+    /// before the refusal, one at or below 0 would warn before
+    /// anything was spent, and one below the rationalization floor
+    /// could not warn at all.
     soft_fraction: f64,
 }
 
 /// The per-run spend state under the gate's mutex.
 ///
 /// Counters and latches only — every line and threshold lives in the
-/// immutable config, so a poisoned lock costs a moment of accounting,
-/// never a mis-evaluated budget.
+/// immutable config, and the critical sections are flag writes and
+/// saturating adds that cannot panic, so the lock cannot be poisoned.
+/// Were it poisoned regardless, every gate method would go silent —
+/// no warns, no refusals, never a refusal on stale data — a fail-open
+/// shape the panic-free sections keep unreachable by construction.
 #[derive(Debug, Default)]
 struct GateState {
     /// Provider-reported tokens spent so far this run.
@@ -354,21 +362,26 @@ impl BudgetGate {
 
     /// Move every soft line to `fraction` of its hard line.
     ///
-    /// The fraction must sit in `(0.0, 1.0]`: at or above one the
+    /// The fraction must sit in `[0.0001, 1.0]`: at or above one the
     /// soft line would coincide with or trail the refusal (no warn
     /// before the block), at or below zero it would warn before any
-    /// spend. Out-of-range fractions are rejected loudly rather
-    /// than clamped — a mistyped 8.0 for 0.80 should surface, not
-    /// silently become a different gate.
+    /// spend, and below the four-decimal rationalization floor
+    /// (`0.0001`) no soft line could fire at all — a warless gate
+    /// wearing a fraction. Out-of-range fractions are rejected loudly
+    /// rather than clamped — a mistyped 8.0 for 0.80 should surface,
+    /// not silently become a different gate.
     ///
     /// # Errors
     ///
-    /// Returns [`LoopError::InvalidInput`] when `fraction` is zero,
-    /// negative, NaN, or greater than one.
+    /// Returns [`LoopError::InvalidInput`] when `fraction` is below
+    /// the rationalization floor, zero, negative, NaN, or greater
+    /// than one.
     pub fn with_soft_fraction(mut self, fraction: f64) -> Result<Self, LoopError> {
-        if !fraction.is_finite() || fraction <= 0.0 || fraction > 1.0 {
+        if !fraction.is_finite() || fraction < 0.0001 || fraction > 1.0 {
             return Err(LoopError::InvalidInput(format!(
-                "budget soft fraction must be in (0.0, 1.0], got {fraction}"
+                "budget soft fraction must be in [0.0001, 1.0] — 0.0001 is the \
+                 four-decimal rationalization floor below which no soft line \
+                 could fire — got {fraction}"
             )));
         }
         self.config.soft_fraction = fraction;
@@ -406,24 +419,28 @@ impl BudgetGate {
 
     /// Record one completed turn.
     ///
-    /// Called at turn end so an in-flight turn never counts against
-    /// itself — the turns line refuses the *next* request, after the
-    /// current turn has fully completed.
+    /// Called at a successful turn's end so an in-flight turn never
+    /// counts against itself — the turns line refuses the *next*
+    /// request, after the current turn has fully completed. The
+    /// engine does not call it for a failed turn end: the dimension
+    /// counts completed turns, and every failed turn end is terminal
+    /// for its run.
     pub fn observe_turn_end(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.turns = state.turns.saturating_add(1);
         }
     }
 
-    /// Evaluate both lines before sending a model request.
+    /// Evaluate every enabled dimension's line before a model request.
     ///
     /// Returns the soft crossings to report — each dimension at most
-    /// once per run — or the hard crossing that refuses the request:
+    /// once per run — and the hard crossing that refuses the request:
     /// the dimension, the spend, and the limit, ready for
-    /// [`LoopError::BudgetExhausted`] and the deny record. When a
-    /// hard line is crossed the warns for that pass are still
-    /// included, so a consumer sees the warn it would have gotten
-    /// had the lines been further apart. The elapsed [`Duration`] is
+    /// [`LoopError::BudgetExhausted`] and the deny record. Every
+    /// dimension's first crossing latches in the same check,
+    /// whichever dimension's hard line refuses the request — the
+    /// tokens → turns → wall-clock priority picks the refusal, never
+    /// which warns a consumer sees. The elapsed [`Duration`] is
     /// the caller's clock-seam reading since the run began — the
     /// gate itself never reads a clock, so a replayed run crosses
     /// the same lines at the same logical instants.
@@ -439,6 +456,7 @@ impl BudgetGate {
             return (Vec::new(), None);
         };
         let mut warns = Vec::new();
+        let mut hard = None;
 
         if let Some(limit) = self.config.limits.tokens {
             if state.spent_tokens >= limit {
@@ -450,16 +468,12 @@ impl BudgetGate {
                     spent,
                     limit,
                 );
-                return (
-                    warns,
-                    Some(HardCrossing {
-                        dimension: BudgetDimension::Tokens,
-                        spent,
-                        limit,
-                    }),
-                );
-            }
-            if !state.warned_tokens
+                hard = Some(HardCrossing {
+                    dimension: BudgetDimension::Tokens,
+                    spent,
+                    limit,
+                });
+            } else if !state.warned_tokens
                 && soft_line(limit, self.config.soft_fraction)
                     .is_some_and(|soft| state.spent_tokens >= soft)
             {
@@ -482,16 +496,14 @@ impl BudgetGate {
                     spent,
                     limit,
                 );
-                return (
-                    warns,
-                    Some(HardCrossing {
+                if hard.is_none() {
+                    hard = Some(HardCrossing {
                         dimension: BudgetDimension::Turns,
                         spent,
                         limit,
-                    }),
-                );
-            }
-            if !state.warned_turns
+                    });
+                }
+            } else if !state.warned_turns
                 && soft_line(limit, self.config.soft_fraction)
                     .is_some_and(|soft| state.turns >= soft)
             {
@@ -515,16 +527,14 @@ impl BudgetGate {
                     elapsed_ms,
                     limit_ms,
                 );
-                return (
-                    warns,
-                    Some(HardCrossing {
+                if hard.is_none() {
+                    hard = Some(HardCrossing {
                         dimension: BudgetDimension::WallClock,
                         spent: elapsed_ms,
                         limit: limit_ms,
-                    }),
-                );
-            }
-            if !state.warned_wall_clock
+                    });
+                }
+            } else if !state.warned_wall_clock
                 && soft_line(limit_ms, self.config.soft_fraction)
                     .is_some_and(|soft| elapsed_ms >= soft)
             {
@@ -537,7 +547,7 @@ impl BudgetGate {
             }
         }
 
-        (warns, None)
+        (warns, hard)
     }
 }
 
@@ -790,6 +800,30 @@ mod tests {
         // The 80% default lands where the docs say.
         assert_eq!(soft_line(200, 0.80), Some(160));
         assert_eq!(soft_line(1, 0.80), Some(0));
+    }
+
+    #[test]
+    fn a_fraction_below_the_rationalization_floor_is_rejected_loudly() {
+        // `rationalize` keeps four decimals; a fraction below 0.0001
+        // rounds to a zero numerator, which `soft_line` would read as
+        // "no warn, ever" — an accepted builder value silently
+        // disabling every soft line. The builder rejects it instead.
+        let limits = BudgetLimits {
+            tokens: Some(100),
+            ..BudgetLimits::new()
+        };
+        let sub_floor = BudgetGate::new(limits.clone()).with_soft_fraction(0.00001);
+        assert!(
+            sub_floor.is_err(),
+            "a sub-floor fraction must be a loud InvalidInput, not a \
+             warless gate: {sub_floor:?}"
+        );
+        let at_floor = BudgetGate::new(limits).with_soft_fraction(0.0001);
+        assert!(
+            at_floor.is_ok(),
+            "the floor itself rationalizes (1/10_000) and is accepted: \
+             {at_floor:?}"
+        );
     }
 
     #[test]

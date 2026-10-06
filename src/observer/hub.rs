@@ -661,6 +661,11 @@ mod tests {
             tool_call_id: "call_1".to_string(),
         });
         publish_gate_decision(&hub);
+        hub.on_budget_warn(&BudgetWarnContext {
+            dimension: crate::budget::BudgetDimension::Tokens,
+            spent: 375,
+            limit: 400,
+        });
         hub.on_tool_post(&ToolPostContext {
             tool_call_id: "call_1".to_string(),
             turn: 0,
@@ -738,6 +743,7 @@ mod tests {
             "tool_call_received",
             "tool_pre",
             "gate_decision",
+            "budget_warn",
             "tool_post",
             "pre_compaction",
             "compaction",
@@ -750,7 +756,7 @@ mod tests {
             "turn_end",
             "run_end",
         ];
-        drain_and_assert_kinds(&mut receiver, &expected, 22);
+        drain_and_assert_kinds(&mut receiver, &expected, 23);
     }
 
     /// Drain a hub receiver and pin both the event-kind order and the

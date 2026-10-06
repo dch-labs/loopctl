@@ -8834,4 +8834,57 @@ mod budget_gate_tests {
             "the nested loop completes under its own gate: {outcome:?}"
         );
     }
+
+    #[tokio::test]
+    async fn a_hard_crossing_still_emits_the_other_dimensions_soft_warn() {
+        let client =
+            crate::testing::MockApiClient::new("budget-model").with_responses(budget_script(8));
+        let collector = std::sync::Arc::new(BudgetCollector {
+            warns: Mutex::new(Vec::new()),
+            decisions: Mutex::new(Vec::new()),
+        });
+        let mut agent = budget_loop(
+            client,
+            crate::budget::BudgetLimits {
+                tokens: Some(550),
+                turns: Some(10),
+                ..crate::budget::BudgetLimits::new()
+            },
+            std::sync::Arc::clone(&collector),
+        );
+        let error = agent
+            .run("start", &make_run_config())
+            .await
+            .expect_err("the tokens hard line ends the run");
+        match error {
+            crate::error::LoopError::BudgetExhausted {
+                dimension,
+                spent,
+                limit,
+            } => {
+                assert_eq!(dimension, crate::budget::BudgetDimension::Tokens);
+                assert_eq!(spent, 600);
+                assert_eq!(limit, 550);
+            }
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
+        let warns = collector.warns.lock().unwrap().clone();
+        assert_eq!(
+            warns.len(),
+            2,
+            "both dimensions' first soft crossings reach the observer — \
+             the hard crossing cannot swallow the other dimension's warn: \
+             {warns:?}"
+        );
+        assert_eq!(
+            (warns[0].dimension, warns[0].spent, warns[0].limit),
+            (crate::budget::BudgetDimension::Tokens, 450, 550),
+            "the tokens warn latched at the 450-spend check, first"
+        );
+        assert_eq!(
+            (warns[1].dimension, warns[1].spent, warns[1].limit),
+            (crate::budget::BudgetDimension::Turns, 8, 10),
+            "the turns warn latches in the same check that refuses on tokens"
+        );
+    }
 }

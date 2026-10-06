@@ -228,12 +228,12 @@ pub enum LoopError {
 
         /// The token budget that was exceeded.
         ///
-        /// One of two values, depending on where the error originates:
-        /// the model's context window (from
+        /// The model's context window (from
         /// [`SessionConfig::context_window`](crate::config::SessionConfig::context_window))
-        /// when a compaction result still does not fit, or the measured
-        /// pre-compaction size when the no-progress guard ends a run
-        /// because compaction could not reduce the conversation. Pair
+        /// — the unfit-pass arm always carries the configured window. A
+        /// compaction that cannot shrink the conversation fails as
+        /// [`CompactionStalled`](LoopError::CompactionStalled) with
+        /// the measured figure instead, never as this variant. Pair
         /// with `used` to report utilization to the caller.
         limit: u64,
     },
@@ -821,6 +821,28 @@ mod tests {
     fn is_recoverable_true_for_api() {
         let err = LoopError::Api("rate limited".into());
         assert!(err.is_recoverable());
+    }
+
+    #[test]
+    fn is_recoverable_true_for_compaction_failed() {
+        let err = LoopError::CompactionFailed {
+            used: 120,
+            limit: 100,
+            cause: "summarizer unavailable".to_string(),
+        };
+        assert!(
+            err.is_recoverable(),
+            "the failing pass may be transient — a retry re-attempts it"
+        );
+    }
+
+    #[test]
+    fn is_recoverable_false_for_compaction_stalled() {
+        let err = LoopError::CompactionStalled { used: 120 };
+        assert!(
+            !err.is_recoverable(),
+            "the measured no-progress is evidence a retry changes nothing"
+        );
     }
 
     #[test]

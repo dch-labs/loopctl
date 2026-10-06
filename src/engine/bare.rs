@@ -227,7 +227,7 @@ pub struct BareLoop<C: ApiClient> {
     /// [`ToolHealthRegistry`]: crate::tool::health::ToolHealthRegistry
     managers: LoopManagers,
 
-    /// The budget gate consulted before each model request.
+    /// The budget gate consulted before each turn's model request.
     ///
     /// `None` on a loop built without one — no budgets, no warns, no
     /// refusals, the additive default. When present the run begins
@@ -574,7 +574,7 @@ impl<C: ApiClient> BareLoop<C> {
         loop_
     }
 
-    /// Install the budget gate consulted before each model request.
+    /// Install the budget gate consulted before each turn's model request.
     ///
     /// The gate is owned by this loop — budget accounting is local by
     /// construction, so one loop's spending can never reach another's

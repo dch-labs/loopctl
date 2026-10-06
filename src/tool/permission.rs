@@ -513,7 +513,7 @@ impl GateDecision {
     pub fn args_digest(input: &Value) -> String {
         format!(
             "{:016x}",
-            crate::compact::demote::fnv1a64(canonical_json(input).as_bytes())
+            crate::compact::demote::fnv1a64(super::canonical_json(input).as_bytes())
         )
     }
 
@@ -555,44 +555,5 @@ impl GateDecision {
     pub fn with_ts(mut self, ts: u64) -> Self {
         self.ts = ts;
         self
-    }
-}
-
-/// Render `value` as canonical JSON: every object's keys sorted.
-///
-/// The digest's cross-host contract — two hosts and a cassette agree
-/// on one digest for one call — cannot rest on `serde_json`'s default
-/// map backend: feature unification lets any downstream crate switch
-/// the `Map` to insertion-ordered (`preserve_order`), which would
-/// render the same arguments in the order they arrived and silently
-/// split digests across hosts. Rebuilding every object with its keys
-/// inserted in sorted order makes the rendering a function of the
-/// value alone under either backend; escaping and number formatting
-/// stay `serde_json`'s own, so digests computed before this
-/// canonicalization match digests computed after it.
-fn canonical_json(value: &Value) -> String {
-    sorted_keys(value).to_string()
-}
-
-/// Rebuild `value` with every object's keys in sorted order.
-///
-/// Recursion covers nested objects; array order is untouched,
-/// because it is semantic. Under the default `BTreeMap` backend the
-/// rebuild is byte-identical to the input — the map is already
-/// sorted — and only the insertion-ordered backend takes the sorted
-/// path.
-fn sorted_keys(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            let mut sorted = serde_json::Map::new();
-            for (key, entry) in entries {
-                sorted.insert(key.clone(), sorted_keys(entry));
-            }
-            Value::Object(sorted)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(sorted_keys).collect()),
-        other => other.clone(),
     }
 }

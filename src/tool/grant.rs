@@ -281,13 +281,19 @@ pub trait GrantStore: Send + Sync {
 /// Construct with a root directory and the project path the grants
 /// bind to: grants live in `<root>/projects/<identity>/grants.json`,
 /// where `<identity>` is the 16-hex digest of the project path's
-/// canonical form — one project's grants are invisible to every
-/// other project over the same root, and the layout the CLI
-/// documents as its reference (`~/.local/state/<app>/grants/`) is
-/// the same shape. The file is created owner-only (`0600`, unix;
-/// best-effort, like the ledger writers) and replaced atomically on
-/// every write; one store instance per process per project is the
-/// concurrency contract.
+/// stable spelling (see [`new`](Self::new) — the binding survives the
+/// project directory's creation in the common cases) — one project's
+/// grants are invisible to every other project over the same root,
+/// and the layout the CLI documents as its reference
+/// (`~/.local/state/<app>/grants/`) is the same shape. The ledger is
+/// created owner-only (`0600`, unix; best-effort, like the ledger
+/// writers) and replaced atomically on every write, staged under a
+/// per-process name beside the ledger so two processes over one
+/// project never collide on the staging file itself. Concurrency is
+/// single-writer: `save`, `revoke`, and `clear` are read-modify-
+/// writes under a one-process-per-project contract — concurrent
+/// processes over one project are unsupported, and the last replace
+/// silently wins, which can lose a grant or a revocation.
 ///
 /// Requires the `file_grants` feature.
 #[cfg(feature = "file_grants")]
@@ -304,14 +310,19 @@ pub struct FileGrantStore {
 impl FileGrantStore {
     /// Bind a store to one project under one root.
     ///
-    /// The project path is canonicalized when possible (so a relative
-    /// and an absolute spelling of one project bind identically) and
-    /// falls back to the path as given when it cannot be resolved
-    /// yet.
+    /// The project's identity-bearing spelling is resolved
+    /// best-effort, most-canonical first: the canonicalized project
+    /// when it resolves; else its canonicalized parent with the final
+    /// component joined back — the path the project will carry once
+    /// created; else the lexically absolute path (anchored at the
+    /// working directory, `..` not normalized); else the path as
+    /// given. A project bound before its directory exists therefore
+    /// selects the same ledger after creation in the common cases,
+    /// and once the directory exists the first rung always wins, so
+    /// the identity never moves.
     #[must_use]
     pub fn new(root: impl AsRef<std::path::Path>, project: impl AsRef<std::path::Path>) -> Self {
-        let stable = std::fs::canonicalize(project.as_ref())
-            .unwrap_or_else(|_| project.as_ref().to_path_buf());
+        let stable = stable_project_identity(project.as_ref());
         let identity = format!("{:016x}", fnv1a64(stable.to_string_lossy().as_bytes()));
         Self {
             path: root
@@ -320,6 +331,17 @@ impl FileGrantStore {
                 .join(identity)
                 .join("grants.json"),
         }
+    }
+
+    /// The per-process staging path for the atomic replace.
+    ///
+    /// `grants.json.<process id>.staged` beside the ledger: unique
+    /// across processes over one project, stable within this process,
+    /// so a crashed write leaves at most one orphan and the next
+    /// write truncates and reuses it rather than accumulating.
+    fn staged_path(&self) -> std::path::PathBuf {
+        self.path
+            .with_extension(format!("json.{}.staged", std::process::id()))
     }
 
     /// Read the ledger, treating a missing file as empty.
@@ -355,9 +377,10 @@ impl FileGrantStore {
 
     /// Replace the ledger, creating it owner-only and atomically.
     ///
-    /// The staged write lands beside the ledger at `0600` and renames
-    /// over the original, so a reader never sees a half-written file
-    /// and a crash leaves either the old or the new ledger whole.
+    /// The write stages under this process's name beside the ledger
+    /// and renames over the original, so a reader never sees a
+    /// half-written file and a crash leaves either the old or the new
+    /// ledger whole.
     ///
     /// # Errors
     ///
@@ -375,7 +398,7 @@ impl FileGrantStore {
                 parent.display()
             ))
         })?;
-        let staged = self.path.with_extension("json.staged");
+        let staged = self.staged_path();
         let contents = serde_json::to_string(grants).map_err(|error| {
             LoopError::Internal(format!("cannot serialize the grant ledger: {error}"))
         })?;
@@ -398,9 +421,11 @@ impl FileGrantStore {
 /// Write `contents` to `path` owner-only, truncating.
 ///
 /// The staged-write half of the atomic replace: the file appears at
-/// `0600` on unix (best-effort — a permissions failure falls back to
-/// a plain write rather than losing the ledger) and with platform
-/// defaults elsewhere.
+/// `0600` on unix — including a staged file left behind by an earlier
+/// crashed write, whose mode is reset on open — best-effort in both
+/// directions (a permissions failure falls back to a plain write
+/// rather than losing the ledger), and with platform defaults
+/// elsewhere.
 ///
 /// # Errors
 ///
@@ -431,6 +456,7 @@ fn write_owner_only(path: &std::path::Path, contents: &str) -> Result<(), LoopEr
                     path.display()
                 ))
             })?;
+        reset_owner_only(&file);
         file.write_all(contents.as_bytes())
     };
     #[cfg(not(unix))]
@@ -441,6 +467,51 @@ fn write_owner_only(path: &std::path::Path, contents: &str) -> Result<(), LoopEr
             path.display()
         ))
     })
+}
+
+/// Reset an opened staged file to owner-only, best-effort.
+///
+/// The open's `0600` mode applies only at creation; a staged file
+/// left behind by a crashed write keeps the mode it died with, and
+/// the rename would carry that mode onto the ledger. The reset closes
+/// that hole; a failure is logged and the write proceeds — the
+/// best-effort contract [`write_owner_only`] documents.
+#[cfg(all(feature = "file_grants", unix))]
+fn reset_owner_only(file: &std::fs::File) {
+    use std::os::unix::fs::PermissionsExt;
+    let permissions = std::fs::Permissions::from_mode(0o600);
+    if let Err(error) = file.set_permissions(permissions) {
+        tracing::debug!(
+            error = %error,
+            "could not reset the staged grant ledger to owner-only"
+        );
+    }
+}
+
+/// The identity-bearing spelling of a project path.
+///
+/// The ladder, most-canonical first: the canonicalized project when
+/// it resolves; else the canonicalized parent with the final
+/// component joined back — the spelling the project carries once
+/// created; else the lexically absolute path; else the path as given.
+/// Best-effort by design: the rung chosen for a not-yet-existing
+/// project matches its canonical form after creation in the common
+/// cases, and an existing project always takes the first rung, so a
+/// bound identity never moves.
+#[cfg(feature = "file_grants")]
+fn stable_project_identity(project: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(project) {
+        return canonical;
+    }
+    let joined = project
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .zip(project.file_name())
+        .map(|(parent, name)| parent.join(name));
+    if let Some(joined) = joined {
+        return joined;
+    }
+    std::path::absolute(project).unwrap_or_else(|_| project.to_path_buf())
 }
 
 #[cfg(feature = "file_grants")]
@@ -691,6 +762,107 @@ mod tests {
                 store.clear().expect("clear again"),
                 0,
                 "clearing an absent ledger is Ok(0), not an error"
+            );
+        }
+
+        #[test]
+        #[cfg(unix)]
+        fn grants_saved_through_a_symlinked_parent_survive_the_directorys_creation() {
+            let root = tempfile::tempdir().expect("temp grant root");
+            let real_parent = root.path().join("real");
+            std::fs::create_dir(&real_parent).expect("create the real parent");
+            let linked_parent = root.path().join("link");
+            std::os::unix::fs::symlink(&real_parent, &linked_parent).expect("symlink the parent");
+            let project = linked_parent.join("alpha");
+            let grant = Grant::new("shell", GrantVerdict::Allow, GrantScope::ThisTool)
+                .with_pinned_descriptor("feedfacefeedface");
+
+            FileGrantStore::new(root.path(), &project)
+                .save(&grant)
+                .expect("save before the project directory exists");
+            std::fs::create_dir(real_parent.join("alpha"))
+                .expect("create the project directory at its real location");
+
+            let reloaded = FileGrantStore::new(root.path(), &project)
+                .load()
+                .expect("load after the project directory exists");
+            assert_eq!(
+                reloaded,
+                vec![grant],
+                "one project is one identity whether bound before or after \
+                 its directory exists — the ledger must not move"
+            );
+        }
+
+        #[test]
+        #[cfg(unix)]
+        fn a_save_over_a_preexisting_wide_staged_file_lands_the_ledger_owner_only() {
+            use std::os::unix::fs::PermissionsExt;
+            let root = tempfile::tempdir().expect("temp grant root");
+            let store = FileGrantStore::new(root.path(), "/projects/alpha");
+            let staged = store.staged_path();
+            std::fs::create_dir_all(
+                store
+                    .path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )
+            .expect("create the project directory");
+            std::fs::write(&staged, b"stale staged debris").expect("seed the staged file");
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o644))
+                .expect("widen the staged file");
+
+            store
+                .save(&Grant::new(
+                    "shell",
+                    GrantVerdict::Allow,
+                    GrantScope::ThisTool,
+                ))
+                .expect("save over the preexisting staged file");
+
+            let mode = std::fs::metadata(&store.path)
+                .expect("the ledger exists after the save")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "a staged file left wide by an earlier write must not carry \
+                 its mode onto the ledger through the rename"
+            );
+        }
+
+        #[test]
+        fn a_save_ignores_staged_debris_beside_the_ledger() {
+            let root = tempfile::tempdir().expect("temp grant root");
+            let store = FileGrantStore::new(root.path(), "/projects/alpha");
+            let debris = root
+                .path()
+                .join("projects")
+                .join(format!("{:016x}", fnv1a64(b"/projects/alpha")))
+                .join("grants.json.staged");
+            std::fs::create_dir_all(
+                store
+                    .path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )
+            .expect("create the project directory");
+            std::fs::write(&debris, "not json at all").expect("seed foreign staged debris");
+
+            let grant = Grant::new("read", GrantVerdict::Allow, GrantScope::ThisTool);
+            store.save(&grant).expect("save beside the debris");
+
+            assert_eq!(
+                store.load().expect("reload"),
+                vec![grant],
+                "staging never depends on prior staged state — foreign \
+                 debris beside the ledger changes nothing"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&debris).expect("the debris survives"),
+                "not json at all",
+                "the debris is neither read nor reused"
             );
         }
     }

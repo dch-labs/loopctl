@@ -757,7 +757,7 @@ impl LoopMachine {
     /// [`Self::compaction_result`] applies: when nothing was shaved off, the
     /// machine transitions to [`MachineOutcome::Failed`] with
     /// [`LoopError::CompactionStalled`] — compaction cannot shrink this
-    /// conversation, and another model call would exceed the context window.
+    /// conversation below the size that triggered the pass.
     /// Has no effect once the machine is terminal.
     pub fn compaction_noop(&mut self, tokens_before: u64, tokens_after: u64) {
         if self.is_terminal() {

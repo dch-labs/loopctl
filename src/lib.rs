@@ -94,6 +94,7 @@ pub use loopctl_derive::Tool;
 
 pub mod api;
 pub mod ask;
+pub mod budget;
 pub mod cancel;
 pub mod capabilities;
 pub mod compact;

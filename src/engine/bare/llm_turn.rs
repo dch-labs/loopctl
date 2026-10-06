@@ -185,11 +185,67 @@ impl<C: ApiClient> BareLoop<C> {
         if self.cancelled.is_cancelled() {
             return Err(LoopError::Cancelled);
         }
+        self.check_budget_before_request(turn)?;
         match self.turn_mode {
             #[cfg(feature = "streaming")]
             super::TurnMode::Streaming => self.do_stream(turn, messages).await,
             super::TurnMode::NonStreaming => self.do_create_message(turn, messages).await,
         }
+    }
+
+    /// Consult the budget gate before the turn's model request is sent.
+    ///
+    /// The soft crossings of this check notify observers once per
+    /// dimension per run; a hard crossing refuses the request before
+    /// it leaves — the deny record rides the gate-decision trail and
+    /// the turn fails with [`LoopError::BudgetExhausted`]. No gate
+    /// configured is a no-op, the additive default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::BudgetExhausted`] when a hard line is
+    /// crossed, carrying the dimension and the numbers.
+    fn check_budget_before_request(&self, turn: usize) -> Result<(), LoopError> {
+        let Some(gate) = self.budget_gate.as_ref() else {
+            return Ok(());
+        };
+        let elapsed = self
+            .budget_run_started
+            .map(|started| self.managers.clock().elapsed_since(started))
+            .unwrap_or_default();
+        let (warns, crossing) = gate.pre_request(elapsed);
+        for warn in warns {
+            self.managers
+                .observers()
+                .on_budget_warn(&crate::observer::BudgetWarnContext {
+                    dimension: warn.dimension,
+                    spent: warn.spent,
+                    limit: warn.limit,
+                });
+        }
+        if let Some(crate::budget::HardCrossing {
+            dimension,
+            spent,
+            limit,
+        }) = crossing
+        {
+            let decision = crate::tool::permission::GateDecision::new(
+                "model_request",
+                crate::tool::permission::GateVerdict::Deny,
+                "budget.hard",
+                crate::tool::permission::GateRuleSource::Middleware,
+            )
+            .with_reason(format!(
+                "{dimension} budget exhausted: spent {spent} of {limit}"
+            ));
+            self.notify_gate_decision(turn, "", decision);
+            return Err(LoopError::BudgetExhausted {
+                dimension,
+                spent,
+                limit,
+            });
+        }
+        Ok(())
     }
 
     /// Request one assistant response via the non-streaming API.

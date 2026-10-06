@@ -1395,7 +1395,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// after the dispatch returns and before the result is recorded —
     /// the one emission site for every gate record a dispatch carries,
     /// whichever gate minted it.
-    fn notify_gate_decision(
+    pub(super) fn notify_gate_decision(
         &self,
         turn: usize,
         call_id: &str,
@@ -1500,6 +1500,10 @@ mod tests {
     use super::*;
 
     /// Reflector that marks every failure recoverable, used by the recovery tests.
+    ///
+    /// Every analysis answers "retry", so recovery-path pins can
+    /// exercise the engine's retry plumbing without depending on a
+    /// real reflector's heuristics.
     struct AlwaysRecoverable;
     impl crate::reflection::Reflector for AlwaysRecoverable {
         fn analyze(
@@ -1885,8 +1889,17 @@ mod tests {
     /// `MockTool` cannot report execution spans, hence this local fixture.
     struct SpanRecordingTool {
         /// One `(start, end)` pair per completed call.
+        ///
+        /// Pushed under the shared mutex as each call finishes, in
+        /// completion order; the overlap pin reads the pairs after the
+        /// dispatch settles.
         spans: Arc<Mutex<Vec<(Instant, Instant)>>>,
+
         /// Artificial per-call delay: the span's in-flight window.
+        ///
+        /// Every call sleeps exactly this long, so two overlapping
+        /// spans prove concurrent execution rather than fast
+        /// sequencing.
         delay: std::time::Duration,
     }
 

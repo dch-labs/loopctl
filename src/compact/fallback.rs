@@ -510,8 +510,7 @@ impl ContextCompactor for FallbackCompactor {
                 let duration = started.elapsed();
                 if outcome.success {
                     let measured_after = context.counter.count(&outcome.messages);
-                    let reduced =
-                        outcome.messages.len() != original.len() || measured_after < tokens_before;
+                    let reduced = measured_after < tokens_before;
                     if !reduced {
                         tracing::warn!(
                             target: "loopctl::compact",
@@ -647,6 +646,14 @@ mod tests {
         /// outcome that reduced nothing cannot carry the pass while a
         /// later stage might still reduce.
         Unchanged,
+
+        /// Succeed by compacting down to one verbose message.
+        ///
+        /// The length-only reduction shape: fewer messages, more
+        /// tokens — a summary wordier than the conversation it
+        /// replaced, the "reduction" a token-budget consumer cannot
+        /// use.
+        GrowToVerbose,
     }
 
     /// What one scripted stage observed per call.
@@ -731,6 +738,11 @@ mod tests {
                     CompactionOutcome::compacted(vec![last], context.tokens_before, 1)
                 }
                 Scripted::Unchanged => CompactionOutcome::no_change(messages),
+                Scripted::GrowToVerbose => CompactionOutcome::compacted(
+                    vec![Message::assistant("v".repeat(5_000))],
+                    context.tokens_before,
+                    19,
+                ),
             }))
         }
     }
@@ -1125,6 +1137,43 @@ mod tests {
         assert!(
             !report.stages[0].success,
             "the unchanged stage is recorded as not carrying the pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_length_reducing_token_growing_stage_does_not_win_the_chain() {
+        let first = ScriptedCompactor::new(vec![Scripted::GrowToVerbose]);
+        let second = ScriptedCompactor::new(vec![Scripted::ShrinkToLast]);
+        let chain = FallbackCompactor::builder()
+            .stage("first", Arc::clone(&first) as Arc<dyn ContextCompactor>)
+            .stage("second", Arc::clone(&second) as Arc<dyn ContextCompactor>)
+            .build();
+        let messages = conversation();
+        let outcome = chain
+            .compact(messages, 40_000, context_for(&conversation()))
+            .await;
+        assert_eq!(
+            second.call_count(),
+            1,
+            "a stage that answered with fewer messages but more tokens has \
+             not reduced the conversation — the chain's progress test is the \
+             token drop the machine's own no-progress guard measures, so the \
+             pass must fall through to the truncating stage"
+        );
+        assert_eq!(
+            outcome.messages.len(),
+            1,
+            "the reducing stage's output is the pass's output"
+        );
+        let report = chain.last_report().expect("a report is stored per run");
+        assert_eq!(
+            report.winning_stage,
+            Some(1),
+            "the winner is the stage that reduced the token count"
+        );
+        assert!(
+            !report.stages[0].success,
+            "the token-growing stage is recorded as declined"
         );
     }
 

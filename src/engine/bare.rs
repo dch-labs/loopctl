@@ -227,6 +227,22 @@ pub struct BareLoop<C: ApiClient> {
     /// [`ToolHealthRegistry`]: crate::tool::health::ToolHealthRegistry
     managers: LoopManagers,
 
+    /// The budget gate consulted before each turn's model request.
+    ///
+    /// `None` on a loop built without one — no budgets, no warns, no
+    /// refusals, the additive default. When present the run begins
+    /// it, the turn loop consults it before every model request, and
+    /// the response/turn-end paths feed it usage and completed-turn
+    /// counts.
+    budget_gate: Option<crate::budget::BudgetGate>,
+
+    /// The wall-clock origin the budget gate measures from.
+    ///
+    /// Captured from the clock seam at run start when a gate is
+    /// configured; the elapsed duration handed to each pre-request
+    /// check derives from it.
+    budget_run_started: Option<std::time::Instant>,
+
     /// Failure analyser for tool errors.
     ///
     /// When a tool call returns an error, the reflector analyses the
@@ -536,6 +552,8 @@ impl<C: ApiClient> BareLoop<C> {
             session_temp_dir,
             machine: LoopMachine::from_history(Vec::new()),
             managers,
+            budget_gate: None,
+            budget_run_started: None,
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
@@ -554,6 +572,24 @@ impl<C: ApiClient> BareLoop<C> {
         };
         Self::wire_default_profile(&mut loop_);
         loop_
+    }
+
+    /// Install the budget gate consulted before each turn's model request.
+    ///
+    /// The gate is owned by this loop — budget accounting is local by
+    /// construction, so one loop's spending can never reach another's
+    /// counters. It accumulates provider-reported tokens, completed
+    /// turns, and wall-clock (from the clock seam), warns through
+    /// [`on_budget_warn`](crate::observer::LoopObserver::on_budget_warn)
+    /// at each dimension's soft line once per run, and refuses the
+    /// next model request past a hard line with
+    /// [`LoopError::BudgetExhausted`] and a `budget.hard` deny
+    /// record on the gate-decision trail. Chains with the other
+    /// builders; omitting it disables every budget line.
+    #[must_use]
+    pub fn with_budget_gate(mut self, gate: crate::budget::BudgetGate) -> Self {
+        self.budget_gate = Some(gate);
+        self
     }
 
     /// Get the conversation as the driving state machine currently holds it.
@@ -939,6 +975,8 @@ impl<C: ApiClient> BareLoop<C> {
             session_temp_dir,
             machine,
             managers,
+            budget_gate: None,
+            budget_run_started: None,
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
@@ -1049,6 +1087,8 @@ impl<C: ApiClient> BareLoop<C> {
             session_temp_dir,
             machine,
             managers,
+            budget_gate: None,
+            budget_run_started: None,
             reflector: Arc::new(NoopReflector),
             recovery: Arc::new(ExponentialBackoffRecovery::new(3)),
             cancelled: Arc::new(CancelSignal::new()),
@@ -1986,6 +2026,10 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 .runs
                 .push(Self::new_run(input, run_config, &self.managers));
             self.notify_run_start();
+            if let Some(gate) = &self.budget_gate {
+                gate.begin();
+                self.budget_run_started = Some(self.managers.clock().monotonic());
+            }
             self.machine.accept_input(input);
             self.deferred_transient_tokens = 0;
             let cancelled = Arc::clone(&self.cancelled);
@@ -2078,10 +2122,10 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
     /// cannot fit the context window discards it (committing an
     /// unshrinkable over-window history would wedge every future run);
     /// every other interrupted run salvages the coherent prefix, so
-    /// cancellation and ordinary failure cost the in-flight turn, not
-    /// the entire conversation. The cannot-fit signal is recognized
-    /// from both places it originates — the compactor's
-    /// [`LoopError::ContextExceeded`], and a provider rejection whose
+    /// cancellation, ordinary failure, and a transient compactor error
+    /// cost the in-flight turn, not the entire conversation. The
+    /// cannot-fit signal is recognized from every place it originates —
+    /// the measured compaction outcomes, and a provider rejection whose
     /// error text classifies as context overflow (see the
     /// `conversation_cannot_fit` predicate).
     fn finalize<'a>(
@@ -2147,24 +2191,23 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
 
 /// Decide whether a failed run's conversation cannot fit the window.
 ///
-/// Two signals mean the same thing — the request as built will keep
-/// being refused — and both take the full-discard arm of
-/// [`finalize`](BareLoop::finalize): the compaction family's errors
-/// ([`LoopError::ContextExceeded`],
-/// [`LoopError::CompactionFailed`], [`LoopError::CompactionStalled`]),
-/// and a provider rejection whose
-/// error text reports an oversized prompt (see
-/// `message_reports_context_overflow` — a phrase set deliberately
-/// stricter than the error-code classification, so context-bearing
-/// transients keep the salvage guarantee). Salvaging on either would
-/// commit exactly the content the window cannot hold. Everything
-/// else — cancellation, ordinary provider failure, tool failure —
-/// salvages.
+/// The signals that the request as built will keep being refused take
+/// the full-discard arm of [`finalize`](BareLoop::finalize): the
+/// measured compaction outcomes ([`LoopError::ContextExceeded`] — a
+/// pass succeeded but its result still does not fit — and
+/// [`LoopError::CompactionStalled`] — a pass could not shrink the
+/// conversation at all), and a provider rejection whose error text
+/// reports an oversized prompt (see `message_reports_context_overflow`
+/// — a phrase set deliberately stricter than the error-code
+/// classification, so context-bearing transients keep the salvage
+/// guarantee). Salvaging on any of these would commit exactly the
+/// content the window cannot hold. Everything else — cancellation,
+/// ordinary provider failure, tool failure, and
+/// [`LoopError::CompactionFailed`], whose compactor error is a
+/// transient the retry the variant invites re-attempts — salvages.
 fn conversation_cannot_fit(error: &LoopError) -> bool {
     match error {
-        LoopError::ContextExceeded { .. }
-        | LoopError::CompactionFailed { .. }
-        | LoopError::CompactionStalled { .. } => true,
+        LoopError::ContextExceeded { .. } | LoopError::CompactionStalled { .. } => true,
         LoopError::Api(message) => message_reports_context_overflow(message),
         _ => false,
     }

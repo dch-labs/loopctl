@@ -210,6 +210,11 @@ impl<C: ApiClient> BareLoop<C> {
     /// arguments. `duration_ms` is derived from the [`Duration`] inside the
     /// struct when the observer context is built.
     pub(super) fn notify_turn_end(&self, data: &TurnEnd) {
+        if data.success
+            && let Some(gate) = &self.budget_gate
+        {
+            gate.observe_turn_end();
+        }
         self.managers.observers().on_turn_end(&TurnEndContext {
             turn: data.turn,
             success: data.success,
@@ -361,6 +366,9 @@ impl<C: ApiClient> BareLoop<C> {
         let served = self.routed_or_client_model()?;
         self.managers.fallback().record_success()?;
         let (in_tok, out_tok) = Self::usage_tokens(usage);
+        if let Some(gate) = &self.budget_gate {
+            gate.observe_usage(in_tok, out_tok);
+        }
         self.managers.observers().on_stream_success(&StreamContext {
             turn,
             model: served,

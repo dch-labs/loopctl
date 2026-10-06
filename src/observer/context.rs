@@ -378,8 +378,11 @@ pub struct AttemptResetContext {
 /// dispatch returns, a parked ask's denial at the park, an approved
 /// ask's at the dispatch return or at the exit that stopped its call —
 /// so every gated dispatch produces exactly one, while dispatches no
-/// gate consulted produce none. The `call_id` pairs the record with
-/// the surrounding
+/// gate consulted produce none. Engine-level gates also emit records
+/// with no dispatch at all: a budget refusal refuses the next turn's
+/// model request before any tool is called, so its record stands
+/// alone — no surrounding tool events, an empty `call_id`. The
+/// `call_id` pairs a dispatch decision with the surrounding
 /// [`on_tool_pre`](crate::observer::LoopObserver::on_tool_pre) /
 /// [`on_tool_post`](crate::observer::LoopObserver::on_tool_post)
 /// events; the decision itself carries the tool, the argument digest,
@@ -389,13 +392,16 @@ pub struct GateDecisionContext {
     /// Turn number, 0-indexed.
     ///
     /// The turn whose dispatch the gate decided about, matching the
-    /// value on the surrounding tool events.
+    /// value on the surrounding tool events; for engine-level
+    /// decisions, the turn whose request was refused.
     pub turn: usize,
 
     /// The model-assigned call id the decision is about.
     ///
     /// Pairs this record with the dispatch's `tool.call` /
-    /// `tool.result` ledger lines and its pre/post observer events.
+    /// `tool.result` ledger lines and its pre/post observer events;
+    /// empty for engine-level decisions that are not about a tool
+    /// call, such as a budget refusal.
     pub call_id: String,
 
     /// The decision itself.
@@ -403,6 +409,46 @@ pub struct GateDecisionContext {
     /// Verdict, argument digest, rule id and source, matched
     /// pattern, reason, and the engine-stamped timestamp.
     pub decision: crate::tool::permission::GateDecision,
+}
+
+/// Context for [`LoopObserver::on_budget_warn`](crate::observer::LoopObserver::on_budget_warn).
+///
+/// The budget gate's soft-line crossing report: which budget line
+/// crossed, the spend at the crossing, and the hard limit the soft
+/// line derives from — the numbers a "N of M" warning needs.
+///
+/// # Examples
+///
+/// ```
+/// use loopctl::observer::BudgetWarnContext;
+///
+/// let ctx = BudgetWarnContext {
+///     dimension: loopctl::budget::BudgetDimension::Tokens,
+///     spent: 8_100,
+///     limit: 10_000,
+/// };
+/// assert_eq!(ctx.spent, 8_100);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetWarnContext {
+    /// The budget line whose soft threshold was crossed.
+    ///
+    /// Tokens, turns, or wall-clock — the same vocabulary the
+    /// exhausted error and the gate records use.
+    pub dimension: crate::budget::BudgetDimension,
+
+    /// The spend at the crossing.
+    ///
+    /// Tokens or turns counted, or elapsed milliseconds for the
+    /// wall-clock line.
+    pub spent: u64,
+
+    /// The hard limit the soft line derives from.
+    ///
+    /// The operator's configured ceiling, not the derived soft
+    /// line, so consumers report spend against the number that was
+    /// set.
+    pub limit: u64,
 }
 
 /// Context for [`LoopObserver::on_tool_call_received`](crate::observer::LoopObserver::on_tool_call_received).

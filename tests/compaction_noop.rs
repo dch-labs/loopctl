@@ -729,6 +729,42 @@ mod scenarios {
     }
 
     #[tokio::test]
+    async fn a_transient_compactor_failure_salvages_the_prompt_for_the_retry() {
+        // The failure is recoverable — the error's own doc invites a
+        // retry that re-attempts the pass — so the failed run's prompt
+        // must survive in history exactly as an ordinary transient's
+        // does: a compactor blip never measured the conversation
+        // against the window, and discarding it would erase the very
+        // conversation the retry is invited to continue.
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model").with_responses(vec![final_response()]),
+        );
+
+        let config = SessionConfig::default()
+            .with_context_window(300)
+            .with_compact_threshold(80)
+            .with_system_prompt("s".repeat(200));
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+        agent.set_context_manager(Arc::new(ContextManager::new(Arc::new(FailingCompactor))));
+
+        let prompt = "x".repeat(1_000);
+        let result = agent.run(&prompt, &RunConfig::default()).await;
+
+        assert!(
+            matches!(result, Err(LoopError::CompactionFailed { .. })),
+            "the failing compactor ends the run: {result:?}"
+        );
+        assert!(
+            agent
+                .conversation()
+                .iter()
+                .any(|message| message.text_content() == prompt),
+            "a recoverable compaction failure salvages — the prompt survives \
+             for the retry the error invites"
+        );
+    }
+
+    #[tokio::test]
     async fn a_failing_compactor_keeps_the_compaction_observer_silent() {
         // A failed pass never fires on_compaction — the event means a
         // compaction happened, and no savings can be reported for one
@@ -1070,12 +1106,11 @@ mod scenarios {
         armed.store(true, Ordering::SeqCst);
         let second = agent.run("overload now", &RunConfig::default()).await;
         assert!(
-            matches!(
-                second,
-                Err(LoopError::CompactionStalled { .. }) | Err(LoopError::ContextExceeded { .. })
-            ),
+            matches!(second, Err(LoopError::CompactionStalled { .. })),
             "run 2 defers on the transient overload and dies at the vetoed \
-             compaction with the budget unconsumed: {second:?}"
+             compaction — the no-progress guard on the veto's equal \
+             measurements, never the unfit arm of a pass that never ran: \
+             {second:?}"
         );
 
         armed.store(false, Ordering::SeqCst);

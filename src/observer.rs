@@ -18,6 +18,7 @@
 //! - [`ToolCallReceivedContext`] — tool call accumulated, before dispatch
 //! - [`ToolPreContext`] / [`ToolPostContext`] — tool dispatch lifecycle
 //! - [`GateDecisionContext`] — permission-gate decision for a dispatch
+//! - [`BudgetWarnContext`] — budget gate soft-line crossing, once per dimension per run
 //! - [`PreCompactionContext`] — compaction pass starting
 //! - [`CompactedContext`] — context window compaction
 //! - [`CompactionFailedContext`] — compaction pass failed
@@ -49,11 +50,12 @@ pub mod context;
 pub mod hub;
 
 pub use context::{
-    AttemptResetContext, CompactedContext, CompactionFailedContext, ConvergenceDetectedContext,
-    FallbackContext, GateDecisionContext, LoopDetectedContext, ModelSwitchedContext,
-    PreCompactionContext, ResponseContext, RunEndContext, RunStartContext, StreamContext,
-    StreamFailureContext, TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext,
-    ToolPostContext, ToolPreContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
+    AttemptResetContext, BudgetWarnContext, CompactedContext, CompactionFailedContext,
+    ConvergenceDetectedContext, FallbackContext, GateDecisionContext, LoopDetectedContext,
+    ModelSwitchedContext, PreCompactionContext, ResponseContext, RunEndContext, RunStartContext,
+    StreamContext, StreamFailureContext, TextDeltaContext, ThinkingDeltaContext,
+    ToolCallReceivedContext, ToolPostContext, ToolPreContext, TransportFallbackContext,
+    TurnEndContext, TurnStartContext,
 };
 pub use hub::{EventHub, LoopEvent, ObservedEvent};
 
@@ -241,6 +243,17 @@ pub trait LoopObserver: Send + Sync {
     /// enforced.
     fn on_gate_decision(&self, _ctx: &GateDecisionContext) {}
 
+    /// Called when the budget gate's soft line is crossed.
+    ///
+    /// Fires once per dimension per run, at the first pre-request
+    /// check that observes the spend at or past the derived soft
+    /// line — before the hard line refuses anything. Notification-
+    /// only: the warn has already been latched, and the run
+    /// continues; the hard line's refusal is a
+    /// [`BudgetExhausted`](crate::error::LoopError::BudgetExhausted)
+    /// error and a gate-decision record, not this event.
+    fn on_budget_warn(&self, _ctx: &BudgetWarnContext) {}
+
     /// Called when the engine has accumulated a tool call and is about to dispatch it.
     ///
     /// Fires once per call, after the streaming response is accumulated and
@@ -333,10 +346,14 @@ pub trait LoopObserver: Send + Sync {
     /// matching [`on_pre_compaction`](Self::on_pre_compaction) already
     /// fired at pass start, and the success
     /// [`on_compaction`](Self::on_compaction) never follows, so this
-    /// event is the only programmatic signal that a pass was attempted
-    /// and died — hosts that row retry episodes can row this one the
-    /// same way. Notification-only: the run has already failed with
-    /// the cause-carrying error by the time observers see this.
+    /// event is the only programmatic signal of the two pass-death
+    /// modes it covers — hosts that row retry episodes can row this one
+    /// the same way. A stalled pass (the machine's no-progress guard,
+    /// [`CompactionStalled`](crate::error::LoopError::CompactionStalled))
+    /// fires no compaction-family event: the stall is decided after the
+    /// feed, and the typed run error is its surface. Notification-only:
+    /// the run has already failed with the cause-carrying error by the
+    /// time observers see this.
     ///
     /// # Example
     ///
@@ -598,6 +615,15 @@ impl ObserverHost {
     /// registration order.
     pub fn on_gate_decision(&self, ctx: &GateDecisionContext) {
         self.dispatch(|obs| obs.on_gate_decision(ctx));
+    }
+
+    /// Dispatch [`LoopObserver::on_budget_warn`] to all observers.
+    ///
+    /// Fired once per dimension per run at the first pre-request
+    /// check past the budget gate's soft line. Iterates registered
+    /// observers in registration order.
+    pub fn on_budget_warn(&self, ctx: &BudgetWarnContext) {
+        self.dispatch(|obs| obs.on_budget_warn(ctx));
     }
 
     /// Dispatch [`LoopObserver::on_tool_pre`] to all observers.

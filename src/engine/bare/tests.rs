@@ -8558,7 +8558,7 @@ mod budget_gate_tests {
         registry.register(EchoTool);
         let mut agent = BareLoop::new(std::sync::Arc::new(client), registry, make_config());
         agent.register_observer(collector);
-        agent.with_budget_gate(std::sync::Arc::new(crate::budget::BudgetGate::new(limits)))
+        agent.with_budget_gate(crate::budget::BudgetGate::new(limits))
     }
 
     /// The task-named pin: the soft line emits `budget.warn` exactly once
@@ -8677,6 +8677,161 @@ mod budget_gate_tests {
                 .is_some_and(|reason| reason.contains("150 of 100")),
             "the record's reason carries the numbers: {:?}",
             deny.reason
+        );
+    }
+
+    /// The nested-loop tool for the independence pin below.
+    ///
+    /// Parks a second `BareLoop` behind a tokio mutex and runs it to
+    /// completion when called, writing how it ended to the shared
+    /// outcome slot so the pin can assert it from outside the tool.
+    struct RunNestedLoopTool {
+        /// The second loop, parked until A's first dispatch calls it.
+        ///
+        /// The tokio mutex lets the guard live across the nested
+        /// `run` await; the slot is visited exactly once.
+        inner: tokio::sync::Mutex<Option<BareLoop<crate::testing::MockApiClient>>>,
+
+        /// How the nested run ended, written by the tool.
+        ///
+        /// `"ok"` on completion, `"err: …"` otherwise; the pin reads
+        /// it through the shared handle.
+        outcome: std::sync::Arc<Mutex<Option<String>>>,
+    }
+
+    impl Tool for RunNestedLoopTool {
+        fn name(&self) -> &'static str {
+            "run_nested_loop"
+        }
+
+        fn description(&self) -> &'static str {
+            "Runs the nested loop to completion"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "run_nested_loop".into(),
+                description: "Runs the nested loop to completion".into(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            }
+        }
+
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async move {
+                let mut slot = self.inner.lock().await;
+                let Some(nested) = slot.as_mut() else {
+                    return Ok(ToolOutput::text("no nested loop parked"));
+                };
+                let summary = match nested.run("nested", &make_run_config()).await {
+                    Ok(run) => format!("ok: {}", run.output.as_deref().unwrap_or("no output")),
+                    Err(error) => format!("err: {error}"),
+                };
+                if let Ok(mut outcome) = self.outcome.lock() {
+                    *outcome = Some(summary);
+                }
+                Ok(ToolOutput::text("nested loop finished"))
+            })
+        }
+    }
+
+    /// Budget accounting is local to each loop. Loop A exhausts its own
+    /// 100-token gate while loop B — run nested inside A's first tool
+    /// dispatch, the tightest interleave two loops can have — completes
+    /// under its own 400-token gate. The served-call count is the
+    /// discriminator: under any regression to shared gate state, B's
+    /// run-begin would wipe A's mid-run accumulation and A's second
+    /// request would be refused early (one provider call, not two).
+    #[tokio::test]
+    async fn two_loops_keep_independent_budget_accounting() {
+        let b_client = crate::testing::MockApiClient::new("budget-model-b").with_responses(vec![
+            crate::testing::MockResponse {
+                text: "b-done".to_string(),
+                tool_call: None,
+                stop_reason: "end_turn".to_string(),
+            },
+        ]);
+        let b_loop = budget_loop(
+            b_client,
+            crate::budget::BudgetLimits {
+                tokens: Some(400),
+                ..crate::budget::BudgetLimits::new()
+            },
+            std::sync::Arc::new(BudgetCollector {
+                warns: Mutex::new(Vec::new()),
+                decisions: Mutex::new(Vec::new()),
+            }),
+        );
+        let nested_outcome: std::sync::Arc<Mutex<Option<String>>> =
+            std::sync::Arc::new(Mutex::new(None));
+        let mut registry = ToolRegistry::new();
+        registry.register(RunNestedLoopTool {
+            inner: tokio::sync::Mutex::new(Some(b_loop)),
+            outcome: std::sync::Arc::clone(&nested_outcome),
+        });
+
+        let a_client = crate::testing::MockApiClient::new("budget-model-a").with_responses(vec![
+            crate::testing::MockResponse {
+                text: "a-1".to_string(),
+                tool_call: Some(crate::testing::MockToolCall {
+                    id: "a1".to_string(),
+                    name: "run_nested_loop".to_string(),
+                    input: json!({}),
+                }),
+                stop_reason: "tool_use".to_string(),
+            },
+            crate::testing::MockResponse {
+                text: "a-2".to_string(),
+                tool_call: Some(crate::testing::MockToolCall {
+                    id: "a2".to_string(),
+                    name: "echo".to_string(),
+                    input: json!({ "message": "x" }),
+                }),
+                stop_reason: "tool_use".to_string(),
+            },
+        ]);
+        let mut agent = BareLoop::new(
+            std::sync::Arc::new(a_client.clone()),
+            registry,
+            make_config(),
+        );
+        agent.register_observer(std::sync::Arc::new(BudgetCollector {
+            warns: Mutex::new(Vec::new()),
+            decisions: Mutex::new(Vec::new()),
+        }));
+        let mut agent = agent.with_budget_gate(crate::budget::BudgetGate::new(
+            crate::budget::BudgetLimits {
+                tokens: Some(100),
+                ..crate::budget::BudgetLimits::new()
+            },
+        ));
+
+        let error = agent
+            .run("start", &make_run_config())
+            .await
+            .expect_err("A's own 150-of-100 spend ends it");
+        match error {
+            crate::error::LoopError::BudgetExhausted { spent, limit, .. } => {
+                assert_eq!(spent, 150);
+                assert_eq!(limit, 100);
+            }
+            other => panic!("expected BudgetExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            a_client.with_options_calls(),
+            2,
+            "A serves both its requests — the nested loop's separate gate \
+             never wiped A's mid-run accumulation"
+        );
+        let outcome = nested_outcome.lock().unwrap().clone();
+        assert!(
+            outcome
+                .as_deref()
+                .is_some_and(|text| text.starts_with("ok")),
+            "the nested loop completes under its own gate: {outcome:?}"
         );
     }
 }

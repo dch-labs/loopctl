@@ -275,8 +275,8 @@ pub struct BudgetGate {
 
     /// The mutable spend state, latched per run.
     ///
-    /// Interior-mutex so the engine can share one gate by `Arc`
-    /// across the request, response, and turn-end paths.
+    /// Interior-mutex so the loop's request, response, and turn-end
+    /// paths can update and check the same gate.
     state: Mutex<GateState>,
 }
 

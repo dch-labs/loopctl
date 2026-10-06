@@ -206,7 +206,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// Returns [`LoopError::BudgetExhausted`] when a hard line is
     /// crossed, carrying the dimension and the numbers.
     fn check_budget_before_request(&self, turn: usize) -> Result<(), LoopError> {
-        let Some(gate) = self.budget_gate.clone() else {
+        let Some(gate) = self.budget_gate.as_ref() else {
             return Ok(());
         };
         let elapsed = self

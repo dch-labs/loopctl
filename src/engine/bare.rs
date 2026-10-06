@@ -234,7 +234,7 @@ pub struct BareLoop<C: ApiClient> {
     /// it, the turn loop consults it before every model request, and
     /// the response/turn-end paths feed it usage and completed-turn
     /// counts.
-    budget_gate: Option<std::sync::Arc<crate::budget::BudgetGate>>,
+    budget_gate: Option<crate::budget::BudgetGate>,
 
     /// The wall-clock origin the budget gate measures from.
     ///
@@ -576,7 +576,9 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Install the budget gate consulted before each model request.
     ///
-    /// The gate accumulates provider-reported tokens, completed
+    /// The gate is owned by this loop — budget accounting is local by
+    /// construction, so one loop's spending can never reach another's
+    /// counters. It accumulates provider-reported tokens, completed
     /// turns, and wall-clock (from the clock seam), warns through
     /// [`on_budget_warn`](crate::observer::LoopObserver::on_budget_warn)
     /// at each dimension's soft line once per run, and refuses the
@@ -585,7 +587,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// record on the gate-decision trail. Chains with the other
     /// builders; omitting it disables every budget line.
     #[must_use]
-    pub fn with_budget_gate(mut self, gate: std::sync::Arc<crate::budget::BudgetGate>) -> Self {
+    pub fn with_budget_gate(mut self, gate: crate::budget::BudgetGate) -> Self {
         self.budget_gate = Some(gate);
         self
     }

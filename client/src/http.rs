@@ -113,6 +113,41 @@ enum Framing {
     ToClose,
 }
 
+/// The chunked-coding decoder's position between chunks.
+///
+/// Transitions commit only after each step's bytes are fully
+/// consumed — a pended, dropped, and recreated read resumes exactly
+/// where the last completed step left off, never re-consuming or
+/// skipping chunk syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkPhase {
+    /// A size line is the next syntax on the wire.
+    ///
+    /// The body's opening state: the first size line has no
+    /// preceding separator.
+    NeedSize,
+
+    /// The previous chunk's CRLF separator is the next syntax.
+    ///
+    /// Read and checked before the following size line.
+    NeedSeparator,
+
+    /// Inside a chunk with this many body bytes remaining.
+    ///
+    /// Delivering decrements; reaching zero schedules the separator.
+    InChunk(usize),
+
+    /// The zero-size terminator arrived; trailer lines remain.
+    ///
+    /// Consumed line by line until the blank one.
+    Trailer,
+
+    /// The chunked body is complete.
+    ///
+    /// Terminal: every later decoded read reports the body's end.
+    Done,
+}
+
 /// The incremental reader over one open response.
 ///
 /// Owns the socket so long-running consumers (the SSE stream) pull
@@ -154,22 +189,13 @@ pub(super) struct ByteStream {
     /// body's exact end.
     length_remaining: usize,
 
-    /// Bytes remaining in the current chunk, under chunked coding.
+    /// The chunked-coding decoder's position, under that framing.
     ///
-    /// Meaningful only under that framing; the separator and next
-    /// size line are consumed when it hits zero.
-    chunk_remaining: usize,
-
-    /// Whether the chunked body's zero-size terminator arrived.
-    ///
-    /// Terminal: every later decoded read reports the body's end.
-    chunks_done: bool,
-
-    /// Whether the next chunk-open expects no leading separator.
-    ///
-    /// True only before the first size line; every later chunk is
-    /// preceded by the previous chunk's CRLF.
-    first_chunk: bool,
+    /// Meaningful only under chunked coding. Every transition is
+    /// committed only after the step's bytes are fully consumed, so
+    /// a read that pends and is dropped mid-step resumes at the same
+    /// state — the cancel-safety the event stream's polling demands.
+    phase: ChunkPhase,
 
     /// The undelivered tail of a previous decoded pull.
     ///
@@ -189,9 +215,7 @@ impl ByteStream {
             pos: 0,
             framing: None,
             length_remaining: 0,
-            chunk_remaining: 0,
-            chunks_done: false,
-            first_chunk: true,
+            phase: ChunkPhase::NeedSize,
             line_pending: Vec::new(),
         }
     }
@@ -363,65 +387,80 @@ impl ByteStream {
                 Ok(self.take_buffered(take).unwrap_or_default())
             }
             Some(Framing::Chunked) => {
-                if self.chunks_done {
+                while !matches!(self.phase, ChunkPhase::InChunk(_) | ChunkPhase::Done) {
+                    self.advance_chunk().await?;
+                }
+                if self.phase == ChunkPhase::Done {
                     return Ok(Vec::new());
                 }
-                if self.chunk_remaining == 0 {
-                    self.open_next_chunk().await?;
-                    if self.chunks_done {
-                        return Ok(Vec::new());
-                    }
-                }
+                let ChunkPhase::InChunk(remaining) = self.phase else {
+                    return Ok(Vec::new());
+                };
                 if self.buffered().is_empty() && self.fill_wire().await? == 0 {
                     return Err(ClientError::MalformedResponse(
                         "the stream ended inside a chunk".into(),
                     ));
                 }
-                let take = max.min(self.chunk_remaining).min(self.buffered().len());
+                let take = max.min(remaining).min(self.buffered().len());
                 let slice = self.take_buffered(take).unwrap_or_default();
-                self.chunk_remaining = self.chunk_remaining.saturating_sub(slice.len());
+                let served = slice.len();
+                if served >= remaining {
+                    self.phase = ChunkPhase::NeedSeparator;
+                } else {
+                    self.phase = ChunkPhase::InChunk(remaining.saturating_sub(served));
+                }
                 Ok(slice)
             }
         }
     }
 
-    /// Consume one chunk-size line, opening the next chunk or
-    /// completing the body through the zero-size terminator.
+    /// Advance the chunk decoder by one completed step.
+    ///
+    /// Exactly one wire step runs per call, and the phase commits
+    /// only after that step's bytes are fully consumed — a read that
+    /// pends and is dropped mid-step loses nothing, because no
+    /// transition preceded it.
     /// # Errors
     ///
-    /// Malformed chunk syntax (a non-hex size, a missing separator)
-    /// or a transport failure.
-    async fn open_next_chunk(&mut self) -> Result<(), ClientError> {
-        if self.first_chunk {
-            self.first_chunk = false;
-        } else {
-            let separator = self.take_raw(2).await?;
-            if separator.as_slice() != b"\r\n" {
-                return Err(ClientError::MalformedResponse(
-                    "a chunk was not CRLF-terminated".into(),
-                ));
-            }
-        }
-        let size_line = self
-            .take_raw_line()
-            .await?
-            .ok_or_else(|| ClientError::MalformedResponse("chunked body ended early".into()))?;
-        let size_text = size_line.split(';').next().unwrap_or_default().trim();
-        let size = usize::from_str_radix(size_text, 16)
-            .map_err(|_| ClientError::MalformedResponse("a chunk size was not hex".into()))?;
-        if size == 0 {
-            loop {
-                match self.take_raw_line().await? {
-                    Some(line) if line.is_empty() => break,
-                    Some(_) => {}
-                    None => break,
+    /// Malformed chunk syntax (a non-hex size, a bad separator) or a
+    /// transport failure.
+    async fn advance_chunk(&mut self) -> Result<(), ClientError> {
+        match self.phase {
+            ChunkPhase::NeedSeparator => {
+                let separator = self.take_raw(2).await?;
+                if separator.as_slice() != b"\r\n" {
+                    return Err(ClientError::MalformedResponse(
+                        "a chunk was not CRLF-terminated".into(),
+                    ));
                 }
+                self.phase = ChunkPhase::NeedSize;
+                Ok(())
             }
-            self.chunks_done = true;
-            return Ok(());
+            ChunkPhase::NeedSize => {
+                let size_line = self.take_raw_line().await?.ok_or_else(|| {
+                    ClientError::MalformedResponse("chunked body ended early".into())
+                })?;
+                let size_text = size_line.split(';').next().unwrap_or_default().trim();
+                let size = usize::from_str_radix(size_text, 16).map_err(|_| {
+                    ClientError::MalformedResponse("a chunk size was not hex".into())
+                })?;
+                if size == 0 {
+                    self.phase = ChunkPhase::Trailer;
+                } else {
+                    self.phase = ChunkPhase::InChunk(size);
+                }
+                Ok(())
+            }
+            ChunkPhase::Trailer => {
+                match self.take_raw_line().await? {
+                    Some(line) if line.is_empty() => self.phase = ChunkPhase::Done,
+                    Some(_) => {}
+                    None => self.phase = ChunkPhase::Done,
+                }
+                Ok(())
+            }
+            ChunkPhase::InChunk(_) | ChunkPhase::Done => Ok(()),
         }
-        self.chunk_remaining = size;
-        Ok(())
     }
 
     /// One decoded `\n`-terminated body line, `\r` stripped.
@@ -595,8 +634,8 @@ fn parse_head(head: &str) -> Result<(u16, Framing), ClientError> {
         .nth(1)
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or_else(|| ClientError::MalformedResponse("no status code in the line".into()))?;
-    let mut framing = Framing::ToClose;
     let mut declared_length: Option<usize> = None;
+    let mut chunked = false;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -614,12 +653,16 @@ fn parse_head(head: &str) -> Result<(u16, Framing), ClientError> {
                 }
                 _ => declared_length = Some(wanted),
             }
-            framing = Framing::ContentLength(wanted);
         }
         if name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked") {
-            framing = Framing::Chunked;
+            chunked = true;
         }
     }
+    let framing = if chunked {
+        Framing::Chunked
+    } else {
+        declared_length.map_or(Framing::ToClose, Framing::ContentLength)
+    };
     Ok((status, framing))
 }
 
@@ -710,6 +753,23 @@ mod tests {
         assert!(
             parse_head(head).is_err(),
             "conflicting duplicate lengths are a smuggling vector and refuse"
+        );
+    }
+
+    #[test]
+    fn chunked_precedence_is_header_order_independent() {
+        let te_first = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n";
+        let parsed = parse_head(te_first);
+        assert!(
+            matches!(parsed, Ok((200, Framing::Chunked))),
+            "chunked wins regardless of header order — a length after it must \
+             not re-arm length decoding: {parsed:?}"
+        );
+        let cl_only = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n";
+        let parsed = parse_head(cl_only);
+        assert!(
+            matches!(parsed, Ok((200, Framing::ContentLength(2)))),
+            "a lone declared length still selects length framing: {parsed:?}"
         );
     }
 

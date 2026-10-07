@@ -227,6 +227,7 @@ pub trait LoopctlClient: Send + Sync {
 /// Fields are additive across versions — new columns appear here as
 /// the registry grows.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct LoopSummary {
     /// The loop's identifier, stable across runs.
     ///
@@ -243,8 +244,36 @@ pub struct LoopSummary {
     /// The model the loop is configured for, when declared.
     ///
     /// `None` when the loop runs on its manifest's default rather
-    /// than an explicit model choice.
+    /// than an explicit model choice. Optional fields deserialize as
+    /// `None` when an older daemon omits them (serde's own rule for
+    /// `Option`), so additive fields stay additive on the wire.
     pub model: Option<String>,
+}
+
+impl LoopSummary {
+    /// Build a loop summary from its two required facts.
+    ///
+    /// The construction path for code outside the crate — the type
+    /// is `#[non_exhaustive]`, so struct literals compile only
+    /// inside; fields that default (`model`) attach after.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use loopctl_client::LoopSummary;
+    ///
+    /// let summary = LoopSummary::new("watch-repos", "running");
+    /// assert_eq!(summary.id, "watch-repos");
+    /// assert_eq!(summary.model, None);
+    /// ```
+    #[must_use]
+    pub fn new(id: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            status: status.into(),
+            model: None,
+        }
+    }
 }
 
 /// The handle a run start returns.
@@ -253,6 +282,7 @@ pub struct LoopSummary {
 /// polls [`RunState`] with the id to observe
 /// progress.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct RunHandle {
     /// The started run's identifier.
     ///
@@ -260,11 +290,32 @@ pub struct RunHandle {
     pub run_id: Uuid,
 }
 
+impl RunHandle {
+    /// Build a run handle around one identifier.
+    ///
+    /// The construction path for code outside the crate — the type
+    /// is `#[non_exhaustive]`, so struct literals compile only
+    /// inside.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use loopctl_client::RunHandle;
+    ///
+    /// let handle = RunHandle::new(uuid::Uuid::new_v4());
+    /// ```
+    #[must_use]
+    pub fn new(run_id: Uuid) -> Self {
+        Self { run_id }
+    }
+}
+
 /// One run's observable state.
 ///
 /// The run record as the daemon holds it — the polling answer for
 /// detached runs and the resume surface after reconnects.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct RunState {
     /// The run's identifier.
     ///
@@ -285,8 +336,36 @@ pub struct RunState {
     ///
     /// `None` while the run is in flight; the daemon's terminal
     /// vocabulary (`completed`, `failed`, `cancelled`, …) once it
-    /// ends.
+    /// ends. Optional fields deserialize as `None` when an older
+    /// daemon omits them (serde's own rule for `Option`), so
+    /// additive fields stay additive on the wire.
     pub stop_reason: Option<String>,
+}
+
+impl RunState {
+    /// Build a run state from its three required facts.
+    ///
+    /// The construction path for code outside the crate — the type
+    /// is `#[non_exhaustive]`, so struct literals compile only
+    /// inside; fields that default (`stop_reason`) attach after.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use loopctl_client::RunState;
+    ///
+    /// let state = RunState::new(uuid::Uuid::new_v4(), "watch-repos", "running");
+    /// assert_eq!(state.stop_reason, None);
+    /// ```
+    #[must_use]
+    pub fn new(run_id: Uuid, loop_id: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            run_id,
+            loop_id: loop_id.into(),
+            status: status.into(),
+            stop_reason: None,
+        }
+    }
 }
 
 /// One approval waiting on a human.
@@ -294,6 +373,7 @@ pub struct RunState {
 /// The unattended-ask queue entry: a paused run's gated tool call,
 /// surfaced so a CLI or the TUI can answer it from anywhere.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct GatePending {
     /// The pending gate's identifier — the approve/deny target.
     ///
@@ -317,11 +397,42 @@ pub struct GatePending {
     pub prompt: String,
 }
 
+impl GatePending {
+    /// Build a pending gate from its four facts.
+    ///
+    /// The construction path for code outside the crate — the type
+    /// is `#[non_exhaustive]`, so struct literals compile only
+    /// inside.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use loopctl_client::GatePending;
+    ///
+    /// let pending = GatePending::new("g1", "watch-repos", "Bash", "run rm?");
+    /// ```
+    #[must_use]
+    pub fn new(
+        gate_id: impl Into<String>,
+        loop_id: impl Into<String>,
+        tool: impl Into<String>,
+        prompt: impl Into<String>,
+    ) -> Self {
+        Self {
+            gate_id: gate_id.into(),
+            loop_id: loop_id.into(),
+            tool: tool.into(),
+            prompt: prompt.into(),
+        }
+    }
+}
+
 /// One registered schedule, as the daemon summarizes it.
 ///
 /// The calendar surface only — the spec itself lives in the loop's
 /// manifest.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct ScheduleSummary {
     /// The schedule's name.
     ///
@@ -331,8 +442,35 @@ pub struct ScheduleSummary {
     /// Whether the schedule is suspended (no automatic triggers).
     ///
     /// A suspended schedule keeps its history but fires nothing
-    /// until resumed.
+    /// until resumed. A non-optional field that must still parse
+    /// from older daemons, it carries an explicit `serde` default
+    /// (`false`) — the one place lenience is declared rather than
+    /// implied by `Option`.
+    #[serde(default)]
     pub suspended: bool,
+}
+
+impl ScheduleSummary {
+    /// Build a schedule summary from its name and suspension state.
+    ///
+    /// The construction path for code outside the crate — the type
+    /// is `#[non_exhaustive]`, so struct literals compile only
+    /// inside.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use loopctl_client::ScheduleSummary;
+    ///
+    /// let schedule = ScheduleSummary::new("nightly", false);
+    /// ```
+    #[must_use]
+    pub fn new(name: impl Into<String>, suspended: bool) -> Self {
+        Self {
+            name: name.into(),
+            suspended,
+        }
+    }
 }
 
 /// Everything that can go wrong on the client side of the seam.

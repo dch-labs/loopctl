@@ -47,13 +47,7 @@ impl LoopctlClient for InProcessFake {
                 + '_,
         >,
     > {
-        Box::pin(async move {
-            Ok(vec![loopctl_client::LoopSummary {
-                id: "in-process".to_string(),
-                status: "idle".to_string(),
-                model: None,
-            }])
-        })
+        Box::pin(async move { Ok(vec![loopctl_client::LoopSummary::new("in-process", "idle")]) })
     }
     fn get_loop(
         &self,
@@ -66,13 +60,7 @@ impl LoopctlClient for InProcessFake {
         >,
     > {
         let id = loop_id.to_string();
-        Box::pin(async move {
-            Ok(loopctl_client::LoopSummary {
-                id,
-                status: "idle".to_string(),
-                model: None,
-            })
-        })
+        Box::pin(async move { Ok(loopctl_client::LoopSummary::new(id, "idle")) })
     }
     fn start_run(
         &self,
@@ -85,11 +73,7 @@ impl LoopctlClient for InProcessFake {
                 + '_,
         >,
     > {
-        Box::pin(async move {
-            Ok(loopctl_client::RunHandle {
-                run_id: uuid::Uuid::new_v4(),
-            })
-        })
+        Box::pin(async move { Ok(loopctl_client::RunHandle::new(uuid::Uuid::new_v4())) })
     }
     fn get_run(
         &self,
@@ -102,12 +86,11 @@ impl LoopctlClient for InProcessFake {
         >,
     > {
         Box::pin(async move {
-            Ok(loopctl_client::RunState {
+            Ok(loopctl_client::RunState::new(
                 run_id,
-                loop_id: "in-process".to_string(),
-                status: "completed".to_string(),
-                stop_reason: None,
-            })
+                "in-process",
+                "completed",
+            ))
         })
     }
     fn stop_run(
@@ -820,6 +803,133 @@ async fn an_in_process_subscription_delivers_through_the_shared_event_type() {
     assert!(
         stream.next().await.is_none(),
         "the adapted source ends when the host source ends"
+    );
+}
+
+/// Serve the handshake, then one chunked event-stream connection
+/// fed piece by piece.
+///
+/// Each chunk-syntax piece (size lines, data, separators, the
+/// terminator) is written as its own write with a sleep between, so
+/// the client is polled to `Pending` mid-syntax between pieces — the
+/// cancel-safety conditions the close-delimited mock can never
+/// produce.
+fn spawn_chunked_sse_mock(dir: &tempfile::TempDir, pieces: Vec<String>) -> PathBuf {
+    let socket = dir.path().join("chunked-events.sock");
+    let listener = UnixListener::bind(&socket).expect("the chunked socket binds");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let request = read_one_request(&mut stream).await;
+            if request.path == "/v1/hello" {
+                stream
+                    .write_all(&hello_response("loopctl", 1, 1))
+                    .await
+                    .expect("the handshake");
+                continue;
+            }
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                        Transfer-Encoding: chunked\r\n\r\n";
+            stream.write_all(head.as_bytes()).await.expect("the head");
+            for piece in pieces {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                stream.write_all(piece.as_bytes()).await.expect("a piece");
+            }
+            return;
+        }
+    });
+    socket
+}
+
+/// One SSE frame's bytes (`id:` + `data:` + the blank dispatch line).
+fn sse_frame(cursor: u64, payload: &serde_json::Value) -> String {
+    format!("id: {cursor}\r\ndata: {payload}\r\n\r\n")
+}
+
+/// The chunk-syntax pieces for one event, size line split in two.
+fn chunked_frame_pieces(frame: &str) -> Vec<String> {
+    let hex = format!("{:x}", frame.len());
+    vec![
+        hex.get(0..1).unwrap_or("0").to_string(),
+        hex.get(1..).unwrap_or("").to_string() + "\r\n",
+        frame.to_string(),
+        "\r\n".to_string(),
+    ]
+}
+
+#[tokio::test]
+async fn a_chunked_sse_feed_with_split_writes_delivers_events() {
+    let dir = client_test_dir();
+    let first = sse_frame(7, &run_started_event(1));
+    let second = sse_frame(8, &run_started_event(2));
+    let mut pieces = chunked_frame_pieces(&first);
+    pieces.extend(chunked_frame_pieces(&second));
+    pieces.push("0\r\n\r\n".to_string());
+    let socket = spawn_chunked_sse_mock(&dir, pieces);
+    let client = DaemonClient::connect(ConnectOptions::new(socket))
+        .await
+        .expect("the mock speaks the handshake");
+    let mut stream = client
+        .subscribe("watch-repos", None)
+        .await
+        .expect("the stream opens");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the first event arrives")
+        .expect("the stream is open")
+        .expect("the first chunked frame parses");
+    assert_eq!(
+        event.cursor, 7,
+        "a chunked event stream delivers with its cursor: {event:?}"
+    );
+    let next = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the second event arrives")
+        .expect("the stream is open")
+        .expect("the second chunked frame parses");
+    assert_eq!(next.cursor, 8);
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await;
+    assert!(
+        matches!(end, Ok(None)),
+        "the zero-size terminator ends the stream cleanly: {end:?}"
+    );
+}
+
+#[test]
+fn construction_still_works_through_the_constructors() {
+    let summary = loopctl_client::LoopSummary::new("watch-repos", "running");
+    assert_eq!(summary.id, "watch-repos");
+    assert_eq!(summary.model, None);
+    let handle = loopctl_client::RunHandle::new(uuid::Uuid::nil());
+    assert_eq!(handle.run_id, uuid::Uuid::nil());
+    let state = loopctl_client::RunState::new(uuid::Uuid::nil(), "watch-repos", "completed");
+    assert_eq!(state.status, "completed");
+    assert_eq!(state.stop_reason, None);
+    let pending = loopctl_client::GatePending::new("g1", "watch-repos", "Bash", "run rm?");
+    assert_eq!(pending.tool, "Bash");
+    let schedule = loopctl_client::ScheduleSummary::new("nightly", false);
+    assert!(!schedule.suspended);
+}
+
+#[test]
+fn optional_fields_deserialize_leniently_from_older_daemons() {
+    let loop_json = r#"{"id":"watch-repos","status":"idle"}"#;
+    let summary: loopctl_client::LoopSummary =
+        serde_json::from_str(loop_json).expect("a loop envelope omitting model still parses");
+    assert_eq!(
+        summary.model, None,
+        "the omitted optional field defaults rather than failing the envelope"
+    );
+    let run_json = r#"{"run_id":"2f0d6a6e-0d3a-4d8e-9f2b-2b1e93bd78f1","loop_id":"watch-repos","status":"running"}"#;
+    let state: loopctl_client::RunState =
+        serde_json::from_str(run_json).expect("a run envelope omitting stop_reason still parses");
+    assert_eq!(state.stop_reason, None);
+    let schedule_json = r#"{"name":"nightly"}"#;
+    let schedule: loopctl_client::ScheduleSummary = serde_json::from_str(schedule_json)
+        .expect("a schedule envelope omitting suspended still parses");
+    assert!(
+        !schedule.suspended,
+        "the omitted boolean defaults to false — not suspended"
     );
 }
 

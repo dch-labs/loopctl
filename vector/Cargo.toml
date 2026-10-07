@@ -1,0 +1,57 @@
+[package]
+name = "loopctl-vector"
+version = "0.3.2"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+description = "External vector-store backends (Qdrant, pgvector) for loopctl's semantic memory"
+repository = "https://github.com/dch-labs/loopctl"
+homepage = "https://loopctl.rs"
+keywords = ["agent", "loopctl", "vector", "qdrant", "pgvector"]
+categories = ["api-bindings", "database"]
+
+[workspace]
+
+[features]
+default = []
+qdrant = ["dep:qdrant-client"]
+pgvector = ["dep:pgvector", "dep:sqlx"]
+testing = []
+
+[dependencies]
+loopctl = { path = "..", version = "=0.3.2", default-features = false, features = ["vector_index"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+qdrant-client = { version = "1.19", optional = true, default-features = false, features = ["uuid"] }
+sqlx = { version = "0.9", optional = true, default-features = false, features = ["runtime-tokio", "postgres", "uuid"] }
+pgvector = { version = "0.4", optional = true, features = ["sqlx"] }
+
+[[test]]
+name = "qdrant"
+required-features = ["qdrant", "testing"]
+
+[[test]]
+name = "pgvector"
+required-features = ["pgvector", "testing"]
+
+[dev-dependencies]
+futures = "0.3"
+loopctl = { path = "..", version = "=0.3.2", default-features = false, features = ["vector_memory", "testing"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+arithmetic_side_effects = "deny"
+indexing_slicing = "deny"
+match_same_arms = "deny"
+redundant_clone = "deny"
+clone_on_ref_ptr = "deny"
+let_underscore_must_use = "deny"

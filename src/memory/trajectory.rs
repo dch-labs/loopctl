@@ -1351,6 +1351,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1617,6 +1618,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1746,6 +1748,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1801,6 +1804,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 5,
@@ -1816,6 +1820,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         // Turn 3's end arrives only after two later turns have closed.
         observer.on_turn_end(&TurnEndContext {
@@ -1828,6 +1833,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -1874,6 +1880,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         // A later turn remains in flight; the late end must not close it.
         observer.on_turn_start(&TurnStartContext {
@@ -1923,6 +1930,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_turn_end(&TurnEndContext {
             turn: 0,
@@ -1934,6 +1942,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_run_end(&RunEndContext {
             success: true,
@@ -2031,6 +2040,7 @@ mod tests {
                     stop_reason: crate::stream::StreamStopReason::EndTurn,
                     context_tokens: 10,
                     context_window: None,
+                    history: std::sync::Arc::new(Vec::new()),
                 });
             }
         }
@@ -2126,6 +2136,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 2,
@@ -2179,6 +2190,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 1,
@@ -2234,6 +2246,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 8,
@@ -2511,6 +2524,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 4,
@@ -2526,6 +2540,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_turn_start(&TurnStartContext {
             turn: 3,
@@ -2541,6 +2556,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_run_end(&RunEndContext {
             success: true,

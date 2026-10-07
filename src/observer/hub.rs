@@ -729,6 +729,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 12,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         hub.on_run_end(&RunEndContext::new(true, None, 1, 5));
 
@@ -798,6 +799,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 777,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         let observed = receiver
             .try_recv()

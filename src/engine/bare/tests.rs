@@ -2855,6 +2855,289 @@ async fn observer_sequence_compaction_turn() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_pass_survives_cancellation_of_the_same_turn() {
+    let seeded: Vec<Message> = (0..30)
+        .map(|idx| Message::user(format!("{idx:02} ") + &"s".repeat(400)))
+        .collect();
+    let machine = LoopMachine::from_history(seeded);
+    let client = BlockingClient {
+        started: Arc::new(AtomicBool::new(false)),
+    };
+    let started = Arc::clone(&client.started);
+    let compactions = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::from_machine(
+        machine,
+        make_config()
+            .with_context_window(1_000)
+            .with_compact_threshold(80),
+        Arc::new(client),
+        ToolRegistry::new(),
+    );
+    agent.set_turn_mode(TurnMode::NonStreaming);
+    agent.register_observer(Arc::new(CompactionRecorder {
+        events: Arc::clone(&compactions),
+    }));
+    agent.set_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+        ShrinkingPassCompactor,
+    ))));
+
+    let cancel_signal = Arc::clone(&agent.cancel_signal());
+    let run_handle = tokio::spawn(async move {
+        let result = agent.run("resume", &RunConfig::default()).await;
+        (agent, result)
+    });
+
+    // The pass must have landed and the follow-up request must be in
+    // flight before the cancel: entering `create_message` proves the
+    // machine already adopted the compacted set (the deferred `CallLLM`
+    // only reaches the client after `compaction_result` returned).
+    let mut waits = 0u32;
+    while !started.load(Ordering::SeqCst) || compactions.lock().expect("events lock").is_empty() {
+        waits += 1;
+        assert!(
+            waits <= 1000,
+            "the compacted follow-up request was never entered — test setup is broken"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    cancel_signal.cancel();
+    let (agent, run_result) = run_handle.await.unwrap();
+
+    assert!(
+        matches!(run_result, Err(LoopError::Cancelled)),
+        "run must return Err(Cancelled): {run_result:?}"
+    );
+    let history = agent.machine().history();
+    assert_eq!(
+        history.len(),
+        1,
+        "a completed compaction pass is durable in the machine across \
+         same-turn cancellation — the compacted set replaces the seeded \
+         history the moment the pass lands, not at turn or run completion: \
+         got {} messages",
+        history.len()
+    );
+    assert_eq!(
+        history.first().map(Message::text_content),
+        Some("r".repeat(40)),
+        "the surviving message is the compactor's shrunken set"
+    );
+}
+
+/// One `on_turn_end` dispatch's record: the turn, the success flag,
+/// and the context's history snapshot verbatim.
+type TurnEndRecord = (usize, bool, Arc<Vec<Message>>);
+
+/// Records the history snapshot of every `on_turn_end` dispatch.
+///
+/// One row per dispatch, so a test asserts on the set the engine
+/// surfaced rather than on any derived count.
+struct TurnEndHistoryRecorder {
+    /// One [`TurnEndRecord`] per `on_turn_end` dispatch.
+    ///
+    /// Shared with the test body, which drains it once the run ends.
+    ends: Arc<Mutex<Vec<TurnEndRecord>>>,
+}
+
+impl crate::observer::LoopObserver for TurnEndHistoryRecorder {
+    fn name(&self) -> &'static str {
+        "turn-end-history-recorder"
+    }
+    fn on_turn_end(&self, ctx: &crate::observer::TurnEndContext) {
+        self.ends.lock().expect("ends lock").push((
+            ctx.turn,
+            ctx.success,
+            Arc::clone(&ctx.history),
+        ));
+    }
+}
+
+#[tokio::test]
+async fn on_turn_end_carries_the_committed_history_plus_the_completed_exchange() {
+    let client = MockClient::new("test-model");
+    client.add_tool_only_response("tool_1", "echo", &json!({ "message": "hi" }));
+    client.add_text_response("done");
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    agent.register_observer(Arc::new(TurnEndHistoryRecorder {
+        ends: Arc::clone(&ends),
+    }));
+    agent
+        .run("two rounds", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let ends = ends.lock().expect("ends lock");
+    assert_eq!(
+        ends.len(),
+        2,
+        "one turn-end event per completed turn: {ends:?}"
+    );
+    let (turn, success, first) = &ends[0];
+    assert!(
+        *success && *turn == 0,
+        "the tool round ends successfully as turn 0: {ends:?}"
+    );
+    assert_eq!(
+        first.len(),
+        3,
+        "the tool round's snapshot is the committed history plus the \
+         complete exchange — input, tool-call request, tool result"
+    );
+    assert_eq!(first[0].role, Role::User);
+    assert_eq!(first[0].text_content(), "two rounds");
+    assert_eq!(first[1].role, Role::Assistant);
+    assert_eq!(
+        first[1].tool_call_parts(),
+        vec![("tool_1", "echo", &json!({ "message": "hi" }))],
+        "the snapshot carries the model's tool-call request verbatim"
+    );
+    assert_eq!(first[2].role, Role::User);
+    assert!(
+        matches!(first[2].parts.first(), Some(MessagePart::ToolResult { .. })),
+        "the tool result lands in the snapshot as its own user message"
+    );
+
+    let (turn, success, second) = &ends[1];
+    assert!(
+        *success && *turn == 1,
+        "the final text round ends successfully as turn 1: {ends:?}"
+    );
+    assert_eq!(
+        second.len(),
+        4,
+        "the next turn's snapshot adds the final exchange, not replaces it"
+    );
+    assert_eq!(second[3].role, Role::Assistant);
+    assert_eq!(second[3].text_content(), "done");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_turn_end_carries_only_committed_history() {
+    let machine = LoopMachine::from_history(vec![
+        Message::user("a"),
+        Message::assistant("b"),
+        Message::user("c"),
+    ]);
+    let client = BlockingClient {
+        started: Arc::new(AtomicBool::new(false)),
+    };
+    let started = Arc::clone(&client.started);
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::from_machine(
+        machine,
+        make_config(),
+        Arc::new(client),
+        ToolRegistry::new(),
+    );
+    agent.set_turn_mode(TurnMode::NonStreaming);
+    agent.register_observer(Arc::new(TurnEndHistoryRecorder {
+        ends: Arc::clone(&ends),
+    }));
+
+    let cancel_signal = Arc::clone(&agent.cancel_signal());
+    let run_handle = tokio::spawn(async move {
+        let result = agent.run("interrupted", &RunConfig::default()).await;
+        (agent, result)
+    });
+    let mut waits = 0u32;
+    while !started.load(Ordering::SeqCst) {
+        waits += 1;
+        assert!(
+            waits <= 1000,
+            "create_message was never entered — test setup is broken"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    cancel_signal.cancel();
+    let (_agent, run_result) = run_handle.await.unwrap();
+
+    assert!(
+        matches!(run_result, Err(LoopError::Cancelled)),
+        "run must return Err(Cancelled): {run_result:?}"
+    );
+    let ends = ends.lock().expect("ends lock");
+    assert_eq!(
+        ends.len(),
+        1,
+        "the cancelled turn fires exactly one failed turn-end event"
+    );
+    let (turn, success, history) = &ends[0];
+    assert!(
+        !*success && *turn == 0,
+        "the event reports the failed turn 0: {ends:?}"
+    );
+    assert_eq!(
+        history.len(),
+        3,
+        "a failed turn-end carries only the committed history — the \
+         interrupted exchange, the run's own input included, never rides"
+    );
+    assert_eq!(history[0].text_content(), "a");
+    assert_eq!(history[1].text_content(), "b");
+    assert_eq!(history[2].text_content(), "c");
+}
+
+#[tokio::test]
+async fn turn_end_history_reflects_a_mid_run_compaction() {
+    let client = MockClient::new("test-model");
+    for idx in 0..3 {
+        client.add_tool_only_response(
+            &format!("c{idx}"),
+            "echo",
+            &json!({ "message": "x".repeat(400) }),
+        );
+    }
+    client.add_text_response("compacted-and-done");
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(50);
+    let mut agent = BareLoop::new(Arc::new(client), registry, config);
+    agent.register_observer(Arc::new(TurnEndHistoryRecorder {
+        ends: Arc::clone(&ends),
+    }));
+    agent.set_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+        ShrinkingPassCompactor,
+    ))));
+    let run_result = agent.run("fill it up", &RunConfig::default()).await;
+    assert!(
+        run_result.is_ok(),
+        "the compacting run completes: {run_result:?}"
+    );
+
+    let ends = ends.lock().expect("ends lock");
+    let (_, success, last) = ends
+        .last()
+        .expect("the run fired at least one turn-end event");
+    assert!(*success, "the post-compaction turn completes: {ends:?}");
+    assert_eq!(
+        last.len(),
+        2,
+        "the first turn-end after the pass carries exactly the compacted \
+         set plus the post-compact assistant message: got {} messages",
+        last.len()
+    );
+    assert_eq!(
+        last[0].text_content(),
+        "r".repeat(40),
+        "the compacted set the pass produced is what the event carries"
+    );
+    assert_eq!(last[1].role, Role::Assistant);
+    assert_eq!(last[1].text_content(), "compacted-and-done");
+    assert!(
+        ends.iter()
+            .any(|(_, _, history)| history.len() > last.len()),
+        "an earlier event carried the grown pre-compaction set — the \
+         compaction actually changed the snapshot mid-run"
+    );
+}
+
 #[tokio::test]
 async fn observer_sequence_cancelled_turn() {
     let client = MockClient::new("test-model");
@@ -6669,6 +6952,101 @@ async fn run_cancel_during_dispatch_fires_turn_end() {
         1,
         "on_run_end must fire via finalize after cancel",
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dispatch_failed_turn_end_carries_only_committed_history() {
+    struct SlowTool {
+        notify: Arc<tokio::sync::Notify>,
+        started: Arc<AtomicBool>,
+    }
+    impl Tool for SlowTool {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn description(&self) -> &'static str {
+            "Blocks until notified"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "slow".into(),
+                description: "Blocks until notified".into(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            let notify = self.notify.clone();
+            let started = self.started.clone();
+            Box::pin(async move {
+                started.store(true, Ordering::SeqCst);
+                notify.notified().await;
+                Ok(ToolOutput::text("done"))
+            })
+        }
+    }
+
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(AtomicBool::new(false));
+    let mut registry = ToolRegistry::new();
+    registry.register(SlowTool {
+        notify: Arc::clone(&notify),
+        started: Arc::clone(&started),
+    });
+
+    let client = MockClient::new("test");
+    client.add_tool_only_response("tc-1", "slow", &json!({}));
+
+    let machine = LoopMachine::from_history(vec![Message::user("a"), Message::assistant("b")]);
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::from_machine(machine, make_config(), Arc::new(client), registry);
+    agent.register_observer(Arc::new(TurnEndHistoryRecorder {
+        ends: Arc::clone(&ends),
+    }));
+    let signal = agent.cancel_signal();
+    let handle =
+        tokio::spawn(async move { agent.run("Use slow tool", &RunConfig::default()).await });
+
+    let mut waits = 0u32;
+    while !started.load(Ordering::SeqCst) {
+        waits += 1;
+        assert!(
+            waits <= 1000,
+            "the slow tool was never dispatched — test setup is broken"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    signal.cancel();
+    let result = handle.await.unwrap();
+    assert!(
+        matches!(result, Err(LoopError::Cancelled)),
+        "run must return Err(Cancelled): {result:?}"
+    );
+
+    let ends = ends.lock().expect("ends lock");
+    assert_eq!(
+        ends.len(),
+        1,
+        "the cancelled dispatch fires exactly one failed turn-end event"
+    );
+    let (turn, success, history) = &ends[0];
+    assert!(
+        !*success && *turn == 0,
+        "the event reports the failed turn 0: {ends:?}"
+    );
+    assert_eq!(
+        history.len(),
+        2,
+        "the dispatch-failure arm carries the committed history only — the \
+         interrupted exchange, the run's input and its tool-call request \
+         included, never rides: got {} messages",
+        history.len()
+    );
+    assert_eq!(history[0].text_content(), "a");
+    assert_eq!(history[1].text_content(), "b");
 }
 
 #[cfg(feature = "streaming")]

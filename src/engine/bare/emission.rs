@@ -19,11 +19,13 @@ use crate::capabilities::Hookable;
 use crate::hooks::context::{
     RunEndContext as HookRunEndContext, RunEndReason, RunStartContext as HookRunStartContext,
 };
+use crate::message::Message;
 use crate::observer::{
     FallbackContext, ResponseContext, RunEndContext, RunStartContext, StreamContext,
     StreamFailureContext, ToolCallReceivedContext, TurnEndContext, TurnStartContext,
 };
 use crate::stream::{StreamStopReason, Usage};
+use std::sync::Arc;
 
 /// Data for an `on_turn_end` notification.
 ///
@@ -138,6 +140,18 @@ pub(super) struct TurnEnd<'a> {
     /// at event time via
     /// [`turn_end_context_window`](BareLoop::turn_end_context_window).
     pub context_window: Option<u64>,
+
+    /// The machine's history snapshot this event reports.
+    ///
+    /// Built by the firing site: a successful turn end carries
+    /// [`full_history`](crate::engine::core::LoopMachine::full_history)
+    /// — the committed history plus the run's turns so far, ending with
+    /// this turn's complete exchange; a failed turn end carries the
+    /// committed [`history`](crate::engine::core::LoopMachine::history)
+    /// only, so an interrupted exchange never rides. Shared behind an
+    /// [`Arc`] so every observer receives the same snapshot without a
+    /// copy each.
+    pub history: Arc<Vec<Message>>,
 }
 
 impl<C: ApiClient> BareLoop<C> {
@@ -225,6 +239,7 @@ impl<C: ApiClient> BareLoop<C> {
             stop_reason: data.stop_reason,
             context_tokens: data.context_tokens,
             context_window: data.context_window,
+            history: Arc::clone(&data.history),
         });
     }
 

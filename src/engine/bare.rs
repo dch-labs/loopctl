@@ -1349,6 +1349,7 @@ impl<C: ApiClient> BareLoop<C> {
                     stop_reason: accounting.stop_reason,
                     context_tokens: self.machine.context_tokens(),
                     context_window: self.turn_end_context_window(),
+                    history: Arc::new(self.machine.history().to_vec()),
                 });
                 Err(e)
             }
@@ -1467,6 +1468,7 @@ impl<C: ApiClient> BareLoop<C> {
             stop_reason,
             context_tokens: self.machine.context_tokens(),
             context_window: self.turn_end_context_window(),
+            history: Arc::new(self.machine.history().to_vec()),
         });
     }
 
@@ -1626,6 +1628,7 @@ impl<C: ApiClient> BareLoop<C> {
                 stop_reason: stream_stop,
                 context_tokens: self.machine.context_tokens(),
                 context_window: self.turn_end_context_window(),
+                history: Arc::new(self.machine.full_history()),
             });
         }
         Ok(())
@@ -1928,6 +1931,7 @@ impl<C: ApiClient> BareLoop<C> {
             stop_reason: accounting.stop_reason,
             context_tokens: self.machine.context_tokens(),
             context_window: self.turn_end_context_window(),
+            history: Arc::new(self.machine.full_history()),
         });
         Ok(())
     }

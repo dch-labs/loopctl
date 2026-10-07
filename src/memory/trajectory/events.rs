@@ -960,6 +960,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_run_end(&RunEndContext::new(true, None, 1, 5));
         observer.on_run_start(&RunStartContext { session_id });
@@ -1355,6 +1356,7 @@ mod tests {
             stop_reason: crate::stream::StreamStopReason::EndTurn,
             context_tokens: 10,
             context_window: None,
+            history: std::sync::Arc::new(Vec::new()),
         });
         observer.on_run_end(&RunEndContext::new(true, None, 1, 1));
 
@@ -1446,6 +1448,7 @@ mod tests {
                 stop_reason: crate::stream::StreamStopReason::EndTurn,
                 context_tokens: 10,
                 context_window: None,
+                history: std::sync::Arc::new(Vec::new()),
             });
             observer.on_run_end(&RunEndContext::new(true, None, 1, 5));
         });

@@ -4,6 +4,10 @@
 //! Observers receive shared references (`&Context`) — the structs are
 //! notification-only data carriers.
 
+use std::sync::Arc;
+
+use crate::message::Message;
+
 /// Context for [`LoopObserver::on_run_start`](crate::observer::LoopObserver::on_run_start).
 ///
 /// Carries the session identifier so observers can correlate lifecycle
@@ -98,8 +102,9 @@ pub struct TurnStartContext {
 
 /// Context for [`LoopObserver::on_turn_end`](crate::observer::LoopObserver::on_turn_end).
 ///
-/// Reports whether the turn succeeded, any error, its duration,
-/// and the token counts consumed during the turn.
+/// Reports whether the turn succeeded, any error, its duration, the
+/// token counts consumed during the turn, and the machine's history
+/// snapshot as the turn ended.
 /// `#[non_exhaustive]` so fields can be added in minor
 /// releases; it is constructed by the engine — external code
 /// reads it, never builds it.
@@ -178,6 +183,22 @@ pub struct TurnEndContext {
     /// [`context_tokens`](Self::context_tokens) by this field for a
     /// utilization view against the limit the engine enforced.
     pub context_window: Option<u64>,
+
+    /// The machine's history as this turn ended.
+    ///
+    /// On a successful turn end: the committed history followed by the
+    /// run's turns so far, ending with this turn's complete exchange —
+    /// exactly
+    /// [`full_history`](crate::engine::core::LoopMachine::full_history)
+    /// at the event, a coherent set a host may snapshot or seed a
+    /// resume from. On a failed turn end: the committed
+    /// [`history`](crate::engine::core::LoopMachine::history) only —
+    /// an interrupted exchange never rides. Shared behind an [`Arc`]
+    /// so multiple observers receive the same snapshot without a copy
+    /// each; this is the read a persisting host would otherwise be
+    /// unable to make while
+    /// [`run`](crate::engine::core::Loop::run) holds the loop.
+    pub history: Arc<Vec<Message>>,
 }
 
 /// Context for [`LoopObserver::on_stream_success`](crate::observer::LoopObserver::on_stream_success).

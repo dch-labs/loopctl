@@ -61,19 +61,13 @@
 )]
 
 #[cfg(feature = "testing")]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::missing_panics_doc
-)]
 pub mod contract;
 #[cfg(feature = "pgvector")]
 pub mod pgvector;
 #[cfg(feature = "qdrant")]
 pub mod qdrant;
 
+#[cfg(any(feature = "qdrant", feature = "pgvector"))]
 use uuid::Uuid;
 
 /// Characters of a backend error message kept in a mapped error.
@@ -82,6 +76,7 @@ use uuid::Uuid;
 /// Postgres hints, IO dumps); the mapped [`LoopError::Memory`] string
 /// carries enough to diagnose without flooding logs and observer
 /// surfaces.
+#[cfg(any(feature = "qdrant", feature = "pgvector"))]
 const MAX_ERROR_CHARS: usize = 512;
 
 /// Map a backend failure into the one error surface hosts see.
@@ -90,6 +85,7 @@ const MAX_ERROR_CHARS: usize = 512;
 /// its own diagnosis (bounded at [`MAX_ERROR_CHARS`] characters, cut on
 /// a character boundary), so no backend error type ever leaks past
 /// `LoopError::Memory` and every failure names where it came from.
+#[cfg(any(feature = "qdrant", feature = "pgvector"))]
 fn memory_error(backend: &str, error: impl std::fmt::Display) -> loopctl::error::LoopError {
     let text = error.to_string();
     let bounded: String = text.chars().take(MAX_ERROR_CHARS).collect();
@@ -105,6 +101,7 @@ fn memory_error(backend: &str, error: impl std::fmt::Display) -> loopctl::error:
 /// # Errors
 ///
 /// Returns [`LoopError::Memory`] naming the field when blank.
+#[cfg(any(feature = "qdrant", feature = "pgvector"))]
 fn require_non_blank(
     backend: &str,
     field: &'static str,
@@ -129,6 +126,7 @@ fn require_non_blank(
 ///
 /// Returns [`LoopError::Memory`](loopctl::error::LoopError) naming the
 /// rule when the name is not a strict identifier.
+#[cfg(feature = "pgvector")]
 fn strict_identifier(backend: &str, name: &str) -> Result<String, loopctl::error::LoopError> {
     let mut chars = name.chars();
     let head_ok = chars
@@ -152,10 +150,45 @@ fn strict_identifier(backend: &str, name: &str) -> Result<String, loopctl::error
 /// # Errors
 ///
 /// Returns [`LoopError::Memory`] when the dimension is zero.
+#[cfg(any(feature = "qdrant", feature = "pgvector"))]
 fn require_dim(backend: &str, dim: usize) -> Result<(), loopctl::error::LoopError> {
     if dim == 0 {
         return Err(loopctl::error::LoopError::Memory(format!(
             "{backend}: dim must be greater than zero"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a vector cosine search cannot use.
+///
+/// Both external tiers measure cosine similarity, which is undefined
+/// for a zero-norm vector (no direction) and meaningless for a
+/// non-finite one — and the server-side index scans silently drop such
+/// rows instead of erroring. One shared validation so both backends
+/// reject the same inputs with the same voice, loudly, at `add` and at
+/// `search`: the in-process tiers keep their documented `0.0`
+/// similarity fallback for degenerate vectors, so a host moving between
+/// tiers meets a named error rather than silently different results.
+///
+/// # Errors
+///
+/// Returns [`LoopError::Memory`] naming the reason when any component
+/// is non-finite or the vector's norm is zero.
+#[cfg(any(feature = "qdrant", feature = "pgvector"))]
+fn require_usable_vector(backend: &str, vector: &[f32]) -> Result<(), loopctl::error::LoopError> {
+    if vector.iter().any(|component| !component.is_finite()) {
+        return Err(loopctl::error::LoopError::Memory(format!(
+            "{backend}: vector has a non-finite component; cosine search needs a finite direction"
+        )));
+    }
+    let squared_norm: f64 = vector
+        .iter()
+        .map(|component| f64::from(*component) * f64::from(*component))
+        .sum();
+    if squared_norm == 0.0 {
+        return Err(loopctl::error::LoopError::Memory(format!(
+            "{backend}: vector has zero norm; cosine search needs a non-zero direction"
         )));
     }
     Ok(())
@@ -166,6 +199,7 @@ fn require_dim(backend: &str, dim: usize) -> Result<(), loopctl::error::LoopErro
 /// One INFO event per target per process — creating a collection,
 /// table, or dataset is a side effect an operator should see, and the
 /// idempotence contract means repeats stay silent.
+#[cfg(any(feature = "qdrant", feature = "pgvector"))]
 fn emit_provisioned(backend: &str, target: &str) {
     tracing::info!(
         target: "loopctl::metrics",
@@ -180,6 +214,7 @@ fn emit_provisioned(backend: &str, target: &str) {
 ///
 /// Paired with the provision event so a store that cannot reach or
 /// create its target is countable next to the healthy tier.
+#[cfg(any(feature = "qdrant", feature = "pgvector"))]
 fn emit_provision_error(backend: &str) {
     tracing::debug!(
         target: "loopctl::metrics",
@@ -200,7 +235,10 @@ fn emit_provision_error(backend: &str) {
 /// answers without IO and stays exact while this process is the only
 /// writer since construction. Writes from other processes (or before
 /// this construction) are invisible to it by design; when that
-/// approximation matters, re-construct the index.
+/// approximation matters, re-construct the index. Every handle holds
+/// the bookkeeping behind an [`Arc`](std::sync::Arc), so clones of a
+/// backend share one ledger — one process, one count — instead of
+/// drifting as independent snapshots.
 ///
 /// Bookkeeping rules: `add` of an id this client has already added is a
 /// replace (no delta); `add` of a re-added-after-remove id counts
@@ -210,6 +248,7 @@ fn emit_provision_error(backend: &str) {
 /// of the same absent id cannot double-decrement. Backends gate the
 /// call on that confirmation — pgvector on `rows_affected`, qdrant on
 /// a point lookup — so a phantom remove never reaches these rules.
+#[cfg(any(feature = "qdrant", feature = "pgvector"))]
 #[derive(Debug, Default)]
 struct RemoteCount {
     /// The server's count at construction time.
@@ -228,6 +267,7 @@ struct RemoteCount {
 /// The tag decides whether an `add`/`remove` under the id changes the
 /// count — the replacements and no-op removes the trait's semantics
 /// produce.
+#[cfg(any(feature = "qdrant", feature = "pgvector"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Known {
     /// Added by this client and present on the server.
@@ -240,6 +280,7 @@ enum Known {
     Removed,
 }
 
+#[cfg(any(feature = "qdrant", feature = "pgvector"))]
 impl RemoteCount {
     /// Seed the bookkeeping with the constructor-time server count.
     ///
@@ -299,21 +340,12 @@ impl RemoteCount {
     }
 }
 
-impl Clone for RemoteCount {
-    fn clone(&self) -> Self {
-        let known = recover_known(self.known.lock()).clone();
-        Self {
-            base: std::sync::atomic::AtomicUsize::new(self.len()),
-            known: std::sync::Mutex::new(known),
-        }
-    }
-}
-
 /// Recover a poisoned known-set lock the way loopctl's own mutexes do.
 ///
 /// The bookkeeping is advisory count arithmetic — a poisoned lock means
 /// a panicking thread mid-update, whose worst effect is a stale count;
 /// continuing beats poisoning every future `len`.
+#[cfg(any(feature = "qdrant", feature = "pgvector"))]
 fn recover_known(
     guard: std::sync::LockResult<std::sync::MutexGuard<'_, std::collections::HashMap<Uuid, Known>>>,
 ) -> std::sync::MutexGuard<'_, std::collections::HashMap<Uuid, Known>> {
@@ -322,8 +354,10 @@ fn recover_known(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "qdrant", feature = "pgvector"))]
     use super::*;
 
+    #[cfg(any(feature = "qdrant", feature = "pgvector"))]
     #[test]
     fn backend_errors_map_to_bounded_memory_strings() {
         let long = "x".repeat(2_000);
@@ -342,6 +376,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "qdrant", feature = "pgvector"))]
     #[test]
     fn shared_validation_rejects_blank_names_and_zero_dims() {
         assert!(require_non_blank("b", "url", "   ").is_err());
@@ -350,6 +385,27 @@ mod tests {
         assert!(require_dim("b", 4).is_ok());
     }
 
+    #[cfg(any(feature = "qdrant", feature = "pgvector"))]
+    #[test]
+    fn shared_validation_rejects_unusable_vectors() {
+        let rejection = require_usable_vector("b", &[0.0, 0.0]);
+        assert!(
+            rejection
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("zero")),
+            "a zero-norm vector names its reason: {rejection:?}"
+        );
+        let rejection = require_usable_vector("b", &[1.0, f32::NAN]);
+        assert!(
+            rejection
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("non-finite")),
+            "a non-finite component names its reason: {rejection:?}"
+        );
+        assert!(require_usable_vector("b", &[1.0, 0.0]).is_ok());
+    }
+
+    #[cfg(any(feature = "qdrant", feature = "pgvector"))]
     #[test]
     fn remote_count_saturates_on_removes_of_never_added_ids() {
         let count = RemoteCount::default();
@@ -364,6 +420,7 @@ mod tests {
         assert_eq!(count.len(), 0, "a second absent-id remove still saturates");
     }
 
+    #[cfg(any(feature = "qdrant", feature = "pgvector"))]
     #[test]
     fn remote_count_tracks_adds_replaces_and_removes_without_io() {
         let count = RemoteCount::default();

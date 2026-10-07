@@ -825,6 +825,18 @@ pub struct Usage {
     /// the model. Defaults to `0` when constructed via
     /// [`Default::default`].
     pub output_tokens: u32,
+
+    /// Number of input tokens served from the provider's prompt cache.
+    ///
+    /// Providers that cache the prompt prefix report how much of
+    /// [`input_tokens`](Self::input_tokens) was read from cache instead
+    /// of re-processed (Anthropic's `cache_read_input_tokens`, OpenAI's
+    /// `prompt_tokens_details.cached_tokens`); providers that do not
+    /// report a cached share leave this at `0`. The count is a subset of
+    /// `input_tokens`, never additional to it. Defaults to `0` when
+    /// constructed via [`Default::default`] or [`new`](Self::new).
+    #[serde(default)]
+    pub cached_input_tokens: u32,
 }
 
 impl Usage {
@@ -856,7 +868,40 @@ impl Usage {
         Self {
             input_tokens,
             output_tokens,
+            cached_input_tokens: 0,
         }
+    }
+
+    /// Attach a cached share to an existing usage instance.
+    ///
+    /// Sets [`cached_input_tokens`](Self::cached_input_tokens) — the
+    /// portion of the input the provider reported as served from its
+    /// prompt cache, a subset of the input count already carried. Use
+    /// after [`new`](Self::new) when a response reports the cached share
+    /// alongside the totals.
+    ///
+    /// # Parameters
+    ///
+    /// - `cached_input_tokens` — Input tokens read from the prompt
+    ///   cache.
+    ///
+    /// # Returns
+    ///
+    /// A [`Usage`] instance with the cached count set.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::stream::Usage;
+    ///
+    /// let usage = Usage::new(1000, 50).with_cached_input(900);
+    /// assert_eq!(usage.cached_input_tokens, 900);
+    /// assert_eq!(usage.input_tokens, 1000);
+    /// ```
+    #[must_use]
+    pub fn with_cached_input(mut self, cached_input_tokens: u32) -> Self {
+        self.cached_input_tokens = cached_input_tokens;
+        self
     }
 
     /// Total tokens consumed (input + output).

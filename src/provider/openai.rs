@@ -1753,14 +1753,44 @@ struct OpenAiUsage {
     /// engine's `u32` counter.
     #[serde(default)]
     completion_tokens: u64,
+
+    /// Breakdown of the input prompt's token counts.
+    ///
+    /// Present only on providers that report it; `None` leaves the
+    /// cached share at zero.
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+/// The `prompt_tokens_details` object inside an OpenAI usage report.
+///
+/// Carries the per-part breakdown of the prompt token count. Only
+/// `cached_tokens` is read — the share of the prompt served from the
+/// provider's automatic prompt cache — because that is the only member
+/// the engine's [`Usage`] accounts for. Both the object and the field
+/// default when absent, so servers that omit the breakdown (or report
+/// it under a different shape) deserialize with a zero cached share
+/// instead of failing the whole usage object.
+#[derive(Deserialize, Default)]
+struct OpenAiPromptTokensDetails {
+    /// Number of prompt tokens served from the provider's prompt cache.
+    ///
+    /// Defaults to 0 when the details object omits it.
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 impl From<&OpenAiUsage> for Usage {
     fn from(u: &OpenAiUsage) -> Self {
+        let cached = u
+            .prompt_tokens_details
+            .as_ref()
+            .map_or(0, |d| u32::try_from(d.cached_tokens).unwrap_or(u32::MAX));
         Usage::new(
             u32::try_from(u.prompt_tokens).unwrap_or(u32::MAX),
             u32::try_from(u.completion_tokens).unwrap_or(u32::MAX),
         )
+        .with_cached_input(cached)
     }
 }
 
@@ -2755,6 +2785,23 @@ mod tests {
         let typed: Usage = usage.into();
         assert_eq!(typed.input_tokens, 42);
         assert_eq!(typed.output_tokens, 7);
+    }
+
+    #[test]
+    fn parse_final_chunk_with_cached_tokens_detail() {
+        let data = r#"{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":1024}}}"#;
+        let chunk = OpenAiChunk::parse(data).unwrap();
+        let typed: Usage = chunk.usage.as_ref().expect("usage").into();
+        assert_eq!(typed.input_tokens, 1200);
+        assert_eq!(typed.cached_input_tokens, 1024);
+    }
+
+    #[test]
+    fn parse_final_chunk_without_cached_tokens_detail_defaults_to_zero() {
+        let data = r#"{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":7}}"#;
+        let chunk = OpenAiChunk::parse(data).unwrap();
+        let typed: Usage = chunk.usage.as_ref().expect("usage").into();
+        assert_eq!(typed.cached_input_tokens, 0);
     }
 
     #[test]

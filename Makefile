@@ -165,6 +165,10 @@ derive-consumer:
 
 vector-check:
 	cargo fmt --all --check --manifest-path vector/Cargo.toml
+	cargo clippy --manifest-path vector/Cargo.toml --all-targets -- -D warnings
+	cargo clippy --manifest-path vector/Cargo.toml --no-default-features --all-targets -- -D warnings
+	cargo clippy --manifest-path vector/Cargo.toml --no-default-features --features qdrant --all-targets -- -D warnings
+	cargo clippy --manifest-path vector/Cargo.toml --no-default-features --features pgvector --all-targets -- -D warnings
 	cargo clippy --manifest-path vector/Cargo.toml --all-targets --all-features -- -D warnings
 	cargo check --manifest-path vector/Cargo.toml --all-features
 	RUSTDOCFLAGS="-D warnings" cargo doc --manifest-path vector/Cargo.toml --no-deps --all-features

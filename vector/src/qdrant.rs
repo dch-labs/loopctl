@@ -5,8 +5,11 @@
 //! outgrow one process, shared across sessions and hosts. The
 //! collection is auto-provisioned on first use (created if absent,
 //! cosine distance, the configured dimension; an existing collection
-//! is adopted only when its unnamed vector configuration matches that
-//! shape), and the point id *is*
+//! is adopted only when its unnamed single-vector configuration
+//! matches that shape at the default float32 datatype with no
+//! multivector configuration), a collection deleted mid-life is
+//! re-provisioned by the next operation instead of wedging the
+//! handle, and the point id *is*
 //! the memory entry's [`Uuid`], so upsert and delete map onto Qdrant's
 //! native point operations with no payload indirection. Failures map
 //! to [`LoopError::Memory`] with Qdrant's message preserved but
@@ -60,15 +63,23 @@ const BACKEND: &str = "qdrant";
 /// with cosine distance and the configured dimension — and the
 /// provisioning is idempotent: a concurrent construction that loses
 /// the create race sees the winner's collection, validates its
-/// vector configuration, and succeeds, a repeated construction is a
-/// no-op, and a construction whose provisioning failed retries on the
-/// next operation (the guard only caches success). An existing
-/// collection is adopted only when it uses the unnamed single-vector
-/// layout this index creates, at the configured dimension and cosine
-/// distance — anything else rejects at connect instead of failing (or
-/// scoring wrongly) on use. Point ids are the caller's [`Uuid`]s
+/// vector configuration, and succeeds, and a repeated construction
+/// is a no-op. A collection deleted after construction does not wedge
+/// the handle: the next operation that fails naming a missing
+/// collection re-provisions once (a fresh, empty collection — the new
+/// provision event is the visible trace of the loss) and retries
+/// itself. An existing collection is adopted only when it uses the
+/// unnamed single-vector layout this index creates, at the configured
+/// dimension and cosine distance, with the default float32 datatype
+/// and no multivector configuration — a quantized datatype or a
+/// `MaxSim` layout changes what scores mean and rejects at connect,
+/// while the server's on-disk-vs-RAM placement of vectors is its own
+/// tuning and is adopted. Point ids are the caller's [`Uuid`]s
 /// directly, so [`add`](VectorIndex::add) is Qdrant upsert-by-id and
-/// [`remove`](VectorIndex::remove) is delete-by-id.
+/// [`remove`](VectorIndex::remove) is delete-by-id; points a foreign
+/// writer keyed by anything but a UUID are invisible to search and
+/// excluded from this handle's count deltas, though the
+/// construction-time seed counts every point the server holds.
 ///
 /// Construct through [`QdrantIndexBuilder`] or
 /// [`from_env`](Self::from_env); the client is cloned per operation
@@ -109,18 +120,19 @@ pub struct QdrantIndex {
 
     /// The client-side count bookkeeping backing the trait's sync `len`.
     ///
-    /// Seeded with the server's count at construction; see
-    /// [`RemoteCount`](crate::RemoteCount) for the exactness contract.
-    count: crate::RemoteCount,
+    /// Seeded with the server's count at construction and shared with
+    /// every clone of this handle, so one process answers one count;
+    /// see [`RemoteCount`](crate::RemoteCount) for the exactness
+    /// contract.
+    count: std::sync::Arc<crate::RemoteCount>,
 
-    /// Set once this construction has confirmed (or created) the
-    /// collection.
+    /// Whether this handle has confirmed (or created) the collection.
     ///
-    /// Construction provisions, so operations skip the existence
-    /// round trip; only a construction against a server that later
-    /// dropped the collection pays it again, on the failing operation's
-    /// retry through a fresh construction.
-    provisioned: std::sync::OnceLock<()>,
+    /// Shared with every clone, and deliberately clearable: an
+    /// operation that fails because the collection vanished clears it
+    /// so the re-provision path can run — the guard caches success,
+    /// never failure.
+    provisioned: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Clone for QdrantIndex {
@@ -129,23 +141,10 @@ impl Clone for QdrantIndex {
             client: self.client.clone(),
             collection: self.collection.clone(),
             dim: self.dim,
-            count: self.count.clone(),
-            provisioned: provisioned_from(&self.provisioned),
+            count: std::sync::Arc::clone(&self.count),
+            provisioned: std::sync::Arc::clone(&self.provisioned),
         }
     }
-}
-
-/// Copy a provisioning guard's settled state into a fresh guard.
-///
-/// A clone shares the channel but not the guard cell; propagating the
-/// settled state keeps the clone from paying the existence round trip
-/// the original already paid.
-fn provisioned_from(guard: &std::sync::OnceLock<()>) -> std::sync::OnceLock<()> {
-    let fresh = std::sync::OnceLock::new();
-    if guard.get().is_some() {
-        let _ignored = fresh.set(());
-    }
-    fresh
 }
 
 impl std::fmt::Debug for QdrantIndex {
@@ -260,7 +259,7 @@ impl QdrantIndex {
 
     /// Confirm or create the collection, once per construction.
     ///
-    /// Construction provisions and seeds the count, and the guard makes
+    /// Construction provisions and seeds the count, and the flag makes
     /// every later operation skip the existence round trip — one
     /// metadata call per process per collection, not one per upsert.
     /// An already-existing collection (including one a concurrent
@@ -274,26 +273,38 @@ impl QdrantIndex {
     /// or the validation of an existing collection fails — the message
     /// carries Qdrant's diagnosis, bounded.
     async fn ensure_collection(&self) -> Result<(), LoopError> {
-        if self.provisioned.get().is_some() {
+        if self.provisioned.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
-        if self
+        let exists = match self
             .client
             .collection_exists(self.collection.as_str())
             .await
-            .map_err(|error| memory_error(BACKEND, error))?
         {
+            Ok(exists) => exists,
+            Err(error) => {
+                emit_provision_error(BACKEND);
+                return Err(memory_error(BACKEND, error));
+            }
+        };
+        if exists {
             self.validate_existing_collection().await?;
             return Ok(());
         }
         let request = CreateCollectionBuilder::new(self.collection.clone())
             .vectors_config(VectorParamsBuilder::new(self.dim as u64, Distance::Cosine));
         if let Err(error) = self.client.create_collection(request).await {
-            let lost_race = self
+            let lost_race = match self
                 .client
                 .collection_exists(self.collection.as_str())
                 .await
-                .unwrap_or(false);
+            {
+                Ok(exists) => exists,
+                Err(probe_error) => {
+                    emit_provision_error(BACKEND);
+                    return Err(memory_error(BACKEND, probe_error));
+                }
+            };
             if lost_race {
                 self.validate_existing_collection().await?;
                 return Ok(());
@@ -305,18 +316,53 @@ impl QdrantIndex {
         Ok(())
     }
 
+    /// Re-provision after an operation found the collection missing.
+    ///
+    /// Clears the shared guard so the existence round trip runs again,
+    /// then runs it: a collection an operator (or a retention job)
+    /// dropped mid-life comes back as a fresh, empty target — the
+    /// provision event this fires is the visible trace of the loss —
+    /// and the caller retries its operation against it. Bounded to the
+    /// one retry per operation; a server that cannot be reached or a
+    /// collection that cannot be created surfaces the underlying
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Memory`] when the re-provisioning fails.
+    async fn reprovision(&self) -> Result<(), LoopError> {
+        self.provisioned
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.ensure_collection().await
+    }
+
+    /// Whether a mapped error names a missing collection.
+    ///
+    /// The re-provision trigger: Qdrant answers operations against a
+    /// dropped collection with a not-found status, whose message is
+    /// the only transport-stable signal available through the client's
+    /// error surface.
+    fn is_missing_collection(error: &LoopError) -> bool {
+        error.to_string().to_lowercase().contains("not found")
+    }
+
     /// Validate an existing collection's vector configuration before
     /// adopting it.
     ///
     /// A handle keyed to the requested dim over a collection whose
     /// configuration disagrees would pass every client-side check and
     /// fail on the server at the first upsert or search — or, with a
-    /// non-cosine distance metric, answer with scores that are not
-    /// cosine similarities and never error at all. The collection must
-    /// use the unnamed single-vector layout this index creates, at the
-    /// requested dimension, measured with cosine distance; a named or
-    /// multi-vector layout, a mismatched dimension, and a foreign
-    /// distance metric all reject with the collection's shape named.
+    /// non-cosine distance metric, a quantized datatype, or a
+    /// multivector comparator, answer with scores that are not cosine
+    /// similarities and never error at all. The collection must use
+    /// the unnamed single-vector layout this index creates, at the
+    /// requested dimension, measured with cosine distance, storing
+    /// default float32 vectors with no multivector configuration; a
+    /// named or multi-vector layout, a mismatched dimension, a foreign
+    /// distance metric, a quantized datatype, and a `MaxSim` comparator
+    /// all reject with the collection's shape named. The server's
+    /// on-disk-vs-RAM placement of vectors is tuning, not semantics,
+    /// and is adopted.
     ///
     /// # Errors
     ///
@@ -354,6 +400,25 @@ impl QdrantIndex {
                 self.collection
             )));
         }
+        if let Some(datatype) = params.datatype
+            && datatype != i32::from(qdrant_client::qdrant::Datatype::Default)
+            && datatype != i32::from(qdrant_client::qdrant::Datatype::Float32)
+        {
+            let stored = datatype_label(datatype);
+            return Err(LoopError::Memory(format!(
+                "{BACKEND}: collection {} stores {stored} vectors; this \
+                 index requires the default float32 datatype (a quantized datatype \
+                 silently changes write precision)",
+                self.collection
+            )));
+        }
+        if params.multivector_config.is_some() {
+            return Err(LoopError::Memory(format!(
+                "{BACKEND}: collection {} carries a multivector configuration; this index \
+                 writes single vectors and the MaxSim comparator would score them differently",
+                self.collection
+            )));
+        }
         Ok(())
     }
 
@@ -361,7 +426,10 @@ impl QdrantIndex {
     ///
     /// The async half of the construction-time seeding; every later
     /// `len` answer is a lock read (see
-    /// [`RemoteCount`](crate::RemoteCount)).
+    /// [`RemoteCount`](crate::RemoteCount)). The seed counts every
+    /// point the server holds — including points a foreign writer
+    /// keyed by a non-UUID id, which search can never return and this
+    /// handle's own deltas never touch.
     ///
     /// # Errors
     ///
@@ -452,6 +520,20 @@ impl QdrantIndex {
     }
 }
 
+/// The human name of a Qdrant vector datatype code.
+///
+/// Used only in rejection wording, so an unrecognized code renders as
+/// its numeric value rather than guessing.
+fn datatype_label(datatype: i32) -> &'static str {
+    match datatype {
+        code if code == i32::from(qdrant_client::qdrant::Datatype::Float32) => "float32",
+        code if code == i32::from(qdrant_client::qdrant::Datatype::Uint8) => "uint8",
+        code if code == i32::from(qdrant_client::qdrant::Datatype::Float16) => "float16",
+        code if code == i32::from(qdrant_client::qdrant::Datatype::Turbo4) => "turbo4",
+        _ => "non-default",
+    }
+}
+
 impl QdrantIndexBuilder {
     /// Attach an API key (Qdrant Cloud).
     ///
@@ -510,11 +592,13 @@ impl QdrantIndexBuilder {
             client,
             collection: self.collection,
             dim: self.dim,
-            count: crate::RemoteCount::default(),
-            provisioned: std::sync::OnceLock::new(),
+            count: std::sync::Arc::new(crate::RemoteCount::default()),
+            provisioned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         index.ensure_collection().await?;
-        let _ignored = index.provisioned.set(());
+        index
+            .provisioned
+            .store(true, std::sync::atomic::Ordering::Release);
         index.seed_count().await?;
         Ok(index)
     }
@@ -538,12 +622,25 @@ impl VectorIndex for QdrantIndex {
                     self.dim
                 )));
             }
+            crate::require_usable_vector(BACKEND, vector.as_slice())?;
             self.ensure_collection().await?;
-            let request = self.upsert_request(Self::point(id, vector.as_slice().to_vec()));
-            self.client
-                .upsert_points(request)
-                .await
-                .map_err(|error| memory_error(BACKEND, error))?;
+            let upsert = |point: PointStruct| {
+                let request = self.upsert_request(point);
+                async {
+                    self.client
+                        .upsert_points(request)
+                        .await
+                        .map_err(|error| memory_error(BACKEND, error))
+                }
+            };
+            let point = Self::point(id, vector.as_slice().to_vec());
+            if let Err(error) = upsert(point.clone()).await {
+                if !Self::is_missing_collection(&error) {
+                    return Err(error);
+                }
+                self.reprovision().await?;
+                upsert(point).await?;
+            }
             self.count.note_add(id);
             Ok(())
         })
@@ -563,42 +660,55 @@ impl VectorIndex for QdrantIndex {
                     self.dim
                 )));
             }
+            crate::require_usable_vector(BACKEND, &query)?;
             self.ensure_collection().await?;
             let started = std::time::Instant::now();
-            let response = self
-                .client
-                .search_points(SearchPointsBuilder::new(
-                    self.collection.clone(),
-                    query,
-                    k.min(u32::MAX as usize) as u64,
-                ))
-                .await
-                .map_err(|error| memory_error(BACKEND, error))?;
+            if k == 0 {
+                emit_search_metric(BACKEND, k, &[], 0, started);
+                return Ok(Vec::new());
+            }
+            let search = |query: Vec<f32>| async move {
+                self.client
+                    .search_points(SearchPointsBuilder::new(
+                        self.collection.clone(),
+                        query,
+                        k.min(u32::MAX as usize) as u64,
+                    ))
+                    .await
+                    .map_err(|error| memory_error(BACKEND, error))
+            };
+            let response = match search(query.clone()).await {
+                Ok(response) => response,
+                Err(error) => {
+                    if !Self::is_missing_collection(&error) {
+                        return Err(error);
+                    }
+                    self.reprovision().await?;
+                    search(query).await?
+                }
+            };
+            let mut non_uuid_skipped = 0usize;
             let matches: Vec<VectorMatch> = response
                 .result
                 .into_iter()
                 .filter_map(|point| {
-                    let id = match point.id {
+                    let parsed = match point.id {
                         Some(point_id) => match point_id.point_id_options {
-                            Some(PointIdOptions::Uuid(text)) => Uuid::parse_str(&text).ok()?,
-                            _ => return None,
+                            Some(PointIdOptions::Uuid(text)) => Uuid::parse_str(&text).ok(),
+                            _ => None,
                         },
-                        None => return None,
+                        None => None,
                     };
-                    let score = point.score.clamp(-1.0, 1.0);
-                    Some(VectorMatch { id, score })
+                    if let Some(id) = parsed {
+                        let score = point.score.clamp(-1.0, 1.0);
+                        Some(VectorMatch { id, score })
+                    } else {
+                        non_uuid_skipped = non_uuid_skipped.saturating_add(1);
+                        None
+                    }
                 })
                 .collect();
-            let top_score = matches.first().map_or(0.0, |match_| match_.score);
-            tracing::debug!(
-                target: "loopctl::metrics",
-                metric = "loopctl.vector.index.search",
-                k,
-                returned = matches.len(),
-                top_score = %top_score,
-                duration_ms = %started.elapsed().as_millis(),
-                "vector index search complete"
-            );
+            emit_search_metric(BACKEND, k, &matches, non_uuid_skipped, started);
             Ok(matches)
         })
     }
@@ -606,7 +716,18 @@ impl VectorIndex for QdrantIndex {
     fn remove(&self, id: Uuid) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + '_>> {
         Box::pin(async move {
             self.ensure_collection().await?;
-            if !self.point_exists(id).await? {
+            let lookup = || async { self.point_exists(id).await };
+            let exists = match lookup().await {
+                Ok(exists) => exists,
+                Err(error) => {
+                    if !Self::is_missing_collection(&error) {
+                        return Err(error);
+                    }
+                    self.reprovision().await?;
+                    lookup().await?
+                }
+            };
+            if !exists {
                 return Ok(());
             }
             let request = self.delete_request(id);
@@ -622,6 +743,35 @@ impl VectorIndex for QdrantIndex {
     fn len(&self) -> usize {
         self.count.len()
     }
+}
+
+/// Emit the search counter event with the backend and skip counts
+/// labeled.
+///
+/// The same event shape every loopctl index emits — `k`, `returned`,
+/// `top_score`, `duration_ms` — plus this crate's `backend` label and
+/// the count of returned points skipped because a foreign writer
+/// keyed them by anything but a UUID, so the stream distinguishes the
+/// external tiers and the silent-dropouts stay countable.
+fn emit_search_metric(
+    backend: &str,
+    k: usize,
+    matches: &[VectorMatch],
+    non_uuid_skipped: usize,
+    started: std::time::Instant,
+) {
+    let top_score = matches.first().map_or(0.0, |match_| match_.score);
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.vector.index.search",
+        backend,
+        k,
+        returned = matches.len(),
+        non_uuid_skipped,
+        top_score = %top_score,
+        duration_ms = %started.elapsed().as_millis(),
+        "vector index search complete"
+    );
 }
 
 #[cfg(test)]
@@ -667,8 +817,8 @@ mod tests {
                 .expect("the lazy channel builds without a server"),
             collection: "unreachable".to_string(),
             dim: 2,
-            count: crate::RemoteCount::default(),
-            provisioned: std::sync::OnceLock::new(),
+            count: std::sync::Arc::new(crate::RemoteCount::default()),
+            provisioned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let upsert = index.upsert_request(QdrantIndex::point(uuid::Uuid::new_v4(), vec![1.0, 0.0]));
         assert_eq!(

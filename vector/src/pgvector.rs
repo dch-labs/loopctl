@@ -8,14 +8,16 @@
 //! table name is validated as a strict SQL identifier because it is
 //! interpolated into DDL that cannot be parameterized, an existing
 //! table is adopted only when its `embedding` column's dimension
-//! matches the requested one (a foreign or mismatched table rejects
-//! at connect), and searches order by cosine distance (`<=>`) mapped
-//! once into the trait's descending-similarity contract — each search
-//! sizes a transaction-local `hnsw.ef_search` to `k`, so a `k` above
-//! pgvector's 40 candidate-list default still returns every row, and
-//! a `k` above the setting's server ceiling of 1000 rejects rather
-//! than returning short. Failures map to
-//! [`LoopError::Memory`] with Postgres's message preserved but
+//! matches the requested one **and** its `id` column is a not-null
+//! `uuid` under a unique index — the exact key shape the upsert's
+//! `ON CONFLICT (id)` arbitrates (a foreign or mismatched table
+//! rejects at connect) — and searches order by cosine distance
+//! (`<=>`) mapped once into the trait's descending-similarity
+//! contract — each search sizes a transaction-local `hnsw.ef_search`
+//! to `k`, so a `k` above the extension's 40 candidate-list default
+//! still returns every row, and a `k` above the setting's server
+//! ceiling of 1000 rejects rather than returning short. Failures map
+//! to [`LoopError::Memory`] with Postgres's message preserved but
 //! bounded; searches emit the same `loopctl.vector.index.search`
 //! metric event every loopctl index emits.
 //!
@@ -46,17 +48,19 @@ use crate::require_non_blank;
 /// store identically.
 const BACKEND: &str = "pgvector";
 
-/// pgvector's default HNSW candidate-list size.
+/// The pgvector extension's default HNSW candidate-list size.
 ///
-/// The server's `hnsw.ef_search` default of `40`; a search whose `k`
-/// exceeds it can come back short on an index-scan plan unless the
-/// candidate list is raised for the query's transaction, so every
-/// search sizes it to `k` (never below this default).
+/// The extension's `hnsw.ef_search` server default of `40`; a search
+/// whose `k` exceeds it can come back short on an index-scan plan
+/// unless the candidate list is raised for the query's transaction, so
+/// every search sizes it to `k` (never below this default).
 const DEFAULT_EF_SEARCH: usize = 40;
 
 /// The server-enforced ceiling on `hnsw.ef_search`.
 ///
-/// Postgres rejects values outside `1..=1000`; a `k` above the
+/// The pgvector extension rejects values outside `1..=1000` for the
+/// `hnsw.ef_search` GUC (the bound of the extension versions this
+/// crate runs against — 0.8.x on the tested images); a `k` above the
 /// ceiling therefore rejects client-side with the ceiling named
 /// rather than silently returning short results.
 const MAX_EF_SEARCH: usize = 1000;
@@ -66,17 +70,21 @@ const MAX_EF_SEARCH: usize = 1000;
 /// The table is provisioned at construction — created if absent with
 /// an `id UUID PRIMARY KEY` key, a `embedding VECTOR(<dim>)` column,
 /// and an HNSW `vector_cosine_ops` index — and an existing table is
-/// adopted only when its `embedding` column's dimension matches. The
-/// client-side count is seeded from the same construction —
-/// client-side bookkeeping whose exactness contract the count type's
-/// docs state.
+/// adopted only when its `embedding` column's dimension matches and
+/// its `id` column is a not-null `uuid` under a unique index, the key
+/// shape the upsert owns. The client-side count is seeded from the
+/// same construction — client-side bookkeeping whose exactness
+/// contract the count type's docs state.
 /// [`add`](VectorIndex::add) is `INSERT … ON CONFLICT (id) DO UPDATE`,
 /// so re-adding under one id replaces without leaking, and
 /// [`search`](VectorIndex::search) maps Postgres's ascending cosine
 /// distance into the trait's descending-similarity order, sizing a
 /// transaction-local `hnsw.ef_search` to `k` so the candidate list
 /// never caps results below the rows the store holds (a `k` above
-/// the 1000 ceiling rejects with the ceiling named).
+/// the 1000 ceiling rejects with the ceiling named). Vectors and
+/// queries must be finite with a non-zero norm — cosine over a
+/// degenerate vector is undefined, and the index scan would drop the
+/// row silently, so the rejection is loud and client-side.
 ///
 /// Construct through [`PgVectorIndexBuilder`] or
 /// [`from_env`](Self::from_env).
@@ -120,9 +128,11 @@ pub struct PgVectorIndex {
 
     /// The client-side count bookkeeping backing the trait's sync `len`.
     ///
-    /// Seeded from the table's row count at construction; see
-    /// [`RemoteCount`](crate::RemoteCount) for the exactness contract.
-    count: RemoteCount,
+    /// Seeded from the table's row count at construction and shared
+    /// with every clone of this handle, so one process answers one
+    /// count; see [`RemoteCount`](crate::RemoteCount) for the
+    /// exactness contract.
+    count: std::sync::Arc<RemoteCount>,
 }
 
 impl std::fmt::Debug for PgVectorIndex {
@@ -198,26 +208,31 @@ impl PgVectorIndexBuilder {
     ///
     /// # Errors
     ///
-    /// [`LoopError::Memory`] for a blank url, a table name that is not
-    /// a strict SQL identifier, a zero dimension, an unreachable
-    /// server, a missing `pgvector` extension, a failed provisioning,
-    /// or an existing table whose `embedding` column is missing,
-    /// untyped, or dimensioned differently from the request — the
-    /// message carries Postgres's own diagnosis, bounded.
+    /// [`LoopError::Memory`] for a blank url or table name, a table
+    /// name that is not a strict SQL identifier, a zero dimension, an
+    /// unreachable server, a missing `pgvector` extension, a failed
+    /// provisioning, or an existing table whose `embedding` column is
+    /// missing, untyped, or dimensioned differently from the request,
+    /// or whose `id` column is not a not-null `uuid` under a unique
+    /// index — the message carries Postgres's own diagnosis, bounded.
     pub async fn connect(self) -> Result<PgVectorIndex, LoopError> {
         require_non_blank(BACKEND, "url", &self.url)?;
+        require_non_blank(BACKEND, "table", &self.table)?;
         require_dim(BACKEND, self.dim)?;
         let table = crate::strict_identifier(BACKEND, self.table.as_str())?;
         let pool = PgPoolOptions::new()
             .max_connections(self.max_connections)
             .connect(self.url.as_str())
             .await
-            .map_err(|error| memory_error(BACKEND, error))?;
+            .map_err(|error| {
+                emit_provision_error(BACKEND);
+                memory_error(BACKEND, error)
+            })?;
         let index = PgVectorIndex {
             pool,
             table,
             dim: self.dim,
-            count: RemoteCount::default(),
+            count: std::sync::Arc::new(RemoteCount::default()),
         };
         index.provision().await?;
         index.seed_count().await?;
@@ -265,24 +280,31 @@ impl PgVectorIndex {
     /// `CREATE EXTENSION IF NOT EXISTS` does not serialize two in-flight
     /// creations — the loser hits the catalog's unique index — so a
     /// failure is accepted exactly when the extension exists afterwards
-    /// (another connection won the race).
+    /// (another connection won the race). A follow-up probe that cannot
+    /// answer (the server unreachable again) counts and returns the
+    /// creation's own diagnosis rather than guessing.
     ///
     /// # Errors
     ///
     /// [`LoopError::Memory`] when creation fails and the extension is
-    /// absent afterwards — the race lost, the load missing.
+    /// absent afterwards — the race lost, the load missing — or the
+    /// existence probe itself failed.
     async fn ensure_extension(&self) -> Result<(), LoopError> {
         let create = "CREATE EXTENSION IF NOT EXISTS vector";
         if let Err(error) = sqlx::query(sqlx::AssertSqlSafe(create))
             .execute(&self.pool)
             .await
         {
-            let present: Option<(String,)> =
-                sqlx::query_as("SELECT extname FROM pg_extension WHERE extname = 'vector'")
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|probe_error| memory_error(BACKEND, probe_error))?;
-            if present.is_some() {
+            let extension_present = match sqlx::query_as::<_, (String,)>(
+                "SELECT extname FROM pg_extension WHERE extname = 'vector'",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            {
+                Ok(rows) => rows.is_some(),
+                Err(_) => false,
+            };
+            if extension_present {
                 return Ok(());
             }
             emit_provision_error(BACKEND);
@@ -298,9 +320,15 @@ impl PgVectorIndex {
     /// first constructions within one process serialize: the lock
     /// holder creates and emits, the follower's probe sees the table
     /// and stays silent — the once-per-target event holds under
-    /// concurrency, not just sequentially. `IF NOT EXISTS` on both
-    /// statements remains the cross-process backstop. A probe that
-    /// finds the table already present routes through
+    /// concurrency, not just sequentially. The lock key is
+    /// `hashtext`'s 32-bit hash of the name, so two distinct table
+    /// names that collide on the hash merely serialize against each
+    /// other — harmless, never a correctness effect. The once-per-
+    /// target event is keyed by the configured name, so two spellings
+    /// that alias one relation (Postgres folds unquoted identifier
+    /// case) each emit once. `IF NOT EXISTS` on both statements
+    /// remains the cross-process backstop. A probe that finds the
+    /// table already present routes through
     /// [`validate_existing_table`](Self::validate_existing_table)
     /// before adoption, so the follow-on constructions reject a
     /// mismatched or foreign table instead of silently accepting it.
@@ -359,23 +387,45 @@ impl PgVectorIndex {
         Ok(())
     }
 
-    /// Validate an existing table's embedding column before adopting it.
+    /// Validate an existing table's shape before adopting it.
     ///
-    /// A handle keyed to the requested dim over a table whose column
+    /// A handle keyed to the requested dim over a table whose shape
     /// disagrees would pass every client-side check and fail on the
     /// server at the first add or search, so the shape rejects at
     /// connect instead. The probe runs inside the caller's
     /// advisory-locked transaction and reads the catalog: the table
     /// must carry a live `vector(n)`-typed `embedding` column whose
-    /// `n` equals the requested dim — a foreign table without the
-    /// column, an untyped `vector` column, and a mismatched `n` all
-    /// reject with the table's shape named.
+    /// `n` equals the requested dim, **and** an `id` column of type
+    /// `uuid` that is not null and covered by a unique non-partial
+    /// index over exactly that column — the key the upsert's
+    /// `ON CONFLICT (id)` arbitrates. A foreign table without the
+    /// embedding column, an untyped `vector` column, a mismatched
+    /// `n`, a text- or integer-keyed `id`, a nullable `id`, and an
+    /// `id` whose uniqueness rests on a partial index all reject with
+    /// the table's actual shape named.
     ///
     /// # Errors
     ///
-    /// [`LoopError::Memory`] when the probe fails or the table's shape
-    /// does not match the requested dimension.
+    /// [`LoopError::Memory`] when a probe fails or the table's shape
+    /// does not match what this index requires.
     async fn validate_existing_table(&self, tx: &mut sqlx::PgConnection) -> Result<(), LoopError> {
+        self.validate_embedding_column(tx).await?;
+        self.validate_id_column(tx).await
+    }
+
+    /// Validate the `embedding` column's vector type and dimension.
+    ///
+    /// The first half of adoption validation: the column must be a
+    /// live `vector(n)` whose `n` equals the requested dim.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Memory`] when the probe fails or the column is
+    /// missing, untyped, or dimensioned differently.
+    async fn validate_embedding_column(
+        &self,
+        tx: &mut sqlx::PgConnection,
+    ) -> Result<(), LoopError> {
         let column: Option<(i32,)> = sqlx::query_as(
             "SELECT a.atttypmod FROM pg_attribute a \
              WHERE a.attrelid = $1::regclass AND a.attname = 'embedding' \
@@ -406,6 +456,58 @@ impl PgVectorIndex {
              for {} dimensions",
             self.table, self.dim
         )))
+    }
+
+    /// Validate the `id` column's key shape.
+    ///
+    /// The second half of adoption validation: the column must be
+    /// typed `uuid`, marked not null, and covered by a unique,
+    /// non-partial index over exactly that one column — the shape
+    /// `ON CONFLICT (id)` needs to arbitrate the upsert. Anything
+    /// else (a text key, a nullable unique, uniqueness from a partial
+    /// index) writes rows the handle could never read back.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Memory`] when the probe fails or the key shape
+    /// does not match.
+    async fn validate_id_column(&self, tx: &mut sqlx::PgConnection) -> Result<(), LoopError> {
+        let key: Option<(bool, bool)> = sqlx::query_as(
+            "SELECT a.attnotnull, EXISTS ( \
+                SELECT 1 FROM pg_index i \
+                WHERE i.indrelid = a.attrelid AND i.indisunique AND i.indisvalid \
+                  AND i.indpred IS NULL AND i.indnkeyatts = 1 \
+                  AND (string_to_array(i.indkey::text, ' '))[1] = a.attnum::text \
+             ) FROM pg_attribute a \
+             WHERE a.attrelid = $1::regclass AND a.attname = 'id' \
+             AND a.atttypid = 'uuid'::regtype AND NOT a.attisdropped",
+        )
+        .bind(self.table.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| memory_error(BACKEND, error))?;
+        let Some((not_null, uniquely_indexed)) = key else {
+            return Err(LoopError::Memory(format!(
+                "{BACKEND}: table {} exists and has no uuid-typed id column; \
+                 this index upserts with ON CONFLICT (id) over a uuid key",
+                self.table
+            )));
+        };
+        if !not_null {
+            return Err(LoopError::Memory(format!(
+                "{BACKEND}: table {} exists and its id column is nullable; \
+                 this index requires a not-null uuid id under a unique index",
+                self.table
+            )));
+        }
+        if !uniquely_indexed {
+            return Err(LoopError::Memory(format!(
+                "{BACKEND}: table {} exists and its id column has no unique index over \
+                 exactly id; ON CONFLICT (id) cannot arbitrate the upsert",
+                self.table
+            )));
+        }
+        Ok(())
     }
 
     /// Fetch the true row count once and seed the bookkeeping.
@@ -454,6 +556,7 @@ impl VectorIndex for PgVectorIndex {
                     self.dim
                 )));
             }
+            crate::require_usable_vector(BACKEND, vector.as_slice())?;
             let sql = format!(
                 "INSERT INTO {table} (id, embedding) VALUES ($1, $2) \
                  ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding",
@@ -487,11 +590,17 @@ impl VectorIndex for PgVectorIndex {
                     self.dim
                 )));
             }
+            crate::require_usable_vector(BACKEND, &query)?;
             if k > MAX_EF_SEARCH {
                 return Err(LoopError::Memory(format!(
                     "{BACKEND}: k {k} exceeds the hnsw.ef_search ceiling of {MAX_EF_SEARCH}; \
                      lower k"
                 )));
+            }
+            let started = std::time::Instant::now();
+            if k == 0 {
+                emit_search_metric(BACKEND, k, &[], started);
+                return Ok(Vec::new());
             }
             let sql = format!(
                 "SELECT id, CAST(1 - (embedding <=> $1::vector) AS REAL) AS score \
@@ -508,7 +617,6 @@ impl VectorIndex for PgVectorIndex {
                 .execute(&mut *tx)
                 .await
                 .map_err(|error| memory_error(BACKEND, error))?;
-            let started = std::time::Instant::now();
             let rows: Vec<(Uuid, f32)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(Vector::from(query))
                 .bind(i64::try_from(k).unwrap_or(i64::MAX))
@@ -525,16 +633,7 @@ impl VectorIndex for PgVectorIndex {
                     score: score.clamp(-1.0, 1.0),
                 })
                 .collect();
-            let top_score = matches.first().map_or(0.0, |match_| match_.score);
-            tracing::debug!(
-                target: "loopctl::metrics",
-                metric = "loopctl.vector.index.search",
-                k,
-                returned = matches.len(),
-                top_score = %top_score,
-                duration_ms = %started.elapsed().as_millis(),
-                "vector index search complete"
-            );
+            emit_search_metric(BACKEND, k, &matches, started);
             Ok(matches)
         })
     }
@@ -557,6 +656,31 @@ impl VectorIndex for PgVectorIndex {
     fn len(&self) -> usize {
         self.count.len()
     }
+}
+
+/// Emit the search counter event with the backend labeled.
+///
+/// The same event shape every loopctl index emits — `k`, `returned`,
+/// `top_score`, `duration_ms` — plus this crate's `backend` label, so
+/// the stream distinguishes the external tiers the way the in-process
+/// indexes carry their `provider` label.
+fn emit_search_metric(
+    backend: &str,
+    k: usize,
+    matches: &[VectorMatch],
+    started: std::time::Instant,
+) {
+    let top_score = matches.first().map_or(0.0, |match_| match_.score);
+    tracing::debug!(
+        target: "loopctl::metrics",
+        metric = "loopctl.vector.index.search",
+        backend,
+        k,
+        returned = matches.len(),
+        top_score = %top_score,
+        duration_ms = %started.elapsed().as_millis(),
+        "vector index search complete"
+    );
 }
 
 #[cfg(test)]

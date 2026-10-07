@@ -123,6 +123,17 @@ pub struct AnthropicClient {
     /// part order — wire-legal on every Messages-compatible endpoint,
     /// unlike an unsigned native thinking block.
     replay_reasoning: bool,
+
+    /// Whether requests carry prompt-cache breakpoints.
+    ///
+    /// Off by default: the wire is byte-identical to a client that never
+    /// asked to cache. When on, every request marks up to four
+    /// `cache_control` breakpoints (the last tool, the system block, and
+    /// the last two content blocks of the final message) so the server
+    /// can serve the stable conversation prefix from cache across an
+    /// agentic loop's turns. See
+    /// [`AnthropicClientBuilder::prompt_caching`].
+    prompt_caching: bool,
 }
 
 impl AnthropicClient {
@@ -229,6 +240,29 @@ impl AnthropicClient {
         format!("{}/v1/messages", self.base_url)
     }
 
+    /// Build a request body under this client's full configuration.
+    ///
+    /// Wraps [`build_request_body`] with the client-level knobs
+    /// (`max_tokens`, `replay_reasoning`) and, when
+    /// [`prompt_caching`](Self::prompt_caching) is on, applies
+    /// [`apply_prompt_cache_breakpoints`] to the result so every
+    /// outgoing request carries the cache markers. Both wire paths —
+    /// streaming and non-streaming — go through here, so the two can
+    /// never disagree about which requests ask to be cached.
+    fn build_body(
+        &self,
+        spec: &RequestBodySpec<'_>,
+        stream: bool,
+        effort: Option<crate::structured::ThinkingEffort>,
+    ) -> Value {
+        let mut body =
+            build_request_body(spec, stream, self.max_tokens, effort, self.replay_reasoning);
+        if self.prompt_caching {
+            apply_prompt_cache_breakpoints(&mut body);
+        }
+        body
+    }
+
     /// Build a typed [`NonStreamingResponse`] from Anthropic's native JSON.
     ///
     /// Anthropic's native response already carries a `content` array of typed
@@ -310,11 +344,12 @@ fn extract_usage(raw: &Value) -> Option<Usage> {
 /// Extract token [`Usage`] from a single Anthropic `usage` object.
 ///
 /// Reads the object's `input_tokens` and `output_tokens`, defaulting each to
-/// zero when absent or non-numeric. Returns `None` when both counts are zero,
-/// so an all-zero report is indistinguishable from a missing one — the
-/// convention both response paths apply. Shared by the non-streaming
-/// `usage` field ([`extract_usage`]) and the streaming `message_start`
-/// latch in `on_message_start`.
+/// zero when absent or non-numeric, and `cache_read_input_tokens` into
+/// [`Usage::cached_input_tokens`] the same way. Returns `None` when both
+/// counts are zero, so an all-zero report is indistinguishable from a
+/// missing one — the convention both response paths apply. Shared by the
+/// non-streaming `usage` field ([`extract_usage`]) and the streaming
+/// `message_start` latch in `on_message_start`.
 fn extract_usage_object(usage: &Value) -> Option<Usage> {
     let input = usage
         .get("input_tokens")
@@ -324,7 +359,11 @@ fn extract_usage_object(usage: &Value) -> Option<Usage> {
         .get("output_tokens")
         .and_then(Value::as_u64)
         .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
-    (input > 0 || output > 0).then(|| Usage::new(input, output))
+    let cached = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+    (input > 0 || output > 0).then(|| Usage::new(input, output).with_cached_input(cached))
 }
 
 impl ApiClient for AnthropicClient {
@@ -392,7 +431,7 @@ impl ApiClient for AnthropicClient {
             .clone()
             .unwrap_or_else(|| crate::error::recover_guard(self.model.lock()).clone());
         let rf = options.response_format.as_ref();
-        let body = build_request_body(
+        let body = self.build_body(
             &RequestBodySpec {
                 model: &model,
                 messages: &request.messages,
@@ -402,9 +441,7 @@ impl ApiClient for AnthropicClient {
                 tool_constraint: &options.tool_constraint,
             },
             true,
-            self.max_tokens,
             effort,
-            self.replay_reasoning,
         );
         let url = self.messages_url();
         let api_key = self.api_key.clone();
@@ -455,7 +492,7 @@ impl ApiClient for AnthropicClient {
             .clone()
             .unwrap_or_else(|| crate::error::recover_guard(self.model.lock()).clone());
         let rf = options.response_format.as_ref();
-        let body = build_request_body(
+        let body = self.build_body(
             &RequestBodySpec {
                 model: &model,
                 messages: &request.messages,
@@ -465,9 +502,7 @@ impl ApiClient for AnthropicClient {
                 tool_constraint: &options.tool_constraint,
             },
             false,
-            self.max_tokens,
             effort,
-            self.replay_reasoning,
         );
         let url = self.messages_url();
         Box::pin(async move {
@@ -525,6 +560,12 @@ pub struct AnthropicClientBuilder {
     /// client field's docs for the wire shape.
     replay_reasoning: bool,
 
+    /// Whether requests carry prompt-cache breakpoints.
+    ///
+    /// Set via [`AnthropicClientBuilder::prompt_caching`]; see the
+    /// client field's docs for the breakpoint placement.
+    prompt_caching: bool,
+
     /// Shared HTTP client configuration (timeouts, pool, TCP).
     ///
     /// Holds the timeout, connection-pool, and TCP knobs that apply to the
@@ -549,6 +590,7 @@ impl Default for AnthropicClientBuilder {
             max_tokens: DEFAULT_MAX_TOKENS,
             thinking_effort: None,
             replay_reasoning: false,
+            prompt_caching: false,
             http: super::HttpClientConfig::default(),
             seed: super::ProfileSeed::default(),
         }
@@ -666,6 +708,25 @@ impl AnthropicClientBuilder {
         self
     }
 
+    /// Mark prompt-cache breakpoints on every request.
+    ///
+    /// Off by default. When enabled, each request carries
+    /// `cache_control` breakpoints — on the last tool definition, on the
+    /// system block, and on the last two content blocks of the final
+    /// message — so the provider caches the stable conversation prefix
+    /// and later turns in the same loop re-use it instead of
+    /// re-processing the whole context. On `api.anthropic.com` this is
+    /// a latency and cost win for any multi-turn loop; a read of the
+    /// cache shows up in [`Usage::cached_input_tokens`]. Endpoints
+    /// that reject the extra field should leave this off.
+    ///
+    /// [`Usage::cached_input_tokens`]: crate::stream::Usage::cached_input_tokens
+    #[must_use]
+    pub fn prompt_caching(mut self, enabled: bool) -> Self {
+        self.prompt_caching = enabled;
+        self
+    }
+
     /// Set the HTTP read timeout.
     ///
     /// This bounds *idleness* — how long a gap between bytes on the
@@ -775,6 +836,7 @@ impl AnthropicClientBuilder {
             max_tokens: self.max_tokens,
             thinking_effort: self.thinking_effort,
             replay_reasoning: self.replay_reasoning,
+            prompt_caching: self.prompt_caching,
         })
     }
 }
@@ -993,6 +1055,82 @@ fn build_request_body(
     }
 
     body
+}
+
+/// Mark one content block as a cache breakpoint.
+///
+/// Inserts `cache_control: {type: "ephemeral"}` on the block object;
+/// non-object blocks are left alone rather than reshaped.
+fn mark_cache_breakpoint(block: &mut Value) {
+    if let Some(obj) = block.as_object_mut() {
+        obj.insert(
+            "cache_control".to_string(),
+            serde_json::json!({ "type": "ephemeral" }),
+        );
+    }
+}
+
+/// Place prompt-cache breakpoints on a built Messages request body.
+///
+/// Mutates the body in place: the last tool definition, the system
+/// prompt (rewritten from its plain-string form into a single marked
+/// text block), and the last two content blocks of the final message
+/// each get `cache_control`. That placement follows the provider's
+/// guidance for agentic loops — the tools and system are stable for the
+/// session's life, and the trailing pair of message blocks rolls the
+/// cached prefix forward one turn at a time, so each request shares the
+/// longest prefix with its predecessor. At most four breakpoints are
+/// placed, matching the provider's per-request cap. A final message
+/// whose content is a plain string is wrapped into a one-block array so
+/// it can carry the marker; an empty system string stays a string,
+/// since marking nothing-at-all buys no cache.
+fn apply_prompt_cache_breakpoints(body: &mut Value) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+
+    if let Some(Value::Array(tools)) = obj.get_mut("tools")
+        && let Some(last) = tools.last_mut()
+    {
+        mark_cache_breakpoint(last);
+    }
+
+    let system_text = obj
+        .get("system")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(text) = system_text.filter(|t| !t.is_empty()) {
+        obj.insert(
+            "system".to_string(),
+            serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral" },
+            }]),
+        );
+    }
+
+    if let Some(Value::Array(messages)) = obj.get_mut("messages")
+        && let Some(last_message) = messages.last_mut().and_then(Value::as_object_mut)
+        && let Some(content) = last_message.get_mut("content")
+    {
+        match content {
+            Value::String(text) => {
+                let text = text.clone();
+                *content = serde_json::json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": { "type": "ephemeral" },
+                }]);
+            }
+            Value::Array(blocks) => {
+                for block in blocks.iter_mut().rev().take(2) {
+                    mark_cache_breakpoint(block);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The Messages API `thinking.budget_tokens` for one effort level.
@@ -1644,8 +1782,9 @@ impl StreamEmitter {
     /// unrecognized value) and `/usage/input_tokens` +
     /// `/usage/output_tokens`, each merged with the
     /// [`start_usage`](Self::start_usage) latch by taking the larger of the
-    /// two counts. The max matters because the two events split the
-    /// reporting: `message_start` carries the input count the terminal
+    /// two counts — `/usage/cache_read_input_tokens` merges the same way
+    /// into the cached share. The max matters because the two events split
+    /// the reporting: `message_start` carries the input count the terminal
     /// delta omits, and a server-tools turn's delta may revise either count
     /// upward from its start value. The merge is max-by-assumption, not
     /// max-by-guarantee: a genuine downward revision by the terminal delta
@@ -1680,11 +1819,16 @@ impl StreamEmitter {
             .pointer("/usage/output_tokens")
             .and_then(Value::as_u64)
             .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+        let delta_cached = v
+            .pointer("/usage/cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
         let in_tok = delta_in.max(self.start_usage.input_tokens);
         let out_tok = delta_out.max(self.start_usage.output_tokens);
+        let cached_tok = delta_cached.max(self.start_usage.cached_input_tokens);
 
         let usage = if in_tok > 0 || out_tok > 0 {
-            Some(Usage::new(in_tok, out_tok))
+            Some(Usage::new(in_tok, out_tok).with_cached_input(cached_tok))
         } else {
             None
         };
@@ -2468,6 +2612,111 @@ mod tests {
         assert_eq!(content[0]["type"], "tool_result");
         assert_eq!(content[0]["tool_use_id"], "call_1");
         assert_eq!(content[0]["content"], "result text");
+    }
+
+    #[test]
+    fn prompt_cache_breakpoints_mark_tools_system_and_tail_blocks() {
+        let msgs = vec![
+            Message::user("earlier turn"),
+            Message::new(
+                Role::User,
+                vec![
+                    MessagePart::ToolResult {
+                        call_id: "call_1".into(),
+                        name: "echo".into(),
+                        output: ToolContent::from_string("result text"),
+                        is_error: None,
+                    },
+                    MessagePart::ToolResult {
+                        call_id: "call_2".into(),
+                        name: "echo".into(),
+                        output: ToolContent::from_string("later result"),
+                        is_error: None,
+                    },
+                ],
+            ),
+        ];
+        let tools = vec![ToolSchema {
+            tool: "search".into(),
+            description: "Search the web".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let mut body = build_request_body(
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: Some("be brief"),
+                tools: Some(&tools),
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+            false,
+        );
+        apply_prompt_cache_breakpoints(&mut body);
+
+        let tools_arr = body["tools"].as_array().unwrap();
+        assert_eq!(
+            tools_arr[0]["cache_control"]["type"], "ephemeral",
+            "the single tool definition carries the marker"
+        );
+
+        let system_arr = body["system"].as_array().unwrap();
+        assert_eq!(system_arr[0]["type"], "text");
+        assert_eq!(system_arr[0]["text"], "be brief");
+        assert_eq!(system_arr[0]["cache_control"]["type"], "ephemeral");
+
+        let final_blocks = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(final_blocks.len(), 2);
+        assert_eq!(
+            final_blocks[0]["cache_control"]["type"], "ephemeral",
+            "second-to-last block keeps the previous prefix cached"
+        );
+        assert_eq!(
+            final_blocks[1]["cache_control"]["type"], "ephemeral",
+            "last block rolls the cached prefix forward"
+        );
+
+        let earlier_content = &body["messages"].as_array().unwrap()[0]["content"];
+        assert_eq!(
+            earlier_content, "earlier turn",
+            "non-tail messages keep their plain-string shape"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_breakpoints_wrap_string_tail_and_skip_empty_system() {
+        let msgs = vec![Message::user("hello")];
+        let mut body = build_request_body(
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
+            false,
+            DEFAULT_MAX_TOKENS,
+            None,
+            false,
+        );
+        apply_prompt_cache_breakpoints(&mut body);
+
+        assert_eq!(
+            body["system"], "",
+            "an empty system stays a string — marking nothing buys no cache"
+        );
+        let tail = body["messages"].as_array().unwrap().last().unwrap();
+        let blocks = tail["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "hello");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]
@@ -3273,6 +3522,37 @@ mod tests {
     }
 
     #[test]
+    fn build_response_reports_cached_input_tokens() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "hello"}],
+            "usage": {
+                "input_tokens": 1500,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 1200,
+                "cache_creation_input_tokens": 300
+            }
+        });
+        let response = AnthropicClient::build_response(&raw);
+        let usage = response.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 1500);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(
+            usage.cached_input_tokens, 1200,
+            "the cached read share rides the usage report; creation spend is not a read"
+        );
+    }
+
+    #[test]
+    fn build_response_without_cache_fields_reports_zero_cached() {
+        let raw = serde_json::json!({
+            "content": [{"type": "text", "text": "hello"}],
+            "usage": {"input_tokens": 30, "output_tokens": 12}
+        });
+        let response = AnthropicClient::build_response(&raw);
+        assert_eq!(response.usage.expect("usage").cached_input_tokens, 0);
+    }
+
+    #[test]
     fn build_response_maps_tool_use_block_and_tool_call() {
         let raw = serde_json::json!({
             "content": [{
@@ -4008,6 +4288,74 @@ mod tests {
             "input tokens arrive on message_start and must survive to the terminal usage"
         );
         assert_eq!(usage.output_tokens, 15);
+    }
+
+    #[test]
+    fn emitter_merges_cached_input_tokens_across_start_and_delta() {
+        let mut em = StreamEmitter::default();
+        em.on_message_start(Some(&serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3",
+                "usage": {
+                    "input_tokens": 1500,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 1200
+                }
+            }
+        })));
+        em.drain();
+        em.on_message_delta(Some(serde_json::json!({
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {
+                "output_tokens": 15,
+                "cache_read_input_tokens": 1250
+            }
+        })));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        let usage = usage.expect("MessageDelta must carry usage");
+        assert_eq!(usage.input_tokens, 1500);
+        assert_eq!(
+            usage.cached_input_tokens, 1250,
+            "the terminal delta's revised cache read wins over the latched start value"
+        );
+    }
+
+    #[test]
+    fn emitter_keeps_latched_cached_tokens_when_delta_omits_them() {
+        let mut em = StreamEmitter::default();
+        em.on_message_start(Some(&serde_json::json!({
+            "message": {
+                "id": "msg_1",
+                "model": "claude-3",
+                "usage": {
+                    "input_tokens": 1500,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 1200
+                }
+            }
+        })));
+        em.drain();
+        em.on_message_delta(Some(serde_json::json!({
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 15}
+        })));
+        let events = em.drain();
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
+            _ => None,
+        });
+        assert_eq!(
+            usage
+                .expect("MessageDelta must carry usage")
+                .cached_input_tokens,
+            1200,
+            "a delta without cache fields must not erase the start event's cached share"
+        );
     }
 
     #[test]

@@ -152,7 +152,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: make derive-consumer
 
-  vector:
+  vector-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: make vector-check
+
+  vector-e2e:
     runs-on: ubuntu-latest
     services:
       qdrant:
@@ -167,7 +179,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres"
+          --health-cmd "pg_isready -U postgres -d postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -179,7 +191,6 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: make vector-check
       - name: Wait for Qdrant readiness
         run: |
           for i in $(seq 1 30); do

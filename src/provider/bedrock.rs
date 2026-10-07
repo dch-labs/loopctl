@@ -1485,7 +1485,9 @@ fn indexed_text(index: usize, text: &str) -> StreamEvent {
 ///
 /// Converse reports camelCase token counts (`inputTokens`,
 /// `outputTokens`); missing or oversized values default to 0 rather
-/// than erroring mid-stream.
+/// than erroring mid-stream. Converse reports its cache reads as
+/// `cacheReadInputTokens` (and writes as `cacheWriteInputTokens`),
+/// which map onto the cached share the same way.
 fn converse_usage(usage: &serde_json::Value) -> crate::stream::Usage {
     crate::stream::Usage {
         input_tokens: usage
@@ -1495,6 +1497,11 @@ fn converse_usage(usage: &serde_json::Value) -> crate::stream::Usage {
             .unwrap_or(0),
         output_tokens: usage
             .get("outputTokens")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(0),
+        cached_input_tokens: usage
+            .get("cacheReadInputTokens")
             .and_then(serde_json::Value::as_u64)
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(0),
@@ -1821,6 +1828,11 @@ fn bedrock_non_streaming_response(
                     .and_then(serde_json::Value::as_u64)
                     .and_then(|v| u32::try_from(v).ok())
                     .unwrap_or(0),
+                cached_input_tokens: u
+                    .get("cache_read_input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(0),
             }),
             stop_reason: anthropic_stop_to_engine(stop),
         });
@@ -1857,18 +1869,7 @@ fn bedrock_non_streaming_response(
             .unwrap_or("end_turn");
         return Ok(NonStreamingResponse {
             message: crate::message::Message::new(crate::message::Role::Assistant, parts),
-            usage: json.pointer("/usage").map(|u| crate::stream::Usage {
-                input_tokens: u
-                    .get("inputTokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|v| u32::try_from(v).ok())
-                    .unwrap_or(0),
-                output_tokens: u
-                    .get("outputTokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|v| u32::try_from(v).ok())
-                    .unwrap_or(0),
-            }),
+            usage: json.pointer("/usage").map(converse_usage),
             stop_reason: anthropic_stop_to_engine(stop),
         });
     }
@@ -2271,7 +2272,8 @@ mod tests {
             usage,
             Some(crate::stream::Usage {
                 input_tokens: 4,
-                output_tokens: 6
+                output_tokens: 6,
+                cached_input_tokens: 0,
             })
         );
     }
@@ -2638,7 +2640,8 @@ mod tests {
             usage,
             Some(crate::stream::Usage {
                 input_tokens: 3,
-                output_tokens: 5
+                output_tokens: 5,
+                cached_input_tokens: 0,
             })
         );
     }
@@ -2937,6 +2940,7 @@ mod tests {
                 if d.usage == Some(crate::stream::Usage {
                     input_tokens: 7,
                     output_tokens: 0,
+                cached_input_tokens: 0,
                 }))),
             "a usage object reporting only one side zeroes the other: {events:?}"
         );
@@ -3176,7 +3180,8 @@ mod tests {
             usage,
             Some(crate::stream::Usage {
                 input_tokens: 3,
-                output_tokens: 5
+                output_tokens: 5,
+                cached_input_tokens: 0,
             })
         );
     }
@@ -3228,7 +3233,8 @@ mod tests {
             usage,
             Some(crate::stream::Usage {
                 input_tokens: 4,
-                output_tokens: 6
+                output_tokens: 6,
+                cached_input_tokens: 0,
             })
         );
     }
@@ -3274,6 +3280,7 @@ mod tests {
                 if d.usage == Some(crate::stream::Usage {
                     input_tokens: 0,
                     output_tokens: 0,
+                cached_input_tokens: 0,
                 }))),
             "counts beyond u32 clamp to 0 rather than truncating: {events:?}"
         );

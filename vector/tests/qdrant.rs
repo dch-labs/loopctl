@@ -7,7 +7,7 @@
 //! with a printed reason instead of failing hermetic runs.
 //!
 //! Run: `LOOPCTL_VECTOR_E2E=1 cargo test -p loopctl-vector --features
-//! qdrant --test qdrant`
+//! qdrant,testing --test qdrant`
 
 #![allow(
     clippy::unwrap_used,
@@ -58,35 +58,52 @@ fn gated() -> bool {
 #[tokio::test]
 async fn upsert_replaces_without_leaking() {
     if gated() {
-        contract::upsert_replaces_without_leaking(&factory()).await;
+        contract::upsert_replaces_without_leaking(&factory())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn zero_k_returns_empty() {
+    if gated() {
+        contract::zero_k_returns_empty(&factory()).await.unwrap();
     }
 }
 
 #[tokio::test]
 async fn search_orders_by_cosine_and_respects_k() {
     if gated() {
-        contract::search_orders_by_cosine_and_respects_k(&factory()).await;
+        contract::search_orders_by_cosine_and_respects_k(&factory())
+            .await
+            .unwrap();
     }
 }
 
 #[tokio::test]
 async fn remove_then_len_shrinks_and_id_is_gone() {
     if gated() {
-        contract::remove_then_len_shrinks_and_id_is_gone(&factory()).await;
+        contract::remove_then_len_shrinks_and_id_is_gone(&factory())
+            .await
+            .unwrap();
     }
 }
 
 #[tokio::test]
 async fn dim_mismatch_rejects_at_add() {
     if gated() {
-        contract::dim_mismatch_rejects_at_add(&factory()).await;
+        contract::dim_mismatch_rejects_at_add(&factory())
+            .await
+            .unwrap();
     }
 }
 
 #[tokio::test]
 async fn provisioning_is_idempotent() {
     if gated() {
-        contract::provisioning_is_idempotent(&factory()).await;
+        contract::provisioning_is_idempotent(&factory())
+            .await
+            .unwrap();
     }
 }
 
@@ -292,6 +309,173 @@ fn fixture_client() -> qdrant_client::Qdrant {
         .skip_compatibility_check()
         .build()
         .expect("the lazy channel builds without a server")
+}
+
+#[tokio::test]
+async fn a_float16_datatype_collection_rejects_at_connect() {
+    if !gated() {
+        return;
+    }
+    let collection = contract::unique_name("float16");
+    let client = fixture_client();
+    let mut params =
+        qdrant_client::qdrant::VectorParamsBuilder::new(4, qdrant_client::qdrant::Distance::Cosine)
+            .build();
+    params.datatype = Some(i32::from(qdrant_client::qdrant::Datatype::Float16));
+    client
+        .create_collection(
+            qdrant_client::qdrant::CreateCollectionBuilder::new(collection.clone()).vectors_config(
+                qdrant_client::qdrant::vectors_config::Config::Params(params),
+            ),
+        )
+        .await
+        .expect("the float16 fixture collection creates");
+    let rejection = QdrantIndex::builder(url(), collection, 4).connect().await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("datatype")),
+        "a quantized datatype silently changes write precision and must reject: {rejection:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_multivector_collection_rejects_at_connect() {
+    if !gated() {
+        return;
+    }
+    let collection = contract::unique_name("multivector");
+    let client = fixture_client();
+    let mut params =
+        qdrant_client::qdrant::VectorParamsBuilder::new(4, qdrant_client::qdrant::Distance::Cosine)
+            .build();
+    params.multivector_config = Some(qdrant_client::qdrant::MultiVectorConfig {
+        comparator: i32::from(qdrant_client::qdrant::MultiVectorComparator::MaxSim),
+    });
+    client
+        .create_collection(
+            qdrant_client::qdrant::CreateCollectionBuilder::new(collection.clone()).vectors_config(
+                qdrant_client::qdrant::vectors_config::Config::Params(params),
+            ),
+        )
+        .await
+        .expect("the multivector fixture collection creates");
+    let rejection = QdrantIndex::builder(url(), collection, 4).connect().await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("multivector")),
+        "a MaxSim multivector layout scores differently and must reject: {rejection:?}"
+    );
+}
+
+#[tokio::test]
+async fn cloned_handles_share_one_count_ledger() {
+    if !gated() {
+        return;
+    }
+    let index = QdrantIndex::builder(url(), contract::unique_name("clone_ledger"), 2)
+        .connect()
+        .await
+        .expect("the fixture collection provisions");
+    let clone = index.clone();
+    index
+        .add(uuid::Uuid::new_v4(), contract::axis(0))
+        .await
+        .expect("the original's add lands");
+    assert_eq!(
+        clone.len(),
+        1,
+        "a clone shares the count ledger — one process, one count, not two drifting snapshots"
+    );
+    clone
+        .add(uuid::Uuid::new_v4(), contract::axis(1))
+        .await
+        .expect("the clone's add lands");
+    assert_eq!(
+        index.len(),
+        2,
+        "the original sees the clone's write through the shared ledger"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_collection_reprovisions_on_the_next_operation() {
+    if !gated() {
+        return;
+    }
+    let collection = contract::unique_name("resurrect");
+    let index = QdrantIndex::builder(url(), collection.clone(), 2)
+        .connect()
+        .await
+        .expect("the fixture collection provisions");
+    let id = uuid::Uuid::new_v4();
+    index
+        .add(id, contract::axis(0))
+        .await
+        .expect("the pre-delete add lands");
+    let client = fixture_client();
+    client
+        .delete_collection(collection)
+        .await
+        .expect("the operator's drop lands");
+    let replacement = uuid::Uuid::new_v4();
+    index
+        .add(replacement, contract::axis(1))
+        .await
+        .expect("an operation against a dropped collection re-provisions and succeeds");
+    let hits = index
+        .search(&contract::axis(1), 5)
+        .await
+        .expect("the re-provisioned collection answers a search");
+    assert!(
+        hits.iter().any(|hit| hit.id == replacement),
+        "the retried write is durable after re-provisioning: {hits:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_zero_norm_vector_rejects_at_add() {
+    if !gated() {
+        return;
+    }
+    let index = QdrantIndex::builder(url(), contract::unique_name("zero_norm"), 2)
+        .connect()
+        .await
+        .expect("the fixture collection provisions");
+    let rejection = index
+        .add(
+            uuid::Uuid::new_v4(),
+            loopctl::memory::vector::Embedding::new(vec![0.0, 0.0]),
+        )
+        .await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("zero")),
+        "a zero-norm vector rejects identically to the pgvector tier: {rejection:?}"
+    );
+    assert_eq!(index.len(), 0, "the rejected vector stored nothing");
+}
+
+#[tokio::test]
+async fn a_zero_norm_query_rejects_at_search() {
+    if !gated() {
+        return;
+    }
+    let index = QdrantIndex::builder(url(), contract::unique_name("zero_query"), 2)
+        .connect()
+        .await
+        .expect("the fixture collection provisions");
+    let rejection = index
+        .search(&loopctl::memory::vector::Embedding::new(vec![0.0, 0.0]), 5)
+        .await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("zero")),
+        "a zero-norm query rejects instead of erroring or matching arbitrarily: {rejection:?}"
+    );
 }
 
 #[tokio::test]

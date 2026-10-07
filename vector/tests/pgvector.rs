@@ -8,7 +8,7 @@
 //! hermetic runs.
 //!
 //! Run: `LOOPCTL_VECTOR_E2E=1 cargo test -p loopctl-vector --features
-//! pgvector --test pgvector`
+//! pgvector,testing --test pgvector`
 
 #![allow(
     clippy::unwrap_used,
@@ -60,35 +60,52 @@ fn gated() -> bool {
 #[tokio::test]
 async fn upsert_replaces_without_leaking() {
     if gated() {
-        contract::upsert_replaces_without_leaking(&factory()).await;
+        contract::upsert_replaces_without_leaking(&factory())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn zero_k_returns_empty() {
+    if gated() {
+        contract::zero_k_returns_empty(&factory()).await.unwrap();
     }
 }
 
 #[tokio::test]
 async fn search_orders_by_cosine_and_respects_k() {
     if gated() {
-        contract::search_orders_by_cosine_and_respects_k(&factory()).await;
+        contract::search_orders_by_cosine_and_respects_k(&factory())
+            .await
+            .unwrap();
     }
 }
 
 #[tokio::test]
 async fn remove_then_len_shrinks_and_id_is_gone() {
     if gated() {
-        contract::remove_then_len_shrinks_and_id_is_gone(&factory()).await;
+        contract::remove_then_len_shrinks_and_id_is_gone(&factory())
+            .await
+            .unwrap();
     }
 }
 
 #[tokio::test]
 async fn dim_mismatch_rejects_at_add() {
     if gated() {
-        contract::dim_mismatch_rejects_at_add(&factory()).await;
+        contract::dim_mismatch_rejects_at_add(&factory())
+            .await
+            .unwrap();
     }
 }
 
 #[tokio::test]
 async fn provisioning_is_idempotent() {
     if gated() {
-        contract::provisioning_is_idempotent(&factory()).await;
+        contract::provisioning_is_idempotent(&factory())
+            .await
+            .unwrap();
     }
 }
 
@@ -294,6 +311,188 @@ async fn seed_and_analyze(pool: &sqlx::PgPool, table: &str, rows: i64) {
         .execute(pool)
         .await
         .expect("the fixture table is analyzed");
+}
+
+#[tokio::test]
+async fn a_text_keyed_table_rejects_at_connect() {
+    if !gated() {
+        return;
+    }
+    let table = contract::unique_name("text_keyed");
+    let pool = fixture_pool().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        format!("CREATE TABLE {table} (id TEXT PRIMARY KEY, embedding VECTOR(4))").as_str(),
+    ))
+    .execute(&pool)
+    .await
+    .expect("the text-keyed fixture table creates");
+    let rejection = PgVectorIndexBuilder::new(url(), table, 4).connect().await;
+    let text = rejection
+        .expect_err("a text-keyed table rejects at connect, not on use")
+        .to_string();
+    assert!(
+        text.contains("id"),
+        "the rejection names the id column's shape: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_partially_indexed_id_rejects_at_connect() {
+    if !gated() {
+        return;
+    }
+    let table = contract::unique_name("partial_key");
+    let pool = fixture_pool().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        format!("CREATE TABLE {table} (id UUID, embedding VECTOR(4))").as_str(),
+    ))
+    .execute(&pool)
+    .await
+    .expect("the unkeyed fixture table creates");
+    sqlx::query(sqlx::AssertSqlSafe(
+        format!("CREATE UNIQUE INDEX ON {table} (id) WHERE embedding IS NOT NULL").as_str(),
+    ))
+    .execute(&pool)
+    .await
+    .expect("the partial unique fixture index creates");
+    let rejection = PgVectorIndexBuilder::new(url(), table, 4).connect().await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("unique")),
+        "a partial unique index cannot arbitrate the upsert's ON CONFLICT: {rejection:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unkeyed_id_rejects_at_connect() {
+    if !gated() {
+        return;
+    }
+    let table = contract::unique_name("unkeyed_id");
+    let pool = fixture_pool().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        format!("CREATE TABLE {table} (id UUID, embedding VECTOR(4))").as_str(),
+    ))
+    .execute(&pool)
+    .await
+    .expect("the index-free fixture table creates");
+    let rejection = PgVectorIndexBuilder::new(url(), table, 4).connect().await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("unique")),
+        "a valid embedding column with no unique index on id cannot \
+         arbitrate the upsert's ON CONFLICT and rejects at connect: {rejection:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_nullable_id_rejects_at_connect() {
+    if !gated() {
+        return;
+    }
+    let table = contract::unique_name("nullable_id");
+    let pool = fixture_pool().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        format!("CREATE TABLE {table} (id UUID UNIQUE, embedding VECTOR(4))").as_str(),
+    ))
+    .execute(&pool)
+    .await
+    .expect("the nullable-keyed fixture table creates");
+    let rejection = PgVectorIndexBuilder::new(url(), table, 4).connect().await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("not-null")),
+        "a nullable id column is not the key shape the upsert owns: {rejection:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_uuid_primary_keyed_table_is_adopted() {
+    if !gated() {
+        return;
+    }
+    let table = contract::unique_name("uuid_pk");
+    let pool = fixture_pool().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        format!("CREATE TABLE {table} (id UUID PRIMARY KEY, embedding VECTOR(4))").as_str(),
+    ))
+    .execute(&pool)
+    .await
+    .expect("the uuid-keyed fixture table creates");
+    let index = PgVectorIndexBuilder::new(url(), table, 4)
+        .connect()
+        .await
+        .expect("the matching key shape is adopted");
+    let id = uuid::Uuid::new_v4();
+    index
+        .add(
+            id,
+            loopctl::memory::vector::Embedding::new(vec![1.0, 0.0, 0.0, 0.0]),
+        )
+        .await
+        .expect("the adopted table accepts the upsert");
+    let hits = index
+        .search(
+            &loopctl::memory::vector::Embedding::new(vec![1.0, 0.0, 0.0, 0.0]),
+            5,
+        )
+        .await
+        .expect("the adopted table answers a search");
+    assert_eq!(
+        hits.first().map(|hit| hit.id),
+        Some(id),
+        "the adopted key shape reads back what it wrote: {hits:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_zero_norm_vector_rejects_at_add() {
+    if !gated() {
+        return;
+    }
+    let index = PgVectorIndexBuilder::new(url(), contract::unique_name("zero_norm"), 4)
+        .connect()
+        .await
+        .expect("the fixture table provisions");
+    let rejection = index
+        .add(
+            uuid::Uuid::new_v4(),
+            loopctl::memory::vector::Embedding::new(vec![0.0, 0.0, 0.0, 0.0]),
+        )
+        .await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("zero")),
+        "a zero-norm vector has no cosine direction and rejects loudly: {rejection:?}"
+    );
+    assert_eq!(index.len(), 0, "the rejected vector stored nothing");
+}
+
+#[tokio::test]
+async fn a_zero_norm_query_rejects_at_search() {
+    if !gated() {
+        return;
+    }
+    let index = PgVectorIndexBuilder::new(url(), contract::unique_name("zero_query"), 4)
+        .connect()
+        .await
+        .expect("the fixture table provisions");
+    let rejection = index
+        .search(
+            &loopctl::memory::vector::Embedding::new(vec![0.0, 0.0, 0.0, 0.0]),
+            5,
+        )
+        .await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("zero")),
+        "a zero-norm query rejects instead of silently matching nothing: {rejection:?}"
+    );
 }
 
 #[tokio::test]

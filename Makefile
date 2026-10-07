@@ -1,6 +1,6 @@
-.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check vector-e2e
+.PHONY: check test clippy fmt docs ci lint examples e2e e2e-providers e2e-ollama check-default redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check vector-e2e client-check
 
-ci: fmt check check-default clippy test docs examples redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check
+ci: fmt check check-default clippy test docs examples redaction-minimal search_tools-minimal digest-canonical derive-consumer darwin-clippy windows-check vector-check client-check
 
 check:
 	cargo check --all-features
@@ -26,6 +26,7 @@ darwin-clippy:
 
 windows-check:
 	cargo check --target x86_64-pc-windows-msvc --features shell_tools,fs_tools,search_tools
+	cargo check --target x86_64-pc-windows-msvc -p loopctl-client 2>&1 | grep -q 'unix-only by design'
 
 fmt:
 	cargo fmt --all -- --check
@@ -177,3 +178,10 @@ vector-check:
 
 vector-e2e:
 	LOOPCTL_VECTOR_E2E=1 cargo test --manifest-path vector/Cargo.toml --features qdrant,pgvector,testing --test qdrant --test pgvector
+
+client-check:
+	cargo fmt -p loopctl-client -- --check
+	cargo clippy -p loopctl-client --all-targets -- -D warnings
+	cargo check -p loopctl-client
+	RUSTDOCFLAGS="-D warnings" cargo doc -p loopctl-client --no-deps
+	cargo test -p loopctl-client

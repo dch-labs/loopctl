@@ -282,11 +282,102 @@ impl tracing::field::Visit for EventGrabber {
     }
 }
 
-/// The managed-tier smoke — Qdrant Cloud with a real API key.
+/// A raw client for fixture collections the index must refuse.
 ///
-/// `#[ignore]`d like every live credential test; run deliberately with
-/// `QDRANT_URL`, `QDRANT_COLLECTION`, and `QDRANT_API_KEY` exported
-/// (`cargo test --features qdrant --test qdrant -- --ignored`).
+/// Fixture collections are created outside the index under test so
+/// its connect-time validation judges shapes it would never itself
+/// produce.
+fn fixture_client() -> qdrant_client::Qdrant {
+    qdrant_client::Qdrant::from_url(&url())
+        .skip_compatibility_check()
+        .build()
+        .expect("the lazy channel builds without a server")
+}
+
+#[tokio::test]
+async fn a_dimension_mismatched_target_rejects_at_connect() {
+    if !gated() {
+        return;
+    }
+    let collection = contract::unique_name("dim_mismatch");
+    let _first = QdrantIndex::builder(url(), collection.clone(), 4)
+        .connect()
+        .await
+        .expect("the dim-4 construction provisions the collection");
+    let rejection = QdrantIndex::builder(url(), collection, 8).connect().await;
+    let text = rejection
+        .expect_err("a mismatched dim rejects at connect, not on use")
+        .to_string();
+    assert!(
+        text.contains("holds 4-dimensional vectors")
+            && text.contains("configured for 8 dimensions"),
+        "the rejection names the collection's dimension and the requested one: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_named_vector_collection_rejects_at_connect() {
+    if !gated() {
+        return;
+    }
+    let collection = contract::unique_name("named_vectors");
+    let client = fixture_client();
+    let named = qdrant_client::qdrant::vectors_config::Config::ParamsMap(
+        qdrant_client::qdrant::VectorParamsMap {
+            map: [(
+                "default".to_string(),
+                qdrant_client::qdrant::VectorParams {
+                    size: 4,
+                    distance: i32::from(qdrant_client::qdrant::Distance::Cosine),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+        },
+    );
+    client
+        .create_collection(
+            qdrant_client::qdrant::CreateCollectionBuilder::new(collection.clone())
+                .vectors_config(named),
+        )
+        .await
+        .expect("the named-vector fixture collection creates");
+    let rejection = QdrantIndex::builder(url(), collection, 4).connect().await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("named")),
+        "the rejection names the unsupported layout: {rejection:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_non_cosine_collection_rejects_at_connect() {
+    if !gated() {
+        return;
+    }
+    let collection = contract::unique_name("euclid");
+    let client = fixture_client();
+    client
+        .create_collection(
+            qdrant_client::qdrant::CreateCollectionBuilder::new(collection.clone()).vectors_config(
+                qdrant_client::qdrant::VectorParamsBuilder::new(
+                    4,
+                    qdrant_client::qdrant::Distance::Euclid,
+                ),
+            ),
+        )
+        .await
+        .expect("the euclid fixture collection creates");
+    let rejection = QdrantIndex::builder(url(), collection, 4).connect().await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().to_lowercase().contains("cosine")),
+        "the rejection names the cosine requirement: {rejection:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "live cloud credentials required: QDRANT_URL, QDRANT_COLLECTION, QDRANT_API_KEY"]
 async fn qdrant_cloud_smoke() {

@@ -38,6 +38,7 @@ required-features = ["pgvector", "testing"]
 [dev-dependencies]
 futures = "0.3"
 loopctl = { path = "..", version = "=0.3.2", default-features = false, features = ["vector_memory", "testing"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 
 [lints.clippy]

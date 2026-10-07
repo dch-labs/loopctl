@@ -18,7 +18,9 @@
 //! same hybrid retrieval, same [`LoopMemory`](loopctl::memory::LoopMemory)
 //! contract, same golden-set quality bar. Each backend auto-provisions
 //! its target on first use (collection, table, or on-disk dataset,
-//! create-if-absent, idempotent), maps every failure to
+//! create-if-absent, idempotent — and validates an existing target's
+//! vector shape before adopting it, so a mismatched reuse rejects at
+//! connect instead of failing on use), maps every failure to
 //! [`LoopError::Memory`](loopctl::error::LoopError::Memory) with the
 //! backend's message preserved but bounded, and emits the same
 //! `loopctl.vector.index.search` metric event the in-process indexes

@@ -6,9 +6,15 @@
 //! auto-provisioned on first use (`CREATE TABLE IF NOT EXISTS` with a
 //! `vector(n)` column plus a `vector_cosine_ops` HNSW index), the
 //! table name is validated as a strict SQL identifier because it is
-//! interpolated into DDL that cannot be parameterized, and searches
-//! order by cosine distance (`<=>`) mapped once into the trait's
-//! descending-similarity contract. Failures map to
+//! interpolated into DDL that cannot be parameterized, an existing
+//! table is adopted only when its `embedding` column's dimension
+//! matches the requested one (a foreign or mismatched table rejects
+//! at connect), and searches order by cosine distance (`<=>`) mapped
+//! once into the trait's descending-similarity contract — each search
+//! sizes a transaction-local `hnsw.ef_search` to `k`, so a `k` above
+//! pgvector's 40 candidate-list default still returns every row, and
+//! a `k` above the setting's server ceiling of 1000 rejects rather
+//! than returning short. Failures map to
 //! [`LoopError::Memory`] with Postgres's message preserved but
 //! bounded; searches emit the same `loopctl.vector.index.search`
 //! metric event every loopctl index emits.
@@ -40,17 +46,37 @@ use crate::require_non_blank;
 /// store identically.
 const BACKEND: &str = "pgvector";
 
+/// pgvector's default HNSW candidate-list size.
+///
+/// The server's `hnsw.ef_search` default of `40`; a search whose `k`
+/// exceeds it can come back short on an index-scan plan unless the
+/// candidate list is raised for the query's transaction, so every
+/// search sizes it to `k` (never below this default).
+const DEFAULT_EF_SEARCH: usize = 40;
+
+/// The server-enforced ceiling on `hnsw.ef_search`.
+///
+/// Postgres rejects values outside `1..=1000`; a `k` above the
+/// ceiling therefore rejects client-side with the ceiling named
+/// rather than silently returning short results.
+const MAX_EF_SEARCH: usize = 1000;
+
 /// A [`VectorIndex`] over one pgvector table.
 ///
 /// The table is provisioned at construction — created if absent with
 /// an `id UUID PRIMARY KEY` key, a `embedding VECTOR(<dim>)` column,
-/// and an HNSW `vector_cosine_ops` index — and the client-side count
-/// is seeded from the same construction — client-side bookkeeping
-/// whose exactness contract the count type's docs state.
+/// and an HNSW `vector_cosine_ops` index — and an existing table is
+/// adopted only when its `embedding` column's dimension matches. The
+/// client-side count is seeded from the same construction —
+/// client-side bookkeeping whose exactness contract the count type's
+/// docs state.
 /// [`add`](VectorIndex::add) is `INSERT … ON CONFLICT (id) DO UPDATE`,
 /// so re-adding under one id replaces without leaking, and
 /// [`search`](VectorIndex::search) maps Postgres's ascending cosine
-/// distance into the trait's descending-similarity order.
+/// distance into the trait's descending-similarity order, sizing a
+/// transaction-local `hnsw.ef_search` to `k` so the candidate list
+/// never caps results below the rows the store holds (a `k` above
+/// the 1000 ceiling rejects with the ceiling named).
 ///
 /// Construct through [`PgVectorIndexBuilder`] or
 /// [`from_env`](Self::from_env).
@@ -174,9 +200,10 @@ impl PgVectorIndexBuilder {
     ///
     /// [`LoopError::Memory`] for a blank url, a table name that is not
     /// a strict SQL identifier, a zero dimension, an unreachable
-    /// server, a missing `pgvector` extension, or a failed
-    /// provisioning — the message carries Postgres's own diagnosis,
-    /// bounded.
+    /// server, a missing `pgvector` extension, a failed provisioning,
+    /// or an existing table whose `embedding` column is missing,
+    /// untyped, or dimensioned differently from the request — the
+    /// message carries Postgres's own diagnosis, bounded.
     pub async fn connect(self) -> Result<PgVectorIndex, LoopError> {
         require_non_blank(BACKEND, "url", &self.url)?;
         require_dim(BACKEND, self.dim)?;
@@ -272,13 +299,17 @@ impl PgVectorIndex {
     /// holder creates and emits, the follower's probe sees the table
     /// and stays silent — the once-per-target event holds under
     /// concurrency, not just sequentially. `IF NOT EXISTS` on both
-    /// statements remains the cross-process backstop.
+    /// statements remains the cross-process backstop. A probe that
+    /// finds the table already present routes through
+    /// [`validate_existing_table`](Self::validate_existing_table)
+    /// before adoption, so the follow-on constructions reject a
+    /// mismatched or foreign table instead of silently accepting it.
     ///
     /// # Errors
     ///
     /// [`LoopError::Memory`] when the extension load, the lock, the
-    /// probe, the DDL, or the commit fails — the message carries
-    /// Postgres's diagnosis.
+    /// probe, the validation of an existing table, the DDL, or the
+    /// commit fails — the message carries Postgres's diagnosis.
     async fn provision(&self) -> Result<(), LoopError> {
         self.ensure_extension().await?;
         let mut tx = self
@@ -297,7 +328,7 @@ impl PgVectorIndex {
             .await
             .map_err(|error| memory_error(BACKEND, error))?;
         if existing.is_some_and(|(name,)| name.is_some()) {
-            return Ok(());
+            return self.validate_existing_table(&mut tx).await;
         }
         let ddl = [
             format!(
@@ -326,6 +357,55 @@ impl PgVectorIndex {
             .map_err(|error| memory_error(BACKEND, error))?;
         emit_provisioned(BACKEND, &self.table);
         Ok(())
+    }
+
+    /// Validate an existing table's embedding column before adopting it.
+    ///
+    /// A handle keyed to the requested dim over a table whose column
+    /// disagrees would pass every client-side check and fail on the
+    /// server at the first add or search, so the shape rejects at
+    /// connect instead. The probe runs inside the caller's
+    /// advisory-locked transaction and reads the catalog: the table
+    /// must carry a live `vector(n)`-typed `embedding` column whose
+    /// `n` equals the requested dim — a foreign table without the
+    /// column, an untyped `vector` column, and a mismatched `n` all
+    /// reject with the table's shape named.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Memory`] when the probe fails or the table's shape
+    /// does not match the requested dimension.
+    async fn validate_existing_table(&self, tx: &mut sqlx::PgConnection) -> Result<(), LoopError> {
+        let column: Option<(i32,)> = sqlx::query_as(
+            "SELECT a.atttypmod FROM pg_attribute a \
+             WHERE a.attrelid = $1::regclass AND a.attname = 'embedding' \
+             AND a.atttypid = 'vector'::regtype AND NOT a.attisdropped",
+        )
+        .bind(self.table.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| memory_error(BACKEND, error))?;
+        let typmod = column.map_or(0, |(value,)| value);
+        if typmod > 0 {
+            if usize::try_from(typmod).is_ok_and(|dim| dim == self.dim) {
+                return Ok(());
+            }
+            return Err(LoopError::Memory(format!(
+                "{BACKEND}: table {} exists and holds VECTOR({typmod}) embeddings; \
+                 this construction is configured for {} dimensions",
+                self.table, self.dim
+            )));
+        }
+        let shape = if typmod == 0 {
+            "has no vector-typed embedding column"
+        } else {
+            "has an untyped vector embedding column"
+        };
+        Err(LoopError::Memory(format!(
+            "{BACKEND}: table {} exists and {shape}; this construction is configured \
+             for {} dimensions",
+            self.table, self.dim
+        )))
     }
 
     /// Fetch the true row count once and seed the bookkeeping.
@@ -407,16 +487,35 @@ impl VectorIndex for PgVectorIndex {
                     self.dim
                 )));
             }
+            if k > MAX_EF_SEARCH {
+                return Err(LoopError::Memory(format!(
+                    "{BACKEND}: k {k} exceeds the hnsw.ef_search ceiling of {MAX_EF_SEARCH}; \
+                     lower k"
+                )));
+            }
             let sql = format!(
                 "SELECT id, CAST(1 - (embedding <=> $1::vector) AS REAL) AS score \
                  FROM {table} ORDER BY embedding <=> $1::vector LIMIT $2",
                 table = self.table
             );
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|error| memory_error(BACKEND, error))?;
+            sqlx::query("SELECT set_config('hnsw.ef_search', $1, true)")
+                .bind(k.max(DEFAULT_EF_SEARCH).to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| memory_error(BACKEND, error))?;
             let started = std::time::Instant::now();
             let rows: Vec<(Uuid, f32)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(Vector::from(query))
                 .bind(i64::try_from(k).unwrap_or(i64::MAX))
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|error| memory_error(BACKEND, error))?;
+            tx.rollback()
                 .await
                 .map_err(|error| memory_error(BACKEND, error))?;
             let matches: Vec<VectorMatch> = rows

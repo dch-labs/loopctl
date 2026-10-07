@@ -260,6 +260,137 @@ impl tracing::field::Visit for EventGrabber {
     }
 }
 
+/// A fixture SQL pool over the same URL the suite connects through.
+///
+/// Fixture SQL bypasses the index under test on purpose: pre-shaped
+/// tables (a foreign table, a bulk-seeded HNSW table) are the inputs
+/// the connect-time and search-time contracts must judge.
+async fn fixture_pool() -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url())
+        .await
+        .expect("the pgvector server is reachable under the e2e gate")
+}
+
+/// Seed `rows` distinct vectors into an already-provisioned table and
+/// analyze it.
+///
+/// The analyze step is what makes the planner pick the HNSW index
+/// scan these pins exercise — without it the planner may prefer a
+/// seq scan, which returns full results regardless of `ef_search`.
+async fn seed_and_analyze(pool: &sqlx::PgPool, table: &str, rows: i64) {
+    sqlx::query(sqlx::AssertSqlSafe(
+        format!(
+            "INSERT INTO {table} SELECT gen_random_uuid(), ('[' || x || ',1]')::vector \
+             FROM generate_series(1, {rows}) x"
+        )
+        .as_str(),
+    ))
+    .execute(pool)
+    .await
+    .expect("the bulk fixture seed lands");
+    sqlx::query(sqlx::AssertSqlSafe(format!("ANALYZE {table}").as_str()))
+        .execute(pool)
+        .await
+        .expect("the fixture table is analyzed");
+}
+
+#[tokio::test]
+async fn a_dimension_mismatched_target_rejects_at_connect() {
+    if !gated() {
+        return;
+    }
+    let table = contract::unique_name("dim_mismatch");
+    let _first = PgVectorIndexBuilder::new(url(), table.clone(), 4)
+        .connect()
+        .await
+        .expect("the dim-4 construction provisions the table");
+    let rejection = PgVectorIndexBuilder::new(url(), table, 8).connect().await;
+    let text = rejection
+        .expect_err("a mismatched dim rejects at connect, not on use")
+        .to_string();
+    assert!(
+        text.contains("VECTOR(4)") && text.contains("for 8 dimensions"),
+        "the rejection names the table's dimension and the requested one: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_foreign_table_without_a_vector_embedding_column_rejects_at_connect() {
+    if !gated() {
+        return;
+    }
+    let table = contract::unique_name("foreign_table");
+    let pool = fixture_pool().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        format!("CREATE TABLE {table} (note TEXT)").as_str(),
+    ))
+    .execute(&pool)
+    .await
+    .expect("the foreign fixture table creates");
+    let rejection = PgVectorIndexBuilder::new(url(), table, 4).connect().await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("embedding")),
+        "the rejection names the missing embedding column: {rejection:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_k_above_the_default_candidate_list_returns_every_row() {
+    if !gated() {
+        return;
+    }
+    let table = contract::unique_name("ef_search");
+    let index = PgVectorIndexBuilder::new(url(), table.clone(), 2)
+        .connect()
+        .await
+        .expect("the dim-2 construction provisions the table");
+    let pool = fixture_pool().await;
+    seed_and_analyze(&pool, &table, 8_000).await;
+    let query = loopctl::memory::vector::Embedding::new(vec![1.0, 1.0]);
+    let hits = index.search(&query, 60).await.expect("the search runs");
+    assert_eq!(
+        hits.len(),
+        60,
+        "k=60 over 8 000 rows returns 60, not the ef_search default's 40"
+    );
+}
+
+#[tokio::test]
+async fn a_k_above_the_ef_search_ceiling_rejects() {
+    if !gated() {
+        return;
+    }
+    let table = contract::unique_name("ef_ceiling");
+    let index = PgVectorIndexBuilder::new(url(), table.clone(), 2)
+        .connect()
+        .await
+        .expect("the dim-2 construction provisions the table");
+    let pool = fixture_pool().await;
+    seed_and_analyze(&pool, &table, 8_000).await;
+    let query = loopctl::memory::vector::Embedding::new(vec![1.0, 1.0]);
+    let rejection = index.search(&query, 1001).await;
+    let text = rejection
+        .expect_err("a k above the ceiling rejects instead of returning short")
+        .to_string();
+    assert!(
+        text.contains("ceiling of 1000"),
+        "the rejection names the ef_search ceiling: {text}"
+    );
+    let hits = index
+        .search(&query, 1000)
+        .await
+        .expect("the at-ceiling search runs");
+    assert_eq!(
+        hits.len(),
+        1000,
+        "k at the ceiling returns full results, not the ef_search default's 40"
+    );
+}
+
 #[tokio::test]
 async fn pgvector_cosine_distance_maps_to_similarity_order() {
     if !gated() {

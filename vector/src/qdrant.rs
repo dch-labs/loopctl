@@ -4,7 +4,9 @@
 //! self-hosted or Qdrant Cloud — letting semantic memory outlive and
 //! outgrow one process, shared across sessions and hosts. The
 //! collection is auto-provisioned on first use (created if absent,
-//! cosine distance, the configured dimension), and the point id *is*
+//! cosine distance, the configured dimension; an existing collection
+//! is adopted only when its unnamed vector configuration matches that
+//! shape), and the point id *is*
 //! the memory entry's [`Uuid`], so upsert and delete map onto Qdrant's
 //! native point operations with no payload indirection. Failures map
 //! to [`LoopError::Memory`] with Qdrant's message preserved but
@@ -57,11 +59,15 @@ const BACKEND: &str = "qdrant";
 /// The collection is provisioned at construction — created if absent
 /// with cosine distance and the configured dimension — and the
 /// provisioning is idempotent: a concurrent construction that loses
-/// the create race sees the winner's collection and succeeds, a
-/// repeated construction is a no-op, and a construction whose
-/// provisioning failed retries on the next operation (the guard only
-/// caches success). Point ids are the caller's [`Uuid`]s directly, so
-/// [`add`](VectorIndex::add) is Qdrant upsert-by-id and
+/// the create race sees the winner's collection, validates its
+/// vector configuration, and succeeds, a repeated construction is a
+/// no-op, and a construction whose provisioning failed retries on the
+/// next operation (the guard only caches success). An existing
+/// collection is adopted only when it uses the unnamed single-vector
+/// layout this index creates, at the configured dimension and cosine
+/// distance — anything else rejects at connect instead of failing (or
+/// scoring wrongly) on use. Point ids are the caller's [`Uuid`]s
+/// directly, so [`add`](VectorIndex::add) is Qdrant upsert-by-id and
 /// [`remove`](VectorIndex::remove) is delete-by-id.
 ///
 /// Construct through [`QdrantIndexBuilder`] or
@@ -257,11 +263,16 @@ impl QdrantIndex {
     /// Construction provisions and seeds the count, and the guard makes
     /// every later operation skip the existence round trip — one
     /// metadata call per process per collection, not one per upsert.
+    /// An already-existing collection (including one a concurrent
+    /// construction just won the create race for) is adopted only
+    /// after [`validate_existing_collection`](Self::validate_existing_collection)
+    /// confirms its vector configuration matches this construction.
     ///
     /// # Errors
     ///
-    /// [`LoopError::Memory`] when the existence check or the creation
-    /// fails — the message carries Qdrant's diagnosis, bounded.
+    /// [`LoopError::Memory`] when the existence check, the creation,
+    /// or the validation of an existing collection fails — the message
+    /// carries Qdrant's diagnosis, bounded.
     async fn ensure_collection(&self) -> Result<(), LoopError> {
         if self.provisioned.get().is_some() {
             return Ok(());
@@ -272,6 +283,7 @@ impl QdrantIndex {
             .await
             .map_err(|error| memory_error(BACKEND, error))?
         {
+            self.validate_existing_collection().await?;
             return Ok(());
         }
         let request = CreateCollectionBuilder::new(self.collection.clone())
@@ -283,12 +295,65 @@ impl QdrantIndex {
                 .await
                 .unwrap_or(false);
             if lost_race {
+                self.validate_existing_collection().await?;
                 return Ok(());
             }
             emit_provision_error(BACKEND);
             return Err(memory_error(BACKEND, error));
         }
         emit_provisioned(BACKEND, &self.collection);
+        Ok(())
+    }
+
+    /// Validate an existing collection's vector configuration before
+    /// adopting it.
+    ///
+    /// A handle keyed to the requested dim over a collection whose
+    /// configuration disagrees would pass every client-side check and
+    /// fail on the server at the first upsert or search — or, with a
+    /// non-cosine distance metric, answer with scores that are not
+    /// cosine similarities and never error at all. The collection must
+    /// use the unnamed single-vector layout this index creates, at the
+    /// requested dimension, measured with cosine distance; a named or
+    /// multi-vector layout, a mismatched dimension, and a foreign
+    /// distance metric all reject with the collection's shape named.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::Memory`] when the collection lookup fails or its
+    /// vector configuration does not match this construction.
+    async fn validate_existing_collection(&self) -> Result<(), LoopError> {
+        let response = self
+            .client
+            .collection_info(self.collection.as_str())
+            .await
+            .map_err(|error| memory_error(BACKEND, error))?;
+        let vectors = response
+            .result
+            .and_then(|info| info.config)
+            .and_then(|config| config.params)
+            .and_then(|params| params.vectors_config)
+            .and_then(|vectors| vectors.config);
+        let Some(qdrant_client::qdrant::vectors_config::Config::Params(params)) = vectors else {
+            return Err(LoopError::Memory(format!(
+                "{BACKEND}: collection {} uses a named or multi-vector layout this index does not support",
+                self.collection
+            )));
+        };
+        let size = usize::try_from(params.size).unwrap_or(usize::MAX);
+        if size != self.dim {
+            return Err(LoopError::Memory(format!(
+                "{BACKEND}: collection {} holds {size}-dimensional vectors but this \
+                 construction is configured for {} dimensions",
+                self.collection, self.dim
+            )));
+        }
+        if params.distance != i32::from(Distance::Cosine) {
+            return Err(LoopError::Memory(format!(
+                "{BACKEND}: collection {} does not measure cosine distance",
+                self.collection
+            )));
+        }
         Ok(())
     }
 
@@ -423,8 +488,10 @@ impl QdrantIndexBuilder {
     /// # Errors
     ///
     /// [`LoopError::Memory`] for a blank url or collection, a zero
-    /// dimension, or a failed connection — the message carries
-    /// Qdrant's own diagnosis, bounded.
+    /// dimension, a failed connection, or an existing collection whose
+    /// vector layout, dimension, or distance metric does not match
+    /// this construction — the message carries Qdrant's own
+    /// diagnosis, bounded.
     pub async fn connect(self) -> Result<QdrantIndex, LoopError> {
         require_non_blank(BACKEND, "url", &self.url)?;
         require_non_blank(BACKEND, "collection", &self.collection)?;

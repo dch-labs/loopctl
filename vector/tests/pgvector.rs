@@ -281,13 +281,33 @@ impl tracing::field::Visit for EventGrabber {
 ///
 /// Fixture SQL bypasses the index under test on purpose: pre-shaped
 /// tables (a foreign table, a bulk-seeded HNSW table) are the inputs
-/// the connect-time and search-time contracts must judge.
+/// the connect-time and search-time contracts must judge. The pool
+/// also loads the `vector` extension before handing control back —
+/// the index's own construction loads it lazily, so a fixture that
+/// builds a `VECTOR(n)` table ahead of any connect would race a fresh
+/// server's missing extension. The load is idempotent and tolerant of
+/// another connection winning the concurrent create.
 async fn fixture_pool() -> sqlx::PgPool {
-    sqlx::postgres::PgPoolOptions::new()
+    let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&url())
         .await
-        .expect("the pgvector server is reachable under the e2e gate")
+        .expect("the pgvector server is reachable under the e2e gate");
+    if let Err(error) = sqlx::query(sqlx::AssertSqlSafe("CREATE EXTENSION IF NOT EXISTS vector"))
+        .execute(&pool)
+        .await
+    {
+        let present: Option<(String,)> =
+            sqlx::query_as("SELECT extname FROM pg_extension WHERE extname = 'vector'")
+                .fetch_optional(&pool)
+                .await
+                .expect("the extension probe runs");
+        assert!(
+            present.is_some(),
+            "the vector extension must install for fixture DDL: {error}"
+        );
+    }
+    pool
 }
 
 /// Seed `rows` distinct vectors into an already-provisioned table and

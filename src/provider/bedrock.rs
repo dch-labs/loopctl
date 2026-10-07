@@ -1817,22 +1817,33 @@ fn bedrock_non_streaming_response(
         let usage = json.get("usage");
         return Ok(NonStreamingResponse {
             message: crate::message::Message::new(crate::message::Role::Assistant, parts),
-            usage: usage.map(|u| crate::stream::Usage {
-                input_tokens: u
+            usage: usage.map(|u| {
+                let raw_input = u
                     .get("input_tokens")
                     .and_then(serde_json::Value::as_u64)
                     .and_then(|v| u32::try_from(v).ok())
-                    .unwrap_or(0),
-                output_tokens: u
-                    .get("output_tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .and_then(|v| u32::try_from(v).ok())
-                    .unwrap_or(0),
-                cached_input_tokens: u
+                    .unwrap_or(0);
+                let cache_read = u
                     .get("cache_read_input_tokens")
                     .and_then(serde_json::Value::as_u64)
                     .and_then(|v| u32::try_from(v).ok())
-                    .unwrap_or(0),
+                    .unwrap_or(0);
+                let cache_creation = u
+                    .get("cache_creation_input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(0);
+                crate::stream::Usage {
+                    input_tokens: raw_input
+                        .saturating_add(cache_read)
+                        .saturating_add(cache_creation),
+                    output_tokens: u
+                        .get("output_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok())
+                        .unwrap_or(0),
+                    cached_input_tokens: cache_read,
+                }
             }),
             stop_reason: anthropic_stop_to_engine(stop),
         });

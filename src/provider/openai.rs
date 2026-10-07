@@ -1775,9 +1775,33 @@ struct OpenAiUsage {
 struct OpenAiPromptTokensDetails {
     /// Number of prompt tokens served from the provider's prompt cache.
     ///
-    /// Defaults to 0 when the details object omits it.
-    #[serde(default)]
+    /// Defaults to 0 when the details object omits it, and parses
+    /// leniently — a non-numeric value (seen in the wild from
+    /// OpenAI-compatible servers) reads as 0 rather than failing the
+    /// enclosing usage object, so the prompt and completion counts
+    /// survive.
+    #[serde(default, deserialize_with = "cached_tokens_or_zero")]
     cached_tokens: u64,
+}
+
+/// Deserialize the cached share leniently.
+///
+/// The count is optional and advisory; a server that emits a
+/// non-numeric placeholder reads as zero instead of dropping the
+/// whole usage report it rides in.
+///
+/// # Errors
+///
+/// Propagates the deserializer's own error only for a shape serde
+/// cannot hand over at all; a present-but-unparseable value is
+/// converted to zero, never an error.
+fn cached_tokens_or_zero<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)?
+        .as_u64()
+        .unwrap_or(0))
 }
 
 impl From<&OpenAiUsage> for Usage {
@@ -2794,6 +2818,22 @@ mod tests {
         let typed: Usage = chunk.usage.as_ref().expect("usage").into();
         assert_eq!(typed.input_tokens, 1200);
         assert_eq!(typed.cached_input_tokens, 1024);
+    }
+
+    #[test]
+    fn a_non_numeric_cached_count_defaults_to_zero_without_dropping_usage() {
+        let data = r#"{"id":"c1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":"many"}}}"#;
+        let chunk = OpenAiChunk::parse(data).unwrap();
+        let typed: Usage = chunk.usage.as_ref().expect("usage").into();
+        assert_eq!(
+            typed.input_tokens, 1200,
+            "an invalid cached count must not fail the whole usage object"
+        );
+        assert_eq!(typed.output_tokens, 9);
+        assert_eq!(
+            typed.cached_input_tokens, 0,
+            "a non-numeric cached share parses as zero, never drops the report"
+        );
     }
 
     #[test]

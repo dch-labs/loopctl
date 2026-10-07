@@ -339,11 +339,18 @@ impl QdrantIndex {
     /// Whether a mapped error names a missing collection.
     ///
     /// The re-provision trigger: Qdrant answers operations against a
-    /// dropped collection with a not-found status, whose message is
-    /// the only transport-stable signal available through the client's
-    /// error surface.
+    /// dropped collection with a collection-specific not-found status,
+    /// whose message is the only transport-stable signal available
+    /// through the client's error surface. Both the collection word
+    /// and the missing word must appear, so a point-level or other
+    /// unrelated not-found error passes through without paying the
+    /// re-provision round trips.
     fn is_missing_collection(error: &LoopError) -> bool {
-        error.to_string().to_lowercase().contains("not found")
+        let text = error.to_string().to_lowercase();
+        (text.contains("not found")
+            || text.contains("doesn't exist")
+            || text.contains("does not exist"))
+            && text.contains("collection")
     }
 
     /// Validate an existing collection's vector configuration before

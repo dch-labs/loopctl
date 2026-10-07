@@ -343,15 +343,20 @@ fn extract_usage(raw: &Value) -> Option<Usage> {
 
 /// Extract token [`Usage`] from a single Anthropic `usage` object.
 ///
-/// Reads the object's `input_tokens` and `output_tokens`, defaulting each to
-/// zero when absent or non-numeric, and `cache_read_input_tokens` into
-/// [`Usage::cached_input_tokens`] the same way. Returns `None` when both
-/// counts are zero, so an all-zero report is indistinguishable from a
-/// missing one — the convention both response paths apply. Shared by the
-/// non-streaming `usage` field ([`extract_usage`]) and the streaming
-/// `message_start` latch in `on_message_start`.
+/// Reads the object's `input_tokens` and `output_tokens`, defaulting
+/// each to zero when absent or non-numeric. The input is normalized:
+/// Anthropic's raw `input_tokens` **excludes** cache traffic, so
+/// `cache_read_input_tokens` and `cache_creation_input_tokens` are
+/// added into the reported input, with the read share kept as
+/// [`Usage::cached_input_tokens`] — the cached count stays a subset
+/// of the input, the documented invariant. Returns `None` when the
+/// normalized input and the output are both zero, so an all-zero
+/// report is indistinguishable from a missing one — the convention
+/// both response paths apply. Shared by the non-streaming `usage`
+/// field ([`extract_usage`]) and the streaming `message_start` latch
+/// in `on_message_start`.
 fn extract_usage_object(usage: &Value) -> Option<Usage> {
-    let input = usage
+    let raw_input = usage
         .get("input_tokens")
         .and_then(Value::as_u64)
         .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
@@ -363,6 +368,11 @@ fn extract_usage_object(usage: &Value) -> Option<Usage> {
         .get("cache_read_input_tokens")
         .and_then(Value::as_u64)
         .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+    let creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+    let input = raw_input.saturating_add(cached).saturating_add(creation);
     (input > 0 || output > 0).then(|| Usage::new(input, output).with_cached_input(cached))
 }
 
@@ -1057,6 +1067,19 @@ fn build_request_body(
     body
 }
 
+/// Whether a content block is an extended-thinking block.
+///
+/// Anthropic rejects `cache_control` on `thinking` and
+/// `redacted_thinking` blocks — they are server-managed reasoning
+/// artifacts, not cacheable content — so the breakpoint placement
+/// skips them when selecting the trailing blocks to mark.
+fn is_thinking_block(block: &Value) -> bool {
+    block
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "thinking" || kind == "redacted_thinking")
+}
+
 /// Mark one content block as a cache breakpoint.
 ///
 /// Inserts `cache_control: {type: "ephemeral"}` on the block object;
@@ -1074,16 +1097,20 @@ fn mark_cache_breakpoint(block: &mut Value) {
 ///
 /// Mutates the body in place: the last tool definition, the system
 /// prompt (rewritten from its plain-string form into a single marked
-/// text block), and the last two content blocks of the final message
-/// each get `cache_control`. That placement follows the provider's
-/// guidance for agentic loops — the tools and system are stable for the
-/// session's life, and the trailing pair of message blocks rolls the
-/// cached prefix forward one turn at a time, so each request shares the
-/// longest prefix with its predecessor. At most four breakpoints are
-/// placed, matching the provider's per-request cap. A final message
-/// whose content is a plain string is wrapped into a one-block array so
-/// it can carry the marker; an empty system string stays a string,
-/// since marking nothing-at-all buys no cache.
+/// text block), and the last two **eligible** content blocks of the
+/// final message each get `cache_control` — thinking and
+/// redacted-thinking blocks are skipped (the provider rejects markers
+/// on them) but never reordered, so a signed-thinking tail still
+/// marks the two text blocks around it. That placement follows the
+/// provider's guidance for agentic loops — the tools and system are
+/// stable for the session's life, and the trailing pair of message
+/// blocks rolls the cached prefix forward one turn at a time, so each
+/// request shares the longest prefix with its predecessor. At most
+/// four breakpoints are placed, matching the provider's per-request
+/// cap. A final message whose content is a plain string is wrapped
+/// into a one-block array so it can carry the marker; an empty
+/// system string stays a string, since marking nothing-at-all buys
+/// no cache.
 fn apply_prompt_cache_breakpoints(body: &mut Value) {
     let Some(obj) = body.as_object_mut() else {
         return;
@@ -1124,8 +1151,16 @@ fn apply_prompt_cache_breakpoints(body: &mut Value) {
                 }]);
             }
             Value::Array(blocks) => {
-                for block in blocks.iter_mut().rev().take(2) {
+                let mut marked: usize = 0;
+                for block in blocks.iter_mut().rev() {
+                    if marked >= 2 {
+                        break;
+                    }
+                    if is_thinking_block(block) {
+                        continue;
+                    }
                     mark_cache_breakpoint(block);
+                    marked = marked.saturating_add(1);
                 }
             }
             _ => {}
@@ -1823,7 +1858,14 @@ impl StreamEmitter {
             .pointer("/usage/cache_read_input_tokens")
             .and_then(Value::as_u64)
             .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
-        let in_tok = delta_in.max(self.start_usage.input_tokens);
+        let delta_creation = v
+            .pointer("/usage/cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+        let delta_input_total = delta_in
+            .saturating_add(delta_cached)
+            .saturating_add(delta_creation);
+        let in_tok = delta_input_total.max(self.start_usage.input_tokens);
         let out_tok = delta_out.max(self.start_usage.output_tokens);
         let cached_tok = delta_cached.max(self.start_usage.cached_input_tokens);
 
@@ -2720,6 +2762,63 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_breakpoints_skip_thinking_blocks() {
+        let thinking_tail = Message::new(
+            Role::Assistant,
+            vec![
+                MessagePart::text("signed reasoning precedes the answer"),
+                MessagePart::Thinking {
+                    text: "chain of thought".into(),
+                    signature: Some("sig".into()),
+                    redacted: None,
+                },
+                MessagePart::text("the answer"),
+            ],
+        );
+        let msgs = vec![Message::user("hello"), thinking_tail];
+        let mut body = build_request_body(
+            &RequestBodySpec {
+                model: "claude-3",
+                messages: &msgs,
+                system: None,
+                tools: None,
+                response_format: None,
+                tool_constraint: &ToolConstraint::None,
+            },
+            false,
+            DEFAULT_MAX_TOKENS,
+            Some(crate::structured::ThinkingEffort::Low),
+            false,
+        );
+        apply_prompt_cache_breakpoints(&mut body);
+
+        let blocks = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(
+            blocks[0]["type"], "thinking",
+            "the signed thinking block rides the wire natively"
+        );
+        assert!(
+            blocks[0].get("cache_control").is_none(),
+            "cache_control on a thinking block fails Anthropic request validation"
+        );
+        assert_eq!(
+            blocks[1]["cache_control"]["type"], "ephemeral",
+            "the last eligible text block rolls the cached prefix forward"
+        );
+        assert_eq!(
+            blocks[2]["type"], "text",
+            "the final eligible block is the trailing text"
+        );
+        assert_eq!(
+            blocks[2]["cache_control"]["type"], "ephemeral",
+            "the final eligible block carries the marker"
+        );
+    }
+
+    #[test]
     fn request_body_includes_tools() {
         let msgs = vec![Message::user("hi")];
         let tools = vec![ToolSchema {
@@ -3534,7 +3633,11 @@ mod tests {
         });
         let response = AnthropicClient::build_response(&raw);
         let usage = response.usage.expect("usage");
-        assert_eq!(usage.input_tokens, 1500);
+        assert_eq!(
+            usage.input_tokens, 3000,
+            "raw input excludes cache traffic — the normalized input adds the \
+             cached read and the cache-creation spend (1500 + 1200 + 300)"
+        );
         assert_eq!(usage.output_tokens, 20);
         assert_eq!(
             usage.cached_input_tokens, 1200,
@@ -4318,7 +4421,10 @@ mod tests {
             _ => None,
         });
         let usage = usage.expect("MessageDelta must carry usage");
-        assert_eq!(usage.input_tokens, 1500);
+        assert_eq!(
+            usage.input_tokens, 2700,
+            "raw input excludes the cached read — the normalized input is 1500 + 1200"
+        );
         assert_eq!(
             usage.cached_input_tokens, 1250,
             "the terminal delta's revised cache read wins over the latched start value"
@@ -4349,11 +4455,10 @@ mod tests {
             StreamEvent::MessageDelta(MessageDelta { usage, .. }) => *usage,
             _ => None,
         });
+        let usage = usage.expect("MessageDelta must carry usage");
+        assert_eq!(usage.input_tokens, 2700);
         assert_eq!(
-            usage
-                .expect("MessageDelta must carry usage")
-                .cached_input_tokens,
-            1200,
+            usage.cached_input_tokens, 1200,
             "a delta without cache fields must not erase the start event's cached share"
         );
     }

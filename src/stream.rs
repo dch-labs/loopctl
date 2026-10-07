@@ -832,9 +832,15 @@ pub struct Usage {
     /// [`input_tokens`](Self::input_tokens) was read from cache instead
     /// of re-processed (Anthropic's `cache_read_input_tokens`, OpenAI's
     /// `prompt_tokens_details.cached_tokens`); providers that do not
-    /// report a cached share leave this at `0`. The count is a subset of
-    /// `input_tokens`, never additional to it. Defaults to `0` when
-    /// constructed via [`Default::default`] or [`new`](Self::new).
+    /// report a cached share leave this at `0`. The count is a subset
+    /// of `input_tokens`, never additional to it — where a provider's
+    /// raw input count already includes cached traffic (OpenAI), it is
+    /// reported as-is, and where it excludes it (Anthropic's
+    /// `input_tokens` carries neither the cache reads nor the
+    /// cache-creation spend), the conversion normalizes the input
+    /// total before constructing this type, so the subset invariant
+    /// holds for every provider. Defaults to `0` when constructed via
+    /// [`Default::default`] or [`new`](Self::new).
     #[serde(default)]
     pub cached_input_tokens: u32,
 }

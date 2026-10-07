@@ -344,11 +344,12 @@ pub async fn provisioning_is_idempotent(make: &IndexFactory) -> Result<(), Strin
 
 /// The rejection shape [`dim_mismatch_rejects_at_add`] accepts.
 ///
-/// A backend may reject through [`LoopError::Memory`] or any error
-/// whose text names the dimension — one shared predicate so the
-/// contract's tolerance is stated once.
+/// The backend must reject through [`LoopError::Memory`] **and** name
+/// the dimension in its text — both backends map every failure to
+/// `Memory`, so the variant alone would let an unrelated failure
+/// (connection, timeout, server error) pass the dimension check.
 #[must_use]
 pub fn names_the_dimension(rejection: &LoopError) -> bool {
     matches!(rejection, LoopError::Memory(_))
-        || rejection.to_string().to_lowercase().contains("dim")
+        && rejection.to_string().to_lowercase().contains("dim")
 }

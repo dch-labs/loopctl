@@ -462,10 +462,12 @@ impl PgVectorIndex {
     ///
     /// The second half of adoption validation: the column must be
     /// typed `uuid`, marked not null, and covered by a unique,
-    /// non-partial index over exactly that one column — the shape
-    /// `ON CONFLICT (id)` needs to arbitrate the upsert. Anything
-    /// else (a text key, a nullable unique, uniqueness from a partial
-    /// index) writes rows the handle could never read back.
+    /// valid, immediate, non-partial index over exactly that one
+    /// column — the shape `ON CONFLICT (id)` needs to arbitrate the
+    /// upsert. Anything else (a text key, a nullable unique, a
+    /// deferrable constraint whose uniqueness is checked at commit,
+    /// uniqueness from a partial index) writes rows the handle could
+    /// never read back.
     ///
     /// # Errors
     ///
@@ -476,6 +478,7 @@ impl PgVectorIndex {
             "SELECT a.attnotnull, EXISTS ( \
                 SELECT 1 FROM pg_index i \
                 WHERE i.indrelid = a.attrelid AND i.indisunique AND i.indisvalid \
+                  AND i.indimmediate \
                   AND i.indpred IS NULL AND i.indnkeyatts = 1 \
                   AND (string_to_array(i.indkey::text, ' '))[1] = a.attnum::text \
              ) FROM pg_attribute a \

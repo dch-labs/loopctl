@@ -344,7 +344,7 @@ async fn a_partially_indexed_id_rejects_at_connect() {
     let table = contract::unique_name("partial_key");
     let pool = fixture_pool().await;
     sqlx::query(sqlx::AssertSqlSafe(
-        format!("CREATE TABLE {table} (id UUID, embedding VECTOR(4))").as_str(),
+        format!("CREATE TABLE {table} (id UUID NOT NULL, embedding VECTOR(4))").as_str(),
     ))
     .execute(&pool)
     .await
@@ -359,8 +359,32 @@ async fn a_partially_indexed_id_rejects_at_connect() {
     assert!(
         rejection
             .as_ref()
-            .is_err_and(|error| error.to_string().contains("unique")),
+            .is_err_and(|error| error.to_string().contains("no unique index")),
         "a partial unique index cannot arbitrate the upsert's ON CONFLICT: {rejection:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_deferrable_id_constraint_rejects_at_connect() {
+    if !gated() {
+        return;
+    }
+    let table = contract::unique_name("deferrable_key");
+    let pool = fixture_pool().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        format!("CREATE TABLE {table} (id UUID NOT NULL UNIQUE DEFERRABLE, embedding VECTOR(4))")
+            .as_str(),
+    ))
+    .execute(&pool)
+    .await
+    .expect("the deferrable fixture table creates");
+    let rejection = PgVectorIndexBuilder::new(url(), table, 4).connect().await;
+    assert!(
+        rejection
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("no unique index")),
+        "a deferrable unique constraint is not an immediate ON CONFLICT \
+         arbiter and rejects at connect: {rejection:?}"
     );
 }
 
@@ -372,7 +396,7 @@ async fn an_unkeyed_id_rejects_at_connect() {
     let table = contract::unique_name("unkeyed_id");
     let pool = fixture_pool().await;
     sqlx::query(sqlx::AssertSqlSafe(
-        format!("CREATE TABLE {table} (id UUID, embedding VECTOR(4))").as_str(),
+        format!("CREATE TABLE {table} (id UUID NOT NULL, embedding VECTOR(4))").as_str(),
     ))
     .execute(&pool)
     .await
@@ -381,7 +405,7 @@ async fn an_unkeyed_id_rejects_at_connect() {
     assert!(
         rejection
             .as_ref()
-            .is_err_and(|error| error.to_string().contains("unique")),
+            .is_err_and(|error| error.to_string().contains("no unique index")),
         "a valid embedding column with no unique index on id cannot \
          arbitrate the upsert's ON CONFLICT and rejects at connect: {rejection:?}"
     );

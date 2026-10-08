@@ -602,6 +602,52 @@ impl QaSummarizer {
         *recover_guard(self.prior.lock()) = None;
     }
 
+    /// Split with the durable-pull cost folded into the tail budget.
+    ///
+    /// The output carries the leading system message and every pulled
+    /// durable message beside the tail, so a budget that ignores them
+    /// overspends the target. Iterates: split under the budget,
+    /// re-compute the durable set the split implies, subtract its cost
+    /// (plus the system head's) from the budget, split again — until
+    /// the split and the set stabilize. The loop terminates: each
+    /// smaller budget only moves the split later, the split is bounded
+    /// by the `preserve_recent` floor, and the pull set at a fixed
+    /// split is fixed.
+    fn budgeted_split(
+        &self,
+        messages: &[Message],
+        mut tail_budget: u64,
+        counter: &dyn crate::compact::TokenCounter,
+    ) -> (crate::compact::truncating::SplitResult, Vec<usize>) {
+        let mut split = self
+            .splitter()
+            .split_within_budget(messages, tail_budget, counter);
+        let mut durable =
+            crate::compact::truncating::durable_pull_indices(messages, split.split_index);
+        loop {
+            let pulled_tokens: u64 = durable
+                .iter()
+                .filter_map(|index| messages.get(*index))
+                .map(|message| counter.count(std::slice::from_ref(message)))
+                .sum();
+            let next_budget = tail_budget.saturating_sub(pulled_tokens);
+            if next_budget == tail_budget {
+                return (split, durable);
+            }
+            tail_budget = next_budget;
+            let next_split = self
+                .splitter()
+                .split_within_budget(messages, tail_budget, counter);
+            let next_durable =
+                crate::compact::truncating::durable_pull_indices(messages, next_split.split_index);
+            if next_split.split_index == split.split_index && next_durable == durable {
+                return (split, durable);
+            }
+            split = next_split;
+            durable = next_durable;
+        }
+    }
+
     /// The splitter whose boundary this compactor delegates to.
     ///
     /// Rebuilt from the config each pass — a plain value, so the
@@ -1083,15 +1129,21 @@ impl ContextCompactor for QaSummarizer {
             }
             let budget = self.config.summary_budget(target_tokens);
             let pinned_tokens = context.counter.count(&context.pinned);
-            let split = self.splitter().split_within_budget(
+            let system_tokens = if leading_system(&messages) {
+                messages.first().map_or(0, |first| {
+                    context.counter.count(std::slice::from_ref(first))
+                })
+            } else {
+                0
+            };
+            let (split, durable) = self.budgeted_split(
                 &messages,
                 target_tokens
                     .saturating_sub(budget)
-                    .saturating_sub(pinned_tokens),
+                    .saturating_sub(pinned_tokens)
+                    .saturating_sub(system_tokens),
                 context.counter.as_ref(),
             );
-            let durable =
-                crate::compact::truncating::durable_pull_indices(&messages, split.split_index);
             let skip_head = usize::from(leading_system(&split.to_compact));
             let dropped: Vec<Message> = split
                 .to_compact
@@ -2606,7 +2658,6 @@ mod tests {
             ),
         );
         let (_client, summarizer) = scripted(vec![ok("SUMMARY-D"), ok("[]")]);
-        let context = context_for(&messages);
         let outcome = summarizer
             .compact(messages.clone(), 200, context_for(&messages))
             .await;
@@ -2634,7 +2685,6 @@ mod tests {
             !part_text(&outcome.evicted).contains("deployment receipt 42"),
             "a pulled durable message is never handed to the sink"
         );
-        let _ = context;
     }
 
     #[tokio::test]
@@ -2652,6 +2702,70 @@ mod tests {
                 .iter()
                 .any(|m| m.text_content() == pin.text_content()),
             "the pinned set rides the qa output verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_durable_pull_cost_is_folded_into_the_tail_budget() {
+        let mut messages = vec![Message::new(
+            Role::System,
+            vec![crate::message::MessagePart::text(
+                "standing instructions that ride the head unbudgeted",
+            )],
+        )];
+        messages.push(Message::new(
+            Role::Assistant,
+            vec![crate::message::MessagePart::tool_call(
+                "receipt",
+                "Bash",
+                serde_json::json!({"cmd": "deploy"}),
+            )],
+        ));
+        messages.push(Message::new(
+            Role::User,
+            vec![
+                crate::message::MessagePart::tool_result(
+                    "receipt",
+                    "Bash",
+                    crate::message::ToolContent::from_string(
+                        "exit 0: deployment receipt 99 ".to_string() + &"detail ".repeat(48),
+                    ),
+                    false,
+                )
+                .with_retention(crate::tool::Retention::Durable),
+            ],
+        ));
+        for turn in 0..9 {
+            if turn % 2 == 0 {
+                messages.push(Message::user(format!(
+                    "user turn {turn} {}",
+                    "u".repeat(80)
+                )));
+            } else {
+                messages.push(Message::assistant(format!(
+                    "assistant turn {turn} {}",
+                    "a".repeat(80)
+                )));
+            }
+        }
+        let client = RecordingClient::new(vec![ok("S"), ok("[]")]);
+        let summarizer = QaSummarizer::new(
+            Arc::clone(&client) as SharedApiClient,
+            QaSummarizerConfig::default().with_preserve_recent(4),
+        );
+        let outcome = summarizer
+            .compact(messages.clone(), 300, context_for(&messages))
+            .await;
+        assert!(
+            outcome.success,
+            "the pass lands within the target: {}",
+            outcome.error.as_deref().unwrap_or_default()
+        );
+        assert!(
+            HeuristicTokenCounter.count(&outcome.messages) <= 300,
+            "the leading system message and the pulled durable pair are \
+             budgeted, not bolted on after the split (landing {})",
+            HeuristicTokenCounter.count(&outcome.messages)
         );
     }
 }

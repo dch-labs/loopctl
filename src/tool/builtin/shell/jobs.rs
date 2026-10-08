@@ -181,8 +181,11 @@ impl JobStore {
             let run = backend.run(&command, &cwd, timeout);
             let (mut text, is_error) = match tokio::time::timeout(timeout, run).await {
                 Ok(Ok(outcome)) => {
-                    let rendered =
-                        crate::tool::builtin::shell::render_outcome(&outcome, timeout_secs);
+                    let rendered = crate::tool::builtin::shell::render_outcome(
+                        &outcome,
+                        timeout_secs,
+                        &command,
+                    );
                     (rendered.text_content(), rendered.is_error)
                 }
                 Ok(Err(error)) => (error.to_string(), true),

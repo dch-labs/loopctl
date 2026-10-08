@@ -1302,16 +1302,19 @@ impl ContextManager {
     /// [`CompactionContext::pinned`](crate::compact::CompactionContext::pinned)
     /// themselves, but the contract — the compacted history always
     /// carries the pinned set verbatim — must hold for every compactor,
-    /// so a pinned message with no exact-equal representative in the
-    /// outcome is inserted after a leading system message, in statement
-    /// order, before the caller re-measures. Returns how many pins
-    /// were prepended (zero when the compactor was cooperative).
+    /// so each pin with no representative in the outcome (an output
+    /// message of the same role carrying the pin's exact text content —
+    /// the comparison the cooperative compactors' verbatim carriage
+    /// satisfies by construction) is inserted after a leading system
+    /// message, in statement order, before the caller re-measures.
+    /// Returns how many pins were prepended (zero when the compactor
+    /// was cooperative).
     fn backstop_pins(&self, outcome: &mut CompactionOutcome) -> usize {
-        if self.pins().is_empty() {
+        let pins = self.pins();
+        if pins.is_empty() {
             return 0;
         }
-        let mut missing: Vec<Message> = self
-            .pins()
+        let mut missing: Vec<Message> = pins
             .into_iter()
             .map(|(_, message)| message)
             .filter(|pin| {
@@ -2066,7 +2069,7 @@ mod tests {
             additional_context: Vec::new(),
             pinned: Vec::new(),
         };
-        let outcome = compactor.compact(msgs, 25, context).await;
+        let outcome = compactor.compact(msgs, 26, context).await;
         assert!(outcome.success);
         // 1 (first/system prompt) + 2 (preserve_recent) = 3 messages
         // preserved: the target admits the floor and no growth past it.

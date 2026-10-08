@@ -579,14 +579,17 @@ impl<C: ApiClient> BareLoop<C> {
     ///
     /// The `tool_call_id` and `resolved_tool_name` come from the call; the
     /// caller supplies the elapsed `duration`, the `output`, the `is_error`
-    /// flag, and any `display_hint`. Used by the three dispatch-outcome arms
-    /// (success, error, panic) so they share one construction shape.
+    /// flag, any `display_hint`, and the tool's own `retention` class.
+    /// Used by the dispatch-outcome arms (success, error, panic) so they
+    /// share one construction shape; the arms whose result never came
+    /// from a [`ToolOutput`](crate::tool::ToolOutput) pass `None`.
     fn result_for_call(
         tc: &ToolCall,
         duration: Duration,
         output: ToolContent,
         is_error: bool,
         display_hint: Option<crate::tool::DisplayHint>,
+        retention: Option<crate::tool::Retention>,
     ) -> ToolDispatchResult {
         ToolDispatchResult {
             tool_call_id: tc.id.clone(),
@@ -595,7 +598,7 @@ impl<C: ApiClient> BareLoop<C> {
             duration,
             resolved_tool_name: tc.tool.clone(),
             display_hint,
-            retention: None,
+            retention,
             gate: None,
         }
     }
@@ -663,6 +666,7 @@ impl<C: ApiClient> BareLoop<C> {
                     ToolContent::Text(format!("dispatch refused before execution: {e}")),
                     true,
                     None,
+                    None,
                 );
                 self.notify_tool_post(turn_idx, &tc, &blocked);
                 return Err(e);
@@ -683,6 +687,7 @@ impl<C: ApiClient> BareLoop<C> {
                         "tool temporarily unavailable: circuit breaker open".to_string(),
                     ),
                     true,
+                    None,
                     None,
                 );
                 self.post_detection(&tc, &refused);
@@ -912,12 +917,14 @@ impl<C: ApiClient> BareLoop<C> {
                     result.payload,
                     result.is_error,
                     result.display_hint,
+                    result.retention,
                 ),
                 Ok(Err(e)) => Self::result_for_call(
                     tc,
                     self.managers.clock().elapsed_since(start),
                     ToolContent::Text(e.to_string()),
                     true,
+                    None,
                     None,
                 ),
                 Err(panic_payload) => {
@@ -939,6 +946,7 @@ impl<C: ApiClient> BareLoop<C> {
                         duration,
                         ToolContent::Text(format!("Tool '{}' panicked: {msg}", tc.tool)),
                         true,
+                        None,
                         None,
                     )
                 }

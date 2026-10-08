@@ -253,14 +253,31 @@ async fn multi_edit_inner(
     if parsed.dry_run {
         return Ok(ToolOutput::text(summary).with_hint(DisplayHint::Diff));
     }
-    if let Some(conflict) = write_finals(&operations, &originals, &finals, session).await? {
-        let mut message = changed_message(Path::new(&conflict.path));
-        if !conflict.applied.is_empty() {
-            message.push_str("\n\nAlready written by this batch: ");
-            message.push_str(&conflict.applied.join(", "));
-            message.push('.');
+    match write_finals(&operations, &originals, &finals, session).await {
+        WriteOutcome::Conflict(conflict) => {
+            let mut message = changed_message(Path::new(&conflict.path));
+            if !conflict.applied.is_empty() {
+                message.push_str("\n\nAlready written by this batch: ");
+                message.push_str(&conflict.applied.join(", "));
+                message.push('.');
+            }
+            let mut output = ToolOutput::error_text(message);
+            if !conflict.applied.is_empty() {
+                output = output.with_retention(Retention::Durable);
+            }
+            return Ok(output);
         }
-        return Ok(ToolOutput::error_text(message));
+        WriteOutcome::Fault(error, applied) => {
+            if applied.is_empty() {
+                return Err(error);
+            }
+            let mut message = error.to_string();
+            message.push_str("\n\nAlready written by this batch: ");
+            message.push_str(&applied.join(", "));
+            message.push('.');
+            return Ok(ToolOutput::error_text(message).with_retention(Retention::Durable));
+        }
+        WriteOutcome::Done => {}
     }
 
     let applied: Vec<&str> = finals.keys().map(String::as_str).collect();
@@ -268,6 +285,27 @@ async fn multi_edit_inner(
     Ok(ToolOutput::text(message)
         .with_hint(DisplayHint::Diff)
         .with_retention(Retention::Durable))
+}
+
+/// How the batch's write phase ended.
+///
+/// The write phase never propagates a fault past its own boundary as an
+/// error: a mid-batch stop carries the files already written, and the
+/// caller needs that fact to classify the receipt — a batch that wrote
+/// nothing is a clean failure, while a partial apply changed state.
+enum WriteOutcome {
+    /// Every file in the batch was written.
+    ///
+    /// The caller renders the apply summary over the finals map.
+    Done,
+
+    /// A target changed on disk mid-batch; `applied` inside the
+    /// conflict lists the files written before it, in write order.
+    Conflict(BatchConflict),
+
+    /// A write-phase fault; `applied` lists the files written before
+    /// it, in write order.
+    Fault(ToolError, Vec<String>),
 }
 
 /// Why and where a batch write stopped.
@@ -314,7 +352,7 @@ async fn write_finals(
     originals: &BTreeMap<String, String>,
     finals: &BTreeMap<String, String>,
     session: &FileSession,
-) -> Result<Option<BatchConflict>, ToolError> {
+) -> WriteOutcome {
     let workspace = session.cwd();
     let policy = session.resolve_policy();
     let anchor = session.anchor();
@@ -330,23 +368,26 @@ async fn write_finals(
                 match check_content_unchanged(baseline, &op.full_path).await {
                     Ok(identity) => expected = Some(identity),
                     Err(CheckFailure::Changed) => {
-                        return Ok(Some(BatchConflict {
+                        return WriteOutcome::Conflict(BatchConflict {
                             applied,
                             path: op.file_path.clone(),
-                        }));
+                        });
                     }
-                    Err(CheckFailure::Fault(e)) => return Err(fault_with_applied(e, &applied)),
+                    Err(CheckFailure::Fault(e)) => {
+                        return WriteOutcome::Fault(e, applied);
+                    }
                 }
             }
-            atomic::atomic_write(
+            if let Err(e) = atomic::atomic_write(
                 &op.full_path,
                 final_content,
                 workspace,
                 policy,
                 expected.as_ref(),
                 Some(anchor),
-            )
-            .map_err(|e| fault_with_applied(e, &applied))?;
+            ) {
+                return WriteOutcome::Fault(e, applied);
+            }
             applied.push(op.file_path.clone());
             session.record_baseline(
                 &op.full_path,
@@ -354,22 +395,7 @@ async fn write_finals(
             );
         }
     }
-    Ok(None)
-}
-
-/// Fold the files already written into a mid-batch fault's message.
-///
-/// Earlier writes of a batch stay on disk when a later file faults, so
-/// the model must learn which files landed. When nothing has been
-/// written yet the error is returned untouched.
-fn fault_with_applied(error: ToolError, applied: &[String]) -> ToolError {
-    if applied.is_empty() {
-        return error;
-    }
-    ToolError::Execution(format!(
-        "{error}\n\nAlready written by this batch: {}.",
-        applied.join(", ")
-    ))
+    WriteOutcome::Done
 }
 
 /// Parsed top-level `MultiEdit` input.
@@ -1515,6 +1541,12 @@ mod tests {
             "the earlier writes must be reported: {text}"
         );
         assert_eq!(
+            out.retention,
+            Some(Retention::Durable),
+            "a partial apply changed state — the receipt is a side-effect record \
+             and must survive compaction"
+        );
+        assert_eq!(
             std::fs::read_to_string(tmp.path().join("a.rs")).unwrap(),
             "ALPHA\n",
             "writes before the conflict stay on disk"
@@ -1652,6 +1684,51 @@ mod tests {
             out.retention,
             Some(crate::tool::Retention::Durable),
             "a multi-edit receipt is a side-effect record — it must survive compaction verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conflict_before_any_write_stays_evictable() {
+        struct MutateA {
+            a_path: std::path::PathBuf,
+        }
+
+        impl ContentValidator for MutateA {
+            fn validate<'a>(
+                &'a self,
+                path: &'a Path,
+                _content: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Vec<ValidationDiagnostic>> + Send + 'a>> {
+                Box::pin(async move {
+                    if path == self.a_path.as_path() {
+                        std::fs::write(path, "EXTERNAL\n").unwrap();
+                    }
+                    Vec::new()
+                })
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "alpha\n").unwrap();
+        std::fs::write(tmp.path().join("b.rs"), "beta\n").unwrap();
+        let ctx = ctx_in(tmp.path().to_str().unwrap());
+        let tool = MultiEditTool::new().with_validator(Arc::new(MutateA {
+            a_path: tmp.path().join("a.rs"),
+        }));
+        let out = tool
+            .call(
+                json!({"edits": [
+                    edit("a.rs", "alpha", "ALPHA"),
+                    edit("b.rs", "beta", "BETA")
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "the first file's change aborts the batch");
+        assert_eq!(
+            out.retention, None,
+            "nothing was written — a read-only-shaped failure stays evictable"
         );
     }
 }

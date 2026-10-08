@@ -121,6 +121,16 @@ const DEFAULT_TRANSCRIPT_MAX_CHARS: usize = 48_000;
 /// compaction process to the continuing model.
 const DEFAULT_HEADER: &str = "## Conversation summary (compacted)";
 
+/// The prefix a default-header summary message is recognized by.
+///
+/// The rolling compactor adopts a big-bang ledger found at a history's
+/// head by this prefix when it carries no restored text of its own —
+/// the shared recognition seam between the two compactors. Hosts whose
+/// templates use a custom header keep the explicit
+/// [`restore_ledger`](crate::compact::rolling::RollingCompactor::restore_ledger)
+/// path.
+pub(crate) const LEDGER_HEADER_PREFIX: &str = "## Conversation summary";
+
 /// The line a fully-empty summary renders as.
 ///
 /// A dropped context with nothing salient is a valid outcome; the stub keeps
@@ -886,6 +896,50 @@ impl StructuredSummarizer {
         Self { client, config }
     }
 
+    /// Split with the durable-pull cost folded into the tail budget.
+    ///
+    /// The qa compactor's [`budgeted_split`] discipline verbatim: the
+    /// output carries the leading system message and every pulled
+    /// durable message beside the tail, so each iteration subtracts
+    /// their cost from the budget until the split and the pull set
+    /// stabilize.
+    ///
+    /// [`budgeted_split`]: crate::compact::qa_summarizer::QaSummarizer::budgeted_split
+    fn budgeted_split(
+        &self,
+        messages: &[Message],
+        mut tail_budget: u64,
+        counter: &dyn crate::compact::TokenCounter,
+    ) -> (crate::compact::truncating::SplitResult, Vec<usize>) {
+        let mut split = self
+            .splitter()
+            .split_within_budget(messages, tail_budget, counter);
+        let mut durable =
+            crate::compact::truncating::durable_pull_indices(messages, split.split_index);
+        loop {
+            let pulled_tokens: u64 = durable
+                .iter()
+                .filter_map(|index| messages.get(*index))
+                .map(|message| counter.count(std::slice::from_ref(message)))
+                .sum();
+            let next_budget = tail_budget.saturating_sub(pulled_tokens);
+            if next_budget == tail_budget {
+                return (split, durable);
+            }
+            tail_budget = next_budget;
+            let next_split = self
+                .splitter()
+                .split_within_budget(messages, tail_budget, counter);
+            let next_durable =
+                crate::compact::truncating::durable_pull_indices(messages, next_split.split_index);
+            if next_split.split_index == split.split_index && next_durable == durable {
+                return (split, durable);
+            }
+            split = next_split;
+            durable = next_durable;
+        }
+    }
+
     /// The splitter whose boundary this compactor delegates to.
     ///
     /// Rebuilt from the config each pass — a plain value, so the
@@ -1190,15 +1244,21 @@ impl ContextCompactor for StructuredSummarizer {
             }
             let budget = self.config.summary_budget(target_tokens);
             let pinned_tokens = context.counter.count(&context.pinned);
-            let split = self.splitter().split_within_budget(
+            let system_tokens = if leading_system(&messages) {
+                messages.first().map_or(0, |first| {
+                    context.counter.count(std::slice::from_ref(first))
+                })
+            } else {
+                0
+            };
+            let (split, durable) = self.budgeted_split(
                 &messages,
                 target_tokens
                     .saturating_sub(budget)
-                    .saturating_sub(pinned_tokens),
+                    .saturating_sub(pinned_tokens)
+                    .saturating_sub(system_tokens),
                 context.counter.as_ref(),
             );
-            let durable =
-                crate::compact::truncating::durable_pull_indices(&messages, split.split_index);
             let skip_head = usize::from(leading_system(&split.to_compact));
             let dropped: Vec<Message> = split
                 .to_compact

@@ -339,6 +339,29 @@ impl RollingCompactor {
         *recover_guard(self.state.lock()) = RollingState::default();
     }
 
+    /// Find the ledger message this pass carries, if any.
+    ///
+    /// A candidate is an assistant message in the first two positions:
+    /// when the compactor carries restored ledger text it must match
+    /// that text exactly; otherwise a message opening with the shared
+    /// summary-header prefix is adopted — a big-bang summary left at
+    /// the head by an earlier pass through another compactor. Hosts
+    /// with custom summary headers keep the explicit
+    /// [`restore_ledger`](Self::restore_ledger) path.
+    fn find_ledger(messages: &[Message], carried: Option<&str>) -> Option<usize> {
+        messages.iter().take(2).position(|message| {
+            if message.role != Role::Assistant {
+                return false;
+            }
+            match carried {
+                Some(ledger) => message.text_content() == ledger,
+                None => message
+                    .text_content()
+                    .starts_with(crate::compact::structured_summarizer::LEDGER_HEADER_PREFIX),
+            }
+        })
+    }
+
     /// Run one micro-summary call over one aged group.
     ///
     /// The only call shape this compactor makes: a system prompt, a
@@ -486,12 +509,7 @@ impl ContextCompactor for RollingCompactor {
                 let state = recover_guard(self.state.lock());
                 (state.ledger.clone(), state.micro_summaries.clone())
             };
-            let ledger_index = carried_ledger.as_ref().and_then(|ledger| {
-                messages
-                    .iter()
-                    .take(2)
-                    .position(|message| message.text_content() == *ledger)
-            });
+            let ledger_index = Self::find_ledger(&messages, carried_ledger.as_deref());
             let mut head_indices: Vec<usize> = Vec::new();
             if messages
                 .first()
@@ -556,7 +574,10 @@ impl ContextCompactor for RollingCompactor {
                 groups
             };
 
-            let mut summaries = prior;
+            let mut summaries: Vec<String> = carried_summaries
+                .iter()
+                .filter_map(|index| messages.get(*index).map(Message::text_content))
+                .collect();
             for group in &aged_groups {
                 match self.micro_summarize(group).await {
                     Ok(text) => summaries.push(text),
@@ -1008,6 +1029,96 @@ mod tests {
         assert_eq!(
             chain.stage_names(),
             vec!["RollingCompactor", "TruncatingCompactor"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rolling_pass_adopts_a_big_bang_ledger_at_the_head() {
+        let client = RecordingClient::new(vec![ok("micro-A"), ok("micro-B"), ok("micro-C")]);
+        let rolling = RollingCompactor::new(
+            Arc::clone(&client) as SharedApiClient,
+            RollingConfig::default()
+                .with_age_turns(2)
+                .with_min_messages(4),
+        );
+        let ledger_text =
+            "## Conversation summary (compacted)\n- the task ledger survived the handoff";
+        let mut messages = vec![Message::assistant(ledger_text)];
+        messages.extend(turn_history(4, 40));
+        let outcome = rolling
+            .compact(messages.clone(), 40_000, context_for(&messages))
+            .await;
+        assert!(outcome.success);
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.text_content() == ledger_text),
+            "a big-bang summary at the head is adopted and carried verbatim, \
+             never re-summarized"
+        );
+        let ledger_evicted = outcome
+            .evicted
+            .iter()
+            .any(|m| m.text_content() == ledger_text);
+        assert!(
+            !ledger_evicted,
+            "the adopted ledger is never handed to the sink"
+        );
+        assert_eq!(
+            rolling.ledger_summary().as_deref(),
+            Some(ledger_text),
+            "the pass adopted the ledger into its carried state"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declined_pass_does_not_resurrect_vanished_micro_summaries() {
+        let client = RecordingClient::new(vec![
+            ok("micro-one"),
+            ok("micro-two"),
+            ok("micro-A"),
+            ok("micro-B"),
+        ]);
+        let rolling = RollingCompactor::new(
+            Arc::clone(&client) as SharedApiClient,
+            RollingConfig::default()
+                .with_age_turns(1)
+                .with_min_messages(4),
+        );
+        let first = turn_history(3, 40);
+        let outcome_one = rolling
+            .compact(first, 40_000, context_for(&turn_history(3, 40)))
+            .await;
+        assert!(outcome_one.success);
+        assert!(
+            outcome_one
+                .messages
+                .iter()
+                .any(|m| m.text_content() == "micro-one"),
+            "the fixture: pass one committed a micro-summary"
+        );
+        let mut truncated_by_the_winner: Vec<Message> = outcome_one
+            .messages
+            .into_iter()
+            .filter(|m| m.text_content() != "micro-one")
+            .collect();
+        truncated_by_the_winner.extend(turn_history(2, 40));
+        let outcome_two = rolling
+            .compact(
+                truncated_by_the_winner,
+                40_000,
+                context_for(&turn_history(2, 40)),
+            )
+            .await;
+        assert!(outcome_two.success);
+        assert!(
+            !outcome_two
+                .messages
+                .iter()
+                .any(|m| m.text_content() == "micro-one"),
+            "a summary the winning stage removed from the history is not \
+             re-injected from stale state — the history decides what is carried"
         );
     }
 }

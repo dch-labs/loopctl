@@ -532,11 +532,48 @@ impl TruncatingCompactor {
             let landing = first_tokens.saturating_add(Self::tail_and_pulled_tokens(
                 messages, pairing, split, context,
             ));
-            if landing <= target_tokens {
+            if landing > target_tokens {
+                continue;
+            }
+            let kept = Self::assemble_kept(messages, pairing, split);
+            if context.counter.count(&kept) <= target_tokens {
                 return Some(split);
             }
         }
         None
+    }
+
+    /// The kept side as one message list, for exact re-measurement.
+    ///
+    /// The estimate's pieces each floor independently, so their sum can
+    /// undercount the single whole-slice count by a token per piece;
+    /// before a candidate is accepted, the caller counts this assembled
+    /// list once and holds the landing to that figure.
+    fn assemble_kept(messages: &[Message], pairing: &ToolPairing, split: usize) -> Vec<Message> {
+        let mut kept: Vec<Message> =
+            Vec::with_capacity(messages.len().saturating_sub(split).saturating_add(2));
+        if let Some(first) = messages.first() {
+            kept.push(first.clone());
+        }
+        let mut pulled = pairing.first_message_dropped_result_indices(split);
+        for index in durable_pull_indices(messages, split) {
+            if !pulled.contains(&index) {
+                pulled.push(index);
+            }
+        }
+        for index in pulled {
+            if let Some(message) = messages.get(index) {
+                kept.push(message.clone());
+            }
+        }
+        kept.extend(
+            messages
+                .get(split..)
+                .map_or([].as_slice(), |tail| tail)
+                .iter()
+                .cloned(),
+        );
+        kept
     }
 
     /// The kept side's token estimate for one split point.
@@ -2334,7 +2371,7 @@ mod tests {
             .with_min_messages(2)
             .with_preserve_recent(1);
         let context = make_context(&messages);
-        let outcome = compactor.compact(messages, 10, context).await;
+        let outcome = compactor.compact(messages, 11, context).await;
         assert!(outcome.success);
 
         for (id, calls, results) in part_counts(&outcome.messages) {
@@ -3170,6 +3207,30 @@ mod tests {
             vec![1, 2, 3],
             "every durable result's call message is pulled — both mates survive \
              together: {pulled:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_terminal_holds_the_landing_to_one_exact_count() {
+        let mut messages = vec![Message::user("p".repeat(30)), Message::user("q".repeat(30))];
+        for _ in 0..5 {
+            messages.push(Message::user("u".repeat(30)));
+        }
+        messages.push(Message::user("w".repeat(32)));
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(4)
+            .with_preserve_recent(2);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 87, context).await;
+        assert!(
+            outcome.success,
+            "a fitting candidate exists (the six-message kept side counts 75)"
+        );
+        assert!(
+            HeuristicTokenCounter.count(&outcome.messages) <= 87,
+            "the landing is held to one whole-slice count, not the sum of \
+             slice estimates (landing {})",
+            HeuristicTokenCounter.count(&outcome.messages)
         );
     }
 }

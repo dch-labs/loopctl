@@ -311,7 +311,7 @@ pub(crate) fn render_compaction_transcript(messages: &[Message], max_chars: usiz
     use std::fmt::Write as _;
     let blocks: Vec<String> = messages
         .iter()
-        .map(|msg| render_message_with(msg, COMPACTION_THINKING_CHARS))
+        .map(|msg| render_message_with(msg, COMPACTION_THINKING_CHARS, true))
         .collect();
     let total: usize = blocks.iter().map(|block| block.chars().count()).sum();
     if total <= max_chars {
@@ -414,8 +414,10 @@ fn head_cut(blocks: &[String], max_chars: usize) -> String {
 /// The per-message unit of [`render_evicted`]: role prefix, text content,
 /// then per-part summaries in part order, closed by a newline. Parts
 /// truncate at [`PART_CHARS`] — the one-line memory-entry budget.
+/// Re-derivable results render with their content (the memory-entry
+/// contract): withholding is the compaction transcript's own view.
 fn render_message(msg: &Message) -> String {
-    render_message_with(msg, PART_CHARS)
+    render_message_with(msg, PART_CHARS, false)
 }
 
 /// Render one message with an explicit thinking-part budget.
@@ -425,8 +427,13 @@ fn render_message(msg: &Message) -> String {
 /// outputs always truncate at [`PART_CHARS`] — serialized arguments are
 /// noise beyond a snippet — so the parameter widens only the thinking
 /// lane, the part marathon sessions carry their conclusions in (see
-/// [`render_compaction_transcript`]).
-fn render_message_with(msg: &Message, thinking_chars: usize) -> String {
+/// [`render_compaction_transcript`]). When `omit_requery` is set, a
+/// result stamped [`Requery`](crate::tool::Retention::Requery) renders
+/// as the omission marker instead of its content — the compaction
+/// transcript's view, where the paired `calls:` line is the pointer and
+/// content the summarizer must not restate; the demotion render keeps
+/// the content.
+fn render_message_with(msg: &Message, thinking_chars: usize, omit_requery: bool) -> String {
     use std::fmt::Write as _;
     let role = match msg.role {
         Role::User => "User",
@@ -461,6 +468,7 @@ fn render_message_with(msg: &Message, thinking_chars: usize) -> String {
                 name,
                 output,
                 is_error,
+                retention,
                 ..
             } => {
                 let status = if is_error.unwrap_or(false) {
@@ -468,8 +476,16 @@ fn render_message_with(msg: &Message, thinking_chars: usize) -> String {
                 } else {
                     "ok"
                 };
-                let rendered_output: String = output.to_string().chars().take(PART_CHARS).collect();
-                let _ignored = write!(line, " result[{name}, {status}]: {rendered_output}");
+                if omit_requery && retention == &Some(crate::tool::Retention::Requery) {
+                    let _ignored = write!(
+                        line,
+                        " result[{name}, {status}]: [re-derivable — content omitted]"
+                    );
+                } else {
+                    let rendered_output: String =
+                        output.to_string().chars().take(PART_CHARS).collect();
+                    let _ignored = write!(line, " result[{name}, {status}]: {rendered_output}");
+                }
             }
             MessagePart::Image { .. } => line.push_str(" [image]"),
             MessagePart::Text { .. } => {}
@@ -953,6 +969,60 @@ mod tests {
         assert_eq!(
             entries[0].memory, "…[evicted 3 more messages]",
             "a zero budget keeps only the marker"
+        );
+    }
+
+    #[test]
+    fn a_requery_result_renders_as_the_omission_marker_in_the_transcript_only() {
+        let requery = Message::new(
+            crate::message::Role::User,
+            vec![
+                crate::message::MessagePart::tool_result(
+                    "c1",
+                    "Read",
+                    "the full body of a.rs sits here and must not reach the summarizer",
+                    false,
+                )
+                .with_retention(crate::tool::Retention::Requery),
+            ],
+        );
+        let transcript = render_compaction_transcript(std::slice::from_ref(&requery), 4_000);
+        assert!(
+            transcript.contains("result[Read, ok]: [re-derivable — content omitted]"),
+            "the compaction transcript replaces re-derivable content with the \
+             omission marker: {transcript}"
+        );
+        assert!(
+            !transcript.contains("the full body"),
+            "the withheld content never reaches the summarizer: {transcript}"
+        );
+        let evicted = render_evicted(std::slice::from_ref(&requery), 4_000);
+        assert!(
+            evicted.contains("the full body"),
+            "the demotion render keeps the content — the memory entry stays recallable: \
+             {evicted}"
+        );
+    }
+
+    #[test]
+    fn a_durable_result_renders_in_full_in_the_transcript() {
+        let durable = Message::new(
+            crate::message::Role::User,
+            vec![
+                crate::message::MessagePart::tool_result(
+                    "c1",
+                    "Bash",
+                    "exit 0: deployment receipt 42",
+                    false,
+                )
+                .with_retention(crate::tool::Retention::Durable),
+            ],
+        );
+        let transcript = render_compaction_transcript(std::slice::from_ref(&durable), 4_000);
+        assert!(
+            transcript.contains("exit 0: deployment receipt 42"),
+            "a durable result renders with its content — the boundary's preservation \
+             side: {transcript}"
         );
     }
 }

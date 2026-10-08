@@ -60,7 +60,6 @@ use std::sync::Mutex;
 
 use super::budget_permille;
 use super::leading_system;
-use super::summarizable;
 
 /// The shared system prompt for all three summarization calls.
 ///
@@ -889,7 +888,10 @@ impl QaSummarizer {
              the files or areas already read, reviewed, or verified with what was found. Then \
              give the dense running summary: the objective, decisions made and why, important \
              constraints, active and blocked work, and the key files, paths, and identifiers \
-             involved. Keep it under roughly {budget} tokens. Emit only the summary.\n\n\
+             involved. Tool results marked as re-derivable had their content withheld — the \
+             calls lines above them name what was read; record only that coverage in the \
+             ledger, never the withheld content. Keep it under roughly {budget} tokens. Emit \
+             only the summary.\n\n\
              <conversation>\n{transcript}\n</conversation>"
         );
         if let Some(instructions) = host_instructions {
@@ -972,16 +974,28 @@ impl QaSummarizer {
     /// The assembled output list for a successful pass.
     ///
     /// A leading system-role history message survives at the head, the
-    /// summary follows as one assistant message, and the preserved tail
-    /// rides verbatim.
-    fn assemble(summary: &str, preserved: &[Message], messages: &[Message]) -> Vec<Message> {
-        let mut out = Vec::with_capacity(preserved.len().saturating_add(2));
+    /// summary follows as one assistant message, then any durable-stamped
+    /// messages pulled out of the dropped slice ride verbatim in
+    /// conversation order, and the preserved tail rides verbatim.
+    fn assemble(
+        summary: &str,
+        pulled: &[Message],
+        preserved: &[Message],
+        messages: &[Message],
+    ) -> Vec<Message> {
+        let mut out = Vec::with_capacity(
+            preserved
+                .len()
+                .saturating_add(pulled.len())
+                .saturating_add(2),
+        );
         if leading_system(messages)
             && let Some(first) = messages.first()
         {
             out.push(first.clone());
         }
         out.push(Message::assistant(summary.to_string()));
+        out.extend_from_slice(pulled);
         out.extend_from_slice(preserved);
         out
     }
@@ -1067,18 +1081,38 @@ impl ContextCompactor for QaSummarizer {
             if messages.len() <= self.config.min_messages {
                 return CompactionOutcome::no_change(messages);
             }
-            let split = self.splitter().split(&messages);
-            let dropped = summarizable(&split.to_compact);
+            let budget = self.config.summary_budget(target_tokens);
+            let pinned_tokens = context.counter.count(&context.pinned);
+            let split = self.splitter().split_within_budget(
+                &messages,
+                target_tokens
+                    .saturating_sub(budget)
+                    .saturating_sub(pinned_tokens),
+                context.counter.as_ref(),
+            );
+            let durable =
+                crate::compact::truncating::durable_pull_indices(&messages, split.split_index);
+            let skip_head = usize::from(leading_system(&split.to_compact));
+            let dropped: Vec<Message> = split
+                .to_compact
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index >= skip_head && !durable.contains(index))
+                .map(|(_, message)| message.clone())
+                .collect();
             if dropped.is_empty() {
                 return CompactionOutcome::no_change(messages);
             }
+            let pulled: Vec<Message> = durable
+                .iter()
+                .filter_map(|&index| messages.get(index).cloned())
+                .collect();
 
-            let budget = self.config.summary_budget(target_tokens);
             let prior = self.prior_summary();
             let mut spend = TokenSpend::default();
             let (enriched, steps, questions) = match self
                 .run_steps(
-                    dropped,
+                    &dropped,
                     &split.preserved,
                     budget,
                     prior.as_ref(),
@@ -1091,12 +1125,13 @@ impl ContextCompactor for QaSummarizer {
                 Err((step, error)) => return Self::fail(original, &context, step, &error),
             };
 
-            let out = Self::assemble(&enriched.text, &split.preserved, &messages);
+            let mut out = Self::assemble(&enriched.text, &pulled, &split.preserved, &messages);
+            crate::compact::prepend_pinned(&mut out, &context.pinned);
             let tokens_after = context.counter.count(&out);
             self.commit_prior(enriched.text, prior.as_ref().map(|prior| prior.pass));
             Self::emit_telemetry(steps, questions, budget, &spend);
             CompactionOutcome::compacted(out, context.tokens_before, tokens_after)
-                .with_evicted(dropped.to_vec())
+                .with_evicted(dropped)
         })
     }
 }
@@ -1276,6 +1311,7 @@ mod tests {
     use crate::api::ApiClient;
     use crate::api::error::ApiError;
     use crate::compact::TokenCounter;
+    use crate::compact::summarizable;
     use crate::compact::types::CompactReason;
     use crate::compact::{ContextManager, EnsureContextResult, HeuristicTokenCounter};
     use crate::stream::{StreamEvent, StreamStopReason};
@@ -1351,6 +1387,20 @@ mod tests {
         (client, summarizer)
     }
 
+    /// The `scripted` shape with a chosen summary budget fraction, for
+    /// pins that vary the verbosity split between summary and tail.
+    fn scripted_with_fraction(
+        script: Vec<Result<NonStreamingResponse, ApiError>>,
+        budget_pct: f64,
+    ) -> (Arc<RecordingClient>, QaSummarizer) {
+        let client = RecordingClient::new(script);
+        let summarizer = QaSummarizer::new(
+            Arc::clone(&client) as SharedApiClient,
+            QaSummarizerConfig::default().with_summary_budget_pct(budget_pct),
+        );
+        (client, summarizer)
+    }
+
     /// Six user/assistant pairs with unique, probe-able text per message.
     ///
     /// The standing fixture for the chat-history pins: enough turns for
@@ -1378,7 +1428,25 @@ mod tests {
             counter: Arc::new(HeuristicTokenCounter),
             instructions: None,
             additional_context: Vec::new(),
+            pinned: Vec::new(),
         }
+    }
+
+    /// A compaction target whose tail budget admits the count-floor
+    /// tail and blocks growth past it, for pins asserting the floor
+    /// shape under the budget split.
+    ///
+    /// Solved for the default 0.25 summary fraction, whose budget is
+    /// `target × 250 / 1000`: `4/3` of the floor tail's counted tokens
+    /// (rounded up, one more to absorb the permille flooring) leaves
+    /// the tail budget at-or-above the floor while the next boundary's
+    /// tail — a full two messages larger on the standing fixtures —
+    /// stays out of reach.
+    fn floor_target(floor_tail_tokens: u64) -> u64 {
+        floor_tail_tokens
+            .saturating_mul(4)
+            .div_ceil(3)
+            .saturating_add(1)
     }
 
     #[tokio::test]
@@ -1435,7 +1503,10 @@ mod tests {
             QaSummarizerConfig::default().with_preserve_recent(4),
         );
         let context = context_for(&messages);
-        let outcome = summarizer.compact(messages, 40_000, context).await;
+        let floor_tail = HeuristicTokenCounter.count(messages.get(4..).unwrap_or_default());
+        let outcome = summarizer
+            .compact(messages, floor_target(floor_tail), context)
+            .await;
         assert!(
             !client.prompts().is_empty(),
             "a tool-loop history has a summarizable slice — the pass must \
@@ -1464,10 +1535,15 @@ mod tests {
     #[tokio::test]
     async fn the_split_delegates_to_the_token_splitter() {
         let messages = conversation();
+        let budget = QaSummarizerConfig::default().summary_budget(40_000);
         let expected = TokenSplitter::new()
             .with_preserve_recent(6)
             .with_min_messages(8)
-            .split(&messages);
+            .split_within_budget(
+                &messages,
+                40_000_u64.saturating_sub(budget),
+                &HeuristicTokenCounter,
+            );
         let (_client, summarizer) = scripted(vec![ok("S"), ok("[]")]);
         let outcome = summarizer
             .compact(messages.clone(), 40_000, context_for(&messages))
@@ -1685,8 +1761,10 @@ mod tests {
     async fn the_summary_message_is_assistant_role_and_precedes_the_preserved_tail() {
         let (_client, summarizer) = scripted(vec![ok("SUMMARY-C"), ok("[]")]);
         let messages = conversation();
+        let target =
+            floor_target(HeuristicTokenCounter.count(messages.get(6..).unwrap_or_default()));
         let outcome = summarizer
-            .compact(messages.clone(), 40_000, context_for(&messages))
+            .compact(messages.clone(), target, context_for(&messages))
             .await;
         let first = outcome.messages.first().expect("the output is non-empty");
         assert_eq!(
@@ -1713,8 +1791,10 @@ mod tests {
                 vec![crate::message::MessagePart::text("standing instructions")],
             ),
         );
+        let target =
+            floor_target(HeuristicTokenCounter.count(messages.get(7..).unwrap_or_default()));
         let outcome = summarizer
-            .compact(messages.clone(), 40_000, context_for(&messages))
+            .compact(messages.clone(), target, context_for(&messages))
             .await;
         let first = outcome.messages.first().expect("the output is non-empty");
         assert_eq!(first.role, Role::System, "the system message survives");
@@ -2143,7 +2223,8 @@ mod tests {
         context.tokens_before = counter.count(&messages);
         context.counter = Arc::clone(&counter) as Arc<dyn TokenCounter>;
         let tokens_before = context.tokens_before;
-        let outcome = summarizer.compact(messages, 40_000, context).await;
+        let target = floor_target(counter.count(messages.get(6..).unwrap_or_default()));
+        let outcome = summarizer.compact(messages, target, context).await;
         assert_eq!(
             outcome.messages.len(),
             7,
@@ -2165,16 +2246,17 @@ mod tests {
     async fn evicted_carries_the_dropped_slice_for_the_sink() {
         let (_client, summarizer) = scripted(vec![ok("S"), ok("[]")]);
         let messages = conversation();
+        let budget = QaSummarizerConfig::default().summary_budget(40_000);
         let expected_split = TokenSplitter::new()
             .with_preserve_recent(6)
             .with_min_messages(8)
-            .split(&messages);
+            .split_within_budget(
+                &messages,
+                40_000_u64.saturating_sub(budget),
+                &HeuristicTokenCounter,
+            );
         let outcome = summarizer
-            .compact(
-                messages,
-                40_000,
-                context_for(&expected_split_to_compact_placeholder()),
-            )
+            .compact(messages.clone(), 40_000, context_for(&messages))
             .await;
         assert_eq!(
             outcome.evicted.len(),
@@ -2192,10 +2274,6 @@ mod tests {
                 .all(|msg| !kept_texts.contains(&msg.text_content())),
             "nothing listed as evicted survives in the output"
         );
-    }
-
-    fn expected_split_to_compact_placeholder() -> Vec<Message> {
-        conversation()
     }
 
     #[tokio::test]
@@ -2350,7 +2428,9 @@ mod tests {
         );
         let messages = conversation();
         let context = context_for(&messages);
-        let outcome = summarizer.compact(messages, 40_000, context).await;
+        let target =
+            floor_target(HeuristicTokenCounter.count(messages.get(6..).unwrap_or_default()));
+        let outcome = summarizer.compact(messages, target, context).await;
         assert!(outcome.success);
         let prompts = client.prompts();
         let prompt = prompts.first().expect("step 1 ran");
@@ -2365,6 +2445,106 @@ mod tests {
         assert!(
             !prompt.contains("topic-0"),
             "messages past the transcript budget never reach the prompt: {prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_qa_landing_measures_within_the_target() {
+        let (_client, summarizer) = scripted(vec![ok("S"), ok("[]")]);
+        let messages = conversation();
+        let target = 141_u64;
+        let outcome = summarizer
+            .compact(messages.clone(), target, context_for(&messages))
+            .await;
+        assert!(
+            outcome.success,
+            "the pass lands within the target: {}",
+            outcome.error.as_deref().unwrap_or_default()
+        );
+        let preserved = outcome.messages.len().saturating_sub(1);
+        assert_eq!(
+            preserved, 8,
+            "the tail budget admits the eight-message boundary tail, past the \
+             count floor of six"
+        );
+        assert!(
+            HeuristicTokenCounter.count(&outcome.messages) <= target,
+            "summary plus tail measures within the target"
+        );
+        let split_at = messages.len().saturating_sub(preserved);
+        assert_eq!(
+            messages.get(split_at.saturating_sub(1)).map(|m| m.role),
+            Some(Role::Assistant),
+            "the drop ends on an assistant message — no mid-turn cut"
+        );
+        assert_eq!(
+            messages.get(split_at).map(|m| m.role),
+            Some(Role::User),
+            "the preserved tail opens on a user message — no mid-turn cut"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_qa_tail_grows_to_fill_the_budget() {
+        let (_client, summarizer) = scripted(vec![ok("S"), ok("[]")]);
+        let messages = conversation();
+        let config = QaSummarizerConfig::default();
+        let budget = config.summary_budget(141);
+        let outcome = summarizer
+            .compact(messages.clone(), 141, context_for(&messages))
+            .await;
+        assert!(outcome.success);
+        let tail = outcome.messages.len().saturating_sub(1);
+        assert!(
+            tail > config.preserve_recent(),
+            "a budget with room grows the tail past the count floor (kept {tail})"
+        );
+        assert!(
+            HeuristicTokenCounter.count(outcome.messages.get(1..).unwrap_or_default())
+                <= 141_u64.saturating_sub(budget),
+            "the grown tail stays within the budget the split was given"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_verbosity_lands_within_the_target_s_tail_band() {
+        let messages = conversation();
+        let target = 141_u64;
+        let config = QaSummarizerConfig::default();
+        let leanest = config
+            .clone()
+            .with_summary_budget_pct(0.1)
+            .summary_budget(target);
+        let floor_tail = HeuristicTokenCounter.count(messages.get(6..).unwrap_or_default());
+        let mut landings = Vec::new();
+        for pct in [0.1_f64, 0.4] {
+            let (_client, summarizer) = scripted_with_fraction(vec![ok("S"), ok("[]")], pct);
+            let outcome = summarizer
+                .compact(messages.clone(), target, context_for(&messages))
+                .await;
+            assert!(
+                outcome.success,
+                "the {pct}-verbosity pass lands within the target: {}",
+                outcome.error.as_deref().unwrap_or_default()
+            );
+            let landing = HeuristicTokenCounter.count(&outcome.messages);
+            assert!(
+                landing <= target,
+                "every verbosity lands at-or-under the target ({pct}: {landing})"
+            );
+            assert!(
+                landing >= floor_tail,
+                "every landing keeps at least the count-floor tail ({pct}: {landing})"
+            );
+            landings.push(landing);
+        }
+        let spread = landings[0].abs_diff(landings[1]);
+        let band = target.saturating_sub(leanest).saturating_sub(floor_tail);
+        assert!(
+            spread <= band,
+            "the landings sit within the tail-budget band (spread {spread}, band \
+             {band}) — no verbosity configuration can land outside the target's \
+             own tail-budget arithmetic"
         );
     }
 
@@ -2393,6 +2573,85 @@ mod tests {
         assert_eq!(
             none_fit, "BASE",
             "when even the first bullet cannot fit, the summary returns unchanged with no section"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_durable_result_and_its_call_survive_a_qa_pass_verbatim() {
+        let mut messages = conversation();
+        messages.insert(
+            1,
+            Message::new(
+                Role::Assistant,
+                vec![crate::message::MessagePart::tool_call(
+                    "receipt",
+                    "Bash",
+                    serde_json::json!({"cmd": "deploy"}),
+                )],
+            ),
+        );
+        messages.insert(
+            2,
+            Message::new(
+                Role::User,
+                vec![
+                    crate::message::MessagePart::tool_result(
+                        "receipt",
+                        "Bash",
+                        crate::message::ToolContent::from_string("exit 0: deployment receipt 42"),
+                        false,
+                    )
+                    .with_retention(crate::tool::Retention::Durable),
+                ],
+            ),
+        );
+        let (_client, summarizer) = scripted(vec![ok("SUMMARY-D"), ok("[]")]);
+        let context = context_for(&messages);
+        let outcome = summarizer
+            .compact(messages.clone(), 200, context_for(&messages))
+            .await;
+        assert!(
+            outcome.success,
+            "the pass runs: {}",
+            outcome.error.as_deref().unwrap_or_default()
+        );
+        let part_text = |msgs: &[Message]| {
+            msgs.iter()
+                .flat_map(|m| m.parts.iter())
+                .filter_map(|p| match p {
+                    crate::message::MessagePart::ToolResult { output, .. } => {
+                        Some(output.to_string())
+                    }
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+        assert!(
+            part_text(&outcome.messages).contains("deployment receipt 42"),
+            "the durable receipt rides the compacted history verbatim"
+        );
+        assert!(
+            !part_text(&outcome.evicted).contains("deployment receipt 42"),
+            "a pulled durable message is never handed to the sink"
+        );
+        let _ = context;
+    }
+
+    #[tokio::test]
+    async fn pinned_content_survives_a_qa_pass_byte_for_byte() {
+        let (_client, summarizer) = scripted(vec![ok("SUMMARY-P"), ok("[]")]);
+        let messages = conversation();
+        let pin = Message::user("PIN: active edit set = a.rs, b.rs");
+        let mut context = context_for(&messages);
+        context.pinned = vec![pin.clone()];
+        let outcome = summarizer.compact(messages.clone(), 40_000, context).await;
+        assert!(outcome.success);
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .any(|m| m.text_content() == pin.text_content()),
+            "the pinned set rides the qa output verbatim"
         );
     }
 }

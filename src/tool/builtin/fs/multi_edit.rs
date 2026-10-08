@@ -31,6 +31,7 @@ use serde_json::json;
 use tokio::io::AsyncReadExt;
 
 use crate::tool::DisplayHint;
+use crate::tool::Retention;
 use crate::tool::Tool;
 use crate::tool::ToolContext;
 use crate::tool::ToolError;
@@ -264,7 +265,9 @@ async fn multi_edit_inner(
 
     let applied: Vec<&str> = finals.keys().map(String::as_str).collect();
     let message = apply_summary(&summary, &applied, &operations);
-    Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
+    Ok(ToolOutput::text(message)
+        .with_hint(DisplayHint::Diff)
+        .with_retention(Retention::Durable))
 }
 
 /// Why and where a batch write stopped.
@@ -1633,5 +1636,22 @@ mod tests {
         let tool = MultiEditTool::new();
         assert!(!tool.is_read_only());
         assert!(!tool.is_concurrency_safe());
+    }
+
+    #[tokio::test]
+    async fn a_multi_edit_receipt_is_stamped_durable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "x\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = MultiEditTool::new();
+        let out = tool
+            .call(json!({"edits": [edit("a.rs", "x", "y")]}), &ctx_in(cwd))
+            .await
+            .expect("the multi-edit succeeds");
+        assert_eq!(
+            out.retention,
+            Some(crate::tool::Retention::Durable),
+            "a multi-edit receipt is a side-effect record — it must survive compaction verbatim"
+        );
     }
 }

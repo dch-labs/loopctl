@@ -16,6 +16,7 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
 use crate::tool::DisplayHint;
+use crate::tool::Retention;
 use crate::tool::Tool;
 use crate::tool::ToolContext;
 use crate::tool::ToolError;
@@ -242,7 +243,9 @@ async fn edit_inner(
         OldContent::Text(&old_content),
         &new_content,
     );
-    Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
+    Ok(ToolOutput::text(message)
+        .with_hint(DisplayHint::Diff)
+        .with_retention(Retention::Durable))
 }
 
 /// Parsed and validated Edit input.
@@ -864,5 +867,25 @@ mod tests {
         let tool = EditTool::new();
         assert!(!tool.is_read_only());
         assert!(!tool.is_concurrency_safe());
+    }
+
+    #[tokio::test]
+    async fn an_edit_receipt_is_stamped_durable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "x\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = EditTool::new();
+        let out = tool
+            .call(
+                json!({"file_path": "a.rs", "old_text": "x", "new_text": "y"}),
+                &ctx_in(cwd),
+            )
+            .await
+            .expect("the edit succeeds");
+        assert_eq!(
+            out.retention,
+            Some(crate::tool::Retention::Durable),
+            "an edit receipt is a side-effect record — it must survive compaction verbatim"
+        );
     }
 }

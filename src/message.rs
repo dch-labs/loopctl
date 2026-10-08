@@ -483,6 +483,17 @@ pub enum MessagePart {
         /// `Some(true)` indicates the tool invocation failed. When
         /// `None` or `Some(false)`, the result is a success.
         is_error: Option<bool>,
+
+        /// How compaction may treat this result's content.
+        ///
+        /// Forwarded by the engine from the tool's
+        /// [`ToolOutput`](crate::tool::ToolOutput) at dispatch; `None`
+        /// (also the value older serialized histories deserialize with)
+        /// keeps today's compaction behavior. The compactors are the
+        /// only readers — wire serializers never emit the field and
+        /// loop semantics never consult it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retention: Option<crate::tool::Retention>,
     },
 }
 
@@ -586,6 +597,76 @@ impl MessagePart {
             name: name.into(),
             output: output.into(),
             is_error: Some(is_error),
+            retention: None,
+        }
+    }
+
+    /// Stamp a compaction retention class on a tool-result part,
+    /// consuming `self`.
+    ///
+    /// The host-side path for the part's [`retention`] field: builds a
+    /// history by hand and wants the compactors to treat the result as
+    /// re-derivable or durable. A non-result part returns unchanged.
+    /// The engine stamps the class automatically at dispatch — hosts
+    /// need this only for seeded fixtures and resumed histories.
+    ///
+    /// [`retention`]: MessagePart::ToolResult
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::message::MessagePart;
+    /// use loopctl::tool::Retention;
+    ///
+    /// let part = MessagePart::tool_result("c1", "Read", "body", false)
+    ///     .with_retention(Retention::Requery);
+    /// assert!(part.is_tool_result());
+    /// ```
+    #[must_use]
+    pub fn with_retention(self, retention: crate::tool::Retention) -> Self {
+        let Self::ToolResult {
+            call_id,
+            name,
+            output,
+            is_error,
+            ..
+        } = self
+        else {
+            return self;
+        };
+        Self::ToolResult {
+            call_id,
+            name,
+            output,
+            is_error,
+            retention: Some(retention),
+        }
+    }
+
+    /// Stamp an optional compaction retention class, consuming `self`.
+    ///
+    /// The `None`-passing twin of [`with_retention`](Self::with_retention):
+    /// `None` leaves the part unclassed (today's compaction behavior),
+    /// so a forwarding call site passes an `Option` through without
+    /// branching.
+    #[must_use]
+    pub fn with_retention_opt(self, retention: Option<crate::tool::Retention>) -> Self {
+        let Self::ToolResult {
+            call_id,
+            name,
+            output,
+            is_error,
+            ..
+        } = self
+        else {
+            return self;
+        };
+        Self::ToolResult {
+            call_id,
+            name,
+            output,
+            is_error,
+            retention,
         }
     }
 

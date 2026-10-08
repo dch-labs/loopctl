@@ -9,6 +9,7 @@
 use crate::compact::ContextCompactor;
 use crate::compact::types::{CompactionContext, CompactionOutcome};
 use crate::message::{Message, MessagePart, Role};
+use crate::tool::Retention;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -178,22 +179,123 @@ impl ToolPairing {
     }
 }
 
-/// A simple compactor that drops the oldest messages.
+/// The pair-safe role-transition boundaries of a history, ascending.
 ///
-/// Keeps the first message (typically the system prompt) and a configurable
-/// number of recent messages. No LLM calls required — useful as a fallback
-/// or for contexts where summarization isn't available.
+/// Every index where an assistant message is followed by a user
+/// message and the cut keeps the kept side self-contained (the
+/// [`TokenSplitter`](crate::compact::TokenSplitter) slide's own test,
+/// at its fixed point) — the turn boundaries a rolling pass ages
+/// against. Shared with the rolling compactor so "one turn" means the
+/// same group everywhere.
+pub(crate) fn safe_boundaries(messages: &[Message]) -> Vec<usize> {
+    let pairing = ToolPairing::scan(messages);
+    let mut boundaries = Vec::new();
+    for candidate in 1..messages.len() {
+        let (Some(prev), Some(curr)) = (
+            candidate
+                .checked_sub(1)
+                .and_then(|index| messages.get(index)),
+            messages.get(candidate),
+        ) else {
+            continue;
+        };
+        if prev.role != Role::Assistant || curr.role != Role::User {
+            continue;
+        }
+        let mut split = candidate;
+        loop {
+            let adjusted = pairing.adjusted_split(split);
+            if adjusted == split {
+                break;
+            }
+            split = adjusted;
+        }
+        if split == candidate {
+            boundaries.push(candidate);
+        }
+    }
+    boundaries
+}
+
+/// Dropped-message indices that must ride the kept side verbatim.
 ///
-/// The compaction target is ignored: the shed is by message count
-/// (`preserve_recent`), not token budget, so whether the result fits
-/// the window — including any budget reserved for content riding the
-/// request — is decided by the manager's fit check, not here.
+/// Every message before `split` carrying a
+/// [`Durable`](crate::tool::Retention::Durable)-stamped tool result,
+/// plus the messages carrying those results' paired calls — both mates
+/// survive together, or the strict reconstruction would strand one
+/// behind the cut. A durable result whose call never appears (a lone
+/// result) is not pulled: carrying it forward produces a
+/// provider-rejecting history, so it sinks with its slice. Shared by
+/// the truncating terminal and both LLM compactors, so the exemption
+/// means the same thing everywhere. Sorted ascending, deduplicated.
+pub(crate) fn durable_pull_indices(messages: &[Message], split: usize) -> Vec<usize> {
+    let pairing = ToolPairing::scan(messages);
+    let mut indices: Vec<usize> = Vec::new();
+    for (message_index, row) in pairing.mates.iter().enumerate().take(split) {
+        let mut mates: Vec<usize> = Vec::new();
+        let mut durable = false;
+        for (part_index, state) in row.iter().enumerate() {
+            let is_durable_result = messages
+                .get(message_index)
+                .and_then(|message| message.parts.get(part_index))
+                .is_some_and(|part| {
+                    matches!(
+                        part,
+                        MessagePart::ToolResult {
+                            retention: Some(Retention::Durable),
+                            ..
+                        }
+                    )
+                });
+            if !is_durable_result {
+                continue;
+            }
+            durable = true;
+            if let Some(PartMate::Paired { message: m }) = state
+                && !mates.contains(m)
+            {
+                mates.push(*m);
+            }
+        }
+        if !durable {
+            continue;
+        }
+        indices.push(message_index);
+        for mate in mates {
+            if mate < split && !indices.contains(&mate) {
+                indices.push(mate);
+            }
+        }
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+/// A simple compactor that keeps the first message and a recent tail,
+/// sized by the compaction target.
+///
+/// Keeps the first message (typically the system prompt) and the
+/// **largest pair-safe tail whose landing fits `target_tokens`**, as
+/// measured with the caller's counter — growing beyond the count when
+/// the target has room, never shedding below `preserve_recent`
+/// messages (the floor), and returning a no-change outcome when the
+/// floor alone cannot fit the target rather than shedding the
+/// messages the floor promised to keep. A `target_tokens` of zero —
+/// after subtracting any pinned budget — is treated as no target at
+/// all (a degenerate threshold configuration): the count floor
+/// governs, so an emergency pass still sheds. No LLM
+/// calls required — useful as a fallback or for contexts where
+/// summarization isn't available. Whether the result fits the window —
+/// including any budget reserved for content riding the request — is
+/// still decided by the manager's fit check, not here.
 ///
 /// # Strategy
 ///
 /// ```text
 /// [System?] [Old₁, Old₂, ..., Oldₙ] [Recent₁, Recent₂, ..., Recentₘ]
-///  ↑ kept   ↑ discarded ↑            ↑ preserved ↑
+///  ↑ kept   ↑ discarded ↑            ↑ preserved — m ≥ preserve_recent,
+///  ↑                                    sized so the landing fits the target
 /// ```
 ///
 /// The first message is retained (if present) because it usually
@@ -229,10 +331,12 @@ impl ToolPairing {
 /// ```
 #[derive(Debug, Clone)]
 pub struct TruncatingCompactor {
-    /// Number of recent messages to always preserve during compaction.
+    /// Floor on the number of recent messages always preserved.
     ///
-    /// This many messages from the end of the conversation are kept intact;
-    /// everything before them is dropped. Defaults to 4.
+    /// The kept tail never drops below this many messages from the
+    /// end, however tight the compaction target is; when the target
+    /// has room, the tail grows beyond it up to the largest size that
+    /// fits. Defaults to 4.
     preserve_recent: usize,
 
     /// Minimum number of messages before compaction is attempted.
@@ -246,8 +350,9 @@ pub struct TruncatingCompactor {
 impl TruncatingCompactor {
     /// Create a new truncating compactor with sensible defaults.
     ///
-    /// Preserves the 4 most recent messages and requires at least 6 messages
-    /// before compaction is attempted.
+    /// Floors the kept tail at the 4 most recent messages and requires
+    /// at least 6 messages before compaction is attempted; the target
+    /// sizes the tail above that floor.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -256,10 +361,11 @@ impl TruncatingCompactor {
         }
     }
 
-    /// Set how many recent messages to preserve during compaction.
+    /// Set the floor on recent messages preserved during compaction.
     ///
-    /// This many messages from the end of the conversation are kept
-    /// intact. The rest are dropped. Must be at least 1.
+    /// The kept tail never drops below this many messages from the
+    /// end; when the compaction target has room, the tail grows beyond
+    /// the floor up to the largest size that fits. Must be at least 1.
     #[must_use]
     pub fn with_preserve_recent(mut self, count: usize) -> Self {
         self.preserve_recent = count.max(1);
@@ -277,9 +383,11 @@ impl TruncatingCompactor {
         self
     }
 
-    /// Number of recent messages that will be preserved during compaction.
+    /// The floor on recent messages preserved during compaction.
     ///
-    /// This many messages from the end of the conversation are always kept.
+    /// The kept tail never drops below this many messages from the
+    /// end; the target sizes the tail above the floor when it has
+    /// room.
     #[must_use]
     pub fn preserve_recent(&self) -> usize {
         self.preserve_recent
@@ -304,7 +412,7 @@ impl ContextCompactor for TruncatingCompactor {
     fn compact(
         &self,
         messages: Vec<Message>,
-        _target_tokens: u64,
+        target_tokens: u64,
         context: CompactionContext,
     ) -> Pin<Box<dyn Future<Output = CompactionOutcome> + Send + '_>> {
         Box::pin(async move {
@@ -315,19 +423,17 @@ impl ContextCompactor for TruncatingCompactor {
             }
 
             let pairing = ToolPairing::scan(&messages);
-            let initial_split = total.saturating_sub(self.preserve_recent);
-            let mut split = initial_split;
-            loop {
-                let adjusted = Self::adjust_for_tool_pairs(&pairing, split);
-                if adjusted == split {
-                    break;
-                }
-                split = adjusted;
-            }
-
-            if split == 0 {
+            let floor_split = total.saturating_sub(self.preserve_recent);
+            let pinned_tokens = context.counter.count(&context.pinned);
+            let effective_target = target_tokens.saturating_sub(pinned_tokens);
+            let split = if effective_target == 0 {
+                Self::floor_split_at(&pairing, floor_split)
+            } else {
+                Self::choose_split(&messages, &pairing, floor_split, effective_target, &context)
+            };
+            let Some(split) = split else {
                 return Self::unchanged(&messages, &pairing, &context);
-            }
+            };
 
             let recent: Vec<Message> = messages.get(split..).unwrap_or_default().to_vec();
 
@@ -344,9 +450,11 @@ impl ContextCompactor for TruncatingCompactor {
             }
 
             let evicted = Self::evicted_complement(&messages, &surviving);
-            let tokens_after = context.counter.count(&preserved);
+            let mut out = preserved;
+            crate::compact::prepend_pinned(&mut out, &context.pinned);
+            let tokens_after = context.counter.count(&out);
             CompactionOutcome {
-                messages: preserved,
+                messages: out,
                 tokens_after,
                 tokens_saved: context.tokens_before.saturating_sub(tokens_after),
                 success: true,
@@ -359,6 +467,108 @@ impl ContextCompactor for TruncatingCompactor {
 }
 
 impl TruncatingCompactor {
+    /// The floor split, pair-adjusted, without a target.
+    ///
+    /// The legacy selection for a `target_tokens` of zero — a degenerate
+    /// threshold configuration (or a reserve that consumed the whole
+    /// target) where "fit the target" has no meaning: the count floor
+    /// governs, so an emergency pass can still shed. `None` when the
+    /// adjustment pulls the split past the head (nothing can be shed
+    /// without breaking a tool pair).
+    fn floor_split_at(pairing: &ToolPairing, floor_split: usize) -> Option<usize> {
+        let mut split = floor_split;
+        loop {
+            let adjusted = Self::adjust_for_tool_pairs(pairing, split);
+            if adjusted == split {
+                break;
+            }
+            split = adjusted;
+        }
+        if split == 0 { None } else { Some(split) }
+    }
+
+    /// Choose the split whose kept side is the largest tail that fits
+    /// the target, never shedding below the `preserve_recent` floor.
+    ///
+    /// Candidates are the split points from the conversation's head up
+    /// to `floor_split` (the floor: at most `preserve_recent` messages
+    /// are shed), each slid to its pair-safe fixed point — the slide
+    /// only moves a split backward, so every candidate stays within
+    /// range. The landing is estimated per candidate as the first
+    /// message plus the tail plus any first-message-mate results the
+    /// assembly pulls back, all counted with the caller's counter; the
+    /// first candidate whose estimate fits (and whose exact
+    /// re-measurement of the assembled shape fits too) wins — the
+    /// smallest split, i.e. the largest tail. `None` when no candidate
+    /// fits — the pair-adjusted floor itself lands above the target,
+    /// so the caller takes the unchanged path rather than shedding
+    /// the floor the configuration promised to keep, or when every
+    /// candidate slides past the head (nothing can be shed without
+    /// breaking a tool pair).
+    fn choose_split(
+        messages: &[Message],
+        pairing: &ToolPairing,
+        floor_split: usize,
+        target_tokens: u64,
+        context: &CompactionContext,
+    ) -> Option<usize> {
+        let first_tokens = messages.first().map_or(0, |first| {
+            context.counter.count(std::slice::from_ref(first))
+        });
+        let mut last_seen = 0;
+        for candidate in 2..=floor_split {
+            let mut split = candidate;
+            loop {
+                let adjusted = Self::adjust_for_tool_pairs(pairing, split);
+                if adjusted == split {
+                    break;
+                }
+                split = adjusted;
+            }
+            if split < 2 || split == last_seen {
+                continue;
+            }
+            last_seen = split;
+            let landing = first_tokens.saturating_add(Self::tail_and_pulled_tokens(
+                messages, pairing, split, context,
+            ));
+            if landing <= target_tokens {
+                return Some(split);
+            }
+        }
+        None
+    }
+
+    /// The kept side's token estimate for one split point.
+    ///
+    /// The tail from `split` onward plus the dropped messages the
+    /// assembly pulls back alongside the first message for its tool
+    /// calls — both counted with the caller's counter, per message, so
+    /// the walk stays linear in the history while the final outcome
+    /// still reports the exact whole-slice measurement.
+    fn tail_and_pulled_tokens(
+        messages: &[Message],
+        pairing: &ToolPairing,
+        split: usize,
+        context: &CompactionContext,
+    ) -> u64 {
+        let mut tokens = messages
+            .get(split..)
+            .map_or(0, |tail| context.counter.count(tail));
+        let mut pulled: Vec<usize> = pairing.first_message_dropped_result_indices(split);
+        for index in durable_pull_indices(messages, split) {
+            if !pulled.contains(&index) {
+                pulled.push(index);
+            }
+        }
+        for index in pulled {
+            if let Some(pulled) = messages.get(index) {
+                tokens = tokens.saturating_add(context.counter.count(std::slice::from_ref(pulled)));
+            }
+        }
+        tokens
+    }
+
     /// Adjust the split index to avoid orphaning tool-call/result pairs.
     ///
     /// If the "recent" portion (from `split` onward) contains any
@@ -416,7 +626,14 @@ impl TruncatingCompactor {
         split: usize,
         kept: Vec<Message>,
     ) -> (Vec<Message>, Vec<usize>) {
-        let pull_indices = pairing.first_message_dropped_result_indices(split);
+        let mut pull_indices = pairing.first_message_dropped_result_indices(split);
+        for index in durable_pull_indices(messages, split) {
+            if !pull_indices.contains(&index) {
+                pull_indices.push(index);
+            }
+        }
+        pull_indices.sort_unstable();
+        pull_indices.dedup();
 
         let pulled: Vec<Message> = pull_indices
             .iter()
@@ -759,6 +976,104 @@ impl TokenSplitter {
         }
     }
 
+    /// Split the given messages so the preserved tail fits a token
+    /// budget, keeping at least the `preserve_recent` floor.
+    ///
+    /// The budget-aware selection behind the LLM compactors' landings:
+    /// candidate boundaries are the role-transition points at or
+    /// before `len − preserve_recent` messages dropped (the floor —
+    /// never summarize the newest `preserve_recent` messages away),
+    /// each slid to its pair-safe fixed point exactly as
+    /// [`split`](Self::split) slides its cut. Among candidates whose
+    /// tail — measured with the caller's `counter`, the same one the
+    /// landing will be judged by — fits `tail_token_budget`, the
+    /// **largest tail** (the smallest split point) wins, so the tail
+    /// grows to fill the budget when boundaries allow instead of
+    /// sitting at the count floor. When no boundary's tail fits, the
+    /// result degrades to [`split`](Self::split)'s count-based cut —
+    /// the landing will exceed the budget, and the caller's chain
+    /// declines the stage.
+    ///
+    /// The `min_messages` guard and the "never compact the last user
+    /// message" rule are [`split`](Self::split)'s; the
+    /// [`SplitResult`] token fields keep their heuristic-estimate
+    /// semantics — the budget walk itself runs on `counter`.
+    #[must_use]
+    pub fn split_within_budget(
+        &self,
+        messages: &[Message],
+        tail_token_budget: u64,
+        counter: &dyn crate::compact::TokenCounter,
+    ) -> SplitResult {
+        if messages.len() <= self.min_messages {
+            return SplitResult {
+                to_compact: vec![],
+                preserved: messages.to_vec(),
+                compact_tokens: 0,
+                preserved_tokens: CompactionOutcome::estimate_tokens(messages),
+                split_index: 0,
+            };
+        }
+        let max_split = messages.len().saturating_sub(self.preserve_recent);
+        if max_split == 0 {
+            return self.split(messages);
+        }
+        let pairing = ToolPairing::scan(messages);
+        let mut suffix_estimate = vec![0_u64; messages.len().saturating_add(1)];
+        for index in (0..messages.len()).rev() {
+            if let Some(message) = messages.get(index) {
+                let tail = counter.count(std::slice::from_ref(message));
+                let after = suffix_estimate
+                    .get(index.saturating_add(1))
+                    .copied()
+                    .unwrap_or(0);
+                if let Some(slot) = suffix_estimate.get_mut(index) {
+                    *slot = after.saturating_add(tail);
+                }
+            }
+        }
+        let mut last_seen = 0;
+        for candidate in 1..=max_split {
+            let (Some(prev), Some(curr)) = (
+                messages.get(candidate.wrapping_sub(1)),
+                messages.get(candidate),
+            ) else {
+                continue;
+            };
+            if prev.role != Role::Assistant || curr.role != Role::User {
+                continue;
+            }
+            let mut split = candidate;
+            loop {
+                let adjusted = pairing.adjusted_split(split);
+                if adjusted == split {
+                    break;
+                }
+                split = adjusted;
+            }
+            if split == last_seen {
+                continue;
+            }
+            last_seen = split;
+            let estimate = suffix_estimate.get(split).copied().unwrap_or(u64::MAX);
+            if estimate > tail_token_budget {
+                continue;
+            }
+            let exact = counter.count(messages.get(split..).unwrap_or_default());
+            if exact <= tail_token_budget {
+                let (to_compact, preserved) = messages.split_at(split);
+                return SplitResult {
+                    to_compact: to_compact.to_vec(),
+                    preserved: preserved.to_vec(),
+                    compact_tokens: CompactionOutcome::estimate_tokens(to_compact),
+                    preserved_tokens: CompactionOutcome::estimate_tokens(preserved),
+                    split_index: split,
+                };
+            }
+        }
+        self.split(messages)
+    }
+
     /// Find the nearest turn boundary at or before the target index,
     /// sliding an orphaning cut back to the straddling call.
     ///
@@ -824,6 +1139,8 @@ impl Default for TokenSplitter {
 mod tests {
     use super::*;
     use crate::compact::ContextCompactor;
+    use crate::compact::HeuristicTokenCounter;
+    use crate::compact::TokenCounter;
     use crate::compact::types::{CompactReason, CompactionContext};
     use crate::message::{Message, MessagePart, Role, ToolContent};
     use serde_json::json;
@@ -842,6 +1159,7 @@ mod tests {
 
             instructions: None,
             additional_context: Vec::new(),
+            pinned: Vec::new(),
         }
     }
 
@@ -883,6 +1201,174 @@ mod tests {
         msgs.iter()
             .flat_map(|m| m.parts.iter())
             .any(|p| matches!(p, MessagePart::ToolResult { call_id: cid, .. } if cid == call_id))
+    }
+
+    /// A ten-message history with a small head, five small turns, and
+    /// four medium tails — sizes chosen so the target ladder below
+    /// separates every candidate landing.
+    ///
+    /// Token shapes with the heuristic counter (chars + 20 over 4):
+    /// the head message is 6, each small message 30, each medium
+    /// message 130 — floor landing 526, then 556, 586, 616, 646 for
+    /// the successive grow candidates.
+    fn sized_history() -> Vec<Message> {
+        let mut messages = vec![Message::user("head")];
+        for _ in 0..5 {
+            messages.push(Message::user("a".repeat(100)));
+        }
+        for _ in 0..4 {
+            messages.push(Message::assistant("m".repeat(500)));
+        }
+        messages
+    }
+
+    #[tokio::test]
+    async fn the_terminal_sizes_the_tail_to_the_target_above_the_floor() {
+        let compactor = TruncatingCompactor::new()
+            .with_preserve_recent(4)
+            .with_min_messages(4);
+        for (target, expected_kept) in [(600_u64, 7_usize), (560, 6), (530, 5)] {
+            let messages = sized_history();
+            let context = make_context(&messages);
+            let outcome = compactor.compact(messages, target, context).await;
+            assert!(
+                outcome.success,
+                "the target admits a tail at-or-above the floor ({target})"
+            );
+            assert_eq!(
+                outcome.messages.len(),
+                expected_kept,
+                "the largest fitting tail above the floor is kept (target {target})"
+            );
+            assert!(
+                HeuristicTokenCounter.count(&outcome.messages) <= target,
+                "the landing measures within the target (target {target})"
+            );
+            assert_eq!(
+                outcome.messages.last().map(Message::text_content),
+                Some("m".repeat(500)),
+                "the newest message always survives"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_terminal_grows_the_tail_when_the_target_allows() {
+        let compactor = TruncatingCompactor::new()
+            .with_preserve_recent(2)
+            .with_min_messages(4);
+        let mut messages = vec![Message::user("head")];
+        for turn in 0..12 {
+            messages.push(Message::user(format!("turn {turn}: {}", "x".repeat(80))));
+        }
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 140, context).await;
+        assert!(outcome.success);
+        assert!(
+            outcome.messages.len() > 3,
+            "a generous target grows the tail beyond the preserve_recent floor \
+             of two (kept {})",
+            outcome.messages.len()
+        );
+        assert!(
+            HeuristicTokenCounter.count(&outcome.messages) <= 140,
+            "the grown tail still lands within the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_floor_that_cannot_fit_the_target_refuses_through_the_noop_path() {
+        let compactor = TruncatingCompactor::new()
+            .with_preserve_recent(4)
+            .with_min_messages(4);
+        let messages = sized_history();
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 500, context).await;
+        assert!(
+            outcome.success,
+            "the refusal is a no-change outcome, not a failure"
+        );
+        assert_eq!(
+            outcome.messages.len(),
+            10,
+            "a floor that cannot fit the target sheds nothing"
+        );
+        assert!(
+            outcome.evicted.is_empty(),
+            "nothing left the feed on the refusal path"
+        );
+        assert_eq!(
+            outcome.tokens_after,
+            HeuristicTokenCounter.count(&outcome.messages),
+            "the no-change outcome reports the honest unchanged size"
+        );
+    }
+
+    /// Eight user/assistant pairs with a distinct body per message, so
+    /// a tail's content is identifiable by its text.
+    fn pair_history() -> Vec<Message> {
+        let mut messages = Vec::new();
+        for turn in 0..8 {
+            messages.push(Message::user(format!(
+                "user-{turn} asks about topic-{turn}"
+            )));
+            messages.push(Message::assistant(format!(
+                "assistant-{turn} decided fact-{turn}"
+            )));
+        }
+        messages
+    }
+
+    #[test]
+    fn the_budget_split_takes_the_largest_tail_that_fits() {
+        let splitter = TokenSplitter::new()
+            .with_min_messages(4)
+            .with_preserve_recent(4);
+        let messages = pair_history();
+        let counter = HeuristicTokenCounter;
+        // A budget sized exactly at the eight-message tail: the largest
+        // fitting boundary tail is that one, well past the count floor
+        // of four messages.
+        let eight = counter.count(messages.get(8..).unwrap_or_default());
+        let ten = counter.count(messages.get(6..).unwrap_or_default());
+        assert!(eight < ten, "the fixture separates the candidates");
+        let result = splitter.split_within_budget(&messages, eight, &counter);
+        assert_eq!(
+            result.split_index, 8,
+            "the largest fitting boundary tail is taken, growing past the \
+             count floor of four"
+        );
+        assert_eq!(
+            result.preserved.len(),
+            messages.len() - 8,
+            "the preserved tail is everything from the split point"
+        );
+        assert!(
+            counter.count(&result.preserved) <= eight,
+            "the chosen tail fits the budget exactly"
+        );
+    }
+
+    #[test]
+    fn the_budget_split_keeps_the_count_floor_when_the_budget_cannot_fit_it() {
+        let splitter = TokenSplitter::new()
+            .with_min_messages(4)
+            .with_preserve_recent(4);
+        let messages = pair_history();
+        let counter = HeuristicTokenCounter;
+        let floor_tail = counter.count(messages.get(16..).unwrap_or_default());
+        let result =
+            splitter.split_within_budget(&messages, floor_tail.saturating_sub(1), &counter);
+        let count_based = splitter.split(&messages);
+        assert_eq!(
+            result.split_index, count_based.split_index,
+            "a budget the floor tail cannot fit degrades to the count-based cut"
+        );
+        assert_eq!(
+            result.preserved.len(),
+            count_based.preserved.len(),
+            "at least preserve_recent messages stay preserved"
+        );
     }
 
     #[tokio::test]
@@ -1848,7 +2334,7 @@ mod tests {
             .with_min_messages(2)
             .with_preserve_recent(1);
         let context = make_context(&messages);
-        let outcome = compactor.compact(messages, 1, context).await;
+        let outcome = compactor.compact(messages, 10, context).await;
         assert!(outcome.success);
 
         for (id, calls, results) in part_counts(&outcome.messages) {
@@ -1879,7 +2365,7 @@ mod tests {
             .with_min_messages(2)
             .with_preserve_recent(2);
         let context = make_context(&messages);
-        let outcome = compactor.compact(messages, 1, context).await;
+        let outcome = compactor.compact(messages, 100, context).await;
         assert!(outcome.success);
 
         let pending_call_kept = outcome.messages.iter().any(|m| {
@@ -2158,7 +2644,7 @@ mod tests {
             .with_min_messages(4)
             .with_preserve_recent(3);
         let context = make_context(&messages);
-        let outcome = compactor.compact(messages, 1, context).await;
+        let outcome = compactor.compact(messages, 28, context).await;
         assert!(outcome.success);
 
         assert_eq!(
@@ -2261,7 +2747,7 @@ mod tests {
             .with_min_messages(2)
             .with_preserve_recent(2);
         let context = make_context(&messages);
-        let outcome = compactor.compact(messages, 1, context).await;
+        let outcome = compactor.compact(messages, 18, context).await;
         assert!(outcome.success);
         assert!(
             !outcome.messages.iter().any(|m| m.parts.iter().any(
@@ -2346,7 +2832,7 @@ mod tests {
             .with_min_messages(4)
             .with_preserve_recent(4);
         let context = make_context(&messages);
-        let outcome = compactor.compact(messages, 1, context).await;
+        let outcome = compactor.compact(messages, 45, context).await;
         assert!(outcome.success);
 
         assert!(
@@ -2404,6 +2890,7 @@ mod tests {
 
             instructions: None,
             additional_context: Vec::new(),
+            pinned: Vec::new(),
         };
         let outcome = compactor.compact(messages, 1, context).await;
         assert!(outcome.success);
@@ -2429,6 +2916,7 @@ mod tests {
 
             instructions: None,
             additional_context: Vec::new(),
+            pinned: Vec::new(),
         };
         let outcome = compactor.compact(clean, 1, context).await;
         assert!(outcome.success);
@@ -2541,5 +3029,147 @@ mod tests {
                 prop_assert!(!outcome.messages.is_empty(), "output never empties");
             }
         });
+    }
+
+    #[tokio::test]
+    async fn a_durable_result_and_its_call_survive_the_truncating_terminal_verbatim() {
+        let mut messages = vec![Message::user("task")];
+        for turn in 0..3 {
+            messages.push(Message::assistant(format!(
+                "note {turn} {}",
+                "x".repeat(60)
+            )));
+            messages.push(Message::user(format!("filler {turn} {}", "y".repeat(60))));
+        }
+        messages.insert(
+            1,
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "receipt",
+                    "Bash",
+                    json!({"cmd": "deploy"}),
+                )],
+            ),
+        );
+        messages.insert(
+            2,
+            Message::new(
+                Role::User,
+                vec![
+                    MessagePart::tool_result(
+                        "receipt",
+                        "Bash",
+                        tool_text("exit 0: deployment receipt 42"),
+                        false,
+                    )
+                    .with_retention(crate::tool::Retention::Durable),
+                ],
+            ),
+        );
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(2)
+            .with_preserve_recent(2);
+        let context = make_context(&messages);
+        let outcome = compactor.compact(messages, 120, context).await;
+        assert!(outcome.success);
+        assert!(
+            has_tool_call(&outcome.messages, "receipt"),
+            "the durable result's call is pulled into the kept side"
+        );
+        let part_text = |messages: &[Message]| {
+            messages
+                .iter()
+                .flat_map(|m| m.parts.iter())
+                .filter_map(|p| match p {
+                    MessagePart::ToolResult { output, .. } => Some(output.to_string()),
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+        let kept_text = part_text(&outcome.messages);
+        assert!(
+            kept_text.contains("deployment receipt 42"),
+            "the durable receipt rides the compacted history verbatim: {:?}",
+            outcome.messages.len()
+        );
+        assert!(
+            outcome.messages.len() < 9,
+            "the pass actually compacted rather than refusing"
+        );
+        let evicted_text = part_text(&outcome.evicted);
+        assert!(
+            !evicted_text.contains("deployment receipt 42"),
+            "a pulled durable message is never listed as evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_terminal_counts_the_pinned_set_in_its_target_arithmetic() {
+        let messages: Vec<Message> = (0..12)
+            .map(|turn| {
+                if turn % 2 == 0 {
+                    Message::user(format!("turn {turn} {}", "u".repeat(90)))
+                } else {
+                    Message::assistant(format!("reply {turn} {}", "a".repeat(90)))
+                }
+            })
+            .collect();
+        let pin = Message::user(format!("PIN {}", "p".repeat(36)));
+        let pinned_tokens = HeuristicTokenCounter.count(std::slice::from_ref(&pin));
+        let compactor = TruncatingCompactor::new()
+            .with_min_messages(4)
+            .with_preserve_recent(4);
+        let mut context = make_context(&messages);
+        context.pinned = vec![pin.clone()];
+        let target = 190_u64;
+        let outcome = compactor.compact(messages, target, context).await;
+        assert!(
+            outcome.success,
+            "a target with slack admits a tail above the floor"
+        );
+        assert!(
+            HeuristicTokenCounter.count(&outcome.messages) <= target,
+            "the landing includes the pinned set — the selection must budget for \
+             it (pin {pinned_tokens} tokens, landing {})",
+            HeuristicTokenCounter.count(&outcome.messages)
+        );
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .any(|m| m.text_content() == pin.text_content()),
+            "the pin rides the landing it was budgeted for"
+        );
+    }
+
+    #[test]
+    fn a_message_with_two_durable_results_pulls_both_call_messages() {
+        let mut messages = vec![Message::user("task")];
+        messages.push(Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call("r1", "Bash", json!({"cmd": "one"}))],
+        ));
+        messages.push(Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call("r2", "Bash", json!({"cmd": "two"}))],
+        ));
+        messages.push(Message::new(
+            Role::User,
+            vec![
+                MessagePart::tool_result("r1", "Bash", tool_text("receipt one"), false)
+                    .with_retention(crate::tool::Retention::Durable),
+                MessagePart::tool_result("r2", "Bash", tool_text("receipt two"), false)
+                    .with_retention(crate::tool::Retention::Durable),
+            ],
+        ));
+        messages.push(Message::assistant("later"));
+        let pulled = durable_pull_indices(&messages, 4);
+        assert_eq!(
+            pulled,
+            vec![1, 2, 3],
+            "every durable result's call message is pulled — both mates survive \
+             together: {pulled:?}"
+        );
     }
 }

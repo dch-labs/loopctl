@@ -643,6 +643,7 @@ mod tests {
                         payload: ToolContent::Text("w".repeat(OUTPUT_CAP_CHARS)),
                         is_error: false,
                         display_hint: None,
+                        retention: None,
                     })
                 })
             }

@@ -23,6 +23,7 @@ use tokio::io::AsyncSeekExt;
 use tokio::io::SeekFrom;
 
 use crate::tool::DisplayHint;
+use crate::tool::Retention;
 use crate::tool::Tool;
 use crate::tool::ToolContext;
 use crate::tool::ToolError;
@@ -206,9 +207,11 @@ async fn view_inner(input: Value, session: &FileSession) -> Result<ToolOutput, T
     let view_lines = read_window(&mut file, bounds.start, window_len).await?;
 
     let output = render_output(parsed.file_path, &bounds, &view_lines, parsed.output_format);
-    Ok(ToolOutput::text(output).with_hint(DisplayHint::Code {
-        language: detect_language(parsed.file_path).to_string(),
-    }))
+    Ok(ToolOutput::text(output)
+        .with_hint(DisplayHint::Code {
+            language: detect_language(parsed.file_path).to_string(),
+        })
+        .with_retention(Retention::Requery))
 }
 
 /// Open the view target, verifying the handle under containment.
@@ -1451,6 +1454,23 @@ mod tests {
         assert!(
             err.to_string().contains("escaped"),
             "the post-swap location must be rejected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_output_is_stamped_requery() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = FileViewerTool;
+        let out = tool
+            .call(json!({"file_path": "a.rs"}), &ctx_in(cwd))
+            .await
+            .expect("the read succeeds");
+        assert_eq!(
+            out.retention,
+            Some(crate::tool::Retention::Requery),
+            "a file read is re-derivable — the compaction transcript withholds it"
         );
     }
 }

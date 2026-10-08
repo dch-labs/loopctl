@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::tool::Retention;
 use crate::tool::builtin::search::SearchSource;
 use crate::tool::builtin::search::SourceEntry;
 use crate::tool::builtin::search::output::MAX_INLINE_OUTPUT_BYTES;
@@ -199,7 +200,8 @@ async fn tree_inner<S: SearchSource + 'static>(
             &temp_dir,
             MAX_INLINE_OUTPUT_BYTES,
         )
-        .0)
+        .0
+        .with_retention(Retention::Requery))
     })
     .await
     .map_err(|error| ToolError::Execution(format!("Tree walk task failed: {error}")))?
@@ -866,6 +868,25 @@ mod tests {
             output.text_content().starts_with("No matching entries in:"),
             "{}",
             output.text_content()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tree_output_is_stamped_requery() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "x\n").unwrap();
+        let tool = TreeTool::new(FsSearchSource);
+        let output = tool
+            .call(
+                json!({"path": tmp.path().to_str().unwrap()}),
+                &ctx_in(tmp.path().to_str().unwrap()),
+            )
+            .await
+            .expect("call");
+        assert_eq!(
+            output.retention,
+            Some(crate::tool::Retention::Requery),
+            "a tree listing is re-derivable — the compaction transcript withholds it"
         );
     }
 }

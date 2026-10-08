@@ -718,6 +718,7 @@ mod tests {
                     name: "echo".to_string(),
                     output: crate::message::ToolContent::from("ok"),
                     is_error: None,
+                    retention: None,
                 }],
             },
         ]);

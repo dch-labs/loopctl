@@ -432,8 +432,8 @@ mod scenarios {
         // the new run's first request carries the compacted history,
         // not the grown one.
         let script = vec![
-            tool_turn_response_with_fill(0, 40, 320),
-            tool_turn_response_with_fill(1, 40, 320),
+            tool_turn_response_with_fill(0, 40, 800),
+            tool_turn_response_with_fill(1, 40, 800),
             tool_turn_response_with_fill(2, 40, 320),
             tool_turn_response_with_fill(3, 40, 320),
             final_response(),
@@ -539,9 +539,11 @@ mod scenarios {
         // compacted history, and its request is then served under the
         // window.
         let script = vec![
-            tool_turn_response(0, 40),
-            tool_turn_response(1, 40),
-            tool_turn_response(2, 40),
+            tool_turn_response_with_fill(0, 40, 800),
+            tool_turn_response_with_fill(1, 40, 800),
+            tool_turn_response_with_fill(2, 40, 40),
+            tool_turn_response_with_fill(3, 40, 40),
+            tool_turn_response_with_fill(4, 40, 40),
             final_response(),
         ];
         let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
@@ -549,7 +551,7 @@ mod scenarios {
         let starts = Arc::new(AtomicUsize::new(0));
 
         let config = SessionConfig::default()
-            .with_context_window(400)
+            .with_context_window(900)
             .with_compact_threshold(80);
         let client_handle = client.clone();
         let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
@@ -585,7 +587,7 @@ mod scenarios {
         );
         for tokens in &served {
             assert!(
-                *tokens <= 400,
+                *tokens <= 900,
                 "every served request carries the whole payload under the \
                  window; served {served:?}"
             );
@@ -1071,8 +1073,8 @@ mod scenarios {
         }
 
         let script = vec![
-            tool_turn_response_with_fill(0, 40, 320),
-            tool_turn_response_with_fill(1, 40, 320),
+            tool_turn_response_with_fill(0, 40, 800),
+            tool_turn_response_with_fill(1, 40, 800),
             tool_turn_response_with_fill(2, 40, 320),
             tool_turn_response_with_fill(3, 40, 320),
             final_response(),
@@ -1223,8 +1225,8 @@ mod scenarios {
         // past the default 80% line), while the emergency line at 95%
         // stays armed.
         let script = vec![
-            tool_turn_response_with_fill(0, 40, 300),
-            tool_turn_response_with_fill(1, 40, 300),
+            tool_turn_response_with_fill(0, 40, 260),
+            tool_turn_response_with_fill(1, 40, 260),
             final_response(),
         ];
         let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));

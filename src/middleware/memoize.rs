@@ -558,6 +558,7 @@ mod tests {
                     tool_call_id: "fixture_call_id".to_string(),
                     duration: Duration::ZERO,
                     display_hint: None,
+                    retention: None,
                     gate: None,
                 }
             })
@@ -599,6 +600,7 @@ mod tests {
                     tool_call_id: "fixture_call_id".to_string(),
                     duration: Duration::ZERO,
                     display_hint: None,
+                    retention: None,
                     gate: None,
                 }
             })
@@ -967,6 +969,7 @@ mod tests {
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
                 display_hint: None,
+                retention: None,
                 gate: None,
             },
             0,
@@ -991,6 +994,7 @@ mod tests {
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
                 display_hint: None,
+                retention: None,
                 gate: None,
             },
             0,
@@ -1029,6 +1033,7 @@ mod tests {
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
                 display_hint: None,
+                retention: None,
                 gate: None,
             },
             0,
@@ -1045,6 +1050,7 @@ mod tests {
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
                 display_hint: None,
+                retention: None,
                 gate: None,
             },
             1,
@@ -1072,6 +1078,7 @@ mod tests {
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
             display_hint: None,
+            retention: None,
             gate: None,
         };
         insert(
@@ -1119,6 +1126,7 @@ mod tests {
                 duration: Duration::ZERO,
                 resolved_tool_name: String::new(),
                 display_hint: None,
+                retention: None,
                 gate: None,
             },
             0,
@@ -1144,6 +1152,7 @@ mod tests {
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
             display_hint: None,
+            retention: None,
             gate: None,
         };
         // Two entries both touching "shared.rs".
@@ -1209,6 +1218,7 @@ mod tests {
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
             display_hint: None,
+            retention: None,
             gate: None,
         };
         let epoch = current_epoch(&cache);
@@ -1239,6 +1249,7 @@ mod tests {
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
             display_hint: None,
+            retention: None,
             gate: None,
         };
         let epoch = current_epoch(&cache);
@@ -1274,6 +1285,7 @@ mod tests {
                         tool_call_id: String::new(),
                         duration: Duration::ZERO,
                         display_hint: None,
+                        retention: None,
                         gate: None,
                     }
                 })
@@ -1336,6 +1348,7 @@ mod tests {
                         tool_call_id: String::new(),
                         duration: Duration::from_millis(250),
                         display_hint: None,
+                        retention: None,
                         gate: None,
                     }
                 })
@@ -1650,6 +1663,7 @@ mod tests {
                         tool_call_id: String::new(),
                         duration: std::time::Duration::ZERO,
                         display_hint: None,
+                        retention: None,
                         gate: None,
                     }
                 })

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::tool::Retention;
 use crate::tool::builtin::search::SearchSource;
 use crate::tool::builtin::search::content::Match;
 use crate::tool::builtin::search::content::SearchJob;
@@ -198,7 +199,8 @@ async fn code_search_inner<S: SearchSource + 'static>(
         return Ok(no_matches_message(&parsed.pattern));
     }
 
-    Ok(render(&matches, &parsed.pattern, context_lines, &temp_dir))
+    Ok(render(&matches, &parsed.pattern, context_lines, &temp_dir)
+        .with_retention(Retention::Requery))
 }
 
 /// Scan one file's lines for regex matches; return up to `limit`.
@@ -628,6 +630,21 @@ mod tests {
             output.text_content().contains("  1: Needle"),
             "{}",
             output.text_content()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_search_output_is_stamped_requery() {
+        let tool =
+            CodeSearchTool::new(FakeSearchSource::with(&[("/repo/a.rs", text("hit one\n"))]));
+        let output = tool
+            .call(json!({"pattern": "hit", "path": "/repo"}), &ctx_in("/repo"))
+            .await
+            .expect("call");
+        assert_eq!(
+            output.retention,
+            Some(crate::tool::Retention::Requery),
+            "code-search hits are re-derivable — the compaction transcript withholds them"
         );
     }
 }

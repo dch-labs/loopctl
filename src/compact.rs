@@ -67,17 +67,20 @@
 //! [`ContextManager`]. When present, it checks token usage after each turn
 //! and triggers compaction automatically when usage exceeds the threshold.
 
+use crate::error::LoopError;
 use crate::message::{Message, MessagePart, Role};
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub mod demote;
 pub mod fallback;
 pub mod qa_summarizer;
+pub mod rolling;
 pub mod structured_summarizer;
 pub mod truncating;
 pub mod types;
@@ -91,6 +94,7 @@ pub use fallback::{
     TerminalCapture,
 };
 pub use qa_summarizer::{CompactionSummary, PriorSummary, QaSummarizer, QaSummarizerConfig};
+pub use rolling::{RollingCompactor, RollingConfig};
 pub use structured_summarizer::{
     StructuredSummarizer, StructuredSummary, StructuredSummaryConfig, SummarySection,
     SummaryTemplate,
@@ -456,6 +460,39 @@ fn budget_permille(pct: f64) -> u64 {
     }
 }
 
+/// Carry the pinned set at the head of a compactor's output.
+///
+/// The cooperative half of the pin seam: after a leading system-role
+/// message (when the history opens with one), the pinned messages ride
+/// verbatim in statement order ahead of the compactor's own output.
+/// The compactors count the pins in their landing — callers size their
+/// target arithmetic accordingly — and the manager's backstop
+/// re-checks the final list, so a custom compactor that ignores
+/// [`CompactionContext::pinned`] still cannot lose the set.
+pub(crate) fn prepend_pinned(out: &mut Vec<Message>, pinned: &[Message]) {
+    if pinned.is_empty() {
+        return;
+    }
+    let at = usize::from(out.first().is_some_and(|first| first.role == Role::System));
+    for (offset, message) in pinned.iter().enumerate() {
+        out.insert(at.saturating_add(offset), message.clone());
+    }
+}
+
+/// The slice of dropped messages a pass actually summarizes.
+///
+/// The dropped slice minus a leading system-role message: standing
+/// instructions survive at the head of the assembled output, so
+/// rendering them into the transcript would let the summary restate
+/// them. Test-support shape for the leading-system pins; the
+/// compactors inline the same rule with their durable-pull filtering.
+#[cfg(test)]
+pub(crate) fn summarizable(to_compact: &[Message]) -> &[Message] {
+    to_compact
+        .get(usize::from(leading_system(to_compact))..)
+        .unwrap_or_default()
+}
+
 /// Whether the conversation opens with a system-role history message.
 ///
 /// The one message kind the LLM compactors pull back from the dropped
@@ -466,21 +503,6 @@ fn leading_system(messages: &[Message]) -> bool {
     messages
         .first()
         .is_some_and(|first| first.role == Role::System)
-}
-
-/// The slice of dropped messages a pass actually summarizes.
-///
-/// The dropped slice minus a leading system-role message: standing
-/// instructions survive at the head of the assembled output, so rendering
-/// them into the transcript would let the summary restate them, carry them
-/// twice in the result, and spend prompt tokens on content that is never
-/// evicted. A slice holding only the system message summarizes nothing;
-/// the caller treats that empty result as a no-change pass rather than
-/// spending calls on it.
-fn summarizable(to_compact: &[Message]) -> &[Message] {
-    to_compact
-        .get(usize::from(leading_system(to_compact))..)
-        .unwrap_or_default()
 }
 
 impl TokenCounter for RatioTokenCounter {
@@ -509,8 +531,17 @@ impl TokenCounter for RatioTokenCounter {
 ///
 /// - The returned [`CompactionOutcome`] always contains a valid message
 ///   list (never empty unless the input was empty).
-/// - The `target_tokens` parameter is a hint; implementations may exceed
-///   it if necessary for coherent output.
+/// - The `target_tokens` parameter is the landing the caller holds the
+///   result to. The shipped compactors hold their landings to it by
+///   different mechanisms: [`TruncatingCompactor`] and both LLM
+///   compactors budget for it in their own selection, while
+///   [`RollingCompactor`]
+///   and any chain-deployed stage are held to it by
+///   [`FallbackCompactor`]'s decline — a stage whose measured landing
+///   exceeds the target falls through in favor of a later one (a
+///   standalone install bypassing the chain is verified against the
+///   window only). A custom implementation should land at-or-under it
+///   whenever it can.
 /// - Implementations must set [`CompactionOutcome::success`] to `false`
 ///   and provide an error message if compaction fails.
 ///
@@ -739,6 +770,18 @@ pub struct ContextManager {
     /// [`HeuristicTokenCounter`]; swap in a real tokenizer via
     /// [`with_token_counter`](Self::with_token_counter).
     token_counter: Arc<dyn TokenCounter>,
+
+    /// The host's pinned content, keyed by id and re-statable at runtime.
+    ///
+    /// Shared interior mutability so a host holding the
+    /// `Arc<ContextManager>` for a session's life can re-state pins as
+    /// their content changes ([`set_pin`](Self::set_pin)) without
+    /// rebuilding the manager. Each pass copies the pinned set into the
+    /// compactor's [`CompactionContext`](crate::compact::CompactionContext)
+    /// and the manager re-checks the outcome, so the compacted history
+    /// always carries the pinned set verbatim regardless of which
+    /// compactor ran.
+    pins: Arc<Mutex<Vec<(String, Message)>>>,
 }
 
 impl ContextManager {
@@ -764,6 +807,7 @@ impl ContextManager {
             compact_base: CompactBase::Threshold,
             compact_target: 70,
             token_counter: Arc::new(HeuristicTokenCounter),
+            pins: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -786,6 +830,109 @@ impl ContextManager {
     #[must_use]
     pub fn token_counter(&self) -> &Arc<dyn TokenCounter> {
         &self.token_counter
+    }
+
+    /// Add or replace one pinned content block, consuming `self`.
+    ///
+    /// The builder-side half of the pin seam: pins are content the host
+    /// re-states as it changes (the runtime half is
+    /// [`set_pin`](Self::set_pin)) and every compacted history carries
+    /// the pinned set verbatim — a pass never summarizes, truncates, or
+    /// evicts what is pinned. Re-statements under an existing id replace
+    /// that id's entry in place; ids order the set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::InvalidInput`] for an empty id or blank
+    /// content, and when the whole pin set — the existing pins plus
+    /// this one — would count above the manager's
+    /// [`compact_target_tokens`](Self::compact_target_tokens) with its
+    /// own counter: a host pinning everything gets the error at install,
+    /// never a silent no-op pass. The registry is left unchanged on
+    /// rejection.
+    pub fn with_pin(self, id: &str, content: impl Into<String>) -> Result<Self, LoopError> {
+        self.set_pin(id, content)?;
+        Ok(self)
+    }
+
+    /// Add or replace one pinned content block at runtime.
+    ///
+    /// The runtime re-statement path: the host holds the session's
+    /// `Arc<ContextManager>` and calls this whenever the pinned content
+    /// changes, so the next pass carries the fresh statement. Validation
+    /// and the size guard are [`with_pin`](Self::with_pin)'s.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::InvalidInput`] under the same conditions as
+    /// [`with_pin`](Self::with_pin); the registry is left unchanged on
+    /// rejection.
+    pub fn set_pin(&self, id: &str, content: impl Into<String>) -> Result<(), LoopError> {
+        let text = content.into();
+        if id.trim().is_empty() {
+            return Err(LoopError::InvalidInput(
+                "a pin id must be a non-empty label".to_string(),
+            ));
+        }
+        if text.trim().is_empty() {
+            return Err(LoopError::InvalidInput(format!(
+                "pin {id:?} carries no content — an empty pin cannot survive a pass"
+            )));
+        }
+        let message = Message::user(text);
+        let mut pins = crate::error::recover_guard(self.pins.lock());
+        let mut sized: Vec<Message> = pins
+            .iter()
+            .filter(|(existing, _)| existing != id)
+            .map(|(_, message)| message.clone())
+            .collect();
+        sized.push(message.clone());
+        let total = self.token_counter.count(&sized);
+        if total > self.compact_target_tokens() {
+            return Err(LoopError::InvalidInput(format!(
+                "the pin set would count {total} tokens against the compaction target \
+                 of {} — pin less content or raise the target",
+                self.compact_target_tokens()
+            )));
+        }
+        match pins.iter().position(|(existing, _)| existing == id) {
+            Some(index) => {
+                if let Some(slot) = pins.get_mut(index) {
+                    *slot = (id.to_string(), message);
+                }
+            }
+            None => pins.push((id.to_string(), message)),
+        }
+        Ok(())
+    }
+
+    /// Remove one pinned content block.
+    ///
+    /// No-op when no pin is registered under `id`; the next pass simply
+    /// stops carrying it.
+    pub fn remove_pin(&self, id: &str) {
+        crate::error::recover_guard(self.pins.lock()).retain(|(existing, _)| existing != id);
+    }
+
+    /// The pinned set as `(id, message)` pairs, in statement order.
+    ///
+    /// A snapshot of the registry at read time — the latest statement
+    /// per id, in the order ids were first added. Each pass copies this
+    /// set into the compactor's context.
+    #[must_use]
+    pub fn pins(&self) -> Vec<(String, Message)> {
+        crate::error::recover_guard(self.pins.lock()).clone()
+    }
+
+    /// The pinned messages for a pass's context, in statement order.
+    ///
+    /// The [`CompactionContext.pinned`](crate::compact::CompactionContext::pinned)
+    /// payload: the registry's message half, without the ids.
+    fn pinned_messages(&self) -> Vec<Message> {
+        crate::error::recover_guard(self.pins.lock())
+            .iter()
+            .map(|(_, message)| message.clone())
+            .collect()
     }
 
     /// Set the model's context window size.
@@ -994,6 +1141,7 @@ impl ContextManager {
             counter: Arc::clone(&self.token_counter),
             instructions: None,
             additional_context: Vec::new(),
+            pinned: self.pinned_messages(),
         };
         let outcome = self
             .compactor
@@ -1010,6 +1158,8 @@ impl ContextManager {
             });
         }
 
+        let mut outcome = outcome;
+        self.backstop_pins(&mut outcome);
         let tokens_after = self.estimate_tokens(&outcome.messages);
         if tokens_after > self.context_window {
             return Err(ContextOverflow {
@@ -1106,6 +1256,7 @@ impl ContextManager {
             counter: Arc::clone(&self.token_counter),
             instructions,
             additional_context,
+            pinned: self.pinned_messages(),
         };
         let outcome = self
             .compactor
@@ -1122,6 +1273,8 @@ impl ContextManager {
             });
         }
 
+        let mut outcome = outcome;
+        self.backstop_pins(&mut outcome);
         let tokens_after = self.estimate_tokens(&outcome.messages);
         if tokens_after > self.context_window.saturating_sub(reserved_tokens) {
             return Err(ContextOverflow {
@@ -1140,6 +1293,47 @@ impl ContextManager {
         normalized.tokens_after = tokens_after;
         normalized.tokens_saved = tokens_before.saturating_sub(tokens_after);
         Ok(EnsureContextResult::Compacted(normalized))
+    }
+
+    /// Re-check a successful outcome for the pinned set, prepending
+    /// anything the compactor dropped.
+    ///
+    /// The backstop half of the pin seam: cooperative compactors carry
+    /// [`CompactionContext::pinned`](crate::compact::CompactionContext::pinned)
+    /// themselves, but the contract — the compacted history always
+    /// carries the pinned set verbatim — must hold for every compactor,
+    /// so a pinned message with no exact-equal representative in the
+    /// outcome is inserted after a leading system message, in statement
+    /// order, before the caller re-measures. Returns how many pins
+    /// were prepended (zero when the compactor was cooperative).
+    fn backstop_pins(&self, outcome: &mut CompactionOutcome) -> usize {
+        if self.pins().is_empty() {
+            return 0;
+        }
+        let mut missing: Vec<Message> = self
+            .pins()
+            .into_iter()
+            .map(|(_, message)| message)
+            .filter(|pin| {
+                !outcome.messages.iter().any(|message| {
+                    message.role == pin.role && message.text_content() == pin.text_content()
+                })
+            })
+            .collect();
+        if missing.is_empty() {
+            return 0;
+        }
+        let count = missing.len();
+        let at = usize::from(
+            outcome
+                .messages
+                .first()
+                .is_some_and(|first| first.role == Role::System),
+        );
+        for (offset, pin) in missing.drain(..).enumerate() {
+            outcome.messages.insert(at.saturating_add(offset), pin);
+        }
+        count
     }
 
     /// Build telemetry for a compaction operation.
@@ -1846,6 +2040,7 @@ mod tests {
 
             instructions: None,
             additional_context: Vec::new(),
+            pinned: Vec::new(),
         };
         let outcome = compactor.compact(msgs.clone(), 500, context).await;
         assert!(outcome.success);
@@ -1869,10 +2064,12 @@ mod tests {
 
             instructions: None,
             additional_context: Vec::new(),
+            pinned: Vec::new(),
         };
-        let outcome = compactor.compact(msgs, 500, context).await;
+        let outcome = compactor.compact(msgs, 25, context).await;
         assert!(outcome.success);
-        // 1 (first/system prompt) + 2 (preserve_recent) = 3 messages preserved.
+        // 1 (first/system prompt) + 2 (preserve_recent) = 3 messages
+        // preserved: the target admits the floor and no growth past it.
         assert_eq!(outcome.messages.len(), 3);
         assert!(outcome.tokens_saved > 0);
         // Verify the first message was preserved.
@@ -1937,11 +2134,11 @@ mod tests {
         let compactor = TruncatingCompactor::new()
             .with_min_messages(4)
             .with_preserve_recent(2);
-        // Use a window that triggers compaction at 10% but still fits
-        // the preserved 2 messages after compaction.
-        // 2 messages ≈ 18 tokens, so 200 tokens is plenty of headroom.
+        // Use a window that triggers compaction at 10% but whose target
+        // (7% of the window after the default 70% target fraction)
+        // still fits the preserved tail with room to grow into it.
         let manager = ContextManager::new(Arc::new(compactor))
-            .with_context_window(200)
+            .with_context_window(1_000)
             .with_threshold(10);
         let msgs = make_conversation(20); // 40 messages
         let result = manager.ensure_context_fits(msgs, 1).await;
@@ -2233,6 +2430,7 @@ mod tests {
                     name: "echo".to_string(),
                     output: crate::message::ToolContent::from("r".repeat(80)),
                     is_error: None,
+                    retention: None,
                 }],
             },
             Message::assistant("a".repeat(60)),
@@ -2423,6 +2621,141 @@ mod tests {
                 outcome.messages.len() < messages.len() || outcome.tokens_saved > 0,
                 "doc: Compacted means compaction occurred and produced a shorter message list — got identical list with zero savings"
             );
+        }
+    }
+
+    fn pinned_context(messages: &[Message], pin: &str) -> CompactionContext {
+        CompactionContext {
+            tokens_before: CompactionOutcome::estimate_tokens(messages),
+            reason: CompactReason::ThresholdExceeded,
+            context_window: 1_000,
+            turn: 1,
+            counter: Arc::new(HeuristicTokenCounter),
+            instructions: None,
+            additional_context: Vec::new(),
+            pinned: vec![Message::user(pin.to_string())],
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_content_survives_a_pass_byte_for_byte() {
+        let pin = "PIN: active edit set = a.rs, b.rs";
+        let messages: Vec<Message> = (0..12)
+            .map(|turn| {
+                if turn % 2 == 0 {
+                    Message::user(format!("user turn {turn} {}", "u".repeat(80)))
+                } else {
+                    Message::assistant(format!("assistant turn {turn} {}", "a".repeat(80)))
+                }
+            })
+            .collect();
+        let truncator = TruncatingCompactor::new()
+            .with_min_messages(4)
+            .with_preserve_recent(4);
+        let context = pinned_context(&messages, pin);
+        let outcome = truncator.compact(messages, 200, context).await;
+        assert!(outcome.success);
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .any(|m| m.role == Role::User && m.text_content() == pin),
+            "the truncating terminal carries the pin verbatim at the head"
+        );
+    }
+
+    #[test]
+    fn a_pin_set_larger_than_the_target_is_refused_at_install() {
+        let manager = ContextManager::new(Arc::new(TruncatingCompactor::new()))
+            .with_context_window(100)
+            .with_threshold(50);
+        let fat = "x".repeat(4 * 90);
+        let rejected = manager
+            .clone()
+            .with_pin("everything", fat.clone())
+            .unwrap_err();
+        assert!(
+            matches!(rejected, crate::error::LoopError::InvalidInput(_)),
+            "the oversized pin set is refused loudly: {rejected:?}"
+        );
+        assert!(
+            manager.pins().is_empty(),
+            "the registry is left unchanged on rejection"
+        );
+        let runtime = manager.set_pin("everything", fat);
+        assert!(
+            runtime.is_err(),
+            "the runtime path guards the same size limit"
+        );
+        manager
+            .set_pin("ok", "a lean pin")
+            .expect("a lean pin fits");
+        assert_eq!(manager.pins().len(), 1, "the lean pin registered");
+
+        let restated = ContextManager::new(Arc::new(TruncatingCompactor::new()))
+            .with_context_window(200)
+            .with_threshold(80);
+        restated
+            .set_pin("edit-set", "lean")
+            .expect("the lean first statement fits");
+        let fat_restatement = restated.set_pin("edit-set", "x".repeat(4 * 200));
+        assert!(
+            matches!(
+                fat_restatement,
+                Err(crate::error::LoopError::InvalidInput(_))
+            ),
+            "a re-statement that outgrows the target is refused like a first \
+             statement: {fat_restatement:?}"
+        );
+        assert_eq!(
+            restated.pins().len(),
+            1,
+            "the registry is left unchanged on rejection"
+        );
+        assert_eq!(
+            restated.pins()[0].1.text_content(),
+            "lean",
+            "the previous statement survives the rejected re-statement"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_manager_backstops_a_compactor_that_drops_the_pins() {
+        struct PinBlindCompactor;
+        impl ContextCompactor for PinBlindCompactor {
+            fn compact(
+                &self,
+                messages: Vec<Message>,
+                _target_tokens: u64,
+                context: CompactionContext,
+            ) -> Pin<Box<dyn Future<Output = CompactionOutcome> + Send + '_>> {
+                Box::pin(async move {
+                    let kept: Vec<Message> = messages.into_iter().rev().take(2).rev().collect();
+                    let tokens_after = context.counter.count(&kept);
+                    CompactionOutcome::compacted(kept, context.tokens_before, tokens_after)
+                })
+            }
+        }
+        let manager = ContextManager::new(Arc::new(PinBlindCompactor))
+            .with_context_window(1_000)
+            .with_pin("edit-set", "PIN: active edit set = a.rs")
+            .expect("the pin fits");
+        let messages: Vec<Message> = (0..10)
+            .map(|turn| Message::user(format!("turn {turn} {}", "u".repeat(80))))
+            .collect();
+        let result = manager.compact_manual(messages, 1).await;
+        match result {
+            Ok(EnsureContextResult::Compacted(outcome)) => {
+                assert!(
+                    outcome
+                        .messages
+                        .iter()
+                        .any(|m| m.text_content() == "PIN: active edit set = a.rs"),
+                    "the backstop prepends the pin a custom compactor dropped"
+                );
+                assert_eq!(outcome.messages.len(), 3, "two kept messages plus the pin");
+            }
+            other => panic!("the backstopped pass classifies Compacted: {other:?}"),
         }
     }
 }

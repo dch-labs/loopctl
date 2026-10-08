@@ -66,7 +66,7 @@ impl Tool for FactTool {
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
         Box::pin(async {
             Ok(ToolOutput::text(
-                "the launch code is ARC-7 ".to_string() + &"supporting detail ".repeat(20),
+                "the launch code is ARC-7 ".to_string() + &"supporting detail ".repeat(8),
             ))
         })
     }

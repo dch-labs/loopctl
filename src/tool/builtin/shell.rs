@@ -24,6 +24,7 @@ use std::time::Duration;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::tool::Retention;
 use crate::tool::builtin::shell::jobs::JobStore;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 
@@ -352,7 +353,7 @@ pub(crate) fn render_outcome(outcome: &ShellOutcome, timeout_secs: u64) -> ToolO
         outcome.exit_code, outcome.duration_ms
     );
     if outcome.exit_code == 0 {
-        ToolOutput::text(output_text)
+        ToolOutput::text(output_text).with_retention(Retention::Durable)
     } else {
         ToolOutput::error_text(output_text)
     }
@@ -1240,6 +1241,22 @@ mod tests {
         assert!(
             marker.exists(),
             "a helper detached before the tool returned must not be group-killed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shell_receipt_is_stamped_durable() {
+        let tool = tool();
+        let ctx = ctx_in(std::env::temp_dir().as_path());
+        let out = tool
+            .call(serde_json::json!({"command": "true"}), &ctx)
+            .await
+            .expect("the trivial command succeeds");
+        assert_eq!(
+            out.retention,
+            Some(crate::tool::Retention::Durable),
+            "a shell receipt records a side effect — it must survive compaction verbatim"
         );
     }
 }

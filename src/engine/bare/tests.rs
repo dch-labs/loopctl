@@ -4614,6 +4614,7 @@ async fn test_tool_result_message_format() {
         duration: Duration::from_millis(100),
         resolved_tool_name: String::new(),
         display_hint: None,
+        retention: None,
         gate: None,
     }];
 
@@ -4626,6 +4627,7 @@ async fn test_tool_result_message_format() {
             name: _,
             output,
             is_error,
+            ..
         } => {
             assert_eq!(call_id, "tool_123");
             assert!(!is_error.unwrap_or(true));
@@ -6229,9 +6231,30 @@ async fn a_switch_to_a_smaller_window_keeps_compacting_under_the_new_one() {
         .run("grow", &crate::engine::RunConfig::default())
         .await
         .expect("the post-shrink run completes under the new window");
+    let after = loop_.machine.full_history();
     assert!(
-        loop_.machine.full_history().len() < before,
-        "the tighter window drove a compaction that removed messages"
+        after.len() < before.saturating_add(4),
+        "the tighter window drove a compaction — the grow run's four new          messages cannot all have survived alongside the old history"
+    );
+    let fat_results = after
+        .iter()
+        .filter(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    crate::message::MessagePart::ToolResult { output, .. }
+                        if matches!(
+                            output,
+                            crate::message::ToolContent::Text(text)
+                                if text.chars().count() > 1_000
+                        )
+                )
+            })
+        })
+        .count();
+    assert_eq!(
+        fat_results, 0,
+        "the fat pre-switch results were shed under the tighter target"
     );
 }
 
@@ -9359,4 +9382,142 @@ mod budget_gate_tests {
             "the turns warn latches in the same check that refuses on tokens"
         );
     }
+}
+
+#[tokio::test]
+async fn retention_rides_the_dispatch_path_into_the_history() {
+    struct RetentionTool;
+
+    impl Tool for RetentionTool {
+        fn name(&self) -> &'static str {
+            "stamped"
+        }
+
+        fn description(&self) -> &'static str {
+            "Stamps a retention class on its output"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                json!({"type": "object"}),
+            )
+        }
+
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(ToolOutput::text("a.rs lines 1-400")
+                    .with_retention(crate::tool::Retention::Requery))
+            })
+        }
+    }
+
+    let client = std::sync::Arc::new(MockClient::new("m"));
+    client.add_tool_only_response("c0", "stamped", &json!({}));
+    client.add_text_response("done");
+    let mut registry = ToolRegistry::new();
+    registry.register(RetentionTool);
+    let mut loop_ = BareLoop::new(Arc::clone(&client), registry, SessionConfig::default());
+    loop_
+        .run("stamp then finish", &crate::engine::RunConfig::default())
+        .await
+        .expect("the stamped run completes");
+    let stamped = loop_
+        .machine
+        .full_history()
+        .iter()
+        .flat_map(|m| m.parts.iter())
+        .filter_map(|p| match p {
+            crate::message::MessagePart::ToolResult { retention, .. } => *retention,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stamped,
+        vec![crate::tool::Retention::Requery],
+        "the tool's retention class lands on the history's tool-result part"
+    );
+}
+
+#[tokio::test]
+async fn an_engine_run_keeps_durable_content_across_the_boundary() {
+    struct ReceiptTool;
+
+    impl Tool for ReceiptTool {
+        fn name(&self) -> &'static str {
+            "receipt"
+        }
+
+        fn description(&self) -> &'static str {
+            "Returns a durable deployment receipt"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                json!({"type": "object"}),
+            )
+        }
+
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(ToolOutput::text("exit 0: deployment receipt 42")
+                    .with_retention(crate::tool::Retention::Durable))
+            })
+        }
+    }
+
+    let client = std::sync::Arc::new(MockClient::new("m"));
+    client.add_tool_only_response("deploy", "receipt", &json!({}));
+    script_sized_turns(&client, 3, 2_000);
+    let mut registry = ToolRegistry::new();
+    registry.register(ReceiptTool);
+    registry.register(SizedTool);
+    let config = SessionConfig::default()
+        .with_context_window(1_500)
+        .with_compact_threshold(70);
+    let mut loop_ = BareLoop::new(Arc::clone(&client), registry, config);
+    loop_.set_context_manager(std::sync::Arc::new(
+        crate::compact::ContextManager::new(std::sync::Arc::new(
+            crate::compact::TruncatingCompactor::new()
+                .with_min_messages(2)
+                .with_preserve_recent(2),
+        ))
+        .with_context_window(1_500)
+        .with_threshold(70),
+    ));
+
+    loop_
+        .run(
+            "deploy then grow past the threshold",
+            &crate::engine::RunConfig::default(),
+        )
+        .await
+        .expect("the run crosses the compaction boundary");
+    let receipt_survives = loop_
+        .machine
+        .full_history()
+        .iter()
+        .flat_map(|m| m.parts.iter())
+        .any(|p| {
+            matches!(
+                p,
+                crate::message::MessagePart::ToolResult { output, .. }
+                    if output.to_string().contains("deployment receipt 42")
+            )
+        });
+    assert!(
+        receipt_survives,
+        "the durable receipt survives the compaction pass verbatim in the committed history"
+    );
 }

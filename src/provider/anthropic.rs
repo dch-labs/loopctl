@@ -2631,6 +2631,7 @@ mod tests {
                 name: "echo".into(),
                 output: ToolContent::from_string("result text"),
                 is_error: None,
+                retention: None,
             }],
         )];
         let body = build_request_body(
@@ -2668,12 +2669,14 @@ mod tests {
                         name: "echo".into(),
                         output: ToolContent::from_string("result text"),
                         is_error: None,
+                        retention: None,
                     },
                     MessagePart::ToolResult {
                         call_id: "call_2".into(),
                         name: "echo".into(),
                         output: ToolContent::from_string("later result"),
                         is_error: None,
+                        retention: None,
                     },
                 ],
             ),

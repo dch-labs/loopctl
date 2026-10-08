@@ -570,6 +570,7 @@ impl<C: ApiClient> BareLoop<C> {
             duration: Duration::ZERO,
             resolved_tool_name: tc.map(|c| c.tool.clone()).unwrap_or_default(),
             display_hint: None,
+            retention: None,
             gate: None,
         }
     }
@@ -594,6 +595,7 @@ impl<C: ApiClient> BareLoop<C> {
             duration,
             resolved_tool_name: tc.tool.clone(),
             display_hint,
+            retention: None,
             gate: None,
         }
     }
@@ -966,6 +968,7 @@ impl<C: ApiClient> BareLoop<C> {
             duration: Duration::ZERO,
             resolved_tool_name: tc.tool.clone(),
             display_hint: None,
+            retention: None,
             gate: None,
         }
     }
@@ -1048,6 +1051,7 @@ impl<C: ApiClient> BareLoop<C> {
                 duration: Duration::ZERO,
                 resolved_tool_name: tc.tool.clone(),
                 display_hint: None,
+                retention: None,
                 gate: None,
             })),
             HookAction::Ask { message } => HookCheck::Ask(message),
@@ -1068,6 +1072,7 @@ impl<C: ApiClient> BareLoop<C> {
             duration: Duration::ZERO,
             resolved_tool_name: tc.tool.clone(),
             display_hint: None,
+            retention: None,
             gate: None,
         }
     }
@@ -1383,6 +1388,7 @@ impl<C: ApiClient> BareLoop<C> {
             duration,
             resolved_tool_name: dispatch_result.resolved_tool_name,
             display_hint: dispatch_result.display_hint,
+            retention: dispatch_result.retention,
             gate: dispatch_result.gate,
         }
     }

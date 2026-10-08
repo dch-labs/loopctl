@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::tool::Retention;
 use crate::tool::builtin::search::SearchSource;
 use crate::tool::builtin::search::output::MAX_INLINE_OUTPUT_BYTES;
 use crate::tool::builtin::search::output::truncate_or_spill;
@@ -140,7 +141,11 @@ async fn glob_inner<S: SearchSource + 'static>(
 
     let json = serde_json::to_string_pretty(&matches)
         .map_err(|error| ToolError::Execution(format!("Failed to serialize results: {error}")))?;
-    Ok(truncate_or_spill(json, "glob", &temp_dir, MAX_INLINE_OUTPUT_BYTES).0)
+    Ok(
+        truncate_or_spill(json, "glob", &temp_dir, MAX_INLINE_OUTPUT_BYTES)
+            .0
+            .with_retention(Retention::Requery),
+    )
 }
 
 /// Walk `base` on `source` and collect the relative paths of files
@@ -572,6 +577,23 @@ mod tests {
             shared.walks.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "input rejection must happen before the walk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_glob_output_is_stamped_requery() {
+        let tool = GlobTool::new(FakeSearchSource::with(&[("/repo/a.rs", text(""))]));
+        let output = tool
+            .call(
+                json!({"pattern": "**/*.rs", "path": "/repo"}),
+                &ctx_in("/repo"),
+            )
+            .await
+            .expect("call");
+        assert_eq!(
+            output.retention,
+            Some(crate::tool::Retention::Requery),
+            "a listing is re-derivable — the compaction transcript withholds it"
         );
     }
 }

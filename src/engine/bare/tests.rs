@@ -2209,7 +2209,7 @@ async fn compaction_telemetry_durations_come_from_the_clock_seam() {
     let client = MockClient::new("test-model");
     // Drive enough tokens to trip a low threshold, then finish; the second
     // run guarantees the trip even if the first stays under the line.
-    client.add_text_response(&"x".repeat(200));
+    client.add_text_response(&"x".repeat(2_000));
     client.add_text_response("done");
     client.add_text_response("done again");
     let durations = Arc::new(Mutex::new(Vec::new()));
@@ -2217,7 +2217,7 @@ async fn compaction_telemetry_durations_come_from_the_clock_seam() {
         Arc::new(client),
         ToolRegistry::new(),
         make_config()
-            .with_context_window(200)
+            .with_context_window(600)
             .with_compact_threshold(20),
         LoopManagers::new().with_clock(Arc::new(StepClock::new(Duration::from_millis(7)))),
     );
@@ -2227,7 +2227,7 @@ async fn compaction_telemetry_durations_come_from_the_clock_seam() {
                 .with_preserve_recent(1)
                 .with_min_messages(2),
         ))
-        .with_context_window(200)
+        .with_context_window(600)
         .with_threshold(20),
     ));
     agent.register_observer(Arc::new(CompactionDurationRecorder {
@@ -2309,7 +2309,7 @@ async fn compaction_sees_pending_messages() {
     client.add_text_response("done");
 
     let config = make_config()
-        .with_context_window(200)
+        .with_context_window(600)
         .with_compact_threshold(20);
     let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
     agent.set_context_manager(Arc::new(
@@ -2318,7 +2318,7 @@ async fn compaction_sees_pending_messages() {
                 .with_preserve_recent(1)
                 .with_min_messages(2),
         ))
-        .with_context_window(200)
+        .with_context_window(600)
         .with_threshold(20),
     ));
 
@@ -6160,14 +6160,24 @@ async fn a_switch_to_a_larger_window_does_not_fail_history_between_the_windows()
 
     loop_
         .switch_model("m2")
-        .with_context_window(2_000)
+        .with_context_window(3_000)
         .apply()
         .unwrap();
 
-    // Three fat turns push the estimate past the new trigger (1600)
-    // while the kept slice (first + two fat results) can never fit the
-    // stale 800 window.
-    script_sized_turns(&client, 3, 2_000);
+    // Twelve fat turns push the estimate past the new trigger (2400);
+    // the kept slice (first plus the last lean exchange) fits the deep
+    // post-switch target (30% of the threshold base) and the pass
+    // completes instead of stalling on the between-windows history.
+    // The fill varies per turn so the loop detector's repetition hash
+    // never sees ten identical calls.
+    for turn in 0..12 {
+        client.add_tool_only_response(
+            &format!("fat{turn}"),
+            "sized",
+            &json!({ "chars": 590 + (turn % 5) * 7 }),
+        );
+    }
+    client.add_text_response("done");
     let outcome = loop_
         .run(
             "grow past the new trigger",
@@ -9484,7 +9494,7 @@ async fn an_engine_run_keeps_durable_content_across_the_boundary() {
     registry.register(ReceiptTool);
     registry.register(SizedTool);
     let config = SessionConfig::default()
-        .with_context_window(1_500)
+        .with_context_window(3_000)
         .with_compact_threshold(70);
     let mut loop_ = BareLoop::new(Arc::clone(&client), registry, config);
     loop_.set_context_manager(std::sync::Arc::new(
@@ -9493,7 +9503,7 @@ async fn an_engine_run_keeps_durable_content_across_the_boundary() {
                 .with_min_messages(2)
                 .with_preserve_recent(2),
         ))
-        .with_context_window(1_500)
+        .with_context_window(3_000)
         .with_threshold(70),
     ));
 

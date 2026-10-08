@@ -341,25 +341,54 @@ impl RollingCompactor {
 
     /// Find the ledger message this pass carries, if any.
     ///
-    /// A candidate is an assistant message in the first two positions:
-    /// when the compactor carries restored ledger text it must match
-    /// that text exactly; otherwise a message opening with the shared
-    /// summary-header prefix is adopted — a big-bang summary left at
-    /// the head by an earlier pass through another compactor. Hosts
-    /// with custom summary headers keep the explicit
+    /// The scan skips exactly the head the pass's own output shape
+    /// puts before a ledger — a leading system message, then the
+    /// contiguous run of messages matching the pinned set by role and
+    /// text content — and inspects only the next message: an assistant
+    /// message matching the carried ledger text exactly when the
+    /// compactor carries one, otherwise one opening with the shared
+    /// summary-header prefix (a big-bang summary an earlier pass
+    /// through another compactor left at the head). It never scans
+    /// deeper — a ledger past the head run is not the head ledger.
+    /// Hosts with custom summary headers keep the explicit
     /// [`restore_ledger`](Self::restore_ledger) path.
-    fn find_ledger(messages: &[Message], carried: Option<&str>) -> Option<usize> {
-        messages.iter().take(2).position(|message| {
-            if message.role != Role::Assistant {
-                return false;
+    fn find_ledger(
+        messages: &[Message],
+        carried: Option<&str>,
+        pinned: &[Message],
+    ) -> Option<usize> {
+        let mut index = usize::from(
+            messages
+                .first()
+                .is_some_and(|first| first.role == Role::System),
+        );
+        let mut consumed_pin = 0;
+        while consumed_pin < pinned.len() {
+            let matches_pin = messages.get(index).is_some_and(|message| {
+                pinned.get(consumed_pin).is_some_and(|pin| {
+                    message.role == pin.role && message.text_content() == pin.text_content()
+                })
+            });
+            if !matches_pin {
+                break;
             }
-            match carried {
-                Some(ledger) => message.text_content() == ledger,
-                None => message
-                    .text_content()
-                    .starts_with(crate::compact::structured_summarizer::LEDGER_HEADER_PREFIX),
-            }
-        })
+            index = index.saturating_add(1);
+            consumed_pin = consumed_pin.saturating_add(1);
+        }
+        messages
+            .get(index)
+            .is_some_and(|message| {
+                if message.role != Role::Assistant {
+                    return false;
+                }
+                match carried {
+                    Some(ledger) => message.text_content() == ledger,
+                    None => message
+                        .text_content()
+                        .starts_with(crate::compact::structured_summarizer::LEDGER_HEADER_PREFIX),
+                }
+            })
+            .then_some(index)
     }
 
     /// Run one micro-summary call over one aged group.
@@ -509,7 +538,8 @@ impl ContextCompactor for RollingCompactor {
                 let state = recover_guard(self.state.lock());
                 (state.ledger.clone(), state.micro_summaries.clone())
             };
-            let ledger_index = Self::find_ledger(&messages, carried_ledger.as_deref());
+            let ledger_index =
+                Self::find_ledger(&messages, carried_ledger.as_deref(), &context.pinned);
             let mut head_indices: Vec<usize> = Vec::new();
             if messages
                 .first()
@@ -1119,6 +1149,69 @@ mod tests {
                 .any(|m| m.text_content() == "micro-one"),
             "a summary the winning stage removed from the history is not \
              re-injected from stale state — the history decides what is carried"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_session_carries_an_adopted_ledger_across_a_pass() {
+        let client = RecordingClient::new(vec![ok("micro-A"), ok("micro-B"), ok("micro-C")]);
+        let rolling = RollingCompactor::new(
+            Arc::clone(&client) as SharedApiClient,
+            RollingConfig::default()
+                .with_age_turns(2)
+                .with_min_messages(4),
+        );
+        let ledger_text =
+            "## Conversation summary (compacted)\n- the task ledger sits behind the pin";
+        let pin = Message::user("PIN: active edit set = a.rs, b.rs");
+        let mut messages = vec![
+            Message::new(
+                Role::System,
+                vec![crate::message::MessagePart::text("rules")],
+            ),
+            pin.clone(),
+            Message::assistant(ledger_text),
+        ];
+        messages.extend(turn_history(4, 40));
+        let mut context = context_for(&messages);
+        context.pinned = vec![pin.clone()];
+        let outcome_one = rolling.compact(messages, 40_000, context).await;
+        assert!(outcome_one.success);
+        let texts: Vec<String> = outcome_one
+            .messages
+            .iter()
+            .map(Message::text_content)
+            .collect();
+        assert!(
+            texts.contains(&ledger_text.to_string()),
+            "the ledger behind the pin is adopted and carried verbatim: {texts:?}"
+        );
+        assert_eq!(
+            rolling.ledger_summary().as_deref(),
+            Some(ledger_text),
+            "the pass adopted the ledger into its carried state"
+        );
+
+        let client_two = RecordingClient::new(vec![ok("micro-D"), ok("micro-E"), ok("micro-F")]);
+        let rolling_two = RollingCompactor::new(
+            Arc::clone(&client_two) as SharedApiClient,
+            RollingConfig::default()
+                .with_age_turns(2)
+                .with_min_messages(4),
+        );
+        rolling_two.restore_ledger(Some(ledger_text.to_string()));
+        let mut second = outcome_one.messages.clone();
+        second.extend(turn_history(2, 40));
+        let mut context_two = context_for(&second);
+        context_two.pinned = vec![pin];
+        let outcome_two = rolling_two.compact(second, 40_000, context_two).await;
+        assert!(outcome_two.success);
+        assert!(
+            outcome_two
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.text_content() == ledger_text),
+            "the ledger still rides the next pass behind the pin"
         );
     }
 }

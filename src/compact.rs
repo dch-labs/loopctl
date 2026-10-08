@@ -656,8 +656,8 @@ pub enum CompactBase {
     /// `target = compact_threshold_tokens × compact_target_pct / 100`
     ///
     /// This is the default. With the default `threshold = 80` (80%) and
-    /// `compact_target_pct = 70` (70%), compaction targets 56% of the
-    /// context window (`0.8 × 0.7 = 0.56`).
+    /// `compact_target_pct = 30` (30%), compaction targets 24% of the
+    /// context window (`0.8 × 0.3 = 0.24`).
     #[default]
     Threshold,
 }
@@ -758,7 +758,10 @@ pub struct ContextManager {
     ///
     /// The post-compaction size aimed for: `compact_target * base / 100`,
     /// where `base` is determined by [`compact_base`](Self::compact_base).
-    /// Defaults to `70` (70%); set and clamped to `[1, 100]` via
+    /// Defaults to `30` (30%) — a deep landing: at the default 80%
+    /// threshold that is 24% of the window, so a pass buys back real
+    /// headroom and a small model resumes on a mostly-empty context
+    /// instead of a half-full one. Set and clamped to `[1, 100]` via
     /// [`with_compact_target_pct`](Self::with_compact_target_pct).
     compact_target: u8,
 
@@ -795,7 +798,7 @@ impl ContextManager {
     /// | `threshold`          | 80 (80%)                     |
     /// | `auto_compact`       | `true`                       |
     /// | `compact_target`     | [`CompactBase::Threshold`]   |
-    /// | `compact_target_pct` | 70 (70%)                     |
+    /// | `compact_target_pct` | 30 (30%)                     |
     /// | `token_counter`      | [`HeuristicTokenCounter`]    |
     #[must_use]
     pub fn new(compactor: Arc<dyn ContextCompactor>) -> Self {
@@ -805,7 +808,7 @@ impl ContextManager {
             threshold: 80,
             auto_compact: true,
             compact_base: CompactBase::Threshold,
-            compact_target: 70,
+            compact_target: 30,
             token_counter: Arc::new(HeuristicTokenCounter),
             pins: Arc::new(Mutex::new(Vec::new())),
         }
@@ -848,7 +851,11 @@ impl ContextManager {
     /// this one — would count above the manager's
     /// [`compact_target_tokens`](Self::compact_target_tokens) with its
     /// own counter: a host pinning everything gets the error at install,
-    /// never a silent no-op pass. The registry is left unchanged on
+    /// never a silent no-op pass. A target that computes to zero (a
+    /// degenerate threshold or window configuration) disables the size
+    /// guard — the same no-target meaning
+    /// [`TruncatingCompactor`]
+    /// gives a zero target. The registry is left unchanged on
     /// rejection.
     pub fn with_pin(self, id: &str, content: impl Into<String>) -> Result<Self, LoopError> {
         self.set_pin(id, content)?;
@@ -888,11 +895,11 @@ impl ContextManager {
             .collect();
         sized.push(message.clone());
         let total = self.token_counter.count(&sized);
-        if total > self.compact_target_tokens() {
+        let target = self.compact_target_tokens();
+        if target != 0 && total > target {
             return Err(LoopError::InvalidInput(format!(
                 "the pin set would count {total} tokens against the compaction target \
-                 of {} — pin less content or raise the target",
-                self.compact_target_tokens()
+                 of {target} — pin less content or raise the target"
             )));
         }
         match pins.iter().position(|(existing, _)| existing == id) {
@@ -979,7 +986,7 @@ impl ContextManager {
     /// (`0–100`; `100` = 100%).
     ///
     /// Clamped to `[1, 100]` to prevent degenerate configurations.
-    /// Defaults to `70`.
+    /// Defaults to `30`.
     #[must_use]
     pub fn with_compact_target_pct(mut self, pct: u8) -> Self {
         self.compact_target = pct.clamp(1, 100);
@@ -1222,10 +1229,18 @@ impl ContextManager {
     ///
     /// `reserved_tokens` is budget the compacted history must leave room
     /// for — per-request overhead plus, when compaction serves a deferred
-    /// turn, that turn's transient messages: both the compaction target
-    /// and the fit check subtract it, so the post-compaction history plus
-    /// the reserve fits the window. Pass `0` when nothing rides the
-    /// request beyond the history.
+    /// turn, that turn's transient messages. The fit check subtracts it
+    /// (the post-compaction history plus the reserve must fit the
+    /// window); the compaction target handed to the stages does not —
+    /// the stages' landing checks are history-only against the full
+    /// target, because the trigger that re-fires compaction is
+    /// overhead-inclusive and a history-only landing at the target
+    /// clears it with the reserve as headroom. Netting the reserve out
+    /// of the stage target too would shrink the target below any
+    /// reachable floor whenever the reserve is a large fraction of the
+    /// window (small windows, big schemas) and deadlock the pass into a
+    /// no-progress stall. Pass `0` when nothing rides the request
+    /// beyond the history.
     ///
     /// # Errors
     ///
@@ -1247,7 +1262,7 @@ impl ContextManager {
         }
 
         let message_count = messages.len();
-        let target_tokens = self.compact_target_tokens().saturating_sub(reserved_tokens);
+        let target_tokens = self.compact_target_tokens();
         let context = CompactionContext {
             tokens_before,
             reason,
@@ -1984,7 +1999,7 @@ mod tests {
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(200_000)
             .with_threshold(80);
-        assert_eq!(manager.compact_target_tokens(), 112_000);
+        assert_eq!(manager.compact_target_tokens(), 48_000);
     }
 
     #[test]
@@ -2025,7 +2040,7 @@ mod tests {
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor));
         assert_eq!(manager.compact_target(), CompactBase::Threshold);
-        assert_eq!(manager.compact_target_pct(), 70);
+        assert_eq!(manager.compact_target_pct(), 30);
     }
 
     #[tokio::test]
@@ -2138,7 +2153,7 @@ mod tests {
             .with_min_messages(4)
             .with_preserve_recent(2);
         // Use a window that triggers compaction at 10% but whose target
-        // (7% of the window after the default 70% target fraction)
+        // (3% of the window after the default 30% target fraction)
         // still fits the preserved tail with room to grow into it.
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(1_000)
@@ -2720,6 +2735,23 @@ mod tests {
             "lean",
             "the previous statement survives the rejected re-statement"
         );
+
+        let zero_target = ContextManager::new(Arc::new(TruncatingCompactor::new()))
+            .with_context_window(0)
+            .with_threshold(80);
+        assert_eq!(
+            zero_target.compact_target_tokens(),
+            0,
+            "the fixture's target computes to zero"
+        );
+        zero_target
+            .set_pin("edit-set", "x".repeat(4 * 200))
+            .expect("a zero-target manager disables the size guard — the pin registers");
+        assert_eq!(
+            zero_target.pins().len(),
+            1,
+            "the pin registered without the guard's rejection"
+        );
     }
 
     #[tokio::test]
@@ -2759,6 +2791,89 @@ mod tests {
                 assert_eq!(outcome.messages.len(), 3, "two kept messages plus the pin");
             }
             other => panic!("the backstopped pass classifies Compacted: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_stage_target_is_the_full_target_while_the_fit_check_keeps_the_reserve() {
+        let messages: Vec<Message> = (0..10)
+            .map(|turn| {
+                if turn % 2 == 0 {
+                    Message::user(format!("user turn {turn} {}", "u".repeat(100)))
+                } else {
+                    Message::assistant(format!("assistant turn {turn} {}", "a".repeat(100)))
+                }
+            })
+            .collect();
+        let manager = ContextManager::new(Arc::new(
+            TruncatingCompactor::new()
+                .with_min_messages(2)
+                .with_preserve_recent(2),
+        ))
+        .with_context_window(1_000)
+        .with_threshold(80);
+        let target = manager.compact_target_tokens();
+        let reserve = target / 2;
+
+        let roomy = manager
+            .compact_with_reason(
+                messages.clone(),
+                1,
+                CompactReason::Manual,
+                None,
+                Vec::new(),
+                reserve,
+            )
+            .await;
+        match roomy {
+            Ok(EnsureContextResult::Compacted(outcome)) => {
+                assert!(
+                    outcome.tokens_after > target.saturating_sub(reserve),
+                    "the stage aimed at the full target ({target}), not the reserve-netted \
+                     one — a landing past target − reserve proves the stage was not starved"
+                );
+                assert!(
+                    outcome.tokens_after <= manager.context_window().saturating_sub(reserve),
+                    "the fit check still holds the landing to window − reserve"
+                );
+            }
+            other => panic!("a roomy window compacts at the full target: {other:?}"),
+        }
+
+        let tight = ContextManager::new(Arc::new(
+            TruncatingCompactor::new()
+                .with_min_messages(2)
+                .with_preserve_recent(2),
+        ))
+        .with_context_window(target.saturating_add(target / 4))
+        .with_threshold(80);
+        let overflow = tight
+            .compact_with_reason(
+                messages,
+                1,
+                CompactReason::Manual,
+                None,
+                Vec::new(),
+                reserve,
+            )
+            .await;
+        match overflow {
+            Err(ContextOverflow {
+                compactor_error, ..
+            }) => assert!(
+                compactor_error.is_none(),
+                "the refusal is the honest still-does-not-fit window error, not a compactor \
+                 failure: {compactor_error:?}"
+            ),
+            Ok(EnsureContextResult::Compacted(outcome)) => {
+                assert!(
+                    outcome.tokens_after <= tight.context_window().saturating_sub(reserve),
+                    "when the fit holds, the landing respects window − reserve"
+                );
+            }
+            other => {
+                panic!("the tight window either refuses honestly or fits the reserve: {other:?}")
+            }
         }
     }
 }

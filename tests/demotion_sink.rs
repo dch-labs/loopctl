@@ -259,7 +259,7 @@ fn compacting_loop(
     let mut registry = ToolRegistry::new();
     registry.register(FactTool);
     let config = SessionConfig::default()
-        .with_context_window(400)
+        .with_context_window(900)
         .with_compact_threshold(50);
     let mut loop_ = BareLoop::new(Arc::new(client), registry, config);
     loop_.set_context_manager(Arc::new(
@@ -268,7 +268,7 @@ fn compacting_loop(
                 .with_min_messages(2)
                 .with_preserve_recent(2),
         ))
-        .with_context_window(400),
+        .with_context_window(900),
     ));
     if let Some(sink) = sink {
         loop_.set_demotion_sink(sink);
@@ -428,7 +428,7 @@ async fn with_demotion_sink_wires_the_manager() {
     let mut registry = ToolRegistry::new();
     registry.register(FactTool);
     let config = SessionConfig::default()
-        .with_context_window(400)
+        .with_context_window(900)
         .with_compact_threshold(50);
     // Built through the consuming builder — the test pins the
     // `with_demotion_sink` spelling itself, not just the setter the
@@ -444,7 +444,7 @@ async fn with_demotion_sink_wires_the_manager() {
                 .with_min_messages(2)
                 .with_preserve_recent(2),
         ))
-        .with_context_window(400),
+        .with_context_window(900),
     ))
     .with_demotion_sink(Arc::new(RecordingSink {
         deliveries: Arc::clone(&deliveries),
@@ -642,7 +642,7 @@ async fn memory_and_sink_share_one_store_across_turns() {
     // returns as a bounded transient, not as unbounded history.
     let store = Arc::new(InMemoryStore::new());
     let mut responses = Vec::new();
-    for i in 0..5 {
+    for i in 0..4 {
         responses.push(MockResponse {
             text: "go".to_string(),
             tool_call: Some(MockToolCall {
@@ -654,15 +654,25 @@ async fn memory_and_sink_share_one_store_across_turns() {
         });
     }
     responses.push(MockResponse {
+        text: "wrap up".to_string(),
+        tool_call: Some(MockToolCall {
+            id: "lean".to_string(),
+            name: "recall".to_string(),
+            input: serde_json::json!({}),
+        }),
+        stop_reason: "tool_use".to_string(),
+    });
+    responses.push(MockResponse {
         text: "done".to_string(),
         tool_call: None,
         stop_reason: "end_turn".to_string(),
     });
     let mut registry = ToolRegistry::new();
     registry.register(BigResultTool);
+    registry.register(FactTool);
     let config = SessionConfig::default()
         .with_context_window(8_000)
-        .with_compact_threshold(50);
+        .with_compact_threshold(70);
     let client = MockApiClient::new("m").with_responses(responses);
     let handle = client.clone();
     let mut loop_ = BareLoop::new(Arc::new(client), registry, config);
@@ -673,7 +683,7 @@ async fn memory_and_sink_share_one_store_across_turns() {
                 .with_preserve_recent(2),
         ))
         .with_context_window(8_000)
-        .with_threshold(50),
+        .with_threshold(70),
     ));
     loop_.set_memory(Arc::clone(&store) as Arc<dyn LoopMemory>);
     loop_.set_demotion_sink(Arc::new(
@@ -777,7 +787,7 @@ async fn default_budget_recall_does_not_spiral_the_compaction_trigger() {
     // trigger cannot chase it.
     let store = Arc::new(InMemoryStore::new());
     let mut responses = Vec::new();
-    for i in 0..5 {
+    for i in 0..4 {
         responses.push(MockResponse {
             text: "go".to_string(),
             tool_call: Some(MockToolCall {
@@ -789,15 +799,25 @@ async fn default_budget_recall_does_not_spiral_the_compaction_trigger() {
         });
     }
     responses.push(MockResponse {
+        text: "wrap up".to_string(),
+        tool_call: Some(MockToolCall {
+            id: "lean".to_string(),
+            name: "recall".to_string(),
+            input: serde_json::json!({}),
+        }),
+        stop_reason: "tool_use".to_string(),
+    });
+    responses.push(MockResponse {
         text: "done".to_string(),
         tool_call: None,
         stop_reason: "end_turn".to_string(),
     });
     let mut registry = ToolRegistry::new();
     registry.register(BigResultTool);
+    registry.register(FactTool);
     let config = SessionConfig::default()
         .with_context_window(8_000)
-        .with_compact_threshold(50);
+        .with_compact_threshold(70);
     let mut loop_ = BareLoop::new(
         Arc::new(MockApiClient::new("m").with_responses(responses)),
         registry,
@@ -810,7 +830,7 @@ async fn default_budget_recall_does_not_spiral_the_compaction_trigger() {
                 .with_preserve_recent(2),
         ))
         .with_context_window(8_000)
-        .with_threshold(50),
+        .with_threshold(70),
     ));
     loop_.set_memory(Arc::clone(&store) as Arc<dyn LoopMemory>);
     loop_.set_demotion_sink(Arc::new(MemoryDemotionSink::new(

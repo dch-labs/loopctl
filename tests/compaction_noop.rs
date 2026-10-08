@@ -432,10 +432,10 @@ mod scenarios {
         // the new run's first request carries the compacted history,
         // not the grown one.
         let script = vec![
-            tool_turn_response_with_fill(0, 40, 800),
-            tool_turn_response_with_fill(1, 40, 800),
-            tool_turn_response_with_fill(2, 40, 320),
-            tool_turn_response_with_fill(3, 40, 320),
+            tool_turn_response_with_fill(0, 40, 1_500),
+            tool_turn_response_with_fill(1, 40, 1_500),
+            tool_turn_response_with_fill(2, 40, 100),
+            tool_turn_response_with_fill(3, 40, 100),
             final_response(),
             final_response(),
         ];
@@ -445,7 +445,7 @@ mod scenarios {
         });
 
         let config = SessionConfig::default()
-            .with_context_window(700)
+            .with_context_window(1_400)
             .with_compact_threshold(80);
         let client_handle = client.clone();
         let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
@@ -464,7 +464,7 @@ mod scenarios {
             .copied()
             .unwrap_or_default();
 
-        let second = agent.run(&"y".repeat(300), &RunConfig::default()).await;
+        let second = agent.run(&"y".repeat(600), &RunConfig::default()).await;
         assert!(
             second.is_ok(),
             "run 2 compacts at start and completes: {second:?}"
@@ -485,8 +485,8 @@ mod scenarios {
         );
         for tokens in &served {
             assert!(
-                *tokens <= 700,
-                "no request may exceed the 700-token window; served \
+                *tokens <= 1_400,
+                "no request may exceed the 1 400-token window; served \
                  estimates {served:?}"
             );
         }
@@ -1073,10 +1073,10 @@ mod scenarios {
         }
 
         let script = vec![
-            tool_turn_response_with_fill(0, 40, 800),
-            tool_turn_response_with_fill(1, 40, 800),
-            tool_turn_response_with_fill(2, 40, 320),
-            tool_turn_response_with_fill(3, 40, 320),
+            tool_turn_response_with_fill(0, 40, 1_500),
+            tool_turn_response_with_fill(1, 40, 1_500),
+            tool_turn_response_with_fill(2, 40, 100),
+            tool_turn_response_with_fill(3, 40, 100),
             final_response(),
             tool_turn_response(0, 40),
             final_response(),
@@ -1084,7 +1084,7 @@ mod scenarios {
         let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
 
         let config = SessionConfig::default()
-            .with_context_window(700)
+            .with_context_window(1_600)
             .with_compact_threshold(80);
         let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
         let mut executor = HookExecutor::new();
@@ -1116,7 +1116,7 @@ mod scenarios {
         );
 
         armed.store(false, Ordering::SeqCst);
-        let third = agent.run(&"y".repeat(300), &RunConfig::default()).await;
+        let third = agent.run(&"y".repeat(600), &RunConfig::default()).await;
         assert!(
             third.is_ok(),
             "run 3 compacts at start against the unreserved target — the \
@@ -1134,7 +1134,7 @@ mod scenarios {
         });
 
         let config = SessionConfig::default()
-            .with_context_window(600)
+            .with_context_window(1_200)
             .with_compact_threshold(80);
         let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
         agent.register_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>);
@@ -1162,7 +1162,7 @@ mod scenarios {
         });
 
         let config =
-            loopctl::presets::ConstrainedProfile::session_config().with_context_window(600);
+            loopctl::presets::ConstrainedProfile::session_config().with_context_window(1_200);
         let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
         loopctl::presets::ConstrainedProfile::apply(&mut agent).expect("profile applies");
         agent.register_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>);

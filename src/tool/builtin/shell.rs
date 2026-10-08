@@ -1304,10 +1304,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_read_only_command_s_output_is_stamped_requery() {
+        let fixture = tempfile::TempDir::new().unwrap();
+        std::fs::write(fixture.path().join("fixture.txt"), "hostname-here\n").unwrap();
         let tool = tool();
-        let ctx = ctx_in(std::env::temp_dir().as_path());
+        let ctx = ctx_in(fixture.path());
         let out = tool
-            .call(json!({"command": "cat /etc/hostname"}), &ctx)
+            .call(json!({"command": "cat fixture.txt"}), &ctx)
             .await
             .expect("the read-only command runs");
         assert!(

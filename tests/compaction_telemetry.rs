@@ -171,18 +171,30 @@ fn telemetry_loop(
     sink: Option<Arc<dyn DemotionSink>>,
     observer: Arc<dyn LoopObserver>,
 ) -> BareLoop<MockApiClient> {
+    telemetry_loop_with_window(compactor, sink, observer, 900)
+}
+
+/// The [`telemetry_loop`] shape with a caller-chosen window — the
+/// no-action and veto pins run three turns over a small window so the
+/// pass is attempted (and refused) within their turn budget.
+fn telemetry_loop_with_window(
+    compactor: Arc<dyn ContextCompactor>,
+    sink: Option<Arc<dyn DemotionSink>>,
+    observer: Arc<dyn LoopObserver>,
+    window: u64,
+) -> BareLoop<MockApiClient> {
     let mut registry = ToolRegistry::new();
     registry.register(GrowTool);
     let config = SessionConfig::default()
-        .with_context_window(400)
-        .with_compact_threshold(50);
+        .with_context_window(window)
+        .with_compact_threshold(80);
     let mut loop_ = BareLoop::new(
         Arc::new(MockApiClient::new("m").with_responses(growing_script())),
         registry,
         config,
     );
     loop_.set_context_manager(Arc::new(
-        ContextManager::new(compactor).with_context_window(400),
+        ContextManager::new(compactor).with_context_window(window),
     ));
     if let Some(sink) = sink {
         loop_.set_demotion_sink(sink);
@@ -286,7 +298,7 @@ async fn the_pre_event_carries_the_pre_state() {
         "the pre event carries the session's stable id, identical across passes"
     );
     assert_eq!(
-        first.context_window, 400,
+        first.context_window, 900,
         "the pre event carries the manager's window"
     );
     assert_eq!(
@@ -445,7 +457,7 @@ async fn a_no_action_pass_fires_pre_without_post() {
     // manager classifies every pass as no action, and the run ends by
     // max-turns rather than compaction.
     let stall = Arc::new(TruncatingCompactor::new().with_min_messages(100));
-    let mut loop_ = telemetry_loop(stall, None, observer);
+    let mut loop_ = telemetry_loop_with_window(stall, None, observer, 250);
     let bounded = RunConfig::default().with_max_turns(3);
 
     let _outcome = loop_.run("grow but never compact", &bounded).await;
@@ -479,7 +491,7 @@ async fn a_vetoed_pass_fires_pre_without_post() {
     }
 
     let (observer, pre, post) = recorder();
-    let mut loop_ = telemetry_loop(truncating(), None, observer);
+    let mut loop_ = telemetry_loop_with_window(truncating(), None, observer, 250);
     let mut executor = HookExecutor::new();
     executor.register(Arc::new(VetoHook));
     loop_.set_hook_executor(Arc::new(executor));

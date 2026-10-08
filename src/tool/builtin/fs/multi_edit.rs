@@ -289,10 +289,11 @@ async fn multi_edit_inner(
 
 /// How the batch's write phase ended.
 ///
-/// The write phase never propagates a fault past its own boundary as an
-/// error: a mid-batch stop carries the files already written, and the
-/// caller needs that fact to classify the receipt — a batch that wrote
-/// nothing is a clean failure, while a partial apply changed state.
+/// A fault stops the batch; the outcome carries the files already
+/// written so the caller can classify the receipt — a fault after
+/// nothing was written is the clean failure, which the caller returns
+/// as the error, while a partial apply changed state and its receipt
+/// must survive compaction.
 enum WriteOutcome {
     /// Every file in the batch was written.
     ///

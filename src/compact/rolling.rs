@@ -25,9 +25,11 @@
 //! Aged content becomes micro-summaries — one assistant message per
 //! rolled group, accumulated across passes — and the micro-summaries
 //! themselves coalesce (see [`RollingConfig`]) so a marathon session's
-//! summary head stays bounded. The prior big-bang ledger — the summary
-//! message an earlier pass left at the head — rides verbatim, never
-//! re-summarized. Burst growth the aging cannot keep up with lands
+//! summary head stays bounded. A big-bang ledger left at the head is
+//! recognized by the shared summary-header prefix (or exact carried
+//! text via [`restore_ledger`](RollingCompactor::restore_ledger) for
+//! custom headers) and rides verbatim, never re-summarized. Burst
+//! growth the aging cannot keep up with lands
 //! over the compaction target and the chain declines the stage to the
 //! big-bang tiers, exactly the fallback chain's decline shape.
 //!

@@ -6244,7 +6244,8 @@ async fn a_switch_to_a_smaller_window_keeps_compacting_under_the_new_one() {
     let after = loop_.machine.full_history();
     assert!(
         after.len() < before.saturating_add(4),
-        "the tighter window drove a compaction — the grow run's four new          messages cannot all have survived alongside the old history"
+        "the tighter window drove a compaction — the grow run's four new \
+             messages cannot all have survived alongside the old history"
     );
     let fat_results = after
         .iter()

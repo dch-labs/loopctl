@@ -598,11 +598,10 @@ pub trait ContextCompactor: Send + Sync {
     /// # Arguments
     ///
     /// * `messages` — The full conversation history to compact.
-    /// * `target_tokens` — The target token count for the compacted
-    ///   output, already reduced by any budget reserved for content
-    ///   riding the request alongside the history (see
-    ///   [`ContextManager::compact_with_reason`](ContextManager::compact_with_reason)),
-    ///   so fitting the target leaves room for it.
+    /// * `target_tokens` — The history-only target token count for the
+    ///   compacted output. It is not reduced by the reserve; the manager's
+    ///   fit check enforces `window - reserved_tokens` separately (see
+    ///   [`ContextManager::compact_with_reason`](ContextManager::compact_with_reason)).
     /// * `context` — Metadata about the compaction trigger.
     ///
     /// The return-type boxing is required for object safety.

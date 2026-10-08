@@ -24,6 +24,7 @@ use std::time::Duration;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::tool::Retention;
 use crate::tool::builtin::shell::jobs::JobStore;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 
@@ -320,7 +321,7 @@ impl<B: ShellBackend + 'static> ShellTool<B> {
             .backend
             .run(&command, &cwd, Duration::from_secs(timeout_secs))
             .await?;
-        Ok(render_outcome(&outcome, timeout_secs))
+        Ok(render_outcome(&outcome, timeout_secs, &command))
     }
 }
 
@@ -330,11 +331,16 @@ impl<B: ShellBackend + 'static> ShellTool<B> {
 /// when either was cut, and closes with the `[exit …]` metadata
 /// line. A timeout renders the fixed message and an error-shaped
 /// output; a non-zero exit renders the captured body as an error
-/// text so the model sees the failure without an exception. Shared
-/// by the foreground path and the background completion task, so a
-/// polled job's payload is exactly what the foreground call would
-/// have returned.
-pub(crate) fn render_outcome(outcome: &ShellOutcome, timeout_secs: u64) -> ToolOutput {
+/// text so the model sees the failure without an exception. The
+/// retention class follows [`retention_for`] on the command's shape,
+/// not the exit status. Shared by the foreground path and the
+/// background completion task, so a polled job's payload is exactly
+/// what the foreground call would have returned.
+pub(crate) fn render_outcome(
+    outcome: &ShellOutcome,
+    timeout_secs: u64,
+    command: &str,
+) -> ToolOutput {
     if outcome.timed_out {
         return ToolOutput::error_text(format!("Command timed out after {timeout_secs} seconds"));
     }
@@ -351,11 +357,36 @@ pub(crate) fn render_outcome(outcome: &ShellOutcome, timeout_secs: u64) -> ToolO
         "{body}\n[exit {}, {}ms]",
         outcome.exit_code, outcome.duration_ms
     );
-    if outcome.exit_code == 0 {
+    let retention = retention_for(command, outcome.exit_code == 0);
+    let mut output = if outcome.exit_code == 0 {
         ToolOutput::text(output_text)
     } else {
         ToolOutput::error_text(output_text)
+    };
+    if let Some(class) = retention {
+        output = output.with_retention(class);
     }
+    output
+}
+
+/// Classify a command's receipt by the command's shape, not its exit
+/// status.
+///
+/// A read-only-shaped command — the same
+/// [`READ_ONLY_PREFIXES`] allowlist (with its operator and mutating-
+/// flag guards) that qualifies a command for concurrent dispatch —
+/// produces re-derivable output: success stamps
+/// [`Requery`](Retention::Requery) so a large query's stdout stays
+/// evictable, while a failure changed nothing and stays unclassed.
+/// Every other command is a side-effect record: its receipt stamps
+/// [`Durable`](Retention::Durable) whatever the exit code, because a
+/// mutating command that failed can still have changed state and its
+/// receipt records the attempt.
+fn retention_for(command: &str, succeeded: bool) -> Option<Retention> {
+    if command_is_read_only(command) {
+        return succeeded.then_some(Retention::Requery);
+    }
+    Some(Retention::Durable)
 }
 
 /// Commands that are safe to run concurrently (read-only).
@@ -486,9 +517,20 @@ fn get_background(input: &Value) -> Result<bool, ToolError> {
 /// command honors a newline as a statement separator, so the
 /// matched text is not the whole story of what would execute.
 fn is_read_only_command(input: &Value) -> bool {
-    let Some(command) = input.get("command").and_then(Value::as_str) else {
-        return false;
-    };
+    input
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(command_is_read_only)
+}
+
+/// Whether a command's text is read-only by shape.
+///
+/// The body behind [`is_read_only_command`]: the shell-normalized
+/// command matches a [`READ_ONLY_PREFIXES`] entry with no shell
+/// operator, no mutating-flag substring, and no control separator —
+/// the same shape both the concurrent-dispatch gate and
+/// [`retention_for`] classify by.
+fn command_is_read_only(command: &str) -> bool {
     if has_control_separator(command) {
         return false;
     }
@@ -1240,6 +1282,127 @@ mod tests {
         assert!(
             marker.exists(),
             "a helper detached before the tool returned must not be group-killed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shell_receipt_is_stamped_durable() {
+        let tool = tool();
+        let ctx = ctx_in(std::env::temp_dir().as_path());
+        let out = tool
+            .call(serde_json::json!({"command": "true"}), &ctx)
+            .await
+            .expect("the trivial command succeeds");
+        assert_eq!(
+            out.retention,
+            Some(crate::tool::Retention::Durable),
+            "a shell receipt records a side effect — it must survive compaction verbatim"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_only_command_s_output_is_stamped_requery() {
+        let fixture = tempfile::TempDir::new().unwrap();
+        std::fs::write(fixture.path().join("fixture.txt"), "hostname-here\n").unwrap();
+        let tool = tool();
+        let ctx = ctx_in(fixture.path());
+        let out = tool
+            .call(json!({"command": "cat fixture.txt"}), &ctx)
+            .await
+            .expect("the read-only command runs");
+        assert!(
+            !out.is_error,
+            "the fixture command succeeds: {}",
+            out.text_content()
+        );
+        assert_eq!(
+            out.retention,
+            Some(crate::tool::Retention::Requery),
+            "a read-only command's stdout is re-derivable — large query output \
+             must stay evictable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_mutating_command_s_failed_receipt_is_stamped_durable() {
+        let tool = tool();
+        let ctx = ctx_in(std::env::temp_dir().as_path());
+        let out = tool
+            .call(
+                json!({"command": "rm /nonexistent-loopctl-fixture-target"}),
+                &ctx,
+            )
+            .await
+            .expect("the failed command still returns a receipt");
+        assert!(out.is_error, "the fixture command fails");
+        assert_eq!(
+            out.retention,
+            Some(crate::tool::Retention::Durable),
+            "a mutating command's failed receipt records the attempt — it must \
+             survive compaction"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_only_command_s_failed_output_is_not_classified() {
+        let tool = tool();
+        let ctx = ctx_in(std::env::temp_dir().as_path());
+        let out = tool
+            .call(
+                json!({"command": "cat /nonexistent-loopctl-fixture-file"}),
+                &ctx,
+            )
+            .await
+            .expect("the failed read still returns a receipt");
+        assert!(out.is_error, "the fixture read fails");
+        assert_eq!(
+            out.retention, None,
+            "a read-only failure changed nothing — its error text stays evictable"
+        );
+    }
+
+    #[test]
+    fn retention_for_classifies_by_command_shape_not_exit_status() {
+        use super::retention_for;
+        use crate::tool::Retention;
+        assert_eq!(
+            retention_for("cat big.log", true),
+            Some(Retention::Requery),
+            "read-only verbs are re-derivable on success"
+        );
+        assert_eq!(
+            retention_for("cat big.log", false),
+            None,
+            "read-only failures changed nothing and stay unclassed"
+        );
+        assert_eq!(
+            retention_for("git log --oneline", true),
+            Some(Retention::Requery),
+            "git's read-only subcommands are re-derivable"
+        );
+        assert_eq!(
+            retention_for("git push origin main", true),
+            Some(Retention::Durable),
+            "git's mutating subcommands are side-effect receipts"
+        );
+        assert_eq!(
+            retention_for("cargo build --release", true),
+            Some(Retention::Durable),
+            "unknown verbs default to the durable receipt"
+        );
+        assert_eq!(
+            retention_for("cargo build", false),
+            Some(Retention::Durable),
+            "a mutating command's failed receipt still records the attempt"
+        );
+        assert_eq!(
+            retention_for("ls -la", false),
+            None,
+            "a failed listing changed nothing"
         );
     }
 }

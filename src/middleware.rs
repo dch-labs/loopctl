@@ -1300,6 +1300,7 @@ mod tests {
                     ]),
                     is_error: false,
                     display_hint: None,
+                    retention: None,
                 })
             })
         }
@@ -1671,6 +1672,7 @@ mod tests {
                     ]),
                     is_error: false,
                     display_hint: None,
+                    retention: None,
                 })
             })
         }
@@ -1836,6 +1838,7 @@ mod tests {
                     ]),
                     is_error: false,
                     display_hint: None,
+                    retention: None,
                 })
             })
         }

@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
 use crate::tool::DisplayHint;
+use crate::tool::Retention;
 use crate::tool::Tool;
 use crate::tool::ToolContext;
 use crate::tool::ToolError;
@@ -268,7 +269,9 @@ async fn write_inner(
 
     let message = format_file_change(file_path, old_content, content);
 
-    Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
+    Ok(ToolOutput::text(message)
+        .with_hint(DisplayHint::Diff)
+        .with_retention(Retention::Durable))
 }
 
 /// Format a validator's findings as the message that blocks the write.
@@ -789,6 +792,25 @@ mod tests {
         assert!(
             err.to_string().contains("FileSession"),
             "the error must name the missing wiring: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_receipt_is_stamped_durable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = WriteTool::new();
+        let out = tool
+            .call(
+                json!({"file_path": "new.rs", "content": "fn main() {}"}),
+                &ctx_in(cwd),
+            )
+            .await
+            .expect("the write succeeds");
+        assert_eq!(
+            out.retention,
+            Some(crate::tool::Retention::Durable),
+            "a write receipt is a side-effect record — it must survive compaction verbatim"
         );
     }
 }

@@ -284,6 +284,42 @@ pub enum DisplayHint {
     Markdown,
 }
 
+/// How a tool result's content may be treated at compaction time.
+///
+/// Advisory metadata a tool stamps on its own output so the compaction
+/// machinery knows what the content is: re-derivable (a file read, a
+/// search hit — the compaction transcript withholds it and the paired
+/// call line serves as the pointer) or non-re-derivable (a side-effect
+/// receipt, a recorded user decision — exempt from eviction, carried
+/// into the kept side verbatim). `None` — the default — keeps today's
+/// behavior everywhere: the transcript renders the content under its
+/// per-part budget and eviction is positional.
+///
+/// Like [`DisplayHint`], the class never affects loop semantics, wire
+/// shape, or token counting; only the compactors read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Retention {
+    /// Re-derivable content — the model can fetch it again on demand.
+    ///
+    /// File reads, search hits, listings: the compaction transcript
+    /// render replaces the content with a one-line omission marker and
+    /// the paired `calls:` line (which renders the tool name and its
+    /// arguments) is the pointer, so a summary physically cannot
+    /// restate content it never saw and the ledger's coverage
+    /// requirement names what was read.
+    Requery,
+
+    /// Non-re-derivable results — exempt from eviction.
+    ///
+    /// Side-effect receipts, user decisions, approvals: the compactors
+    /// pull a `Durable` result (with its call) into the kept side
+    /// verbatim rather than summarizing or dropping it — what survives
+    /// a pass is the receipt itself, not a paraphrase of it.
+    Durable,
+}
+
 /// Result from a tool invocation.
 ///
 /// Every [`Tool::call`] returns a `Result<ToolOutput, ToolError>`. On
@@ -359,6 +395,19 @@ pub struct ToolOutput {
     /// [`ToolPostContext`](crate::observer::ToolPostContext) so presentation
     /// layers can read it. Set via [`with_hint`](ToolOutput::with_hint).
     pub display_hint: Option<DisplayHint>,
+
+    /// How compaction may treat this result's content.
+    ///
+    /// `None` — the default — keeps today's compaction behavior; a tool
+    /// that knows its output is re-derivable stamps
+    /// [`Retention::Requery`] (the compaction transcript withholds the
+    /// content; the paired call line is the pointer) and one whose
+    /// output is a non-re-derivable receipt stamps
+    /// [`Retention::Durable`] (the compactors carry it into the kept
+    /// side verbatim). Forwarded onto [`ToolDispatchResult`] and into
+    /// the conversation's `tool_result` part, where the compactors
+    /// read it. Set via [`with_retention`](ToolOutput::with_retention).
+    pub retention: Option<Retention>,
 }
 
 impl ToolOutput {
@@ -386,6 +435,7 @@ impl ToolOutput {
             payload: payload.into(),
             is_error: false,
             display_hint: None,
+            retention: None,
         }
     }
 
@@ -413,6 +463,7 @@ impl ToolOutput {
             payload: payload.into(),
             is_error: true,
             display_hint: None,
+            retention: None,
         }
     }
 
@@ -461,6 +512,33 @@ impl ToolOutput {
     /// ```
     pub fn error_text(text: impl Into<String>) -> Self {
         Self::error(text.into())
+    }
+
+    /// Stamp how compaction may treat this result's content. Fluent
+    /// builder.
+    ///
+    /// The producer-side path for [`retention`](ToolOutput::retention):
+    /// a tool whose output is re-derivable stamps
+    /// [`Retention::Requery`] (the compaction transcript withholds the
+    /// content and the paired call line is the pointer), one whose
+    /// output is a non-re-derivable receipt stamps
+    /// [`Retention::Durable`] (the compactors carry it into the kept
+    /// side verbatim). Does not mutate
+    /// [`payload`](ToolOutput::payload) or [`is_error`](ToolOutput::is_error);
+    /// loop semantics are unaffected.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::tool::{Retention, ToolOutput};
+    ///
+    /// let out = ToolOutput::text("a.rs lines 1-400").with_retention(Retention::Requery);
+    /// assert_eq!(out.retention, Some(Retention::Requery));
+    /// ```
+    #[must_use]
+    pub fn with_retention(mut self, retention: Retention) -> Self {
+        self.retention = Some(retention);
+        self
     }
 
     /// Attach an advisory [`DisplayHint`]. Fluent builder.
@@ -733,6 +811,15 @@ pub struct ToolDispatchResult {
     /// for observers to read; never read by loop semantics.
     pub display_hint: Option<DisplayHint>,
 
+    /// How compaction may treat this result's content.
+    ///
+    /// Forwarded from the originating [`ToolOutput`]'s
+    /// [`retention`](ToolOutput::retention); stamped by the engine into the
+    /// conversation's `tool_result` part, where the compactors read it. Read
+    /// the class off the history part, not the dispatch result, when both are
+    /// available.
+    pub retention: Option<Retention>,
+
     /// The permission gate's decision about this call, when one ran.
     ///
     /// `None` on every path no gate consulted — a bare registry
@@ -756,6 +843,7 @@ impl ToolDispatchResult {
             duration,
             resolved_tool_name: tool_name.to_string(),
             display_hint: None,
+            retention: None,
             gate: None,
         }
     }
@@ -772,6 +860,7 @@ impl ToolDispatchResult {
             duration,
             resolved_tool_name: tool_name.to_string(),
             display_hint: None,
+            retention: None,
             gate: None,
         }
     }
@@ -855,6 +944,7 @@ impl ToolDispatchResult {
             duration,
             resolved_tool_name: tool_name.to_string(),
             display_hint: None,
+            retention: None,
             gate: None,
         }
     }
@@ -902,6 +992,7 @@ impl From<ToolOutput> for ToolDispatchResult {
             duration: Duration::ZERO,
             resolved_tool_name: String::new(),
             display_hint: output.display_hint,
+            retention: output.retention,
             gate: None,
         }
     }

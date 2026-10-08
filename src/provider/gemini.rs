@@ -1581,6 +1581,7 @@ mod tests {
                 name: "echo".into(),
                 output: ToolContent::from_string("result text"),
                 is_error: None,
+                retention: None,
             }],
         )];
         let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
@@ -1603,6 +1604,7 @@ mod tests {
                 name: "search".into(),
                 output: ToolContent::from_string("results here"),
                 is_error: None,
+                retention: None,
             }],
         )];
         let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);
@@ -1622,6 +1624,7 @@ mod tests {
                 name: "search".into(),
                 output: ToolContent::from_string("ok"),
                 is_error: None,
+                retention: None,
             }],
         )];
         let body = build_request_body(&msgs, None, None, None, &ToolConstraint::None, false, None);

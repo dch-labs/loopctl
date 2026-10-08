@@ -2209,7 +2209,7 @@ async fn compaction_telemetry_durations_come_from_the_clock_seam() {
     let client = MockClient::new("test-model");
     // Drive enough tokens to trip a low threshold, then finish; the second
     // run guarantees the trip even if the first stays under the line.
-    client.add_text_response(&"x".repeat(200));
+    client.add_text_response(&"x".repeat(2_000));
     client.add_text_response("done");
     client.add_text_response("done again");
     let durations = Arc::new(Mutex::new(Vec::new()));
@@ -2217,7 +2217,7 @@ async fn compaction_telemetry_durations_come_from_the_clock_seam() {
         Arc::new(client),
         ToolRegistry::new(),
         make_config()
-            .with_context_window(100)
+            .with_context_window(600)
             .with_compact_threshold(20),
         LoopManagers::new().with_clock(Arc::new(StepClock::new(Duration::from_millis(7)))),
     );
@@ -2227,7 +2227,7 @@ async fn compaction_telemetry_durations_come_from_the_clock_seam() {
                 .with_preserve_recent(1)
                 .with_min_messages(2),
         ))
-        .with_context_window(100)
+        .with_context_window(600)
         .with_threshold(20),
     ));
     agent.register_observer(Arc::new(CompactionDurationRecorder {
@@ -2309,7 +2309,7 @@ async fn compaction_sees_pending_messages() {
     client.add_text_response("done");
 
     let config = make_config()
-        .with_context_window(100)
+        .with_context_window(600)
         .with_compact_threshold(20);
     let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
     agent.set_context_manager(Arc::new(
@@ -2318,7 +2318,7 @@ async fn compaction_sees_pending_messages() {
                 .with_preserve_recent(1)
                 .with_min_messages(2),
         ))
-        .with_context_window(100)
+        .with_context_window(600)
         .with_threshold(20),
     ));
 
@@ -4614,6 +4614,7 @@ async fn test_tool_result_message_format() {
         duration: Duration::from_millis(100),
         resolved_tool_name: String::new(),
         display_hint: None,
+        retention: None,
         gate: None,
     }];
 
@@ -4626,6 +4627,7 @@ async fn test_tool_result_message_format() {
             name: _,
             output,
             is_error,
+            ..
         } => {
             assert_eq!(call_id, "tool_123");
             assert!(!is_error.unwrap_or(true));
@@ -6158,14 +6160,24 @@ async fn a_switch_to_a_larger_window_does_not_fail_history_between_the_windows()
 
     loop_
         .switch_model("m2")
-        .with_context_window(2_000)
+        .with_context_window(3_000)
         .apply()
         .unwrap();
 
-    // Three fat turns push the estimate past the new trigger (1600)
-    // while the kept slice (first + two fat results) can never fit the
-    // stale 800 window.
-    script_sized_turns(&client, 3, 2_000);
+    // Twelve fat turns push the estimate past the new trigger (2400);
+    // the kept slice (first plus the last lean exchange) fits the deep
+    // post-switch target (30% of the threshold base) and the pass
+    // completes instead of stalling on the between-windows history.
+    // The fill varies per turn so the loop detector's repetition hash
+    // never sees ten identical calls.
+    for turn in 0..12 {
+        client.add_tool_only_response(
+            &format!("fat{turn}"),
+            "sized",
+            &json!({ "chars": 590 + (turn % 5) * 7 }),
+        );
+    }
+    client.add_text_response("done");
     let outcome = loop_
         .run(
             "grow past the new trigger",
@@ -6229,9 +6241,31 @@ async fn a_switch_to_a_smaller_window_keeps_compacting_under_the_new_one() {
         .run("grow", &crate::engine::RunConfig::default())
         .await
         .expect("the post-shrink run completes under the new window");
+    let after = loop_.machine.full_history();
     assert!(
-        loop_.machine.full_history().len() < before,
-        "the tighter window drove a compaction that removed messages"
+        after.len() < before.saturating_add(4),
+        "the tighter window drove a compaction — the grow run's four new \
+             messages cannot all have survived alongside the old history"
+    );
+    let fat_results = after
+        .iter()
+        .filter(|message| {
+            message.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    crate::message::MessagePart::ToolResult { output, .. }
+                        if matches!(
+                            output,
+                            crate::message::ToolContent::Text(text)
+                                if text.chars().count() > 1_000
+                        )
+                )
+            })
+        })
+        .count();
+    assert_eq!(
+        fat_results, 0,
+        "the fat pre-switch results were shed under the tighter target"
     );
 }
 
@@ -9359,4 +9393,231 @@ mod budget_gate_tests {
             "the turns warn latches in the same check that refuses on tokens"
         );
     }
+}
+
+#[tokio::test]
+async fn retention_rides_the_dispatch_path_into_the_history() {
+    struct RetentionTool;
+
+    impl Tool for RetentionTool {
+        fn name(&self) -> &'static str {
+            "stamped"
+        }
+
+        fn description(&self) -> &'static str {
+            "Stamps a retention class on its output"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                json!({"type": "object"}),
+            )
+        }
+
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(ToolOutput::text("a.rs lines 1-400")
+                    .with_retention(crate::tool::Retention::Requery))
+            })
+        }
+    }
+
+    let client = std::sync::Arc::new(MockClient::new("m"));
+    client.add_tool_only_response("c0", "stamped", &json!({}));
+    client.add_text_response("done");
+    let mut registry = ToolRegistry::new();
+    registry.register(RetentionTool);
+    let mut loop_ = BareLoop::new(Arc::clone(&client), registry, SessionConfig::default());
+    loop_
+        .run("stamp then finish", &crate::engine::RunConfig::default())
+        .await
+        .expect("the stamped run completes");
+    let stamped = loop_
+        .machine
+        .full_history()
+        .iter()
+        .flat_map(|m| m.parts.iter())
+        .filter_map(|p| match p {
+            crate::message::MessagePart::ToolResult { retention, .. } => *retention,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stamped,
+        vec![crate::tool::Retention::Requery],
+        "the tool's retention class lands on the history's tool-result part"
+    );
+}
+
+#[tokio::test]
+async fn an_engine_run_keeps_durable_content_across_the_boundary() {
+    struct ReceiptTool;
+
+    impl Tool for ReceiptTool {
+        fn name(&self) -> &'static str {
+            "receipt"
+        }
+
+        fn description(&self) -> &'static str {
+            "Returns a durable deployment receipt"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                json!({"type": "object"}),
+            )
+        }
+
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(ToolOutput::text("exit 0: deployment receipt 42")
+                    .with_retention(crate::tool::Retention::Durable))
+            })
+        }
+    }
+
+    let client = std::sync::Arc::new(MockClient::new("m"));
+    client.add_tool_only_response("deploy", "receipt", &json!({}));
+    script_sized_turns(&client, 3, 2_000);
+    let mut registry = ToolRegistry::new();
+    registry.register(ReceiptTool);
+    registry.register(SizedTool);
+    let config = SessionConfig::default()
+        .with_context_window(3_000)
+        .with_compact_threshold(70);
+    let mut loop_ = BareLoop::new(Arc::clone(&client), registry, config);
+    loop_.set_context_manager(std::sync::Arc::new(
+        crate::compact::ContextManager::new(std::sync::Arc::new(
+            crate::compact::TruncatingCompactor::new()
+                .with_min_messages(2)
+                .with_preserve_recent(2),
+        ))
+        .with_context_window(3_000)
+        .with_threshold(70),
+    ));
+
+    loop_
+        .run(
+            "deploy then grow past the threshold",
+            &crate::engine::RunConfig::default(),
+        )
+        .await
+        .expect("the run crosses the compaction boundary");
+    let receipt_survives = loop_
+        .machine
+        .full_history()
+        .iter()
+        .flat_map(|m| m.parts.iter())
+        .any(|p| {
+            matches!(
+                p,
+                crate::message::MessagePart::ToolResult { output, .. }
+                    if output.to_string().contains("deployment receipt 42")
+            )
+        });
+    assert!(
+        receipt_survives,
+        "the durable receipt survives the compaction pass verbatim in the committed history"
+    );
+}
+
+fn pipeline_installed(loop_: &BareLoop<MockClient>) -> bool {
+    use crate::capabilities::PipelineAware;
+    loop_.managers.pipeline().is_some()
+}
+
+#[tokio::test]
+async fn retention_rides_the_dispatch_path_without_a_pipeline() {
+    struct RetentionTool;
+
+    impl Tool for RetentionTool {
+        fn name(&self) -> &'static str {
+            "stamped"
+        }
+
+        fn description(&self) -> &'static str {
+            "Stamps a retention class on its output"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(
+                self.name().to_string(),
+                self.description().to_string(),
+                json!({"type": "object"}),
+            )
+        }
+
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async move {
+                Ok(ToolOutput::text("exit 0: deployment receipt 7")
+                    .with_retention(crate::tool::Retention::Durable))
+            })
+        }
+    }
+
+    let client = std::sync::Arc::new(MockClient::new("m"));
+    client.add_tool_only_response("c0", "stamped", &json!({}));
+    client.add_text_response("done");
+    let mut registry = ToolRegistry::new();
+    registry.register(RetentionTool);
+    let mut machine = crate::engine::core::LoopMachine::from_history(Vec::new());
+    machine.accept_input("seed the machine past Start");
+    let policy = crate::engine::core::MachinePolicy {
+        max_turns: 4,
+        context_window: 100_000,
+        compact_threshold: 80,
+        auto_compact: false,
+    };
+    let _ = machine.next_step(policy);
+    let mut loop_ = BareLoop::from_machine_with_managers(
+        machine,
+        SessionConfig::default(),
+        Arc::clone(&client),
+        registry,
+        crate::managers::LoopManagers::new(),
+    );
+    assert!(
+        !pipeline_installed(&loop_),
+        "the fixture reaches the direct registry arm — a machine past Start \
+         skips the default wiring, so no pipeline is installed"
+    );
+    loop_
+        .run(
+            "no pipeline, stamped tool",
+            &crate::engine::RunConfig::default(),
+        )
+        .await
+        .expect("the pipeline-less run completes");
+    let stamped = loop_
+        .machine
+        .full_history()
+        .iter()
+        .flat_map(|m| m.parts.iter())
+        .filter_map(|p| match p {
+            crate::message::MessagePart::ToolResult { retention, .. } => *retention,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stamped,
+        vec![crate::tool::Retention::Durable],
+        "the direct registry dispatch arm forwards the tool's retention class \
+         into the history, exactly like the pipeline arm"
+    );
 }

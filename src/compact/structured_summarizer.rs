@@ -47,7 +47,6 @@ use std::pin::Pin;
 use super::budget_permille;
 use super::leading_system;
 use super::render_compaction_transcript;
-use super::summarizable;
 
 /// The shared system-prompt stem for both the first call and the retry.
 ///
@@ -121,6 +120,16 @@ const DEFAULT_TRANSCRIPT_MAX_CHARS: usize = 48_000;
 /// Marks the block as a summary of compacted context without narrating the
 /// compaction process to the continuing model.
 const DEFAULT_HEADER: &str = "## Conversation summary (compacted)";
+
+/// The prefix a default-header summary message is recognized by.
+///
+/// The rolling compactor adopts a big-bang ledger found at a history's
+/// head by this prefix when it carries no restored text of its own —
+/// the shared recognition seam between the two compactors. Hosts whose
+/// templates use a custom header keep the explicit
+/// [`restore_ledger`](crate::compact::rolling::RollingCompactor::restore_ledger)
+/// path.
+pub(crate) const LEDGER_HEADER_PREFIX: &str = "## Conversation summary";
 
 /// The line a fully-empty summary renders as.
 ///
@@ -887,6 +896,50 @@ impl StructuredSummarizer {
         Self { client, config }
     }
 
+    /// Split with the durable-pull cost folded into the tail budget.
+    ///
+    /// The qa compactor's [`budgeted_split`] discipline verbatim: the
+    /// output carries the leading system message and every pulled
+    /// durable message beside the tail, so each iteration subtracts
+    /// their cost from the budget until the split and the pull set
+    /// stabilize.
+    ///
+    /// [`budgeted_split`]: crate::compact::qa_summarizer::QaSummarizer::budgeted_split
+    fn budgeted_split(
+        &self,
+        messages: &[Message],
+        mut tail_budget: u64,
+        counter: &dyn crate::compact::TokenCounter,
+    ) -> (crate::compact::truncating::SplitResult, Vec<usize>) {
+        let mut split = self
+            .splitter()
+            .split_within_budget(messages, tail_budget, counter);
+        let mut durable =
+            crate::compact::truncating::durable_pull_indices(messages, split.split_index);
+        loop {
+            let pulled_tokens: u64 = durable
+                .iter()
+                .filter_map(|index| messages.get(*index))
+                .map(|message| counter.count(std::slice::from_ref(message)))
+                .sum();
+            let next_budget = tail_budget.saturating_sub(pulled_tokens);
+            if next_budget == tail_budget {
+                return (split, durable);
+            }
+            tail_budget = next_budget;
+            let next_split = self
+                .splitter()
+                .split_within_budget(messages, tail_budget, counter);
+            let next_durable =
+                crate::compact::truncating::durable_pull_indices(messages, next_split.split_index);
+            if next_split.split_index == split.split_index && next_durable == durable {
+                return (split, durable);
+            }
+            split = next_split;
+            durable = next_durable;
+        }
+    }
+
     /// The splitter whose boundary this compactor delegates to.
     ///
     /// Rebuilt from the config each pass — a plain value, so the
@@ -911,7 +964,9 @@ impl StructuredSummarizer {
             "\n\nEmit ONLY the sections below, each starting with its exact heading \
              line, each entry a `- ` bullet. Omit a section entirely if it has no \
              entries. No prose outside sections. Keep the total under roughly \
-             {budget} tokens."
+             {budget} tokens. Tool results marked as re-derivable had their content \
+             withheld — the calls lines above them name what was read; record only \
+             that coverage in the ledger, never the withheld content."
         );
         for section in &self.config.template.sections {
             let _ignored = write!(
@@ -1187,14 +1242,40 @@ impl ContextCompactor for StructuredSummarizer {
             if messages.len() <= self.config.min_messages {
                 return CompactionOutcome::no_change(messages);
             }
-            let split = self.splitter().split(&messages);
-            let dropped = summarizable(&split.to_compact);
+            let budget = self.config.summary_budget(target_tokens);
+            let pinned_tokens = context.counter.count(&context.pinned);
+            let system_tokens = if leading_system(&messages) {
+                messages.first().map_or(0, |first| {
+                    context.counter.count(std::slice::from_ref(first))
+                })
+            } else {
+                0
+            };
+            let (split, durable) = self.budgeted_split(
+                &messages,
+                target_tokens
+                    .saturating_sub(budget)
+                    .saturating_sub(pinned_tokens)
+                    .saturating_sub(system_tokens),
+                context.counter.as_ref(),
+            );
+            let skip_head = usize::from(leading_system(&split.to_compact));
+            let dropped: Vec<Message> = split
+                .to_compact
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index >= skip_head && !durable.contains(index))
+                .map(|(_, message)| message.clone())
+                .collect();
             if dropped.is_empty() {
                 return CompactionOutcome::no_change(messages);
             }
+            let pulled: Vec<Message> = durable
+                .iter()
+                .filter_map(|&index| messages.get(index).cloned())
+                .collect();
 
-            let budget = self.config.summary_budget(target_tokens);
-            let outcome = self.summarize(dropped, budget, &context).await;
+            let outcome = self.summarize(&dropped, budget, &context).await;
             let summary = match outcome {
                 SummarizeOutcome::Parsed { summary, retried } => (summary, retried),
                 SummarizeOutcome::Blank => {
@@ -1225,18 +1306,26 @@ impl ContextCompactor for StructuredSummarizer {
             };
 
             let text = render(&summary.0, &self.config.template);
-            let mut out = Vec::with_capacity(split.preserved.len().saturating_add(2));
+            let mut out = Vec::with_capacity(
+                split
+                    .preserved
+                    .len()
+                    .saturating_add(pulled.len())
+                    .saturating_add(2),
+            );
             if leading_system(&messages)
                 && let Some(first) = messages.first()
             {
                 out.push(first.clone());
             }
             out.push(Message::assistant(text));
+            out.extend_from_slice(&pulled);
             out.extend_from_slice(&split.preserved);
+            crate::compact::prepend_pinned(&mut out, &context.pinned);
             let tokens_after = context.counter.count(&out);
             self.emit_telemetry(&summary.0, budget, summary.1);
             CompactionOutcome::compacted(out, context.tokens_before, tokens_after)
-                .with_evicted(dropped.to_vec())
+                .with_evicted(dropped)
         })
     }
 }
@@ -1494,7 +1583,23 @@ mod tests {
             counter: Arc::new(HeuristicTokenCounter),
             instructions: None,
             additional_context: Vec::new(),
+            pinned: Vec::new(),
         }
+    }
+
+    /// A compaction target whose tail budget admits the count-floor
+    /// tail and blocks growth past it, for pins asserting the floor
+    /// shape under the budget split.
+    ///
+    /// Solved for the 0.90 summary fraction the shape pins configure
+    /// (so the scripted sectioned summary clears its budget at these
+    /// small targets): the tail budget is a tenth of the target, so
+    /// ten times the floor tail's counted tokens leaves the tail
+    /// budget at-or-above the floor while the next boundary's tail —
+    /// two messages larger on the standing fixtures — stays out of
+    /// reach.
+    fn floor_target(floor_tail_tokens: u64) -> u64 {
+        floor_tail_tokens.saturating_mul(10).saturating_add(1)
     }
 
     /// A canonical structured response with a known section payload.
@@ -1574,11 +1679,14 @@ mod tests {
         let (client, summarizer) = scripted_with(
             vec![ok(&canonical_response())],
             StructuredSummaryConfig::default()
-                .with_summary_instructions("name the findings file path in the ledger"),
+                .with_summary_instructions("name the findings file path in the ledger")
+                .with_summary_budget_pct(0.9),
         );
         let messages = conversation();
+        let target =
+            floor_target(HeuristicTokenCounter.count(messages.get(6..).unwrap_or_default()));
         let outcome = summarizer
-            .compact(messages.clone(), 40_000, context_for(&messages))
+            .compact(messages.clone(), target, context_for(&messages))
             .await;
         assert!(outcome.success);
         let prompts = client.user_prompts();
@@ -1622,10 +1730,15 @@ mod tests {
     #[tokio::test]
     async fn the_split_delegates_to_the_token_splitter() {
         let messages = conversation();
+        let budget = StructuredSummaryConfig::default().summary_budget(40_000);
         let expected = TokenSplitter::new()
             .with_preserve_recent(6)
             .with_min_messages(8)
-            .split(&messages);
+            .split_within_budget(
+                &messages,
+                40_000_u64.saturating_sub(budget),
+                &HeuristicTokenCounter,
+            );
         let (_client, summarizer) = scripted(vec![ok("### Key facts\n- a fact")]);
         let outcome = summarizer
             .compact(messages.clone(), 40_000, context_for(&messages))
@@ -1885,10 +1998,15 @@ mod tests {
 
     #[tokio::test]
     async fn the_summary_message_is_assistant_role_and_precedes_the_preserved_tail() {
-        let (_client, summarizer) = scripted(vec![ok(&canonical_response())]);
+        let (_client, summarizer) = scripted_with(
+            vec![ok(&canonical_response())],
+            StructuredSummaryConfig::default().with_summary_budget_pct(0.9),
+        );
         let messages = conversation();
+        let target =
+            floor_target(HeuristicTokenCounter.count(messages.get(6..).unwrap_or_default()));
         let outcome = summarizer
-            .compact(messages.clone(), 40_000, context_for(&messages))
+            .compact(messages.clone(), target, context_for(&messages))
             .await;
         let first = outcome.messages.first().expect("the output is non-empty");
         assert_eq!(first.role, Role::Assistant, "the summary is assistant-role");
@@ -2142,10 +2260,15 @@ mod tests {
     async fn evicted_carries_the_dropped_slice_for_the_sink() {
         let (_client, summarizer) = scripted(vec![ok(&canonical_response())]);
         let messages = conversation();
+        let budget = StructuredSummaryConfig::default().summary_budget(40_000);
         let expected = TokenSplitter::new()
             .with_preserve_recent(6)
             .with_min_messages(8)
-            .split(&messages);
+            .split_within_budget(
+                &messages.clone(),
+                40_000_u64.saturating_sub(budget),
+                &HeuristicTokenCounter,
+            );
         let outcome = summarizer
             .compact(messages, 40_000, context_for(&expected.preserved))
             .await;
@@ -2181,13 +2304,17 @@ mod tests {
     #[tokio::test]
     async fn the_outcome_counts_tokens_with_the_context_counter() {
         let counter = Arc::new(ConstantPerMessageCounter(7));
-        let (_client, summarizer) = scripted(vec![ok(&canonical_response())]);
+        let (_client, summarizer) = scripted_with(
+            vec![ok(&canonical_response())],
+            StructuredSummaryConfig::default().with_summary_budget_pct(0.9),
+        );
         let messages = conversation();
         let mut context = context_for(&messages);
         context.counter = Arc::clone(&counter) as Arc<dyn TokenCounter>;
         let tokens_before = counter.count(&messages);
         context.tokens_before = tokens_before;
-        let outcome = summarizer.compact(messages, 40_000, context).await;
+        let target = floor_target(counter.count(messages.get(6..).unwrap_or_default()));
+        let outcome = summarizer.compact(messages, target, context).await;
         assert_eq!(
             outcome.messages.len(),
             7,
@@ -2206,14 +2333,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_structured_landing_measures_within_the_target() {
+        let (_client, summarizer) = scripted_with(
+            vec![ok(&canonical_response())],
+            StructuredSummaryConfig::default().with_summary_budget_pct(0.9),
+        );
+        let messages = conversation();
+        let target = 1_100_u64;
+        let outcome = summarizer
+            .compact(messages.clone(), target, context_for(&messages))
+            .await;
+        assert!(
+            outcome.success,
+            "the pass lands within the target: {}",
+            outcome.error.as_deref().unwrap_or_default()
+        );
+        let preserved = outcome.messages.len().saturating_sub(1);
+        assert_eq!(
+            preserved, 8,
+            "the tail budget admits the eight-message boundary tail, past the \
+             count floor of six"
+        );
+        assert!(
+            HeuristicTokenCounter.count(&outcome.messages) <= target,
+            "summary plus tail measures within the target"
+        );
+    }
+
+    #[tokio::test]
     async fn a_transcript_budget_bounds_the_prompt() {
         let (client, summarizer) = scripted_with(
             vec![ok(&canonical_response())],
-            StructuredSummaryConfig::default().with_transcript_max_chars(60),
+            StructuredSummaryConfig::default()
+                .with_transcript_max_chars(60)
+                .with_summary_budget_pct(0.9),
         );
         let messages = conversation();
+        let target =
+            floor_target(HeuristicTokenCounter.count(messages.get(6..).unwrap_or_default()));
         let outcome = summarizer
-            .compact(messages.clone(), 40_000, context_for(&messages))
+            .compact(messages.clone(), target, context_for(&messages))
             .await;
         assert!(outcome.success);
         let prompts = client.user_prompts();
@@ -2262,10 +2421,15 @@ mod tests {
             SummarySection::ALL.len(),
             "an emptied sections list is rejected with the default template taking its place"
         );
-        let (client, summarizer) = scripted_with(vec![ok(&canonical_response())], config);
+        let (client, summarizer) = scripted_with(
+            vec![ok(&canonical_response())],
+            config.with_summary_budget_pct(0.9),
+        );
         let messages = conversation();
+        let target =
+            floor_target(HeuristicTokenCounter.count(messages.get(6..).unwrap_or_default()));
         let outcome = summarizer
-            .compact(messages.clone(), 40_000, context_for(&messages))
+            .compact(messages.clone(), target, context_for(&messages))
             .await;
         assert!(outcome.success, "the clamped config still compacts");
         let system = client.systems()[0].clone();
@@ -2373,11 +2537,14 @@ mod tests {
             vec![ok(raw), ok("[]")],
             StructuredSummaryConfig::default()
                 .with_parse_output(false)
-                .with_template(SummaryTemplate::action_only()),
+                .with_template(SummaryTemplate::action_only())
+                .with_summary_budget_pct(0.9),
         );
         let messages = conversation();
+        let target =
+            floor_target(HeuristicTokenCounter.count(messages.get(6..).unwrap_or_default()));
         let outcome = summarizer
-            .compact(messages.clone(), 40_000, context_for(&messages))
+            .compact(messages.clone(), target, context_for(&messages))
             .await;
         assert!(outcome.success, "the unparsed pass succeeds");
         assert_eq!(client.calls().len(), 1, "no parse means no retry path");
@@ -2719,6 +2886,24 @@ mod tests {
             vec!["a fact beneath the heading".to_string()],
             "discarded preamble lines do not unparse a response whose sections collected \
              entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_content_survives_a_structured_pass_byte_for_byte() {
+        let (_client, summarizer) = scripted(vec![ok(&canonical_response())]);
+        let messages = conversation();
+        let pin = Message::user("PIN: active edit set = a.rs, b.rs");
+        let mut context = context_for(&messages);
+        context.pinned = vec![pin.clone()];
+        let outcome = summarizer.compact(messages.clone(), 40_000, context).await;
+        assert!(outcome.success);
+        assert!(
+            outcome
+                .messages
+                .iter()
+                .any(|m| m.text_content() == pin.text_content()),
+            "the pinned set rides the structured output verbatim"
         );
     }
 }

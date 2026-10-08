@@ -469,6 +469,7 @@ mod tests {
             duration: Duration::ZERO,
             resolved_tool_name: "x".into(),
             display_hint: None,
+            retention: None,
             gate: None,
         };
         assert!(!UnknownToolMiddleware::is_tool_not_found(&result));

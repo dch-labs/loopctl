@@ -127,6 +127,18 @@ pub struct CompactionContext {
     /// into its prompt; empty when no hooks are configured or none
     /// supplied any.
     pub additional_context: Vec<String>,
+
+    /// The host's pinned content for this pass, in statement order.
+    ///
+    /// Filled by the [`ContextManager`](super::ContextManager) from its
+    /// pin registry; empty when no pins are set. Cooperative compactors
+    /// carry the set at the head of their output (after a leading
+    /// system message), verbatim, counted in their landing — and the
+    /// manager re-checks the outcome and prepends anything a custom
+    /// compactor dropped, so the compacted history always carries the
+    /// pinned set regardless of which compactor ran. Pins are never
+    /// evicted: they were never conversation messages.
+    pub pinned: Vec<Message>,
 }
 
 impl CompactionContext {
@@ -154,6 +166,7 @@ impl CompactionContext {
             counter,
             instructions: None,
             additional_context: Vec::new(),
+            pinned: Vec::new(),
         }
     }
 }

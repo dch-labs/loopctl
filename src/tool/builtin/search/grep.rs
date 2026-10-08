@@ -27,7 +27,7 @@ use crate::tool::builtin::search::content::{parse_input, relative_file, run};
 use crate::tool::builtin::search::output::MAX_INLINE_OUTPUT_BYTES;
 use crate::tool::builtin::search::output::truncate_or_spill;
 use crate::tool::builtin::search::resolve;
-use crate::tool::{DisplayHint, Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
+use crate::tool::{DisplayHint, Retention, Tool, ToolContext, ToolError, ToolOutput, ToolSchema};
 
 /// Default per-file match cap when the caller omits `max_matches`.
 ///
@@ -261,6 +261,7 @@ fn render(matches: &[Match], temp_dir: &Path) -> Result<ToolOutput, ToolError> {
     let json = serde_json::to_string_pretty(&json_array)
         .map_err(|error| ToolError::Execution(format!("Failed to serialize results: {error}")))?;
     let (output, inline) = truncate_or_spill(json, "grep", temp_dir, MAX_INLINE_OUTPUT_BYTES);
+    let output = output.with_retention(Retention::Requery);
     if inline {
         Ok(output.with_hint(DisplayHint::Json))
     } else {
@@ -688,6 +689,23 @@ mod tests {
             parsed.len(),
             MAX_RESULTS_CAP,
             "an over-cap request stops at the hard ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grep_output_is_stamped_requery() {
+        let tool = GrepTool::new(FakeSearchSource::with(&[("/repo/a.rs", text("Needle\n"))]));
+        let output = tool
+            .call(
+                json!({"pattern": "needle", "path": "/repo", "case_insensitive": true}),
+                &ctx_in("/repo"),
+            )
+            .await
+            .expect("call");
+        assert_eq!(
+            output.retention,
+            Some(crate::tool::Retention::Requery),
+            "search hits are re-derivable — the compaction transcript withholds them"
         );
     }
 }

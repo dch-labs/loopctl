@@ -396,6 +396,7 @@ mod tests {
                     tool_call_id: String::new(),
                     duration: std::time::Duration::ZERO,
                     display_hint: None,
+                    retention: None,
                     gate: None,
                 }
             })

@@ -2678,6 +2678,7 @@ mod tests {
                 name: "echo".into(),
                 output: ToolContent::from_string("result text"),
                 is_error: None,
+                retention: None,
             }],
         );
         let v = convert_message(&m, false).remove(0);
@@ -2696,12 +2697,14 @@ mod tests {
                     name: "echo".into(),
                     output: ToolContent::from_string("a"),
                     is_error: None,
+                    retention: None,
                 },
                 MessagePart::ToolResult {
                     call_id: "call_2".into(),
                     name: "echo".into(),
                     output: ToolContent::from_string("b"),
                     is_error: None,
+                    retention: None,
                 },
             ],
         );
@@ -4782,6 +4785,7 @@ mod tests {
                     name: "search".to_string(),
                     output: ToolContent::from_string("42"),
                     is_error: None,
+                    retention: None,
                 },
                 MessagePart::Thinking {
                     text: "first pass".to_string(),

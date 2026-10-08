@@ -1,17 +1,22 @@
 //! Compactor chain: run inner compactors in sequence until one
-//! reduces the conversation.
+//! reduces the conversation **and lands within the compaction
+//! target**.
 //!
 //! [`FallbackCompactor`] holds an ordered chain of [`ContextCompactor`]s and
-//! runs them in order, returning the first outcome that both succeeds and
-//! actually reduces — a success that changed nothing does not win, because a
-//! later stage (the terminal truncator can always drop) still might. The
+//! runs them in order, returning the first outcome that succeeds,
+//! reduces, and measures at-or-under the passed `target_tokens` with
+//! the caller's own counter — a success that changed nothing does not
+//! win (a later stage, the terminal truncator can always drop, still
+//! might), and neither does a landing above the target (the target is
+//! enforced, not advised; a later stage might land within it). The
 //! default chain is quality-descending — [`QaSummarizer`]
 //! → [`StructuredSummarizer`]
-//! → [`TerminalCapture`] around a [`TruncatingCompactor`] — so compaction
-//! degrades from best-effort summarization down to deterministic truncation
-//! and, because the terminal stage cannot fail, the chain as a whole never
-//! fails to compact: an out-of-tokens condition stops surfacing as a failed
-//! pass with the original messages returned intact.
+//! → [`TerminalCapture`] around a [`TruncatingCompactor`] — so
+//! compaction degrades from best-effort summarization down to
+//! deterministic truncation and, because the terminal stage cannot
+//! fail, the chain as a whole never fails to compact: an
+//! out-of-tokens condition stops surfacing as a failed pass with the
+//! original messages returned intact.
 //!
 //! Each failed or declined stage is logged at `warn` and recorded in a
 //! [`ChainReport`](FallbackCompactor::last_report), so the chain stays
@@ -22,8 +27,9 @@
 //! messages are discarded rather than handed
 //! onward — every stage runs against the original input, so a stage that
 //! fails with a partial or emptied list cannot corrupt the history its
-//! successors compact. When every stage declines without reducing, the
-//! last unchanged outcome rides out as a success, so the caller's own
+//! successors compact. When every stage declines without carrying the
+//! pass — errored, unchanged, or landed over the target — the last
+//! non-failing outcome rides out as a success, so the caller's own
 //! no-action classification (not a manufactured failure) decides what
 //! the pass meant; the all-stages-failed outcome is reserved for chains
 //! whose every stage errored.
@@ -79,6 +85,22 @@ const ALL_STAGES_FAILED: &str = "all compactor stages failed";
 /// compactor's own error, so it gets its own label rather than riding
 /// the failure text verbatim.
 const NO_REDUCTION: &str = "stage returned success without reducing";
+
+/// The decline reason recorded for a stage whose landing measured
+/// above the chain's compaction target.
+///
+/// The target is enforced, not advised: a stage that reduced the
+/// conversation but landed above `target_tokens` cannot carry the pass
+/// while a later stage might land within it — the landing check runs
+/// with the same counter the reduction check uses.
+const OVER_TARGET: &str = "stage landed above the compaction target";
+
+/// The trail closing for a run no stage landed within the target.
+///
+/// The mirror of `no stage reduced`: every stage that ran was declined
+/// for its landing (or errored), and the last non-failing outcome rode
+/// out for the caller's own classification.
+const NO_FIT_CLOSING: &str = "no stage landed within the compaction target";
 
 /// One stage in a fallback chain.
 ///
@@ -501,7 +523,7 @@ impl ContextCompactor for FallbackCompactor {
         Box::pin(async move {
             let mut report = ChainReport::default();
             let original = messages;
-            let mut last_unchanged: Option<CompactionOutcome> = None;
+            let mut ride_out: Option<CompactionOutcome> = None;
             for (index, stage) in self.stages.iter().enumerate() {
                 let started = Instant::now();
                 let tokens_before = context.counter.count(&original);
@@ -528,7 +550,26 @@ impl ContextCompactor for FallbackCompactor {
                             tokens_after: outcome.tokens_after,
                             duration,
                         });
-                        last_unchanged = Some(outcome);
+                        ride_out = Some(outcome);
+                        continue;
+                    }
+                    let fits = measured_after <= target_tokens;
+                    if !fits {
+                        tracing::warn!(
+                            target: "loopctl::compact",
+                            stage = stage.name,
+                            measured_after,
+                            target_tokens,
+                            "fallback chain stage landed above the compaction target; trying the next stage"
+                        );
+                        report.stages.push(StageOutcome {
+                            name: stage.name.to_string(),
+                            success: false,
+                            error: Some(OVER_TARGET.to_string()),
+                            tokens_after: outcome.tokens_after,
+                            duration,
+                        });
+                        ride_out = Some(outcome);
                         continue;
                     }
                     for failed in &report.stages {
@@ -570,8 +611,8 @@ impl ContextCompactor for FallbackCompactor {
             let tokens_after = context.counter.count(&original);
             let trail = stage_trail(&report);
             self.store_report(report);
-            if let Some(unchanged) = last_unchanged {
-                return stamped(unchanged, &trail);
+            if let Some(ride_out) = ride_out {
+                return stamped(ride_out, &trail);
             }
             stamped(
                 CompactionOutcome::failed(original, tokens_after, ALL_STAGES_FAILED),
@@ -599,10 +640,14 @@ fn stamped(outcome: CompactionOutcome, trail: &str) -> CompactionOutcome {
 ///
 /// Each stage the pass declined through appears as `name: reason` — its
 /// recorded error or decline text — and the winning stage as
-/// `name (won)`; when no stage won, every stage lists its reason and the
-/// trail closes with `no stage reduced`. The trail is the digest a host
-/// reads off the outcome; [`ChainReport`](FallbackCompactor::last_report)
-/// stays the full record.
+/// `name (won)`; when no stage won, every stage lists its reason and
+/// the trail closes with the wall the chain hit: `no stage landed
+/// within the compaction target` when any decline was an over-target
+/// landing (the target bound the run, even if some stages also failed
+/// to reduce), otherwise `no stage reduced`. The trail is the
+/// digest a host reads off the outcome;
+/// [`ChainReport`](FallbackCompactor::last_report) stays the full
+/// record.
 fn stage_trail(report: &ChainReport) -> String {
     use std::fmt::Write as _;
     let mut trail = String::new();
@@ -622,7 +667,16 @@ fn stage_trail(report: &ChainReport) -> String {
         );
     }
     if report.winning_stage.is_none() && !report.stages.is_empty() {
-        trail.push_str("; no stage reduced");
+        let any_over_target = report
+            .stages
+            .iter()
+            .any(|stage| stage.error.as_deref() == Some(OVER_TARGET));
+        if any_over_target {
+            trail.push_str("; ");
+            trail.push_str(NO_FIT_CLOSING);
+        } else {
+            trail.push_str("; no stage reduced");
+        }
     }
     trail
 }
@@ -664,6 +718,7 @@ mod tests {
     use crate::api::StreamRequest;
     use crate::api::error::ApiError;
     use crate::compact::HeuristicTokenCounter;
+    use crate::compact::TokenCounter;
     use crate::compact::types::CompactReason;
     use crate::compact::{ContextManager, EnsureContextResult};
     use crate::stream::StreamEvent;
@@ -709,6 +764,14 @@ mod tests {
         /// replaced, the "reduction" a token-budget consumer cannot
         /// use.
         GrowToVerbose,
+
+        /// Succeed by compacting down to one message of the given
+        /// token size.
+        ///
+        /// The landing-control shape: a genuine reduction whose size
+        /// the script pins exactly, so a test can place a stage's
+        /// landing above or below the chain's target at will.
+        ShrinkToTokens(u64),
     }
 
     /// What one scripted stage observed per call.
@@ -798,6 +861,13 @@ mod tests {
                     context.tokens_before,
                     19,
                 ),
+                Scripted::ShrinkToTokens(tokens) => CompactionOutcome::compacted(
+                    vec![Message::assistant("s".repeat(
+                        usize::try_from(tokens.saturating_mul(4)).unwrap_or(usize::MAX),
+                    ))],
+                    context.tokens_before,
+                    tokens,
+                ),
             }))
         }
     }
@@ -857,6 +927,7 @@ mod tests {
             counter: Arc::new(HeuristicTokenCounter),
             instructions: None,
             additional_context: Vec::new(),
+            pinned: Vec::new(),
         }
     }
 
@@ -1018,7 +1089,7 @@ mod tests {
         assert_eq!(capture.floor(), 4, "the floor reports the configured value");
         let messages = conversation();
         let outcome = capture
-            .compact(messages.clone(), 40_000, context_for(&messages))
+            .compact(messages.clone(), 65, context_for(&messages))
             .await;
         assert!(outcome.success);
         let kept: Vec<String> = outcome.messages.iter().map(Message::text_content).collect();
@@ -1042,7 +1113,7 @@ mod tests {
             .with_min_messages(8);
         let raised = TerminalCapture::new(&low, 4);
         let outcome = raised
-            .compact(conversation(), 40_000, context_for(&conversation()))
+            .compact(conversation(), 65, context_for(&conversation()))
             .await;
         assert_eq!(
             outcome.messages.len(),
@@ -1057,7 +1128,7 @@ mod tests {
         let chain = FallbackCompactor::default_chain(Arc::new(FailingClient));
         let messages = conversation();
         let outcome = chain
-            .compact(messages.clone(), 40_000, context_for(&messages))
+            .compact(messages.clone(), 65, context_for(&messages))
             .await;
         assert!(outcome.success);
         assert_eq!(
@@ -1078,7 +1149,7 @@ mod tests {
             .build();
         let messages = conversation();
         let outcome = floored
-            .compact(messages.clone(), 40_000, context_for(&messages))
+            .compact(messages.clone(), 90, context_for(&messages))
             .await;
         assert!(outcome.success);
         assert_eq!(
@@ -1467,7 +1538,7 @@ mod tests {
     #[tokio::test]
     async fn the_chain_compacts_through_the_manager_without_overflow() {
         let chain = FallbackCompactor::default_chain(Arc::new(FailingClient));
-        let manager = ContextManager::new(Arc::new(chain)).with_context_window(100);
+        let manager = ContextManager::new(Arc::new(chain)).with_context_window(280);
         let messages = conversation();
         let result = manager.ensure_context_fits(messages, 3).await;
         match result {
@@ -1481,5 +1552,130 @@ mod tests {
                 panic!("an over-window conversation compacts instead of overflowing: {other:?}")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn an_over_target_landing_declines_to_the_next_stage() {
+        let first = ScriptedCompactor::new(vec![Scripted::ShrinkToTokens(150)]);
+        let second = ScriptedCompactor::new(vec![Scripted::ShrinkToTokens(40)]);
+        let chain = FallbackCompactor::builder()
+            .stage("first", Arc::clone(&first) as Arc<dyn ContextCompactor>)
+            .stage("second", Arc::clone(&second) as Arc<dyn ContextCompactor>)
+            .build();
+        let messages = conversation();
+        let outcome = chain
+            .compact(messages, 120, context_for(&conversation()))
+            .await;
+        assert_eq!(
+            second.call_count(),
+            1,
+            "a stage that reduced but landed above the target cannot carry the \
+             pass — the chain must fall through to the next stage"
+        );
+        assert_eq!(
+            outcome.messages.len(),
+            1,
+            "the fitting stage's output is the pass's output"
+        );
+        let report = chain.last_report().expect("a report is stored per run");
+        assert_eq!(
+            report.winning_stage,
+            Some(1),
+            "the winner is the stage that landed within the target"
+        );
+        assert_eq!(
+            report.stages[0].error.as_deref(),
+            Some(OVER_TARGET),
+            "the decline names the landing, not a failure: {:?}",
+            report.stages[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chain_whose_stages_never_fit_rides_out_the_last_outcome() {
+        let first = ScriptedCompactor::new(vec![Scripted::ShrinkToTokens(150)]);
+        let second = ScriptedCompactor::new(vec![Scripted::ShrinkToTokens(180)]);
+        let chain = FallbackCompactor::builder()
+            .stage("first", Arc::clone(&first) as Arc<dyn ContextCompactor>)
+            .stage("second", Arc::clone(&second) as Arc<dyn ContextCompactor>)
+            .build();
+        let outcome = chain
+            .compact(conversation(), 120, context_for(&conversation()))
+            .await;
+        assert!(
+            outcome.success,
+            "no stage errored, so the chain does not manufacture a failure"
+        );
+        assert_eq!(
+            outcome.messages.len(),
+            1,
+            "the last non-failing outcome rides out for the caller's own \
+             classification"
+        );
+        let trail = outcome
+            .stage
+            .as_deref()
+            .expect("a ride-out outcome still names the stages that decided it");
+        assert!(
+            trail.contains("first: stage landed above the compaction target")
+                && trail.contains("second: stage landed above the compaction target"),
+            "the trail names every stage with its decline reason: {trail}"
+        );
+        assert!(
+            trail.ends_with("no stage landed within the compaction target"),
+            "a pass no stage fit states that outright: {trail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_winning_stage_never_lands_above_the_target() {
+        let mut winners = 0_usize;
+        for size in [40_u64, 90, 150, 400] {
+            let first = ScriptedCompactor::new(vec![Scripted::ShrinkToTokens(size)]);
+            let second = ScriptedCompactor::new(vec![Scripted::ShrinkToTokens(30)]);
+            let chain = FallbackCompactor::builder()
+                .stage("first", Arc::clone(&first) as Arc<dyn ContextCompactor>)
+                .stage("second", Arc::clone(&second) as Arc<dyn ContextCompactor>)
+                .build();
+            let outcome = chain
+                .compact(conversation(), 120, context_for(&conversation()))
+                .await;
+            let report = chain.last_report().expect("a report is stored per run");
+            if let Some(winner) = report.winning_stage {
+                winners = winners.saturating_add(1);
+                let measured = HeuristicTokenCounter.count(&outcome.messages);
+                assert!(
+                    measured <= 120,
+                    "a winning stage's landing measures within the target \
+                     (size {size}, winner {winner}, measured {measured})"
+                );
+            }
+        }
+        assert!(
+            winners >= 2,
+            "the grid produced winners to check ({winners}) — a chain that stopped \
+             selecting any would make the landing assert vacuous"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stage_that_neither_reduced_nor_fit_records_no_reduction() {
+        let first = ScriptedCompactor::new(vec![Scripted::Unchanged]);
+        let second = ScriptedCompactor::new(vec![Scripted::ShrinkToTokens(30)]);
+        let chain = FallbackCompactor::builder()
+            .stage("first", Arc::clone(&first) as Arc<dyn ContextCompactor>)
+            .stage("second", Arc::clone(&second) as Arc<dyn ContextCompactor>)
+            .build();
+        chain
+            .compact(conversation(), 120, context_for(&conversation()))
+            .await;
+        let report = chain.last_report().expect("a report is stored per run");
+        assert_eq!(
+            report.stages[0].error.as_deref(),
+            Some(NO_REDUCTION),
+            "the missing reduction is the more fundamental finding — an \
+             unchanged stage records it even when its landing is also over \
+             the target"
+        );
     }
 }

@@ -1371,6 +1371,7 @@ impl<C: ApiClient> BareLoop<C> {
             .into_iter()
             .map(|r| {
                 MessagePart::tool_result(r.tool_call_id, r.resolved_tool_name, r.output, r.is_error)
+                    .with_retention_opt(r.retention)
             })
             .collect()
     }

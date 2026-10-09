@@ -2,9 +2,8 @@
 //! update the model (and optionally the context window) atomically.
 
 use super::{ApiClient, BareLoop, LoopError};
-use crate::capabilities::{Compactable, FallbackCapable};
+use crate::capabilities::FallbackCapable;
 use crate::observer::ModelSwitchedContext;
-use std::sync::Arc;
 
 /// Builder for a model switch on [`BareLoop`].
 ///
@@ -114,10 +113,7 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
         if let Some(cw) = context_window {
             loop_.session.config.context_window = cw;
             loop_.context_window = None;
-            if let Some(manager) = loop_.managers.context_manager() {
-                let synced = (**manager).clone().with_context_window(cw);
-                loop_.managers.set_context_manager(Arc::new(synced));
-            }
+            loop_.sync_manager_window(cw);
         }
 
         loop_.managers.fallback().reset()?;

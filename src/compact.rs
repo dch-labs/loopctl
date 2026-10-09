@@ -757,8 +757,8 @@ pub struct ContextManager {
     ///
     /// The post-compaction size aimed for: `compact_target * base / 100`,
     /// where `base` is determined by [`compact_base`](Self::compact_base).
-    /// Defaults to `30` (30%) — a deep landing: at the default 80%
-    /// threshold that is 24% of the window, so a pass buys back real
+    /// Defaults to `15` (15%) — a deep landing: at the default 80%
+    /// threshold that is 12% of the window, so a pass buys back real
     /// headroom and a small model resumes on a mostly-empty context
     /// instead of a half-full one. Set and clamped to `[1, 100]` via
     /// [`with_compact_target_pct`](Self::with_compact_target_pct).
@@ -985,7 +985,7 @@ impl ContextManager {
     /// (`0–100`; `100` = 100%).
     ///
     /// Clamped to `[1, 100]` to prevent degenerate configurations.
-    /// Defaults to `30`.
+    /// Defaults to `15`.
     #[must_use]
     pub fn with_compact_target_pct(mut self, pct: u8) -> Self {
         self.compact_target = pct.clamp(1, 100);

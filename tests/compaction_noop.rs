@@ -151,6 +151,10 @@ mod scenarios {
             self.inner.model()
         }
 
+        fn set_model(&self, model: &str) -> bool {
+            self.inner.set_model(model)
+        }
+
         fn stream_messages(
             &self,
             request: &StreamRequest,
@@ -178,6 +182,24 @@ mod scenarios {
         {
             let billed = self.billed_input(request);
             let inner = self.inner.create_message(request);
+            Box::pin(async move {
+                let mut response = inner.await?;
+                response.usage = Some(loopctl::stream::Usage::new(
+                    u32::try_from(billed).unwrap_or(u32::MAX),
+                    25,
+                ));
+                Ok(response)
+            })
+        }
+
+        fn create_message_with_options(
+            &self,
+            request: &StreamRequest,
+            options: loopctl::structured::RequestOptions,
+        ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>>
+        {
+            let billed = self.billed_input(request);
+            let inner = self.inner.create_message_with_options(request, options);
             Box::pin(async move {
                 let mut response = inner.await?;
                 response.usage = Some(loopctl::stream::Usage::new(
@@ -657,6 +679,64 @@ mod scenarios {
         assert!(
             observer.events.load(Ordering::SeqCst) >= 1,
             "the calibrated trigger fired at least one compaction pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_calibrated_backend_still_compacts_to_health_after_a_model_switch() {
+        // The switch seam, one rung below the ratio-move sync the test
+        // above pins: run 1 seeds the 4x ratio, and the ratio move has
+        // already converted the installed manager's window into raw
+        // units. A model switch that carries a context window must pass
+        // through the same converting sync — a verbatim write hands the
+        // manager the provider-scale window again, its target lands
+        // above the trigger line, and run 2 dies on the no-progress
+        // guard instead of compacting to health.
+        let script = std::iter::once(final_response())
+            .chain((0..10).map(|step| tool_turn_response_with_fill(step, 40, 150)))
+            .chain(std::iter::once(final_response()))
+            .collect();
+        let client =
+            BillingClient::wrap(MockApiClient::new("test-model").with_responses(script), 4);
+        let observer = Arc::new(CountingObserver {
+            events: Arc::new(AtomicUsize::new(0)),
+        });
+        let config = SessionConfig::default()
+            .with_context_window(2_000)
+            .with_compact_threshold(80);
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+        agent.set_turn_mode(loopctl::engine::TurnMode::NonStreaming);
+        agent.register_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>);
+        agent.set_context_manager(Arc::new(
+            ContextManager::new(Arc::new(TargetLandingCompactor)).with_compact_target_pct(30),
+        ));
+
+        agent
+            .run("seed the ratio", &RunConfig::default())
+            .await
+            .unwrap();
+        agent
+            .switch_model("test-model-2")
+            .with_context_window(2_000)
+            .apply()
+            .unwrap();
+
+        let result = agent
+            .run(
+                "grow until the dense tokenizer bites",
+                &RunConfig::default(),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a switch on a calibrated loop keeps the compactor's target under \
+             the trigger line — the run compacts to health instead of stalling: \
+             {result:?}"
+        );
+        assert!(
+            observer.events.load(Ordering::SeqCst) >= 1,
+            "the calibrated trigger fired at least one compaction pass after the switch"
         );
     }
 

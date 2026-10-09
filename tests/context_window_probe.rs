@@ -229,9 +229,10 @@ mod engine_resolution {
     /// A seeded history big enough to cross a small window's threshold
     /// while staying far under a large one's.
     ///
-    /// 40 messages of 500 characters estimate near 5 200 tokens with
-    /// the heuristic counter: over 80 % of a 4 096-token window
-    /// (3 276), nowhere near 80 % of a 200 000-token one.
+    /// 80 messages of 500 characters estimate 10 477 tokens with
+    /// the heuristic counter (131 per message): over 80 % of an
+    /// 8 192-token window (6 553), nowhere near 80 % of a 200 000-token
+    /// one.
     fn bulky_history() -> Vec<Message> {
         let filler = "y".repeat(500);
         (0..80)

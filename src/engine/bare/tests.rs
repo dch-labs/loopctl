@@ -335,19 +335,18 @@ impl MockClient {
     /// Script a thinking-bearing tool turn followed by a thinking-bearing
     /// terminal turn, with no usage report on either response.
     ///
-    /// The reasoning-heavy shape the estimate-honesty pins ride on: the
-    /// first turn's thinking is stale by the time the second response is
-    /// counted (stripped inside `model_response`), while the second's is
-    /// the live turn's. Usage stays absent so the wire-shape assertion is
-    /// isolated from usage-fed calibration.
+    /// The reasoning-heavy shape the session-retention pins ride on:
+    /// both turns' thinking stays in history and counts toward the
+    /// estimate. Usage stays absent so the assertion is isolated from
+    /// usage-fed calibration.
     #[cfg(feature = "streaming")]
     fn add_thinking_tool_then_thinking_text(
         &self,
-        stale_thinking: &str,
+        first_thinking: &str,
         tool_id: &str,
         tool_name: &str,
         tool_input: &Value,
-        live_thinking: &str,
+        final_thinking: &str,
         final_text: &str,
     ) {
         let model = crate::error::recover_guard(self.model_name.lock()).clone();
@@ -366,7 +365,7 @@ impl MockClient {
             StreamEvent::IndexedDelta(IndexedDelta {
                 index: 0,
                 delta: DeltaPart::Thinking {
-                    text: stale_thinking.to_string(),
+                    text: first_thinking.to_string(),
                     signature: None,
                     redacted: None,
                 },
@@ -408,7 +407,7 @@ impl MockClient {
             StreamEvent::IndexedDelta(IndexedDelta {
                 index: 0,
                 delta: DeltaPart::Thinking {
-                    text: live_thinking.to_string(),
+                    text: final_thinking.to_string(),
                     signature: None,
                     redacted: None,
                 },
@@ -6715,6 +6714,65 @@ async fn switch_model_with_context_window_resyncs_the_installed_manager() {
     );
 }
 
+/// A model switch on a calibrated loop must land the installed
+/// manager's window in the counter's raw units — the same `raw_window`
+/// conversion every other sync uses. A verbatim write of the provider
+/// window leaves the compactor's target and the machine's trigger line
+/// in different scales, the stall shape the conversion exists to
+/// prevent.
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_switch_on_a_calibrated_loop_lands_the_manager_in_raw_units() {
+    let calibrated_client = MockClient::new("m");
+    calibrated_client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_sw".into(),
+                role: "assistant".into(),
+                model: "m".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("done")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "done".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: Some(Usage::new(8_000, 25)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let mut calibrated = BareLoop::new(
+        std::sync::Arc::new(calibrated_client),
+        ToolRegistry::new(),
+        SessionConfig::default().with_context_window(2_000),
+    );
+    calibrated.run("Hi", &RunConfig::default()).await.unwrap();
+    calibrated
+        .switch_model("m2")
+        .with_context_window(2_000)
+        .apply()
+        .unwrap();
+    let Some(installed) = calibrated.managers.context_manager() else {
+        panic!("the default manager is always seeded");
+    };
+    assert_eq!(
+        installed.context_window(),
+        500,
+        "the switch converts the 2 000-token provider window into the counter's raw \
+         units under the settled 4x ratio"
+    );
+}
+
 #[tokio::test]
 async fn a_switch_to_a_larger_window_does_not_fail_history_between_the_windows() {
     // History whose kept slice fits the new window but not the old one
@@ -10419,9 +10477,8 @@ fn canon(message: &Message) -> String {
 /// the public counter over the captured payload plus the final
 /// response, so an overhead component that stopped being measured, or
 /// a message the figure counts but the wire never carried, turns the
-/// figure assertion red. Both retention modes ride the same script:
-/// under `Turn` the first turn's thinking must leave the wire exactly
-/// when the strip says so, under `Session` it must stay.
+/// figure assertion red. The history rides the wire verbatim, so both
+/// turns' thinking must appear on every request exactly as counted.
 #[cfg(feature = "streaming")]
 fn wire_parity_expected_sets() -> Vec<Vec<Message>> {
     let thinking = |text: &str| MessagePart::Thinking {

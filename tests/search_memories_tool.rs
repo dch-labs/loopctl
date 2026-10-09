@@ -455,7 +455,7 @@ async fn demoted_content_is_recallable_through_the_tool() {
         }),
         stop_reason: "tool_use".to_string(),
     }];
-    for turn in 1..=4 {
+    for turn in 1..=9 {
         responses.push(MockResponse {
             text: "grow".to_string(),
             tool_call: Some(MockToolCall {
@@ -484,10 +484,14 @@ async fn demoted_content_is_recallable_through_the_tool() {
     registry.register(FactTool);
     registry.register(BigResultTool);
     let config = SessionConfig::default()
-        .with_context_window(8_000)
+        .with_context_window(16_000)
         .with_compact_threshold(70);
     let mut loop_ = BareLoop::new(
-        Arc::new(MockApiClient::new("m").with_responses(responses)),
+        Arc::new(
+            MockApiClient::new("m")
+                .without_usage()
+                .with_responses(responses),
+        ),
         registry,
         config,
     );
@@ -497,7 +501,7 @@ async fn demoted_content_is_recallable_through_the_tool() {
                 .with_min_messages(2)
                 .with_preserve_recent(2),
         ))
-        .with_context_window(8_000)
+        .with_context_window(16_000)
         .with_threshold(70),
     ));
     loop_.set_memory(Arc::clone(&store) as Arc<dyn LoopMemory>);

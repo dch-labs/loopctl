@@ -1358,6 +1358,7 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 25,
+            calibration_ratio_bp: None,
         });
     }
 
@@ -1409,6 +1410,7 @@ mod tests {
             error: Some("cancelled".to_string()),
             total_turns: 1,
             duration_ms: 50,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -1456,6 +1458,7 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 9,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -1501,6 +1504,7 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 5,
+            calibration_ratio_bp: None,
         });
 
         let records = observer.records();
@@ -1523,6 +1527,7 @@ mod tests {
             error: None,
             total_turns: 0,
             duration_ms: 0,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -1555,6 +1560,7 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 1,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -1579,6 +1585,7 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 1,
+            calibration_ratio_bp: None,
         });
         assert_eq!(
             empty.records()[0].turns[0].response_text,
@@ -1625,6 +1632,7 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 1,
+            calibration_ratio_bp: None,
         });
         assert!(
             observer.records().is_empty(),
@@ -1663,6 +1671,7 @@ mod tests {
                 error: None,
                 total_turns: 1,
                 duration_ms: 1,
+                calibration_ratio_bp: None,
             });
         });
         assert_eq!(
@@ -1708,6 +1717,7 @@ mod tests {
             error: None,
             total_turns: 6,
             duration_ms: 40,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -1755,6 +1765,7 @@ mod tests {
             error: None,
             total_turns: 5,
             duration_ms: 60,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -1840,6 +1851,7 @@ mod tests {
             error: None,
             total_turns: 6,
             duration_ms: 90,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -1892,6 +1904,7 @@ mod tests {
             error: None,
             total_turns: 4,
             duration_ms: 50,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -1949,6 +1962,7 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 50,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -2089,6 +2103,7 @@ mod tests {
             error: None,
             total_turns: 1,
             duration_ms: 12,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -2153,6 +2168,7 @@ mod tests {
             error: None,
             total_turns: 3,
             duration_ms: 30,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -2211,6 +2227,7 @@ mod tests {
             error: None,
             total_turns: 2,
             duration_ms: 20,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -2257,6 +2274,7 @@ mod tests {
             error: Some("cancelled".to_string()),
             total_turns: 9,
             duration_ms: 25,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -2321,6 +2339,7 @@ mod tests {
                 error: None,
                 total_turns: 6,
                 duration_ms: 10,
+                 calibration_ratio_bp: None,
             });
 
             let records = observer.records();
@@ -2495,6 +2514,7 @@ mod tests {
             error: None,
             total_turns: 3,
             duration_ms: 12,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];
@@ -2563,6 +2583,7 @@ mod tests {
             error: None,
             total_turns: 5,
             duration_ms: 10,
+            calibration_ratio_bp: None,
         });
 
         let record = &observer.records()[0];

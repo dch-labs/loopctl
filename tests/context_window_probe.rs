@@ -229,12 +229,13 @@ mod engine_resolution {
     /// A seeded history big enough to cross a small window's threshold
     /// while staying far under a large one's.
     ///
-    /// 40 messages of 500 characters estimate near 5 200 tokens with
-    /// the heuristic counter: over 80 % of a 4 096-token window
-    /// (3 276), nowhere near 80 % of a 200 000-token one.
+    /// 80 messages of 500 characters estimate 10 477 tokens with
+    /// the heuristic counter (131 per message): over 80 % of an
+    /// 8 192-token window (6 553), nowhere near 80 % of a 200 000-token
+    /// one.
     fn bulky_history() -> Vec<Message> {
         let filler = "y".repeat(500);
-        (0..40)
+        (0..80)
             .map(|idx| {
                 Message::new(
                     loopctl::message::Role::User,
@@ -251,7 +252,7 @@ mod engine_resolution {
         let machine = loopctl::engine::core::LoopMachine::from_history(bulky_history());
         let observer = Arc::new(RecordingObserver::new());
         let managers = loopctl::managers::LoopManagers::new().with_observer(observer.clone());
-        let client = Arc::new(ProbingClient::probing(Some(4_096), text_mock()));
+        let client = Arc::new(ProbingClient::probing(Some(8_192), text_mock()));
         let mut agent = BareLoop::from_machine_with_managers(
             machine,
             SessionConfig::default(),
@@ -266,7 +267,7 @@ mod engine_resolution {
         );
         assert!(
             observer.compactions() >= 1,
-            "a payload over 80% of the probed 4 096-token window compacts — the declared \
+            "a payload over 80% of the probed 8 192-token window compacts — the declared \
              200 000 would never have triggered"
         );
     }
@@ -450,7 +451,10 @@ mod engine_resolution {
             .with_threshold(60),
         ));
         managers.register_observer(observer.clone());
-        let client = Arc::new(ProbingClient::probing(Some(4_096), text_mock()));
+        let client = Arc::new(ProbingClient::probing(
+            Some(4_096),
+            text_mock().without_usage(),
+        ));
         let mut agent = BareLoop::new_with_managers(
             client,
             loopctl::tool::ToolRegistry::new(),
@@ -478,7 +482,7 @@ mod engine_resolution {
         let managers = loopctl::managers::LoopManagers::new().with_observer(observer.clone());
         let client = Arc::new(ProbingClient::flippable(
             Arc::clone(&answer),
-            text_mock_of_turns(2),
+            text_mock_of_turns(2).without_usage(),
         ));
         let mut agent = BareLoop::new_with_managers(
             client,
@@ -535,7 +539,7 @@ mod engine_resolution {
         let managers = loopctl::managers::LoopManagers::new();
         let client = Arc::new(ProbingClient::flippable(
             Arc::clone(&answer),
-            text_mock_of_turns(2),
+            text_mock_of_turns(2).without_usage(),
         ));
         let mut agent = BareLoop::new_with_managers(
             client,
@@ -570,7 +574,7 @@ mod engine_resolution {
         let gate = Arc::new(tokio::sync::Notify::new());
         let client = Arc::new(ProbingClient::hanging(
             None,
-            text_mock_of_turns(1),
+            text_mock_of_turns(1).without_usage(),
             Arc::clone(&gate),
         ));
         let mut agent = BareLoop::new_with_managers(

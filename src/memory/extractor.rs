@@ -2400,6 +2400,7 @@ mod tests {
             error: None,
             total_turns: 3,
             duration_ms: 100,
+            calibration_ratio_bp: None,
         });
         tokio::task::yield_now().await;
     }

@@ -293,7 +293,9 @@ fn request_signatures(client: &MockApiClient) -> Vec<String> {
 async fn demoted_content_is_retrievable() {
     let store = Arc::new(InMemoryStore::new());
     let mut loop_ = compacting_loop(
-        MockApiClient::new("m").with_responses(growing_script()),
+        MockApiClient::new("m")
+            .without_usage()
+            .with_responses(growing_script()),
         Some(Arc::new(MemoryDemotionSink::new(
             Arc::clone(&store) as Arc<dyn LoopMemory>
         ))),
@@ -322,7 +324,9 @@ async fn sink_failure_does_not_fail_compaction() {
     let calls = Arc::new(Mutex::new(0usize));
     let compactions = Arc::new(Mutex::new(0usize));
     let mut loop_ = compacting_loop(
-        MockApiClient::new("m").with_responses(growing_script()),
+        MockApiClient::new("m")
+            .without_usage()
+            .with_responses(growing_script()),
         Some(Arc::new(FailingSink {
             calls: Arc::clone(&calls),
         })),
@@ -349,7 +353,9 @@ async fn sink_failure_does_not_fail_compaction() {
 #[tokio::test]
 async fn noop_default_is_byte_identical() {
     let compactions = Arc::new(Mutex::new(0usize));
-    let client = MockApiClient::new("m").with_responses(growing_script());
+    let client = MockApiClient::new("m")
+        .without_usage()
+        .with_responses(growing_script());
     let handle = client.clone();
     let mut default_loop = compacting_loop(
         client,
@@ -368,7 +374,9 @@ async fn noop_default_is_byte_identical() {
     );
     let default_signatures = request_signatures(&handle);
 
-    let client = MockApiClient::new("m").with_responses(growing_script());
+    let client = MockApiClient::new("m")
+        .without_usage()
+        .with_responses(growing_script());
     let noop_handle = client.clone();
     let mut noop_loop = compacting_loop(
         client,
@@ -391,7 +399,9 @@ async fn noop_default_is_byte_identical() {
 async fn a_cancel_during_a_hanging_sink_ends_the_run_typed() {
     let entered = Arc::new(Mutex::new(0usize));
     let mut loop_ = compacting_loop(
-        MockApiClient::new("m").with_responses(growing_script()),
+        MockApiClient::new("m")
+            .without_usage()
+            .with_responses(growing_script()),
         Some(Arc::new(HangingSink {
             entered: Arc::clone(&entered),
         })),
@@ -434,7 +444,11 @@ async fn with_demotion_sink_wires_the_manager() {
     // `with_demotion_sink` spelling itself, not just the setter the
     // shared harness uses.
     let mut loop_ = BareLoop::new(
-        Arc::new(MockApiClient::new("m").with_responses(growing_script())),
+        Arc::new(
+            MockApiClient::new("m")
+                .without_usage()
+                .with_responses(growing_script()),
+        ),
         registry,
         config,
     )
@@ -526,7 +540,9 @@ impl LoopObserver for OrderObserver {
 async fn delivery_precedes_the_compaction_observer() {
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mut loop_ = compacting_loop(
-        MockApiClient::new("m").with_responses(growing_script()),
+        MockApiClient::new("m")
+            .without_usage()
+            .with_responses(growing_script()),
         Some(Arc::new(OrderSink {
             log: Arc::clone(&log),
         })),
@@ -601,7 +617,9 @@ async fn delivery_precedes_the_post_compact_hook() {
 
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mut loop_ = compacting_loop(
-        MockApiClient::new("m").with_responses(growing_script()),
+        MockApiClient::new("m")
+            .without_usage()
+            .with_responses(growing_script()),
         Some(Arc::new(HookOrderSink {
             log: Arc::clone(&log),
         })),
@@ -642,7 +660,7 @@ async fn memory_and_sink_share_one_store_across_turns() {
     // returns as a bounded transient, not as unbounded history.
     let store = Arc::new(InMemoryStore::new());
     let mut responses = Vec::new();
-    for i in 0..4 {
+    for i in 0..9 {
         responses.push(MockResponse {
             text: "go".to_string(),
             tool_call: Some(MockToolCall {
@@ -671,9 +689,11 @@ async fn memory_and_sink_share_one_store_across_turns() {
     registry.register(BigResultTool);
     registry.register(FactTool);
     let config = SessionConfig::default()
-        .with_context_window(8_000)
+        .with_context_window(16_000)
         .with_compact_threshold(70);
-    let client = MockApiClient::new("m").with_responses(responses);
+    let client = MockApiClient::new("m")
+        .without_usage()
+        .with_responses(responses);
     let handle = client.clone();
     let mut loop_ = BareLoop::new(Arc::new(client), registry, config);
     loop_.set_context_manager(Arc::new(
@@ -682,7 +702,7 @@ async fn memory_and_sink_share_one_store_across_turns() {
                 .with_min_messages(2)
                 .with_preserve_recent(2),
         ))
-        .with_context_window(8_000)
+        .with_context_window(16_000)
         .with_threshold(70),
     ));
     loop_.set_memory(Arc::clone(&store) as Arc<dyn LoopMemory>);
@@ -746,7 +766,11 @@ async fn an_emergency_pass_delivers_with_its_reason() {
         .with_context_window(1_000)
         .with_compact_threshold(95);
     let mut loop_ = BareLoop::new(
-        Arc::new(MockApiClient::new("m").with_responses(responses)),
+        Arc::new(
+            MockApiClient::new("m")
+                .without_usage()
+                .with_responses(responses),
+        ),
         registry,
         config,
     );
@@ -787,7 +811,7 @@ async fn default_budget_recall_does_not_spiral_the_compaction_trigger() {
     // trigger cannot chase it.
     let store = Arc::new(InMemoryStore::new());
     let mut responses = Vec::new();
-    for i in 0..4 {
+    for i in 0..9 {
         responses.push(MockResponse {
             text: "go".to_string(),
             tool_call: Some(MockToolCall {
@@ -816,10 +840,14 @@ async fn default_budget_recall_does_not_spiral_the_compaction_trigger() {
     registry.register(BigResultTool);
     registry.register(FactTool);
     let config = SessionConfig::default()
-        .with_context_window(8_000)
+        .with_context_window(16_000)
         .with_compact_threshold(70);
     let mut loop_ = BareLoop::new(
-        Arc::new(MockApiClient::new("m").with_responses(responses)),
+        Arc::new(
+            MockApiClient::new("m")
+                .without_usage()
+                .with_responses(responses),
+        ),
         registry,
         config,
     );
@@ -829,7 +857,7 @@ async fn default_budget_recall_does_not_spiral_the_compaction_trigger() {
                 .with_min_messages(2)
                 .with_preserve_recent(2),
         ))
-        .with_context_window(8_000)
+        .with_context_window(16_000)
         .with_threshold(70),
     ));
     loop_.set_memory(Arc::clone(&store) as Arc<dyn LoopMemory>);

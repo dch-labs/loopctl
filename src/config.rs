@@ -73,7 +73,6 @@ pub struct SessionConfig {
     /// never serves a payload it believes is over the window.
     pub auto_compact: bool,
 }
-
 impl Default for SessionConfig {
     fn default() -> Self {
         let mut config = Self {

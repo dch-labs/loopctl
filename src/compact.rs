@@ -655,8 +655,8 @@ pub enum CompactBase {
     /// `target = compact_threshold_tokens × compact_target_pct / 100`
     ///
     /// This is the default. With the default `threshold = 80` (80%) and
-    /// `compact_target_pct = 30` (30%), compaction targets 24% of the
-    /// context window (`0.8 × 0.3 = 0.24`).
+    /// `compact_target_pct = 15` (15%), compaction targets 12% of the
+    /// context window (`0.8 × 0.15 = 0.12`).
     #[default]
     Threshold,
 }
@@ -757,8 +757,8 @@ pub struct ContextManager {
     ///
     /// The post-compaction size aimed for: `compact_target * base / 100`,
     /// where `base` is determined by [`compact_base`](Self::compact_base).
-    /// Defaults to `30` (30%) — a deep landing: at the default 80%
-    /// threshold that is 24% of the window, so a pass buys back real
+    /// Defaults to `15` (15%) — a deep landing: at the default 80%
+    /// threshold that is 12% of the window, so a pass buys back real
     /// headroom and a small model resumes on a mostly-empty context
     /// instead of a half-full one. Set and clamped to `[1, 100]` via
     /// [`with_compact_target_pct`](Self::with_compact_target_pct).
@@ -797,7 +797,7 @@ impl ContextManager {
     /// | `threshold`          | 80 (80%)                     |
     /// | `auto_compact`       | `true`                       |
     /// | `compact_target`     | [`CompactBase::Threshold`]   |
-    /// | `compact_target_pct` | 30 (30%)                     |
+    /// | `compact_target_pct` | 15 (15%)                     |
     /// | `token_counter`      | [`HeuristicTokenCounter`]    |
     #[must_use]
     pub fn new(compactor: Arc<dyn ContextCompactor>) -> Self {
@@ -807,7 +807,7 @@ impl ContextManager {
             threshold: 80,
             auto_compact: true,
             compact_base: CompactBase::Threshold,
-            compact_target: 30,
+            compact_target: 15,
             token_counter: Arc::new(HeuristicTokenCounter),
             pins: Arc::new(Mutex::new(Vec::new())),
         }
@@ -985,7 +985,7 @@ impl ContextManager {
     /// (`0–100`; `100` = 100%).
     ///
     /// Clamped to `[1, 100]` to prevent degenerate configurations.
-    /// Defaults to `30`.
+    /// Defaults to `15`.
     #[must_use]
     pub fn with_compact_target_pct(mut self, pct: u8) -> Self {
         self.compact_target = pct.clamp(1, 100);
@@ -1998,7 +1998,7 @@ mod tests {
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(200_000)
             .with_threshold(80);
-        assert_eq!(manager.compact_target_tokens(), 48_000);
+        assert_eq!(manager.compact_target_tokens(), 24_000);
     }
 
     #[test]
@@ -2039,7 +2039,7 @@ mod tests {
         let compactor = TruncatingCompactor::new();
         let manager = ContextManager::new(Arc::new(compactor));
         assert_eq!(manager.compact_target(), CompactBase::Threshold);
-        assert_eq!(manager.compact_target_pct(), 30);
+        assert_eq!(manager.compact_target_pct(), 15);
     }
 
     #[tokio::test]
@@ -2151,12 +2151,15 @@ mod tests {
         let compactor = TruncatingCompactor::new()
             .with_min_messages(4)
             .with_preserve_recent(2);
-        // Use a window that triggers compaction at 10% but whose target
-        // (3% of the window after the default 30% target fraction)
-        // still fits the preserved tail with room to grow into it.
+        // Use a window that triggers compaction at 10% but whose
+        // configured target (3% of the window at a 30% target fraction)
+        // still fits the preserved tail with room to grow into it — the
+        // fraction is pinned here so the default's value cannot move
+        // this mechanics pin.
         let manager = ContextManager::new(Arc::new(compactor))
             .with_context_window(1_000)
-            .with_threshold(10);
+            .with_threshold(10)
+            .with_compact_target_pct(30);
         let msgs = make_conversation(20); // 40 messages
         let result = manager.ensure_context_fits(msgs, 1).await;
         match result {

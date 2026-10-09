@@ -124,6 +124,10 @@
         {
           "parts": [
             {
+              "text": "weighing whether to echo first",
+              "type": "thinking"
+            },
+            {
               "id": "call_gold_reason_1",
               "input": {
                 "text": "first"

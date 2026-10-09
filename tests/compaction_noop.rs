@@ -113,6 +113,104 @@ mod scenarios {
         }
     }
 
+    /// A client that bills `multiple ×` the heuristic size of the
+    /// request it actually received.
+    ///
+    /// The deterministic stand-in for a tokenizer denser than the
+    /// `chars ÷ 4` baseline: every non-streaming response reports
+    /// `input_tokens = multiple × heuristic(request)`, so the engine's
+    /// usage-fed calibration converges on that multiple after the
+    /// first report. The streaming method forwards untouched — the
+    /// billing fixture drives the non-streaming turn mode.
+    #[derive(Clone)]
+    struct BillingClient {
+        inner: MockApiClient,
+        multiple: u64,
+    }
+
+    impl BillingClient {
+        fn wrap(inner: MockApiClient, multiple: u64) -> Self {
+            Self { inner, multiple }
+        }
+
+        fn billed_input(&self, request: &StreamRequest) -> u64 {
+            let mut tokens = HeuristicTokenCounter.count(&request.messages);
+            if let Some(system) = &request.system {
+                tokens += HeuristicTokenCounter.count(&[Message::user(system.clone())]);
+            }
+            if let Some(tools) = &request.tools {
+                let rendered = serde_json::to_string(tools).unwrap_or_default();
+                tokens += HeuristicTokenCounter.count(&[Message::user(rendered)]);
+            }
+            tokens.saturating_mul(self.multiple)
+        }
+    }
+
+    impl ApiClient for BillingClient {
+        fn model(&self) -> String {
+            self.inner.model()
+        }
+
+        fn set_model(&self, model: &str) -> bool {
+            self.inner.set_model(model)
+        }
+
+        fn stream_messages(
+            &self,
+            request: &StreamRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+            let billed = self.billed_input(request);
+            let billed = u32::try_from(billed).unwrap_or(u32::MAX);
+            let inner = self.inner.stream_messages(request);
+            Box::pin(futures::StreamExt::map(inner, move |event| {
+                event.map(|mut event| {
+                    if let StreamEvent::MessageDelta(delta) = &mut event {
+                        delta.usage = delta
+                            .usage
+                            .take()
+                            .map(|_| loopctl::stream::Usage::new(billed, 25));
+                    }
+                    event
+                })
+            }))
+        }
+
+        fn create_message(
+            &self,
+            request: &StreamRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>>
+        {
+            let billed = self.billed_input(request);
+            let inner = self.inner.create_message(request);
+            Box::pin(async move {
+                let mut response = inner.await?;
+                response.usage = Some(loopctl::stream::Usage::new(
+                    u32::try_from(billed).unwrap_or(u32::MAX),
+                    25,
+                ));
+                Ok(response)
+            })
+        }
+
+        fn create_message_with_options(
+            &self,
+            request: &StreamRequest,
+            options: loopctl::structured::RequestOptions,
+        ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>>
+        {
+            let billed = self.billed_input(request);
+            let inner = self.inner.create_message_with_options(request, options);
+            Box::pin(async move {
+                let mut response = inner.await?;
+                response.usage = Some(loopctl::stream::Usage::new(
+                    u32::try_from(billed).unwrap_or(u32::MAX),
+                    25,
+                ));
+                Ok(response)
+            })
+        }
+    }
+
     struct CompactionCounter {
         events: AtomicUsize,
     }
@@ -330,7 +428,11 @@ mod scenarios {
             tool_turn_response(3, 40),
             tool_turn_response(4, 40),
         ];
-        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(script),
+        );
 
         let config = SessionConfig::default()
             .with_context_window(200)
@@ -363,7 +465,11 @@ mod scenarios {
             tool_turn_response(0, 40),
             tool_turn_response(1, 40),
         ];
-        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(script),
+        );
 
         let config = SessionConfig::default()
             .with_context_window(260)
@@ -392,7 +498,11 @@ mod scenarios {
     #[tokio::test]
     async fn tool_result_growth_alone_crosses_the_threshold() {
         let script = vec![tool_turn_response_with_fill(0, 20, 8_000), final_response()];
-        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(script),
+        );
 
         let config = SessionConfig::default()
             .with_context_window(2_000)
@@ -432,20 +542,24 @@ mod scenarios {
         // the new run's first request carries the compacted history,
         // not the grown one.
         let script = vec![
-            tool_turn_response_with_fill(0, 40, 1_500),
-            tool_turn_response_with_fill(1, 40, 1_500),
+            tool_turn_response_with_fill(0, 40, 3_300),
+            tool_turn_response_with_fill(1, 40, 3_300),
             tool_turn_response_with_fill(2, 40, 100),
             tool_turn_response_with_fill(3, 40, 100),
             final_response(),
             final_response(),
         ];
-        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(script),
+        );
         let observer = Arc::new(CompactionCounter {
             events: AtomicUsize::new(0),
         });
 
         let config = SessionConfig::default()
-            .with_context_window(1_400)
+            .with_context_window(2_400)
             .with_compact_threshold(80);
         let client_handle = client.clone();
         let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
@@ -464,7 +578,7 @@ mod scenarios {
             .copied()
             .unwrap_or_default();
 
-        let second = agent.run(&"y".repeat(600), &RunConfig::default()).await;
+        let second = agent.run(&"y".repeat(300), &RunConfig::default()).await;
         assert!(
             second.is_ok(),
             "run 2 compacts at start and completes: {second:?}"
@@ -485,11 +599,145 @@ mod scenarios {
         );
         for tokens in &served {
             assert!(
-                *tokens <= 1_400,
-                "no request may exceed the 1 400-token window; served \
+                *tokens <= 2_400,
+                "no request may exceed the 2 400-token window; served \
                  estimates {served:?}"
             );
         }
+    }
+
+    /// A compactor that lands exactly at its target, by construction.
+    ///
+    /// The documented landing goal (`CompactionOutcome`'s contract:
+    /// land at-or-under `target_tokens`) made deterministic: the output
+    /// is one synthetic message sized so the crate's own counter reads
+    /// it at exactly the target. This is the fixture for the
+    /// calibrated-scale interaction — a pass that fulfills its contract
+    /// must also satisfy the trigger that fired it.
+    struct TargetLandingCompactor;
+
+    impl ContextCompactor for TargetLandingCompactor {
+        fn compact(
+            &self,
+            _messages: Vec<Message>,
+            target_tokens: u64,
+            _context: CompactionContext,
+        ) -> Pin<Box<dyn Future<Output = CompactionOutcome> + Send + '_>> {
+            Box::pin(async move {
+                let chars = target_tokens
+                    .saturating_mul(4)
+                    .saturating_sub(20)
+                    .try_into()
+                    .unwrap_or(0);
+                let landed = vec![Message::user("s".repeat(chars))];
+                let tokens_after = HeuristicTokenCounter.count(&landed);
+                CompactionOutcome::compacted(landed, tokens_after.saturating_add(1), tokens_after)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_calibrated_backend_still_compacts_to_health() {
+        // A backend billing 4x the heuristic — inside the clamp the
+        // calibration code itself documents — must not wedge
+        // compaction: the trigger line and the compactor's target
+        // have to live in one scale, or a pass that lands exactly on
+        // its target leaves the calibrated figure still over the
+        // line, the machine re-requests compaction before serving
+        // again, the next pass measures no progress, and the run dies
+        // on the no-progress guard.
+        let script: Vec<MockResponse> = (0..10)
+            .map(|step| tool_turn_response_with_fill(step, 40, 150))
+            .chain(std::iter::once(final_response()))
+            .collect();
+        let client =
+            BillingClient::wrap(MockApiClient::new("test-model").with_responses(script), 4);
+        let observer = Arc::new(CountingObserver {
+            events: Arc::new(AtomicUsize::new(0)),
+        });
+        let config = SessionConfig::default()
+            .with_context_window(2_000)
+            .with_compact_threshold(80);
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+        agent.set_turn_mode(loopctl::engine::TurnMode::NonStreaming);
+        agent.register_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>);
+        agent.set_context_manager(Arc::new(ContextManager::new(Arc::new(
+            TargetLandingCompactor,
+        ))));
+
+        let result = agent
+            .run(
+                "grow until the dense tokenizer bites",
+                &RunConfig::default(),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a 4x-billed backend compacts to health instead of stalling: {result:?}"
+        );
+        assert!(
+            observer.events.load(Ordering::SeqCst) >= 1,
+            "the calibrated trigger fired at least one compaction pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_calibrated_backend_still_compacts_to_health_after_a_model_switch() {
+        // The switch seam, one rung below the ratio-move sync the test
+        // above pins: run 1 seeds the 4x ratio, and the ratio move has
+        // already converted the installed manager's window into raw
+        // units. A model switch that carries a context window must pass
+        // through the same converting sync — a verbatim write hands the
+        // manager the provider-scale window again, its target lands
+        // above the trigger line, and run 2 dies on the no-progress
+        // guard instead of compacting to health.
+        let script = std::iter::once(final_response())
+            .chain((0..10).map(|step| tool_turn_response_with_fill(step, 40, 150)))
+            .chain(std::iter::once(final_response()))
+            .collect();
+        let client =
+            BillingClient::wrap(MockApiClient::new("test-model").with_responses(script), 4);
+        let observer = Arc::new(CountingObserver {
+            events: Arc::new(AtomicUsize::new(0)),
+        });
+        let config = SessionConfig::default()
+            .with_context_window(2_000)
+            .with_compact_threshold(80);
+        let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
+        agent.set_turn_mode(loopctl::engine::TurnMode::NonStreaming);
+        agent.register_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>);
+        agent.set_context_manager(Arc::new(
+            ContextManager::new(Arc::new(TargetLandingCompactor)).with_compact_target_pct(30),
+        ));
+
+        agent
+            .run("seed the ratio", &RunConfig::default())
+            .await
+            .unwrap();
+        agent
+            .switch_model("test-model-2")
+            .with_context_window(2_000)
+            .apply()
+            .unwrap();
+
+        let result = agent
+            .run(
+                "grow until the dense tokenizer bites",
+                &RunConfig::default(),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a switch on a calibrated loop keeps the compactor's target under \
+             the trigger line — the run compacts to health instead of stalling: \
+             {result:?}"
+        );
+        assert!(
+            observer.events.load(Ordering::SeqCst) >= 1,
+            "the calibrated trigger fired at least one compaction pass after the switch"
+        );
     }
 
     #[tokio::test]
@@ -503,7 +751,11 @@ mod scenarios {
             tool_turn_response(1, 40),
             final_response(),
         ];
-        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(script),
+        );
 
         let config = SessionConfig::default()
             .with_context_window(250)
@@ -546,7 +798,11 @@ mod scenarios {
             tool_turn_response_with_fill(4, 40, 40),
             final_response(),
         ];
-        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(script),
+        );
         let consultations = Arc::new(AtomicUsize::new(0));
         let starts = Arc::new(AtomicUsize::new(0));
 
@@ -693,7 +949,9 @@ mod scenarios {
         // riding the reserve — never a history-only number that reads
         // as a pass (252 of 300) while the run is dead.
         let client = RecordingClient::wrap(
-            MockApiClient::new("test-model").with_responses(vec![final_response()]),
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(vec![final_response()]),
         );
 
         let config = SessionConfig::default()
@@ -739,7 +997,9 @@ mod scenarios {
         // against the window, and discarding it would erase the very
         // conversation the retry is invited to continue.
         let client = RecordingClient::wrap(
-            MockApiClient::new("test-model").with_responses(vec![final_response()]),
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(vec![final_response()]),
         );
 
         let config = SessionConfig::default()
@@ -772,7 +1032,9 @@ mod scenarios {
         // compaction happened, and no savings can be reported for one
         // that did not.
         let client = RecordingClient::wrap(
-            MockApiClient::new("test-model").with_responses(vec![final_response()]),
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(vec![final_response()]),
         );
         let config = SessionConfig::default()
             .with_context_window(300)
@@ -849,8 +1111,11 @@ mod scenarios {
                 tool_turn_response_with_fill(2, 40, fill),
                 final_response(),
             ];
-            let client =
-                RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+            let client = RecordingClient::wrap(
+                MockApiClient::new("test-model")
+                    .without_usage()
+                    .with_responses(script),
+            );
             let mut config = SessionConfig::default()
                 .with_context_window(window)
                 .with_compact_threshold(u8::try_from(threshold).unwrap_or(80));
@@ -926,7 +1191,11 @@ mod scenarios {
             tool_turn_response(3, 40),
             final_response(),
         ];
-        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(script),
+        );
 
         let config = SessionConfig::default()
             .with_context_window(350)
@@ -1004,7 +1273,11 @@ mod scenarios {
             tool_turn_response(2, 40),
             final_response(),
         ];
-        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(script),
+        );
         let targets = Arc::new(Mutex::new(Vec::new()));
 
         let config = SessionConfig::default()
@@ -1081,7 +1354,11 @@ mod scenarios {
             tool_turn_response(0, 40),
             final_response(),
         ];
-        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(script),
+        );
 
         let config = SessionConfig::default()
             .with_context_window(1_600)
@@ -1127,14 +1404,16 @@ mod scenarios {
     #[tokio::test]
     async fn default_loop_compacts_at_the_threshold() {
         let client = RecordingClient::wrap(
-            MockApiClient::new("test-model").with_responses(growing_conversation_script(12)),
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(growing_conversation_script(32)),
         );
         let observer = Arc::new(CompactionCounter {
             events: AtomicUsize::new(0),
         });
 
         let config = SessionConfig::default()
-            .with_context_window(1_200)
+            .with_context_window(3_200)
             .with_compact_threshold(80);
         let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
         agent.register_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>);
@@ -1155,14 +1434,16 @@ mod scenarios {
     #[tokio::test]
     async fn small_model_profile_compacts_at_the_threshold() {
         let client = RecordingClient::wrap(
-            MockApiClient::new("test-model").with_responses(growing_conversation_script(12)),
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(growing_conversation_script(32)),
         );
         let observer = Arc::new(CompactionCounter {
             events: AtomicUsize::new(0),
         });
 
         let config =
-            loopctl::presets::ConstrainedProfile::session_config().with_context_window(1_200);
+            loopctl::presets::ConstrainedProfile::session_config().with_context_window(3_200);
         let mut agent = BareLoop::new(Arc::new(client), registry_with_echo(), config);
         loopctl::presets::ConstrainedProfile::apply(&mut agent).expect("profile applies");
         agent.register_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>);
@@ -1191,7 +1472,11 @@ mod scenarios {
             tool_turn_response_with_fill(2, 40, 2_000),
             final_response(),
         ];
-        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(script),
+        );
         let observer = Arc::new(CompactionCounter {
             events: AtomicUsize::new(0),
         });
@@ -1229,7 +1514,11 @@ mod scenarios {
             tool_turn_response_with_fill(1, 40, 260),
             final_response(),
         ];
-        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(script),
+        );
         let observer = Arc::new(CompactionCounter {
             events: AtomicUsize::new(0),
         });
@@ -1279,7 +1568,9 @@ mod scenarios {
         }
 
         let client = RecordingClient::wrap(
-            MockApiClient::new("test-model").with_responses(growing_conversation_script(12)),
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(growing_conversation_script(12)),
         );
 
         let config = SessionConfig::default()
@@ -1336,7 +1627,11 @@ mod scenarios {
         }
 
         let script = growing_conversation_script(12);
-        let client = RecordingClient::wrap(MockApiClient::new("test-model").with_responses(script));
+        let client = RecordingClient::wrap(
+            MockApiClient::new("test-model")
+                .without_usage()
+                .with_responses(script),
+        );
 
         let ran = Arc::new(AtomicBool::new(false));
         let manager = ContextManager::new(Arc::new(ShrinkingCompactor {

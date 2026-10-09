@@ -189,6 +189,16 @@ pub struct MockApiClient {
     /// queue or individual builder methods to mutate the front entry.
     responses: Arc<Mutex<Vec<MockResponse>>>,
 
+    /// Whether served responses carry a usage report.
+    ///
+    /// `true` by default — every canned response reports the same
+    /// fixed token pair, standing in for a provider's usage payload.
+    /// [`without_usage`](MockApiClient::without_usage) flips it off for
+    /// fixtures that model a backend reporting no usage at all, whose
+    /// engine-side estimates must stay at the heuristic's own
+    /// calibration.
+    reports_usage: bool,
+
     /// When set, every call returns an [`ApiError`] instead of a normal
     /// response.
     ///
@@ -421,7 +431,31 @@ impl MockApiClient {
             create_message_calls: Arc::new(Mutex::new(0)),
             with_options_calls: Arc::new(Mutex::new(0)),
             accept_tool_constraints: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reports_usage: true,
         }
+    }
+
+    /// Serve responses without any usage report.
+    ///
+    /// Every canned response then omits the usage payload — the shape
+    /// of a backend that reports no usage (a local server without a
+    /// tokenizer), for fixtures asserting identity behavior on the
+    /// engine's estimate-calibration side. Chained like the other
+    /// builders; the default is to report.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::testing::MockApiClient;
+    ///
+    /// let client = MockApiClient::new("test-model")
+    ///     .with_text_response("no usage attached")
+    ///     .without_usage();
+    /// ```
+    #[must_use]
+    pub fn without_usage(mut self) -> Self {
+        self.reports_usage = false;
+        self
     }
 
     /// Set the text response for the first (or only) turn.
@@ -832,7 +866,7 @@ impl MockApiClient {
             delta: MessageDeltaPayload {
                 stop_reason: Some(response.stop_reason),
             },
-            usage: Some(Usage::new(50, 25)),
+            usage: self.reports_usage.then(|| Usage::new(50, 25)),
         })));
 
         events.push(Ok(StreamEvent::MessageStop));
@@ -900,7 +934,9 @@ impl MockApiClient {
         Ok(crate::api::NonStreamingResponse {
             message: Message::new(Role::Assistant, parts),
             stop_reason,
-            usage: Some(crate::stream::Usage::new(50, 25)),
+            usage: self
+                .reports_usage
+                .then(|| crate::stream::Usage::new(50, 25)),
         })
     }
 }

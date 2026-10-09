@@ -184,6 +184,7 @@ impl<C: ApiClient> BareLoop<C> {
             error: error.map(std::string::ToString::to_string),
             total_turns: result.turn_count(),
             duration_ms: Self::millis_u64(duration),
+            calibration_ratio_bp: self.calibration.report(),
         });
     }
 
@@ -381,6 +382,11 @@ impl<C: ApiClient> BareLoop<C> {
         let served = self.routed_or_client_model()?;
         self.managers.fallback().record_success()?;
         let (in_tok, out_tok) = Self::usage_tokens(usage);
+        let ratio_before = self.calibration.ratio_bp;
+        self.calibration.observe_usage(in_tok);
+        if self.calibration.ratio_bp != ratio_before && self.effective_context_window() > 0 {
+            self.sync_manager_window(self.effective_context_window());
+        }
         if let Some(gate) = &self.budget_gate {
             gate.observe_usage(in_tok, out_tok);
         }

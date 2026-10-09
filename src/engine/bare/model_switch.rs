@@ -115,10 +115,7 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
             loop_.session.config.context_window = cw;
             loop_.context_window = None;
             if let Some(manager) = loop_.managers.context_manager() {
-                let synced = (**manager)
-                    .clone()
-                    .with_context_window(cw)
-                    .with_threshold(loop_.session.config.compact_threshold);
+                let synced = (**manager).clone().with_context_window(cw);
                 loop_.managers.set_context_manager(Arc::new(synced));
             }
         }

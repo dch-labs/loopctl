@@ -54,6 +54,8 @@
 //! println!("Agent responded in {} turns", result.turn_count());
 //! ```
 
+use std::num::NonZeroU64;
+
 use crate::api::ApiClient;
 use std::future::Future;
 use std::path::PathBuf;
@@ -287,12 +289,14 @@ pub struct BareLoop<C: ApiClient> {
     /// [`add_contributor`](BareLoop::add_contributor).
     contributors: Vec<Box<dyn ContextContributor>>,
 
-    /// Cached token cost of the per-request overhead.
+    /// Cached components of the per-request overhead.
     ///
-    /// Covers the system prompt and tool schemas, measured at first
-    /// use — register tools before the first run for the measurement
-    /// to see them.
-    overhead: std::sync::OnceLock<u64>,
+    /// Holds the system-prompt and tool-schema costs separately — both
+    /// measured at first use, so register tools before the first run
+    /// for the measurement to see them — because a request running
+    /// under a `response_format` suppresses tool advertisement and its
+    /// estimate must drop the schema component without re-measuring.
+    overhead: std::sync::OnceLock<OverheadParts>,
 
     /// Transient-message budget of the most recent deferred turn.
     ///
@@ -304,6 +308,18 @@ pub struct BareLoop<C: ApiClient> {
     /// Cleared at run start — a budget left over from a failed run
     /// must not reserve room in the next one.
     deferred_transient_tokens: u64,
+
+    /// Usage-fed correction applied to every context-size estimate.
+    ///
+    /// Holds the rolling ratio between provider-reported input tokens
+    /// and the engine's pre-request prediction, so estimates track the
+    /// backend's real tokenizer instead of the heuristic's calibration.
+    /// Stays at identity while no usage arrives — a backend that
+    /// reports nothing changes no figure. Driver-side by design: the
+    /// ratio describes a tokenizer, not the conversation, so it does
+    /// not serialize with the machine and a resumed loop re-converges
+    /// (the first report seeds the ratio directly).
+    calibration: EstimateCalibration,
 
     /// Sticky detection bypass, set once detection state is found
     /// poisoned — detection is advisory, so the session continues with
@@ -450,6 +466,207 @@ struct TurnAccounting {
     stop_reason: StreamStopReason,
 }
 
+/// The measured components of the per-request overhead.
+///
+/// Kept as two fields rather than one cached sum because the request's
+/// wire shape differs by turn: a request running under a
+/// `response_format` advertises no tools (the provider clients drop or
+/// replace the tool list), so its estimate must drop the schema
+/// component while the compaction reservation — which must hold room
+/// for a post-compaction turn that may carry tools again — keeps the
+/// full sum.
+#[derive(Debug)]
+struct OverheadParts {
+    /// Token cost of the session system prompt.
+    ///
+    /// Measured once at first use as a synthetic user message through
+    /// [`count_context`](BareLoop::count_context); zero when the
+    /// session configures no system prompt.
+    system: u64,
+
+    /// Token cost of the advertised tool schemas.
+    ///
+    /// Measured once at first use from the registry's rendered schema
+    /// list; zero when no tools are registered. Dropped from the
+    /// estimate of a `response_format` turn, whose request suppresses
+    /// tool advertisement.
+    tools: u64,
+}
+
+/// The identity calibration ratio, in thousandths of the raw estimate.
+///
+/// A ratio of exactly 1000 multiplies every estimate by one — the
+/// pre-calibration behavior, preserved bit-for-bit by the integer
+/// arithmetic `tokens × 1000 / 1000`.
+const CALIBRATION_IDENTITY_BP: u64 = 1000;
+
+/// The lower clamp for the calibration ratio, in thousandths.
+///
+/// A backend reporting far fewer input tokens than the heuristic
+/// predicts cannot pull the correction below a quarter — dense-code
+/// histories tokenize above the heuristic's chars-per-token figure,
+/// but never twenty-times above.
+const CALIBRATION_MIN_BP: u64 = 250;
+
+/// The upper clamp for the calibration ratio, in thousandths.
+///
+/// A backend reporting far more input tokens than the heuristic
+/// predicts cannot push the correction past fourfold — CJK-heavy
+/// content genuinely reaches roughly four times the heuristic against
+/// a `chars ÷ 4` baseline, and nothing honest lives beyond it.
+const CALIBRATION_MAX_BP: u64 = 4000;
+
+/// Usage-fed correction between predicted and provider-reported
+/// context size.
+///
+/// The engine predicts each request's input-token count (history plus
+/// overhead plus transients); when the provider reports the actual
+/// `input_tokens`, the prediction error feeds this rolling ratio,
+/// which later estimates multiply in. A model-fallback turn samples a
+/// possibly-different tokenizer than the request the prediction was
+/// armed for — accepted noise, bounded by the clamp and diluted by the
+/// smoothing, since fallback routing is transient by design. The ratio is stored in integer
+/// thousandths — the same exact-integer discipline as the crate's
+/// ratio counters — clamped to
+/// `[CALIBRATION_MIN_BP, CALIBRATION_MAX_BP]` so an absurd report (a
+/// zero, or a garbage ceiling) cannot peg it. The first report seeds
+/// the ratio directly (clamped); later reports move it halfway to the
+/// clamped sample each time. A backend reporting no usable usage
+/// leaves the ratio at identity forever, and every figure it sees is
+/// byte-identical to an uncalibrated loop.
+#[derive(Debug)]
+struct EstimateCalibration {
+    /// The rolling ratio applied to raw estimates, in thousandths.
+    ///
+    /// Starts at [`CALIBRATION_IDENTITY_BP`] and never leaves the
+    /// clamp bounds; every driver→machine estimate feed multiplies it
+    /// in through [`calibrated`](BareLoop::calibrated).
+    ratio_bp: u64,
+
+    /// The raw counter estimate of the last request sent, in uncalibrated
+    /// counter units.
+    ///
+    /// Stashed by the pre-request estimate site on turns that actually
+    /// send (a deferred turn sends nothing and the retried turn
+    /// re-stashes); the next usage report is divided against it — raw,
+    /// so the sample reads the true actual-to-heuristic multiple
+    /// rather than feeding the current ratio back into itself.
+    prediction: Option<u64>,
+
+    /// Whether any usage report has been observed.
+    ///
+    /// Gates the seeding rule (the first report sets the ratio
+    /// outright instead of smoothing toward it) and the run-end
+    /// telemetry, which reports `None` while no ground truth has ever
+    /// arrived — the honest signal for a backend that reports no
+    /// usage.
+    calibrated: bool,
+}
+
+impl EstimateCalibration {
+    /// The identity calibration — estimates pass through unchanged.
+    ///
+    /// The starting state of every loop: until a provider reports
+    /// usable input tokens, [`apply`](Self::apply) is multiplication
+    /// by one and no estimate moves.
+    fn identity() -> Self {
+        Self {
+            ratio_bp: CALIBRATION_IDENTITY_BP,
+            prediction: None,
+            calibrated: false,
+        }
+    }
+
+    /// Multiply a raw estimate by the rolling ratio.
+    ///
+    /// Exact at identity (`tokens × 1000 / 1000`); truncating integer
+    /// arithmetic elsewhere, saturating on overflow. Applied at every
+    /// driver→machine feed so the machine's stored figure stays in one
+    /// scale — the no-shrink comparison compares pre-pass and
+    /// post-pass figures through the same ratio.
+    fn apply(&self, tokens: u64) -> u64 {
+        tokens.saturating_mul(self.ratio_bp) / CALIBRATION_IDENTITY_BP
+    }
+
+    /// Convert a provider-token window into the counter's raw units.
+    ///
+    /// The calibration's whole point is that `raw × ratio / 1000`
+    /// approximates what the provider bills, so machinery that counts
+    /// raw — the installed context manager's thresholds, targets, and
+    /// fit checks — must see the window expressed in raw units too,
+    /// or its reachable landing and the machine's trigger line sit in
+    /// different scales: a pass that lands exactly on its target
+    /// would leave the calibrated figure over the line and the run
+    /// would stall on the no-progress guard. At identity the window
+    /// passes through unchanged.
+    fn raw_window(&self, provider_window: u64) -> u64 {
+        let ratio = NonZeroU64::new(self.ratio_bp).unwrap_or(NonZeroU64::MIN);
+        provider_window.saturating_mul(CALIBRATION_IDENTITY_BP) / ratio
+    }
+
+    /// Record the raw counter estimate of the request that is about to
+    /// go out.
+    ///
+    /// The value the provider's next `input_tokens` report is divided
+    /// against — deliberately the **raw** counter figure, not the
+    /// calibrated one: the sample must read the true
+    /// actual-to-heuristic multiple, and dividing by a prediction that
+    /// already carries the current ratio would converge on the
+    /// multiple's square root instead of the multiple. Only meaningful
+    /// when a request actually follows, which is why the pre-request
+    /// site stashes on the non-deferred path only.
+    fn note_prediction(&mut self, payload: u64) {
+        self.prediction = Some(payload);
+    }
+
+    /// Fold a provider-reported input-token count into the ratio.
+    ///
+    /// Ignored — leaving every estimate untouched — when no prediction
+    /// is armed, the prediction is zero, or the report is zero: a
+    /// zero-bearing usage payload is the shape of a backend that
+    /// reports no usage at all, and treating it as a genuine "the
+    /// payload was free" sample would crash the ratio to the clamp.
+    /// Otherwise the clamped sample `input × 1000 / prediction` seeds
+    /// the ratio on first sight and halves the distance to it on every
+    /// later report, with one metric event per update.
+    fn observe_usage(&mut self, input_tokens: u64) {
+        let Some(predicted) = NonZeroU64::new(self.prediction.unwrap_or(0)) else {
+            return;
+        };
+        if input_tokens == 0 {
+            return;
+        }
+        let sample = input_tokens.saturating_mul(CALIBRATION_IDENTITY_BP) / predicted;
+        let sample = sample.clamp(CALIBRATION_MIN_BP, CALIBRATION_MAX_BP);
+        let half_gap = sample.abs_diff(self.ratio_bp) / 2;
+        self.ratio_bp = if !self.calibrated {
+            self.calibrated = true;
+            sample
+        } else if sample > self.ratio_bp {
+            self.ratio_bp.saturating_add(half_gap)
+        } else {
+            self.ratio_bp.saturating_sub(half_gap)
+        };
+        tracing::debug!(
+            target: "loopctl::metrics",
+            metric = "loopctl.estimate.calibration",
+            ratio_bp = self.ratio_bp,
+            sample_bp = sample,
+            "usage-fed estimate calibration updated"
+        );
+    }
+
+    /// The ratio to surface at run end, if any report ever arrived.
+    ///
+    /// `None` is the never-calibrated state — no usable usage report
+    /// crossed this loop — rather than a disguised identity, so a
+    /// host watching a usage-less backend knows there is no ground
+    /// truth behind the figure it sees.
+    fn report(&self) -> Option<u64> {
+        self.calibrated.then_some(self.ratio_bp)
+    }
+}
+
 impl<C: ApiClient> BareLoop<C> {
     /// The hard ceiling on tool-recovery retry attempts.
     ///
@@ -545,12 +762,13 @@ impl<C: ApiClient> BareLoop<C> {
         }
         let session = Self::new_session(session_config, &managers);
         let session_temp_dir = Some(Self::session_temp_subdir(&std::env::temp_dir(), session.id));
+        let machine = LoopMachine::from_history(Vec::new());
         let mut loop_ = Self {
             client,
             tools: Arc::new(tools),
             session,
             session_temp_dir,
-            machine: LoopMachine::from_history(Vec::new()),
+            machine,
             managers,
             budget_gate: None,
             budget_run_started: None,
@@ -562,6 +780,7 @@ impl<C: ApiClient> BareLoop<C> {
             contributors: Vec::new(),
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
+            calibration: EstimateCalibration::identity(),
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -817,17 +1036,27 @@ impl<C: ApiClient> BareLoop<C> {
     /// the manager keeps its own copy for targeting and fit checks
     /// and without this re-sync the machine would trigger on the
     /// disclosed number while the manager compacted toward the stale
-    /// one) and from the probe-less resolution that reverts an
-    /// earlier probe's sync. The same clone-and-sync a model switch's
-    /// window change performs.
+    /// one), from the probe-less resolution that reverts an earlier
+    /// probe's sync, and whenever the usage-fed calibration ratio
+    /// moves — the same clone-and-sync a model switch's window change
+    /// performs. Only the window moves: the manager's own threshold is
+    /// preserved, because a host that installed a customized manager
+    /// chose it, and a sync firing on every ratio update would
+    /// otherwise reset that choice to the session config's value each
+    /// time. The window is converted from provider tokens into
+    /// the counter's raw units on the way in (see
+    /// [`raw_window`](EstimateCalibration::raw_window)): the manager's
+    /// thresholds, targets, and fit checks all count raw, so its copy
+    /// of the window must live in the same units or a pass that lands
+    /// on its target cannot satisfy a trigger fed calibrated figures.
+    /// A manager installed after the last sync keeps its own window
+    /// until the next one.
     fn sync_manager_window(&mut self, window: u64) {
+        let raw_window = self.calibration.raw_window(window);
         if let Some(manager) = self.managers.context_manager()
-            && manager.context_window() != window
+            && manager.context_window() != raw_window
         {
-            let synced = (**manager)
-                .clone()
-                .with_context_window(window)
-                .with_threshold(self.session.config.compact_threshold);
+            let synced = (**manager).clone().with_context_window(raw_window);
             self.managers.set_context_manager(Arc::new(synced));
         }
     }
@@ -862,12 +1091,14 @@ impl<C: ApiClient> BareLoop<C> {
 
     /// Estimate the token count of `history`.
     ///
-    /// Prefers the configured [`ContextManager`]'s counter and falls
-    /// back to the driver's `token_counter` field when no manager is
-    /// set. This is the single read
-    /// path for context-size estimation — the compaction trigger and the
-    /// post-compaction path both go through the manager, so routing the
-    /// driver's estimate there too keeps one source of truth.
+    /// The history rides the wire verbatim — reasoning included — so
+    /// the raw count is the wire shape by construction. Prefers the
+    /// configured [`ContextManager`]'s counter and falls back to the
+    /// driver's `token_counter` field when no manager is set. This is
+    /// the single read path for context-size estimation — the
+    /// compaction trigger and the post-compaction path both go through
+    /// the manager, so routing the driver's estimate there too keeps
+    /// one source of truth.
     fn count_context(&self, history: &[Message]) -> u64 {
         match self.managers.context_manager() {
             Some(cm) => cm.token_counter().count(history),
@@ -875,21 +1106,28 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// The token cost of the per-request overhead: the session system
-    /// prompt plus the advertised tool schemas.
+    /// Apply the usage-fed calibration ratio to a raw estimate.
     ///
-    /// Both ride every outbound request but never enter the history
-    /// the machine's estimate counts, so every estimate feed adds this
-    /// on top — the window policy then compares against the payload
-    /// the provider actually receives. A turn running under a
-    /// `response_format` constraint suppresses its tools, so the
-    /// estimate over-reserves for that turn — conservative, never
-    /// under. Measured once at first use (register tools before the
-    /// first run for the measurement to see them) with the same
-    /// counter `count_context` uses, by counting each as a synthetic
-    /// message.
-    fn overhead_tokens(&self) -> u64 {
-        *self.overhead.get_or_init(|| {
+    /// Every driver→machine feed of the context-size estimate runs
+    /// through here, so the machine's stored figure — and with it the
+    /// compaction trigger's arithmetic and the no-shrink comparison —
+    /// stays in one scale. Identity until a provider reports usable
+    /// input tokens, and exact at identity.
+    fn calibrated(&self, tokens: u64) -> u64 {
+        self.calibration.apply(tokens)
+    }
+
+    /// The measured per-request overhead components, computed once.
+    ///
+    /// Both components ride every outbound request but never enter
+    /// the history the machine's estimate counts, so every estimate
+    /// feed adds them on top — the window policy then compares against
+    /// the payload the provider actually receives. Measured at first
+    /// use (register tools before the first run for the measurement to
+    /// see them) with the same counter `count_context` uses, by
+    /// counting each as a synthetic message.
+    fn overhead_parts(&self) -> &OverheadParts {
+        self.overhead.get_or_init(|| {
             let system = self
                 .session
                 .config
@@ -905,8 +1143,37 @@ impl<C: ApiClient> BareLoop<C> {
                 serde_json::to_string(&schemas)
                     .map_or(0, |rendered| self.count_context(&[Message::user(rendered)]))
             };
-            system.saturating_add(tools)
+            OverheadParts { system, tools }
         })
+    }
+
+    /// The token cost of the per-request overhead, in full.
+    ///
+    /// The sum of both [`OverheadParts`] components — the figure a
+    /// compaction pass reserves against, because a post-compaction
+    /// turn may carry tools even when the compacted turn did not.
+    fn overhead_tokens(&self) -> u64 {
+        let parts = self.overhead_parts();
+        parts.system.saturating_add(parts.tools)
+    }
+
+    /// The token cost of the overhead as this turn's request carries
+    /// it.
+    ///
+    /// Drops the tool-schema component when the turn's
+    /// `response_format` suppresses tool advertisement: the OpenAI and
+    /// Gemini wire bodies omit `tools` entirely under a format, so the
+    /// estimate reserving them over-counts. The Anthropic body swaps
+    /// the caller's tools for one synthesized forced tool, which rides
+    /// uncounted — a bounded, small under-reserve against the dropped
+    /// registry schemas. Unsuppressed turns get the full sum, same as
+    /// [`overhead_tokens`](Self::overhead_tokens).
+    fn request_overhead_tokens(&self) -> u64 {
+        let parts = self.overhead_parts();
+        if self.request_options.response_format.is_some() {
+            return parts.system;
+        }
+        parts.system.saturating_add(parts.tools)
     }
 
     /// Borrow the driving state machine.
@@ -985,6 +1252,7 @@ impl<C: ApiClient> BareLoop<C> {
             contributors: Vec::new(),
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
+            calibration: EstimateCalibration::identity(),
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -1097,6 +1365,7 @@ impl<C: ApiClient> BareLoop<C> {
             contributors: Vec::new(),
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
+            calibration: EstimateCalibration::identity(),
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -1510,10 +1779,11 @@ impl<C: ApiClient> BareLoop<C> {
         // and model-switch bookkeeping have not fired yet;
         // `next_step` is idempotent, so the re-check is a pure
         // re-decision).
-        let payload = self
+        let raw_payload = self
             .count_context(&self.machine.full_history())
-            .saturating_add(self.overhead_tokens())
+            .saturating_add(self.request_overhead_tokens())
             .saturating_add(self.count_context(&messages));
+        let payload = self.calibrated(raw_payload);
         self.machine.set_context_tokens(payload);
         if matches!(
             self.machine.next_step(self.machine_policy()),
@@ -1522,6 +1792,7 @@ impl<C: ApiClient> BareLoop<C> {
             self.deferred_transient_tokens = self.count_context(&messages);
             return Ok(());
         }
+        self.calibration.note_prediction(raw_payload);
         self.note_routed_model()?;
 
         self.notify_turn_start(turn, &turn_input);
@@ -1599,9 +1870,10 @@ impl<C: ApiClient> BareLoop<C> {
         };
         let mut context_history = self.machine.full_history();
         context_history.push(model_response.message.clone());
-        let context_tokens = self
-            .count_context(&context_history)
-            .saturating_add(self.overhead_tokens());
+        let context_tokens = self.calibrated(
+            self.count_context(&context_history)
+                .saturating_add(self.request_overhead_tokens()),
+        );
         self.machine.model_response(model_response, context_tokens);
 
         let turn_index = turn;
@@ -1918,9 +2190,10 @@ impl<C: ApiClient> BareLoop<C> {
             Role::User,
             slots.into_iter().flatten().collect(),
         )]);
-        let estimate = self
-            .count_context(&self.machine.full_history())
-            .saturating_add(self.overhead_tokens());
+        let estimate = self.calibrated(
+            self.count_context(&self.machine.full_history())
+                .saturating_add(self.request_overhead_tokens()),
+        );
         self.machine.set_context_tokens(estimate);
         self.notify_turn_end(&TurnEnd {
             turn,
@@ -2048,9 +2321,10 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 self.finalize(Some(&e)).await?;
                 return Err(e);
             }
-            let estimate = self
-                .count_context(&self.machine.full_history())
-                .saturating_add(self.overhead_tokens());
+            let estimate = self.calibrated(
+                self.count_context(&self.machine.full_history())
+                    .saturating_add(self.request_overhead_tokens()),
+            );
             self.machine.set_context_tokens(estimate);
 
             loop {

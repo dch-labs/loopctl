@@ -345,7 +345,9 @@ mod hook_guidance {
             stop_reason: "end_turn".to_string(),
         });
 
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(EchoTool);
         let config = SessionConfig::default()
@@ -566,7 +568,9 @@ mod shield_enforcement {
                 stop_reason: "end_turn".to_string(),
             },
         ];
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(tool);
         let mut loop_ = BareLoop::new(Arc::new(client), registry, SessionConfig::default());
@@ -642,7 +646,9 @@ mod shield_enforcement {
                 stop_reason: "end_turn".to_string(),
             },
         ];
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(NamedTool {
             name: "harmless",
@@ -732,7 +738,9 @@ mod shield_enforcement {
             tool_call: None,
             stop_reason: "end_turn".to_string(),
         });
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
@@ -812,7 +820,9 @@ mod shield_enforcement {
                 stop_reason: "end_turn".to_string(),
             },
         ];
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
@@ -1030,7 +1040,9 @@ mod shield_enforcement {
                 stop_reason: "end_turn".to_string(),
             },
         ];
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
@@ -1110,7 +1122,9 @@ mod shield_enforcement {
             tool_call: None,
             stop_reason: "end_turn".to_string(),
         });
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
@@ -1394,7 +1408,9 @@ mod shield_enforcement {
             tool_call: None,
             stop_reason: "end_turn".to_string(),
         });
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
@@ -1496,7 +1512,9 @@ mod shield_enforcement {
             tool_call: None,
             stop_reason: "end_turn".to_string(),
         });
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
@@ -1590,7 +1608,9 @@ mod shield_enforcement {
                 stop_reason: "end_turn".to_string(),
             },
         ];
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
@@ -1654,7 +1674,9 @@ mod shield_enforcement {
                 stop_reason: "end_turn".to_string(),
             },
         ];
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(NamedTool {
             name: "harmless",
@@ -1722,7 +1744,9 @@ mod shield_enforcement {
                 stop_reason: "end_turn".to_string(),
             },
         ];
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(CountingTool {
             executions: Arc::clone(&executions),
@@ -1850,7 +1874,9 @@ mod breaker_sequences {
             tool_call: None,
             stop_reason: "end_turn".to_string(),
         });
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(tool);
         let health = Arc::new(ToolHealthRegistry::new().with_config(
@@ -1952,7 +1978,9 @@ mod breaker_sequences {
                 stop_reason: "end_turn".to_string(),
             },
         ];
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(ScriptedTool {
             executions: Arc::clone(&executions),
@@ -2003,7 +2031,7 @@ mod breaker_sequences {
                         script: Vec<bool>,
                         health: Arc<ToolHealthRegistry>,
                         prompt: &'static str| async move {
-            let client = MockApiClient::new("m").with_responses(vec![
+            let client = MockApiClient::new("m").without_usage().with_responses(vec![
                 MockResponse {
                     text: "go".to_string(),
                     tool_call: Some(MockToolCall {
@@ -2119,7 +2147,9 @@ mod breaker_sequences {
                 stop_reason: "end_turn".to_string(),
             },
         ];
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(ScriptedTool {
             executions: Arc::new(Mutex::new(Vec::new())),
@@ -2247,7 +2277,9 @@ mod breaker_sequences {
             tool_call: None,
             stop_reason: "end_turn".to_string(),
         });
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(HangingTool {
             executions: Arc::clone(&executions),
@@ -2323,7 +2355,9 @@ mod breaker_sequences {
                 stop_reason: "end_turn".to_string(),
             },
         ];
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(ScriptedTool {
             executions: Arc::clone(&executions),
@@ -2440,7 +2474,9 @@ mod shield_sequences {
                 stop_reason: "end_turn".to_string(),
             },
         ];
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(CountingBash {
             executions: Arc::clone(&executions),
@@ -2716,7 +2752,9 @@ mod hook_sequences {
             stop_reason: "end_turn".to_string(),
         });
 
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(LongEchoTool);
         let config = SessionConfig::default()
@@ -3173,7 +3211,9 @@ mod full_stack {
             stop_reason: "end_turn".to_string(),
         });
 
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(FlakyTool {
             executions: Arc::clone(&flaky_executions),
@@ -3449,7 +3489,9 @@ mod randomized_sweep {
                     stop_reason: "end_turn".to_string(),
                 });
 
-                let client = MockApiClient::new("m").with_responses(responses);
+                let client = MockApiClient::new("m")
+                    .without_usage()
+                    .with_responses(responses);
                 let mut registry = ToolRegistry::new();
                 registry.register(EchoTool);
                 registry.register(ScriptedTool {
@@ -3873,7 +3915,9 @@ mod cancellation_recovery {
             tool_call: None,
             stop_reason: "end_turn".to_string(),
         });
-        let client = MockApiClient::new("m").with_responses(responses);
+        let client = MockApiClient::new("m")
+            .without_usage()
+            .with_responses(responses);
         let mut registry = ToolRegistry::new();
         registry.register(LongEchoTool);
         let config = SessionConfig::default()
@@ -4360,7 +4404,9 @@ mod memory_injection {
 
     fn memory_loop(memory: RecordingMemory) -> (BareLoop<CapturingClient>, Arc<CapturingClient>) {
         let client = Arc::new(CapturingClient {
-            inner: MockApiClient::new("m").with_responses(vec![done_response()]),
+            inner: MockApiClient::new("m")
+                .without_usage()
+                .with_responses(vec![done_response()]),
             requests: Mutex::new(Vec::new()),
         });
         let mut loop_ = BareLoop::new(

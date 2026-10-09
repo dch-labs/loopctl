@@ -53,6 +53,20 @@ pub struct RunEndContext {
     /// Measured wall-clock from [`on_run_start`](crate::observer::LoopObserver::on_run_start)
     /// to [`on_run_end`](crate::observer::LoopObserver::on_run_end).
     pub duration_ms: u64,
+
+    /// The run's usage-fed estimate-calibration ratio, in thousandths.
+    ///
+    /// `Some(ratio)` only when the provider reported usable
+    /// `input_tokens` at least once during the loop's lifetime — the
+    /// rolling correction between the engine's predicted payload and
+    /// the backend's real tokenizer, applied to every context-size
+    /// estimate since the first report (1000 = the estimates matched;
+    /// 1500 = the backend reported half as many tokens again as
+    /// predicted). `None` means no ground truth ever arrived: a
+    /// backend that reports no usage leaves every estimate at the
+    /// heuristic's own calibration, and the honest reading is "no
+    /// data", not "ratio of one".
+    pub calibration_ratio_bp: Option<u64>,
 }
 
 impl RunEndContext {
@@ -61,7 +75,11 @@ impl RunEndContext {
     /// The construction path for code outside the crate — the type is
     /// `#[non_exhaustive]`, so struct literals compile only inside the
     /// crate. Hosts testing their observers build synthetic events
-    /// through this constructor.
+    /// through this constructor, which leaves the
+    /// [`calibration_ratio_bp`](Self::calibration_ratio_bp) field at
+    /// `None` — attach one with
+    /// [`with_calibration_ratio`](Self::with_calibration_ratio) when a
+    /// synthetic event needs one.
     ///
     /// # Example
     ///
@@ -79,7 +97,31 @@ impl RunEndContext {
             error,
             total_turns,
             duration_ms,
+            calibration_ratio_bp: None,
         }
+    }
+
+    /// Attach a calibration ratio to a synthetic run-end context.
+    ///
+    /// The engine fills the field from its own rolling state; this
+    /// builder exists for observers exercising their run-end handling
+    /// against a staged ratio (the same reason
+    /// [`new`](Self::new) exists at all). Mirrors the field's units —
+    /// integer thousandths, with 1000 the identity.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::observer::RunEndContext;
+    ///
+    /// let ctx = RunEndContext::new(true, None, 1, 40)
+    ///     .with_calibration_ratio(Some(1_500));
+    /// assert_eq!(ctx.calibration_ratio_bp, Some(1_500));
+    /// ```
+    #[must_use]
+    pub fn with_calibration_ratio(mut self, ratio_bp: Option<u64>) -> Self {
+        self.calibration_ratio_bp = ratio_bp;
+        self
     }
 }
 
@@ -162,7 +204,11 @@ pub struct TurnEndContext {
     /// [`LoopMachine::context_tokens`](crate::engine::core::LoopMachine::context_tokens)
     /// reports at rest: the estimated payload the provider would
     /// receive — history plus per-request overhead and known
-    /// transients. Distinct from
+    /// transients — multiplied by the engine's usage-fed calibration
+    /// ratio once usable usage reports have arrived (identity until
+    /// then; the ratio itself is observable per run through
+    /// [`RunEndContext::calibration_ratio_bp`](crate::observer::RunEndContext::calibration_ratio_bp)).
+    /// Distinct from
     /// [`input_tokens`](Self::input_tokens), which is the provider's
     /// after-the-fact count of the call it actually served: this is
     /// the engine's forward-looking estimate, present even when the

@@ -91,9 +91,10 @@ impl<C: ApiClient> BareLoop<C> {
         reason: crate::compact::types::CompactReason,
     ) -> Result<CompactStepOutcome, LoopError> {
         let history = self.machine.full_history();
-        let tokens_before = self
-            .count_context(&history)
-            .saturating_add(self.overhead_tokens());
+        let tokens_before = self.calibrated(
+            self.count_context(&history)
+                .saturating_add(self.overhead_tokens()),
+        );
         let Some(ctx_manager) = self.managers.context_manager() else {
             return Ok(CompactStepOutcome {
                 tokens_before,
@@ -109,7 +110,7 @@ impl<C: ApiClient> BareLoop<C> {
                 reason,
                 turn,
                 tokens_before,
-                context_window: ctx_manager.context_window(),
+                context_window: self.effective_context_window(),
                 message_count,
                 session_id: self.session.id,
             });
@@ -149,26 +150,9 @@ impl<C: ApiClient> BareLoop<C> {
 
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
-                if !outcome.evicted.is_empty() {
-                    let meta = crate::compact::demote::DemotionContext {
-                        reason,
-                        turn,
-                        session_id: self.session.id,
-                    };
-                    if let Err(e) = self
-                        .managers
-                        .demotion_sink()
-                        .demote(&outcome.evicted, meta)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            count = outcome.evicted.len(),
-                            "demotion sink rejected evicted turns"
-                        );
-                    }
-                }
-                let tokens_after = outcome.tokens_after.saturating_add(self.overhead_tokens());
+                self.demote_evicted(&outcome.evicted, reason, turn).await;
+                let tokens_after =
+                    self.calibrated(outcome.tokens_after.saturating_add(self.overhead_tokens()));
                 let tokens_saved = tokens_before.saturating_sub(tokens_after);
                 #[cfg(feature = "hooks")]
                 let messages_after = outcome.messages.len();
@@ -203,9 +187,10 @@ impl<C: ApiClient> BareLoop<C> {
                 })
             }
             Ok(EnsureContextResult::NoAction(messages)) => {
-                let tokens_after = self
-                    .count_context(&messages)
-                    .saturating_add(self.overhead_tokens());
+                let tokens_after = self.calibrated(
+                    self.count_context(&messages)
+                        .saturating_add(self.overhead_tokens()),
+                );
                 Ok(CompactStepOutcome {
                     tokens_before,
                     tokens_after,
@@ -225,7 +210,7 @@ impl<C: ApiClient> BareLoop<C> {
                         reason,
                         turn,
                         tokens_before,
-                        context_window: overflow.context_window,
+                        context_window: self.effective_context_window(),
                         error: overflow.compactor_error.clone(),
                     });
                 match overflow.compactor_error {
@@ -240,6 +225,35 @@ impl<C: ApiClient> BareLoop<C> {
                     }),
                 }
             }
+        }
+    }
+
+    /// Hand a pass's evicted messages to the demotion sink.
+    ///
+    /// A successful compaction may evict turns; the sink is where they
+    /// become retrievable memories. An empty eviction list is a no-op,
+    /// and a sink that rejects the batch is warned about, never failed
+    /// — compaction's own success must not hinge on the memory layer.
+    async fn demote_evicted(
+        &self,
+        evicted: &[Message],
+        reason: crate::compact::types::CompactReason,
+        turn: usize,
+    ) {
+        if evicted.is_empty() {
+            return;
+        }
+        let meta = crate::compact::demote::DemotionContext {
+            reason,
+            turn,
+            session_id: self.session.id,
+        };
+        if let Err(e) = self.managers.demotion_sink().demote(evicted, meta).await {
+            tracing::warn!(
+                error = %e,
+                count = evicted.len(),
+                "demotion sink rejected evicted turns"
+            );
         }
     }
 
@@ -265,9 +279,10 @@ impl<C: ApiClient> BareLoop<C> {
         let Some(executor) = self.managers.hook_executor() else {
             return crate::hooks::context::CompactResult::allow();
         };
-        let tokens_before = self
-            .count_context(history)
-            .saturating_add(self.overhead_tokens());
+        let tokens_before = self.calibrated(
+            self.count_context(history)
+                .saturating_add(self.overhead_tokens()),
+        );
         let ctx = PreCompactContext {
             trigger: CompactTrigger::from(reason),
             custom_instructions: None,

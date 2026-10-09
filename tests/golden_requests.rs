@@ -834,7 +834,7 @@ fn reasoning_final_turn(trace: &str, answer: &str) -> (Message, loopctl::stream:
 }
 
 #[tokio::test]
-async fn turn_scoped_reasoning_request_is_golden() {
+async fn session_scoped_reasoning_request_is_golden() {
     let client = Arc::new(ReasoningScriptClient::new(vec![
         reasoning_tool_turn(
             "weighing whether to echo first",
@@ -864,9 +864,9 @@ async fn turn_scoped_reasoning_request_is_golden() {
         .await;
     assert!(
         run.is_ok(),
-        "golden turn_scoped_reasoning: the scripted run must complete: {run:?}"
+        "golden session_scoped_reasoning: the scripted run must complete: {run:?}"
     );
-    golden_calls("turn_scoped_reasoning", &client.calls());
+    golden_calls("session_scoped_reasoning", &client.calls());
 }
 
 #[tokio::test]

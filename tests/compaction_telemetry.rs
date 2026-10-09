@@ -189,7 +189,11 @@ fn telemetry_loop_with_window(
         .with_context_window(window)
         .with_compact_threshold(80);
     let mut loop_ = BareLoop::new(
-        Arc::new(MockApiClient::new("m").with_responses(growing_script())),
+        Arc::new(
+            MockApiClient::new("m")
+                .without_usage()
+                .with_responses(growing_script()),
+        ),
         registry,
         config,
     );

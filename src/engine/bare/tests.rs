@@ -8,6 +8,8 @@
 use super::*;
 use crate::api::error::ApiError;
 use crate::capabilities::FallbackCapable;
+#[cfg(feature = "streaming")]
+use crate::compact::{HeuristicTokenCounter, TokenCounter as _};
 use crate::determinism::IdGen;
 use crate::engine::core::Loop;
 use crate::fallback::FallbackManager;
@@ -71,6 +73,8 @@ struct MockClient {
     responses: Arc<Mutex<Vec<Vec<StreamEvent>>>>,
 
     model_name: Arc<std::sync::Mutex<String>>,
+
+    reports_usage: bool,
 }
 
 impl MockClient {
@@ -78,7 +82,22 @@ impl MockClient {
         Self {
             responses: Arc::new(Mutex::new(Vec::new())),
             model_name: Arc::new(std::sync::Mutex::new(model.to_string())),
+            reports_usage: true,
         }
+    }
+
+    /// Script responses without a usage report — a backend that reports
+    /// no usage, whose estimates must stay at the heuristic's own
+    /// calibration.
+    fn without_usage(mut self) -> Self {
+        self.reports_usage = false;
+        self
+    }
+
+    /// The usage a scripted response carries, honoring
+    /// [`without_usage`](Self::without_usage).
+    fn staged_usage(&self, input: u32, output: u32) -> Option<Usage> {
+        self.reports_usage.then(|| Usage::new(input, output))
     }
 
     fn add_text_response(&self, text: &str) {
@@ -105,7 +124,7 @@ impl MockClient {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("end_turn".to_string()),
                 },
-                usage: Some(Usage::new(10, 20)),
+                usage: self.staged_usage(10, 20),
             }),
             StreamEvent::MessageStop,
         ];
@@ -147,7 +166,7 @@ impl MockClient {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("tool_call".to_string()),
                 },
-                usage: Some(Usage::new(50, 10)),
+                usage: self.staged_usage(50, 10),
             }),
             StreamEvent::MessageStop,
         ];
@@ -176,7 +195,7 @@ impl MockClient {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("end_turn".to_string()),
                 },
-                usage: Some(Usage::new(30, 15)),
+                usage: self.staged_usage(30, 15),
             }),
             StreamEvent::MessageStop,
         ];
@@ -202,7 +221,7 @@ impl MockClient {
             delta: MessageDeltaPayload {
                 stop_reason: Some("tool_call".to_string()),
             },
-            usage: Some(Usage::new(50, 10)),
+            usage: self.staged_usage(50, 10),
         }));
         tool_events.push(StreamEvent::MessageStop);
         crate::error::recover_guard(self.responses.lock()).push(tool_events);
@@ -230,7 +249,7 @@ impl MockClient {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("end_turn".to_string()),
                 },
-                usage: Some(Usage::new(30, 15)),
+                usage: self.staged_usage(30, 15),
             }),
             StreamEvent::MessageStop,
         ];
@@ -261,7 +280,7 @@ impl MockClient {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("tool_call".to_string()),
                 },
-                usage: Some(Usage::new(50, 10)),
+                usage: self.staged_usage(50, 10),
             }),
             StreamEvent::MessageStop,
         ];
@@ -292,7 +311,7 @@ impl MockClient {
                 delta: MessageDeltaPayload {
                     stop_reason: Some("max_tokens".to_string()),
                 },
-                usage: Some(Usage::new(10, 20)),
+                usage: self.staged_usage(10, 20),
             }),
             StreamEvent::MessageStop,
         ];
@@ -311,6 +330,110 @@ impl MockClient {
             },
         })];
         crate::error::recover_guard(self.responses.lock()).push(events);
+    }
+
+    /// Script a thinking-bearing tool turn followed by a thinking-bearing
+    /// terminal turn, with no usage report on either response.
+    ///
+    /// The reasoning-heavy shape the estimate-honesty pins ride on: the
+    /// first turn's thinking is stale by the time the second response is
+    /// counted (stripped inside `model_response`), while the second's is
+    /// the live turn's. Usage stays absent so the wire-shape assertion is
+    /// isolated from usage-fed calibration.
+    #[cfg(feature = "streaming")]
+    fn add_thinking_tool_then_thinking_text(
+        &self,
+        stale_thinking: &str,
+        tool_id: &str,
+        tool_name: &str,
+        tool_input: &Value,
+        live_thinking: &str,
+        final_text: &str,
+    ) {
+        let model = crate::error::recover_guard(self.model_name.lock()).clone();
+        let tool_events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg_tool".into(),
+                    role: "assistant".into(),
+                    model: model.clone(),
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: None,
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Thinking {
+                    text: stale_thinking.to_string(),
+                    signature: None,
+                    redacted: None,
+                },
+            }),
+            StreamEvent::PartStop { index: Some(0) },
+            StreamEvent::PartStart(PartStart {
+                index: 1,
+                part: Some(MessagePart::tool_call(tool_id, tool_name, Value::Null)),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::InputJson {
+                    partial_json: tool_input.to_string(),
+                },
+            }),
+            StreamEvent::PartStop { index: Some(1) },
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("tool_call".to_string()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        crate::error::recover_guard(self.responses.lock()).push(tool_events);
+
+        let text_events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg_final".into(),
+                    role: "assistant".into(),
+                    model,
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: None,
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Thinking {
+                    text: live_thinking.to_string(),
+                    signature: None,
+                    redacted: None,
+                },
+            }),
+            StreamEvent::PartStop { index: Some(0) },
+            StreamEvent::PartStart(PartStart {
+                index: 1,
+                part: Some(MessagePart::text(final_text)),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::Text {
+                    text: final_text.to_string(),
+                },
+            }),
+            StreamEvent::PartStop { index: Some(1) },
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".to_string()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        crate::error::recover_guard(self.responses.lock()).push(text_events);
     }
 }
 
@@ -1683,7 +1806,7 @@ async fn the_context_size_accessor_exposes_the_engine_estimate_after_a_run() {
 
 #[tokio::test]
 async fn turn_end_carries_the_engine_s_context_estimate() {
-    let client = MockClient::new("test-model");
+    let client = MockClient::new("test-model").without_usage();
     client.add_tool_then_text("call_1", "echo", &json!({"message": "hi"}), "all done");
     let mut registry = ToolRegistry::new();
     registry.register(EchoTool);
@@ -1743,6 +1866,470 @@ async fn a_failing_turn_s_turn_end_carries_the_engine_s_context_estimate() {
         agent.context_tokens(),
         "the error-path figure equals the frozen at-rest accessor figure"
     );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn session_retention_counts_prior_thinking_in_the_context_estimate() {
+    let client = MockClient::new("test-model");
+    client.add_thinking_tool_then_thinking_text(
+        &"first turn reasoning ".repeat(40),
+        "call_1",
+        "echo",
+        &json!({"message": "hi"}),
+        &"second turn reasoning ".repeat(10),
+        "all done",
+    );
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    agent.run("echo hi", &RunConfig::default()).await.unwrap();
+
+    let at_rest = agent.machine().full_history();
+    let thinking_messages = at_rest
+        .iter()
+        .filter(|message| {
+            message
+                .parts
+                .iter()
+                .any(|part| matches!(part, crate::message::MessagePart::Thinking { .. }))
+        })
+        .count();
+    assert!(
+        thinking_messages >= 2,
+        "the session-retention fixture must keep both turns' thinking on display: {at_rest:?}"
+    );
+    let expected = crate::compact::HeuristicTokenCounter.count(&at_rest);
+    assert_eq!(
+        agent.count_context(&at_rest),
+        expected,
+        "session retention counts the raw history — the prior thinking the wire \
+         carries must not be excluded from the estimate"
+    );
+}
+
+/// Records the calibration ratio each run-end event carries.
+struct RunEndRatioRecorder {
+    /// The `calibration_ratio_bp` per run-end event, in event order.
+    ratios: Arc<Mutex<Vec<Option<u64>>>>,
+}
+
+impl crate::observer::LoopObserver for RunEndRatioRecorder {
+    fn name(&self) -> &'static str {
+        "run-end-ratio-recorder"
+    }
+    fn on_run_end(&self, ctx: &crate::observer::RunEndContext) {
+        crate::error::recover_guard(self.ratios.lock()).push(ctx.calibration_ratio_bp);
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_settled_ratio_rescales_the_manager_s_target_units() {
+    let client = MockClient::new("test-model");
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_cal".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("done")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "done".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: Some(Usage::new(8_000, 25)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let config = make_config().with_context_window(2_000);
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), config);
+    agent.run("Hi", &RunConfig::default()).await.unwrap();
+
+    let manager = agent
+        .managers()
+        .context_manager()
+        .expect("the default manager is installed");
+    assert_eq!(
+        manager.context_window(),
+        500,
+        "a 4x-settled ratio rescales the 2 000-token provider window into 500 raw units"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_ratio_resync_preserves_a_host_installed_manager_s_threshold() {
+    let client = MockClient::new("test-model");
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_thr".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("done")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "done".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: Some(Usage::new(8_000, 25)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let config = make_config().with_context_window(2_000);
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(crate::compact::TruncatingCompactor::new()))
+            .with_threshold(50),
+    ));
+    let mut agent =
+        BareLoop::new_with_managers(Arc::new(client), ToolRegistry::new(), config, managers);
+    agent.run("Hi", &RunConfig::default()).await.unwrap();
+
+    let manager = agent
+        .managers()
+        .context_manager()
+        .expect("the installed manager survives the run");
+    assert_eq!(
+        manager.threshold(),
+        50,
+        "the ratio-driven window sync preserves the host's chosen threshold"
+    );
+    assert_eq!(
+        manager.context_window(),
+        500,
+        "the window itself still rescales into the counter's raw units"
+    );
+}
+
+#[test]
+fn the_first_usage_report_seeds_the_clamped_ratio() {
+    let mut calibration = EstimateCalibration::identity();
+    calibration.note_prediction(100);
+    calibration.observe_usage(200);
+    assert_eq!(
+        calibration.ratio_bp, 2000,
+        "the first report seeds the clamped sample directly, no smoothing from identity"
+    );
+    assert_eq!(calibration.report(), Some(2000));
+}
+
+#[test]
+fn later_reports_smooth_toward_the_sample() {
+    let mut calibration = EstimateCalibration::identity();
+    calibration.note_prediction(100);
+    calibration.observe_usage(200);
+    assert_eq!(calibration.ratio_bp, 2000, "seeded at the staged 2x sample");
+    calibration.note_prediction(100);
+    calibration.observe_usage(300);
+    assert_eq!(
+        calibration.ratio_bp, 2500,
+        "a higher sample moves the ratio halfway: 2000 + (3000 - 2000) / 2"
+    );
+    calibration.note_prediction(100);
+    calibration.observe_usage(100);
+    assert_eq!(
+        calibration.ratio_bp, 1750,
+        "a lower sample moves the ratio halfway down: 2500 - (2500 - 1000) / 2"
+    );
+    assert_eq!(
+        calibration.apply(500),
+        875,
+        "estimates carry the ratio: 500 × 1750 / 1000"
+    );
+}
+
+#[test]
+fn zero_or_absent_usage_leaves_the_ratio_at_identity() {
+    let mut calibration = EstimateCalibration::identity();
+    calibration.note_prediction(100);
+    calibration.observe_usage(0);
+    assert_eq!(
+        calibration.ratio_bp, 1000,
+        "a zero-bearing report is no usage at all, not a free-payload sample"
+    );
+    assert!(
+        calibration.report().is_none(),
+        "no usable report means no ground truth to surface"
+    );
+    let mut unarmed = EstimateCalibration::identity();
+    unarmed.observe_usage(500);
+    assert_eq!(
+        unarmed.ratio_bp, 1000,
+        "a report with no armed prediction (no request went out) is ignored"
+    );
+    let mut zero_prediction = EstimateCalibration::identity();
+    zero_prediction.note_prediction(0);
+    zero_prediction.observe_usage(500);
+    assert_eq!(
+        zero_prediction.ratio_bp, 1000,
+        "a zero prediction cannot divide; the sample is ignored"
+    );
+}
+
+#[test]
+fn absurd_usage_reports_cannot_peg_the_ratio_outside_its_bounds() {
+    let mut ceiling = EstimateCalibration::identity();
+    ceiling.note_prediction(1);
+    ceiling.observe_usage(u64::from(u32::MAX));
+    assert_eq!(
+        ceiling.ratio_bp, 4000,
+        "a garbage-large report clamps at the fourfold ceiling"
+    );
+    let mut floor = EstimateCalibration::identity();
+    floor.note_prediction(u64::from(u32::MAX));
+    floor.observe_usage(1);
+    assert_eq!(
+        floor.ratio_bp, 250,
+        "a near-zero genuine sample clamps at the quarter floor"
+    );
+}
+
+#[tokio::test]
+async fn session_retention_trigger_counts_the_kept_thinking() {
+    let seeded = vec![
+        Message::user("q"),
+        Message::new(
+            crate::message::Role::Assistant,
+            vec![MessagePart::Thinking {
+                text: "s".repeat(4_000),
+                signature: None,
+                redacted: None,
+            }],
+        ),
+        Message::assistant("ok"),
+        Message::user("t1"),
+        Message::assistant("a1"),
+        Message::user("t2"),
+        Message::assistant("a2"),
+    ];
+    let client = MockClient::new("test-model");
+    client.add_text_response("done");
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(50);
+    let mut agent = BareLoop::from_machine(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(client),
+        ToolRegistry::new(),
+    );
+    let compactions = Arc::new(Mutex::new(0usize));
+    agent.register_observer(Arc::new(CompactionCounter {
+        count: Arc::clone(&compactions),
+    }));
+    let _result = agent.run("go", &RunConfig::default()).await.unwrap();
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) > 0,
+        "the kept thinking counts: the over-threshold figure the wire truly carries \
+         must fire the trigger"
+    );
+}
+
+/// Counts `on_compaction` events.
+struct CompactionCounter {
+    /// One increment per compaction observer event.
+    count: Arc<Mutex<usize>>,
+}
+
+impl crate::observer::LoopObserver for CompactionCounter {
+    fn name(&self) -> &'static str {
+        "compaction-counter"
+    }
+    fn on_compaction(&self, _ctx: &crate::observer::CompactedContext) {
+        let mut count = crate::error::recover_guard(self.count.lock());
+        *count = count.saturating_add(1);
+    }
+}
+
+#[tokio::test]
+async fn usage_reports_converge_the_calibration_ratio() {
+    let client = MockClient::new("test-model");
+    client.add_text_response("Hello");
+    client.add_text_response("Done");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let ratios = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(RunEndRatioRecorder {
+        ratios: Arc::clone(&ratios),
+    }));
+    agent.run("Hi", &RunConfig::default()).await.unwrap();
+
+    let recorded = crate::error::recover_guard(ratios.lock()).clone();
+    assert_eq!(
+        recorded.first(),
+        Some(&Some(2000)),
+        "the first report seeds the staged 2x sample exactly: {recorded:?}"
+    );
+
+    agent.run("Hi", &RunConfig::default()).await.unwrap();
+    let mut prediction_set = agent.machine().full_history();
+    let response = prediction_set.pop();
+    assert_eq!(
+        response.map(|message| message.text_content()),
+        Some("Done".to_string()),
+        "the reconstruction drops exactly run two's response"
+    );
+    let predicted = agent.count_context(&prediction_set);
+    let sample = (10_u64 * 1000 / predicted).clamp(250, 4000);
+    let expected = 2000 - (2000 - sample) / 2;
+    let recorded = crate::error::recover_guard(ratios.lock()).clone();
+    assert_eq!(
+        recorded.get(1),
+        Some(&Some(expected)),
+        "run two sampled against the raw prediction ({predicted} raw predicted, \
+         sample {sample}), so a constant multiple converges on the multiple itself: \
+         {recorded:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_backend_reporting_no_usage_leaves_estimates_uncalibrated() {
+    let client = MockClient::new("test-model").without_usage();
+    client.add_text_response("Hello");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let ratios = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(RunEndRatioRecorder {
+        ratios: Arc::clone(&ratios),
+    }));
+    agent.run("Hi", &RunConfig::default()).await.unwrap();
+
+    assert_eq!(
+        crate::error::recover_guard(ratios.lock()).as_slice(),
+        &[None],
+        "no usable report means the run-end ratio is None, not a disguised identity"
+    );
+    let at_rest = agent.machine().full_history();
+    let expected = agent
+        .count_context(&at_rest)
+        .saturating_add(agent.request_overhead_tokens());
+    assert_eq!(
+        agent.context_tokens(),
+        expected,
+        "with no report the stored figure is byte-identical to the uncalibrated count"
+    );
+}
+
+#[tokio::test]
+async fn run_end_carries_the_calibration_ratio() {
+    let ctx = crate::observer::RunEndContext::new(true, None, 1, 40);
+    assert_eq!(
+        ctx.calibration_ratio_bp, None,
+        "the constructor defaults the field to the no-ground-truth state"
+    );
+    assert_eq!(
+        ctx.clone()
+            .with_calibration_ratio(Some(1500))
+            .calibration_ratio_bp,
+        Some(1500),
+        "the additive builder sets the field for synthetic events"
+    );
+
+    let client = MockClient::new("test-model");
+    client.add_text_response("Hello");
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    let ratios = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(RunEndRatioRecorder {
+        ratios: Arc::clone(&ratios),
+    }));
+    agent.run("Hi", &RunConfig::default()).await.unwrap();
+    assert_eq!(
+        crate::error::recover_guard(ratios.lock()).len(),
+        1,
+        "the run-end event reached the observer"
+    );
+}
+
+#[tokio::test]
+async fn response_format_turns_do_not_reserve_suppressed_tool_schemas() {
+    let make_agent = |format: Option<crate::structured::ResponseFormat>| {
+        let client = MockClient::new("test-model").without_usage();
+        client.add_text_response("structured answer");
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+        if let Some(format) = format {
+            agent.set_request_options(
+                crate::structured::RequestOptions::new().with_response_format(format),
+            );
+        }
+        agent
+    };
+
+    let mut plain = make_agent(None);
+    plain.run("Hi", &RunConfig::default()).await.unwrap();
+    let at_rest = plain.machine().full_history();
+    let schemas = plain.overhead_parts().tools;
+    assert!(
+        schemas > 0,
+        "anti-vacuity: the registered tool's schema is real overhead"
+    );
+    assert_eq!(
+        plain.context_tokens(),
+        plain
+            .count_context(&at_rest)
+            .saturating_add(plain.overhead_tokens()),
+        "an unsuppressed turn reserves the full overhead sum"
+    );
+
+    let mut formatted = make_agent(Some(
+        crate::structured::ResponseFormat::from_type::<Forecast>(),
+    ));
+    formatted.run("Hi", &RunConfig::default()).await.unwrap();
+    let at_rest = formatted.machine().full_history();
+    assert_eq!(
+        formatted.context_tokens(),
+        formatted
+            .count_context(&at_rest)
+            .saturating_add(formatted.overhead_parts().system),
+        "the response_format turn's estimate drops the suppressed schema reservation"
+    );
+}
+
+/// A minimal structured-output payload for the `response_format`
+/// fixtures.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Forecast {
+    /// Whether the answer is yes.
+    sunny: bool,
+}
+
+impl crate::structured::StructuredOutput for Forecast {
+    fn name() -> &'static str {
+        "forecast"
+    }
+    fn schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "sunny": { "type": "boolean" }
+            },
+            "required": ["sunny"],
+            "additionalProperties": false
+        })
+    }
 }
 
 #[cfg(feature = "streaming")]
@@ -2228,7 +2815,8 @@ async fn compaction_telemetry_durations_come_from_the_clock_seam() {
                 .with_min_messages(2),
         ))
         .with_context_window(600)
-        .with_threshold(20),
+        .with_threshold(20)
+        .with_compact_target_pct(30),
     ));
     agent.register_observer(Arc::new(CompactionDurationRecorder {
         durations: Arc::clone(&durations),
@@ -2642,7 +3230,7 @@ fn set_token_counter_sets_fallback_and_count_context_prefers_manager() {
 
 #[tokio::test]
 async fn compaction_then_cancellation_leaves_history_compacted() {
-    let client = MockClient::new("test-model");
+    let client = MockClient::new("test-model").without_usage();
     client.add_text_response(&"x".repeat(200));
     client.add_text_response("done");
     client.add_text_response("second done");
@@ -2753,7 +3341,7 @@ impl crate::observer::LoopObserver for StageTrailRecorder {
 
 #[tokio::test]
 async fn on_compaction_carries_the_stage_trail() {
-    let client = MockClient::new("test-model");
+    let client = MockClient::new("test-model").without_usage();
     for idx in 0..3 {
         client.add_tool_only_response(
             &format!("c{idx}"),
@@ -2803,7 +3391,7 @@ async fn on_compaction_carries_the_stage_trail() {
 
 #[tokio::test]
 async fn observer_sequence_compaction_turn() {
-    let client = MockClient::new("test-model");
+    let client = MockClient::new("test-model").without_usage();
     // Three tool-carrying turns grow the history past the session
     // window's threshold, so the machine requests a compaction pass
     // after a completed turn; the shrinking double above guarantees
@@ -3083,7 +3671,7 @@ async fn a_failed_turn_end_carries_only_committed_history() {
 
 #[tokio::test]
 async fn turn_end_history_reflects_a_mid_run_compaction() {
-    let client = MockClient::new("test-model");
+    let client = MockClient::new("test-model").without_usage();
     for idx in 0..3 {
         client.add_tool_only_response(
             &format!("c{idx}"),
@@ -6196,7 +6784,7 @@ async fn a_switch_to_a_larger_window_does_not_fail_history_between_the_windows()
 async fn a_switch_to_a_smaller_window_keeps_compacting_under_the_new_one() {
     // After shrinking the window mid-session, the next run's compaction
     // engages and completes under the new, tighter budget.
-    let client = std::sync::Arc::new(MockClient::new("m"));
+    let client = std::sync::Arc::new(MockClient::new("m").without_usage());
     let mut registry = ToolRegistry::new();
     registry.register(SizedTool);
     let config = SessionConfig::default()
@@ -9620,4 +10208,383 @@ async fn retention_rides_the_dispatch_path_without_a_pipeline() {
         "the direct registry dispatch arm forwards the tool's retention class \
          into the history, exactly like the pipeline arm"
     );
+}
+
+/// A client that records every request it serves and replays a
+/// scripted response queue, MockClient's serving idiom with capture.
+#[cfg(feature = "streaming")]
+#[derive(Clone)]
+struct WireCaptureClient {
+    /// The requests the engine issued, in call order.
+    requests: Arc<Mutex<Vec<crate::api::StreamRequest>>>,
+
+    /// The scripted responses, served front first.
+    responses: Arc<Mutex<Vec<Vec<StreamEvent>>>>,
+
+    /// The model name the client reports.
+    model_name: Arc<std::sync::Mutex<String>>,
+}
+
+#[cfg(feature = "streaming")]
+impl WireCaptureClient {
+    /// Build the client over a shareable request log, empty script.
+    fn new() -> (Self, Arc<Mutex<Vec<crate::api::StreamRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = Self {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(Vec::new())),
+            model_name: Arc::new(std::sync::Mutex::new("parity-model".to_string())),
+        };
+        (client, requests)
+    }
+
+    /// Script one thinking-plus-tool-call response.
+    fn push_tool_turn(&self, thinking: &str, call_id: &str, input: &Value) {
+        let model = crate::error::recover_guard(self.model_name.lock()).clone();
+        let events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: format!("msg_{call_id}"),
+                    role: "assistant".into(),
+                    model,
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: None,
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Thinking {
+                    text: thinking.to_string(),
+                    signature: None,
+                    redacted: None,
+                },
+            }),
+            StreamEvent::PartStop { index: Some(0) },
+            StreamEvent::PartStart(PartStart {
+                index: 1,
+                part: Some(MessagePart::tool_call(call_id, "echo", Value::Null)),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::InputJson {
+                    partial_json: input.to_string(),
+                },
+            }),
+            StreamEvent::PartStop { index: Some(1) },
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("tool_call".to_string()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        crate::error::recover_guard(self.responses.lock()).push(events);
+    }
+
+    /// Script one thinking-plus-text terminal response.
+    fn push_final_turn(&self, thinking: &str, text: &str) {
+        let model = crate::error::recover_guard(self.model_name.lock()).clone();
+        let events = vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: "msg_final".into(),
+                    role: "assistant".into(),
+                    model,
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: None,
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::Thinking {
+                    text: thinking.to_string(),
+                    signature: None,
+                    redacted: None,
+                },
+            }),
+            StreamEvent::PartStop { index: Some(0) },
+            StreamEvent::PartStart(PartStart {
+                index: 1,
+                part: Some(MessagePart::text(text)),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 1,
+                delta: DeltaPart::Text {
+                    text: text.to_string(),
+                },
+            }),
+            StreamEvent::PartStop { index: Some(1) },
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("end_turn".to_string()),
+                },
+                usage: None,
+            }),
+            StreamEvent::MessageStop,
+        ];
+        crate::error::recover_guard(self.responses.lock()).push(events);
+    }
+}
+
+#[cfg(feature = "streaming")]
+impl ApiClient for WireCaptureClient {
+    fn model(&self) -> String {
+        crate::error::recover_guard(self.model_name.lock()).clone()
+    }
+
+    fn stream_messages(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        crate::error::recover_guard(self.requests.lock()).push(request.clone());
+        let mut guard = crate::error::recover_guard(self.responses.lock());
+        if let Some(events) = guard.pop_front() {
+            let events: Vec<Result<StreamEvent, ApiError>> = events.into_iter().map(Ok).collect();
+            Box::pin(futures::stream::iter(events))
+        } else {
+            Box::pin(futures::stream::iter(vec![Err(ApiError::api(
+                "no scripted response",
+            ))]))
+        }
+    }
+
+    fn create_message(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        Box::pin(std::future::ready(Err(ApiError::api("unreachable"))))
+    }
+}
+
+/// The fixture tool the parity script drives.
+#[cfg(feature = "streaming")]
+struct ParityEcho;
+
+#[cfg(feature = "streaming")]
+impl Tool for ParityEcho {
+    fn name(&self) -> &'static str {
+        "echo"
+    }
+
+    fn description(&self) -> &'static str {
+        "Echoes back the input"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            tool: "echo".into(),
+            description: "Echoes back the input".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "message": { "type": "string" } },
+                "required": ["message"]
+            }),
+        }
+    }
+
+    fn call(
+        &self,
+        input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        let msg = input
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Box::pin(async move { Ok(ToolOutput::text(format!("Echo: {msg}"))) })
+    }
+}
+
+/// Serialize a message deterministically for byte comparison.
+#[cfg(feature = "streaming")]
+fn canon(message: &Message) -> String {
+    serde_json::to_string(message).unwrap_or_default()
+}
+
+/// The wire-parity pin: the context the engine counts is exactly the
+/// payload it sends.
+///
+/// Every request's message set, system prompt, and tool schemas are
+/// pinned byte-for-byte against hand-derived expectations — any
+/// transform between the counted history and the wire (a dropped part,
+/// a strip the counter does not model, an unadvertised tool) turns the
+/// set assertions red. The end-state figure is then re-derived with
+/// the public counter over the captured payload plus the final
+/// response, so an overhead component that stopped being measured, or
+/// a message the figure counts but the wire never carried, turns the
+/// figure assertion red. Both retention modes ride the same script:
+/// under `Turn` the first turn's thinking must leave the wire exactly
+/// when the strip says so, under `Session` it must stay.
+#[cfg(feature = "streaming")]
+fn wire_parity_expected_sets() -> Vec<Vec<Message>> {
+    let thinking = |text: &str| MessagePart::Thinking {
+        text: text.to_string(),
+        signature: None,
+        redacted: None,
+    };
+    let input = Message::user("echo hi");
+    let assistant_one_full = Message::new(
+        Role::Assistant,
+        vec![
+            thinking("first turn reasoning "),
+            MessagePart::tool_call("call_1", "echo", json!({"message": "one"})),
+        ],
+    );
+    let result_one = Message::new(
+        Role::User,
+        vec![MessagePart::tool_result(
+            "call_1",
+            "echo",
+            ToolContent::Text("Echo: one".to_string()),
+            false,
+        )],
+    );
+    let assistant_two = Message::new(
+        Role::Assistant,
+        vec![
+            thinking("second turn reasoning "),
+            MessagePart::tool_call("call_2", "echo", json!({"message": "two"})),
+        ],
+    );
+    let result_two = Message::new(
+        Role::User,
+        vec![MessagePart::tool_result(
+            "call_2",
+            "echo",
+            ToolContent::Text("Echo: two".to_string()),
+            false,
+        )],
+    );
+    vec![
+        vec![input.clone()],
+        vec![input, assistant_one_full.clone(), result_one.clone()],
+        vec![
+            Message::user("echo hi"),
+            assistant_one_full,
+            result_one,
+            assistant_two,
+            result_two,
+        ],
+    ]
+}
+
+/// Assert one captured request carries exactly the counted payload.
+#[cfg(feature = "streaming")]
+fn wire_request_matches(
+    index: usize,
+    request: &crate::api::StreamRequest,
+    expected: &[Message],
+    system_prompt: &str,
+    expected_schema: &str,
+) {
+    let got: Vec<String> = request.messages.iter().map(canon).collect();
+    let want: Vec<String> = expected.iter().map(canon).collect();
+    assert_eq!(
+        got,
+        want,
+        "request {} carries exactly the counted message set",
+        index.saturating_add(1)
+    );
+    assert_eq!(
+        request.system.as_deref(),
+        Some(system_prompt),
+        "request {} carries the exact prompt the overhead counts",
+        index.saturating_add(1)
+    );
+    let advertised: Vec<String> = request
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|schema| serde_json::to_string(schema).unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        advertised,
+        vec![expected_schema.to_string()],
+        "request {} advertises exactly the schemas the overhead counts",
+        index.saturating_add(1)
+    );
+}
+
+#[cfg(feature = "streaming")]
+async fn wire_parity_under() {
+    let (client, requests) = WireCaptureClient::new();
+    client.push_tool_turn(
+        "first turn reasoning ",
+        "call_1",
+        &json!({"message": "one"}),
+    );
+    client.push_tool_turn(
+        "second turn reasoning ",
+        "call_2",
+        &json!({"message": "two"}),
+    );
+    client.push_final_turn("final turn reasoning ", "all done");
+
+    let mut registry = ToolRegistry::new();
+    registry.register(ParityEcho);
+    let system_prompt = "You are the parity probe.";
+    let config = make_config().with_system_prompt(system_prompt);
+    let mut agent = BareLoop::new(Arc::new(client), registry, config);
+    agent.run("echo hi", &make_run_config()).await.unwrap();
+
+    let captured = crate::error::recover_guard(requests.lock()).clone();
+    assert_eq!(captured.len(), 3, "the fixture issues three requests");
+
+    let expected_sets = wire_parity_expected_sets();
+    let expected_schema = serde_json::to_string(&ParityEcho.schema()).unwrap_or_default();
+    for (index, (request, expected)) in captured.iter().zip(expected_sets.iter()).enumerate() {
+        wire_request_matches(index, request, expected, system_prompt, &expected_schema);
+    }
+
+    // The end-state figure, re-derived with the public counter over
+    // the captured payload plus the final response — the history rides
+    // verbatim, so the captured set is the at-rest history as-is.
+    let final_response = Message::new(
+        Role::Assistant,
+        vec![
+            MessagePart::Thinking {
+                text: "final turn reasoning ".to_string(),
+                signature: None,
+                redacted: None,
+            },
+            MessagePart::text("all done"),
+        ],
+    );
+    let mut at_rest: Vec<Message> = captured
+        .last()
+        .map(|request| request.messages.clone())
+        .unwrap_or_default();
+    at_rest.push(final_response);
+    let expected_system = HeuristicTokenCounter.count(&[Message::user(system_prompt.to_string())]);
+    let expected_tools = HeuristicTokenCounter.count(&[Message::user(
+        serde_json::to_string(&vec![ParityEcho.schema()]).unwrap_or_default(),
+    )]);
+    let expected_figure = HeuristicTokenCounter
+        .count(&at_rest)
+        .saturating_add(expected_system)
+        .saturating_add(expected_tools);
+    assert_eq!(
+        agent.context_tokens(),
+        expected_figure,
+        "the stored figure equals the public counter over the captured wire payload \
+         plus the final response"
+    );
+}
+
+/// The wire-parity pin: see [`wire_parity_under`].
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn the_wire_payload_is_exactly_what_the_figure_counts() {
+    wire_parity_under().await;
 }

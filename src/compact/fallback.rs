@@ -1538,7 +1538,9 @@ mod tests {
     #[tokio::test]
     async fn the_chain_compacts_through_the_manager_without_overflow() {
         let chain = FallbackCompactor::default_chain(Arc::new(FailingClient));
-        let manager = ContextManager::new(Arc::new(chain)).with_context_window(280);
+        let manager = ContextManager::new(Arc::new(chain))
+            .with_context_window(280)
+            .with_compact_target_pct(30);
         let messages = conversation();
         let result = manager.ensure_context_fits(messages, 3).await;
         match result {

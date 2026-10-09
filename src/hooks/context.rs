@@ -141,13 +141,19 @@ impl From<crate::compact::types::CompactReason> for CompactTrigger {
     /// [`ThresholdExceeded`](crate::compact::types::CompactReason::ThresholdExceeded)
     /// and [`Emergency`](crate::compact::types::CompactReason::Emergency)
     /// are both automatic triggers (they collapse to
-    /// [`Auto`](CompactTrigger::Auto)), while
+    /// [`Auto`](CompactTrigger::Auto)),
     /// [`Manual`](crate::compact::types::CompactReason::Manual) maps to
-    /// [`Manual`](CompactTrigger::Manual).
+    /// [`Manual`](CompactTrigger::Manual), and
+    /// [`Prune`](crate::compact::types::CompactReason::Prune) maps to
+    /// [`Auto`](CompactTrigger::Auto) so the mapping stays total over
+    /// the reason enum — though the prune pass never consults hooks,
+    /// so no live hook context carries it (the mapping exists for the
+    /// enum's other consumers).
     fn from(reason: crate::compact::types::CompactReason) -> Self {
         match reason {
             crate::compact::types::CompactReason::ThresholdExceeded
-            | crate::compact::types::CompactReason::Emergency => CompactTrigger::Auto,
+            | crate::compact::types::CompactReason::Emergency
+            | crate::compact::types::CompactReason::Prune => CompactTrigger::Auto,
             crate::compact::types::CompactReason::Manual => CompactTrigger::Manual,
         }
     }

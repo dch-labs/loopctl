@@ -667,6 +667,28 @@ impl LoopMachine {
         self.state = MachineState::AwaitingTools { turn: turn_number };
     }
 
+    /// Adopt a pruned conversation, preserving the buffer split.
+    ///
+    /// The standalone reclamation pass (no model call, no state
+    /// transition — the machine stays wherever it was, typically
+    /// [`Start`](MachineState::Start)) rewrites the merged
+    /// conversation in place: `messages` replaces
+    /// [`full_history`](Self::full_history) with `history_len` messages
+    /// committed and the rest pending, the same split the rewrite
+    /// started from. The context figure is not touched — the driver
+    /// re-feeds it after re-counting the pruned feed. No effect once
+    /// the machine is terminal.
+    pub fn adopt_pruned(&mut self, messages: Vec<Message>, history_len: usize) {
+        if self.is_terminal() {
+            return;
+        }
+        let split = history_len.min(messages.len());
+        let mut history = messages;
+        let pending = history.split_off(split);
+        self.history = history;
+        self.pending = pending;
+    }
+
     /// Feed tool-result messages back into the machine.
     ///
     /// Each provided [`Message`] is appended to the history, and the pending

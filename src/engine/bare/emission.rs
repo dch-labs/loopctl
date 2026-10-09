@@ -11,7 +11,7 @@
 //! driver modules (`llm_turn`, `dispatch`, `compact`) never fire those
 //! observers directly.
 
-use super::{ApiClient, BareLoop, Duration, LoopError, Run, ToolCall};
+use super::{ApiClient, BareLoop, Duration, LoopError, Run, ToolCall, UsageAnchor};
 use crate::capabilities::FallbackCapable;
 #[cfg(feature = "hooks")]
 use crate::capabilities::Hookable;
@@ -20,6 +20,7 @@ use crate::hooks::context::{
     RunEndContext as HookRunEndContext, RunEndReason, RunStartContext as HookRunStartContext,
 };
 use crate::message::Message;
+use crate::observer::{ContextFigureInfo, FigureSource};
 use crate::observer::{
     FallbackContext, ResponseContext, RunEndContext, RunStartContext, StreamContext,
     StreamFailureContext, ToolCallReceivedContext, TurnEndContext, TurnStartContext,
@@ -40,11 +41,13 @@ pub(super) struct TurnEnd<'a> {
     ///
     /// Lets observers pair an `on_turn_end` with its earlier
     /// [`on_turn_start`](crate::observer::LoopObserver::on_turn_start) by
-    /// index. Exactly one turn-end event fires per turn — the LLM-phase
+    /// index. One turn-end fires per serving attempt — the LLM-phase
     /// event for a tool-free turn, the tool-phase event for a turn whose
-    /// model call requested tools — and both kinds share this number, so an
-    /// observer can tell which model call an event belonged to without
-    /// distinguishing them.
+    /// model call requested tools — and all kinds share this number.
+    /// A turn the overflow salvage retried is served twice: its
+    /// rejected attempt and its retry each fire their own pair under
+    /// this number, so observers pair by index and attempt order, not
+    /// by event count.
     pub turn: usize,
 
     /// Whether the turn reached its intended completion without a hard error.
@@ -71,16 +74,19 @@ pub(super) struct TurnEnd<'a> {
 
     /// Wall-clock duration of the phase this turn-end event describes.
     ///
-    /// Measured from the start of the relevant handler — for the LLM phase,
-    /// from `handle_call_llm`'s entry to the response being recorded; for the
-    /// tool phase, from `handle_call_tools`'s entry through dispatch
-    /// completion. Exactly one turn-end event fires per turn: the LLM
-    /// phase's for a tool-free turn (covering the model call), the tool
-    /// phase's for a turn whose model call requested tools (covering
-    /// dispatch). The phase that does not fire contributes no event, so the
-    /// two durations never double-count. Converted to
-    /// `duration_ms` (via [`millis_u64`](BareLoop::millis_u64)) when the
-    /// observer context is built.
+    /// Measured from the start of the relevant handler — for the LLM
+    /// phase, from `handle_call_llm`'s entry to the response being
+    /// recorded; for the tool phase, from `handle_call_tools`'s entry
+    /// through dispatch completion. One turn-end fires per serving
+    /// attempt: the LLM phase's for a tool-free turn (covering the
+    /// model call), the tool phase's for a turn whose model call
+    /// requested tools (covering dispatch), and a turn the overflow
+    /// salvage retried fires one per attempt — the rejected attempt's
+    /// failed event and the retry's own pair. The phase that does
+    /// not fire contributes no event, so the two durations never
+    /// double-count. Converted to `duration_ms` (via
+    /// [`millis_u64`](BareLoop::millis_u64)) when the observer
+    /// context is built.
     pub duration: Duration,
 
     /// Prompt-side token count reported by the provider for the model call
@@ -179,12 +185,27 @@ impl<C: ApiClient> BareLoop<C> {
     ) {
         #[cfg(feature = "hooks")]
         self.notify_run_end_hook(result, error, duration);
+        let context_figure = match &self.anchor {
+            Some(anchor) => Some(
+                ContextFigureInfo::new(FigureSource::Anchored).with_anchor_age_turns(Some(
+                    self.machine
+                        .turns_taken()
+                        .saturating_sub(anchor.anchored_at_turn),
+                )),
+            ),
+            None => Some(ContextFigureInfo::new(FigureSource::Estimated)),
+        };
+        let unfinished_input = error
+            .filter(|e| super::conversation_cannot_fit(e))
+            .and_then(|_| self.session.current_run().map(|run| run.input.clone()));
         self.managers.observers().on_run_end(&RunEndContext {
             success: error.is_none(),
             error: error.map(std::string::ToString::to_string),
             total_turns: result.turn_count(),
             duration_ms: Self::millis_u64(duration),
             calibration_ratio_bp: self.calibration.report(),
+            context_figure,
+            unfinished_input,
         });
     }
 
@@ -382,6 +403,17 @@ impl<C: ApiClient> BareLoop<C> {
         let served = self.routed_or_client_model()?;
         self.managers.fallback().record_success()?;
         let (in_tok, out_tok) = Self::usage_tokens(usage);
+        let armed_prediction = self.calibration.prediction;
+        if in_tok > 0
+            && let Some(raw_payload) = armed_prediction
+            && raw_payload > 0
+        {
+            self.anchor = Some(UsageAnchor {
+                input_tokens: in_tok,
+                raw_payload,
+                anchored_at_turn: self.machine.turns_taken().saturating_add(1),
+            });
+        }
         let ratio_before = self.calibration.ratio_bp;
         self.calibration.observe_usage(in_tok);
         if self.calibration.ratio_bp != ratio_before && self.effective_context_window() > 0 {

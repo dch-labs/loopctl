@@ -110,6 +110,7 @@ impl<C: ApiClient> ModelSwitch<'_, C> {
             )));
         }
 
+        loop_.anchor = None;
         if let Some(cw) = context_window {
             loop_.session.config.context_window = cw;
             loop_.context_window = None;

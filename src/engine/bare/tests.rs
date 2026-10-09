@@ -1924,6 +1924,1526 @@ impl crate::observer::LoopObserver for RunEndRatioRecorder {
 
 #[cfg(feature = "streaming")]
 #[tokio::test]
+async fn a_compaction_pass_invalidates_the_anchor_until_the_next_report() {
+    let client = MockClient::new("test-model");
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_t0".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::tool_call("c0", "echo", Value::Null)),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::InputJson {
+                partial_json: r#"{"message":"hi"}"#.to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: Some(0) },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("tool_call".to_string()),
+            },
+            usage: Some(Usage::new(3_000, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_fin".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("done")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "done".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: None,
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            ShrinkingPassCompactor,
+        ))));
+    let config = make_config()
+        .with_context_window(1_500)
+        .with_compact_threshold(80);
+    let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
+    agent
+        .run("compact me", &RunConfig::default())
+        .await
+        .unwrap();
+
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 1,
+        "the anchored figure crossed the line and a pass fired"
+    );
+    assert!(
+        agent.anchor.is_none(),
+        "the pass cleared the anchor and the usage-free final response left it cleared"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn the_next_report_after_a_pass_re_arms_the_anchor() {
+    let client = MockClient::new("test-model");
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_t0".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::tool_call("c0", "echo", Value::Null)),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::InputJson {
+                partial_json: r#"{"message":"hi"}"#.to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: Some(0) },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("tool_call".to_string()),
+            },
+            usage: Some(Usage::new(3_000, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_fin".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("done")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "done".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: Some(Usage::new(50, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            ShrinkingPassCompactor,
+        ))));
+    let config = make_config()
+        .with_context_window(1_500)
+        .with_compact_threshold(80);
+    let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
+    agent
+        .run("compact then re-arm", &RunConfig::default())
+        .await
+        .unwrap();
+
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 1,
+        "a pass fired mid-run — the re-arm happens across a real clear"
+    );
+    let anchor = agent
+        .anchor
+        .as_ref()
+        .expect("the post-compaction report re-armed the anchor");
+    assert_eq!(
+        anchor.input_tokens, 50,
+        "the re-armed anchor is the post-compaction turn's own report"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_model_change_invalidates_the_anchor() {
+    let client = MockClient::new("test-model");
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_m".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("done")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "done".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: Some(Usage::new(2_000, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    agent.run("Hi", &RunConfig::default()).await.unwrap();
+    assert!(agent.anchor.is_some(), "the report armed the anchor");
+    agent.switch_model("other-model").apply().unwrap();
+    assert!(
+        agent.anchor.is_none(),
+        "the switch cleared the anchor — the pairing described a different tokenizer"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_zero_usage_report_never_anchors() {
+    let client = MockClient::new("test-model");
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_z".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("done")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "done".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: Some(Usage::new(0, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    agent.run("Hi", &RunConfig::default()).await.unwrap();
+    assert!(
+        agent.anchor.is_none(),
+        "an all-zero usage payload is the shape of a backend that reports nothing"
+    );
+    let at_rest = agent.machine().full_history();
+    let expected = agent.calibration.apply(
+        agent
+            .count_context(&at_rest)
+            .saturating_add(agent.overhead_tokens()),
+    );
+    assert_eq!(
+        agent.context_tokens(),
+        expected,
+        "the zero-report backend's figure is the calibrated estimate, byte-identical to a no-report one"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn run_end_reports_the_figure_source_and_anchor_age() {
+    let reporting = MockClient::new("test-model");
+    reporting.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_r".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("done")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "done".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: Some(Usage::new(2_000, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let figures = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new(Arc::new(reporting), ToolRegistry::new(), make_config());
+    agent.register_observer(Arc::new(RunEndFigureRecorder {
+        figures: Arc::clone(&figures),
+        unfinished: Arc::new(Mutex::new(Vec::new())),
+    }));
+    agent.run("Hi", &RunConfig::default()).await.unwrap();
+    let recorded = crate::error::recover_guard(figures.lock()).clone();
+    let figure = recorded
+        .first()
+        .cloned()
+        .flatten()
+        .expect("every engine-driven run-end reports the figure source in force at the end");
+    assert_eq!(
+        figure.source,
+        crate::observer::FigureSource::Anchored,
+        "the reporting backend's final figure was anchored"
+    );
+    assert_eq!(
+        figure.anchor_age_turns,
+        Some(0),
+        "the anchor is the run's own final report"
+    );
+
+    let usageless = MockClient::new("test-model").without_usage();
+    usageless.add_text_response("done");
+    let figures2 = Arc::new(Mutex::new(Vec::new()));
+    let mut bare = BareLoop::new(Arc::new(usageless), ToolRegistry::new(), make_config());
+    bare.register_observer(Arc::new(RunEndFigureRecorder {
+        figures: Arc::clone(&figures2),
+        unfinished: Arc::new(Mutex::new(Vec::new())),
+    }));
+    bare.run("Hi", &RunConfig::default()).await.unwrap();
+    let recorded2 = crate::error::recover_guard(figures2.lock()).clone();
+    let unanchored = recorded2
+        .first()
+        .cloned()
+        .flatten()
+        .expect("the engine reports the figure source even when estimated");
+    assert_eq!(
+        unanchored.source,
+        crate::observer::FigureSource::Estimated,
+        "a usage-less backend's figure flew on the estimate"
+    );
+    assert_eq!(unanchored.anchor_age_turns, None, "no anchor exists to age");
+}
+
+/// An echo tool whose result size and retention class the scripted
+/// input controls.
+///
+/// The prune fixtures ride on it: `{"fill": N, "retention":
+/// "durable" | "requery" | absent}` produces an `N`-character result
+/// stamped with the named [`Retention`](crate::tool::Retention) class
+/// (untagged when absent), so a single script seeds mixed classes.
+#[cfg(feature = "streaming")]
+struct RetentionEcho;
+
+#[cfg(feature = "streaming")]
+impl Tool for RetentionEcho {
+    fn name(&self) -> &'static str {
+        "echo"
+    }
+    fn description(&self) -> &'static str {
+        "Echo a sized, classed result back"
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "echo",
+            "object",
+            serde_json::json!({"type": "object", "properties": {"fill": {"type": "number"}, "retention": {"type": "string"}}}),
+        )
+    }
+    fn call(
+        &self,
+        input: Value,
+        _ctx: &ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+        Box::pin(async move {
+            let fill = usize::try_from(input.get("fill").and_then(Value::as_u64).unwrap_or(200))
+                .unwrap_or(200);
+            let retention = input
+                .get("retention")
+                .and_then(Value::as_str)
+                .and_then(|text| match text {
+                    "durable" => Some(crate::tool::Retention::Durable),
+                    "requery" => Some(crate::tool::Retention::Requery),
+                    _ => None,
+                });
+            let mut output = ToolOutput::text(format!("echo: {} {}", input, "r".repeat(fill)));
+            if let Some(retention) = retention {
+                output = output.with_retention(retention);
+            }
+            Ok(output)
+        })
+    }
+}
+
+/// Records every demotion handoff's reason and the verbatim message.
+#[cfg(feature = "streaming")]
+struct PruneSinkCapture {
+    /// `(reason, message)` per demoted message, in handoff order.
+    handed: Arc<Mutex<Vec<(String, Message)>>>,
+}
+
+/// The joined tool-result text of a demoted message, for sink-row assertions.
+#[cfg(feature = "streaming")]
+fn sink_tool_text(message: &Message) -> String {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::ToolResult {
+                output: ToolContent::Text(text),
+                ..
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(feature = "streaming")]
+impl crate::compact::DemotionSink for PruneSinkCapture {
+    fn demote<'a>(
+        &'a self,
+        evicted: &'a [Message],
+        context: crate::compact::DemotionContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::error::LoopError>> + Send + 'a>> {
+        let rows: Vec<(String, Message)> = evicted
+            .iter()
+            .map(|message| (format!("{:?}", context.reason), message.clone()))
+            .collect();
+        let handed = Arc::clone(&self.handed);
+        Box::pin(async move {
+            crate::error::recover_guard(handed.lock()).extend(rows);
+            Ok(())
+        })
+    }
+}
+
+/// Script `turns` tool calls then a final text turn onto the mock;
+/// each tool input carries the given fill and retention key, and no
+/// turn reports usage.
+#[cfg(feature = "streaming")]
+fn add_retention_script(client: &MockClient, turns: &[(usize, &str)]) {
+    add_retention_script_with_usage(client, turns, &[]);
+}
+
+/// Script per-turn tool calls onto the mock with optional per-turn
+/// usage, plus the final text turn.
+///
+/// The tool turn at index `k` reports `Usage::new(usage[k], 5)` when
+/// the slice carries a value there and nothing when it does not; the
+/// final text turn always reports nothing.
+#[cfg(feature = "streaming")]
+fn add_retention_script_with_usage(client: &MockClient, turns: &[(usize, &str)], usage: &[u32]) {
+    add_retention_turns(client, turns, usage);
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_final".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("all done")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "all done".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: None,
+        }),
+        StreamEvent::MessageStop,
+    ]);
+}
+
+/// Script per-turn tool calls onto the mock, with no final text turn.
+#[cfg(feature = "streaming")]
+fn add_retention_turns(client: &MockClient, turns: &[(usize, &str)], usage: &[u32]) {
+    for (step, (fill, retention)) in turns.iter().enumerate() {
+        let mut input = serde_json::json!({"fill": fill});
+        if !retention.is_empty() {
+            input["retention"] = Value::String(retention.to_string());
+        }
+        client.add_events(vec![
+            StreamEvent::MessageStart(MessageStart {
+                message: MessageMetadata {
+                    id: format!("msg_{step}"),
+                    role: "assistant".into(),
+                    model: "test-model".into(),
+                },
+            }),
+            StreamEvent::PartStart(PartStart {
+                index: 0,
+                part: Some(MessagePart::tool_call(
+                    format!("call_{step}"),
+                    "echo",
+                    Value::Null,
+                )),
+            }),
+            StreamEvent::IndexedDelta(IndexedDelta {
+                index: 0,
+                delta: DeltaPart::InputJson {
+                    partial_json: input.to_string(),
+                },
+            }),
+            StreamEvent::PartStop { index: Some(0) },
+            StreamEvent::MessageDelta(MessageDelta {
+                delta: MessageDeltaPayload {
+                    stop_reason: Some("tool_call".to_string()),
+                },
+                usage: usage.get(step).map(|input| Usage::new(*input, 5)),
+            }),
+            StreamEvent::MessageStop,
+        ]);
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn pruning_clears_untagged_results_beyond_the_protected_tail() {
+    let client = MockClient::new("test-model").without_usage();
+    add_retention_script(
+        &client,
+        &[(500, ""), (500, ""), (500, ""), (500, ""), (500, "")],
+    );
+    let sink = Arc::new(PruneSinkCapture {
+        handed: Arc::new(Mutex::new(Vec::new())),
+    });
+    let managers = crate::managers::LoopManagers::new()
+        .with_demotion_sink(Arc::clone(&sink) as Arc<dyn crate::compact::DemotionSink>);
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(80);
+    let mut registry = ToolRegistry::new();
+    registry.register(RetentionEcho);
+    let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
+    agent
+        .set_prune(
+            crate::compact::PruneConfig::default()
+                .with_prune_line_pct(60)
+                .with_min_free_pct(10)
+                .with_protected_tail_tokens(150),
+        )
+        .expect("60 sits strictly below the 80 threshold");
+    agent.run("prune me", &RunConfig::default()).await.unwrap();
+
+    let at_rest = agent.machine().full_history();
+    let markers = at_rest
+        .iter()
+        .filter(|message| {
+            message.parts.iter().any(|part| match part {
+                MessagePart::ToolResult { output, .. } => matches!(
+                    output,
+                    ToolContent::Text(text) if text == "[cleared: prior tool output]"
+                ),
+                _ => false,
+            })
+        })
+        .count();
+    assert!(
+        markers >= 1,
+        "at least one prior result beyond the tail was cleared: {at_rest:?}"
+    );
+    let last_result_verbatim = at_rest
+        .iter()
+        .rev()
+        .find_map(|message| {
+            message.parts.iter().find_map(|part| match part {
+                MessagePart::ToolResult { output, .. } => Some(output),
+                _ => None,
+            })
+        })
+        .is_some_and(|output| {
+            matches!(output, ToolContent::Text(text) if text.contains("echo:") && !text.contains("[cleared"))
+        });
+    assert!(
+        last_result_verbatim,
+        "the protected tail's own result rides verbatim: {at_rest:?}"
+    );
+    let handed = crate::error::recover_guard(sink.handed.lock()).clone();
+    assert!(
+        handed
+            .iter()
+            .any(|(reason, message)| reason.contains("Prune")
+                && sink_tool_text(message).contains("echo:")),
+        "the sink received the cleared originals under the prune reason: {handed:?}"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn cleared_content_rides_the_demotion_sink() {
+    let client = MockClient::new("test-model").without_usage();
+    add_retention_turns(&client, &[(600, ""), (600, "requery")], &[]);
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_fail".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::tool_call("call_f", "fail", Value::Null)),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::InputJson {
+                partial_json: "{}".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: Some(0) },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("tool_call".to_string()),
+            },
+            usage: None,
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    add_retention_script(&client, &[(600, "")]);
+    let sink = Arc::new(PruneSinkCapture {
+        handed: Arc::new(Mutex::new(Vec::new())),
+    });
+    let managers = crate::managers::LoopManagers::new()
+        .with_demotion_sink(Arc::clone(&sink) as Arc<dyn crate::compact::DemotionSink>);
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(80);
+    let mut registry = ToolRegistry::new();
+    registry.register(RetentionEcho);
+    registry.register(FailingTool);
+    let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
+    agent
+        .set_prune(
+            crate::compact::PruneConfig::default()
+                .with_prune_line_pct(60)
+                .with_min_free_pct(20)
+                .with_protected_tail_tokens(20),
+        )
+        .expect("60 sits strictly below the 80 threshold");
+    agent
+        .run("clear me whole", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let handed = crate::error::recover_guard(sink.handed.lock()).clone();
+    let cleared: Vec<&Message> = handed
+        .iter()
+        .filter(|(reason, _)| reason.contains("Prune"))
+        .map(|(_, message)| message)
+        .collect();
+    let ids = cleared
+        .iter()
+        .filter_map(|message| {
+            message.parts.iter().find_map(|part| match part {
+                MessagePart::ToolResult { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec![
+            "call_0".to_string(),
+            "call_f".to_string(),
+            "call_1".to_string()
+        ],
+        "the sink batch is oldest-first within the untagged pool, the requery pool after it: {handed:?}"
+    );
+    let row = |id: &str| {
+        cleared
+            .iter()
+            .find(|message| {
+                message.parts.iter().any(|part| match part {
+                    MessagePart::ToolResult { call_id, .. } => call_id == id,
+                    _ => false,
+                })
+            })
+            .unwrap_or_else(|| panic!("no cleared row for {id}: {handed:?}"))
+    };
+    let fields = |message: &Message| {
+        message.parts.iter().find_map(|part| match part {
+            MessagePart::ToolResult {
+                name,
+                is_error,
+                retention,
+                ..
+            } => Some((name.clone(), *is_error, *retention)),
+            _ => None,
+        })
+    };
+    assert_eq!(
+        fields(row("call_0")),
+        Some(("echo".to_string(), Some(false), None)),
+        "an untagged success keeps its identity: {handed:?}"
+    );
+    assert_eq!(
+        fields(row("call_f")),
+        Some(("fail".to_string(), Some(true), None)),
+        "a demoted error result is recorded as the error it was: {handed:?}"
+    );
+    assert_eq!(
+        fields(row("call_1")),
+        Some((
+            "echo".to_string(),
+            Some(false),
+            Some(crate::tool::Retention::Requery)
+        )),
+        "the requery class rides verbatim: {handed:?}"
+    );
+    assert!(
+        sink_tool_text(row("call_f")).contains("intentionally failed"),
+        "the cleared error's own output rides: {handed:?}"
+    );
+    assert!(
+        sink_tool_text(row("call_0")).contains("echo:"),
+        "the cleared success's own output rides: {handed:?}"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn durable_results_survive_pruning_and_requery_clears_last() {
+    let client = MockClient::new("test-model").without_usage();
+    add_retention_script(
+        &client,
+        &[(600, "durable"), (600, "requery"), (500, ""), (200, "")],
+    );
+    let sink = Arc::new(PruneSinkCapture {
+        handed: Arc::new(Mutex::new(Vec::new())),
+    });
+    let managers = crate::managers::LoopManagers::new()
+        .with_demotion_sink(Arc::clone(&sink) as Arc<dyn crate::compact::DemotionSink>);
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(80);
+    let mut registry = ToolRegistry::new();
+    registry.register(RetentionEcho);
+    let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
+    agent
+        .set_prune(
+            crate::compact::PruneConfig::default()
+                .with_prune_line_pct(60)
+                .with_min_free_pct(20)
+                .with_protected_tail_tokens(50),
+        )
+        .expect("60 sits strictly below the 80 threshold");
+    agent
+        .run("prune the classes", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let at_rest = agent.machine().full_history();
+    let requery_cleared = at_rest.iter().any(|message| {
+        message.parts.iter().any(|part| match part {
+            MessagePart::ToolResult {
+                output,
+                retention,
+                ..
+            } => {
+                matches!(retention, Some(crate::tool::Retention::Requery))
+                    && matches!(output, ToolContent::Text(text) if text == "[cleared: prior tool output]")
+            }
+            _ => false,
+        })
+    });
+    assert!(
+        requery_cleared,
+        "the requery result cleared once the untagged pool alone could not meet the gate"
+    );
+    let durable_intact = at_rest.iter().any(|message| {
+        message.parts.iter().any(|part| match part {
+            MessagePart::ToolResult {
+                output,
+                retention,
+                ..
+            } => {
+                matches!(retention, Some(crate::tool::Retention::Durable))
+                    && matches!(output, ToolContent::Text(text) if text.contains("echo:") && !text.contains("[cleared"))
+            }
+            _ => false,
+        })
+    });
+    assert!(durable_intact, "no durable result ever clears: {at_rest:?}");
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_prune_pass_clears_a_report_armed_anchor() {
+    let turns = [(40, ""), (40, ""), (40, "")];
+    let usages = [100_000, 100_000, 600_000];
+    let compactions = Arc::new(Mutex::new(0usize));
+    let sink = Arc::new(PruneSinkCapture {
+        handed: Arc::new(Mutex::new(Vec::new())),
+    });
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_demotion_sink(Arc::clone(&sink) as Arc<dyn crate::compact::DemotionSink>);
+    let config = make_config()
+        .with_context_window(1_000_000)
+        .with_compact_threshold(80);
+    let mut registry = ToolRegistry::new();
+    registry.register(RetentionEcho);
+    let client = MockClient::new("test-model");
+    add_retention_script_with_usage(&client, &turns, &usages);
+    let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
+    agent
+        .set_prune(
+            crate::compact::PruneConfig::default()
+                .with_prune_line_pct(60)
+                .with_min_free_pct(0)
+                .with_protected_tail_tokens(20),
+        )
+        .expect("60 sits strictly below the 80 threshold");
+    agent
+        .run("prune the anchor", &RunConfig::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *crate::error::recover_guard(compactions.lock()),
+        0,
+        "the anchored figures stayed under the compaction threshold — only the prune pass touched the feed"
+    );
+    assert!(
+        !crate::error::recover_guard(sink.handed.lock()).is_empty(),
+        "the prune pass ran and handed cleared content to the sink"
+    );
+    assert!(
+        agent.anchor.is_none(),
+        "the pass cleared the anchor the reports armed; the usage-free final turn re-armed nothing"
+    );
+
+    let bare_client = MockClient::new("test-model");
+    add_retention_script_with_usage(&bare_client, &turns, &usages);
+    let bare_compactions = Arc::new(Mutex::new(0usize));
+    let bare_managers =
+        crate::managers::LoopManagers::new().with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&bare_compactions),
+        }));
+    let mut bare_registry = ToolRegistry::new();
+    bare_registry.register(RetentionEcho);
+    let mut unpruned = BareLoop::new_with_managers(
+        Arc::new(bare_client),
+        bare_registry,
+        make_config()
+            .with_context_window(1_000_000)
+            .with_compact_threshold(80),
+        bare_managers,
+    );
+    unpruned
+        .run("leave the anchor armed", &RunConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        *crate::error::recover_guard(bare_compactions.lock()),
+        0,
+        "the control leg compacts nothing either"
+    );
+    assert!(
+        unpruned.anchor.is_some(),
+        "the same reports arm the anchor when no pass clears it"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_prune_below_the_minimum_free_gate_is_a_no_op() {
+    let client = MockClient::new("test-model").without_usage();
+    add_retention_script(
+        &client,
+        &[(500, ""), (500, ""), (500, ""), (500, ""), (500, "")],
+    );
+    let sink = Arc::new(PruneSinkCapture {
+        handed: Arc::new(Mutex::new(Vec::new())),
+    });
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_demotion_sink(Arc::clone(&sink) as Arc<dyn crate::compact::DemotionSink>);
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(95);
+    let mut registry = ToolRegistry::new();
+    registry.register(RetentionEcho);
+    let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
+    agent
+        .set_prune(
+            crate::compact::PruneConfig::default()
+                .with_prune_line_pct(60)
+                .with_min_free_pct(90)
+                .with_protected_tail_tokens(100),
+        )
+        .expect("60 sits strictly below the 95 threshold");
+    agent.run("gate me", &RunConfig::default()).await.unwrap();
+
+    assert!(
+        agent.context_tokens() >= 600,
+        "the figure crossed the 60% prune line of the 1 000-token window — the no-op is the \
+         gate's verdict, not the line's: {}",
+        agent.context_tokens()
+    );
+    assert_eq!(
+        *crate::error::recover_guard(compactions.lock()),
+        0,
+        "no compaction fired — the untouched feed is the declined pass, not a summarizer's output"
+    );
+    let at_rest = agent.machine().full_history();
+    assert!(
+        at_rest.iter().all(|message| {
+            message.parts.iter().all(|part| match part {
+                MessagePart::ToolResult { output, .. } => {
+                    !matches!(output, ToolContent::Text(text) if text.contains("[cleared"))
+                }
+                _ => true,
+            })
+        }),
+        "a projection under 90% of the window changes nothing: {at_rest:?}"
+    );
+    assert!(
+        crate::error::recover_guard(sink.handed.lock()).is_empty(),
+        "no handoff fires for a no-op pass"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn pruning_is_off_by_default() {
+    let client = MockClient::new("test-model").without_usage();
+    add_retention_script(&client, &[(500, ""), (500, ""), (500, "")]);
+    let sink = Arc::new(PruneSinkCapture {
+        handed: Arc::new(Mutex::new(Vec::new())),
+    });
+    let managers = crate::managers::LoopManagers::new()
+        .with_demotion_sink(Arc::clone(&sink) as Arc<dyn crate::compact::DemotionSink>);
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(80);
+    let mut registry = ToolRegistry::new();
+    registry.register(RetentionEcho);
+    let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
+    assert!(
+        agent
+            .set_prune(crate::compact::PruneConfig::default().with_prune_line_pct(80))
+            .is_err(),
+        "a line at the threshold is rejected, never clamped"
+    );
+    assert!(
+        agent
+            .set_prune(crate::compact::PruneConfig::default().with_min_free_pct(101))
+            .is_err(),
+        "a minimum-free gate above the whole window is rejected, never a silent disable"
+    );
+    agent
+        .run("leave me alone", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let at_rest = agent.machine().full_history();
+    assert!(
+        at_rest.iter().all(|message| {
+            message.parts.iter().all(|part| match part {
+                MessagePart::ToolResult { output, .. } => {
+                    !matches!(output, ToolContent::Text(text) if text.contains("[cleared"))
+                }
+                _ => true,
+            })
+        }),
+        "an unconfigured loop never rewrites a tool result: {at_rest:?}"
+    );
+    assert!(
+        crate::error::recover_guard(sink.handed.lock()).is_empty(),
+        "an unconfigured loop hands nothing to the sink"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_prune_that_frees_enough_avoids_the_compaction() {
+    let client = MockClient::new("test-model").without_usage();
+    add_retention_script(
+        &client,
+        &[(500, ""), (500, ""), (500, ""), (500, ""), (500, "")],
+    );
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers =
+        crate::managers::LoopManagers::new().with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }));
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(80);
+    let mut registry = ToolRegistry::new();
+    registry.register(RetentionEcho);
+    let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
+    agent
+        .set_prune(
+            crate::compact::PruneConfig::default()
+                .with_prune_line_pct(60)
+                .with_min_free_pct(10)
+                .with_protected_tail_tokens(150),
+        )
+        .expect("60 sits strictly below the 80 threshold");
+    let result = agent.run("prune not compact", &RunConfig::default()).await;
+    assert!(
+        result.is_ok(),
+        "the run completes on the pruned feed: {result:?}"
+    );
+    assert!(
+        result
+            .as_ref()
+            .map_or(0, crate::engine::core::Run::turn_count)
+            >= 5,
+        "every scripted turn served"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(compactions.lock()),
+        0,
+        "the reclaiming prune kept the figure under the trigger — no compaction fired"
+    );
+}
+
+/// A client with a hard provider-side window: a request whose
+/// heuristic size exceeds it is rejected with the provider's
+/// oversized-prompt phrase, anything less serves the scripted stream.
+///
+/// The overflow-salvage fixtures ride on it — the estimate the engine
+/// flies on can sit under the session's declared window while the
+/// provider's real limit refuses, which is exactly the case only the
+/// provider can see.
+#[cfg(feature = "streaming")]
+struct HardWindowClient {
+    /// The scripted healthy responses, served in order.
+    inner: MockClient,
+
+    /// The provider's real request-size limit, in heuristic tokens.
+    window: u64,
+}
+
+#[cfg(feature = "streaming")]
+impl HardWindowClient {
+    /// Whether the request exceeds the hard window.
+    fn oversized(&self, request: &crate::api::StreamRequest) -> bool {
+        let mut tokens = HeuristicTokenCounter.count(&request.messages);
+        if let Some(system) = &request.system {
+            tokens = tokens
+                .saturating_add(HeuristicTokenCounter.count(&[Message::user(system.clone())]));
+        }
+        tokens > self.window
+    }
+}
+
+#[cfg(feature = "streaming")]
+impl ApiClient for HardWindowClient {
+    fn model(&self) -> String {
+        self.inner.model()
+    }
+    fn set_model(&self, _model: &str) -> bool {
+        false
+    }
+    fn stream_messages(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        if self.oversized(request) {
+            return Box::pin(futures::stream::iter(vec![Err(ApiError::api(
+                "this model's maximum context length is small and the prompt is too long",
+            ))]));
+        }
+        self.inner.stream_messages(request)
+    }
+    fn create_message(
+        &self,
+        _request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        Box::pin(async {
+            Err(ApiError::api(
+                "this model's maximum context length is small and the prompt is too long",
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_oversized_prompt_rejection_compacts_and_retries_the_same_turn() {
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_tool_only_response("c0", "echo", &json!({"message": "0123456789"}));
+    scripted.add_text_response("retried turn lands");
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            ShrinkingPassCompactor,
+        ))));
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(HardWindowClient {
+            inner: scripted,
+            window: 22,
+        }),
+        registry,
+        config,
+        managers,
+    );
+    let result = agent
+        .run("a short opening prompt", &RunConfig::default())
+        .await;
+    assert!(
+        result.is_ok(),
+        "the rejected turn compacted, retried, and completed: {result:?}"
+    );
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 1,
+        "the rejection forced one emergency compaction pass"
+    );
+    assert_eq!(
+        result
+            .as_ref()
+            .map_or(0, crate::engine::core::Run::turn_count),
+        2,
+        "the same turn served on retry — two model turns, not three"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_second_overflow_rejection_ends_the_run() {
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_text_response("never reached");
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(TurnEventCounter {
+            starts: Arc::clone(&starts),
+            ends: Arc::clone(&ends),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            ShrinkingPassCompactor,
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded = vec![
+        Message::user("earlier question ".repeat(20)),
+        Message::assistant("earlier answer ".repeat(20)),
+    ];
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(HardWindowClient {
+            inner: scripted,
+            window: 5,
+        }),
+        ToolRegistry::new(),
+        managers,
+    );
+    let result = agent
+        .run(
+            "a prompt the provider will always refuse",
+            &RunConfig::default(),
+        )
+        .await;
+    match result {
+        Err(LoopError::ContextExceeded { used, limit }) => assert!(
+            used >= limit,
+            "the refusal floors the reported usage at the window: used {used}, limit {limit}"
+        ),
+        other => {
+            panic!("expected Err(LoopError::ContextExceeded) from the spent retry, got {other:?}")
+        }
+    }
+    assert_eq!(
+        *crate::error::recover_guard(starts.lock()),
+        vec![0, 0],
+        "the rejected attempt and the retry each fired a turn-start"
+    );
+    assert_eq!(
+        *crate::error::recover_guard(ends.lock()),
+        vec![0, 0],
+        "every fired turn-start is paired by a failed turn-end — the terminal rejection's too"
+    );
+}
+
+/// Counts turn-start and turn-end events by turn index, in event order.
+#[cfg(feature = "streaming")]
+struct TurnEventCounter {
+    /// The turn index of each `on_turn_start`, in event order.
+    starts: Arc<Mutex<Vec<usize>>>,
+
+    /// The turn index of each `on_turn_end`, in event order.
+    ends: Arc<Mutex<Vec<usize>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::observer::LoopObserver for TurnEventCounter {
+    fn name(&self) -> &'static str {
+        "turn-event-counter"
+    }
+    fn on_turn_start(&self, ctx: &crate::observer::TurnStartContext) {
+        crate::error::recover_guard(self.starts.lock()).push(ctx.turn);
+    }
+    fn on_turn_end(&self, ctx: &crate::observer::TurnEndContext) {
+        crate::error::recover_guard(self.ends.lock()).push(ctx.turn);
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_overflow_run_end_carries_the_unfinished_input() {
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_text_response("never reached");
+    let figures = Arc::new(Mutex::new(Vec::new()));
+    let unfinished = Arc::new(Mutex::new(Vec::new()));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(RunEndFigureRecorder {
+            figures: Arc::clone(&figures),
+            unfinished: Arc::clone(&unfinished),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            ShrinkingPassCompactor,
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(HardWindowClient {
+            inner: scripted,
+            window: 5,
+        }),
+        ToolRegistry::new(),
+        config,
+        managers,
+    );
+    let input = "the input a host should be able to resubmit";
+    let result = agent.run(input, &RunConfig::default()).await;
+    assert!(
+        result.is_err(),
+        "the provider refuses every request — the run must die, not complete: {result:?}"
+    );
+    let carried = crate::error::recover_guard(unfinished.lock()).clone();
+    assert_eq!(
+        carried.first().cloned(),
+        Some(Some(input.to_string())),
+        "the overflow death path surfaces the triggering input: {carried:?}"
+    );
+}
+
+/// Records the driven-figure report and the run-end input surfacing.
+#[cfg(feature = "streaming")]
+struct RunEndFigureRecorder {
+    /// The `context_figure` payload per run-end event, in event order.
+    figures: Arc<Mutex<Vec<Option<crate::observer::ContextFigureInfo>>>>,
+
+    /// The `unfinished_input` per run-end event, in event order.
+    unfinished: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::observer::LoopObserver for RunEndFigureRecorder {
+    fn name(&self) -> &'static str {
+        "run-end-figure-recorder"
+    }
+    fn on_run_end(&self, ctx: &crate::observer::RunEndContext) {
+        crate::error::recover_guard(self.figures.lock()).push(ctx.context_figure.clone());
+        crate::error::recover_guard(self.unfinished.lock()).push(ctx.unfinished_input.clone());
+    }
+}
+
+/// One scripted tool turn plus one terminal turn, both reporting the
+/// staged usage, for the anchor fixtures.
+#[cfg(feature = "streaming")]
+fn add_tool_then_text_with_usage(
+    client: &MockClient,
+    tool_id: &str,
+    tool_name: &str,
+    tool_input: &Value,
+    tool_usage: u32,
+    final_usage: u32,
+) {
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_tool".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::tool_call(tool_id, tool_name, Value::Null)),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::InputJson {
+                partial_json: tool_input.to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: Some(0) },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("tool_call".to_string()),
+            },
+            usage: Some(Usage::new(tool_usage, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_final".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("all done")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "all done".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: Some(Usage::new(final_usage, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn the_context_figure_anchors_on_a_usage_report() {
+    let client = MockClient::new("test-model");
+    add_tool_then_text_with_usage(
+        &client,
+        "call_1",
+        "echo",
+        &json!({"message": "hi"}),
+        3_000,
+        3_500,
+    );
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    agent.run("anchor me", &RunConfig::default()).await.unwrap();
+
+    let anchor = agent
+        .anchor
+        .as_ref()
+        .expect("the final report leaves an anchor");
+    assert_eq!(anchor.input_tokens, 3_500, "the anchor is the last report");
+    let raw_now = agent
+        .count_context(&agent.machine().full_history())
+        .saturating_add(agent.overhead_tokens());
+    let expected = anchor.input_tokens.saturating_add(
+        agent
+            .calibration
+            .apply(raw_now.saturating_sub(anchor.raw_payload)),
+    );
+    assert_eq!(
+        agent.context_tokens(),
+        expected,
+        "the stored figure is anchor + calibrated delta: stored {}, expected {expected}",
+        agent.context_tokens()
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn appended_exchanges_grow_the_anchored_figure_by_their_estimate() {
+    let client = MockClient::new("test-model").without_usage();
+    add_tool_then_text_with_usage(
+        &client,
+        "call_1",
+        "echo",
+        &json!({"message": "hi"}),
+        3_000,
+        3_000,
+    );
+    client.add_text_response("second turn lands");
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(Arc::new(client), registry, make_config());
+    agent.run("anchor me", &RunConfig::default()).await.unwrap();
+    let anchored = agent.context_tokens();
+    let hist_before = agent.machine().full_history().clone();
+
+    agent
+        .run("grow the figure", &RunConfig::default())
+        .await
+        .unwrap();
+    let hist_after = agent.machine().full_history();
+    assert_eq!(
+        hist_after.len(),
+        hist_before.len() + 2,
+        "the second run appended exactly its user and assistant messages: {hist_after:?}"
+    );
+    let anchor = agent
+        .anchor
+        .as_ref()
+        .expect("the usage-free second run leaves the first run's anchor in force");
+    let raw_now = agent
+        .count_context(&hist_after)
+        .saturating_add(agent.overhead_tokens());
+    let expected = anchor.input_tokens.saturating_add(
+        agent
+            .calibration
+            .apply(raw_now.saturating_sub(anchor.raw_payload)),
+    );
+    assert_eq!(
+        agent.context_tokens(),
+        expected,
+        "the figure is the anchor plus the calibrated estimate of the raw appends: stored {}, \
+         expected {expected}",
+        agent.context_tokens()
+    );
+    assert!(
+        agent.context_tokens() > anchored,
+        "the really-appended exchange grew the figure: before {anchored}, after {}",
+        agent.context_tokens()
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn an_anchored_figure_counts_the_transients_that_re_ride_the_next_request() {
+    let reminder = "stay on task ".repeat(40);
+    let client = MockClient::new("test-model");
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_tr".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("done")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "done".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: Some(Usage::new(2_000, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
+    agent.add_contributor(Box::new(StaticReminder(reminder.clone())));
+    agent
+        .run("carry the reminder", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let anchor = agent.anchor.as_ref().expect("the report arms the anchor");
+    let transients = agent.count_context(&[Message::new(
+        Role::System,
+        vec![MessagePart::text(reminder)],
+    )]);
+    assert!(
+        transients > 0,
+        "the fixture's contributor must carry weight for the pin to bite"
+    );
+    let expected = anchor.input_tokens.saturating_add(
+        agent.calibration.apply(
+            agent
+                .count_context(&agent.machine().full_history())
+                .saturating_add(agent.overhead_tokens())
+                .saturating_add(transients)
+                .saturating_sub(anchor.raw_payload),
+        ),
+    );
+    assert_eq!(
+        agent.context_tokens(),
+        expected,
+        "the anchored figure carries the transient estimate that re-rides the next request: \
+         stored {}, expected {expected}",
+        agent.context_tokens()
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
 async fn a_settled_ratio_rescales_the_manager_s_target_units() {
     let client = MockClient::new("test-model");
     client.add_events(vec![
@@ -7906,28 +9426,21 @@ async fn a_cancelled_run_salvages_completed_turns_into_the_next_request() {
 
 #[tokio::test]
 #[cfg(all(feature = "streaming", feature = "testing"))]
-async fn a_provider_context_rejection_discards_instead_of_salvaging() {
+async fn a_provider_context_rejection_recovers_via_retry() {
     let client = crate::testing::MockApiClient::new("test-model")
         .with_text_response("recovered")
         .with_errors(vec![Some("maximum context length exceeded".to_string())]);
     let mut agent = BareLoop::new(Arc::new(client.clone()), ToolRegistry::new(), make_config());
 
-    let first = agent.run("oversized prompt", &RunConfig::default()).await;
-    match &first {
-        Err(LoopError::Api(message)) => assert!(
-            message.contains("maximum context length"),
-            "the run must surface the provider's own rejection text: {message}"
-        ),
-        other => panic!("expected Err(LoopError::Api), got {other:?}"),
-    }
-    let history = agent.conversation();
-    assert!(
-        !history.iter().any(|m| m.role == Role::User
-            && m.parts
-                .iter()
-                .any(|p| matches!(p, MessagePart::Text { text } if text == "oversized prompt"))),
-        "a provider-rejected context overflow must discard the run's input — \
-         salvaging it would commit exactly the content the provider refused"
+    let run = agent.run("oversized prompt", &RunConfig::default()).await;
+    let output = run.expect(
+        "the overflow-family rejection gets the one compact-and-retry — \
+         the follow-up request serves the scripted recovery",
+    );
+    assert_eq!(
+        output.output.as_deref(),
+        Some("recovered"),
+        "the retried turn consumed the recovery response"
     );
 
     agent
@@ -7935,20 +9448,51 @@ async fn a_provider_context_rejection_discards_instead_of_salvaging() {
         .await
         .unwrap();
     let requests = client.captured_stream_requests();
-    let second = requests
-        .get(1)
+    let last = requests
+        .last()
         .expect("the second run must have issued a model call");
-    let user_texts: Vec<String> = second
+    let user_texts: Vec<String> = last
         .messages
         .iter()
         .filter(|m| m.role == Role::User)
         .map(Message::text_content)
         .collect();
-    assert_eq!(
-        user_texts,
-        vec!["smaller prompt".to_string()],
-        "the next run's request must not grow with the discarded run's \
-         prompt, got {user_texts:?}"
+    assert!(
+        user_texts.contains(&"smaller prompt".to_string()),
+        "the next run's request carries its own prompt, got {user_texts:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(all(feature = "streaming", feature = "testing"))]
+async fn a_follow_up_run_s_salvage_is_not_denied_by_the_prior_run_s_spent_retry() {
+    let client = crate::testing::MockApiClient::new("test-model")
+        .with_text_response("recovered")
+        .with_errors(vec![
+            Some("maximum context length exceeded".to_string()),
+            None,
+            Some("maximum context length exceeded".to_string()),
+        ]);
+    let managers = crate::managers::LoopManagers::new().with_context_manager(Arc::new(
+        crate::compact::ContextManager::new(Arc::new(ShrinkingPassCompactor)),
+    ));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        managers,
+    );
+
+    let first = agent.run("oversized prompt", &RunConfig::default()).await;
+    assert!(
+        first.is_ok(),
+        "the first run spends its salvage at its own turn 0 and recovers: {first:?}"
+    );
+    let second = agent.run("oversized again", &RunConfig::default()).await;
+    assert!(
+        second.is_ok(),
+        "the second run's turn-0 rejection gets its own salvage — the first run's spent \
+         retry was cleared at run start: {second:?}"
     );
 }
 
@@ -7981,7 +9525,7 @@ async fn a_context_bearing_transient_error_still_salvages() {
 
 #[tokio::test]
 #[cfg(all(feature = "streaming", feature = "testing"))]
-async fn an_anthropic_prompt_too_long_rejection_discards() {
+async fn an_anthropic_prompt_too_long_rejection_recovers_via_retry() {
     let client = crate::testing::MockApiClient::new("test-model")
         .with_text_response("recovered")
         .with_errors(vec![Some(
@@ -7989,22 +9533,15 @@ async fn an_anthropic_prompt_too_long_rejection_discards() {
         )]);
     let mut agent = BareLoop::new(Arc::new(client), ToolRegistry::new(), make_config());
 
-    let failed = agent.run("oversized prompt", &RunConfig::default()).await;
-    match &failed {
-        Err(LoopError::Api(message)) => assert!(
-            message.contains("prompt is too long"),
-            "the run must surface the provider's own rejection text: {message}"
-        ),
-        other => panic!("expected Err(LoopError::Api), got {other:?}"),
-    }
-    let history = agent.conversation();
-    assert!(
-        !history.iter().any(|m| m.role == Role::User
-            && m.parts
-                .iter()
-                .any(|p| matches!(p, MessagePart::Text { text } if text == "oversized prompt"))),
-        "Anthropic's prompt-too-long rejection is a context overflow — \
-         salvaging it would commit exactly the content the provider refused"
+    let run = agent.run("oversized prompt", &RunConfig::default()).await;
+    let output = run.expect(
+        "Anthropic's prompt-too-long rejection gets the one compact-and-retry — \
+         the follow-up request serves the scripted recovery",
+    );
+    assert_eq!(
+        output.output.as_deref(),
+        Some("recovered"),
+        "the retried turn consumed the recovery response, not a fresh turn"
     );
 }
 

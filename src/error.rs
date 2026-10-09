@@ -215,7 +215,12 @@ pub enum LoopError {
     /// The agent's conversation history grew beyond the model's
     /// context window and auto-compaction (or an emergency compaction
     /// pass) failed to bring it back under the limit. The `used` and
-    /// `limit` fields give precise token counts for diagnostics.
+    /// `limit` fields give precise token counts for diagnostics,
+    /// except on the provider-refusal path — a backend that rejected
+    /// an oversized prompt after the engine's own estimate fit —
+    /// where `used` is floored just above `limit`: the provider
+    /// declared the request unfittable, so the pair never reads as
+    /// fitting.
     #[error("Context window exceeded: used {used} of {limit} tokens")]
     ContextExceeded {
         /// Number of tokens consumed when the limit was exceeded.
@@ -223,7 +228,8 @@ pub enum LoopError {
         /// A payload-comparable estimate: the history plus what rides the
         /// request — the system prompt, tool schemas, and any reserved
         /// transient budget. Pair with `limit` to report utilization to
-        /// the caller.
+        /// the caller. On the provider-refusal path this is the window
+        /// plus one whenever the engine's own estimate sat under it.
         used: u64,
 
         /// The token budget that was exceeded.

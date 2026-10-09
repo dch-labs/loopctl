@@ -906,13 +906,14 @@ impl LoopObserver for TrajectoryObserver {
 
     /// Close a turn's slot, folding in the phase's duration and tokens.
     ///
-    /// The engine fires exactly one turn-end event per turn — the
-    /// tool-phase event for a turn that requested tools, so such a turn's
-    /// recorded duration covers dispatch only. The fold still sums
-    /// durations across multiple events for one turn (a hand-driven
-    /// stream or a future engine shape may send more) while the token
-    /// figures stay last-wins; a turn-end with no prior slot opens one
-    /// lazily rather than dropping the event.
+    /// The engine fires one turn-end event per serving attempt —
+    /// normally the tool-phase event for a turn that requested tools,
+    /// so such a turn's recorded duration covers dispatch only, and a
+    /// turn the overflow salvage retried fires a second pair under
+    /// the same index. The fold sums durations across multiple events
+    /// for one turn while the token figures stay last-wins; a
+    /// turn-end with no prior slot opens one lazily rather than
+    /// dropping the event.
     fn on_turn_end(&self, ctx: &TurnEndContext) {
         let mut guard = recover_guard(self.inner.lock());
         let Some(builder) = guard.as_mut() else {
@@ -1359,6 +1360,8 @@ mod tests {
             total_turns: 1,
             duration_ms: 25,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
     }
 
@@ -1411,6 +1414,8 @@ mod tests {
             total_turns: 1,
             duration_ms: 50,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -1459,6 +1464,8 @@ mod tests {
             total_turns: 1,
             duration_ms: 9,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -1505,6 +1512,8 @@ mod tests {
             total_turns: 1,
             duration_ms: 5,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let records = observer.records();
@@ -1528,6 +1537,8 @@ mod tests {
             total_turns: 0,
             duration_ms: 0,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -1561,6 +1572,8 @@ mod tests {
             total_turns: 1,
             duration_ms: 1,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -1586,6 +1599,8 @@ mod tests {
             total_turns: 1,
             duration_ms: 1,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
         assert_eq!(
             empty.records()[0].turns[0].response_text,
@@ -1633,6 +1648,8 @@ mod tests {
             total_turns: 1,
             duration_ms: 1,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
         assert!(
             observer.records().is_empty(),
@@ -1672,6 +1689,8 @@ mod tests {
                 total_turns: 1,
                 duration_ms: 1,
                 calibration_ratio_bp: None,
+                context_figure: None,
+                unfinished_input: None,
             });
         });
         assert_eq!(
@@ -1718,6 +1737,8 @@ mod tests {
             total_turns: 6,
             duration_ms: 40,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -1766,6 +1787,8 @@ mod tests {
             total_turns: 5,
             duration_ms: 60,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -1852,6 +1875,8 @@ mod tests {
             total_turns: 6,
             duration_ms: 90,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -1905,6 +1930,8 @@ mod tests {
             total_turns: 4,
             duration_ms: 50,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -1963,6 +1990,8 @@ mod tests {
             total_turns: 1,
             duration_ms: 50,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -2104,6 +2133,8 @@ mod tests {
             total_turns: 1,
             duration_ms: 12,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -2169,6 +2200,8 @@ mod tests {
             total_turns: 3,
             duration_ms: 30,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -2228,6 +2261,8 @@ mod tests {
             total_turns: 2,
             duration_ms: 20,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -2275,6 +2310,8 @@ mod tests {
             total_turns: 9,
             duration_ms: 25,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -2340,6 +2377,8 @@ mod tests {
                 total_turns: 6,
                 duration_ms: 10,
                  calibration_ratio_bp: None,
+                 context_figure: None,
+                 unfinished_input: None,
             });
 
             let records = observer.records();
@@ -2515,6 +2554,8 @@ mod tests {
             total_turns: 3,
             duration_ms: 12,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];
@@ -2584,6 +2625,8 @@ mod tests {
             total_turns: 5,
             duration_ms: 10,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
 
         let record = &observer.records()[0];

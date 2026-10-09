@@ -112,6 +112,7 @@ mod dispatch;
 mod emission;
 mod llm_turn;
 mod model_switch;
+mod prune;
 #[cfg(test)]
 mod tests;
 
@@ -321,6 +322,40 @@ pub struct BareLoop<C: ApiClient> {
     /// (the first report seeds the ratio directly).
     calibration: EstimateCalibration,
 
+    /// The last usable usage report, paired with the raw payload
+    /// estimate of the request it describes.
+    ///
+    /// When present, every driver→machine context figure is
+    /// `input_tokens + calibrated(raw_now − raw_payload)` — the real
+    /// number carries the figure and only the appends since the
+    /// report are estimated. Driver-side like the calibration: a
+    /// property of the backend's reports, not the conversation, so it
+    /// does not serialize with the machine. Cleared whenever the wire
+    /// changes wholesale — a compaction pass or any model change (a
+    /// different tokenizer invalidates the pairing) — and re-armed by
+    /// the next report.
+    anchor: Option<UsageAnchor>,
+
+    /// The standalone tool-output reclamation configuration, if armed.
+    ///
+    /// `None` (the default) leaves the feed untouched outside
+    /// compaction; [`set_prune`](Self::set_prune) arms the pass and
+    /// validates its line against the compaction threshold.
+    prune: Option<crate::compact::PruneConfig>,
+
+    /// The turn that spent its overflow compact-and-retry, if any.
+    ///
+    /// Every turn gets one salvage: a provider rejection whose text
+    /// reports an oversized prompt forces one emergency compaction
+    /// and re-submits the same turn against the compacted history. A
+    /// second rejection on that turn is a genuine misfit — the
+    /// conversation does not fit even compacted — and ends the run as
+    /// [`ContextExceeded`](LoopError::ContextExceeded). Turn numbers
+    /// restart every run, so the spent retry is cleared at run start
+    /// — a later run's own rejection at the same index must get its
+    /// salvage, not collide with the previous run's.
+    overflow_retry: Option<usize>,
+
     /// Sticky detection bypass, set once detection state is found
     /// poisoned — detection is advisory, so the session continues with
     /// it skipped rather than failing. Atomic so the `&self` tool-path
@@ -466,6 +501,40 @@ struct TurnAccounting {
     stop_reason: StreamStopReason,
 }
 
+/// The last usable usage report paired with the wire it describes.
+///
+/// The anchor narrows the context figure's error surface from the
+/// whole history to the appends since the report:
+/// [`context_figure`](BareLoop::context_figure) computes
+/// `input_tokens + calibrated(raw_now − raw_payload)`, so the provider's
+/// own number carries the figure and only the tail is estimated. Built
+/// by the usage observation path whenever a report arrives with a
+/// usable input figure and an armed prediction; cleared by the
+/// invalidation events that make the pairing stale.
+#[derive(Debug)]
+struct UsageAnchor {
+    /// The report's input figure, in the provider's window scale.
+    ///
+    /// The number the provider's own window denominator counts
+    /// against — for OpenAI-compatible wire, prompt tokens including
+    /// cache reads. Zero-bearing reports never build an anchor.
+    input_tokens: u64,
+
+    /// The raw payload estimate of the request the report describes.
+    ///
+    /// The calibration prediction stash captured at report time; the
+    /// delta is the saturating difference between the current raw
+    /// payload and this figure.
+    raw_payload: u64,
+
+    /// The completed-turn count once the anchor's own turn lands.
+    ///
+    /// The age denominator for telemetry: completed turns since the
+    /// report, so a host can see how fresh the figure's real number
+    /// is — zero while the anchoring turn is still the newest one.
+    anchored_at_turn: usize,
+}
+
 /// The measured components of the per-request overhead.
 ///
 /// Kept as two fields rather than one cached sum because the request's
@@ -540,7 +609,7 @@ struct EstimateCalibration {
     ///
     /// Starts at [`CALIBRATION_IDENTITY_BP`] and never leaves the
     /// clamp bounds; every driver→machine estimate feed multiplies it
-    /// in through [`calibrated`](BareLoop::calibrated).
+    /// in through [`context_figure`](BareLoop::context_figure).
     ratio_bp: u64,
 
     /// The raw counter estimate of the last request sent, in uncalibrated
@@ -781,6 +850,9 @@ impl<C: ApiClient> BareLoop<C> {
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
+            anchor: None,
+            prune: None,
+            overflow_retry: None,
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -1106,15 +1178,26 @@ impl<C: ApiClient> BareLoop<C> {
         }
     }
 
-    /// Apply the usage-fed calibration ratio to a raw estimate.
+    /// The context figure for a raw payload estimate.
     ///
-    /// Every driver→machine feed of the context-size estimate runs
-    /// through here, so the machine's stored figure — and with it the
-    /// compaction trigger's arithmetic and the no-shrink comparison —
-    /// stays in one scale. Identity until a provider reports usable
-    /// input tokens, and exact at identity.
-    fn calibrated(&self, tokens: u64) -> u64 {
-        self.calibration.apply(tokens)
+    /// With a fresh anchor the provider's own number carries the
+    /// figure — `anchor.input_tokens` plus the calibrated estimate of
+    /// everything appended to the wire since the report — so the error
+    /// surface is the tail, not the whole history. Without one this is
+    /// exactly the calibrated estimate. Every driver→machine feed
+    /// routes through here, so the machine's stored figure (and with
+    /// it the compaction trigger) is anchored whenever a usable
+    /// report exists and estimated otherwise; the two scales are the
+    /// same provider-token scale, so the trigger's comparison against
+    /// the window is sound in both arms.
+    fn context_figure(&self, raw_payload: u64) -> u64 {
+        let Some(anchor) = &self.anchor else {
+            return self.calibration.apply(raw_payload);
+        };
+        anchor.input_tokens.saturating_add(
+            self.calibration
+                .apply(raw_payload.saturating_sub(anchor.raw_payload)),
+        )
     }
 
     /// The measured per-request overhead components, computed once.
@@ -1253,6 +1336,9 @@ impl<C: ApiClient> BareLoop<C> {
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
+            anchor: None,
+            prune: None,
+            overflow_retry: None,
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -1366,6 +1452,9 @@ impl<C: ApiClient> BareLoop<C> {
             overhead: std::sync::OnceLock::new(),
             deferred_transient_tokens: 0,
             calibration: EstimateCalibration::identity(),
+            anchor: None,
+            prune: None,
+            overflow_retry: None,
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -1779,21 +1868,31 @@ impl<C: ApiClient> BareLoop<C> {
         // and model-switch bookkeeping have not fired yet;
         // `next_step` is idempotent, so the re-check is a pure
         // re-decision).
-        let raw_payload = self
+        let mut raw_payload = self
             .count_context(&self.machine.full_history())
             .saturating_add(self.request_overhead_tokens())
             .saturating_add(self.count_context(&messages));
-        let payload = self.calibrated(raw_payload);
+        let mut payload = self.context_figure(raw_payload);
         self.machine.set_context_tokens(payload);
+        if self.maybe_prune().await? {
+            raw_payload = self
+                .count_context(&self.machine.full_history())
+                .saturating_add(self.request_overhead_tokens())
+                .saturating_add(self.count_context(&messages));
+            payload = self.context_figure(raw_payload);
+            self.machine.set_context_tokens(payload);
+        }
         if matches!(
             self.machine.next_step(self.machine_policy()),
             MachineStep::Compact { .. }
         ) {
             self.deferred_transient_tokens = self.count_context(&messages);
+            self.anchor = None;
             return Ok(());
         }
         self.calibration.note_prediction(raw_payload);
         self.note_routed_model()?;
+        let transient_tokens = self.count_context(&messages);
 
         self.notify_turn_start(turn, &turn_input);
 
@@ -1806,6 +1905,9 @@ impl<C: ApiClient> BareLoop<C> {
         } = match turn_outcome {
             Ok(serving) => serving,
             Err(e) => {
+                if let Some(salvage) = self.overflow_salvage(turn, &e, turn_start) {
+                    return salvage;
+                }
                 let failed = e.to_string();
                 self.notify_failed_turn(
                     turn,
@@ -1870,9 +1972,10 @@ impl<C: ApiClient> BareLoop<C> {
         };
         let mut context_history = self.machine.full_history();
         context_history.push(model_response.message.clone());
-        let context_tokens = self.calibrated(
+        let context_tokens = self.context_figure(
             self.count_context(&context_history)
-                .saturating_add(self.request_overhead_tokens()),
+                .saturating_add(self.request_overhead_tokens())
+                .saturating_add(transient_tokens),
         );
         self.machine.model_response(model_response, context_tokens);
 
@@ -2190,7 +2293,7 @@ impl<C: ApiClient> BareLoop<C> {
             Role::User,
             slots.into_iter().flatten().collect(),
         )]);
-        let estimate = self.calibrated(
+        let estimate = self.context_figure(
             self.count_context(&self.machine.full_history())
                 .saturating_add(self.request_overhead_tokens()),
         );
@@ -2240,6 +2343,7 @@ impl<C: ApiClient> BareLoop<C> {
         &mut self,
         reason: crate::compact::types::CompactReason,
     ) -> Result<(), LoopError> {
+        self.anchor = None;
         let turn = self.machine.turns_taken();
         let cancelled = Arc::clone(&self.cancelled);
         let outcome = tokio::select! {
@@ -2310,6 +2414,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             }
             self.machine.accept_input(input);
             self.deferred_transient_tokens = 0;
+            self.overflow_retry = None;
             let cancelled = Arc::clone(&self.cancelled);
             let resolution = tokio::select! {
                 biased;
@@ -2321,7 +2426,7 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
                 self.finalize(Some(&e)).await?;
                 return Err(e);
             }
-            let estimate = self.calibrated(
+            let estimate = self.context_figure(
                 self.count_context(&self.machine.full_history())
                     .saturating_add(self.request_overhead_tokens()),
             );
@@ -2489,6 +2594,72 @@ fn conversation_cannot_fit(error: &LoopError) -> bool {
         LoopError::ContextExceeded { .. } | LoopError::CompactionStalled { .. } => true,
         LoopError::Api(message) => message_reports_context_overflow(message),
         _ => false,
+    }
+}
+
+impl<C: ApiClient> BareLoop<C> {
+    /// Run the compact-and-retry salvage for a provider-reported
+    /// oversized prompt.
+    ///
+    /// The first such rejection on a turn spends the turn's one
+    /// retry: it fires a failed-turn event, forces the machine onto
+    /// the compaction path when the conversation can shrink (and
+    /// resets the figure when it cannot — a single-message
+    /// conversation has nothing to compact, so the retry re-enters
+    /// directly), and returns the retry marker. A repeat rejection on
+    /// a turn that already spent its retry is terminal: the
+    /// conversation does not fit even compacted, surfaced as
+    /// [`ContextExceeded`](LoopError::ContextExceeded) with the
+    /// machine's figure floored just above the window — the provider
+    /// declared the request unfittable, so the reported usage never
+    /// reads as fitting — after the retry's own failed-turn event
+    /// fires, pairing its turn-start. Any other error returns `None`
+    /// and takes the ordinary failure path.
+    fn overflow_salvage(
+        &mut self,
+        turn: usize,
+        error: &LoopError,
+        turn_start: Instant,
+    ) -> Option<Result<(), LoopError>> {
+        let rejection = matches!(error, LoopError::Api(text)
+            if message_reports_context_overflow(text));
+        if !rejection {
+            return None;
+        }
+        if self.overflow_retry == Some(turn) {
+            let limit = self.effective_context_window();
+            let exhausted = LoopError::ContextExceeded {
+                used: self.machine.context_tokens().max(limit.saturating_add(1)),
+                limit,
+            };
+            let failed = exhausted.to_string();
+            self.notify_failed_turn(turn, &failed, turn_start, (0, 0), StreamStopReason::EndTurn);
+            return Some(Err(exhausted));
+        }
+        self.overflow_retry = Some(turn);
+        let shrinkable = self.machine.full_history().len() > 1;
+        if shrinkable {
+            self.machine
+                .set_context_tokens(self.effective_context_window().saturating_add(1));
+        }
+        let compacted = shrinkable
+            && matches!(
+                self.machine.next_step(self.machine_policy()),
+                MachineStep::Compact { .. }
+            );
+        if !compacted && shrinkable {
+            return None;
+        }
+        if !shrinkable {
+            let raw = self
+                .count_context(&self.machine.full_history())
+                .saturating_add(self.request_overhead_tokens());
+            self.machine.set_context_tokens(self.context_figure(raw));
+        }
+        let failed = error.to_string();
+        self.notify_failed_turn(turn, &failed, turn_start, (0, 0), StreamStopReason::EndTurn);
+        self.anchor = None;
+        Some(Ok(()))
     }
 }
 

@@ -91,7 +91,7 @@ impl<C: ApiClient> BareLoop<C> {
         reason: crate::compact::types::CompactReason,
     ) -> Result<CompactStepOutcome, LoopError> {
         let history = self.machine.full_history();
-        let tokens_before = self.calibrated(
+        let tokens_before = self.context_figure(
             self.count_context(&history)
                 .saturating_add(self.overhead_tokens()),
         );
@@ -151,8 +151,8 @@ impl<C: ApiClient> BareLoop<C> {
         match result {
             Ok(EnsureContextResult::Compacted(outcome)) => {
                 self.demote_evicted(&outcome.evicted, reason, turn).await;
-                let tokens_after =
-                    self.calibrated(outcome.tokens_after.saturating_add(self.overhead_tokens()));
+                let tokens_after = self
+                    .context_figure(outcome.tokens_after.saturating_add(self.overhead_tokens()));
                 let tokens_saved = tokens_before.saturating_sub(tokens_after);
                 #[cfg(feature = "hooks")]
                 let messages_after = outcome.messages.len();
@@ -187,7 +187,7 @@ impl<C: ApiClient> BareLoop<C> {
                 })
             }
             Ok(EnsureContextResult::NoAction(messages)) => {
-                let tokens_after = self.calibrated(
+                let tokens_after = self.context_figure(
                     self.count_context(&messages)
                         .saturating_add(self.overhead_tokens()),
                 );
@@ -234,7 +234,7 @@ impl<C: ApiClient> BareLoop<C> {
     /// become retrievable memories. An empty eviction list is a no-op,
     /// and a sink that rejects the batch is warned about, never failed
     /// — compaction's own success must not hinge on the memory layer.
-    async fn demote_evicted(
+    pub(super) async fn demote_evicted(
         &self,
         evicted: &[Message],
         reason: crate::compact::types::CompactReason,
@@ -279,7 +279,7 @@ impl<C: ApiClient> BareLoop<C> {
         let Some(executor) = self.managers.hook_executor() else {
             return crate::hooks::context::CompactResult::allow();
         };
-        let tokens_before = self.calibrated(
+        let tokens_before = self.context_figure(
             self.count_context(history)
                 .saturating_add(self.overhead_tokens()),
         );

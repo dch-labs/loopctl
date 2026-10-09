@@ -86,6 +86,108 @@ pub mod truncating;
 pub mod types;
 
 pub(crate) use demote::render_compaction_transcript;
+
+/// Configuration for the standalone tool-output reclamation pass.
+///
+/// The prune pass is a no-LLM reclaim that runs below the compaction
+/// trigger: when the context figure crosses
+/// [`prune_line_pct`](Self::prune_line_pct) of the window, completed
+/// tool results older than the protected tail are cleared from the
+/// feed (their content replaced by a short marker) and handed to the
+/// [`DemotionSink`] — reclaiming bytes in milliseconds where a
+/// summarizer pass would cost model calls. Opt-in: a loop without a
+/// configured prune never rewrites a tool result. The pass is
+/// hook-invisible by design — it makes no model call and no state
+/// transition, so `pre_compact` hooks are never consulted and cannot
+/// veto a clear; a host wanting a policy gate over reclamation wraps
+/// the engine's `set_prune` call in its own decision.
+///
+/// # Example
+///
+/// ```rust
+/// use loopctl::compact::PruneConfig;
+///
+/// let config = PruneConfig::default()
+///     .with_prune_line_pct(60)
+///     .with_min_free_pct(10);
+/// assert_eq!(config.prune_line_pct, 60);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneConfig {
+    /// The fraction of the window that arms the pass, in percent.
+    ///
+    /// The pass runs when the context figure reaches this fraction —
+    /// which must sit strictly below the compaction threshold, so
+    /// pruning gets its chance before the summarizer is reached. The
+    /// engine rejects a configuration whose line does not (an
+    /// [`InvalidInput`](crate::error::LoopError::InvalidInput), never
+    /// a silent clamp). Default `60` against the default `80`
+    /// threshold.
+    pub prune_line_pct: u16,
+
+    /// The minimum reclaim that justifies a pass, in percent of the
+    /// window.
+    ///
+    /// The minimum-free gate: a projection under this fraction is a
+    /// no-op, so a clear that frees nothing does not churn the feed.
+    /// Values above `100` are rejected by the engine's configuration
+    /// surface — the clearable pool can never reach a full window
+    /// while the conversation fits under it, so such a gate would
+    /// disable the pass silently. Default `10`.
+    pub min_free_pct: u16,
+
+    /// The token budget of the protected tail.
+    ///
+    /// The newest conversation content, counted from the end, is never
+    /// cleared — the active turn's context and its immediate
+    /// predecessors stay verbatim whatever their class. Default
+    /// `2 000` tokens, the order of a truncating pass's preserved
+    /// floor.
+    pub protected_tail_tokens: u64,
+}
+
+impl Default for PruneConfig {
+    fn default() -> Self {
+        Self {
+            prune_line_pct: 60,
+            min_free_pct: 10,
+            protected_tail_tokens: 2_000,
+        }
+    }
+}
+
+impl PruneConfig {
+    /// Set the arming fraction of the window, in percent.
+    ///
+    /// Must stay strictly below the compaction threshold — the engine
+    /// validates the pairing at configuration time.
+    #[must_use]
+    pub fn with_prune_line_pct(mut self, pct: u16) -> Self {
+        self.prune_line_pct = pct;
+        self
+    }
+
+    /// Set the minimum-free gate, in percent of the window.
+    ///
+    /// A pass projected to reclaim less than this fraction of the
+    /// window is a no-op. Values above `100` are rejected when the
+    /// configuration reaches the engine — such a gate could never be
+    /// satisfied.
+    #[must_use]
+    pub fn with_min_free_pct(mut self, pct: u16) -> Self {
+        self.min_free_pct = pct;
+        self
+    }
+
+    /// Set the protected tail's token budget.
+    ///
+    /// The newest content within this budget is never cleared.
+    #[must_use]
+    pub fn with_protected_tail_tokens(mut self, tokens: u64) -> Self {
+        self.protected_tail_tokens = tokens;
+        self
+    }
+}
 pub use demote::{
     DemotionContext, DemotionSink, MemoryDemotionSink, NoopDemotionSink, render_evicted,
 };

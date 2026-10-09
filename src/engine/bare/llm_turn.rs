@@ -156,6 +156,7 @@ impl<C: ApiClient> BareLoop<C> {
             .is_some_and(|m| *m != served)
         {
             let from = self.last_routed_model.clone().unwrap_or(served.clone());
+            self.anchor = None;
             self.managers
                 .observers()
                 .on_model_switched(&crate::observer::ModelSwitchedContext {

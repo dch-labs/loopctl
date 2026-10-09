@@ -51,11 +51,11 @@ pub mod hub;
 
 pub use context::{
     AttemptResetContext, BudgetWarnContext, CompactedContext, CompactionFailedContext,
-    ConvergenceDetectedContext, FallbackContext, GateDecisionContext, LoopDetectedContext,
-    ModelSwitchedContext, PreCompactionContext, ResponseContext, RunEndContext, RunStartContext,
-    StreamContext, StreamFailureContext, TextDeltaContext, ThinkingDeltaContext,
-    ToolCallReceivedContext, ToolPostContext, ToolPreContext, TransportFallbackContext,
-    TurnEndContext, TurnStartContext,
+    ContextFigureInfo, ConvergenceDetectedContext, FallbackContext, FigureSource,
+    GateDecisionContext, LoopDetectedContext, ModelSwitchedContext, PreCompactionContext,
+    ResponseContext, RunEndContext, RunStartContext, StreamContext, StreamFailureContext,
+    TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext, ToolPostContext,
+    ToolPreContext, TransportFallbackContext, TurnEndContext, TurnStartContext,
 };
 pub use hub::{EventHub, LoopEvent, ObservedEvent};
 

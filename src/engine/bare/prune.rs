@@ -73,17 +73,23 @@ impl<C: ApiClient> BareLoop<C> {
     /// Returns whether the feed changed. No-op — without touching the
     /// conversation — when no [`PruneConfig`] is set, the window policy
     /// is disabled, the figure has not crossed the prune line, or the
-    /// projection would reclaim less than the minimum-free gate. A
-    /// pruned feed clears the usage anchor (the wire changed wholesale)
-    /// and hands the cleared originals to the demotion sink, oldest
-    /// first.
+    /// projection would reclaim less than the minimum-free gate. The
+    /// gate is converted from its provider-token fraction into the
+    /// counter's raw units — the scale the projection counts in — so a
+    /// settled calibration ratio cannot distort the gate's verdict.
+    /// A pruned feed clears the usage anchor (the wire changed
+    /// wholesale) and hands the cleared originals to the demotion
+    /// sink, oldest first.
     ///
     /// # Errors
     ///
-    /// Never: the history rewrite is infallible and a demotion sink
-    /// that rejects its batch is warned about, never failed on — the
-    /// returned [`Result`] exists so the call site composes with the
-    /// driver's error flow.
+    /// Returns [`LoopError::Cancelled`] when the cancel signal fires
+    /// while the demotion handoff is in flight — raced the same biased
+    /// way the compaction arm races its sink, and cut off before the
+    /// rewritten feed is adopted, so a cancelled pass leaves the
+    /// conversation untouched. The history rewrite itself is
+    /// infallible and a demotion sink that rejects its batch is warned
+    /// about, never failed on.
     pub(super) async fn maybe_prune(&mut self) -> Result<bool, LoopError> {
         let Some(config) = self.prune else {
             return Ok(false);
@@ -96,19 +102,26 @@ impl<C: ApiClient> BareLoop<C> {
         if self.machine.context_tokens() < line {
             return Ok(false);
         }
-        let minimum_free = window.saturating_mul(u64::from(config.min_free_pct)) / 100;
+        let minimum_free = self
+            .calibration
+            .raw_window(window.saturating_mul(u64::from(config.min_free_pct)) / 100);
         let messages = self.machine.full_history();
         let history_len = self.machine.history().len();
         let Some((pruned, cleared, reclaimed)) = plan_prune(self, &messages, config, minimum_free)
         else {
             return Ok(false);
         };
-        self.demote_evicted(
-            &cleared,
-            crate::compact::CompactReason::Prune,
-            self.machine.turns_taken(),
-        )
-        .await;
+        let cancelled = std::sync::Arc::clone(&self.cancelled);
+        let turn = self.machine.turns_taken();
+        tokio::select! {
+            biased;
+            () = cancelled.notified() => return Err(LoopError::Cancelled),
+            () = self.demote_evicted(
+                &cleared,
+                crate::compact::CompactReason::Prune,
+                turn,
+            ) => {}
+        }
         self.machine.adopt_pruned(pruned, history_len);
         self.anchor = None;
         tracing::debug!(

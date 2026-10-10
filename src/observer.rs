@@ -338,22 +338,28 @@ pub trait LoopObserver: Send + Sync {
     /// occurred — not on no-action passes.
     fn on_compaction(&self, _ctx: &CompactedContext) {}
 
-    /// Called when a compaction pass was attempted and failed.
+    /// Called when a compaction pass was attempted and failed, or
+    /// deferred.
     ///
-    /// Fires from the error arm of the engine's compaction step — a
-    /// compactor that errored, or a pass whose successful result still
-    /// did not fit the window (`error` is `None` for the latter). The
-    /// matching [`on_pre_compaction`](Self::on_pre_compaction) already
-    /// fired at pass start, and the success
-    /// [`on_compaction`](Self::on_compaction) never follows, so this
-    /// event is the only programmatic signal of the two pass-death
-    /// modes it covers — hosts that row retry episodes can row this one
-    /// the same way. A stalled pass (the machine's no-progress guard,
+    /// Fires from the engine's compaction step in three modes. Two
+    /// are pass deaths — a compactor that errored, or a pass whose
+    /// successful result still did not fit the window (`error` is
+    /// `None` for the latter); the matching
+    /// [`on_pre_compaction`](Self::on_pre_compaction) already fired
+    /// at pass start, the success [`on_compaction`](Self::on_compaction)
+    /// never follows, and the run has already failed with the
+    /// cause-carrying error by the time observers see the event —
+    /// hosts that row retry episodes can row these the same way. The
+    /// third mode is non-fatal: a threshold-triggered pass that shrank
+    /// nothing on a payload that still fits the window defers — the
+    /// engine serves the turn uncompacted and the run continues — and
+    /// `error` carries the deferral notice, so a host alerting on
+    /// this event as a run failure must read the notice before
+    /// alarming. An emergency-line stall (the machine's no-progress
+    /// guard,
     /// [`CompactionStalled`](crate::error::LoopError::CompactionStalled))
-    /// fires no compaction-family event: the stall is decided after the
-    /// feed, and the typed run error is its surface. Notification-only:
-    /// the run has already failed with the cause-carrying error by the
-    /// time observers see this.
+    /// fires no compaction-family event: the stall is decided after
+    /// the feed, and the typed run error is its surface.
     ///
     /// # Example
     ///

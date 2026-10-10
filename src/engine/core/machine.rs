@@ -417,6 +417,20 @@ pub struct LoopMachine {
     /// response requested, awaiting dispatch. Emitted as a `CallTools` step on
     /// the next [`Self::next_step`].
     pending_tools: Vec<PendingToolCall>,
+
+    /// Whether a deferred compaction already served this turn.
+    ///
+    /// Set when a threshold-triggered pass stalled on a payload that
+    /// still fits the window and the driver chose to serve the turn
+    /// anyway; the threshold trigger stands down for the rest of the
+    /// turn so the loop reaches the model request instead of spinning
+    /// compact-defer cycles. The emergency line ignores the latch —
+    /// at the window's edge the hard failure still applies — and the
+    /// next run boundary clears it so a later trigger retries.
+    /// Defaults down, so snapshots serialized before the field
+    /// existed deserialize to exactly the pre-change semantic.
+    #[serde(default)]
+    deferred_compaction: bool,
 }
 
 impl LoopMachine {
@@ -441,6 +455,7 @@ impl LoopMachine {
             context_tokens: 0,
             cancelled: false,
             pending_tools: Vec::new(),
+            deferred_compaction: false,
         }
     }
 
@@ -465,6 +480,7 @@ impl LoopMachine {
         self.context_tokens = 0;
         self.cancelled = false;
         self.pending_tools.clear();
+        self.deferred_compaction = false;
     }
 
     /// Feed a driver-measured context estimate into the machine.
@@ -574,7 +590,7 @@ impl LoopMachine {
             self.state = MachineState::AwaitingCompaction { reason };
             return MachineStep::Compact { reason };
         }
-        if policy.auto_compact && self.should_compact(policy) {
+        if policy.auto_compact && !self.deferred_compaction && self.should_compact(policy) {
             let reason = CompactReason::ThresholdExceeded;
             self.state = MachineState::AwaitingCompaction { reason };
             return MachineStep::Compact { reason };
@@ -645,6 +661,7 @@ impl LoopMachine {
             })
             .collect();
         let turn_number = self.turns_taken;
+        self.deferred_compaction = false;
         self.pending.push(message);
         self.context_tokens = context_tokens;
         self.turns_taken = self.turns_taken.saturating_add(1);
@@ -785,6 +802,25 @@ impl LoopMachine {
             return;
         }
         self.context_tokens = tokens_after;
+        self.state = MachineState::Start;
+    }
+
+    /// Absorb a stalled pass by serving the next request anyway.
+    ///
+    /// The companion to [`Self::compaction_noop`] for the case where a
+    /// threshold-triggered pass could not shrink the conversation but
+    /// the payload still fits the window: the run continues on the
+    /// unchanged history instead of dying on the no-progress guard.
+    /// The engine calls this only after checking the fit; the 95 %
+    /// emergency line keeps its hard failure — a stall at the window's
+    /// edge still ends the run, because serving would wedge
+    /// every later turn.
+    pub fn compaction_deferred(&mut self, tokens_after: u64) {
+        if self.is_terminal() {
+            return;
+        }
+        self.context_tokens = tokens_after;
+        self.deferred_compaction = true;
         self.state = MachineState::Start;
     }
 
@@ -1487,6 +1523,40 @@ mod tests {
         let a = machine.next_step(policy);
         let b = restored.next_step(policy);
         assert!(same_step(&a, &b), "steps diverged after round-trip");
+    }
+
+    #[test]
+    fn a_snapshot_without_the_deferral_latch_round_trips() {
+        let policy = MachinePolicy {
+            max_turns: 5,
+            context_window: 100,
+            compact_threshold: 50,
+            auto_compact: true,
+        };
+        let mut machine = LoopMachine::from_history(vec![Message::user(long_text(250))]);
+        let _ = machine.next_step(policy);
+        machine.model_response(tool_response("echo", &["echo"], 0), count_tokens(&machine));
+        let _ = machine.next_step(policy);
+        machine.tool_results(vec![Message::user(long_text(250))]);
+        let _ = machine.next_step(policy);
+        machine.compaction_deferred(count_tokens(&machine));
+        assert!(
+            machine.deferred_compaction,
+            "the source latched the deferral"
+        );
+
+        let snapshot = serde_json::to_value(&machine).expect("serialize");
+        let mut pre_change = snapshot;
+        pre_change
+            .as_object_mut()
+            .expect("machine serializes as a JSON object")
+            .remove("deferred_compaction");
+        let restored: LoopMachine =
+            serde_json::from_value(pre_change).expect("a pre-change snapshot deserializes");
+        assert!(
+            !restored.deferred_compaction,
+            "the omitted latch defaults down — the pre-change semantic"
+        );
     }
 
     #[test]

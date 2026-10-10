@@ -280,12 +280,13 @@ pub struct TrajectoryTurn {
 
     /// Wall-clock duration of the turn, in milliseconds.
     ///
-    /// The engine reports a tool turn's time as two disjoint per-phase
-    /// figures (the model phase and the tool phase); the recorded
-    /// duration is their saturating sum, so a well-formed stream
-    /// reconstructs the turn's full wall clock. End events arriving for
-    /// an already-closed turn add to it; a turn that never received one
-    /// (mid-run attach, run ending first) reports zero.
+    /// The tool-phase turn-end measures the whole serving attempt
+    /// (the model call plus dispatch), so a well-formed stream's
+    /// recorded duration is the turn's full wall clock. End events
+    /// arriving for an already-closed turn add to it (the overflow
+    /// salvage's rejected attempt and retry each fire their own
+    /// pair); a turn that never received one (mid-run attach, run
+    /// ending first) reports zero.
     pub duration_ms: u64,
 
     /// Input tokens the turn consumed.
@@ -906,14 +907,13 @@ impl LoopObserver for TrajectoryObserver {
 
     /// Close a turn's slot, folding in the phase's duration and tokens.
     ///
-    /// The engine fires one turn-end event per serving attempt —
-    /// normally the tool-phase event for a turn that requested tools,
-    /// so such a turn's recorded duration covers dispatch only, and a
-    /// turn the overflow salvage retried fires a second pair under
-    /// the same index. The fold sums durations across multiple events
-    /// for one turn while the token figures stay last-wins; a
-    /// turn-end with no prior slot opens one lazily rather than
-    /// dropping the event.
+    /// The engine fires one turn-end event per serving attempt — the
+    /// tool-phase event for a turn that requested tools measures the
+    /// whole attempt (the model call plus dispatch), and a turn the
+    /// overflow salvage retried fires a second pair under the same
+    /// index. The fold sums durations across the events for one turn
+    /// while the token figures stay last-wins; a turn-end with no
+    /// prior slot opens one lazily rather than dropping the event.
     fn on_turn_end(&self, ctx: &TurnEndContext) {
         let mut guard = recover_guard(self.inner.lock());
         let Some(builder) = guard.as_mut() else {

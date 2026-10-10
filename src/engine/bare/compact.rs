@@ -137,6 +137,11 @@ impl<C: ApiClient> BareLoop<C> {
         let reserved = self
             .overhead_tokens()
             .saturating_add(std::mem::take(&mut self.deferred_transient_tokens));
+        let salvage_target = std::mem::take(&mut self.salvage_target);
+        let sizing = crate::compact::CompactSizing {
+            reserved_tokens: reserved,
+            target_override: salvage_target,
+        };
         let result = ctx_manager
             .compact_with_reason(
                 history,
@@ -144,7 +149,7 @@ impl<C: ApiClient> BareLoop<C> {
                 reason,
                 instructions,
                 additional_context,
-                reserved,
+                sizing,
             )
             .await;
 

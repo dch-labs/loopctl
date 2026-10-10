@@ -924,14 +924,19 @@ pub struct CompactionFailedContext {
     /// without holding the configuration itself.
     pub context_window: u64,
 
-    /// The compactor's own error text, when the compactor failed.
+    /// The compactor's own error text, the doesn't-fit marker, or the
+    /// deferral notice.
     ///
     /// `Some(cause)` when a compactor ran and errored — the verbatim
     /// text the run failure's `cause` field also carries. `None` when
     /// the pass *succeeded* but its result still did not fit the
     /// window: a different failure (the compactor did its job and the
     /// conversation still overflows), reported through the same event
-    /// so hosts have one place to watch.
+    /// so hosts have one place to watch. `Some(notice)` on the
+    /// non-fatal deferral — a threshold-triggered pass that shrank
+    /// nothing on a payload still under the window, after which the
+    /// run continues serving; the notice names the deferral, so an
+    /// observer can tell it from a cause-carrying death.
     pub error: Option<String>,
 }
 

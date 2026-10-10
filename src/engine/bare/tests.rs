@@ -1739,10 +1739,16 @@ const SLOW_RECOUNT_DELAY_MS: u64 = 600;
 /// — without building a huge history — so the turn-end duration pin can
 /// prove the recount stays outside the reported tool-phase span.
 struct SlowRecountCounter {
-    /// Delay charged by each `count` call.
+    /// Delay charged by each `count` call over result-bearing history.
     ///
     /// Built from [`SLOW_RECOUNT_DELAY_MS`] so a leaked recount visibly
     /// outlasts the tool phase while staying far under any test timeout.
+    /// Charged only when the slice carries a tool result — the shape
+    /// unique to the post-dispatch recount inside a tool turn: the
+    /// turn's earlier consultations (the pre-request payload and
+    /// transient counts) see result-free history and stay fast, so a
+    /// duration that covers the whole serving attempt still excludes
+    /// the recount by construction.
     delay: Duration,
 
     /// Consultations recorded so far.
@@ -1753,9 +1759,17 @@ struct SlowRecountCounter {
 }
 
 impl crate::compact::TokenCounter for SlowRecountCounter {
-    fn count(&self, _messages: &[Message]) -> u64 {
+    fn count(&self, messages: &[Message]) -> u64 {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        std::thread::sleep(self.delay);
+        let result_bearing = messages.iter().any(|message| {
+            message
+                .parts
+                .iter()
+                .any(|part| matches!(part, crate::message::MessagePart::ToolResult { .. }))
+        });
+        if result_bearing {
+            std::thread::sleep(self.delay);
+        }
         1
     }
 }
@@ -2267,6 +2281,78 @@ async fn run_end_reports_the_figure_source_and_anchor_age() {
         "a usage-less backend's figure flew on the estimate"
     );
     assert_eq!(unanchored.anchor_age_turns, None, "no anchor exists to age");
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_cross_run_anchor_ages_without_new_reports() {
+    let client = MockClient::new("test-model").without_usage();
+    client.add_events(vec![
+        StreamEvent::MessageStart(MessageStart {
+            message: MessageMetadata {
+                id: "msg_age".into(),
+                role: "assistant".into(),
+                model: "test-model".into(),
+            },
+        }),
+        StreamEvent::PartStart(PartStart {
+            index: 0,
+            part: Some(MessagePart::text("anchored")),
+        }),
+        StreamEvent::IndexedDelta(IndexedDelta {
+            index: 0,
+            delta: DeltaPart::Text {
+                text: "anchored".to_string(),
+            },
+        }),
+        StreamEvent::PartStop { index: None },
+        StreamEvent::MessageDelta(MessageDelta {
+            delta: MessageDeltaPayload {
+                stop_reason: Some("end_turn".to_string()),
+            },
+            usage: Some(Usage::new(2_000, 5)),
+        }),
+        StreamEvent::MessageStop,
+    ]);
+    client.add_text_response("quiet turn");
+    let figures = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = BareLoop::new_with_managers(
+        Arc::new(client),
+        ToolRegistry::new(),
+        make_config(),
+        crate::managers::LoopManagers::new().with_observer(Arc::new(RunEndFigureRecorder {
+            figures: Arc::clone(&figures),
+            unfinished: Arc::new(Mutex::new(Vec::new())),
+        })),
+    );
+    agent.run("anchor me", &RunConfig::default()).await.unwrap();
+    agent
+        .run("no reports here", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let recorded = crate::error::recover_guard(figures.lock()).clone();
+    let first = recorded
+        .first()
+        .cloned()
+        .flatten()
+        .expect("the reporting run names its figure");
+    assert_eq!(
+        first.anchor_age_turns,
+        Some(0),
+        "the anchoring run's own final report is age zero"
+    );
+    let second = recorded
+        .get(1)
+        .cloned()
+        .flatten()
+        .expect("the usage-free run still names the surviving anchor's figure");
+    let expected_age = 1;
+    assert_eq!(
+        second.anchor_age_turns,
+        Some(expected_age),
+        "the anchor aged by the second run's own completed turn: {second:?}"
+    );
 }
 
 /// An echo tool whose result size and retention class the scripted
@@ -2961,6 +3047,148 @@ async fn a_prune_that_frees_enough_avoids_the_compaction() {
     );
 }
 
+/// A demotion sink that records entry and never resolves.
+#[cfg(feature = "streaming")]
+struct HangingSink {
+    /// How many `demote` calls began.
+    entered: Arc<Mutex<usize>>,
+}
+
+#[cfg(feature = "streaming")]
+impl crate::compact::DemotionSink for HangingSink {
+    fn demote<'a>(
+        &'a self,
+        _evicted: &'a [Message],
+        _context: crate::compact::DemotionContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::error::LoopError>> + Send + 'a>> {
+        let mut entered = crate::error::recover_guard(self.entered.lock());
+        *entered = entered.saturating_add(1);
+        drop(entered);
+        Box::pin(std::future::pending())
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_cancel_during_a_hanging_prune_sink_ends_the_run_typed() {
+    let client = MockClient::new("test-model").without_usage();
+    add_retention_script(
+        &client,
+        &[(500, ""), (500, ""), (500, ""), (500, ""), (500, "")],
+    );
+    let entered = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_demotion_sink(Arc::new(HangingSink {
+            entered: Arc::clone(&entered),
+        }) as Arc<dyn crate::compact::DemotionSink>);
+    let config = make_config()
+        .with_context_window(1_000)
+        .with_compact_threshold(80);
+    let mut registry = ToolRegistry::new();
+    registry.register(RetentionEcho);
+    let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
+    agent
+        .set_prune(
+            crate::compact::PruneConfig::default()
+                .with_prune_line_pct(60)
+                .with_min_free_pct(10)
+                .with_protected_tail_tokens(150),
+        )
+        .expect("60 sits strictly below the 80 threshold");
+    let cancel_signal = agent.cancel_signal();
+    let run = tokio::spawn(async move {
+        let outcome = agent
+            .run("prune into the hanging sink", &RunConfig::default())
+            .await;
+        (outcome, agent)
+    });
+    while *crate::error::recover_guard(entered.lock()) == 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    cancel_signal.cancel();
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(10), run).await;
+    let (outcome, agent) = joined
+        .expect("the cancellation ends the run rather than hanging with the sink")
+        .expect("spawned run task finished");
+    assert!(
+        matches!(outcome, Err(LoopError::Cancelled)),
+        "the mid-handoff cancel surfaces typed: {outcome:?}"
+    );
+    let at_rest = agent.machine().full_history();
+    assert!(
+        at_rest.iter().all(|message| {
+            message.parts.iter().all(|part| match part {
+                MessagePart::ToolResult { output, .. } => {
+                    !matches!(output, ToolContent::Text(text) if text.contains("[cleared"))
+                }
+                _ => true,
+            })
+        }),
+        "the cancelled pass never adopted its rewrite — no marker in the feed: {at_rest:?}"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn the_minimum_free_gate_reads_the_counter_s_scale() {
+    let client = MockClient::new("test-model");
+    add_retention_script_with_usage(&client, &[(250, ""), (50, "")], &[1_250]);
+    let sink = Arc::new(PruneSinkCapture {
+        handed: Arc::new(Mutex::new(Vec::new())),
+    });
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_demotion_sink(Arc::clone(&sink) as Arc<dyn crate::compact::DemotionSink>);
+    let config = make_config()
+        .with_context_window(2_000)
+        .with_compact_threshold(95);
+    let mut registry = ToolRegistry::new();
+    registry.register(RetentionEcho);
+    let mut agent = BareLoop::new_with_managers(Arc::new(client), registry, config, managers);
+    agent
+        .set_prune(
+            crate::compact::PruneConfig::default()
+                .with_prune_line_pct(60)
+                .with_min_free_pct(10)
+                .with_protected_tail_tokens(0),
+        )
+        .expect("60 sits strictly below the 95 threshold");
+    agent
+        .run("gate my scale", &RunConfig::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *crate::error::recover_guard(compactions.lock()),
+        0,
+        "no compaction fired — the prune pass alone handles the crossing"
+    );
+    let at_rest = agent.machine().full_history();
+    let markers = at_rest
+        .iter()
+        .filter(|message| {
+            message.parts.iter().any(|part| match part {
+                MessagePart::ToolResult { output, .. } => matches!(
+                    output,
+                    ToolContent::Text(text) if text == "[cleared: prior tool output]"
+                ),
+                _ => false,
+            })
+        })
+        .count();
+    assert!(
+        markers >= 1,
+        "the raw-scale projection cleared the raw-converted gate and the pass ran: {at_rest:?}"
+    );
+    assert!(
+        !crate::error::recover_guard(sink.handed.lock()).is_empty(),
+        "the admitted pass handed its cleared originals to the sink"
+    );
+}
+
 /// A client with a hard provider-side window: a request whose
 /// heuristic size exceeds it is rejected with the provider's
 /// oversized-prompt phrase, anything less serves the scripted stream.
@@ -3073,6 +3301,57 @@ async fn an_oversized_prompt_rejection_compacts_and_retries_the_same_turn() {
 
 #[cfg(feature = "streaming")]
 #[tokio::test]
+async fn the_salvage_pass_lands_under_the_refused_payload_with_the_default_compactor() {
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_text_response("retried turn lands");
+    let compactions = Arc::new(Mutex::new(0usize));
+    let managers = crate::managers::LoopManagers::new()
+        .with_observer(Arc::new(CompactionCounter {
+            count: Arc::clone(&compactions),
+        }))
+        .with_context_manager(Arc::new(crate::compact::ContextManager::new(Arc::new(
+            crate::compact::TruncatingCompactor::new(),
+        ))));
+    let config = make_config()
+        .with_context_window(4_000)
+        .with_compact_threshold(80);
+    let seeded: Vec<Message> = (0..12)
+        .map(|step| {
+            if step % 2 == 0 {
+                Message::user("y".repeat(40))
+            } else {
+                Message::assistant("a".repeat(40))
+            }
+        })
+        .collect();
+    let mut agent = BareLoop::from_machine_with_managers(
+        crate::engine::core::LoopMachine::from_history(seeded),
+        config,
+        Arc::new(HardWindowClient {
+            inner: scripted,
+            window: 160,
+        }),
+        ToolRegistry::new(),
+        managers,
+    );
+    let result = agent
+        .run(
+            "salvage through the default compactor",
+            &RunConfig::default(),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "the forced pass landed under the refused payload and the retried turn served: {result:?}"
+    );
+    assert!(
+        *crate::error::recover_guard(compactions.lock()) >= 1,
+        "the salvage forced a real truncation pass — not a declined no-op"
+    );
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
 async fn a_second_overflow_rejection_ends_the_run() {
     let scripted = MockClient::new("test-model").without_usage();
     scripted.add_text_response("never reached");
@@ -3151,6 +3430,84 @@ impl crate::observer::LoopObserver for TurnEventCounter {
     fn on_turn_end(&self, ctx: &crate::observer::TurnEndContext) {
         crate::error::recover_guard(self.ends.lock()).push(ctx.turn);
     }
+}
+
+/// A client that delays the first event of every stream, standing in
+/// for a model phase with a measurable wall-clock cost.
+#[cfg(feature = "streaming")]
+struct SlowModelClient {
+    /// The scripted responses, served after the delay.
+    inner: MockClient,
+
+    /// How long each request takes to produce its first event.
+    delay: std::time::Duration,
+}
+
+#[cfg(feature = "streaming")]
+impl ApiClient for SlowModelClient {
+    fn model(&self) -> String {
+        self.inner.model()
+    }
+    fn set_model(&self, model: &str) -> bool {
+        self.inner.set_model(model)
+    }
+    fn stream_messages(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        use futures::StreamExt as _;
+        let delay = self.delay;
+        let inner = self.inner.stream_messages(request);
+        Box::pin(
+            futures::stream::once(async move {
+                tokio::time::sleep(delay).await;
+                inner
+            })
+            .flatten(),
+        )
+    }
+    fn create_message(
+        &self,
+        request: &crate::api::StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::api::NonStreamingResponse, ApiError>> + Send + '_>>
+    {
+        self.inner.create_message(request)
+    }
+}
+
+#[cfg(feature = "streaming")]
+#[tokio::test]
+async fn a_tool_turn_s_duration_covers_the_model_phase() {
+    let scripted = MockClient::new("test-model").without_usage();
+    scripted.add_tool_only_response("c1", "echo", &json!({"message": "hi"}));
+    scripted.add_text_response("done");
+    let ends = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let mut agent = BareLoop::new(
+        Arc::new(SlowModelClient {
+            inner: scripted,
+            delay: std::time::Duration::from_millis(100),
+        }),
+        registry,
+        make_config(),
+    );
+    agent.register_observer(Arc::new(TurnDurationRecorder { ends: ends.clone() }));
+    agent
+        .run("time my whole turn", &RunConfig::default())
+        .await
+        .unwrap();
+
+    let recorded = crate::error::recover_guard(ends.lock()).clone();
+    let tool_phase = recorded
+        .iter()
+        .find(|(turn, _, _)| *turn == 0)
+        .copied()
+        .unwrap_or_else(|| panic!("the tool turn fired its turn-end: {recorded:?}"));
+    assert!(
+        tool_phase.2 >= 100,
+        "the figure covers the 100 ms model phase plus dispatch: {recorded:?}"
+    );
 }
 
 #[cfg(feature = "streaming")]
@@ -12181,4 +12538,205 @@ async fn wire_parity_under() {
 #[tokio::test]
 async fn the_wire_payload_is_exactly_what_the_figure_counts() {
     wire_parity_under().await;
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+fn stalled_threshold_fixture() -> Vec<Message> {
+    let mut history = vec![Message::user("grow")];
+    let chunk = "stall payload line for the budget\n".repeat(60);
+    for index in 0..30u32 {
+        let call_id = format!("seed-{index}");
+        history.push(Message::new(
+            crate::message::Role::Assistant,
+            vec![MessagePart::tool_call(
+                call_id.clone(),
+                "Read",
+                json!({ "path": "chunk.txt" }),
+            )],
+        ));
+        history.push(Message::new(
+            crate::message::Role::User,
+            vec![MessagePart::tool_result(
+                call_id,
+                "Read",
+                ToolContent::Text(chunk.clone()),
+                false,
+            )],
+        ));
+    }
+    history
+}
+
+/// Records every `on_compaction_failed` dispatch's reason and error text.
+#[cfg(all(feature = "streaming", feature = "testing"))]
+struct CompactionFailureRecorder {
+    /// The `(reason, error text)` pair per dispatch, in event order.
+    failures: Arc<Mutex<Vec<CompactionFailureRow>>>,
+}
+
+/// One recorded `on_compaction_failed` dispatch.
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[derive(Clone)]
+struct CompactionFailureRow {
+    /// The triggering reason, debug-rendered.
+    reason: String,
+
+    /// The event's error text — the cause, the doesn't-fit `None`, or
+    /// the deferral notice.
+    error: Option<String>,
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+impl crate::observer::LoopObserver for CompactionFailureRecorder {
+    fn name(&self) -> &'static str {
+        "compaction-failure-recorder"
+    }
+    fn on_compaction_failed(&self, ctx: &crate::observer::CompactionFailedContext) {
+        crate::error::recover_guard(self.failures.lock()).push(CompactionFailureRow {
+            reason: format!("{:?}", ctx.reason),
+            error: ctx.error.clone(),
+        });
+    }
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn a_threshold_stall_that_fits_the_window_serves_the_turn() {
+    // A threshold-triggered pass whose whole chain declines used to
+    // die on the no-progress guard and discard the run's pending
+    // buffer — silent amnesia for a conversation that still fit the
+    // window. The deferral serves the turn on the unchanged history
+    // instead; the notice fires so the host sees why nothing shrank.
+    // Usage-free scripting: a report would re-anchor the figure to the
+    // mock's staged token count and hide the per-turn retry cycle the
+    // pin exists to drive.
+    let history = stalled_threshold_fixture();
+    let client = Arc::new(
+        crate::testing::MockApiClient::new("stall")
+            .without_usage()
+            .with_responses(vec![
+                crate::testing::MockResponse {
+                    text: "first pass done".into(),
+                    tool_call: Some(crate::testing::MockToolCall {
+                        id: "call_stall".into(),
+                        name: "echo".into(),
+                        input: json!({ "text": "hi" }),
+                    }),
+                    stop_reason: "tool_use".into(),
+                },
+                crate::testing::MockResponse {
+                    text: "served anyway".into(),
+                    tool_call: None,
+                    stop_reason: "end_turn".into(),
+                },
+            ]),
+    );
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let config = make_config()
+        .with_context_window(50_000)
+        .with_compact_threshold(10);
+    let mut agent = BareLoop::from_machine(
+        crate::engine::core::LoopMachine::from_history(history),
+        config,
+        Arc::clone(&client),
+        registry,
+    );
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(CompactionFailureRecorder {
+        failures: Arc::clone(&failures),
+    }));
+
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        agent.run("more", &make_run_config()),
+    )
+    .await
+    .expect("the deferred run resolves");
+    let run = run.expect("the threshold stall defers instead of dying");
+    assert_eq!(
+        run.turn_count(),
+        2,
+        "the stalled turn deferred and the run served both turns"
+    );
+    assert_eq!(
+        run.output.as_deref(),
+        Some("served anyway"),
+        "the post-stall response landed after the deferral"
+    );
+    let notices = crate::error::recover_guard(failures.lock()).clone();
+    assert_eq!(
+        notices.len(),
+        1,
+        "exactly the stalled turn's deferral notice fired — the next turn's retry landed a \
+         real pass instead of stalling again: {:?}",
+        notices
+            .iter()
+            .map(|row| (row.reason.as_str(), row.error.as_deref()))
+            .collect::<Vec<_>>()
+    );
+    for row in &notices {
+        assert!(
+            row.reason.contains("ThresholdExceeded"),
+            "the notice carries the threshold reason"
+        );
+        let notice = row
+            .error
+            .as_ref()
+            .expect("the deferral notice carries its explanatory text");
+        assert!(
+            notice.contains("could not shrink") && notice.contains("uncompacted"),
+            "the notice names the deferral and the serving-anyway decision: {notice}"
+        );
+    }
+}
+
+#[cfg(all(feature = "streaming", feature = "testing"))]
+#[tokio::test]
+async fn an_emergency_stall_still_ends_the_run() {
+    // The 95 % emergency line keeps its hard failure: serving an
+    // over-window payload would wedge every later turn, so a stall
+    // there must still terminate.
+    let history = stalled_threshold_fixture();
+    let client = Arc::new(
+        crate::testing::MockApiClient::new("stall").with_responses(vec![
+            crate::testing::MockResponse {
+                text: "first pass done".into(),
+                tool_call: Some(crate::testing::MockToolCall {
+                    id: "call_stall".into(),
+                    name: "echo".into(),
+                    input: json!({ "text": "hi" }),
+                }),
+                stop_reason: "tool_use".into(),
+            },
+        ]),
+    );
+    let mut registry = ToolRegistry::new();
+    registry.register(EchoTool);
+    let config = make_config().with_context_window(20_000);
+    let mut agent = BareLoop::from_machine(
+        crate::engine::core::LoopMachine::from_history(history),
+        config,
+        Arc::clone(&client),
+        registry,
+    );
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    agent.register_observer(Arc::new(CompactionFailureRecorder {
+        failures: Arc::clone(&failures),
+    }));
+
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        agent.run("more", &make_run_config()),
+    )
+    .await
+    .expect("the emergency run resolves");
+    assert!(
+        run.is_err(),
+        "the emergency stall still terminates: {run:?}"
+    );
+    assert!(
+        crate::error::recover_guard(failures.lock()).is_empty(),
+        "the hard emergency death fires no deferral notice — the typed run error is its surface"
+    );
 }

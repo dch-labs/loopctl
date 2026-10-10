@@ -763,6 +763,62 @@ pub enum CompactBase {
     Threshold,
 }
 
+/// The sizing knobs of one compaction request, beyond its
+/// conversation.
+///
+/// Bundles the two budget figures a pass needs so
+/// [`compact_with_reason`](ContextManager::compact_with_reason)
+/// stays under the crate's argument-count ceiling: the reserve the
+/// landing must leave room for, and the optional landing-target
+/// override. Defaults reserve nothing and use the configured target.
+///
+/// # Example
+///
+/// ```rust
+/// use loopctl::compact::CompactSizing;
+///
+/// let sizing = CompactSizing::reserving(120);
+/// assert_eq!(sizing.reserved_tokens, 120);
+/// assert_eq!(sizing.target_override, None);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactSizing {
+    /// Budget the compacted history must leave room for, in the
+    /// counter's raw units.
+    ///
+    /// Per-request overhead plus, when compaction serves a deferred
+    /// turn, that turn's transient messages: the fit check subtracts
+    /// it, so the post-compaction history plus the reserve must fit
+    /// the window. Pass `0` when nothing rides the request beyond
+    /// the history.
+    pub reserved_tokens: u64,
+
+    /// Landing-target override, in the counter's raw units.
+    ///
+    /// Replaces the configured
+    /// [`compact_target_tokens`](ContextManager::compact_target_tokens)
+    /// for this one pass. The engine's overflow-salvage arm uses it
+    /// to force a landing strictly under the payload a provider
+    /// refused; `None` (the default) uses the configured target.
+    pub target_override: Option<u64>,
+}
+
+impl CompactSizing {
+    /// Reserve room for `reserved_tokens` beyond the compacted
+    /// history, with the configured landing target.
+    ///
+    /// The one-field convenience for the common caller — compaction
+    /// serving a deferred turn reserves that turn's transient budget
+    /// and wants the configured target unchanged.
+    #[must_use]
+    pub fn reserving(reserved_tokens: u64) -> Self {
+        Self {
+            reserved_tokens,
+            target_override: None,
+        }
+    }
+}
+
 /// Manages context window usage and triggers compaction when needed.
 ///
 /// Main entry point for context management. It monitors
@@ -1309,8 +1365,15 @@ impl ContextManager {
         messages: Vec<Message>,
         turn: usize,
     ) -> Result<EnsureContextResult, ContextOverflow> {
-        self.compact_with_reason(messages, turn, CompactReason::Manual, None, Vec::new(), 0)
-            .await
+        self.compact_with_reason(
+            messages,
+            turn,
+            CompactReason::Manual,
+            None,
+            Vec::new(),
+            CompactSizing::default(),
+        )
+        .await
     }
 
     /// Trigger compaction with a specific reason, bypassing the threshold check.
@@ -1328,20 +1391,31 @@ impl ContextManager {
     /// are normalized to the same counter, so telemetry reflects the
     /// manager's measurements.
     ///
-    /// `reserved_tokens` is budget the compacted history must leave room
-    /// for — per-request overhead plus, when compaction serves a deferred
-    /// turn, that turn's transient messages. The fit check subtracts it
-    /// (the post-compaction history plus the reserve must fit the
-    /// window); the compaction target handed to the stages does not —
-    /// the stages' landing checks are history-only against the full
+    /// `sizing` bundles the pass's budget figures:
+    /// [`reserved_tokens`](CompactSizing::reserved_tokens) is budget
+    /// the compacted history must leave room for — per-request
+    /// overhead plus, when compaction serves a deferred turn, that
+    /// turn's transient messages. The fit check subtracts it (the
+    /// post-compaction history plus the reserve must fit the window);
+    /// the compaction target handed to the stages does not — the
+    /// stages' landing checks are history-only against the full
     /// target, because the trigger that re-fires compaction is
     /// overhead-inclusive and a history-only landing at the target
-    /// clears it with the reserve as headroom. Netting the reserve out
-    /// of the stage target too would shrink the target below any
-    /// reachable floor whenever the reserve is a large fraction of the
-    /// window (small windows, big schemas) and deadlock the pass into a
-    /// no-progress stall. Pass `0` when nothing rides the request
-    /// beyond the history.
+    /// clears it with the reserve as headroom. Netting the reserve
+    /// out of the stage target too would shrink the target below any
+    /// reachable floor whenever the reserve is a large fraction of
+    /// the window (small windows, big schemas) and deadlock the pass
+    /// into a no-progress stall. Pass `0` when nothing rides the
+    /// request beyond the history.
+    /// [`target_override`](CompactSizing::target_override) replaces
+    /// [`compact_target_tokens`](Self::compact_target_tokens) as the
+    /// pass's landing target, in the counter's raw units. The
+    /// engine's overflow-salvage arm uses it to force a landing
+    /// strictly under the payload a provider refused — the configured
+    /// target can sit above that payload (a real limit below the
+    /// declared window), leaving a target-observing compactor nothing
+    /// to shed and the pass declining into a no-progress stall.
+    /// `None` uses the configured target.
     ///
     /// # Errors
     ///
@@ -1354,7 +1428,7 @@ impl ContextManager {
         reason: CompactReason,
         instructions: Option<String>,
         additional_context: Vec<String>,
-        reserved_tokens: u64,
+        sizing: CompactSizing,
     ) -> Result<EnsureContextResult, ContextOverflow> {
         let tokens_before = self.estimate_tokens(&messages);
 
@@ -1362,8 +1436,11 @@ impl ContextManager {
             return Ok(EnsureContextResult::NoAction(messages));
         }
 
+        let reserved_tokens = sizing.reserved_tokens;
         let message_count = messages.len();
-        let target_tokens = self.compact_target_tokens();
+        let target_tokens = sizing
+            .target_override
+            .unwrap_or_else(|| self.compact_target_tokens());
         let context = CompactionContext {
             tokens_before,
             reason,
@@ -2926,7 +3003,7 @@ mod tests {
                 CompactReason::Manual,
                 None,
                 Vec::new(),
-                reserve,
+                CompactSizing::reserving(reserve),
             )
             .await;
         match roomy {
@@ -2958,7 +3035,7 @@ mod tests {
                 CompactReason::Manual,
                 None,
                 Vec::new(),
-                reserve,
+                CompactSizing::reserving(reserve),
             )
             .await;
         match overflow {

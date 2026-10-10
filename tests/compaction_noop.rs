@@ -483,7 +483,7 @@ mod scenarios {
             "the first run starts under the threshold and completes: {first:?}"
         );
 
-        let _second = agent.run(&"y".repeat(200), &RunConfig::default()).await;
+        let _second = agent.run(&"y".repeat(400), &RunConfig::default()).await;
 
         let served = client_handle.served_request_tokens();
         for tokens in &served {
@@ -883,7 +883,7 @@ mod scenarios {
                 CompactReason::ThresholdExceeded,
                 None,
                 Vec::new(),
-                143,
+                loopctl::compact::CompactSizing::reserving(143),
             )
             .await
             .expect_err(
@@ -922,7 +922,7 @@ mod scenarios {
                 CompactReason::ThresholdExceeded,
                 None,
                 Vec::new(),
-                143,
+                loopctl::compact::CompactSizing::reserving(143),
             )
             .await
             .expect_err("the compactor failed, so the pass cannot succeed");

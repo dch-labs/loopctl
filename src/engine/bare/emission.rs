@@ -76,15 +76,17 @@ pub(super) struct TurnEnd<'a> {
     ///
     /// Measured from the start of the relevant handler — for the LLM
     /// phase, from `handle_call_llm`'s entry to the response being
-    /// recorded; for the tool phase, from `handle_call_tools`'s entry
-    /// through dispatch completion. One turn-end fires per serving
-    /// attempt: the LLM phase's for a tool-free turn (covering the
-    /// model call), the tool phase's for a turn whose model call
-    /// requested tools (covering dispatch), and a turn the overflow
-    /// salvage retried fires one per attempt — the rejected attempt's
-    /// failed event and the retry's own pair. The phase that does
-    /// not fire contributes no event, so the two durations never
-    /// double-count. Converted to `duration_ms` (via
+    /// recorded; for the tool phase, from the turn's serving start
+    /// (the model-phase entry, carried across the phase boundary)
+    /// through dispatch completion, so a tool turn's figure covers
+    /// the whole attempt. One turn-end fires per serving attempt:
+    /// the LLM phase's for a tool-free turn (covering the model
+    /// call), the tool phase's for a turn whose model call requested
+    /// tools (covering the model call plus dispatch), and a turn the
+    /// overflow salvage retried fires one per attempt — the rejected
+    /// attempt's failed event and the retry's own pair. The phase
+    /// that does not fire contributes no event, so the two durations
+    /// never double-count. Converted to `duration_ms` (via
     /// [`millis_u64`](BareLoop::millis_u64)) when the observer
     /// context is built.
     pub duration: Duration,
@@ -188,8 +190,8 @@ impl<C: ApiClient> BareLoop<C> {
         let context_figure = match &self.anchor {
             Some(anchor) => Some(
                 ContextFigureInfo::new(FigureSource::Anchored).with_anchor_age_turns(Some(
-                    self.machine
-                        .turns_taken()
+                    self.session
+                        .total_turns()
                         .saturating_sub(anchor.anchored_at_turn),
                 )),
             ),
@@ -411,7 +413,7 @@ impl<C: ApiClient> BareLoop<C> {
             self.anchor = Some(UsageAnchor {
                 input_tokens: in_tok,
                 raw_payload,
-                anchored_at_turn: self.machine.turns_taken().saturating_add(1),
+                anchored_at_turn: self.session.total_turns().saturating_add(1),
             });
         }
         let ratio_before = self.calibration.ratio_bp;

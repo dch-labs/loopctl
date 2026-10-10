@@ -356,6 +356,32 @@ pub struct BareLoop<C: ApiClient> {
     /// salvage, not collide with the previous run's.
     overflow_retry: Option<usize>,
 
+    /// The landing target the overflow salvage forced on the next
+    /// compaction pass, in the counter's raw units.
+    ///
+    /// Set when a salvage forces the machine onto the compaction path
+    /// and consumed one-shot by the pass that serves it: half the
+    /// refused payload's estimate (or the configured target when
+    /// smaller) — strictly under what the provider refused, so the
+    /// pass cannot decline into a no-progress stall on a configured
+    /// target that sits above the provider's real limit. Cleared at
+    /// run start so a pass a cancelled run never reached cannot land
+    /// a stale target.
+    salvage_target: Option<u64>,
+
+    /// The wall-clock start of the current turn's serving attempt.
+    ///
+    /// Captured where the model phase begins
+    /// ([`handle_call_llm`](Self::handle_call_llm)'s entry), read
+    /// where the tool phase reports its turn-end — so a tool turn's
+    /// recorded duration covers the whole serving attempt (model call
+    /// plus dispatch), not the dispatch phase alone. Taken (cleared)
+    /// on read; a tool phase that begins without one (a machine
+    /// resumed mid-phase, its model phase driven by a previous run)
+    /// falls back to its own entry instant. Cleared at run start so a
+    /// resumed phase cannot inherit a stale start.
+    turn_wall_start: Option<Instant>,
+
     /// Sticky detection bypass, set once detection state is found
     /// poisoned — detection is advisory, so the session continues with
     /// it skipped rather than failing. Atomic so the `&self` tool-path
@@ -452,20 +478,23 @@ pub struct BareLoop<C: ApiClient> {
 ///
 /// [`dispatch_and_record`]: BareLoop::dispatch_and_record
 struct TurnAccounting {
-    /// Wall-clock instant the `CallTools` arm began.
+    /// Wall-clock instant the turn's serving attempt began.
     ///
-    /// Captured from the managers' [`Clock`](crate::determinism::Clock)
-    /// before any tool dispatch starts. Elapsed is taken when dispatch
-    /// completes — on the success path as
-    /// [`dispatch_and_record`](BareLoop::dispatch_and_record) returns, before
-    /// the results land in machine history and the context-size estimate is
-    /// refreshed; on the failure path inside that same helper — producing the
-    /// `duration_ms` reported on
-    /// [`TurnEndContext`](crate::observer::TurnEndContext). The reported
-    /// duration covers the tool-dispatch phase only: the preceding model call
-    /// is timed separately in `handle_call_llm`, and the post-dispatch
-    /// O(history) context recount stays outside the measured span, so the
-    /// success and failure events report the same measure.
+    /// Captured where the model phase starts — the same instant
+    /// [`handle_call_llm`](BareLoop::handle_call_llm) measures from —
+    /// so the elapsed reported on the tool phase's turn-end covers
+    /// the whole attempt (model call plus dispatch); a tool phase
+    /// that begins without a recorded attempt start (a machine
+    /// resumed mid-phase) falls back to its own entry instant.
+    /// Elapsed is taken when dispatch completes — on the success path
+    /// as [`dispatch_and_record`](BareLoop::dispatch_and_record)
+    /// returns, before the results land in machine history and the
+    /// context-size estimate is refreshed; on the failure path inside
+    /// that same helper — producing the `duration_ms` reported on
+    /// [`TurnEndContext`](crate::observer::TurnEndContext). The
+    /// post-dispatch O(history) context recount stays outside the
+    /// measured span, so the success and failure events report the
+    /// same measure.
     start: Instant,
 
     /// Prompt-side token count reported by the provider.
@@ -527,11 +556,16 @@ struct UsageAnchor {
     /// payload and this figure.
     raw_payload: u64,
 
-    /// The completed-turn count once the anchor's own turn lands.
+    /// The session-wide completed-turn count once the anchor's own
+    /// turn lands.
     ///
-    /// The age denominator for telemetry: completed turns since the
-    /// report, so a host can see how fresh the figure's real number
-    /// is — zero while the anchoring turn is still the newest one.
+    /// The age denominator for telemetry: completed turns across the
+    /// whole session since the report, so a host can see how fresh
+    /// the figure's real number is — zero while the anchoring turn is
+    /// still the newest one. Recorded on the session-wide basis
+    /// (`total_turns` plus the in-flight turn) because the anchor
+    /// itself survives across runs: a later run that reports no usage
+    /// must read as an aging anchor, not a fresh one.
     anchored_at_turn: usize,
 }
 
@@ -853,6 +887,8 @@ impl<C: ApiClient> BareLoop<C> {
             anchor: None,
             prune: None,
             overflow_retry: None,
+            salvage_target: None,
+            turn_wall_start: None,
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -1339,6 +1375,8 @@ impl<C: ApiClient> BareLoop<C> {
             anchor: None,
             prune: None,
             overflow_retry: None,
+            salvage_target: None,
+            turn_wall_start: None,
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -1455,6 +1493,8 @@ impl<C: ApiClient> BareLoop<C> {
             anchor: None,
             prune: None,
             overflow_retry: None,
+            salvage_target: None,
+            turn_wall_start: None,
             detection_disabled: std::sync::atomic::AtomicBool::new(false),
             request_options: RequestOptions::default(),
             last_routed_model: None,
@@ -1855,6 +1895,7 @@ impl<C: ApiClient> BareLoop<C> {
         }
 
         let turn_start = self.managers.clock().monotonic();
+        self.turn_wall_start = Some(turn_start);
         let turn_input = self.turn_input(turn);
 
         let mut messages = self.collect_contributor_messages(turn);
@@ -2236,7 +2277,10 @@ impl<C: ApiClient> BareLoop<C> {
         turn: usize,
         calls: &[PendingToolCall],
     ) -> Result<(), LoopError> {
-        let turn_start = self.managers.clock().monotonic();
+        let turn_start = self
+            .turn_wall_start
+            .take()
+            .unwrap_or_else(|| self.managers.clock().monotonic());
         let mut tool_calls: Vec<ToolCall> = Vec::with_capacity(calls.len());
         let mut slots: Vec<Option<MessagePart>> = vec![None; calls.len()];
         let mut dispatch_calls: Vec<ToolCall> = Vec::new();
@@ -2351,15 +2395,31 @@ impl<C: ApiClient> BareLoop<C> {
             () = cancelled.notified() => return Err(LoopError::Cancelled),
             outcome = self.run_compaction(turn, reason) => outcome?,
         };
-        match outcome.compacted {
-            Some(compacted) => {
-                self.machine.compaction_result(
-                    compacted,
-                    outcome.tokens_before,
-                    outcome.tokens_after,
+        if let Some(compacted) = outcome.compacted {
+            self.machine
+                .compaction_result(compacted, outcome.tokens_before, outcome.tokens_after);
+        } else {
+            let window = self.effective_context_window();
+            let threshold_stall = reason == crate::compact::types::CompactReason::ThresholdExceeded
+                && outcome.tokens_after < window
+                && outcome.tokens_after >= outcome.tokens_before;
+            if threshold_stall {
+                self.machine.compaction_deferred(outcome.tokens_after);
+                self.managers.observers().on_compaction_failed(
+                    &crate::observer::CompactionFailedContext {
+                        reason,
+                        turn,
+                        tokens_before: outcome.tokens_before,
+                        context_window: window,
+                        error: Some(
+                            "threshold pass could not shrink the conversation; \
+                                 serving the turn uncompacted while the payload fits \
+                                 the window"
+                                .to_string(),
+                        ),
+                    },
                 );
-            }
-            None => {
+            } else {
                 self.machine
                     .compaction_noop(outcome.tokens_before, outcome.tokens_after);
             }
@@ -2415,6 +2475,8 @@ impl<C: ApiClient> crate::engine::core::Loop for BareLoop<C> {
             self.machine.accept_input(input);
             self.deferred_transient_tokens = 0;
             self.overflow_retry = None;
+            self.salvage_target = None;
+            self.turn_wall_start = None;
             let cancelled = Arc::clone(&self.cancelled);
             let resolution = tokio::select! {
                 biased;
@@ -2606,15 +2668,20 @@ impl<C: ApiClient> BareLoop<C> {
     /// the compaction path when the conversation can shrink (and
     /// resets the figure when it cannot — a single-message
     /// conversation has nothing to compact, so the retry re-enters
-    /// directly), and returns the retry marker. A repeat rejection on
-    /// a turn that already spent its retry is terminal: the
-    /// conversation does not fit even compacted, surfaced as
-    /// [`ContextExceeded`](LoopError::ContextExceeded) with the
-    /// machine's figure floored just above the window — the provider
-    /// declared the request unfittable, so the reported usage never
-    /// reads as fitting — after the retry's own failed-turn event
-    /// fires, pairing its turn-start. Any other error returns `None`
-    /// and takes the ordinary failure path.
+    /// directly), and returns the retry marker. The forced pass lands
+    /// at a target strictly under the payload the provider refused —
+    /// half the refused estimate, or the configured target when that
+    /// is already smaller — so the pass must make real progress even
+    /// when the configured target sits above what the provider
+    /// actually accepts (a real limit below the declared window). A
+    /// repeat rejection on a turn that already spent its retry is
+    /// terminal: the conversation does not fit even compacted,
+    /// surfaced as [`ContextExceeded`](LoopError::ContextExceeded)
+    /// with the machine's figure floored just above the window — the
+    /// provider declared the request unfittable, so the reported
+    /// usage never reads as fitting — after the retry's own
+    /// failed-turn event fires, pairing its turn-start. Any other
+    /// error returns `None` and takes the ordinary failure path.
     fn overflow_salvage(
         &mut self,
         turn: usize,
@@ -2639,6 +2706,15 @@ impl<C: ApiClient> BareLoop<C> {
         self.overflow_retry = Some(turn);
         let shrinkable = self.machine.full_history().len() > 1;
         if shrinkable {
+            let refused_payload = self
+                .count_context(&self.machine.full_history())
+                .saturating_add(self.request_overhead_tokens());
+            let half = refused_payload / 2;
+            let target = match self.managers.context_manager() {
+                Some(manager) => half.min(manager.compact_target_tokens()),
+                None => half,
+            };
+            self.salvage_target = Some(target);
             self.machine
                 .set_context_tokens(self.effective_context_window().saturating_add(1));
         }

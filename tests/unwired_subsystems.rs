@@ -2773,27 +2773,34 @@ mod hook_sequences {
             },
         ))));
 
-        // The aborted pass trips the no-progress guard and ends run 1
-        // with ContextExceeded — the veto is honored. The hook's state
-        // persists into run 2, whose consultation now carries guidance.
-        let _ = loop_
+        // The aborted pass defers — the payload still fits the window,
+        // so the veto is honored by serving the turn uncompacted rather
+        // than dying on the no-progress guard. The hook's state persists
+        // into run 2, whose consultation now carries guidance.
+        let first = loop_
             .run("vetoed run", &RunConfig::default())
             .await
-            .expect_err("the vetoed compaction ends the run");
-        assert!(
-            passes.lock().expect("lock").is_empty(),
-            "the aborted pass never reaches the compactor"
-        );
+            .expect("the vetoed compaction defers and the run completes");
+        assert!(first.output.is_some(), "the vetoed run served its turns");
 
         loop_
             .run("guided run", &RunConfig::default())
             .await
             .expect("run completes");
 
+        let consulted_count = *consulted.lock().expect("lock");
+        assert!(
+            consulted_count >= 2,
+            "the vetoed consultation and a later guided one both happened ({consulted_count})"
+        );
         let passes = passes.lock().expect("lock").clone();
         assert!(
+            !passes.is_empty(),
+            "a later pass ran once the hook stopped vetoing"
+        );
+        assert!(
             passes.iter().all(|p| p.is_some()),
-            "every pass of the guided run carries the hook's instructions"
+            "every pass that reached the compactor carries the hook's instructions"
         );
     }
 }

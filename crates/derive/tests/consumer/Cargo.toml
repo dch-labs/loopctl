@@ -8,7 +8,7 @@ publish = false
 [workspace]
 
 [dependencies]
-lc = { package = "loopctl", path = "../../..", features = ["derive"] }
+lc = { package = "loopctl", path = "../../../..", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 
 [lints.rust]

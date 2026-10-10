@@ -1,25 +1,23 @@
 [package]
-name = "loopctl-sqlite"
-version = "0.3.2"
+name = "loopctl-hnsw"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
-description = "SQLite-backed LoopMemory implementation for loopctl"
+description = "HNSW-backed VectorIndex for loopctl's semantic memory"
 repository = "https://github.com/dch-labs/loopctl"
-keywords = ["agent", "loopctl", "sqlite", "memory"]
-categories = ["api-bindings", "database"]
+homepage = "https://loopctl.rs"
+keywords = ["agent", "loopctl", "hnsw", "ann", "vector"]
+categories = ["api-bindings", "data-structures"]
 
 [dependencies]
-loopctl = { path = "..", version = "=0.3.2" }
-rusqlite = { version = "0.40", features = ["bundled"] }
-serde_json = "1"
-thiserror = "2"
+loopctl = { path = "../..", version = "=0.4.0", default-features = false, features = ["vector_index"] }
+fastrand = "2"
 tracing = "0.1"
 uuid = "1"
 
 [dev-dependencies]
-loopctl = { path = "..", version = "=0.3.2", features = ["file_memory"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+loopctl = { path = "../..", version = "=0.4.0", default-features = false, features = ["vector_memory", "testing"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 
 [lints.clippy]

@@ -1,6 +1,6 @@
 [package]
 name = "loopctl-vector"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
@@ -19,7 +19,7 @@ pgvector = ["dep:pgvector", "dep:sqlx"]
 testing = []
 
 [dependencies]
-loopctl = { path = "..", version = "=0.3.2", default-features = false, features = ["vector_index"] }
+loopctl = { path = "../..", version = "=0.4.0", default-features = false, features = ["vector_index"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
@@ -37,7 +37,7 @@ required-features = ["pgvector", "testing"]
 
 [dev-dependencies]
 futures = "0.3"
-loopctl = { path = "..", version = "=0.3.2", default-features = false, features = ["vector_memory", "testing"] }
+loopctl = { path = "../..", version = "=0.4.0", default-features = false, features = ["vector_memory", "testing"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 

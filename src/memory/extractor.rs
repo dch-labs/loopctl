@@ -2401,6 +2401,8 @@ mod tests {
             total_turns: 3,
             duration_ms: 100,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         });
         tokio::task::yield_now().await;
     }

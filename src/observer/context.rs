@@ -54,6 +54,34 @@ pub struct RunEndContext {
     /// to [`on_run_end`](crate::observer::LoopObserver::on_run_end).
     pub duration_ms: u64,
 
+    /// The figure source in force when the run ended.
+    ///
+    /// The engine fills this on every run-end event:
+    /// [`Anchored`](FigureSource::Anchored) when a usage report was
+    /// carrying the figure at run end — the provider's own input
+    /// count plus an estimated tail — and
+    /// [`Estimated`](FigureSource::Estimated) when the heuristic
+    /// estimate was flying alone, the shape of a backend that never
+    /// reported usable usage. The figure that drove the run's *last*
+    /// window decision can differ in source: an anchor armed by the
+    /// final response post-dates that decision, which flew on
+    /// whatever figure preceded it. `None` appears only on
+    /// host-constructed synthetic events; hosts surface the field so
+    /// a usage-less backend's operator can see that no real number
+    /// ever arrived.
+    pub context_figure: Option<ContextFigureInfo>,
+
+    /// The triggering input of a run that died on the context window.
+    ///
+    /// `Some(input)` only when the run ended in the overflow family —
+    /// the provider refused an oversized prompt or the engine could
+    /// not fit the conversation — carrying the user input that never
+    /// completed, so a host can offer one-click resubmission after the
+    /// user frees context (a manual compaction, a model switch). Every
+    /// other ending leaves it `None`: their conversation survives
+    /// salvage, and the input is recoverable from the history.
+    pub unfinished_input: Option<String>,
+
     /// The run's usage-fed estimate-calibration ratio, in thousandths.
     ///
     /// `Some(ratio)` only when the provider reported usable
@@ -98,6 +126,8 @@ impl RunEndContext {
             total_turns,
             duration_ms,
             calibration_ratio_bp: None,
+            context_figure: None,
+            unfinished_input: None,
         }
     }
 
@@ -121,6 +151,135 @@ impl RunEndContext {
     #[must_use]
     pub fn with_calibration_ratio(mut self, ratio_bp: Option<u64>) -> Self {
         self.calibration_ratio_bp = ratio_bp;
+        self
+    }
+
+    /// Attach the driven-figure report to a synthetic run-end context.
+    ///
+    /// The engine fills the field from its own anchor state; this
+    /// builder exists for observers exercising their run-end handling
+    /// against a staged figure (the same reason
+    /// [`new`](Self::new) exists at all).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::observer::{ContextFigureInfo, FigureSource, RunEndContext};
+    ///
+    /// let ctx = RunEndContext::new(true, None, 2, 90).with_context_figure(Some(
+    ///     ContextFigureInfo::new(FigureSource::Anchored).with_anchor_age_turns(Some(1)),
+    /// ));
+    /// assert_eq!(ctx.context_figure.as_ref().map(|f| f.source), Some(FigureSource::Anchored));
+    /// ```
+    #[must_use]
+    pub fn with_context_figure(mut self, figure: Option<ContextFigureInfo>) -> Self {
+        self.context_figure = figure;
+        self
+    }
+
+    /// Attach the unfinished input to a synthetic run-end context.
+    ///
+    /// Mirrors the engine's overflow-family fill for hosts testing
+    /// their resubmission affordances against synthetic events.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::observer::RunEndContext;
+    ///
+    /// let ctx = RunEndContext::new(false, Some("context exceeded".into()), 1, 12)
+    ///     .with_unfinished_input(Some("rewrite the failing module".to_string()));
+    /// assert_eq!(ctx.unfinished_input.as_deref(), Some("rewrite the failing module"));
+    /// ```
+    #[must_use]
+    pub fn with_unfinished_input(mut self, input: Option<String>) -> Self {
+        self.unfinished_input = input;
+        self
+    }
+}
+
+/// Which kind of figure drove a window decision.
+///
+/// Names the mechanism behind a compaction trigger or emergency-line
+/// check, so a host can tell a real provider number from the
+/// heuristic estimate flying alone. `#[non_exhaustive]` so later
+/// sources (a disclosed window probe, a host-fed figure) widen
+/// additively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FigureSource {
+    /// The last usage report carried the figure.
+    ///
+    /// The provider's own input count plus an estimated tail since
+    /// the report; the error surface is the appends, not the history.
+    Anchored,
+
+    /// The calibrated heuristic estimate drove the figure.
+    ///
+    /// No usable usage report was in force — a usage-less backend, or
+    /// the first request after an invalidating event (a compaction
+    /// pass, a model change).
+    Estimated,
+}
+
+/// The figure source in force when the run ended.
+///
+/// The payload of
+/// [`RunEndContext::context_figure`](crate::observer::RunEndContext::context_figure):
+/// the [`source`](Self::source) mechanism and, when anchored, how many
+/// completed turns old the anchor was. Constructed by the engine;
+/// hosts build synthetic instances through [`new`](Self::new) and the
+/// additive builders.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ContextFigureInfo {
+    /// The mechanism behind the figure.
+    ///
+    /// [`Anchored`](FigureSource::Anchored) when a usage report
+    /// carried the last figure, [`Estimated`](FigureSource::Estimated)
+    /// when the estimate flew alone.
+    pub source: FigureSource,
+
+    /// Completed turns since the anchoring report.
+    ///
+    /// `Some(age)` only when [`source`](Self::source) is
+    /// [`Anchored`](FigureSource::Anchored) — how stale the real
+    /// number is; every request re-anchors on a reporting backend, so
+    /// ages beyond one mean reports stopped arriving.
+    pub anchor_age_turns: Option<usize>,
+}
+
+impl ContextFigureInfo {
+    /// A figure report from its source.
+    ///
+    /// The construction path for code outside the crate — the type is
+    /// `#[non_exhaustive]`; chain [`with_anchor_age_turns`](Self::with_anchor_age_turns)
+    /// for the anchored case.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use loopctl::observer::{ContextFigureInfo, FigureSource};
+    ///
+    /// let info = ContextFigureInfo::new(FigureSource::Estimated);
+    /// assert_eq!(info.source, FigureSource::Estimated);
+    /// ```
+    #[must_use]
+    pub fn new(source: FigureSource) -> Self {
+        Self {
+            source,
+            anchor_age_turns: None,
+        }
+    }
+
+    /// Attach the anchor age to an anchored figure report.
+    ///
+    /// Meaningful only beside
+    /// [`FigureSource::Anchored`]; the
+    /// estimated arm carries `None`.
+    #[must_use]
+    pub fn with_anchor_age_turns(mut self, age: Option<usize>) -> Self {
+        self.anchor_age_turns = age;
         self
     }
 }
@@ -765,14 +924,19 @@ pub struct CompactionFailedContext {
     /// without holding the configuration itself.
     pub context_window: u64,
 
-    /// The compactor's own error text, when the compactor failed.
+    /// The compactor's own error text, the doesn't-fit marker, or the
+    /// deferral notice.
     ///
     /// `Some(cause)` when a compactor ran and errored — the verbatim
     /// text the run failure's `cause` field also carries. `None` when
     /// the pass *succeeded* but its result still did not fit the
     /// window: a different failure (the compactor did its job and the
     /// conversation still overflows), reported through the same event
-    /// so hosts have one place to watch.
+    /// so hosts have one place to watch. `Some(notice)` on the
+    /// non-fatal deferral — a threshold-triggered pass that shrank
+    /// nothing on a payload still under the window, after which the
+    /// run continues serving; the notice names the deferral, so an
+    /// observer can tell it from a cause-carrying death.
     pub error: Option<String>,
 }
 

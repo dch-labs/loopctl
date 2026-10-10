@@ -86,6 +86,108 @@ pub mod truncating;
 pub mod types;
 
 pub(crate) use demote::render_compaction_transcript;
+
+/// Configuration for the standalone tool-output reclamation pass.
+///
+/// The prune pass is a no-LLM reclaim that runs below the compaction
+/// trigger: when the context figure crosses
+/// [`prune_line_pct`](Self::prune_line_pct) of the window, completed
+/// tool results older than the protected tail are cleared from the
+/// feed (their content replaced by a short marker) and handed to the
+/// [`DemotionSink`] — reclaiming bytes in milliseconds where a
+/// summarizer pass would cost model calls. Opt-in: a loop without a
+/// configured prune never rewrites a tool result. The pass is
+/// hook-invisible by design — it makes no model call and no state
+/// transition, so `pre_compact` hooks are never consulted and cannot
+/// veto a clear; a host wanting a policy gate over reclamation wraps
+/// the engine's `set_prune` call in its own decision.
+///
+/// # Example
+///
+/// ```rust
+/// use loopctl::compact::PruneConfig;
+///
+/// let config = PruneConfig::default()
+///     .with_prune_line_pct(60)
+///     .with_min_free_pct(10);
+/// assert_eq!(config.prune_line_pct, 60);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneConfig {
+    /// The fraction of the window that arms the pass, in percent.
+    ///
+    /// The pass runs when the context figure reaches this fraction —
+    /// which must sit strictly below the compaction threshold, so
+    /// pruning gets its chance before the summarizer is reached. The
+    /// engine rejects a configuration whose line does not (an
+    /// [`InvalidInput`](crate::error::LoopError::InvalidInput), never
+    /// a silent clamp). Default `60` against the default `80`
+    /// threshold.
+    pub prune_line_pct: u16,
+
+    /// The minimum reclaim that justifies a pass, in percent of the
+    /// window.
+    ///
+    /// The minimum-free gate: a projection under this fraction is a
+    /// no-op, so a clear that frees nothing does not churn the feed.
+    /// Values above `100` are rejected by the engine's configuration
+    /// surface — the clearable pool can never reach a full window
+    /// while the conversation fits under it, so such a gate would
+    /// disable the pass silently. Default `10`.
+    pub min_free_pct: u16,
+
+    /// The token budget of the protected tail.
+    ///
+    /// The newest conversation content, counted from the end, is never
+    /// cleared — the active turn's context and its immediate
+    /// predecessors stay verbatim whatever their class. Default
+    /// `2 000` tokens, the order of a truncating pass's preserved
+    /// floor.
+    pub protected_tail_tokens: u64,
+}
+
+impl Default for PruneConfig {
+    fn default() -> Self {
+        Self {
+            prune_line_pct: 60,
+            min_free_pct: 10,
+            protected_tail_tokens: 2_000,
+        }
+    }
+}
+
+impl PruneConfig {
+    /// Set the arming fraction of the window, in percent.
+    ///
+    /// Must stay strictly below the compaction threshold — the engine
+    /// validates the pairing at configuration time.
+    #[must_use]
+    pub fn with_prune_line_pct(mut self, pct: u16) -> Self {
+        self.prune_line_pct = pct;
+        self
+    }
+
+    /// Set the minimum-free gate, in percent of the window.
+    ///
+    /// A pass projected to reclaim less than this fraction of the
+    /// window is a no-op. Values above `100` are rejected when the
+    /// configuration reaches the engine — such a gate could never be
+    /// satisfied.
+    #[must_use]
+    pub fn with_min_free_pct(mut self, pct: u16) -> Self {
+        self.min_free_pct = pct;
+        self
+    }
+
+    /// Set the protected tail's token budget.
+    ///
+    /// The newest content within this budget is never cleared.
+    #[must_use]
+    pub fn with_protected_tail_tokens(mut self, tokens: u64) -> Self {
+        self.protected_tail_tokens = tokens;
+        self
+    }
+}
 pub use demote::{
     DemotionContext, DemotionSink, MemoryDemotionSink, NoopDemotionSink, render_evicted,
 };
@@ -661,6 +763,62 @@ pub enum CompactBase {
     Threshold,
 }
 
+/// The sizing knobs of one compaction request, beyond its
+/// conversation.
+///
+/// Bundles the two budget figures a pass needs so
+/// [`compact_with_reason`](ContextManager::compact_with_reason)
+/// stays under the crate's argument-count ceiling: the reserve the
+/// landing must leave room for, and the optional landing-target
+/// override. Defaults reserve nothing and use the configured target.
+///
+/// # Example
+///
+/// ```rust
+/// use loopctl::compact::CompactSizing;
+///
+/// let sizing = CompactSizing::reserving(120);
+/// assert_eq!(sizing.reserved_tokens, 120);
+/// assert_eq!(sizing.target_override, None);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactSizing {
+    /// Budget the compacted history must leave room for, in the
+    /// counter's raw units.
+    ///
+    /// Per-request overhead plus, when compaction serves a deferred
+    /// turn, that turn's transient messages: the fit check subtracts
+    /// it, so the post-compaction history plus the reserve must fit
+    /// the window. Pass `0` when nothing rides the request beyond
+    /// the history.
+    pub reserved_tokens: u64,
+
+    /// Landing-target override, in the counter's raw units.
+    ///
+    /// Replaces the configured
+    /// [`compact_target_tokens`](ContextManager::compact_target_tokens)
+    /// for this one pass. The engine's overflow-salvage arm uses it
+    /// to force a landing strictly under the payload a provider
+    /// refused; `None` (the default) uses the configured target.
+    pub target_override: Option<u64>,
+}
+
+impl CompactSizing {
+    /// Reserve room for `reserved_tokens` beyond the compacted
+    /// history, with the configured landing target.
+    ///
+    /// The one-field convenience for the common caller — compaction
+    /// serving a deferred turn reserves that turn's transient budget
+    /// and wants the configured target unchanged.
+    #[must_use]
+    pub fn reserving(reserved_tokens: u64) -> Self {
+        Self {
+            reserved_tokens,
+            target_override: None,
+        }
+    }
+}
+
 /// Manages context window usage and triggers compaction when needed.
 ///
 /// Main entry point for context management. It monitors
@@ -1207,8 +1365,15 @@ impl ContextManager {
         messages: Vec<Message>,
         turn: usize,
     ) -> Result<EnsureContextResult, ContextOverflow> {
-        self.compact_with_reason(messages, turn, CompactReason::Manual, None, Vec::new(), 0)
-            .await
+        self.compact_with_reason(
+            messages,
+            turn,
+            CompactReason::Manual,
+            None,
+            Vec::new(),
+            CompactSizing::default(),
+        )
+        .await
     }
 
     /// Trigger compaction with a specific reason, bypassing the threshold check.
@@ -1226,20 +1391,31 @@ impl ContextManager {
     /// are normalized to the same counter, so telemetry reflects the
     /// manager's measurements.
     ///
-    /// `reserved_tokens` is budget the compacted history must leave room
-    /// for — per-request overhead plus, when compaction serves a deferred
-    /// turn, that turn's transient messages. The fit check subtracts it
-    /// (the post-compaction history plus the reserve must fit the
-    /// window); the compaction target handed to the stages does not —
-    /// the stages' landing checks are history-only against the full
+    /// `sizing` bundles the pass's budget figures:
+    /// [`reserved_tokens`](CompactSizing::reserved_tokens) is budget
+    /// the compacted history must leave room for — per-request
+    /// overhead plus, when compaction serves a deferred turn, that
+    /// turn's transient messages. The fit check subtracts it (the
+    /// post-compaction history plus the reserve must fit the window);
+    /// the compaction target handed to the stages does not — the
+    /// stages' landing checks are history-only against the full
     /// target, because the trigger that re-fires compaction is
     /// overhead-inclusive and a history-only landing at the target
-    /// clears it with the reserve as headroom. Netting the reserve out
-    /// of the stage target too would shrink the target below any
-    /// reachable floor whenever the reserve is a large fraction of the
-    /// window (small windows, big schemas) and deadlock the pass into a
-    /// no-progress stall. Pass `0` when nothing rides the request
-    /// beyond the history.
+    /// clears it with the reserve as headroom. Netting the reserve
+    /// out of the stage target too would shrink the target below any
+    /// reachable floor whenever the reserve is a large fraction of
+    /// the window (small windows, big schemas) and deadlock the pass
+    /// into a no-progress stall. Pass `0` when nothing rides the
+    /// request beyond the history.
+    /// [`target_override`](CompactSizing::target_override) replaces
+    /// [`compact_target_tokens`](Self::compact_target_tokens) as the
+    /// pass's landing target, in the counter's raw units. The
+    /// engine's overflow-salvage arm uses it to force a landing
+    /// strictly under the payload a provider refused — the configured
+    /// target can sit above that payload (a real limit below the
+    /// declared window), leaving a target-observing compactor nothing
+    /// to shed and the pass declining into a no-progress stall.
+    /// `None` uses the configured target.
     ///
     /// # Errors
     ///
@@ -1252,7 +1428,7 @@ impl ContextManager {
         reason: CompactReason,
         instructions: Option<String>,
         additional_context: Vec<String>,
-        reserved_tokens: u64,
+        sizing: CompactSizing,
     ) -> Result<EnsureContextResult, ContextOverflow> {
         let tokens_before = self.estimate_tokens(&messages);
 
@@ -1260,8 +1436,11 @@ impl ContextManager {
             return Ok(EnsureContextResult::NoAction(messages));
         }
 
+        let reserved_tokens = sizing.reserved_tokens;
         let message_count = messages.len();
-        let target_tokens = self.compact_target_tokens();
+        let target_tokens = sizing
+            .target_override
+            .unwrap_or_else(|| self.compact_target_tokens());
         let context = CompactionContext {
             tokens_before,
             reason,
@@ -2824,7 +3003,7 @@ mod tests {
                 CompactReason::Manual,
                 None,
                 Vec::new(),
-                reserve,
+                CompactSizing::reserving(reserve),
             )
             .await;
         match roomy {
@@ -2856,7 +3035,7 @@ mod tests {
                 CompactReason::Manual,
                 None,
                 Vec::new(),
-                reserve,
+                CompactSizing::reserving(reserve),
             )
             .await;
         match overflow {

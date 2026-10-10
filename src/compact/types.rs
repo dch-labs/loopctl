@@ -26,6 +26,19 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum CompactReason {
+    /// The standalone tool-output reclamation pass.
+    ///
+    /// Not a compaction: no model call, no state transition — the
+    /// engine cleared completed tool results beyond the protected
+    /// tail to keep the conversation under its window, handing the
+    /// cleared content to the demotion sink. Sinks see this reason so
+    /// a pruned handoff is distinguishable from a summarized one.
+    /// Hook-invisible by design: the engine does not consult
+    /// `pre_compact` hooks before clearing (there is no summarizer
+    /// for a hook to steer), so no live hook context ever carries
+    /// this reason.
+    Prune,
+
     /// Token usage exceeded the configured threshold percentage.
     ///
     /// This is the routine, expected trigger: estimated context size crossed the
@@ -57,6 +70,7 @@ impl fmt::Display for CompactReason {
             Self::ThresholdExceeded => write!(f, "threshold exceeded"),
             Self::Emergency => write!(f, "emergency"),
             Self::Manual => write!(f, "manual"),
+            Self::Prune => write!(f, "prune"),
         }
     }
 }
